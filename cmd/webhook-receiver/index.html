@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tokay Webhook Receiver</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg-primary:#0a0a0f;--bg-secondary:#12121a;--bg-tertiary:#1a1a24;--bg-hover:#22222e;
+  --text-primary:#e9edf2;--text-secondary:#a1a1aa;--text-muted:#71717a;
+  --accent:#6366f1;--accent-hover:#818cf8;
+  --success:#22c55e;--danger:#ef4444;--neutral:#71717a;
+  --border:#2a2a35;--border-hover:#3a3a48;
+  --radius:8px;--radius-sm:4px;
+  --font:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  --mono:ui-monospace,'SF Mono','Cascadia Code',monospace;
+  --severity-critical:#ef4444;--severity-warning:#f59e0b;--severity-info:#6b7280;
+  --event-firing:#818cf8;--event-ack:#a1a5ae;--event-resolved:#8b9299;
+}
+body{font-family:var(--font);background:var(--bg-primary);color:var(--text-primary);line-height:1.5;min-height:100vh}
+a{color:var(--accent)}
+
+/* Header */
+.header{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;background:var(--bg-secondary);border-bottom:1px solid var(--border)}
+.header-left{display:flex;align-items:center;gap:12px}
+.header-left h1{font-size:18px;font-weight:600;letter-spacing:-0.3px}
+.logo{width:28px;height:28px;background:var(--accent);border-radius:6px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:#fff}
+.header-right{display:flex;align-items:center;gap:16px}
+.count-badge{font-size:13px;color:var(--text-secondary);background:var(--bg-tertiary);padding:4px 12px;border-radius:20px;font-variant-numeric:tabular-nums}
+.count-badge strong{color:var(--text-primary)}
+.btn{padding:6px 14px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-secondary);cursor:pointer;font-size:13px;font-family:var(--font);transition:all .15s}
+.btn:hover{background:var(--bg-hover);color:var(--text-primary);border-color:var(--border-hover)}
+.btn-danger:hover{border-color:var(--danger);color:var(--danger)}
+
+/* Status bar */
+.status-bar{padding:6px 24px;font-size:12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.status-dot.connected{background:var(--success)}
+.status-dot.disconnected{background:var(--danger)}
+.status-bar span{color:var(--text-muted)}
+
+/* List */
+.list{padding:12px 24px;display:flex;flex-direction:column;gap:6px}
+.empty{text-align:center;padding:80px 24px;color:var(--text-muted);font-size:14px}
+.empty .icon{font-size:40px;margin-bottom:12px;opacity:.4}
+
+/* Webhook entry */
+.entry{background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;transition:border-color .15s}
+.entry:hover{border-color:var(--border-hover)}
+.entry-header{display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;flex-wrap:wrap}
+.entry-id{font-family:var(--mono);font-size:12px;color:var(--text-muted);min-width:36px}
+.entry-time{font-family:var(--mono);font-size:12px;color:var(--text-muted);min-width:70px}
+.entry-event{font-size:13px;font-weight:600;padding:2px 8px;border-radius:var(--radius-sm);color:#fff}
+.entry-event.firing{background:var(--event-firing)}
+.entry-event.acknowledged{background:var(--event-ack)}
+.entry-event.resolved{background:var(--event-resolved)}
+.entry-event.unknown{background:var(--neutral)}
+.entry-title{font-size:13px;color:var(--text-primary);flex:1;min-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.entry-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.badge{font-size:11px;padding:1px 7px;border-radius:var(--radius-sm);font-weight:500}
+.badge-severity{border:1px solid}
+.badge-severity.critical{color:var(--severity-critical);border-color:var(--severity-critical)}
+.badge-severity.warning{color:var(--severity-warning);border-color:var(--severity-warning)}
+.badge-severity.info{color:var(--severity-info);border-color:var(--severity-info)}
+.badge-sig{font-weight:600;font-size:11px}
+.badge-sig.valid{color:var(--success)}
+.badge-sig.invalid{color:var(--danger)}
+.badge-sig.unchecked{color:var(--neutral)}
+.badge-team{color:var(--text-muted);font-size:12px}
+
+/* Expanded detail */
+.entry-detail{display:none;padding:0 14px 14px;border-top:1px solid var(--border)}
+.entry.expanded .entry-detail{display:block}
+.detail-section{margin-top:10px}
+.detail-section h4{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin-bottom:6px}
+.headers-table{width:100%;font-size:12px;font-family:var(--mono);border-collapse:collapse}
+.headers-table td{padding:2px 8px 2px 0;vertical-align:top}
+.headers-table td:first-child{color:var(--accent);white-space:nowrap;font-weight:500}
+.headers-table td:last-child{color:var(--text-secondary);word-break:break-all}
+.json-block{background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;font-family:var(--mono);font-size:12px;color:var(--text-secondary);overflow-x:auto;white-space:pre;line-height:1.6;max-height:500px;overflow-y:auto}
+
+/* Animation */
+@keyframes slideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+.entry.new{animation:slideIn .25s ease-out}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">T</div>
+    <h1>Webhook Receiver</h1>
+  </div>
+  <div class="header-right">
+    <div class="count-badge">Received: <strong id="count">0</strong></div>
+    <button class="btn btn-danger" id="clearBtn">Clear All</button>
+  </div>
+</div>
+
+<div class="status-bar">
+  <span class="status-dot" id="statusDot"></span>
+  <span id="statusText">Connecting...</span>
+</div>
+
+<div class="list" id="list">
+  <div class="empty" id="emptyState">
+    <div class="icon">{ }</div>
+    <div>No webhooks received yet.</div>
+    <div style="margin-top:6px;font-size:12px">POST to this server to see deliveries here.</div>
+  </div>
+</div>
+
+<script>
+const listEl = document.getElementById('list');
+const countEl = document.getElementById('count');
+const emptyEl = document.getElementById('emptyState');
+const clearBtn = document.getElementById('clearBtn');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+
+let webhooks = [];
+
+function setConnected(connected) {
+  statusDot.className = 'status-dot ' + (connected ? 'connected' : 'disconnected');
+  statusText.textContent = connected ? 'SSE: Connected' : 'SSE: Disconnected — reconnecting...';
+}
+
+function formatTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString('en-GB', { hour12: false });
+}
+
+function eventClass(eventType) {
+  if (!eventType) return 'unknown';
+  if (eventType.includes('firing')) return 'firing';
+  if (eventType.includes('acknowledged')) return 'acknowledged';
+  if (eventType.includes('resolved')) return 'resolved';
+  return 'unknown';
+}
+
+function eventLabel(eventType) {
+  if (!eventType) return 'POST';
+  return eventType.replace('alert_group.', '');
+}
+
+function sigIcon(status) {
+  if (status === 'valid') return '\u2713 valid';
+  if (status === 'invalid') return '\u2717 invalid';
+  return '- unchecked';
+}
+
+function renderHeaders(headers) {
+  if (!headers) return '';
+  let rows = '';
+  const sorted = Object.keys(headers).sort();
+  for (const k of sorted) {
+    const vals = Array.isArray(headers[k]) ? headers[k].join(', ') : headers[k];
+    rows += '<tr><td>' + esc(k) + '</td><td>' + esc(vals) + '</td></tr>';
+  }
+  return rows;
+}
+
+function esc(s) {
+  if (s == null) return '';
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+
+function prettyJSON(raw) {
+  try {
+    const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return JSON.stringify(obj, null, 2);
+  } catch {
+    return String(raw);
+  }
+}
+
+function renderEntry(wh, isNew) {
+  const el = document.createElement('div');
+  el.className = 'entry' + (isNew ? ' new' : '');
+  el.dataset.id = wh.id;
+
+  const sevClass = (wh.severity || '').toLowerCase();
+  const sevBadge = wh.severity
+    ? '<span class="badge badge-severity ' + esc(sevClass) + '">' + esc(wh.severity) + '</span>'
+    : '';
+  const teamBadge = wh.team_name
+    ? '<span class="badge-team">' + esc(wh.team_name) + '</span>'
+    : '';
+
+  el.innerHTML =
+    '<div class="entry-header">' +
+      '<span class="entry-id">#' + esc(wh.id) + '</span>' +
+      '<span class="entry-time">' + formatTime(wh.received_at) + '</span>' +
+      '<span class="entry-event ' + eventClass(wh.event_type) + '">' + esc(eventLabel(wh.event_type)) + '</span>' +
+      '<span class="entry-title">' + esc(wh.alert_group_title || wh.path || '/') + '</span>' +
+      '<span class="entry-meta">' +
+        sevBadge + teamBadge +
+        '<span class="badge-sig ' + esc(wh.signature_status) + '">' + sigIcon(wh.signature_status) + '</span>' +
+      '</span>' +
+    '</div>' +
+    '<div class="entry-detail">' +
+      '<div class="detail-section">' +
+        '<h4>Headers</h4>' +
+        '<table class="headers-table">' + renderHeaders(wh.headers) + '</table>' +
+      '</div>' +
+      '<div class="detail-section">' +
+        '<h4>Payload</h4>' +
+        '<pre class="json-block">' + esc(prettyJSON(wh.body)) + '</pre>' +
+      '</div>' +
+    '</div>';
+
+  el.querySelector('.entry-header').addEventListener('click', () => {
+    el.classList.toggle('expanded');
+  });
+
+  return el;
+}
+
+function updateCount() {
+  countEl.textContent = webhooks.length;
+  emptyEl.style.display = webhooks.length === 0 ? '' : 'none';
+}
+
+function addWebhook(wh, isNew) {
+  webhooks.push(wh);
+  if (webhooks.length > 1000) webhooks.shift();
+  const el = renderEntry(wh, isNew);
+  listEl.insertBefore(el, emptyEl);
+  updateCount();
+  // Auto-scroll to newest
+  el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function renderAll(list) {
+  // Remove all entries except empty state
+  while (listEl.children.length > 1) {
+    const child = listEl.lastChild;
+    if (child === emptyEl) break;
+    listEl.removeChild(child);
+  }
+  // Sort oldest first (chronological)
+  webhooks = (list || []).slice().sort((a, b) => new Date(a.received_at) - new Date(b.received_at));
+  for (const wh of webhooks) {
+    const el = renderEntry(wh, false);
+    listEl.insertBefore(el, emptyEl);
+  }
+  updateCount();
+}
+
+// --- Init ---
+
+fetch('/api/webhooks')
+  .then(r => r.json())
+  .then(data => renderAll(data))
+  .catch(err => console.error('Failed to load webhooks:', err));
+
+// SSE
+const es = new EventSource('/api/events');
+es.addEventListener('open', () => setConnected(true));
+es.addEventListener('error', () => setConnected(false));
+es.addEventListener('webhook', (e) => {
+  try {
+    const wh = JSON.parse(e.data);
+    addWebhook(wh, true);
+  } catch (err) {
+    console.error('SSE parse error:', err);
+  }
+});
+es.addEventListener('clear', () => {
+  renderAll([]);
+});
+
+// Clear button
+clearBtn.addEventListener('click', () => {
+  fetch('/api/webhooks', { method: 'DELETE' })
+    .catch(err => console.error('Clear failed:', err));
+});
+</script>
+</body>
+</html>

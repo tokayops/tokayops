@@ -1,0 +1,357 @@
+package store
+
+import (
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/tokayops/tokayops/internal/config"
+	"github.com/tokayops/tokayops/internal/integrations"
+	"github.com/tokayops/tokayops/internal/model"
+	"github.com/google/uuid"
+)
+
+var (
+	ErrIntegrationNotFound  = errors.New("integration not found")
+	ErrDuplicateIntegration = errors.New("integration of this type already exists")
+)
+
+// CreateIntegration creates a new integration with encrypted config
+func (s *Store) CreateIntegration(i *model.Integration) error {
+	if i.ID == "" {
+		i.ID = uuid.New().String()
+	}
+	i.CreatedAt = time.Now()
+	i.UpdatedAt = time.Now()
+
+	// Auto-set direction based on type. Type was validated at the API layer
+	// (integrations.IsValidType); a missing descriptor here is an invariant
+	// violation, not user error.
+	dir, ok := integrations.DirectionFor(i.Type)
+	if !ok {
+		return fmt.Errorf("unknown integration type %s", i.Type)
+	}
+	i.Direction = dir
+
+	// Encrypt config
+	encryptedConfig, err := encryptConfig(i.Config)
+	if err != nil {
+		return err
+	}
+
+	query := `INSERT INTO integrations (id, type, direction, name, enabled, scope, team_id, config, created_at, updated_at)
+			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+
+	_, err = s.db.Exec(query, i.ID, i.Type, i.Direction, i.Name, i.Enabled, scopeToNullString(i.Scope), stringPtrToNullString(i.TeamID), encryptedConfig, i.CreatedAt, i.UpdatedAt)
+	if err != nil {
+		// Check for unique constraint violation (outbound duplicate)
+		if isUniqueViolation(err) {
+			return ErrDuplicateIntegration
+		}
+		return err
+	}
+	return nil
+}
+
+// UpdateIntegration updates an integration, keeping existing secrets if new ones are empty
+func (s *Store) UpdateIntegration(i *model.Integration) error {
+	i.UpdatedAt = time.Now()
+
+	// Get existing integration to merge secrets
+	existing, err := s.GetIntegrationByID(i.ID)
+	if err != nil {
+		return err
+	}
+
+	// Merge secrets: if new secret is empty or "****", keep existing
+	mergedConfig := mergeSecrets(existing.Type, existing.Config, i.Config)
+
+	// Encrypt merged config
+	encryptedConfig, err := encryptConfig(mergedConfig)
+	if err != nil {
+		return err
+	}
+
+	query := `UPDATE integrations SET name = $1, enabled = $2, scope = $3, team_id = $4, config = $5, updated_at = $6 WHERE id = $7`
+	result, err := s.db.Exec(query, i.Name, i.Enabled, scopeToNullString(i.Scope), stringPtrToNullString(i.TeamID), encryptedConfig, i.UpdatedAt, i.ID)
+	if err != nil {
+		return err
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return ErrIntegrationNotFound
+	}
+	return nil
+}
+
+// GetIntegrationByID retrieves an integration by ID with decrypted config
+func (s *Store) GetIntegrationByID(id string) (*model.Integration, error) {
+	query := `SELECT id, type, direction, name, enabled, scope, team_id, config, created_at, updated_at FROM integrations WHERE id = $1`
+	row := s.db.QueryRow(query, id)
+	return scanIntegration(row)
+}
+
+// GetIntegrationByType retrieves the first enabled integration of a given type
+func (s *Store) GetIntegrationByType(integrationType model.IntegrationType) (*model.Integration, error) {
+	query := `SELECT id, type, direction, name, enabled, scope, team_id, config, created_at, updated_at
+			  FROM integrations WHERE type = $1 AND enabled = true LIMIT 1`
+	row := s.db.QueryRow(query, integrationType)
+	return scanIntegration(row)
+}
+
+// GetIntegrationsByType retrieves all enabled integrations of a given type (for inbound)
+func (s *Store) GetIntegrationsByType(integrationType model.IntegrationType) ([]*model.Integration, error) {
+	query := `SELECT id, type, direction, name, enabled, scope, team_id, config, created_at, updated_at
+			  FROM integrations WHERE type = $1 AND enabled = true`
+	rows, err := s.db.Query(query, integrationType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanIntegrations(rows)
+}
+
+// GetAllIntegrations retrieves all integrations with decrypted config
+func (s *Store) GetAllIntegrations() ([]*model.Integration, error) {
+	query := `SELECT id, type, direction, name, enabled, scope, team_id, config, created_at, updated_at FROM integrations ORDER BY created_at DESC`
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanIntegrations(rows)
+}
+
+// DeleteIntegration deletes an integration by ID
+func (s *Store) DeleteIntegration(id string) error {
+	result, err := s.db.Exec(`DELETE FROM integrations WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return ErrIntegrationNotFound
+	}
+	return nil
+}
+
+// scanIntegration scans a single integration row
+func scanIntegration(row *sql.Row) (*model.Integration, error) {
+	var i model.Integration
+	var encryptedConfig string
+	var scopeNull, teamIDNull sql.NullString
+
+	err := row.Scan(&i.ID, &i.Type, &i.Direction, &i.Name, &i.Enabled, &scopeNull, &teamIDNull, &encryptedConfig, &i.CreatedAt, &i.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrIntegrationNotFound
+		}
+		return nil, err
+	}
+
+	if scopeNull.Valid {
+		s := model.WebhookScope(scopeNull.String)
+		i.Scope = &s
+	}
+	if teamIDNull.Valid {
+		i.TeamID = &teamIDNull.String
+	}
+
+	// Decrypt config
+	decryptedConfig, err := decryptConfig(encryptedConfig)
+	if err != nil {
+		return nil, err
+	}
+	i.Config = decryptedConfig
+
+	return &i, nil
+}
+
+// scanIntegrations scans multiple integration rows
+func scanIntegrations(rows *sql.Rows) ([]*model.Integration, error) {
+	var integrations []*model.Integration
+	for rows.Next() {
+		var i model.Integration
+		var encryptedConfig string
+		var scopeNull, teamIDNull sql.NullString
+
+		if err := rows.Scan(&i.ID, &i.Type, &i.Direction, &i.Name, &i.Enabled, &scopeNull, &teamIDNull, &encryptedConfig, &i.CreatedAt, &i.UpdatedAt); err != nil {
+			return nil, err
+		}
+
+		if scopeNull.Valid {
+			s := model.WebhookScope(scopeNull.String)
+			i.Scope = &s
+		}
+		if teamIDNull.Valid {
+			i.TeamID = &teamIDNull.String
+		}
+
+		// Decrypt config
+		decryptedConfig, err := decryptConfig(encryptedConfig)
+		if err != nil {
+			return nil, err
+		}
+		i.Config = decryptedConfig
+
+		integrations = append(integrations, &i)
+	}
+	return integrations, nil
+}
+
+// encryptConfig encrypts JSON config and returns base64-encoded ciphertext
+func encryptConfig(configJSON json.RawMessage) (string, error) {
+	key, err := config.GetEncryptionKey()
+	if err != nil {
+		return "", err
+	}
+
+	ciphertext, err := config.Encrypt(configJSON, key)
+	if err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+// decryptConfig decrypts base64-encoded ciphertext and returns JSON config
+func decryptConfig(encryptedConfig string) (json.RawMessage, error) {
+	key, err := config.GetEncryptionKey()
+	if err != nil {
+		return nil, err
+	}
+
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	plaintext, err := config.Decrypt(ciphertext, key)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.RawMessage(plaintext), nil
+}
+
+// mergeSecrets keeps existing secrets if new ones are empty or masked
+func mergeSecrets(integrationType model.IntegrationType, existingConfig, newConfig json.RawMessage) json.RawMessage {
+	switch integrationType {
+	case model.IntegrationTypeSlack:
+		var existing, new model.SlackConfig
+		if err := json.Unmarshal(existingConfig, &existing); err != nil {
+			return newConfig
+		}
+		if err := json.Unmarshal(newConfig, &new); err != nil {
+			return newConfig
+		}
+		// Keep existing token if new is empty or masked
+		if new.Token == "" || new.Token == model.MaskedSecret {
+			new.Token = existing.Token
+		}
+		// Keep existing user_token if new is empty or masked
+		if new.UserToken == "" || new.UserToken == model.MaskedSecret {
+			new.UserToken = existing.UserToken
+		}
+		// Keep existing signing_secret if new is empty or masked
+		if new.SigningSecret == "" || new.SigningSecret == model.MaskedSecret {
+			new.SigningSecret = existing.SigningSecret
+		}
+		// Keep existing default_channel if not provided
+		if new.DefaultChannel == "" {
+			new.DefaultChannel = existing.DefaultChannel
+		}
+		merged, _ := json.Marshal(new)
+		return merged
+
+	case model.IntegrationTypeTelegram:
+		var existing, new model.TelegramConfig
+		if err := json.Unmarshal(existingConfig, &existing); err != nil {
+			return newConfig
+		}
+		if err := json.Unmarshal(newConfig, &new); err != nil {
+			return newConfig
+		}
+		// Keep existing bot_token if new is empty or masked
+		if new.BotToken == "" || new.BotToken == model.MaskedSecret {
+			new.BotToken = existing.BotToken
+		}
+		// Keep existing secret_token if new is empty or masked
+		if new.SecretToken == "" || new.SecretToken == model.MaskedSecret {
+			new.SecretToken = existing.SecretToken
+		}
+		// Keep existing default_chat_id if not provided
+		if new.DefaultChatID == "" {
+			new.DefaultChatID = existing.DefaultChatID
+		}
+		merged, _ := json.Marshal(new)
+		return merged
+
+	case model.IntegrationTypeAlertmanagerWebhook:
+		var existing, new model.WebhookConfig
+		if err := json.Unmarshal(existingConfig, &existing); err != nil {
+			return newConfig
+		}
+		if err := json.Unmarshal(newConfig, &new); err != nil {
+			return newConfig
+		}
+		// Keep existing secret if new is empty or masked
+		if new.Secret == "" || new.Secret == model.MaskedSecret {
+			new.Secret = existing.Secret
+		}
+		merged, _ := json.Marshal(new)
+		return merged
+
+	case model.IntegrationTypeGenericWebhook:
+		var existing, new model.GenericWebhookConfig
+		if err := json.Unmarshal(existingConfig, &existing); err != nil {
+			return newConfig
+		}
+		if err := json.Unmarshal(newConfig, &new); err != nil {
+			return newConfig
+		}
+		if new.Secret == "" || new.Secret == model.MaskedSecret {
+			new.Secret = existing.Secret
+		}
+		if new.URL == "" {
+			new.URL = existing.URL
+		}
+		if new.TimeoutSeconds == 0 {
+			new.TimeoutSeconds = existing.TimeoutSeconds
+		}
+		if new.CustomHeaders == nil {
+			new.CustomHeaders = existing.CustomHeaders
+		}
+		merged, _ := json.Marshal(new)
+		return merged
+	}
+
+	return newConfig
+}
+
+// isUniqueViolation checks if error is a unique constraint violation
+func isUniqueViolation(err error) bool {
+	// PostgreSQL error code for unique violation is 23505
+	return err != nil && (err.Error() == "pq: duplicate key value violates unique constraint \"idx_integrations_type_outbound\"" ||
+		err.Error() == "pq: duplicate key value violates unique constraint \"integrations_pkey\"")
+}
+
+// scopeToNullString converts *WebhookScope to sql.NullString for DB writes
+func scopeToNullString(s *model.WebhookScope) sql.NullString {
+	if s == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: string(*s), Valid: true}
+}
+
+// stringPtrToNullString converts *string to sql.NullString for DB writes
+func stringPtrToNullString(s *string) sql.NullString {
+	if s == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: *s, Valid: true}
+}

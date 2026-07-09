@@ -1,0 +1,48 @@
+display_information:
+  name: TokayOps
+  description: TokayOps — incident management & alerting gateway
+  background_color: "#2C2D30"
+features:
+  bot_user:
+    display_name: Tokay
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      # Core: Sending notifications
+      - chat:write
+      - chat:write.customize
+      - links:read
+      - links:write
+      
+      # Future: Reading Channels/Users for routing
+      - channels:read
+      - groups:read
+      - users:read
+      - users:read.email
+      
+      # Future: Reactions (Triggering actions via emoji)
+      - reactions:read
+      - reactions:write
+      
+      # Future: Direct Messages (Private notifications/interactions)
+      - im:history
+      - im:write
+      - im:read
+
+settings:
+  event_subscriptions:
+    request_url: https://tokayops.example.com/slack/events
+    bot_events:
+      - reaction_added
+      - message.im
+      - member_joined_channel
+      
+  interactivity:
+    is_enabled: true
+    request_url: https://tokayops.example.com/slack/interactive
+    
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

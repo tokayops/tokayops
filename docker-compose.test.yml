@@ -1,0 +1,19 @@
+
+
+services:
+  test_db:
+    container_name: tokay_test_db_ephemeral
+    image: postgres:13-alpine
+    environment:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: test_tokay
+    ports:
+      - "5433:5432" # Use a different port to avoid conflict with local dev DB
+    tmpfs:
+      - /var/lib/postgresql/data # Use tmpfs for faster tests and no persistence
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test_user -d test_tokay"]
+      interval: 5s
+      timeout: 5s
+      retries: 5

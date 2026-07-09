@@ -1,0 +1,394 @@
+import { test, expect } from '../../fixtures/auth.fixture';
+import { Page } from '@playwright/test';
+
+/**
+ * Get an on-call row that has a configured schedule.
+ * Returns null if no rows with schedules exist.
+ */
+async function getOnCallRowWithSchedule(page: Page) {
+  // Find row that has a non-empty data-schedule-id attribute
+  const rowWithSchedule = page.locator('.oncall-row[data-schedule-id]:not([data-schedule-id=""])').first();
+  if (await rowWithSchedule.count() > 0) {
+    return rowWithSchedule;
+  }
+  return null;
+}
+
+test.describe('Schedule Configuration', () => {
+  test.beforeEach(async ({ schedulesPage }) => {
+    await schedulesPage.gotoOnCall();
+  });
+
+  test('should show on-call rows for teams', async ({ page }) => {
+    const oncallRows = page.locator('.oncall-row');
+    const count = await oncallRows.count();
+
+    if (count > 0) {
+      // Verify on-call rows are displayed
+      await expect(oncallRows.first()).toBeVisible();
+      expect(count).toBeGreaterThan(0);
+    } else {
+      // Empty state should be shown
+      const emptyState = page.locator('.empty-state');
+      await expect(emptyState).toBeVisible();
+    }
+  });
+
+  test('should show edit schedule button for teams with schedule', async ({ page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    // Look for edit schedule button in the row
+    const editBtn = oncallRow.locator('.edit-schedule-btn');
+    await expect(editBtn).toBeVisible();
+  });
+
+  test('should show create override button for teams with schedule', async ({ page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    // Look for override button in the row
+    const overrideBtn = oncallRow.locator('.create-override-btn');
+    await expect(overrideBtn).toBeVisible();
+  });
+
+  test('should open schedule configuration modal', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const editBtn = oncallRow.locator('.edit-schedule-btn');
+    await editBtn.click();
+    await page.waitForTimeout(500);
+
+    // Check if schedule modal opened
+    await schedulesPage.expectScheduleModalVisible();
+    await schedulesPage.closeScheduleModal();
+  });
+
+  test('should show schedule configuration fields', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const editBtn = oncallRow.locator('.edit-schedule-btn');
+    await editBtn.click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    // Check for timezone selector
+    const timezoneSelect = page.locator('#schedule-timezone');
+    await expect(timezoneSelect).toBeVisible();
+
+    // Check for rotation type selector
+    const rotationType = page.locator('#l1-rotation-type');
+    await expect(rotationType).toBeVisible();
+
+    // Check for handoff time
+    const handoffTime = page.locator('#l1-handoff-time');
+    await expect(handoffTime).toBeVisible();
+
+    await schedulesPage.closeScheduleModal();
+  });
+
+  test('should show L1 groups editor and L2 controls', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const editBtn = oncallRow.locator('.edit-schedule-btn');
+    await editBtn.click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    // Check for L1 groups editor section
+    const l1Section = page.locator('#l1-groups-editor');
+    await expect(l1Section).toBeVisible();
+
+    // Check for "Add Group" button
+    const addGroupBtn = page.locator('#l1-add-group');
+    await expect(addGroupBtn).toBeVisible();
+
+    // Check for L2 section (might be hidden if L2 not enabled)
+    const l2Checkbox = page.locator('#l2-enabled');
+    await expect(l2Checkbox).toBeVisible();
+
+    await schedulesPage.closeScheduleModal();
+  });
+
+  test('should toggle L2 escalation', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const editBtn = oncallRow.locator('.edit-schedule-btn');
+    await editBtn.click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    // Check for L2 enabled checkbox
+    const l2Checkbox = page.locator('#l2-enabled');
+    await expect(l2Checkbox).toBeVisible();
+
+    const initialState = await l2Checkbox.isChecked();
+
+    // Toggle L2
+    await l2Checkbox.click();
+    const newState = await l2Checkbox.isChecked();
+
+    expect(newState).not.toBe(initialState);
+
+    // Toggle back
+    await l2Checkbox.click();
+
+    await schedulesPage.closeScheduleModal();
+  });
+
+  test('should save schedule configuration', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const editBtn = oncallRow.locator('.edit-schedule-btn');
+    await editBtn.click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    // Find save button (in modal footer)
+    const saveBtn = page.locator('#schedule-form-submit');
+    await expect(saveBtn).toBeVisible();
+
+    // Set up API response listener
+    const responsePromise = page.waitForResponse(
+      (response) => response.url().includes('/api/v1/teams/') &&
+                    response.url().includes('/schedule') &&
+                    response.request().method() === 'PUT'
+    );
+
+    await saveBtn.click();
+
+    // Wait for API response
+    const response = await responsePromise;
+    expect([200, 201, 204]).toContain(response.status());
+
+    // Should show success toast
+    await schedulesPage.expectToastVisible('saved');
+  });
+});
+
+test.describe('Schedule Deletion', () => {
+  test.beforeEach(async ({ schedulesPage }) => {
+    await schedulesPage.gotoOnCall();
+  });
+
+  test('should show delete button in schedule config modal', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const editBtn = oncallRow.locator('.edit-schedule-btn');
+    await editBtn.click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    // Danger Zone delete button should be visible for existing schedules
+    await expect(schedulesPage.deleteScheduleBtn).toBeVisible();
+
+    await schedulesPage.closeScheduleModal();
+  });
+
+  test('should show danger zone section in schedule config modal', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const editBtn = oncallRow.locator('.edit-schedule-btn');
+    await editBtn.click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    // Danger Zone title should be visible
+    const dangerZone = page.locator('.team-modal-section').filter({ hasText: 'Danger Zone' });
+    await expect(dangerZone).toBeVisible();
+
+    // Should have warning text
+    await expect(dangerZone).toContainText('cannot be undone');
+
+    await schedulesPage.closeScheduleModal();
+  });
+
+  test('should delete schedule with confirmation', async ({ schedulesPage, page }) => {
+    // First create a schedule to delete via API
+    const teamId = `sched-del-${Date.now()}`;
+
+    // Create team via API
+    const createTeamResponse = await page.request.post('/api/v1/teams', {
+      data: { id: teamId, name: 'Delete Schedule Test' },
+    });
+    expect([200, 201]).toContain(createTeamResponse.status());
+
+    try {
+      // Create schedule via API
+      const createScheduleResponse = await page.request.put(`/api/v1/teams/${teamId}/schedule`, {
+        data: {
+          timezone: 'UTC',
+          l1_rotation_type: 'daily',
+          l1_handoff_time: '11:00',
+          l1_rotation_start: new Date().toISOString(),
+        },
+      });
+      expect([200, 201]).toContain(createScheduleResponse.status());
+
+      // Reload on-call page
+      await schedulesPage.gotoOnCall();
+
+      // Find the row for our team
+      const oncallRow = page.locator(`.oncall-row[data-team-id="${teamId}"]`);
+      if (await oncallRow.count() === 0) {
+        test.skip();
+        return;
+      }
+
+      // Open schedule config
+      const editBtn = oncallRow.locator('.edit-schedule-btn');
+      await editBtn.click();
+      await schedulesPage.expectScheduleModalVisible();
+
+      // Set up dialog handler for confirmation
+      page.on('dialog', dialog => dialog.accept());
+
+      // Set up API response listener for delete
+      const deleteResponsePromise = page.waitForResponse(
+        (response) => response.url().includes(`/api/v1/teams/${teamId}/schedule`) &&
+                      response.request().method() === 'DELETE'
+      );
+
+      // Click delete
+      await schedulesPage.deleteSchedule();
+
+      // Wait for delete API response
+      const deleteResponse = await deleteResponsePromise;
+      expect(deleteResponse.status()).toBe(204);
+
+      // Should show success toast
+      await schedulesPage.expectToastVisible('deleted');
+
+      // Modal should close
+      await schedulesPage.expectScheduleModalHidden();
+    } finally {
+      // Cleanup: always delete team (cascades to schedule)
+      await page.request.delete(`/api/v1/teams/${teamId}`);
+    }
+  });
+
+  test('should not delete schedule when confirmation is cancelled', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const editBtn = oncallRow.locator('.edit-schedule-btn');
+    await editBtn.click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    // Set up dialog handler to dismiss (cancel)
+    page.on('dialog', dialog => dialog.dismiss());
+
+    // Click delete
+    await schedulesPage.deleteSchedule();
+
+    // Modal should remain open (schedule not deleted)
+    await schedulesPage.expectScheduleModalVisible();
+
+    await schedulesPage.closeScheduleModal();
+  });
+});
+
+test.describe('Schedule Overrides', () => {
+  test.beforeEach(async ({ schedulesPage }) => {
+    await schedulesPage.gotoOnCall();
+  });
+
+  test('should show create override button', async ({ page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    // Look for override button in the row
+    const overrideBtn = oncallRow.locator('.create-override-btn');
+    await expect(overrideBtn).toBeVisible();
+  });
+
+  test('should open override modal', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const overrideBtn = oncallRow.locator('.create-override-btn');
+    await overrideBtn.click();
+    await page.waitForTimeout(500);
+
+    // Check if override modal opened
+    await schedulesPage.expectOverrideModalVisible();
+
+    // Close override modal
+    await schedulesPage.closeOverrideModal();
+  });
+
+  test('should have override form fields', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    const overrideBtn = oncallRow.locator('.create-override-btn');
+    await overrideBtn.click();
+    await schedulesPage.expectOverrideModalVisible();
+
+    // Check for user select
+    const userSelect = page.locator('#override-user');
+    await expect(userSelect).toBeVisible();
+
+    // Check for datetime-local fields
+    const startField = page.locator('#override-start');
+    const endField = page.locator('#override-end');
+
+    await expect(startField).toBeVisible();
+    await expect(endField).toBeVisible();
+
+    await schedulesPage.closeOverrideModal();
+  });
+});

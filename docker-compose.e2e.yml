@@ -1,0 +1,59 @@
+services:
+  e2e_db:
+    image: postgres:17-alpine
+    container_name: tokay_e2e_db
+    networks:
+      - tokay_e2e_net
+    environment:
+      POSTGRES_USER: e2e_user
+      POSTGRES_PASSWORD: e2e_password
+      POSTGRES_DB: tokay_e2e
+    ports:
+      - "5434:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U e2e_user -d tokay_e2e"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  tokay_app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tokay_e2e_app
+    networks:
+      - tokay_e2e_net
+    depends_on:
+      e2e_db:
+        condition: service_healthy
+    environment:
+      DB_HOST: e2e_db
+      DB_PORT: "5432"
+      DB_USER: e2e_user
+      DB_PASSWORD: e2e_password
+      DB_NAME: tokay_e2e
+      DB_SSLMODE: disable
+      CONFIG_FILE: /app/tokay.yaml
+      JWT_SECRET: e2e-test-secret-key-12345
+      ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      APP_ENV: development
+      TOKAY_WEBHOOK_ALLOW_HTTP: "true"
+      TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS: "127.0.0.0/8"
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./tokay.yaml:/app/tokay.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/swagger/index.html"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+networks:
+  tokay_e2e_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

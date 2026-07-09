@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="TokayOps - Monitor and manage incidents">
+    <title>TokayOps — Alert Group Management</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/css/styles.css?v=11">
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"
+        integrity="sha384-uTYyvsSSUZeaPhb5RbKlQa0zY/WpX/QHfvg2mczXyBQOpkWPEDy9lczyp+w7SKXu"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"
+        integrity="sha384-eeLEhtwdMwD3X9y+8P3Cn7Idl/M+w8H4uZqkgD/2eJVkWIN1yKzEj6XegJ9dL3q0"
+        crossorigin="anonymous"></script>
+
+<body>
+    <!-- Auth Loading Screen (shown until auth check completes) -->
+    <div id="auth-loading" class="auth-loading">
+        <div class="auth-loading-content">
+            <i data-lucide="flame" class="auth-loading-icon"></i>
+            <span class="auth-loading-text">Loading...</span>
+        </div>
+    </div>
+
+    <div class="app" id="main-app" style="display: none;">
+        <!-- Global Header (full-width, above everything) -->
+        <header class="global-header" id="global-header">
+            <!-- Mobile menu toggle -->
+            <button class="mobile-menu-btn" id="mobile-menu-btn" title="Toggle menu">
+                <i data-lucide="menu" class="icon"></i>
+            </button>
+            <!-- Logo area - fixed width matching sidebar -->
+            <div class="global-header-logo">
+                <a href="#/ops/alert-groups" class="logo" id="logo-home-link" title="Go to Operations">
+                    <i data-lucide="flame" class="logo-icon"></i>
+                    <span class="logo-text">TokayOps</span>
+                </a>
+            </div>
+            <!-- Content area - mode switcher + actions -->
+            <div class="global-header-content">
+                <div class="global-header-left">
+                    <!-- Mode Switcher rendered here by JS -->
+                    <div id="header-mode-switcher" class="header-mode-switcher"></div>
+                </div>
+                <div class="global-header-right">
+                    <button class="btn btn-icon" id="theme-toggle" title="Toggle theme">
+                        <i data-lucide="sun" class="icon theme-icon-light"></i>
+                        <i data-lucide="moon" class="icon theme-icon-dark"></i>
+                    </button>
+                    <button class="btn btn-icon" id="refresh-btn" title="Refresh">
+                        <i data-lucide="refresh-cw" class="icon"></i>
+                    </button>
+                    <div class="user-menu" id="user-menu">
+                        <button class="user-avatar-btn" id="user-avatar-btn" title="Profile">
+                            <i data-lucide="user" class="icon"></i>
+                        </button>
+                        <div class="user-dropdown" id="user-dropdown">
+                            <div class="user-dropdown-header">
+                                <span class="dropdown-user-name" id="dropdown-user-name">User</span>
+                                <span class="dropdown-user-email" id="dropdown-user-email">user@example.com</span>
+                            </div>
+                            <div class="user-dropdown-divider"></div>
+                            <a href="#" class="user-dropdown-item" id="open-profile-btn">
+                                <i data-lucide="settings"></i>
+                                Profile Settings
+                            </a>
+                            <a href="#" class="user-dropdown-item user-dropdown-logout" id="logout-btn">
+                                <i data-lucide="log-out"></i>
+                                Logout
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- App Body (sidebar + main content) -->
+        <div class="app-body">
+            <!-- Mobile sidebar overlay -->
+            <div class="sidebar-overlay" id="sidebar-overlay"></div>
+            <!-- Sidebar -->
+            <aside class="sidebar" id="sidebar">
+                <!-- Dynamic Controls (Team Selector) -->
+                <div id="sidebar-header-controls" class="sidebar-header-controls"></div>
+
+                <!-- Dynamic Navigation -->
+                <nav class="sidebar-nav" id="sidebar-nav"></nav>
+
+                <div class="sidebar-footer">
+                    <div class="refresh-status">
+                        <span class="refresh-indicator"></span>
+                        <span class="refresh-text">Auto-refresh: <span id="refresh-countdown">10</span>s</span>
+                    </div>
+                    <div class="app-version" id="app-version"></div>
+                </div>
+            </aside>
+
+            <!-- Main Content -->
+            <main class="main-content">
+                <!-- Page Header (title + page-specific actions) -->
+                <div class="page-header">
+                    <h1 class="page-title">Alert Groups</h1>
+                    <div class="page-actions" id="page-actions"></div>
+                </div>
+
+                <!-- Alert Group Filters -->
+                <div class="filters-bar" id="alert-groups-filters">
+                    <div class="filters-row">
+                        <div class="filter-group">
+                            <div class="filter-label">State</div>
+                            <div class="state-tabs" id="state-tabs" role="tablist" aria-label="State">
+                                <button class="state-tab active" data-state="active"
+                                    aria-selected="true">Active</button>
+                                <button class="state-tab" data-state="triggered"
+                                    aria-selected="false">Triggered</button>
+                                <button class="state-tab" data-state="acknowledged"
+                                    aria-selected="false">Acknowledged</button>
+                                <button class="state-tab" data-state="resolved" aria-selected="false">Resolved</button>
+                                <button class="state-tab" data-state="all" aria-selected="false">All</button>
+                            </div>
+                        </div>
+                        <div class="filter-group">
+                            <div class="filter-label">Severity</div>
+                            <div class="severity-chips" id="severity-chips" role="group" aria-label="Severity">
+                                <button class="severity-chip active" data-severity="critical" aria-pressed="true">
+                                    Critical
+                                </button>
+                                <button class="severity-chip active" data-severity="warning" aria-pressed="true">
+                                    Warning
+                                </button>
+                                <button class="severity-chip" data-severity="info" aria-pressed="false">
+                                    Info
+                                </button>
+                            </div>
+                        </div>
+                        <div class="filters-right">
+                            <div class="filter-group">
+                                <div class="filter-label">Period</div>
+                                <div class="scope-tabs-sm period-tabs" id="period-tabs" role="tablist" aria-label="Period">
+                                    <button class="scope-tab-sm" data-days="1" aria-selected="false">1d</button>
+                                    <button class="scope-tab-sm active" data-days="7" aria-selected="true">7d</button>
+                                    <button class="scope-tab-sm" data-days="14" aria-selected="false">14d</button>
+                                    <button class="scope-tab-sm" data-days="30" aria-selected="false">30d</button>
+                                </div>
+                            </div>
+                            <div class="filter-group" id="view-toggle">
+                                <div class="filter-label">View</div>
+                                <div class="view-toggle-buttons">
+                                    <button class="view-btn active" id="view-grid" title="Grid view">
+                                        <i data-lucide="layout-grid" class="icon"></i>
+                                    </button>
+                                    <button class="view-btn" id="view-list" title="List view">
+                                        <i data-lucide="list" class="icon"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Configure Dashboard (Tiles) -->
+                <div id="configure-dashboard" class="configure-dashboard" style="display: none;"></div>
+
+                <!-- Ops: On-Call View -->
+                <div id="ops-on-call-view" class="view-container" style="display: none;"></div>
+
+                <!-- Ops: Activity View -->
+                <div id="ops-activity-view" class="view-container" style="display: none;"></div>
+
+                <!-- Teams Section (shown when viewing a team) -->
+                <div class="teams-section" id="teams-section" style="display: none;">
+                    <div class="section-header">
+                        <h2 class="section-title" id="team-title">
+                            <i data-lucide="users" class="section-icon"></i>
+                            <span id="team-name">Team</span>
+                        </h2>
+                        <p class="section-description" id="team-description"></p>
+                    </div>
+                    <!-- On-Call Badge (compact, minimal) -->
+                    <div id="on-call-container"></div>
+                    <div class="team-stats" id="team-stats"></div>
+                </div>
+
+                <!-- Users Section (shown when viewing users) -->
+                <div class="users-section" id="users-section" style="display: none;">
+                    <div class="section-header">
+                        <h2 class="section-title">
+                            <i data-lucide="users" class="section-icon"></i>
+                            <span>Users</span>
+                        </h2>
+                        <button class="btn btn-primary" id="add-user-btn">
+                            <i data-lucide="plus"></i>
+                            <span>Add User</span>
+                        </button>
+                    </div>
+                    <div class="users-list" id="users-grid">
+                        <!-- Users will be rendered here -->
+                    </div>
+                    <div class="users-loading" id="users-loading" style="display: none;">
+                        <div class="spinner"></div>
+                        <span>Loading users...</span>
+                    </div>
+                </div>
+
+                <!-- Policies Section -->
+                <div class="users-section" id="policies-section" style="display: none;">
+                    <div class="section-header">
+                        <h2 class="section-title">
+                            <i data-lucide="shield" class="section-icon"></i>
+                            <span>Escalations</span>
+                        </h2>
+                        <button class="btn btn-primary" id="create-policy-btn">
+                            <i data-lucide="plus"></i>
+                            <span>Create Policy</span>
+                        </button>
+                    </div>
+                    <!-- Scope Tabs -->
+                    <div class="policy-scope-tabs" id="policy-scope-tabs">
+                        <button class="scope-tab active" data-scope="team">
+                            <i data-lucide="users"></i>
+                            Team Policies
+                        </button>
+                        <button class="scope-tab" data-scope="global">
+                            <i data-lucide="globe"></i>
+                            Global Policies
+                        </button>
+                    </div>
+                    <div class="policies-grid" id="policies-grid">
+                        <!-- Policies will be rendered here -->
+                    </div>
+                    <div class="policies-loading" id="policies-loading" style="display: none;">
+                        <div class="spinner"></div>
+                        <span>Loading policies...</span>
+                    </div>
+                </div>
+
+                <!-- Integrations Section -->
+                <div class="users-section" id="integrations-section" style="display: none;">
+                    <div class="section-header">
+                        <h2 class="section-title">
+                            <i data-lucide="plug" class="section-icon"></i>
+                            <span>Integrations</span>
+                        </h2>
+                        <button class="btn btn-primary" id="create-integration-btn">
+                            <i data-lucide="plus"></i>
+                            <span>Add Integration</span>
+                        </button>
+                    </div>
+                    <div class="integrations-grid" id="integrations-grid">
+                        <!-- Integrations will be rendered here -->
+                    </div>
+                    <div class="integrations-loading" id="integrations-loading" style="display: none;">
+                        <div class="spinner"></div>
+                        <span>Loading integrations...</span>
+                    </div>
+                </div>
+
+                <!-- Alert Groups Grid -->
+                <div class="alert-groups-container">
+                    <!-- List View Header -->
+                    <div class="list-header" id="list-header">
+                        <span class="list-header-col" data-sort="title">Title</span>
+                        <span class="list-header-col" data-sort="severity">Severity</span>
+                        <span class="list-header-col" data-sort="status">State</span>
+                        <span class="list-header-col" data-sort="team_id">Team</span>
+                        <span class="list-header-col">On-call</span>
+                        <span class="list-header-col">Ack by</span>
+                        <span class="list-header-col" data-sort="created_at">Fired</span>
+                        <span class="list-header-col" data-sort="resolved_at">Resolved</span>
+                        <span class="list-header-col">Alerts</span>
+                    </div>
+                    <div class="alert-groups-grid" id="alert-groups-grid">
+                        <!-- Alert Groups will be rendered here -->
+                    </div>
+                    <div class="loading-state" id="loading-state">
+                        <div class="spinner"></div>
+                        <span>Loading alert groups...</span>
+                    </div>
+                    <div class="empty-state" id="empty-state" style="display: none;">
+                        <i data-lucide="inbox" class="empty-icon"></i>
+                        <p>No alert groups found</p>
+                    </div>
+                </div>
+
+                <!-- Pagination -->
+                <div class="pagination" id="pagination" style="display: none;">
+                    <button class="btn btn-secondary" id="prev-page" disabled>← Previous</button>
+                    <span class="page-info" id="page-info">Page 1</span>
+                    <button class="btn btn-secondary" id="next-page">Next →</button>
+                </div>
+            </main>
+        </div>
+
+        <!-- Alert Group Detail Modal -->
+        <div class="modal-overlay" id="modal-overlay">
+            <div class="modal" id="alert-group-modal">
+                <div class="modal-header">
+                    <h2 class="modal-title" id="modal-title">Alert Group Details</h2>
+                    <button class="btn btn-icon modal-close" id="modal-close">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div class="modal-body" id="modal-body">
+                    <!-- Content rendered dynamically -->
+                </div>
+                <div class="modal-footer" id="modal-footer">
+                    <!-- Actions rendered dynamically -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Team Management Modal -->
+        <div class="modal-overlay" id="team-modal-overlay">
+            <div class="modal" id="team-modal">
+                <div class="modal-header">
+                    <h2 class="modal-title" id="team-modal-title">Manage Team</h2>
+                    <button class="btn btn-icon modal-close" id="team-modal-close">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div class="modal-body" id="team-modal-body">
+                    <!-- Content rendered dynamically -->
+                </div>
+                <div class="modal-footer" id="team-modal-footer"></div>
+            </div>
+        </div>
+
+        <!-- User Form Modal -->
+        <div class="modal-overlay" id="user-modal-overlay">
+            <div class="modal" id="user-modal">
+                <div class="modal-header">
+                    <h2 class="modal-title" id="user-modal-title">Add User</h2>
+                    <button class="btn btn-icon modal-close" id="user-modal-close">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div class="modal-body" id="user-modal-body">
+                    <!-- Content rendered dynamically -->
+                </div>
+                <div class="modal-footer" id="user-modal-footer"></div>
+            </div>
+        </div>
+
+        <!-- Team Form Modal -->
+        <div class="modal-overlay" id="team-form-modal-overlay">
+            <div class="modal modal-sm">
+                <div class="modal-header">
+                    <h2 class="modal-title">Create Team</h2>
+                    <button class="btn btn-icon modal-close" id="team-form-modal-close">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <form id="team-form">
+                        <div class="form-group">
+                            <label for="team-id">Team ID</label>
+                            <input type="text" id="team-id" name="id" required placeholder="devops" autocomplete="off">
+                            <small class="form-hint">Lowercase, no spaces (used in routing)</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="team-name-input">Team Name</label>
+                            <input type="text" id="team-name-input" name="name" required placeholder="DevOps Team"
+                                autocomplete="off">
+                        </div>
+                        <div class="form-group">
+                            <label for="team-description">Description <span class="optional">(optional)</span></label>
+                            <textarea id="team-description" name="description" rows="2"
+                                placeholder="Team responsible for infrastructure and deployments"></textarea>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer" id="team-form-modal-footer">
+                    <button type="button" class="btn btn-secondary" id="team-form-cancel">Cancel</button>
+                    <button type="submit" form="team-form" class="btn btn-primary" id="team-form-submit">Create Team</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Toast Notifications -->
+        <div class="toast-container" id="toast-container"></div>
+
+        <!-- Profile Modal -->
+        <div class="modal-overlay" id="profile-modal-overlay">
+            <div class="modal modal-md" id="profile-modal">
+                <div class="modal-header">
+                    <h2 class="modal-title">Profile Settings</h2>
+                    <button class="btn btn-icon modal-close" id="profile-modal-close">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div class="modal-body" id="profile-modal-body">
+                    <!-- Content rendered by ProfileModule -->
+                </div>
+                <div class="modal-footer" id="profile-modal-footer"></div>
+            </div>
+        </div>
+
+        <!-- Policy Editor Modal -->
+        <div class="modal-overlay" id="policy-modal-overlay">
+            <div class="modal modal-lg" id="policy-modal">
+                <div class="modal-header">
+                    <h2 class="modal-title" id="policy-modal-title">Policy Editor</h2>
+                    <button class="btn btn-icon modal-close" id="policy-modal-close">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div class="modal-body" id="policy-modal-body">
+                    <!-- Content rendered by policies module -->
+                </div>
+                <div class="modal-footer" id="policy-modal-footer"></div>
+            </div>
+        </div>
+
+        <!-- Manual Alert Group Modal -->
+        <div class="modal-overlay" id="manual-alert-modal-overlay">
+            <div class="modal modal-sm" id="manual-alert-modal">
+                <div class="modal-header">
+                    <h2 class="modal-title" id="manual-alert-modal-title">Create Manual Alert</h2>
+                    <button class="btn btn-icon modal-close" id="manual-alert-modal-close">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div class="modal-body" id="manual-alert-modal-body">
+                    <!-- Content rendered dynamically -->
+                </div>
+                <div class="modal-footer" id="manual-alert-modal-footer"></div>
+            </div>
+        </div>
+
+        <!-- Integration Editor Modal -->
+        <div class="modal-overlay" id="integration-modal-overlay">
+            <div class="modal modal-md" id="integration-modal">
+                <div class="modal-header">
+                    <h2 class="modal-title" id="integration-modal-title">Integration</h2>
+                    <button class="btn btn-icon modal-close" id="integration-modal-close">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div class="modal-body" id="integration-modal-body">
+                    <!-- Content rendered by integrations module -->
+                </div>
+                <div class="modal-footer" id="integration-modal-footer"></div>
+            </div>
+        </div>
+
+        <script src="/js/api.js?v=15"></script>
+        <script src="/js/modules/profile.js?v=1"></script>
+        <script src="/js/components.js?v=14"></script>
+        <script type="module" src="/js/app.js?v=15"></script>
+        <script>lucide.createIcons();</script>
+</body>
+
+</html>

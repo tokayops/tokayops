@@ -1,0 +1,11 @@
+# tokay.yaml
+config_version: 3
+
+# Global settings for routing
+global:
+  firehose_critical_channel: "C0A47NEMP33"  # Set to Slack channel ID to enable global logging for critical alerts
+  firehose_warning_channel: "C0A3RBXA3QD"   # Set to Slack channel ID to enable global logging for warning alerts
+  dm_fallback_to_firehose: true # Default true. If no primary delivery, use firehose permalink in DMs
+
+# NOTE: slack_token and providers sections removed in v3.
+# Use the Integrations API instead: POST /api/v1/integrations

@@ -1,0 +1,113 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 6:00 UTC
+
+jobs:
+  # SAST - Static Application Security Testing
+  semgrep:
+    name: Semgrep (SAST)
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Run Semgrep
+        run: |
+          echo "=== Semgrep Security Scan ==="
+          semgrep scan --config auto --error --text -o semgrep-report.txt || true
+          cat semgrep-report.txt
+          echo ""
+          echo "=== Saving JSON for artifacts ==="
+          semgrep scan --config auto --json -o semgrep-results.json
+          # Check if there are blocking findings
+          FINDINGS=$(cat semgrep-results.json | grep -c '"severity":' || echo "0")
+          echo "Total findings: $FINDINGS"
+          # Exit with error if there are findings
+          semgrep scan --config auto --error --quiet
+
+      - name: Upload Semgrep results
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: semgrep-results
+          path: |
+            semgrep-results.json
+            semgrep-report.txt
+
+  # Go Vulnerability Check
+  govulncheck:
+    name: Go Vulnerabilities
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  # SCA - Software Composition Analysis
+  trivy:
+    name: Trivy (SCA)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Run Trivy and save JSON report
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-results.json'
+
+      - name: Upload Trivy results
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: trivy-results
+          path: trivy-results.json
+
+  # Secrets Detection
+  gitleaks:
+    name: Gitleaks (Secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # Full history for comprehensive scan
+
+      - name: Install Gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Run Gitleaks
+        run: gitleaks detect --source . --verbose --exit-code 1

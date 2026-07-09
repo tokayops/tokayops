@@ -1,0 +1,21 @@
+# Semgrep ignore patterns
+
+# Frontend JS uses escapeHtml() in all Components.* functions
+# The insecure-document-method rule produces false positives
+# because it can't trace sanitization across function boundaries
+web/js/
+
+# Docker container security - not a priority for now
+Dockerfile
+docker-compose.yml
+docker-compose.test.yml
+
+# Webhook receiver dev tool — no user input, static embedded HTML, no TLS (reverse proxy)
+cmd/webhook-receiver/
+
+# Test files - cookie security flags not relevant for test harnesses
+*_test.go
+**/*_test.go
+internal/testutil/
+internal/store/main_test.go
+

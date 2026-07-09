@@ -1,0 +1,2681 @@
+basePath: /
+definitions:
+  api.APITokenListItem:
+    properties:
+      created_at:
+        type: string
+      expires_at:
+        type: string
+      id:
+        type: string
+      last_used_at:
+        type: string
+      name:
+        type: string
+    type: object
+  api.APITokenListResponse:
+    properties:
+      tokens:
+        items:
+          $ref: '#/definitions/api.APITokenListItem'
+        type: array
+      total:
+        type: integer
+    type: object
+  api.AddNoteRequest:
+    properties:
+      actor:
+        description: Optional, defaults to "user"
+        type: string
+      message:
+        description: Required
+        type: string
+    type: object
+  api.AddTeamMemberRequest:
+    properties:
+      role:
+        description: Optional, defaults to "member"
+        type: string
+      user_id:
+        description: Required
+        type: string
+    type: object
+  api.AlertGroupListResponse:
+    properties:
+      alert_groups:
+        items:
+          $ref: '#/definitions/model.AlertGroup'
+        type: array
+      incidents:
+        description: Legacy
+        items:
+          $ref: '#/definitions/model.AlertGroup'
+        type: array
+      total:
+        type: integer
+    type: object
+  api.ConfirmSlackCodeRequest:
+    properties:
+      code:
+        type: string
+    type: object
+  api.CreateAPITokenRequest:
+    properties:
+      expires_in:
+        description: 'Optional: expiration in days (nil = no expiration)'
+        type: integer
+      name:
+        description: 'Required: descriptive name for the token'
+        type: string
+    type: object
+  api.CreateAPITokenResponse:
+    properties:
+      created_at:
+        type: string
+      expires_at:
+        type: string
+      id:
+        type: string
+      name:
+        type: string
+      token:
+        description: Plain token - shown ONCE
+        type: string
+    type: object
+  api.CreateIntegrationRequest:
+    properties:
+      config:
+        type: object
+      enabled:
+        description: Pointer to detect if provided (defaults to true)
+        type: boolean
+      name:
+        type: string
+      scope:
+        allOf:
+        - $ref: '#/definitions/model.WebhookScope'
+        description: Required for generic_webhook
+      team_id:
+        description: Required when scope=team
+        type: string
+      type:
+        $ref: '#/definitions/model.IntegrationType'
+    type: object
+  api.CreateTeamRequest:
+    properties:
+      description:
+        description: Optional
+        type: string
+      id:
+        description: Required
+        type: string
+      name:
+        description: Required
+        type: string
+    type: object
+  api.CreateUserRequest:
+    properties:
+      email:
+        description: Required
+        type: string
+      id:
+        description: Optional, will be generated if not provided
+        type: string
+      name:
+        description: Required
+        type: string
+      password:
+        description: Optional, will be hashed if provided
+        type: string
+      role:
+        description: 'Optional: "admin" or "user"'
+        type: string
+    type: object
+  api.ErrorResponse:
+    properties:
+      error:
+        type: string
+    type: object
+  api.IntegrationListResponse:
+    properties:
+      integrations:
+        items:
+          $ref: '#/definitions/model.Integration'
+        type: array
+      total:
+        type: integer
+    type: object
+  api.LoginRequest:
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+    type: object
+  api.ManualAlertGroupRequest:
+    properties:
+      severity:
+        type: string
+      team_id:
+        type: string
+      title:
+        type: string
+    type: object
+  api.OIDCConfigResponse:
+    properties:
+      enabled:
+        type: boolean
+      login_url:
+        type: string
+    type: object
+  api.OverrideRequest:
+    properties:
+      end_time:
+        description: 'Legacy: UTC or offset-included time'
+        type: string
+      end_time_local:
+        description: 'Optional: "2006-01-02T15:04"'
+        type: string
+      reason:
+        description: Optional reason
+        type: string
+      start_time:
+        description: 'Legacy: UTC or offset-included time'
+        type: string
+      start_time_local:
+        description: 'Optional: "2006-01-02T15:04"'
+        type: string
+      timezone:
+        description: 'Optional: Timezone for local times'
+        type: string
+      user_id:
+        description: User to assign
+        type: string
+    type: object
+  api.PolicyRequest:
+    properties:
+      description:
+        type: string
+      name:
+        type: string
+      steps:
+        items:
+          $ref: '#/definitions/api.PolicyStepRequest'
+        type: array
+      team_id:
+        description: nil = global
+        type: string
+    type: object
+  api.PolicyStepRequest:
+    properties:
+      continue_on_failure:
+        description: nil defaults to true
+        type: boolean
+      delay_seconds:
+        type: integer
+      max_attempts:
+        type: integer
+      message:
+        type: string
+      provider:
+        description: '"slack", "telegram", ...'
+        type: string
+      target_id:
+        type: string
+      target_kind:
+        description: '"dm" | "channel"'
+        type: string
+      target_type:
+        description: user, channel, schedule
+        type: string
+      timeout_seconds:
+        type: integer
+    type: object
+  api.ProviderCapability:
+    properties:
+      integration_type:
+        $ref: '#/definitions/model.IntegrationType'
+      name:
+        type: string
+      supported_target_kinds:
+        items:
+          type: string
+        type: array
+    type: object
+  api.ProvidersResponse:
+    properties:
+      providers:
+        items:
+          $ref: '#/definitions/api.ProviderCapability'
+        type: array
+    type: object
+  api.RenderEntry:
+    properties:
+      end_time:
+        type: string
+      layer:
+        description: '"l1", "l2", "override"'
+        type: string
+      override_end:
+        type: string
+      override_id:
+        description: Override-specific fields (only set when Layer == "override")
+        type: string
+      override_start:
+        type: string
+      reason:
+        type: string
+      schedule_id:
+        type: string
+      start_time:
+        type: string
+      user_ids:
+        items:
+          type: string
+        type: array
+      user_names:
+        items:
+          type: string
+        type: array
+    type: object
+  api.RequestSlackCodeRequest:
+    properties:
+      slack_user_id:
+        type: string
+    type: object
+  api.ScheduleRequest:
+    properties:
+      l1_handoff_day:
+        description: 0=Sun, 1=Mon
+        type: integer
+      l1_handoff_time:
+        description: '"11:00"'
+        type: string
+      l1_rotation_start:
+        description: e.g., 2025-01-01T11:00:00Z
+        type: string
+      l1_rotation_type:
+        description: '"daily" | "weekly"'
+        type: string
+      l2_enabled:
+        description: Enable L2 layer
+        type: boolean
+      l2_escalation_timeout:
+        description: Minutes before escalating
+        type: integer
+      l2_handoff_day:
+        type: integer
+      l2_handoff_time:
+        type: string
+      l2_rotation_start:
+        type: string
+      l2_rotation_type:
+        type: string
+      slack_usergroup_id:
+        description: Optional Slack usergroup for on-call sync
+        type: string
+      timezone:
+        description: IANA timezone
+        type: string
+    type: object
+  api.SetGroupsRequest:
+    properties:
+      groups:
+        description: Groups of user IDs, e.g. [["id1","id2"],["id3"]]
+        items:
+          items:
+            type: string
+          type: array
+        type: array
+    type: object
+  api.SetUsersRequest:
+    properties:
+      user_ids:
+        description: Ordered list of user IDs (L2 only)
+        items:
+          type: string
+        type: array
+    type: object
+  api.TeamListResponse:
+    properties:
+      teams:
+        items:
+          $ref: '#/definitions/api.TeamWithConfig'
+        type: array
+      total:
+        type: integer
+    type: object
+  api.TeamMemberListResponse:
+    properties:
+      total:
+        type: integer
+      users:
+        items:
+          $ref: '#/definitions/model.TeamMemberDetail'
+        type: array
+    type: object
+  api.TeamWithConfig:
+    properties:
+      created_at:
+        type: string
+      default_policy_id:
+        description: Fallback escalation policy
+        type: string
+      description:
+        description: Optional description
+        type: string
+      id:
+        description: e.g., "devops"
+        type: string
+      member_count:
+        type: integer
+      name:
+        description: 'Display name: "DevOps Team"'
+        type: string
+      on_call_configured:
+        type: boolean
+      severity_routes:
+        additionalProperties:
+          type: string
+        description: severity -> policy_id
+        type: object
+    type: object
+  api.TestIntegrationRequest:
+    properties:
+      mode:
+        description: '"dm" for direct message test'
+        type: string
+    type: object
+  api.TestIntegrationResponse:
+    properties:
+      message:
+        type: string
+      ok:
+        type: boolean
+    type: object
+  api.TimelineResponse:
+    properties:
+      events:
+        items:
+          $ref: '#/definitions/model.TimelineEvent'
+        type: array
+      total:
+        type: integer
+    type: object
+  api.UpdateIntegrationRequest:
+    properties:
+      config:
+        type: object
+      enabled:
+        type: boolean
+      name:
+        type: string
+    type: object
+  api.UpdateMeRequest:
+    properties:
+      name:
+        type: string
+    type: object
+  api.UpdatePasswordRequest:
+    properties:
+      password:
+        type: string
+    type: object
+  api.UpdateTeamRequest:
+    properties:
+      default_policy_id:
+        type: string
+      description:
+        type: string
+      name:
+        type: string
+      severity_routes:
+        additionalProperties:
+          type: string
+        type: object
+    type: object
+  api.UpdateUserRequest:
+    properties:
+      email:
+        type: string
+      name:
+        type: string
+      role:
+        description: 'Optional: "admin" or "user"'
+        type: string
+    type: object
+  api.UserListResponse:
+    properties:
+      total:
+        type: integer
+      users:
+        items:
+          $ref: '#/definitions/model.User'
+        type: array
+    type: object
+  model.Alert:
+    properties:
+      annotations:
+        additionalProperties:
+          type: string
+        type: object
+      endsAt:
+        type: string
+      fingerprint:
+        type: string
+      generatorURL:
+        type: string
+      labels:
+        additionalProperties:
+          type: string
+        type: object
+      startsAt:
+        type: string
+      status:
+        $ref: '#/definitions/model.AlertStatus'
+    type: object
+  model.AlertGroup:
+    properties:
+      ack_processed_at:
+        description: When ack update job was processed
+        type: string
+      acknowledged_by:
+        description: Acknowledgement
+        type: string
+      alerts:
+        description: Alerts Snapshot
+        items:
+          $ref: '#/definitions/model.Alert'
+        type: array
+      created_at:
+        type: string
+      current_step:
+        type: integer
+      dedup_key:
+        description: groupKey from Alertmanager (fingerprint)
+        type: string
+      external_url:
+        description: External Link to Alertmanager Source (for clickable titles)
+        type: string
+      id:
+        description: UUID
+        type: string
+      incident_id:
+        description: Link to future Incident (NULL in most cases for Phase 2)
+        type: integer
+      oncall_snapshot:
+        allOf:
+        - $ref: '#/definitions/model.OnCallResult'
+        description: OnCall Snapshot (stores the on-call state at the time of alert
+          group creation)
+      policy_id:
+        description: Escalation Logic
+        type: string
+      policy_snapshot:
+        allOf:
+        - $ref: '#/definitions/model.EscalationPolicySnapshot'
+        description: Policy Snapshot (stores the policy state at the time of creation/assignment)
+      resolved_at:
+        type: string
+      resolved_by:
+        type: string
+      severity:
+        type: string
+      slack_update_pending:
+        description: Slack Update Tracking
+        type: boolean
+      status:
+        $ref: '#/definitions/model.AlertGroupStatus'
+      team_id:
+        description: Classification
+        type: string
+      team_name_snapshot:
+        type: string
+      timeline_events:
+        description: Timeline (loaded on demand, not persisted here)
+        items:
+          $ref: '#/definitions/model.TimelineEvent'
+        type: array
+      title:
+        description: Derived from Alert Labels/Annotations
+        type: string
+      updated_at:
+        type: string
+    type: object
+  model.AlertGroupStatus:
+    enum:
+    - new
+    - processing
+    - triggered
+    - acknowledged
+    - resolved
+    - closed
+    type: string
+    x-enum-comments:
+      AlertGroupStatusAcknowledged: User acknowledged, waiting for resolution
+    x-enum-varnames:
+    - AlertGroupStatusNew
+    - AlertGroupStatusProcessing
+    - AlertGroupStatusTriggered
+    - AlertGroupStatusAcknowledged
+    - AlertGroupStatusResolved
+    - AlertGroupStatusClosed
+  model.AlertStatus:
+    enum:
+    - firing
+    - resolved
+    type: string
+    x-enum-varnames:
+    - AlertStatusFiring
+    - AlertStatusResolved
+  model.EscalationPolicy:
+    properties:
+      created_at:
+        type: string
+      description:
+        type: string
+      id:
+        type: string
+      name:
+        type: string
+      steps:
+        items:
+          $ref: '#/definitions/model.EscalationStep'
+        type: array
+      team_id:
+        description: nil = global policy
+        type: string
+      updated_at:
+        type: string
+    type: object
+  model.EscalationPolicySnapshot:
+    properties:
+      name:
+        type: string
+      policy_id:
+        description: Effective policy ID (empty if firehose-only fallback)
+        type: string
+      steps:
+        items:
+          $ref: '#/definitions/model.EscalationStepSnapshot'
+        type: array
+    type: object
+  model.EscalationStep:
+    properties:
+      continue_on_failure:
+        type: boolean
+      delay_seconds:
+        type: integer
+      id:
+        type: string
+      max_attempts:
+        type: integer
+      message:
+        type: string
+      policy_id:
+        type: string
+      provider:
+        description: '"slack", "telegram", ...'
+        type: string
+      step_index:
+        type: integer
+      target_id:
+        description: actual ID
+        type: string
+      target_kind:
+        description: '"dm" | "channel"'
+        type: string
+      target_type:
+        description: user, channel, schedule
+        type: string
+      timeout_seconds:
+        type: integer
+    type: object
+  model.EscalationStepSnapshot:
+    properties:
+      is_firehose:
+        description: true for firehose step
+        type: boolean
+      provider:
+        type: string
+      stage_index:
+        description: which stage this step belongs to
+        type: integer
+      target_id:
+        type: string
+      target_kind:
+        type: string
+      target_type:
+        type: string
+    type: object
+  model.ExternalIdentity:
+    properties:
+      chat_id:
+        description: provider-specific (Telegram DM chat)
+        type: string
+      created_at:
+        type: string
+      display_name:
+        description: shown in timeline / UI
+        type: string
+      external_id:
+        type: string
+      id:
+        type: string
+      provider:
+        type: string
+      updated_at:
+        type: string
+      user_id:
+        type: string
+    type: object
+  model.Integration:
+    properties:
+      config:
+        type: object
+      created_at:
+        type: string
+      direction:
+        $ref: '#/definitions/model.IntegrationDirection'
+      enabled:
+        type: boolean
+      id:
+        type: string
+      name:
+        type: string
+      scope:
+        $ref: '#/definitions/model.WebhookScope'
+      team_id:
+        type: string
+      type:
+        $ref: '#/definitions/model.IntegrationType'
+      updated_at:
+        type: string
+    type: object
+  model.IntegrationDirection:
+    enum:
+    - inbound
+    - outbound
+    type: string
+    x-enum-varnames:
+    - IntegrationDirectionInbound
+    - IntegrationDirectionOutbound
+  model.IntegrationType:
+    enum:
+    - slack
+    - telegram
+    - alertmanager_webhook
+    - generic_webhook
+    type: string
+    x-enum-varnames:
+    - IntegrationTypeSlack
+    - IntegrationTypeTelegram
+    - IntegrationTypeAlertmanagerWebhook
+    - IntegrationTypeGenericWebhook
+  model.OnCallResult:
+    properties:
+      l1_since:
+        description: When L1 shift started
+        type: string
+      l1_until:
+        description: When L1 shift ends. nil = forever/unknown
+        type: string
+      l1_users:
+        items:
+          $ref: '#/definitions/model.User'
+        type: array
+      l2_user:
+        $ref: '#/definitions/model.User'
+      override:
+        allOf:
+        - $ref: '#/definitions/model.ScheduleOverride'
+        description: If override is active
+    type: object
+  model.RotationType:
+    enum:
+    - daily
+    - weekly
+    type: string
+    x-enum-varnames:
+    - RotationDaily
+    - RotationWeekly
+  model.Schedule:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: string
+      l1_groups:
+        items:
+          items:
+            $ref: '#/definitions/model.User'
+          type: array
+        type: array
+      l1_handoff_day:
+        description: 0=Sun, 1=Mon (for weekly)
+        type: integer
+      l1_handoff_time:
+        description: '"11:00" format'
+        type: string
+      l1_rotation_start:
+        description: When rotation started
+        type: string
+      l1_rotation_type:
+        allOf:
+        - $ref: '#/definitions/model.RotationType'
+        description: L1 Layer Config (Primary)
+      l2_enabled:
+        description: L2 Layer Config (Secondary, optional)
+        type: boolean
+      l2_escalation_timeout_min:
+        description: Minutes before escalating to L2
+        type: integer
+      l2_handoff_day:
+        type: integer
+      l2_handoff_time:
+        type: string
+      l2_rotation_start:
+        type: string
+      l2_rotation_type:
+        $ref: '#/definitions/model.RotationType'
+      l2_users:
+        items:
+          $ref: '#/definitions/model.User'
+        type: array
+      overrides:
+        items:
+          $ref: '#/definitions/model.ScheduleOverride'
+        type: array
+      slack_usergroup_id:
+        description: Slack Usergroup Sync (optional)
+        type: string
+      team_id:
+        type: string
+      timezone:
+        description: IANA timezone, e.g., "Asia/Bangkok"
+        type: string
+      updated_at:
+        type: string
+    type: object
+  model.ScheduleOverride:
+    properties:
+      created_at:
+        type: string
+      created_by:
+        type: string
+      end_time:
+        type: string
+      id:
+        type: string
+      reason:
+        type: string
+      schedule_id:
+        type: string
+      start_time:
+        description: Minute precision
+        type: string
+      user:
+        allOf:
+        - $ref: '#/definitions/model.User'
+        description: Populated on read
+      user_id:
+        type: string
+    type: object
+  model.Team:
+    properties:
+      created_at:
+        type: string
+      default_policy_id:
+        description: Fallback escalation policy
+        type: string
+      description:
+        description: Optional description
+        type: string
+      id:
+        description: e.g., "devops"
+        type: string
+      name:
+        description: 'Display name: "DevOps Team"'
+        type: string
+      severity_routes:
+        additionalProperties:
+          type: string
+        description: severity -> policy_id
+        type: object
+    type: object
+  model.TeamMember:
+    properties:
+      role:
+        $ref: '#/definitions/model.TeamMemberRole'
+      team_id:
+        type: string
+      user_id:
+        type: string
+    type: object
+  model.TeamMemberDetail:
+    properties:
+      auth_provider:
+        description: '"password" or "oidc" - last login method'
+        type: string
+      created_at:
+        type: string
+      email:
+        description: Unique email
+        type: string
+      id:
+        description: UUID
+        type: string
+      identities:
+        description: loaded on demand by handlers
+        items:
+          $ref: '#/definitions/model.ExternalIdentity'
+        type: array
+      name:
+        description: Display name
+        type: string
+      role:
+        allOf:
+        - $ref: '#/definitions/model.UserRole'
+        description: 'Global role: admin or user'
+      team_role:
+        allOf:
+        - $ref: '#/definitions/model.TeamMemberRole'
+        description: '"team_admin" or "team_member"'
+    type: object
+  model.TeamMemberRole:
+    enum:
+    - team_admin
+    - team_member
+    type: string
+    x-enum-comments:
+      TeamMemberRoleAdmin: Team administrator
+      TeamMemberRoleMember: Regular team member
+    x-enum-varnames:
+    - TeamMemberRoleAdmin
+    - TeamMemberRoleMember
+  model.TimelineEvent:
+    properties:
+      actor:
+        description: User ID, "system", or alert name
+        type: string
+      alert_group_id:
+        description: Changed from incident_id
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      message:
+        description: Human-readable description
+        type: string
+      metadata:
+        additionalProperties:
+          type: string
+        description: Extra data (alert fingerprint, etc.)
+        type: object
+      type:
+        $ref: '#/definitions/model.TimelineEventType'
+    type: object
+  model.TimelineEventType:
+    enum:
+    - created
+    - alert_added
+    - alert_resolved
+    - acknowledged
+    - resolved
+    - notification_sent
+    - notification_failed
+    - note
+    - status_change
+    type: string
+    x-enum-varnames:
+    - TimelineEventCreated
+    - TimelineEventAlertAdded
+    - TimelineEventAlertResolved
+    - TimelineEventAcknowledged
+    - TimelineEventResolved
+    - TimelineEventNotificationSent
+    - TimelineEventNotificationFailed
+    - TimelineEventNote
+    - TimelineEventStatusChange
+  model.User:
+    properties:
+      auth_provider:
+        description: '"password" or "oidc" - last login method'
+        type: string
+      created_at:
+        type: string
+      email:
+        description: Unique email
+        type: string
+      id:
+        description: UUID
+        type: string
+      identities:
+        description: loaded on demand by handlers
+        items:
+          $ref: '#/definitions/model.ExternalIdentity'
+        type: array
+      name:
+        description: Display name
+        type: string
+      role:
+        allOf:
+        - $ref: '#/definitions/model.UserRole'
+        description: 'Global role: admin or user'
+    type: object
+  model.UserRole:
+    enum:
+    - admin
+    - user
+    type: string
+    x-enum-comments:
+      UserRoleAdmin: Full system access
+      UserRoleUser: Standard authenticated user (default)
+    x-enum-varnames:
+    - UserRoleAdmin
+    - UserRoleUser
+  model.UserWithPermissions:
+    properties:
+      auth_provider:
+        description: '"password" or "oidc" - last login method'
+        type: string
+      created_at:
+        type: string
+      email:
+        description: Unique email
+        type: string
+      id:
+        description: UUID
+        type: string
+      identities:
+        description: loaded on demand by handlers
+        items:
+          $ref: '#/definitions/model.ExternalIdentity'
+        type: array
+      name:
+        description: Display name
+        type: string
+      role:
+        allOf:
+        - $ref: '#/definitions/model.UserRole'
+        description: 'Global role: admin or user'
+      teams:
+        additionalProperties:
+          $ref: '#/definitions/model.TeamMemberRole'
+        description: Teams is a map of TeamID to Role (e.g. "devops" -> "team_admin")
+        type: object
+    type: object
+  model.WebhookScope:
+    enum:
+    - global
+    - team
+    type: string
+    x-enum-varnames:
+    - WebhookScopeGlobal
+    - WebhookScopeTeam
+info:
+  contact: {}
+  description: TokayOps API
+  title: TokayOps API
+  version: "1.0"
+paths:
+  /api/auth/login:
+    post:
+      consumes:
+      - application/json
+      description: Authenticate user and set HTTPOnly cookie
+      parameters:
+      - description: Login credentials
+        in: body
+        name: credentials
+        required: true
+        schema:
+          $ref: '#/definitions/api.LoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.User'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Login
+      tags:
+      - auth
+  /api/auth/logout:
+    post:
+      description: Clear authentication cookie
+      responses:
+        "200":
+          description: OK
+      summary: Logout
+      tags:
+      - auth
+  /api/auth/me:
+    get:
+      description: Get currently authenticated user details
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.UserWithPermissions'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get current user
+      tags:
+      - auth
+    patch:
+      consumes:
+      - application/json
+      description: Update the current user's name. SSO users cannot change their name.
+      parameters:
+      - description: Profile updates
+        in: body
+        name: profile
+        required: true
+        schema:
+          $ref: '#/definitions/api.UpdateMeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.User'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Update current user profile
+      tags:
+      - auth
+  /api/auth/me/slack:
+    delete:
+      consumes:
+      - application/json
+      description: Remove the Slack identity binding from the current user
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Unbind Slack account
+      tags:
+      - auth
+  /api/auth/me/slack/confirm-code:
+    post:
+      consumes:
+      - application/json
+      description: Verify the OTP code and bind the Slack account
+      parameters:
+      - description: Confirm data
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/api.ConfirmSlackCodeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.User'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Confirm Slack OTP code
+      tags:
+      - auth
+  /api/auth/me/slack/request-code:
+    post:
+      consumes:
+      - application/json
+      description: Send an OTP code to the specified Slack User ID via DM
+      parameters:
+      - description: Request data
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/api.RequestSlackCodeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Request a Slack OTP code
+      tags:
+      - auth
+  /api/auth/me/telegram:
+    delete:
+      description: Remove the Telegram identity binding from the current user
+      responses:
+        "204":
+          description: No Content
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Unbind Telegram account
+      tags:
+      - auth
+  /api/auth/me/telegram/link:
+    post:
+      description: Issue a one-time deep-link token and return a t.me/<bot>?start=<token>
+        URL. The user opens it and presses Start to link their Telegram account.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Request a Telegram deep link
+      tags:
+      - auth
+  /api/auth/oidc/callback:
+    get:
+      description: Completes OIDC login flow, creates user if needed
+      parameters:
+      - description: Authorization code
+        in: query
+        name: code
+        required: true
+        type: string
+      - description: State parameter
+        in: query
+        name: state
+        required: true
+        type: string
+      responses:
+        "302":
+          description: Redirect to home
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Handle OIDC callback
+      tags:
+      - auth
+  /api/auth/oidc/config:
+    get:
+      description: Returns OIDC status and login URL for frontend
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.OIDCConfigResponse'
+      summary: Get OIDC configuration
+      tags:
+      - auth
+  /api/auth/oidc/redirect:
+    get:
+      description: Initiates OIDC login flow
+      responses:
+        "302":
+          description: Redirect to OIDC provider
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Redirect to OIDC provider
+      tags:
+      - auth
+  /api/v1/alert-groups:
+    get:
+      consumes:
+      - application/json
+      description: Get a list of alert groups with optional status filter and pagination
+      parameters:
+      - description: Filter by status (new, processing, triggered, resolved, closed)
+        in: query
+        name: status
+        type: string
+      - default: 50
+        description: Limit (max 200)
+        in: query
+        name: limit
+        type: integer
+      - default: 1
+        description: Page number (1-indexed)
+        in: query
+        name: page
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.AlertGroupListResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: List alert groups
+      tags:
+      - alert-groups
+    post:
+      consumes:
+      - application/json
+      description: Create a manual alert group that routes via team+severity policy
+        mapping
+      parameters:
+      - description: Manual alert group data
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.ManualAlertGroupRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/model.AlertGroup'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create a manual alert group
+      tags:
+      - alert-groups
+  /api/v1/alert-groups/{id}:
+    get:
+      consumes:
+      - application/json
+      description: Get detailed information about a specific alert group
+      parameters:
+      - description: Alert Group ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.AlertGroup'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get an alert group by ID
+      tags:
+      - alert-groups
+  /api/v1/alert-groups/{id}/ack:
+    patch:
+      consumes:
+      - application/json
+      description: Mark an alert group as acknowledged
+      parameters:
+      - description: Alert Group ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.AlertGroup'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Acknowledge an alert group
+      tags:
+      - alert-groups
+  /api/v1/alert-groups/{id}/notes:
+    post:
+      consumes:
+      - application/json
+      description: Add a user note to an alert group's timeline
+      parameters:
+      - description: Alert Group ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Note data
+        in: body
+        name: note
+        required: true
+        schema:
+          $ref: '#/definitions/api.AddNoteRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/model.TimelineEvent'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Add a note to an alert group
+      tags:
+      - alert-groups
+  /api/v1/alert-groups/{id}/resolve:
+    patch:
+      consumes:
+      - application/json
+      description: Manually resolve an alert group
+      parameters:
+      - description: Alert Group ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.AlertGroup'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Resolve an alert group
+      tags:
+      - alert-groups
+  /api/v1/alert-groups/{id}/timeline:
+    get:
+      consumes:
+      - application/json
+      description: Get all timeline events for a specific alert group
+      parameters:
+      - description: Alert Group ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.TimelineResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get timeline for an alert group
+      tags:
+      - alert-groups
+  /api/v1/integrations:
+    get:
+      description: Get integrations visible to the current user
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.IntegrationListResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: List integrations
+      tags:
+      - integrations
+    post:
+      consumes:
+      - application/json
+      description: Create a new integration (admin only)
+      parameters:
+      - description: Integration data
+        in: body
+        name: integration
+        required: true
+        schema:
+          $ref: '#/definitions/api.CreateIntegrationRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/model.Integration'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create integration
+      tags:
+      - integrations
+  /api/v1/integrations/{id}:
+    delete:
+      description: Delete an integration (admin only)
+      parameters:
+      - description: Integration ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Delete integration
+      tags:
+      - integrations
+    get:
+      description: Get an integration by ID
+      parameters:
+      - description: Integration ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.Integration'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get integration
+      tags:
+      - integrations
+    put:
+      consumes:
+      - application/json
+      description: Update an integration (admin only). Empty secrets keep existing
+        values.
+      parameters:
+      - description: Integration ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Integration data
+        in: body
+        name: integration
+        required: true
+        schema:
+          $ref: '#/definitions/api.UpdateIntegrationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.Integration'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Update integration
+      tags:
+      - integrations
+  /api/v1/integrations/{id}/test:
+    post:
+      consumes:
+      - application/json
+      description: Send a test message via the integration (admin only)
+      parameters:
+      - description: Integration ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Test request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/api.TestIntegrationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.TestIntegrationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "412":
+          description: Precondition Failed
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Test integration
+      tags:
+      - integrations
+  /api/v1/policies:
+    get:
+      description: Get all escalation policies (filtered by team membership for non-admins)
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/model.EscalationPolicy'
+            type: array
+      summary: List all escalation policies
+      tags:
+      - policies
+    post:
+      consumes:
+      - application/json
+      description: Create a new escalation policy (admin only for global, team_admin
+        for team-scoped)
+      parameters:
+      - description: Policy data
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.PolicyRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/model.EscalationPolicy'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create a new escalation policy
+      tags:
+      - policies
+  /api/v1/policies/{id}:
+    delete:
+      description: Delete escalation policy (admin for global, team_admin for team-scoped)
+      parameters:
+      - description: Policy ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Delete an escalation policy
+      tags:
+      - policies
+    get:
+      description: Get escalation policy by ID
+      parameters:
+      - description: Policy ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.EscalationPolicy'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get a specific escalation policy
+      tags:
+      - policies
+    put:
+      consumes:
+      - application/json
+      description: Update escalation policy (admin for global, team_admin for team-scoped)
+      parameters:
+      - description: Policy ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Policy data
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.PolicyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.EscalationPolicy'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Update an escalation policy
+      tags:
+      - policies
+  /api/v1/providers:
+    get:
+      description: Capability descriptors for the registered notification providers
+        (sorted by name). Used by the policy editor to populate the (provider, target_kind)
+        dropdown without hardcoding step types.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ProvidersResponse'
+      summary: List notification providers
+      tags:
+      - providers
+  /api/v1/schedules/{schedule_id}/overrides/{id}:
+    delete:
+      description: Delete a schedule override
+      parameters:
+      - description: Schedule ID
+        in: path
+        name: schedule_id
+        required: true
+        type: string
+      - description: Override ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Delete an override
+      tags:
+      - schedules
+    put:
+      consumes:
+      - application/json
+      description: Update an existing schedule override (user, times, reason)
+      parameters:
+      - description: Schedule ID
+        in: path
+        name: schedule_id
+        required: true
+        type: string
+      - description: Override ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Override data
+        in: body
+        name: override
+        required: true
+        schema:
+          $ref: '#/definitions/api.OverrideRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.ScheduleOverride'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Update an override
+      tags:
+      - schedules
+  /api/v1/teams:
+    get:
+      consumes:
+      - application/json
+      description: Get all teams with configuration status
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.TeamListResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: List teams
+      tags:
+      - teams
+    post:
+      consumes:
+      - application/json
+      description: Create a new team
+      parameters:
+      - description: Team data
+        in: body
+        name: team
+        required: true
+        schema:
+          $ref: '#/definitions/api.CreateTeamRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/model.Team'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create a new team
+      tags:
+      - teams
+  /api/v1/teams/{id}:
+    delete:
+      consumes:
+      - application/json
+      description: Delete a team by ID
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Delete a team
+      tags:
+      - teams
+    get:
+      consumes:
+      - application/json
+      description: Get detailed information about a specific team
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.Team'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get a team by ID
+      tags:
+      - teams
+    put:
+      consumes:
+      - application/json
+      description: Update team details
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Team data
+        in: body
+        name: team
+        required: true
+        schema:
+          $ref: '#/definitions/api.UpdateTeamRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.Team'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Update a team
+      tags:
+      - teams
+  /api/v1/teams/{id}/alert-groups:
+    get:
+      consumes:
+      - application/json
+      description: Get all alert groups belonging to a specific team
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - default: 50
+        description: Limit (max 200)
+        in: query
+        name: limit
+        type: integer
+      - default: 1
+        description: Page number (1-indexed)
+        in: query
+        name: page
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.AlertGroupListResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get alert groups for a team
+      tags:
+      - teams
+  /api/v1/teams/{id}/members:
+    get:
+      consumes:
+      - application/json
+      description: Get all users belonging to a specific team
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.TeamMemberListResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get team members
+      tags:
+      - teams
+    post:
+      consumes:
+      - application/json
+      description: Add a user as a member of a team
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Member data
+        in: body
+        name: member
+        required: true
+        schema:
+          $ref: '#/definitions/api.AddTeamMemberRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/model.TeamMember'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Add a user to a team
+      tags:
+      - teams
+  /api/v1/teams/{id}/members/{user_id}:
+    delete:
+      consumes:
+      - application/json
+      description: Remove a user from a team
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: User ID
+        in: path
+        name: user_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Remove a user from a team
+      tags:
+      - teams
+  /api/v1/teams/{id}/oncall:
+    get:
+      description: Get who is currently on-call for L1 and L2
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.OnCallResult'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get current on-call for a team
+      tags:
+      - schedules
+  /api/v1/teams/{id}/schedule:
+    delete:
+      description: Delete the on-call schedule configuration for a team
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Delete schedule for a team
+      tags:
+      - schedules
+    get:
+      description: Get the on-call schedule configuration for a team
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.Schedule'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get schedule for a team
+      tags:
+      - schedules
+    put:
+      consumes:
+      - application/json
+      description: Create or update the on-call schedule configuration
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Schedule configuration
+        in: body
+        name: schedule
+        required: true
+        schema:
+          $ref: '#/definitions/api.ScheduleRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.Schedule'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create or update schedule for a team
+      tags:
+      - schedules
+  /api/v1/teams/{id}/schedule/l1-groups:
+    put:
+      consumes:
+      - application/json
+      description: Set the rotation groups for L1 (primary) rotation
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Groups of user IDs
+        in: body
+        name: groups
+        required: true
+        schema:
+          $ref: '#/definitions/api.SetGroupsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Set L1 rotation groups
+      tags:
+      - schedules
+  /api/v1/teams/{id}/schedule/l2-users:
+    put:
+      consumes:
+      - application/json
+      description: Set the ordered list of users for L2 (secondary) rotation
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: User IDs in rotation order
+        in: body
+        name: users
+        required: true
+        schema:
+          $ref: '#/definitions/api.SetUsersRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Set L2 rotation users
+      tags:
+      - schedules
+  /api/v1/teams/{id}/schedule/overrides:
+    post:
+      consumes:
+      - application/json
+      description: Create a temporary on-call override (vacation, swap)
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Override data
+        in: body
+        name: override
+        required: true
+        schema:
+          $ref: '#/definitions/api.OverrideRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/model.ScheduleOverride'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create an override
+      tags:
+      - schedules
+  /api/v1/teams/{id}/schedule/render:
+    get:
+      description: Get schedule entries for a time range
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Start time (RFC3339)
+        in: query
+        name: from
+        required: true
+        type: string
+      - description: End time (RFC3339)
+        in: query
+        name: until
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/api.RenderEntry'
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Render schedule calendar
+      tags:
+      - schedules
+  /api/v1/tokens:
+    get:
+      description: Get all API tokens for the current user
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.APITokenListResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: List user's API tokens
+      tags:
+      - api-tokens
+    post:
+      consumes:
+      - application/json
+      description: Generate a new API token for authentication. The token is shown
+        only once.
+      parameters:
+      - description: Token configuration
+        in: body
+        name: token
+        required: true
+        schema:
+          $ref: '#/definitions/api.CreateAPITokenRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/api.CreateAPITokenResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create a new API token
+      tags:
+      - api-tokens
+  /api/v1/tokens/{id}:
+    delete:
+      description: Delete an API token by ID. The token will no longer work.
+      parameters:
+      - description: Token ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Delete (revoke) an API token
+      tags:
+      - api-tokens
+  /api/v1/users:
+    get:
+      consumes:
+      - application/json
+      description: Get all users
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.UserListResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: List users
+      tags:
+      - users
+    post:
+      consumes:
+      - application/json
+      description: Create a new user with email, name, and optional password
+      parameters:
+      - description: User data
+        in: body
+        name: user
+        required: true
+        schema:
+          $ref: '#/definitions/api.CreateUserRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/model.User'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create a new user
+      tags:
+      - users
+  /api/v1/users/{id}:
+    delete:
+      consumes:
+      - application/json
+      description: Delete a user and remove from all teams
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Delete a user
+      tags:
+      - users
+    get:
+      consumes:
+      - application/json
+      description: Get detailed information about a specific user
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.User'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get a user by ID
+      tags:
+      - users
+    put:
+      consumes:
+      - application/json
+      description: Update a user's information
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: User data
+        in: body
+        name: user
+        required: true
+        schema:
+          $ref: '#/definitions/api.UpdateUserRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.User'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Update a user
+      tags:
+      - users
+  /api/v1/users/{id}/password:
+    put:
+      consumes:
+      - application/json
+      description: Update a user's password
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: New password
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.UpdatePasswordRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/model.User'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Update a user's password
+      tags:
+      - users
+swagger: "2.0"

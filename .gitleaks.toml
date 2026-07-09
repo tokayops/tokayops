@@ -1,0 +1,18 @@
+# Gitleaks configuration
+# https://github.com/gitleaks/gitleaks
+
+[extend]
+useDefault = true
+
+# Global allowlist
+[allowlist]
+description = "Exclude documentation examples, test files, and dummy secrets in CI/e2e configs"
+paths = [
+  '''README\.md$''',
+  '''docs/.*\.md$''',
+  '''.*_test\.go$''',
+  '''testdata/.*''',
+  # Dummy ENCRYPTION_KEY used in CI/e2e — not a real secret
+  '''docker-compose\.e2e\.yml$''',
+  '''\.github/workflows/ci\.yml$''',
+]
