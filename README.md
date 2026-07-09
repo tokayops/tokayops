@@ -1,27 +1,49 @@
 # TokayOps
 
-TokayOps is a lightweight, source-available incident management layer between Alertmanager and your on-call engineer, designed for speed and simplicity. It features a clean, glassmorphism-inspired UI and integrates with **Slack** for alert dispatching.
+TokayOps is a lightweight, source-available incident management layer between
+Alertmanager and your on-call engineer, designed for speed and simplicity. It
+groups noisy alerts into a single incident, routes them to the right team by
+severity and on-call schedule, escalates until someone answers, and lets them
+Acknowledge / Resolve straight from Slack or Telegram. It ships a clean,
+glassmorphism-inspired web UI. One container, your Postgres.
 
-## Architecture (Current Scope)
+## Architecture
 
+TokayOps is an asynchronous pipeline: ingest (Alertmanager webhook) -> store
+(PostgreSQL) -> policy engine -> dispatcher (pluggable providers) -> Slack /
+Telegram. The primary runtime entity is the **AlertGroup**: grouped,
+deduplicated alerts with a status lifecycle, timeline and escalation state.
 
-Tokay uses a **two-tiered entity model**:
-- **AlertGroup**: Primary runtime entity for grouped alerts (from Alertmanager)
-- **Incident**: Business entity stub for future phases
+Delivery is built to be reliable and horizontally safe: a transactional outbox
+commits events in the same transaction as the status change, and job steps run
+under DB leases with compare-and-swap ownership, so a crashed worker's work is
+re-claimed instead of lost.
 
-Key capabilities in the codebase today:
-- ✅ Automatic alert grouping and deduplication
-- ✅ Team-based routing with escalation policies
-- ✅ On-call schedules with **multi-user groups** (1+ users per rotation slot), L2 backup, overrides, calendar
-- ✅ **Parallel notification fan-out** for schedule targets — every member of the on-call group is DM'd in parallel within one escalation step (failures are isolated per member)
-- ✅ **Stage-based job execution** with per-step leases (60s) and stage-aware claim — failed workers are reclaimed automatically
-- ✅ **Group handoff notifications**: every incoming group member with a linked Slack account gets a shift-start DM
-- ✅ **Dual-send**: Team channel + Firehose logging
-- ✅ Rich Slack notifications with timeline updates
-- ✅ **Slack Interactivity**: Ack/Resolve buttons in Block Kit messages, signature‑verified endpoint
-- ✅ **OIDC/SSO**: Optional single sign-on with auto-registration
-- ✅ Integrations API (Slack + Alertmanager webhook + Generic Webhook subscriptions)
-- 🚧 **Telegram** notification target - planned (Epic 8, after Epic 7 Provider Abstraction)
+## Features
+
+- Automatic alert grouping and deduplication by `groupKey`.
+- Team-based routing with severity-selected escalation policies.
+- On-call schedules with multi-user groups (1+ users per rotation slot), L2
+  backup, overrides and calendar.
+- Parallel notification fan-out: every member of the on-call group is DM'd in
+  parallel within one escalation step; failures are isolated per member.
+- Stage-based job execution with per-step leases and stage-aware claim; failed
+  workers are reclaimed automatically.
+- Group handoff notifications: every incoming on-call member with a linked
+  account gets a shift-start DM.
+- Dual-send: team channel + firehose logging.
+- Slack interactivity: Ack/Resolve buttons in Block Kit messages via a
+  signature-verified endpoint.
+- Telegram channel: outbound delivery, policy routing and interactive
+  Ack/Resolve.
+- Generic outgoing webhooks through a transactional outbox: HMAC-signed,
+  SSRF-guarded, retried with backoff, with a delivery log and replay.
+- Observability: Prometheus metrics endpoint including MTTA/MTTR histograms and
+  on-call health gauges.
+- OIDC/SSO: optional single sign-on with auto-registration.
+- Enterprise-grade controls in a light package: RBAC (global + team roles),
+  AES-256-GCM encryption of integration secrets, CSRF + secure cookies in
+  production, and API tokens for automation.
 
 ## Getting Started
 
@@ -30,7 +52,7 @@ Key capabilities in the codebase today:
 - **PostgreSQL**: 13+
 
 ### Configuration
-Tokay uses a YAML configuration file (`tokay.yaml`) and environment variables.
+TokayOps uses a YAML configuration file (`tokay.yaml`) and environment variables.
 
 #### Environment Variables
 
@@ -78,8 +100,8 @@ global:
 Firehose sends full messages with timeline, updates and resolve notifications.
 
 **DM fallback:**
-- `dm_fallback_to_firehose: true` (default) — if no primary delivery, DM links to firehose message.
-- `dm_fallback_to_firehose: false` — DM omits the Slack link when primary is missing.
+- `dm_fallback_to_firehose: true` (default) - if no primary delivery, DM links to firehose message.
+- `dm_fallback_to_firehose: false` - DM omits the Slack link when primary is missing.
 
 ### Running Locally
 1. Start the database using Docker Compose:
@@ -106,7 +128,7 @@ go run cmd/tokayops/main.go seed
 ```
 
 ## User Management
-Tokay provides CLI commands to manage users directly, useful for initial admin creation.
+TokayOps provides CLI commands to manage users directly, useful for initial admin creation.
 
 **Create a new user:**
 ```bash
@@ -146,7 +168,7 @@ go run cmd/tokayops/main.go team create devops "DevOps Team" C01234567
 ### Slack Interactive
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/slack/interactive` | Slack button callbacks (signature‑verified, no AuthMiddleware) |
+| POST | `/slack/interactive` | Slack button callbacks (signature-verified, no AuthMiddleware) |
 
 ### API Tokens (Automation)
 API tokens allow programmatic access without CSRF protection.
@@ -182,7 +204,7 @@ Note: SSO users cannot change their name (synced from provider).
 `/api/v1/incidents/*` endpoints are aliased to `/api/v1/alert-groups/*` for backward compatibility.
 
 ## Deployment
-Tokay is packaged as a Docker container.
+TokayOps is packaged as a Docker container.
 
 ```bash
 docker build -t tokayops .
@@ -200,66 +222,21 @@ docker run -d \
 
 **Note**: In production, ensure `APP_ENV=production` is set to enable HTTPOnly Secure cookies (requires HTTPS).
 
-## Testing
-
-### Unit Tests
-```bash
-make test          # Run all unit tests
-go test ./...      # Same as above
-```
-
-### Integration Tests
-Integration tests require a PostgreSQL database. Use the provided scripts:
-
-```bash
-# Run all integration tests (auto-starts/stops DB)
-make test-integration
-
-# Quick summary (pass/fail only)
-make test-integration-quick
-
-# Run specific test group
-make test-pipeline              # Pipeline tests only
-make test-dispatcher            # Dispatcher tests only
-```
-
-### Iterative Debugging (AI-friendly)
-For faster iteration when debugging tests:
-
-```bash
-# 1. Start test database (stays running)
-make test-db-start
-
-# 2. Run specific test repeatedly
-make test-integration-run RUN=TestPipeline_HappyPath
-make test-integration-run RUN=TestPipeline_FullResolve
-
-# 3. Stop database when done
-make test-db-stop
-```
-
-### Direct Script Usage
-```bash
-./scripts/run_integration_tests.sh --help
-./scripts/run_integration_tests.sh --run TestPipeline --failures
-./scripts/test-db.sh status
-```
-
 ## Project Structure
-- `cmd/tokay`: Main application entry point.
+- `cmd/tokayops`: Main application entry point.
 - `internal/api`: REST API implementation (Echo).
 - `internal/auth`: Authentication logic (JWT, BCrypt).
 - `internal/config`: Configuration loading (YAML).
-- `internal/dispatcher`: Notification dispatch (Slack; provider abstraction planned in Epic 7, Telegram in Epic 8).
+- `internal/dispatcher`: Notification dispatch (Slack, Telegram) behind a provider abstraction.
 - `internal/engine`: Policy assignment engine.
 - `internal/ingester`: Alertmanager webhook ingestion.
-- `internal/model`: Data models (AlertGroup, Incident, User, etc.).
+- `internal/model`: Data models (AlertGroup, User, etc.).
 - `internal/store`: Database access layer (PostgreSQL).
 - `web`: Frontend assets (Vanilla JS + CSS).
 
 ## License
 
-TokayOps is **source-available** under the [Functional Source License 1.1 (Apache 2.0 Future License)](LICENSE.md) — `FSL-1.1-Apache-2.0`.
+TokayOps is **source-available** under the [Functional Source License 1.1 (Apache 2.0 Future License)](LICENSE.md) - `FSL-1.1-Apache-2.0`.
 
 You are free to self-host, modify, and redistribute TokayOps for any purpose **except** offering it to third parties as a commercial product or service that competes with TokayOps. Each released version automatically converts to the **Apache License 2.0** two years after its release.
 
