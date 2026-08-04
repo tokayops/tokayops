@@ -1275,7 +1275,9 @@ const Components = {
                         <i data-lucide="user"></i>
                     </div>
                     <div class="on-call-user-info">
-                        <span class="on-call-user-name">${l1Names ? escapeHtml(l1Names) : 'Not configured'}</span>
+                        <span class="on-call-user-name-wrap${l1Names ? ' text-tip' : ''}"${l1Names ? ` data-tip="${escapeAttr(l1Names)}"` : ''}>
+                            <span class="on-call-user-name">${l1Names ? escapeHtml(l1Names) : 'Not configured'}</span>
+                        </span>
                         ${override ? `
                             <span class="on-call-override-group">
                                 <span class="on-call-override-badge">Override</span>
@@ -1363,7 +1365,8 @@ const Components = {
             untilText = 'permanent';
         }
 
-        const nameText = hasOnCall ? escapeHtml(l1Users.map(u => u.name).join(', ')) : '—';
+        const namesRaw = hasOnCall ? l1Users.map(u => u.name).join(', ') : '';
+        const nameText = hasOnCall ? escapeHtml(namesRaw) : '—';
         const statusLabel = !schedule ? 'Not configured' : (override ? 'Override' : (hasOnCall ? 'Scheduled' : 'No one on-call'));
         const statusClass = !schedule ? 'unconfigured' : (override ? 'override' : (hasOnCall ? 'scheduled' : 'unconfigured'));
 
@@ -1378,7 +1381,7 @@ const Components = {
                         <div class="oncall-team-id">${escapeHtml(teamId)}</div>
                     </div>
                 </div>
-                <div class="oncall-cell" data-label="On-Call">
+                <div class="oncall-cell${hasOnCall ? ' text-tip' : ''}" data-label="On-Call"${hasOnCall ? ` data-tip="${escapeAttr(namesRaw)}"` : ''}>
                     <span class="oncall-user-name ${hasOnCall ? '' : 'is-muted'}">${nameText}</span>
                 </div>
                 <div class="oncall-cell" data-label="Until">
