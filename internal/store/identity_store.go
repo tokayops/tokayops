@@ -133,10 +133,11 @@ func (s *Store) GetUserByExternalID(provider, externalID string) (*model.User, e
 	row := s.db.QueryRow(query, provider, externalID)
 
 	var u model.User
-	var role, passwordHash, authProvider sql.NullString
-	if err := row.Scan(&u.ID, &u.Email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
+	var email, role, passwordHash, authProvider sql.NullString
+	if err := row.Scan(&u.ID, &email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
 		return nil, err
 	}
+	u.Email = email.String
 	u.Role = model.UserRole(role.String)
 	u.PasswordHash = passwordHash.String
 	u.AuthProvider = authProvider.String

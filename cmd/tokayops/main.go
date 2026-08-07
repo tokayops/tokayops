@@ -81,6 +81,17 @@ func main() {
 		log.Fatalf("Failed to init DB schema: %v", err)
 	}
 
+	// Offline schema migrations run right after InitDB, ahead of every
+	// runtime-only check below: they touch nothing that integration
+	// encryption or webhook networking configures, so a misconfigured
+	// integration must not be able to block one. Nothing further down starts
+	// either: HTTP, the scheduler and the background workers are all beyond
+	// this point.
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		runMigrate(st, os.Args[2:])
+		return
+	}
+
 	// Validate ENCRYPTION_KEY is set (required for integrations)
 	if _, err := config.GetEncryptionKey(); err != nil {
 		log.Fatalf("ENCRYPTION_KEY validation failed: %v", err)
@@ -450,6 +461,33 @@ func main() {
 	defer shutdownCancel()
 	if err := internalSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Internal server shutdown error: %v", err)
+	}
+}
+
+// runMigrate dispatches the offline schema migration subcommands. Destructive
+// operations live here rather than behind a startup flag on purpose: they must
+// never be a variant of a normal start.
+func runMigrate(st *store.Store, args []string) {
+	if len(args) == 0 {
+		log.Fatal("Usage: tokayops migrate reset-schedules")
+	}
+	switch subCmd := args[0]; subCmd {
+	case "reset-schedules":
+		if len(args) > 1 {
+			log.Fatal("Usage: tokayops migrate reset-schedules")
+		}
+		res, err := st.ResetLegacySchedules()
+		if err != nil {
+			log.Fatalf("Schedule reset failed: %v", err)
+		}
+		if res.AlreadyApplied {
+			log.Println("Schedule reset already applied - nothing to do.")
+			return
+		}
+		log.Printf("Schedule reset complete: %d schedule(s) deleted. "+
+			"Recreate schedules with the new binary running.", res.SchedulesDeleted)
+	default:
+		log.Fatalf("Unknown migrate command: %s", subCmd)
 	}
 }
 

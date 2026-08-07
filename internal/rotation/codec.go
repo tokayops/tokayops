@@ -16,11 +16,19 @@ import (
 // not a fallback for corrupt data.
 var ErrSnapshotDecode = errors.New("rotation: snapshot decode failed")
 
-// EncodeSnapshot serializes a snapshot in the canonical persistence form:
-// anchors normalized to UTC, nil group slices coerced to [], all fields
-// always present (nil pointers serialize as explicit null). Encoding
-// validates first; an invalid snapshot is never written.
-func EncodeSnapshot(s ScheduleRevisionSnapshot) ([]byte, error) {
+// CanonicalizeSnapshot returns the canonical persistence form of a snapshot:
+// anchors normalized to UTC and nil group slices coerced to []. It validates
+// afterwards, so an invalid snapshot never reaches a canonical form.
+//
+// This is the single definition of what storage does to a snapshot, and it is
+// exported for exactly that reason: a writer that canonicalizes before storing
+// keeps its in-memory copy equal to what a later read returns. Leaving the
+// step inside EncodeSnapshot made the transformation visible only to whoever
+// serialized, so an in-memory snapshot and its persisted twin could differ in
+// nil-vs-empty groups and in the anchor's location.
+//
+// The input is never mutated.
+func CanonicalizeSnapshot(s ScheduleRevisionSnapshot) (ScheduleRevisionSnapshot, error) {
 	c := s.clone()
 	for _, l := range [2]*RotationLayerSnapshot{&c.L1, &c.L2} {
 		if l.PhaseAnchorSlotStart != nil {
@@ -32,6 +40,17 @@ func EncodeSnapshot(s ScheduleRevisionSnapshot) ([]byte, error) {
 		}
 	}
 	if err := c.Validate(); err != nil {
+		return ScheduleRevisionSnapshot{}, err
+	}
+	return c, nil
+}
+
+// EncodeSnapshot serializes a snapshot in its canonical form, with all fields
+// always present (nil pointers serialize as explicit null). An invalid
+// snapshot is never written.
+func EncodeSnapshot(s ScheduleRevisionSnapshot) ([]byte, error) {
+	c, err := CanonicalizeSnapshot(s)
+	if err != nil {
 		return nil, err
 	}
 	return json.Marshal(c)
