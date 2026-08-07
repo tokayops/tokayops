@@ -368,6 +368,58 @@ func appendRevision(t *testing.T, s *Store, prev *scheduleconfig.ScheduleRevisio
 	return next
 }
 
+// TestRevisionKindRoundTrip covers the column that makes a deleted period a
+// record rather than a hole: a created schedule starts active, a deleted
+// revision survives the round trip unchanged, and a kind no reader knows is
+// refused by the schema even if the Go layer were bypassed.
+func TestRevisionKindRoundTrip(t *testing.T) {
+	s := setupTestDB(t)
+	at := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	initial := createSchedule(t, s, "devops", at)
+
+	if initial.Kind != scheduleconfig.RevisionActive {
+		t.Fatalf("initial kind = %q, want %q", initial.Kind, scheduleconfig.RevisionActive)
+	}
+	if got := readRevision(t, s, initial.ScheduleID, at); got.Kind != scheduleconfig.RevisionActive {
+		t.Fatalf("stored initial kind = %q, want %q", got.Kind, scheduleconfig.RevisionActive)
+	}
+
+	// Delete: close the active revision and record the inactive interval.
+	deletedAt := at.Add(24 * time.Hour)
+	deleted := &scheduleconfig.ScheduleRevision{
+		ID:            "rev-deleted",
+		ScheduleID:    initial.ScheduleID,
+		Version:       2,
+		Kind:          scheduleconfig.RevisionDeleted,
+		Snapshot:      initial.Snapshot,
+		EffectiveFrom: deletedAt,
+		RecordedAt:    deletedAt,
+	}
+	err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {
+		if err := tx.CloseRevision(context.Background(), initial.ScheduleID, initial.ID, deletedAt); err != nil {
+			return err
+		}
+		return tx.InsertRevision(context.Background(), deleted)
+	})
+	if err != nil {
+		t.Fatalf("insert deleted revision: %v", err)
+	}
+
+	got := readRevision(t, s, initial.ScheduleID, deletedAt.Add(time.Hour))
+	if got.Kind != scheduleconfig.RevisionDeleted {
+		t.Fatalf("kind after delete = %q, want %q", got.Kind, scheduleconfig.RevisionDeleted)
+	}
+	// The history before the delete is untouched and still active.
+	if before := readRevision(t, s, initial.ScheduleID, at.Add(time.Hour)); before.Kind != scheduleconfig.RevisionActive {
+		t.Fatalf("kind before delete = %q, want %q", before.Kind, scheduleconfig.RevisionActive)
+	}
+
+	_, err = s.db.Exec(`UPDATE schedule_revisions SET kind = 'archived' WHERE id = $1`, deleted.ID)
+	if err == nil {
+		t.Fatal("schema accepted an unknown revision kind")
+	}
+}
+
 func TestScheduleRevisionsAllowOnlyOneTail(t *testing.T) {
 	s := setupTestDB(t)
 	at := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)

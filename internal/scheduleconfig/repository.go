@@ -62,6 +62,24 @@ type ScheduleRoot struct {
 	DeletedAt           *time.Time
 }
 
+// Revision kinds. A schedule's history is one unbroken chain of revisions,
+// so the period during which the schedule did not exist is a revision too.
+//
+// Modelling deletion as an absence instead - closing the tail and leaving a
+// hole - would make a legitimate delete/recreate cycle indistinguishable from
+// a lost row, because a recreate clears deleted_at and the hole is all that
+// remains. A reader would then have to either flag every normal recreate as
+// corruption or never detect real corruption at all.
+const (
+	// RevisionActive is a revision that configures the schedule.
+	RevisionActive = "active"
+
+	// RevisionDeleted covers the interval in which the schedule was deleted.
+	// It carries the last valid snapshot so the column stays NOT NULL and
+	// decodable, but no reader may derive assignments from it.
+	RevisionDeleted = "deleted"
+)
+
 // ScheduleRevision is the persistence envelope around one configuration
 // snapshot. EffectiveTo nil marks the tail revision - the one in force from
 // EffectiveFrom onwards.
@@ -72,6 +90,7 @@ type ScheduleRevision struct {
 	ID            string
 	ScheduleID    string
 	Version       int64
+	Kind          string
 	Snapshot      rotation.ScheduleRevisionSnapshot
 	EffectiveFrom time.Time
 	EffectiveTo   *time.Time

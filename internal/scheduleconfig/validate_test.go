@@ -94,6 +94,7 @@ func TestPrepareRevisionRejects(t *testing.T) {
 				r.EffectiveTo = &to
 			},
 		},
+		{name: "unknown kind", mutate: func(r *ScheduleRevision) { r.Kind = "archived" }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -106,6 +107,27 @@ func TestPrepareRevisionRejects(t *testing.T) {
 	}
 	if err := PrepareRevision(nil); !errors.Is(err, ErrInvariantViolation) {
 		t.Fatalf("nil revision error = %v, want ErrInvariantViolation", err)
+	}
+}
+
+func TestPrepareRevisionDefaultsKind(t *testing.T) {
+	rev := testRevision(t)
+	if err := PrepareRevision(rev); err != nil {
+		t.Fatalf("PrepareRevision: %v", err)
+	}
+	if rev.Kind != RevisionActive {
+		t.Fatalf("kind = %q, want %q", rev.Kind, RevisionActive)
+	}
+
+	// A deleted revision is a legitimate value on the plain path: only the
+	// initial revision of a schedule is required to be active.
+	rev = testRevision(t)
+	rev.Kind = RevisionDeleted
+	if err := PrepareRevision(rev); err != nil {
+		t.Fatalf("PrepareRevision(deleted): %v", err)
+	}
+	if rev.Kind != RevisionDeleted {
+		t.Fatalf("kind = %q, want %q", rev.Kind, RevisionDeleted)
 	}
 }
 
@@ -286,6 +308,12 @@ func TestPrepareInitialScheduleRejects(t *testing.T) {
 				r.EffectiveTo = &to
 				return r
 			},
+		},
+		{
+			// A schedule cannot begin its history already deleted.
+			name: "deleted kind",
+			root: &ScheduleRoot{ID: "sched-1", TeamID: "devops"},
+			rev:  func(t *testing.T) *ScheduleRevision { r := testRevision(t); r.Kind = RevisionDeleted; return r },
 		},
 	}
 	for _, tc := range tests {

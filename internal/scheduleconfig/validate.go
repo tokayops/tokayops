@@ -50,6 +50,15 @@ func PrepareRevision(revision *ScheduleRevision) error {
 		return fmt.Errorf("%w: revision version must start at 1, got %d",
 			ErrInvariantViolation, revision.Version)
 	}
+	// Active is the default so that every existing caller keeps its meaning,
+	// but an unrecognised kind is rejected rather than stored: a reader that
+	// does not know a kind cannot decide whether it produces assignments.
+	if revision.Kind == "" {
+		revision.Kind = RevisionActive
+	}
+	if revision.Kind != RevisionActive && revision.Kind != RevisionDeleted {
+		return fmt.Errorf("%w: unknown revision kind %q", ErrInvariantViolation, revision.Kind)
+	}
 
 	// A snapshot that fails here is a bug, not bad user input: configuration
 	// is validated on the way into the planner, and the planner validates its
@@ -104,6 +113,10 @@ func PrepareInitialSchedule(root *ScheduleRoot, revision *ScheduleRevision) erro
 	}
 	if revision.EffectiveTo != nil {
 		return fmt.Errorf("%w: initial revision must be open-ended", ErrInvariantViolation)
+	}
+	if revision.Kind != RevisionActive {
+		return fmt.Errorf("%w: initial revision must be %s, got %q",
+			ErrInvariantViolation, RevisionActive, revision.Kind)
 	}
 
 	from := revision.EffectiveFrom

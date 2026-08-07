@@ -559,10 +559,16 @@ func (s *Store) InitDB() error {
 	-- ON DELETE RESTRICT: a schedule with history is never physically deleted
 	-- (soft delete via schedules.deleted_at), so cascading the history away
 	-- must be impossible at the schema level too.
+	--
+	-- kind makes the interval in which a schedule was deleted a record of its
+	-- own rather than a hole. Recreating a schedule clears deleted_at, so a
+	-- hole is all that would remain of a normal delete/recreate cycle and a
+	-- reader could not tell it from a lost revision.
 	CREATE TABLE IF NOT EXISTS schedule_revisions (
 		id             TEXT PRIMARY KEY,
 		schedule_id    TEXT NOT NULL REFERENCES schedules(id) ON DELETE RESTRICT,
 		version        BIGINT NOT NULL,
+		kind           TEXT NOT NULL DEFAULT 'active',
 		snapshot       JSONB NOT NULL,
 		effective_from TIMESTAMPTZ NOT NULL,
 		effective_to   TIMESTAMPTZ,
@@ -573,11 +579,17 @@ func (s *Store) InitDB() error {
 
 		UNIQUE (schedule_id, version),
 		CONSTRAINT schedule_revisions_version_positive CHECK (version >= 1),
+		CONSTRAINT schedule_revisions_kind_known CHECK (kind IN ('active', 'deleted')),
 		CHECK (effective_to IS NULL OR effective_to > effective_from)
 	);
+	ALTER TABLE schedule_revisions ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'active';
 	DO $$ BEGIN
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'schedule_revisions_version_positive') THEN
 			ALTER TABLE schedule_revisions ADD CONSTRAINT schedule_revisions_version_positive CHECK (version >= 1);
+		END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'schedule_revisions_kind_known') THEN
+			ALTER TABLE schedule_revisions ADD CONSTRAINT schedule_revisions_kind_known
+				CHECK (kind IN ('active', 'deleted'));
 		END IF;
 	END $$;
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_revisions_one_tail

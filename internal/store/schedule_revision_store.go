@@ -30,7 +30,7 @@ const (
 )
 
 // scheduleRevisionColumns is the SELECT list every revision scan expects.
-const scheduleRevisionColumns = `id, schedule_id, version, snapshot, effective_from, effective_to,
+const scheduleRevisionColumns = `id, schedule_id, version, kind, snapshot, effective_from, effective_to,
 	recorded_at, created_by, change_reason, change_summary`
 
 // ScheduleConfigRepository exposes the schedule configuration unit of work.
@@ -175,9 +175,9 @@ func (t *scheduleConfigTx) InsertRevision(ctx context.Context, revision *schedul
 
 	_, err = t.tx.ExecContext(ctx,
 		`INSERT INTO schedule_revisions
-		 (id, schedule_id, version, snapshot, effective_from, effective_to, recorded_at, created_by, change_reason, change_summary)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		revision.ID, revision.ScheduleID, revision.Version, snapshot,
+		 (id, schedule_id, version, kind, snapshot, effective_from, effective_to, recorded_at, created_by, change_reason, change_summary)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		revision.ID, revision.ScheduleID, revision.Version, revision.Kind, snapshot,
 		revision.EffectiveFrom, revision.EffectiveTo, revision.RecordedAt,
 		revision.CreatedBy, revision.ChangeReason, nullableJSON(summary))
 	if err != nil {
@@ -208,7 +208,7 @@ func scanScheduleRevision(row *sql.Row) (*scheduleconfig.ScheduleRevision, error
 		createdBy   sql.NullString
 		reason      sql.NullString
 	)
-	err := row.Scan(&rev.ID, &rev.ScheduleID, &rev.Version, &snapshot,
+	err := row.Scan(&rev.ID, &rev.ScheduleID, &rev.Version, &rev.Kind, &snapshot,
 		&rev.EffectiveFrom, &effectiveTo, &rev.RecordedAt, &createdBy, &reason, &summary)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, scheduleconfig.ErrRevisionNotFound
