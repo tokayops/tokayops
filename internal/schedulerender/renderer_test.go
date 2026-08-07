@@ -91,7 +91,7 @@ func TestHistoryBeforeEditIsUnchanged(t *testing.T) {
 		From: from, Until: until,
 	})
 
-	if !SameShifts(MergeAdjacent(before.Assignments), MergeAdjacent(after.Assignments)) {
+	if !sameShifts(MergeAdjacent(before.Assignments), MergeAdjacent(after.Assignments)) {
 		t.Fatal("a later edit changed the rendered past")
 	}
 }

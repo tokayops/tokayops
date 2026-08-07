@@ -127,7 +127,7 @@ func appendDistinct(ids []string, id string) []string {
 	return append(ids, id)
 }
 
-// SameShift compares two shifts by what they mean rather than by where they
+// sameShift compares two shifts by what they mean rather than by where they
 // came from: layer, source, group, members, both pairs of boundaries and the
 // slot count, but NOT the revisions that produced them.
 //
@@ -135,7 +135,12 @@ func appendDistinct(ids []string, id string) []string {
 // well would make the property untestable by construction, since a save
 // creates a revision by definition; whether the right revisions are recorded
 // is a separate assertion.
-func SameShift(a, b Shift) bool {
+//
+// Unexported deliberately: nothing outside this package needs it yet, and an
+// exported comparator is a promise to keep. If the preview flow turns out to
+// want "would this save change anything visible", exporting it then is a
+// one-line change.
+func sameShift(a, b Shift) bool {
 	return a.Layer == b.Layer &&
 		a.Source == b.Source &&
 		a.GroupID == b.GroupID &&
@@ -150,12 +155,12 @@ func SameShift(a, b Shift) bool {
 }
 
 // SameShifts is SameShift over two sequences.
-func SameShifts(a, b []Shift) bool {
+func sameShifts(a, b []Shift) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if !SameShift(a[i], b[i]) {
+		if !sameShift(a[i], b[i]) {
 			return false
 		}
 	}

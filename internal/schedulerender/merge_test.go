@@ -65,7 +65,7 @@ func TestMergeCountsDistinctSlots(t *testing.T) {
 // shift, including exactly on a handoff boundary, where a naive renderer
 // would double-advance.
 //
-// Shifts are compared with SameShifts, which ignores provenance: the save
+// Shifts are compared with sameShifts, which ignores provenance: the save
 // creates a revision by definition, so requiring the revision IDs to match
 // would make the property unsatisfiable rather than strict.
 func TestMetadataOnlySaveDoesNotSplitAShift(t *testing.T) {
@@ -149,7 +149,7 @@ func TestMetadataOnlySaveDoesNotSplitAShift(t *testing.T) {
 				if len(wantShifts) == 0 {
 					t.Fatal("nothing rendered; the case proves nothing")
 				}
-				if !SameShifts(gotShifts, wantShifts) {
+				if !sameShifts(gotShifts, wantShifts) {
 					t.Fatalf("a metadata-only save changed the rendered shifts:\n got %+v\nwant %+v",
 						gotShifts, wantShifts)
 				}
@@ -222,7 +222,7 @@ func TestMetadataOnlySaveMidSlotSplitsAtomicAssignments(t *testing.T) {
 	if spanning != 1 {
 		t.Fatalf("%d shifts record both revisions, want exactly the one the save fell in", spanning)
 	}
-	if !SameShifts(shifts, MergeAdjacent(assignmentsOf(unchanged, LayerL1))) {
+	if !sameShifts(shifts, MergeAdjacent(assignmentsOf(unchanged, LayerL1))) {
 		t.Fatal("the split survived the merge")
 	}
 }

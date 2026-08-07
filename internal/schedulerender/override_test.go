@@ -348,7 +348,7 @@ func TestOverlapResolutionIsPermutationInvariant(t *testing.T) {
 				Root: root(start), Revisions: revs, Overrides: shuffled,
 				From: start, Until: utc(2026, 5, 2, 11, 0),
 			})
-			if !SameShifts(MergeAdjacent(got.Assignments), wantShifts) {
+			if !sameShifts(MergeAdjacent(got.Assignments), wantShifts) {
 				t.Fatalf("set %d attempt %d: a different input order produced a different answer", setIdx, attempt)
 			}
 		}

@@ -8,13 +8,6 @@ import (
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
-// baseGroup is the rotation group serving a slot. It is absent when the layer
-// carries no rotation at all.
-type baseGroup struct {
-	GroupID string
-	UserIDs []string
-}
-
 // slotInput is one grid slot of one layer of one revision, plus everything
 // needed to decide who is actually on duty inside it.
 type slotInput struct {

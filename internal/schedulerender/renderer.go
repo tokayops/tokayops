@@ -164,27 +164,17 @@ func Render(in Input) (Result, error) {
 func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interval,
 	overrides []scheduleconfig.OverrideRevision) ([]Assignment, []Warning, error) {
 
-	snapshot := rev.Snapshot
-	layerSnapshot := snapshot.L1
-	if layer == LayerL2 {
-		layerSnapshot = snapshot.L2
-	}
-
-	// The grid comes from the revision's own timezone and policy. Even a
-	// disabled layer carries a valid policy, which is what lets an override
-	// on a switched-off layer still report the grid slot it fell in.
-	grid, err := rotation.NewGrid(snapshot.Timezone, layerSnapshot.Policy)
+	state, err := resolveLayer(rev, layer)
 	if err != nil {
-		return nil, nil, fmt.Errorf("schedulerender: revision %s layer %s: %w", rev.ID, layer, err)
+		return nil, nil, err
 	}
 
 	layerOverrides := overridesOfLayer(overrides, layer)
-	active := layerSnapshot.Enabled && len(layerSnapshot.Groups) > 0
-	if !active && len(layerOverrides) == 0 {
+	if !state.active && len(layerOverrides) == 0 {
 		return nil, nil, nil
 	}
 
-	slots := grid.SlotsOverlapping(bound.Start, bound.End)
+	slots := state.grid.SlotsOverlapping(bound.Start, bound.End)
 	if len(slots) == 0 {
 		return nil, nil, nil
 	}
@@ -195,10 +185,10 @@ func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interv
 	// Calling it per slot would multiply a cost that already grows with the
 	// age of the anchor.
 	position := 0
-	if active {
-		position, _, err = rotation.PositionAt(grid, layerSnapshot, slots[0].Start)
+	if state.active {
+		position, _, err = rotation.PositionAt(state.grid, state.snapshot, slots[0].Start)
 		if err != nil {
-			return nil, nil, fmt.Errorf("schedulerender: revision %s layer %s: %w", rev.ID, layer, err)
+			return nil, nil, layerError(rev, layer, err)
 		}
 	}
 
@@ -214,14 +204,9 @@ func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interv
 			Bound:      interval{Start: slot.Start, End: slot.End}.intersect(bound),
 			Overrides:  layerOverrides,
 		}
-		if active {
-			group := layerSnapshot.Groups[position]
-			in.Base = &baseGroup{GroupID: group.ID, UserIDs: group.Members}
-
-			position++
-			if position == len(layerSnapshot.Groups) {
-				position = 0
-			}
+		if state.active {
+			in.Base = state.groupAt(position)
+			position = state.nextPosition(position)
 		}
 
 		slotAssignments, slotWarnings := renderSlot(in)
@@ -229,16 +214,6 @@ func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interv
 		warnings = append(warnings, slotWarnings...)
 	}
 	return out, warnings, nil
-}
-
-func overridesOfLayer(overrides []scheduleconfig.OverrideRevision, layer string) []scheduleconfig.OverrideRevision {
-	var out []scheduleconfig.OverrideRevision
-	for _, o := range overrides {
-		if o.Layer == layer {
-			out = append(out, o)
-		}
-	}
-	return out
 }
 
 // coverage walks the revision chain and reports where it fails to tile the

@@ -74,7 +74,7 @@ func TestServiceRenderRangeMatchesPureRender(t *testing.T) {
 		Overrides: overrides,
 		From:      start, Until: until,
 	})
-	if !SameShifts(MergeAdjacent(got.Assignments), MergeAdjacent(want.Assignments)) {
+	if !sameShifts(MergeAdjacent(got.Assignments), MergeAdjacent(want.Assignments)) {
 		t.Fatal("loading through the service changed the answer")
 	}
 	if !got.HistoryComplete {

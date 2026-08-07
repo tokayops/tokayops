@@ -1,7 +1,6 @@
 package schedulerender
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/rotation"
@@ -59,16 +58,11 @@ func onCallSlots(rev scheduleconfig.ScheduleRevision, at time.Time) ([]layerSlot
 	out := make([]layerSlot, 0, 2)
 
 	for _, layer := range []string{LayerL1, LayerL2} {
-		layerSnapshot := rev.Snapshot.L1
-		if layer == LayerL2 {
-			layerSnapshot = rev.Snapshot.L2
-		}
-
-		grid, err := rotation.NewGrid(rev.Snapshot.Timezone, layerSnapshot.Policy)
+		state, err := resolveLayer(rev, layer)
 		if err != nil {
-			return nil, fmt.Errorf("schedulerender: revision %s layer %s: %w", rev.ID, layer, err)
+			return nil, err
 		}
-		slot := grid.SlotContaining(at)
+		slot := state.grid.SlotContaining(at)
 
 		ls := layerSlot{
 			layer: layer,
@@ -78,13 +72,12 @@ func onCallSlots(rev scheduleconfig.ScheduleRevision, at time.Time) ([]layerSlot
 		// An inactive rotation still yields a slot: an override on a layer
 		// that was switched off mid-shift is still in force, and it reports
 		// the grid slot it fell in.
-		if layerSnapshot.Enabled && len(layerSnapshot.Groups) > 0 {
-			position, _, err := rotation.PositionAt(grid, layerSnapshot, at)
+		if state.active {
+			position, _, err := rotation.PositionAt(state.grid, state.snapshot, at)
 			if err != nil {
-				return nil, fmt.Errorf("schedulerender: revision %s layer %s: %w", rev.ID, layer, err)
+				return nil, layerError(rev, layer, err)
 			}
-			group := layerSnapshot.Groups[position]
-			ls.base = &baseGroup{GroupID: group.ID, UserIDs: group.Members}
+			ls.base = state.groupAt(position)
 		}
 		out = append(out, ls)
 	}
