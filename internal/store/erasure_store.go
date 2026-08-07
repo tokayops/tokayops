@@ -6,12 +6,25 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/erasure"
-	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
 // AnonymizedUserName replaces the display name of an erased user. History
 // keeps referring to the user ID, so something has to render in its place.
 const AnonymizedUserName = "Deleted user"
+
+// dbTimestampResolution is the resolution PostgreSQL stores TIMESTAMPTZ at.
+// Go clocks carry nanoseconds, so a timestamp is truncated before it is
+// written: otherwise the value read back differs from the value handed in.
+//
+// scheduleconfig states the same fact for its own contract. Erasure has
+// nothing to do with schedule configuration, so it says it itself rather than
+// importing that package for one helper - two one-line statements of an
+// immutable property of the database cannot drift apart.
+const dbTimestampResolution = time.Microsecond
+
+func dbTimestamp(t time.Time) time.Time {
+	return t.Truncate(dbTimestampResolution)
+}
 
 // ErasureRepository exposes the user erasure unit of work. Like the schedule
 // configuration repository it stays out of StoreInterface.
@@ -54,7 +67,7 @@ type erasureTx struct {
 func (t *erasureTx) SetUserDeletedAt(ctx context.Context, userID string, at time.Time) error {
 	_, err := t.tx.ExecContext(ctx,
 		`UPDATE users SET deleted_at = $1 WHERE id = $2`,
-		scheduleconfig.NormalizeTimestamp(at), userID)
+		dbTimestamp(at), userID)
 	return err
 }
 
