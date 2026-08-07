@@ -56,11 +56,26 @@ func revTestSnapshot(t *testing.T, effectiveAt time.Time) rotation.ScheduleRevis
 	return plan.Snapshot
 }
 
-// seedTeam creates the team a schedule needs to reference.
-func seedTeam(t *testing.T, s *Store, teamID string) {
+// seedTeam creates the team a schedule needs to reference, plus any members
+// the configuration under test names. Membership is not decoration: the save
+// pipeline refuses a configuration that puts a non-member on call, so a
+// schedule fixture without members is a schedule that cannot be created.
+func seedTeam(t *testing.T, s *Store, teamID string, memberIDs ...string) {
 	t.Helper()
 	if err := s.CreateTeam(&model.Team{ID: teamID, Name: teamID}); err != nil {
 		t.Fatalf("CreateTeam %s: %v", teamID, err)
+	}
+	for _, id := range memberIDs {
+		// Idempotent: a test that seeds two teams names the same people in
+		// both, and the point of the helper is the membership, not the row.
+		if _, err := s.GetUserByID(id); err != nil {
+			if err := s.CreateUser(&model.User{ID: id, Name: id, Email: id + "@example.test"}); err != nil {
+				t.Fatalf("CreateUser %s: %v", id, err)
+			}
+		}
+		if err := s.AddTeamMember(teamID, id, model.TeamMemberRoleMember); err != nil {
+			t.Fatalf("AddTeamMember %s: %v", id, err)
+		}
 	}
 }
 
@@ -86,10 +101,10 @@ func countRows(t *testing.T, s *Store, query string, args ...any) int {
 
 func TestCreateScheduleIsAtomic(t *testing.T) {
 	s := setupTestDB(t)
-	seedTeam(t, s, "devops")
+	seedTeam(t, s, "devops", "alice", "bob")
 
 	now := time.Date(2026, 5, 4, 8, 30, 0, 123456789, time.UTC)
-	rev, err := newTestScheduleService(s, now).CreateSchedule(context.Background(), "devops", revTestConfig())
+	rev, err := newTestScheduleService(s, now).CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -176,12 +191,12 @@ func TestCreateScheduleRollsBackOnInjectedFailure(t *testing.T) {
 	for _, failAt := range []string{"before", "after"} {
 		t.Run(failAt, func(t *testing.T) {
 			s := setupTestDB(t)
-			seedTeam(t, s, "devops")
+			seedTeam(t, s, "devops", "alice", "bob")
 
 			repo := &failingRepo{inner: s.ScheduleConfigRepository(), failAt: failAt, err: boom}
 			svc := scheduleconfig.NewService(repo)
 
-			if _, err := svc.CreateSchedule(context.Background(), "devops", revTestConfig()); !errors.Is(err, boom) {
+			if _, err := svc.CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil); !errors.Is(err, boom) {
 				t.Fatalf("error = %v, want injected failure", err)
 			}
 			if n := countRows(t, s, `SELECT COUNT(*) FROM schedules`); n != 0 {
@@ -196,7 +211,7 @@ func TestCreateScheduleRollsBackOnInjectedFailure(t *testing.T) {
 
 func TestCreateScheduleConcurrentSameTeam(t *testing.T) {
 	s := setupTestDB(t)
-	seedTeam(t, s, "devops")
+	seedTeam(t, s, "devops", "alice", "bob")
 
 	svc := scheduleconfig.NewService(s.ScheduleConfigRepository())
 	var wg sync.WaitGroup
@@ -205,7 +220,7 @@ func TestCreateScheduleConcurrentSameTeam(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = svc.CreateSchedule(context.Background(), "devops", revTestConfig())
+			_, errs[i] = svc.CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil)
 		}(i)
 	}
 	wg.Wait()
@@ -236,12 +251,12 @@ func TestCreateScheduleConcurrentSameTeam(t *testing.T) {
 // twin of this is TestCreateScheduleReturnsCanonicalSnapshot.
 func TestCreateScheduleStoresCanonicalSnapshot(t *testing.T) {
 	s := setupTestDB(t)
-	seedTeam(t, s, "devops")
+	seedTeam(t, s, "devops", "alice", "bob")
 
 	// revTestConfig leaves L2 disabled with no groups: the planner emits a nil
 	// slice there, which is exactly what storage turns into [].
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
-	rev, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig())
+	rev, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -291,13 +306,28 @@ func TestInsertRevisionRejectsInvalidSnapshot(t *testing.T) {
 	}
 }
 
-// A team that does not exist is a caller mistake, so it must arrive as a typed
-// error rather than as a raw foreign key violation.
+// A team that does not exist is a caller mistake, so the repository must turn
+// the foreign key violation into a typed error rather than leak raw SQL.
+//
+// It is exercised at the repository level because the service refuses earlier
+// and more specifically: membership validation runs before any write, and an
+// unknown team has no members. The mapping still has to be right, since it is
+// what any other writer of this contract would hit.
 func TestCreateScheduleForUnknownTeam(t *testing.T) {
 	s := setupTestDB(t)
 
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
-	_, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "ghost-team", revTestConfig())
+	err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {
+		return tx.CreateInitialSchedule(context.Background(),
+			&scheduleconfig.ScheduleRoot{ID: "ghost-schedule", TeamID: "ghost-team"},
+			&scheduleconfig.ScheduleRevision{
+				ID:            "ghost-revision",
+				ScheduleID:    "ghost-schedule",
+				Version:       1,
+				Snapshot:      revTestSnapshot(t, start),
+				EffectiveFrom: start,
+			})
+	})
 	if !errors.Is(err, scheduleconfig.ErrTeamNotFound) {
 		t.Fatalf("error = %v, want ErrTeamNotFound", err)
 	}
@@ -308,6 +338,12 @@ func TestCreateScheduleForUnknownTeam(t *testing.T) {
 	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules`); n != 0 {
 		t.Fatalf("%d schedule roots were written", n)
 	}
+
+	// And through the service, the more specific refusal.
+	if _, err := newTestScheduleService(s, start).CreateSchedule(
+		context.Background(), "ghost-team", revTestConfig(), "", nil); !errors.Is(err, scheduleconfig.ErrUserNotTeamMember) {
+		t.Fatalf("service error = %v, want a membership rejection", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -317,8 +353,8 @@ func TestCreateScheduleForUnknownTeam(t *testing.T) {
 // createSchedule seeds a team and its schedule, returning the initial revision.
 func createSchedule(t *testing.T, s *Store, teamID string, at time.Time) *scheduleconfig.ScheduleRevision {
 	t.Helper()
-	seedTeam(t, s, teamID)
-	rev, err := newTestScheduleService(s, at).CreateSchedule(context.Background(), teamID, revTestConfig())
+	seedTeam(t, s, teamID, "alice", "bob")
+	rev, err := newTestScheduleService(s, at).CreateSchedule(context.Background(), teamID, revTestConfig(), "", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -368,10 +404,7 @@ func appendRevision(t *testing.T, s *Store, prev *scheduleconfig.ScheduleRevisio
 	return next
 }
 
-// TestRevisionKindRoundTrip covers the column that makes a deleted period a
-// record rather than a hole: a created schedule starts active, a deleted
-// revision survives the round trip unchanged, and a kind no reader knows is
-// refused by the schema even if the Go layer were bypassed.
+
 func TestRevisionKindRoundTrip(t *testing.T) {
 	s := setupTestDB(t)
 	at := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
@@ -747,8 +780,10 @@ func TestInsertScheduleEvent(t *testing.T) {
 			}
 		})
 	}
-	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_events`); n != 1 {
-		t.Fatalf("got %d events after the rejected inserts, want 1", n)
+	// One from creating the schedule, one written above; the rejected inserts
+	// added nothing.
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_events`); n != 2 {
+		t.Fatalf("got %d events after the rejected inserts, want 2", n)
 	}
 
 	// An event rolls back with the transaction it was written in.
@@ -764,8 +799,10 @@ func TestInsertScheduleEvent(t *testing.T) {
 	if !errors.Is(err, failure) {
 		t.Fatalf("error = %v, want the injected failure", err)
 	}
-	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_events`); n != 1 {
-		t.Fatalf("got %d events, want 1", n)
+	// Still the create event and the one written above: the rolled-back event
+	// left nothing behind.
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_events`); n != 2 {
+		t.Fatalf("got %d events, want 2", n)
 	}
 }
 
@@ -946,7 +983,7 @@ func TestInsertRevisionRejectsUnsetIdentifiersAndVersions(t *testing.T) {
 
 func TestCreateInitialScheduleRejectsUnsetRevisionID(t *testing.T) {
 	s := setupTestDB(t)
-	seedTeam(t, s, "devops")
+	seedTeam(t, s, "devops", "alice", "bob")
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
 
 	err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {

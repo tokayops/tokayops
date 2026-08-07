@@ -13,6 +13,8 @@ import (
 // every table that hangs off it by cascade.
 func seedLegacySchedule(t *testing.T, s *Store, teamID, scheduleID, userID string) {
 	t.Helper()
+	// No members: this fixture writes a pre-upgrade row directly, so there is
+	// no save pipeline here to validate membership for.
 	seedTeam(t, s, teamID)
 	if err := s.CreateUser(&model.User{ID: userID, Email: userID + "@example.com", Name: userID}); err != nil {
 		t.Fatalf("CreateUser %s: %v", userID, err)
@@ -92,9 +94,22 @@ func TestLegacyScheduleResetIsNotRepeatable(t *testing.T) {
 		t.Fatalf("first reset: %v", err)
 	}
 
-	// Recreate a schedule the way the new write path does.
+	// Recreate a schedule the way the new write path does. The reset removed
+	// the schedule rows, not the team or its people, but the legacy fixture
+	// only created one of them - the save pipeline needs both on the team.
+	for _, id := range []string{"alice", "bob"} {
+		if _, err := s.GetUserByID(id); err != nil {
+			if err := s.CreateUser(&model.User{ID: id, Name: id, Email: id + "@example.test"}); err != nil {
+				t.Fatalf("CreateUser %s: %v", id, err)
+			}
+		}
+		if err := s.AddTeamMember("devops", id, model.TeamMemberRoleMember); err != nil {
+			t.Fatalf("AddTeamMember %s: %v", id, err)
+		}
+	}
+
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
-	rev, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig())
+	rev, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil)
 	if err != nil {
 		t.Fatalf("recreate schedule: %v", err)
 	}
@@ -127,8 +142,8 @@ func TestLegacyScheduleResetRefusesWhenRevisionsExistWithoutMarker(t *testing.T)
 	seedLegacySchedule(t, s, "platform", "sched-platform", "bob")
 
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
-	seedTeam(t, s, "devops")
-	if _, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig()); err != nil {
+	seedTeam(t, s, "devops", "alice", "bob")
+	if _, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil); err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
 
