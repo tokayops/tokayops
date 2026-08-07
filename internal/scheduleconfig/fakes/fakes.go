@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/erasure"
+	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rotation"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
@@ -35,6 +36,9 @@ type ScheduleConfigRepo struct {
 
 	// Calls records method names in order, including the failing one.
 	Calls []string
+
+	// LockedUsers records the sorted argument of each LockUsers call.
+	LockedUsers [][]string
 }
 
 type fakeState struct {
@@ -43,6 +47,13 @@ type fakeState struct {
 	revisions map[string][]scheduleconfig.ScheduleRevision
 	overrides map[string][]scheduleconfig.OverrideRevision
 	events    map[string][]scheduleconfig.ScheduleEvent
+
+	// members is team id -> user ids and erased is the set of soft-deleted
+	// users. Membership is part of the state because it is part of the
+	// transaction: a command validates it, RemoveTeamMember changes it, and a
+	// rollback has to put it back.
+	members map[string][]string
+	erased  map[string]bool
 }
 
 func newState() fakeState {
@@ -52,6 +63,8 @@ func newState() fakeState {
 		revisions: map[string][]scheduleconfig.ScheduleRevision{},
 		overrides: map[string][]scheduleconfig.OverrideRevision{},
 		events:    map[string][]scheduleconfig.ScheduleEvent{},
+		members:   map[string][]string{},
+		erased:    map[string]bool{},
 	}
 }
 
@@ -76,6 +89,12 @@ func (s fakeState) clone() fakeState {
 	}
 	for k, v := range s.events {
 		c.events[k] = cloneEvents(v)
+	}
+	for k, v := range s.members {
+		c.members[k] = append([]string(nil), v...)
+	}
+	for k, v := range s.erased {
+		c.erased[k] = v
 	}
 	return c
 }
@@ -299,6 +318,42 @@ func (r *ScheduleConfigRepo) RootCount() int {
 	return len(r.state.roots)
 }
 
+// SeedLegacyRoot inserts a schedule row from before the revision model: a root
+// at config_version 0 with no revision chain.
+//
+// No command can produce that state, which is the point - it is what the
+// upgrade leaves behind, and the commands have to refuse it. Without a way to
+// build it here, the refusal would be untestable.
+func (r *ScheduleConfigRepo) SeedLegacyRoot(scheduleID, teamID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.roots[scheduleID] = scheduleconfig.ScheduleRoot{ID: scheduleID, TeamID: teamID}
+	r.state.teamIndex[teamID] = scheduleID
+}
+
+// SetTeamMembers replaces a team's membership.
+func (r *ScheduleConfigRepo) SetTeamMembers(teamID string, userIDs ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.members[teamID] = append([]string(nil), userIDs...)
+}
+
+// TeamMembers reports a team's membership, erased users included: it is the
+// raw state, not the read contract.
+func (r *ScheduleConfigRepo) TeamMembers(teamID string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.state.members[teamID]...)
+}
+
+// EraseUser marks a user soft-deleted, so the membership read stops returning
+// them without their team_members row going anywhere.
+func (r *ScheduleConfigRepo) EraseUser(userID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.erased[userID] = true
+}
+
 // fakeReadView answers the read contract from whichever state it is given:
 // the live one inside a transaction, a frozen copy inside a snapshot.
 type fakeReadView struct {
@@ -402,6 +457,101 @@ func (v *fakeReadView) GetOverrideProjectionInRange(ctx context.Context, schedul
 			continue
 		}
 		out = append(out, cloneOverride(rev))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].ValidFrom.Equal(out[j].ValidFrom) {
+			return out[i].ValidFrom.Before(out[j].ValidFrom)
+		}
+		return out[i].OverrideID < out[j].OverrideID
+	})
+	return out, nil
+}
+
+func (v *fakeReadView) GetRevisionByID(ctx context.Context, scheduleID, revisionID string) (*scheduleconfig.ScheduleRevision, error) {
+	if err := v.record("GetRevisionByID"); err != nil {
+		return nil, err
+	}
+	for _, rev := range v.state().revisions[scheduleID] {
+		if rev.ID == revisionID {
+			found := cloneRevision(rev)
+			return &found, nil
+		}
+	}
+	return nil, scheduleconfig.ErrRevisionNotFound
+}
+
+// ListRevisions returns the page newest first, exclusive of the cursor.
+func (v *fakeReadView) ListRevisions(ctx context.Context, scheduleID string, limit int, beforeVersion *int64) ([]scheduleconfig.ScheduleRevision, error) {
+	if err := v.record("ListRevisions"); err != nil {
+		return nil, err
+	}
+	var out []scheduleconfig.ScheduleRevision
+	for _, rev := range v.state().revisions[scheduleID] {
+		if beforeVersion != nil && rev.Version >= *beforeVersion {
+			continue
+		}
+		out = append(out, cloneRevision(rev))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Version > out[j].Version })
+	if limit >= 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// GetTeamMemberIDs excludes erased users, the way the JOIN in the store does.
+func (v *fakeReadView) GetTeamMemberIDs(ctx context.Context, teamID string) ([]string, error) {
+	if err := v.record("GetTeamMemberIDs"); err != nil {
+		return nil, err
+	}
+	s := v.state()
+	var out []string
+	for _, id := range s.members[teamID] {
+		if s.erased[id] {
+			continue
+		}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// overrideHeads picks the highest-numbered revision per override_id, keeping
+// tombstones: the head is the last thing that happened to an override,
+// whatever that was.
+func overrideHeads(revs []scheduleconfig.OverrideRevision) map[string]scheduleconfig.OverrideRevision {
+	heads := map[string]scheduleconfig.OverrideRevision{}
+	for _, rev := range revs {
+		if cur, ok := heads[rev.OverrideID]; !ok || rev.Revision > cur.Revision {
+			heads[rev.OverrideID] = rev
+		}
+	}
+	return heads
+}
+
+func (v *fakeReadView) GetOverrideHead(ctx context.Context, scheduleID, overrideID string) (*scheduleconfig.OverrideRevision, error) {
+	if err := v.record("GetOverrideHead"); err != nil {
+		return nil, err
+	}
+	head, ok := overrideHeads(v.state().overrides[scheduleID])[overrideID]
+	if !ok {
+		return nil, scheduleconfig.ErrOverrideNotFound
+	}
+	found := cloneOverride(head)
+	return &found, nil
+}
+
+func (v *fakeReadView) ListOverrideHeads(ctx context.Context, scheduleID string, includeDeleted bool) ([]scheduleconfig.OverrideRevision, error) {
+	if err := v.record("ListOverrideHeads"); err != nil {
+		return nil, err
+	}
+	heads := overrideHeads(v.state().overrides[scheduleID])
+	out := make([]scheduleconfig.OverrideRevision, 0, len(heads))
+	for _, head := range heads {
+		if head.Deleted && !includeDeleted {
+			continue
+		}
+		out = append(out, cloneOverride(head))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].ValidFrom.Equal(out[j].ValidFrom) {
@@ -567,6 +717,13 @@ type ErasureRepo struct {
 	// Calls records "Method:userID" in order.
 	Calls []string
 
+	// Users, Tails and Overrides are the state the guards read. They are
+	// exported because a test sets them up directly: there is no command in
+	// this fake that would put a user on call.
+	Users     map[string]erasure.LockedUser
+	Tails     []erasure.ScheduleTail
+	Overrides []erasure.OverrideAssignment
+
 	deleted    map[string]time.Time
 	anonymized map[string]bool
 	wiped      map[string][]string
@@ -576,10 +733,18 @@ type ErasureRepo struct {
 func NewErasureRepo() *ErasureRepo {
 	return &ErasureRepo{
 		FailOn:     map[string]error{},
+		Users:      map[string]erasure.LockedUser{},
 		deleted:    map[string]time.Time{},
 		anonymized: map[string]bool{},
 		wiped:      map[string][]string{},
 	}
+}
+
+// AddUser registers a user the erasure command can lock.
+func (r *ErasureRepo) AddUser(id, role string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Users[id] = erasure.LockedUser{ID: id, Role: role}
 }
 
 // WithinTx runs fn, discarding every recorded effect if it fails.
@@ -645,6 +810,68 @@ type erasureTx struct {
 	repo *ErasureRepo
 }
 
+// LockAdminLifecycle and LockUser record that they happened and in what order.
+// A single-threaded fake has nothing to serialize; what a test can check is
+// that the ordering the design requires is the ordering the code performs.
+func (t *erasureTx) LockAdminLifecycle(ctx context.Context) error {
+	return t.repo.record("LockAdminLifecycle", "")
+}
+
+func (t *erasureTx) LockUser(ctx context.Context, userID string) (*erasure.LockedUser, error) {
+	if err := t.repo.record("LockUser", userID); err != nil {
+		return nil, err
+	}
+	user, ok := t.repo.Users[userID]
+	if !ok {
+		return nil, erasure.ErrUserNotFound
+	}
+	if at, erased := t.repo.deleted[userID]; erased {
+		stamp := at
+		user.DeletedAt = &stamp
+	}
+	return &user, nil
+}
+
+func (t *erasureTx) CountActiveAdmins(ctx context.Context) (int, error) {
+	if err := t.repo.record("CountActiveAdmins", ""); err != nil {
+		return 0, err
+	}
+	count := 0
+	for id, u := range t.repo.Users {
+		if _, erased := t.repo.deleted[id]; erased {
+			continue
+		}
+		if u.Role == string(model.UserRoleAdmin) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (t *erasureTx) ListScheduleTailsLocked(ctx context.Context) ([]erasure.ScheduleTail, error) {
+	if err := t.repo.record("ListScheduleTailsLocked", ""); err != nil {
+		return nil, err
+	}
+	return append([]erasure.ScheduleTail(nil), t.repo.Tails...), nil
+}
+
+func (t *erasureTx) ListLiveOverrideHeadsForUser(ctx context.Context, userID string, at time.Time) ([]erasure.OverrideAssignment, error) {
+	if err := t.repo.record("ListLiveOverrideHeadsForUser", userID); err != nil {
+		return nil, err
+	}
+	var out []erasure.OverrideAssignment
+	for _, o := range t.repo.Overrides {
+		if o.ValidTo.After(at) {
+			out = append(out, o)
+		}
+	}
+	return out, nil
+}
+
+func (t *erasureTx) DeleteUserTeamMemberships(ctx context.Context, userID string) error {
+	return t.wipe("DeleteUserTeamMemberships", userID)
+}
+
 func (t *erasureTx) SetUserDeletedAt(ctx context.Context, userID string, at time.Time) error {
 	if err := t.repo.record("SetUserDeletedAt", userID); err != nil {
 		return err
@@ -687,6 +914,62 @@ func (t *erasureTx) NullifyOverrideRevisionReasons(ctx context.Context, userID s
 
 func (t *erasureTx) NullifyScheduleRevisionChangeReasons(ctx context.Context, userID string) error {
 	return t.wipe("NullifyScheduleRevisionChangeReasons", userID)
+}
+
+func (t *scheduleConfigTx) SetScheduleDeleted(ctx context.Context, scheduleID string, deletedAt *time.Time) error {
+	if err := t.repo.record("SetScheduleDeleted"); err != nil {
+		return err
+	}
+	root, ok := t.repo.state.roots[scheduleID]
+	if !ok {
+		return scheduleconfig.ErrScheduleNotFound
+	}
+	root.DeletedAt = cloneTime(deletedAt)
+	t.repo.state.roots[scheduleID] = root
+	return nil
+}
+
+func (t *scheduleConfigTx) MaxOverrideRecordedAt(ctx context.Context, scheduleID string) (*time.Time, error) {
+	if err := t.repo.record("MaxOverrideRecordedAt"); err != nil {
+		return nil, err
+	}
+	var max *time.Time
+	for _, rev := range t.repo.state.overrides[scheduleID] {
+		if max == nil || rev.RecordedAt.After(*max) {
+			at := rev.RecordedAt
+			max = &at
+		}
+	}
+	return max, nil
+}
+
+// LockUsers records that it happened and what it was asked to lock; there is
+// nothing to lock in a single-threaded fake. What a test can check is the
+// ORDER - that it precedes LockSchedule - and that is the whole point of the
+// method, so recording the order is exactly the right fidelity.
+func (t *scheduleConfigTx) LockUsers(ctx context.Context, userIDs []string) error {
+	if err := t.repo.record("LockUsers"); err != nil {
+		return err
+	}
+	locked := append([]string(nil), userIDs...)
+	sort.Strings(locked)
+	t.repo.LockedUsers = append(t.repo.LockedUsers, locked)
+	return nil
+}
+
+func (t *scheduleConfigTx) DeleteTeamMembership(ctx context.Context, teamID, userID string) error {
+	if err := t.repo.record("DeleteTeamMembership"); err != nil {
+		return err
+	}
+	members := t.repo.state.members[teamID]
+	out := make([]string, 0, len(members))
+	for _, id := range members {
+		if id != userID {
+			out = append(out, id)
+		}
+	}
+	t.repo.state.members[teamID] = out
+	return nil
 }
 
 // Compile-time proof the fakes satisfy the interfaces they double.
