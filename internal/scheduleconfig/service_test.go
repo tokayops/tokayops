@@ -182,6 +182,79 @@ func TestCreateScheduleRejectsInvalidInputBeforeWriting(t *testing.T) {
 	}
 }
 
+// A database hands back data, not aliases. The fake must do the same, or a
+// test that mutates a configuration after saving it would silently "change
+// history" and pass against behaviour PostgreSQL would never produce.
+func TestFakeStoresSnapshotsByValue(t *testing.T) {
+	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
+
+	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	if err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+
+	// Mutate everything reachable through the returned revision.
+	rev.Snapshot.L1.Groups[0].Members[0] = "mallory"
+	rev.Snapshot.L1.Groups = append(rev.Snapshot.L1.Groups, rotation.RotationGroup{ID: "extra"})
+	*rev.Snapshot.L1.StartPosition = 99
+	*rev.Snapshot.L1.PhaseAnchorSlotStart = time.Unix(0, 0).UTC()
+	*rev.Snapshot.L1.Policy.HandoffDay = 6
+	rev.ChangeSummary.L1PhaseAction = "tampered"
+
+	stored := repo.Revisions(rev.ScheduleID)
+	if len(stored) != 1 {
+		t.Fatalf("got %d revisions, want 1", len(stored))
+	}
+	got := stored[0].Snapshot
+	if len(got.L1.Groups) != 2 {
+		t.Fatalf("stored group count changed to %d", len(got.L1.Groups))
+	}
+	if got.L1.Groups[0].Members[0] != "alice" {
+		t.Fatalf("stored member changed to %q", got.L1.Groups[0].Members[0])
+	}
+	if *got.L1.StartPosition != 0 {
+		t.Fatalf("stored start position changed to %d", *got.L1.StartPosition)
+	}
+	if got.L1.PhaseAnchorSlotStart.Equal(time.Unix(0, 0).UTC()) {
+		t.Fatal("stored phase anchor was mutated through the caller's pointer")
+	}
+	if *got.L1.Policy.HandoffDay != 1 {
+		t.Fatalf("stored handoff day changed to %d", *got.L1.Policy.HandoffDay)
+	}
+	if stored[0].ChangeSummary.L1PhaseAction == "tampered" {
+		t.Fatal("stored change summary was mutated through the caller's pointer")
+	}
+
+	// Mutating what a diagnostic accessor returns must not reach back either.
+	stored[0].Snapshot.L1.Groups[0].Members[0] = "mallory"
+	if again := repo.Revisions(rev.ScheduleID); again[0].Snapshot.L1.Groups[0].Members[0] != "alice" {
+		t.Fatal("the accessor handed out an alias of the stored revision")
+	}
+}
+
+func TestFakeRollbackRestoresDeepState(t *testing.T) {
+	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
+	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	if err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+
+	boom := errors.New("injected failure")
+	err = repo.WithinTx(context.Background(), func(tx scheduleconfig.ScheduleConfigTx) error {
+		if err := tx.CloseRevision(context.Background(), rev.ScheduleID, rev.ID,
+			rev.EffectiveFrom.Add(time.Hour)); err != nil {
+			return err
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("error = %v, want the injected failure", err)
+	}
+	if got := repo.Revisions(rev.ScheduleID); got[0].EffectiveTo != nil {
+		t.Fatalf("revision stayed closed at %v after rollback", *got[0].EffectiveTo)
+	}
+}
+
 // The current override projection must pick the latest revision per override
 // first and drop tombstones only afterwards; the reverse order resurrects the
 // revision that preceded a delete.

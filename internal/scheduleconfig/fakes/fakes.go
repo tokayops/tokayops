@@ -8,12 +8,14 @@ package fakes
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/erasure"
+	"github.com/tokayops/tokayops/internal/rotation"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
@@ -53,27 +55,138 @@ func newState() fakeState {
 	}
 }
 
-// clone copies deeply enough for rollback: slice elements are copied by value
-// and the fake only ever replaces whole elements, never mutates through a
-// shared pointer.
+// clone deep-copies the whole state. Everything crossing the fake's boundary -
+// stored values, the rollback snapshot and the values handed back out - goes
+// through these helpers, because a database hands back data, not aliases: a
+// caller that mutates a snapshot's group members after storing it must not
+// see the "stored" copy change with it.
 func (s fakeState) clone() fakeState {
 	c := newState()
 	for k, v := range s.roots {
-		c.roots[k] = v
+		c.roots[k] = cloneRoot(v)
 	}
 	for k, v := range s.teamIndex {
 		c.teamIndex[k] = v
 	}
 	for k, v := range s.revisions {
-		c.revisions[k] = append([]scheduleconfig.ScheduleRevision(nil), v...)
+		c.revisions[k] = cloneRevisions(v)
 	}
 	for k, v := range s.overrides {
-		c.overrides[k] = append([]scheduleconfig.OverrideRevision(nil), v...)
+		c.overrides[k] = cloneOverrides(v)
 	}
 	for k, v := range s.events {
-		c.events[k] = append([]scheduleconfig.ScheduleEvent(nil), v...)
+		c.events[k] = cloneEvents(v)
 	}
 	return c
+}
+
+func cloneTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	v := *t
+	return &v
+}
+
+func cloneString(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	v := *s
+	return &v
+}
+
+func cloneInt(i *int) *int {
+	if i == nil {
+		return nil
+	}
+	v := *i
+	return &v
+}
+
+func cloneRoot(r scheduleconfig.ScheduleRoot) scheduleconfig.ScheduleRoot {
+	r.HistoryCompleteFrom = cloneTime(r.HistoryCompleteFrom)
+	r.DeletedAt = cloneTime(r.DeletedAt)
+	return r
+}
+
+func cloneLayer(l rotation.RotationLayerSnapshot) rotation.RotationLayerSnapshot {
+	l.Policy.HandoffDay = cloneInt(l.Policy.HandoffDay)
+	l.PhaseAnchorSlotStart = cloneTime(l.PhaseAnchorSlotStart)
+	l.StartPosition = cloneInt(l.StartPosition)
+	if l.Groups != nil {
+		groups := make([]rotation.RotationGroup, len(l.Groups))
+		for i, g := range l.Groups {
+			groups[i] = rotation.RotationGroup{
+				ID:      g.ID,
+				Members: append([]string(nil), g.Members...),
+			}
+		}
+		l.Groups = groups
+	}
+	return l
+}
+
+func cloneSnapshot(s rotation.ScheduleRevisionSnapshot) rotation.ScheduleRevisionSnapshot {
+	s.L1 = cloneLayer(s.L1)
+	s.L2 = cloneLayer(s.L2)
+	return s
+}
+
+func cloneRevision(r scheduleconfig.ScheduleRevision) scheduleconfig.ScheduleRevision {
+	r.Snapshot = cloneSnapshot(r.Snapshot)
+	r.EffectiveTo = cloneTime(r.EffectiveTo)
+	r.CreatedBy = cloneString(r.CreatedBy)
+	r.ChangeReason = cloneString(r.ChangeReason)
+	if r.ChangeSummary != nil {
+		summary := *r.ChangeSummary
+		r.ChangeSummary = &summary
+	}
+	return r
+}
+
+func cloneRevisions(revs []scheduleconfig.ScheduleRevision) []scheduleconfig.ScheduleRevision {
+	if revs == nil {
+		return nil
+	}
+	out := make([]scheduleconfig.ScheduleRevision, len(revs))
+	for i, rev := range revs {
+		out[i] = cloneRevision(rev)
+	}
+	return out
+}
+
+func cloneOverride(o scheduleconfig.OverrideRevision) scheduleconfig.OverrideRevision {
+	o.Reason = cloneString(o.Reason)
+	o.RecordedBy = cloneString(o.RecordedBy)
+	return o
+}
+
+func cloneOverrides(revs []scheduleconfig.OverrideRevision) []scheduleconfig.OverrideRevision {
+	if revs == nil {
+		return nil
+	}
+	out := make([]scheduleconfig.OverrideRevision, len(revs))
+	for i, rev := range revs {
+		out[i] = cloneOverride(rev)
+	}
+	return out
+}
+
+func cloneEvent(e scheduleconfig.ScheduleEvent) scheduleconfig.ScheduleEvent {
+	e.Payload = append(json.RawMessage(nil), e.Payload...)
+	return e
+}
+
+func cloneEvents(events []scheduleconfig.ScheduleEvent) []scheduleconfig.ScheduleEvent {
+	if events == nil {
+		return nil
+	}
+	out := make([]scheduleconfig.ScheduleEvent, len(events))
+	for i, e := range events {
+		out[i] = cloneEvent(e)
+	}
+	return out
 }
 
 // NewScheduleConfigRepo returns an empty repository.
@@ -111,7 +224,7 @@ func (r *ScheduleConfigRepo) Root(scheduleID string) (scheduleconfig.ScheduleRoo
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	root, ok := r.state.roots[scheduleID]
-	return root, ok
+	return cloneRoot(root), ok
 }
 
 // RootByTeam returns the schedule root owned by a team, if present.
@@ -123,14 +236,14 @@ func (r *ScheduleConfigRepo) RootByTeam(teamID string) (scheduleconfig.ScheduleR
 		return scheduleconfig.ScheduleRoot{}, false
 	}
 	root, ok := r.state.roots[id]
-	return root, ok
+	return cloneRoot(root), ok
 }
 
 // Revisions returns the revisions of a schedule ordered by version.
 func (r *ScheduleConfigRepo) Revisions(scheduleID string) []scheduleconfig.ScheduleRevision {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := append([]scheduleconfig.ScheduleRevision(nil), r.state.revisions[scheduleID]...)
+	out := cloneRevisions(r.state.revisions[scheduleID])
 	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
 	return out
 }
@@ -140,14 +253,14 @@ func (r *ScheduleConfigRepo) Revisions(scheduleID string) []scheduleconfig.Sched
 func (r *ScheduleConfigRepo) OverrideRevisions(scheduleID string) []scheduleconfig.OverrideRevision {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]scheduleconfig.OverrideRevision(nil), r.state.overrides[scheduleID]...)
+	return cloneOverrides(r.state.overrides[scheduleID])
 }
 
 // Events returns the schedule events recorded for a schedule.
 func (r *ScheduleConfigRepo) Events(scheduleID string) []scheduleconfig.ScheduleEvent {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]scheduleconfig.ScheduleEvent(nil), r.state.events[scheduleID]...)
+	return cloneEvents(r.state.events[scheduleID])
 }
 
 // RootCount reports how many schedule roots exist.
@@ -183,9 +296,9 @@ func (t *scheduleConfigTx) CreateInitialSchedule(ctx context.Context, root *sche
 	root.ConfigVersion = 1
 	root.HistoryCompleteFrom = &from
 
-	s.roots[root.ID] = *root
+	s.roots[root.ID] = cloneRoot(*root)
 	s.teamIndex[root.TeamID] = root.ID
-	s.revisions[root.ID] = append(s.revisions[root.ID], *initial)
+	s.revisions[root.ID] = append(s.revisions[root.ID], cloneRevision(*initial))
 	return nil
 }
 
@@ -197,7 +310,8 @@ func (t *scheduleConfigTx) LockSchedule(ctx context.Context, scheduleID string) 
 	if !ok {
 		return nil, scheduleconfig.ErrScheduleNotFound
 	}
-	return &root, nil
+	locked := cloneRoot(root)
+	return &locked, nil
 }
 
 func (t *scheduleConfigTx) GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*scheduleconfig.ScheduleRevision, error) {
@@ -211,7 +325,7 @@ func (t *scheduleConfigTx) GetEffectiveRevision(ctx context.Context, scheduleID 
 		if rev.EffectiveTo != nil && !rev.EffectiveTo.After(at) {
 			continue
 		}
-		found := rev
+		found := cloneRevision(rev)
 		return &found, nil
 	}
 	return nil, scheduleconfig.ErrRevisionNotFound
@@ -223,7 +337,7 @@ func (t *scheduleConfigTx) GetTailRevision(ctx context.Context, scheduleID strin
 	}
 	for _, rev := range t.repo.state.revisions[scheduleID] {
 		if rev.EffectiveTo == nil {
-			found := rev
+			found := cloneRevision(rev)
 			return &found, nil
 		}
 	}
@@ -256,6 +370,13 @@ func (t *scheduleConfigTx) InsertRevision(ctx context.Context, revision *schedul
 	if revision == nil {
 		return fmt.Errorf("%w: nil revision", scheduleconfig.ErrInvariantViolation)
 	}
+	if revision.ID == "" || revision.ScheduleID == "" {
+		return fmt.Errorf("%w: revision needs an id and a schedule id", scheduleconfig.ErrInvariantViolation)
+	}
+	if revision.Version < 1 {
+		return fmt.Errorf("%w: revision version must start at 1, got %d",
+			scheduleconfig.ErrInvariantViolation, revision.Version)
+	}
 	s := t.repo.state
 	if _, ok := s.roots[revision.ScheduleID]; !ok {
 		return scheduleconfig.ErrScheduleNotFound
@@ -268,7 +389,7 @@ func (t *scheduleConfigTx) InsertRevision(ctx context.Context, revision *schedul
 			return fmt.Errorf("%w: schedule would have two open revisions", scheduleconfig.ErrInvariantViolation)
 		}
 	}
-	s.revisions[revision.ScheduleID] = append(s.revisions[revision.ScheduleID], *revision)
+	s.revisions[revision.ScheduleID] = append(s.revisions[revision.ScheduleID], cloneRevision(*revision))
 	return nil
 }
 
@@ -292,14 +413,22 @@ func (t *scheduleConfigTx) InsertScheduleEvent(ctx context.Context, event *sched
 	if err := t.repo.record("InsertScheduleEvent"); err != nil {
 		return err
 	}
+	// Not a no-op on nil: an event that belongs to a configuration change must
+	// not let a failure to assemble it commit silently.
 	if event == nil {
-		return nil
+		return fmt.Errorf("%w: nil schedule event", scheduleconfig.ErrInvariantViolation)
+	}
+	if event.EventType == "" {
+		return fmt.Errorf("%w: schedule event needs a type", scheduleconfig.ErrInvariantViolation)
+	}
+	if len(event.Payload) > 0 && !json.Valid(event.Payload) {
+		return fmt.Errorf("%w: schedule event payload is not valid JSON", scheduleconfig.ErrInvariantViolation)
 	}
 	s := t.repo.state
 	if _, ok := s.roots[event.ScheduleID]; !ok {
 		return scheduleconfig.ErrScheduleNotFound
 	}
-	s.events[event.ScheduleID] = append(s.events[event.ScheduleID], *event)
+	s.events[event.ScheduleID] = append(s.events[event.ScheduleID], cloneEvent(*event))
 	return nil
 }
 
@@ -321,7 +450,7 @@ func (t *scheduleConfigTx) GetCurrentOverrides(ctx context.Context, scheduleID s
 		if rev.Deleted {
 			continue
 		}
-		out = append(out, rev)
+		out = append(out, cloneOverride(rev))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].ValidFrom.Equal(out[j].ValidFrom) {
@@ -348,7 +477,7 @@ func (t *scheduleConfigTx) InsertOverrideRevision(ctx context.Context, rev *sche
 			return fmt.Errorf("%w: duplicate override revision %d", scheduleconfig.ErrInvariantViolation, rev.Revision)
 		}
 	}
-	s.overrides[rev.ScheduleID] = append(s.overrides[rev.ScheduleID], *rev)
+	s.overrides[rev.ScheduleID] = append(s.overrides[rev.ScheduleID], cloneOverride(*rev))
 	return nil
 }
 

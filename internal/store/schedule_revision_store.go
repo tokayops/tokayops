@@ -14,11 +14,20 @@ import (
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
-// scheduleTeamUniqueConstraint is the UNIQUE(team_id) constraint on schedules.
-// Only this constraint means "the team already has a schedule"; any other
-// unique violation (a repeated primary key, say) has different semantics and
-// must not be laundered into a caller-recoverable conflict.
-const scheduleTeamUniqueConstraint = "schedules_team_id_key"
+const (
+	// scheduleTeamUniqueConstraint is the UNIQUE(team_id) constraint on
+	// schedules. Only this constraint means "the team already has a
+	// schedule"; any other unique violation (a repeated primary key, say) has
+	// different semantics and must not be laundered into a caller-recoverable
+	// conflict.
+	scheduleTeamUniqueConstraint = "schedules_team_id_key"
+
+	// scheduleTeamFKConstraint is the schedules -> teams foreign key. Only
+	// this one means "the caller named a team that does not exist"; every
+	// other foreign key on the revision tables points at rows this package
+	// writes itself, so violating one is a bug.
+	scheduleTeamFKConstraint = "schedules_team_id_fkey"
+)
 
 // scheduleRevisionColumns is the SELECT list every revision scan expects.
 const scheduleRevisionColumns = `id, schedule_id, version, snapshot, effective_from, effective_to,
@@ -183,6 +192,15 @@ func (t *scheduleConfigTx) InsertRevision(ctx context.Context, revision *schedul
 	if revision == nil {
 		return fmt.Errorf("%w: nil revision", scheduleconfig.ErrInvariantViolation)
 	}
+	// An empty string is a perfectly good TEXT primary key, so an unset ID
+	// would be stored rather than rejected.
+	if revision.ID == "" || revision.ScheduleID == "" {
+		return fmt.Errorf("%w: revision needs an id and a schedule id", scheduleconfig.ErrInvariantViolation)
+	}
+	if revision.Version < 1 {
+		return fmt.Errorf("%w: revision version must start at 1, got %d",
+			scheduleconfig.ErrInvariantViolation, revision.Version)
+	}
 	snapshot, err := rotation.EncodeSnapshot(revision.Snapshot)
 	if err != nil {
 		return err
@@ -319,8 +337,14 @@ func mapScheduleWriteError(err error) error {
 			return scheduleconfig.ErrScheduleExists
 		}
 		return fmt.Errorf("%w: unique constraint %q: %s", scheduleconfig.ErrInvariantViolation, pqErr.Constraint, pqErr.Message)
-	case "check_violation", "exclusion_violation":
-		return fmt.Errorf("%w: constraint %q: %s", scheduleconfig.ErrInvariantViolation, pqErr.Constraint, pqErr.Message)
+	case "foreign_key_violation":
+		if pqErr.Constraint == scheduleTeamFKConstraint {
+			return scheduleconfig.ErrTeamNotFound
+		}
+		return fmt.Errorf("%w: foreign key %q: %s", scheduleconfig.ErrInvariantViolation, pqErr.Constraint, pqErr.Message)
+	case "check_violation", "exclusion_violation", "not_null_violation":
+		return fmt.Errorf("%w: constraint %q on column %q: %s",
+			scheduleconfig.ErrInvariantViolation, pqErr.Constraint, pqErr.Column, pqErr.Message)
 	}
 	return err
 }

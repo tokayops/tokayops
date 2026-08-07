@@ -16,15 +16,17 @@ func (t *scheduleConfigTx) InsertScheduleEvent(ctx context.Context, event *sched
 	return insertScheduleEventTx(ctx, t.tx, event)
 }
 
-// insertScheduleEventTx follows the shape of insertOutboxEventTx: nil is a
-// no-op, defaults are normalized here so callers cannot forget them.
+// insertScheduleEventTx normalizes defaults here so callers cannot forget
+// them. Unlike insertOutboxEventTx it does NOT treat nil as a no-op: an event
+// that must be part of a configuration change would otherwise turn a failure
+// to assemble it into a successful commit with no audit trail.
 //
 // The table carries no delivery columns. Consumers of schedule events are
 // internal (handoff timers, usergroup sync), unlike the customer webhooks
 // event_outbox fans out to, and event_outbox is bound to alert groups anyway.
 func insertScheduleEventTx(ctx context.Context, tx *sql.Tx, event *scheduleconfig.ScheduleEvent) error {
 	if event == nil {
-		return nil
+		return fmt.Errorf("%w: nil schedule event", scheduleconfig.ErrInvariantViolation)
 	}
 	if event.ScheduleID == "" {
 		return fmt.Errorf("%w: schedule event needs a schedule id", scheduleconfig.ErrInvariantViolation)
@@ -37,6 +39,11 @@ func insertScheduleEventTx(ctx context.Context, tx *sql.Tx, event *scheduleconfi
 	}
 	if len(event.Payload) == 0 {
 		event.Payload = json.RawMessage("{}")
+	}
+	// Checked here so malformed payloads read as a contract violation rather
+	// than a raw PostgreSQL JSON parse error.
+	if !json.Valid(event.Payload) {
+		return fmt.Errorf("%w: schedule event payload is not valid JSON", scheduleconfig.ErrInvariantViolation)
 	}
 	event.RecordedAt = normalizeRecordedAt(event.RecordedAt)
 

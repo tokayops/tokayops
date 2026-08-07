@@ -31,6 +31,11 @@ var (
 	// ErrScheduleNotFound means no schedule row matches the ID.
 	ErrScheduleNotFound = errors.New("scheduleconfig: schedule not found")
 
+	// ErrTeamNotFound means the schedule would belong to a team that does not
+	// exist. Only the caller can fix that, so it is a contract error rather
+	// than an invariant violation.
+	ErrTeamNotFound = errors.New("scheduleconfig: team not found")
+
 	// ErrVersionConflict means config_version did not match the expected value.
 	ErrVersionConflict = errors.New("scheduleconfig: schedule config version conflict")
 

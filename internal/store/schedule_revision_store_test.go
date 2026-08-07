@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lib/pq"
+
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rotation"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
@@ -224,6 +226,25 @@ func TestCreateScheduleConcurrentSameTeam(t *testing.T) {
 	}
 	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules WHERE team_id = 'devops'`); n != 1 {
 		t.Fatalf("got %d schedules for the team, want 1", n)
+	}
+}
+
+// A team that does not exist is a caller mistake, so it must arrive as a typed
+// error rather than as a raw foreign key violation.
+func TestCreateScheduleForUnknownTeam(t *testing.T) {
+	s := setupTestDB(t)
+
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	_, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "ghost-team", revTestConfig())
+	if !errors.Is(err, scheduleconfig.ErrTeamNotFound) {
+		t.Fatalf("error = %v, want ErrTeamNotFound", err)
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		t.Fatalf("a raw SQL error leaked through the contract: %v", pqErr)
+	}
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules`); n != 0 {
+		t.Fatalf("%d schedule roots were written", n)
 	}
 }
 
@@ -589,6 +610,33 @@ func TestInsertScheduleEvent(t *testing.T) {
 		t.Fatalf("event_type = %q", eventType)
 	}
 
+	// A nil or malformed event is a contract violation, not a quiet success:
+	// an event that must accompany a change would otherwise vanish while the
+	// change itself committed.
+	for _, tc := range []struct {
+		name  string
+		event *scheduleconfig.ScheduleEvent
+	}{
+		{name: "nil event", event: nil},
+		{name: "no type", event: &scheduleconfig.ScheduleEvent{ScheduleID: rev.ScheduleID}},
+		{name: "no schedule", event: &scheduleconfig.ScheduleEvent{EventType: "schedule.changed"}},
+		{name: "malformed payload", event: &scheduleconfig.ScheduleEvent{
+			ScheduleID: rev.ScheduleID, EventType: "schedule.changed", Payload: []byte(`{"broken"`),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {
+				return tx.InsertScheduleEvent(context.Background(), tc.event)
+			})
+			if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
+				t.Fatalf("error = %v, want ErrInvariantViolation", err)
+			}
+		})
+	}
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_events`); n != 1 {
+		t.Fatalf("got %d events after the rejected inserts, want 1", n)
+	}
+
 	// An event rolls back with the transaction it was written in.
 	failure := errors.New("nope")
 	err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {
@@ -730,6 +778,78 @@ func TestOverrideProjectionKeepsOtherOverrides(t *testing.T) {
 	}
 	if current[0].Layer != scheduleconfig.LayerL2 {
 		t.Fatalf("layer = %q, want l2", current[0].Layer)
+	}
+}
+
+// An empty string is a valid TEXT primary key, so an unset ID has to be
+// rejected in code rather than by the database.
+func TestInsertRevisionRejectsUnsetIdentifiersAndVersions(t *testing.T) {
+	s := setupTestDB(t)
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	rev := createSchedule(t, s, "devops", start)
+	snapshot := revTestSnapshot(t, start.Add(time.Hour))
+
+	tests := []struct {
+		name       string
+		id         string
+		scheduleID string
+		version    int64
+	}{
+		{name: "no revision id", id: "", scheduleID: rev.ScheduleID, version: 2},
+		{name: "no schedule id", id: "rev-x", scheduleID: "", version: 2},
+		{name: "zero version", id: "rev-x", scheduleID: rev.ScheduleID, version: 0},
+		{name: "negative version", id: "rev-x", scheduleID: rev.ScheduleID, version: -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {
+				return tx.InsertRevision(context.Background(), &scheduleconfig.ScheduleRevision{
+					ID:            tc.id,
+					ScheduleID:    tc.scheduleID,
+					Version:       tc.version,
+					Snapshot:      snapshot,
+					EffectiveFrom: start.Add(time.Hour),
+					RecordedAt:    start.Add(time.Hour),
+				})
+			})
+			if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
+				t.Fatalf("error = %v, want ErrInvariantViolation", err)
+			}
+		})
+	}
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_revisions`); n != 1 {
+		t.Fatalf("got %d revisions, want only the initial one", n)
+	}
+
+	// The same invariant is enforced by the schema, for any writer.
+	if !hasConstraint(t, s, "schedule_revisions_version_positive") {
+		t.Fatal("schedule_revisions_version_positive constraint is missing")
+	}
+	if !hasConstraint(t, s, "schedule_override_revisions_revision_positive") {
+		t.Fatal("schedule_override_revisions_revision_positive constraint is missing")
+	}
+}
+
+func TestCreateInitialScheduleRejectsUnsetRevisionID(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops")
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+
+	err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {
+		root := &scheduleconfig.ScheduleRoot{ID: "sched-1", TeamID: "devops"}
+		return tx.CreateInitialSchedule(context.Background(), root, &scheduleconfig.ScheduleRevision{
+			ScheduleID:    root.ID,
+			Version:       1,
+			Snapshot:      revTestSnapshot(t, start),
+			EffectiveFrom: start,
+			RecordedAt:    start,
+		})
+	})
+	if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
+		t.Fatalf("error = %v, want ErrInvariantViolation", err)
+	}
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules`); n != 0 {
+		t.Fatalf("%d schedule roots survived, want 0", n)
 	}
 }
 

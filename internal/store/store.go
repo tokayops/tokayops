@@ -572,8 +572,14 @@ func (s *Store) InitDB() error {
 		change_summary JSONB,
 
 		UNIQUE (schedule_id, version),
+		CONSTRAINT schedule_revisions_version_positive CHECK (version >= 1),
 		CHECK (effective_to IS NULL OR effective_to > effective_from)
 	);
+	DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'schedule_revisions_version_positive') THEN
+			ALTER TABLE schedule_revisions ADD CONSTRAINT schedule_revisions_version_positive CHECK (version >= 1);
+		END IF;
+	END $$;
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_revisions_one_tail
 		ON schedule_revisions(schedule_id)
 		WHERE effective_to IS NULL;
@@ -612,8 +618,15 @@ func (s *Store) InitDB() error {
 		recorded_by TEXT,
 
 		UNIQUE (override_id, revision),
+		CONSTRAINT schedule_override_revisions_revision_positive CHECK (revision >= 1),
 		CHECK (valid_to > valid_from)
 	);
+	DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'schedule_override_revisions_revision_positive') THEN
+			ALTER TABLE schedule_override_revisions
+				ADD CONSTRAINT schedule_override_revisions_revision_positive CHECK (revision >= 1);
+		END IF;
+	END $$;
 	CREATE INDEX IF NOT EXISTS idx_schedule_override_revisions_range
 		ON schedule_override_revisions(schedule_id, valid_from);
 
