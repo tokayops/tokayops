@@ -209,6 +209,44 @@ func TestCreateScheduleRejectsWhatTheDatabaseWouldReject(t *testing.T) {
 	}
 }
 
+// The revision the caller holds after a write must be what a read returns.
+// Storage canonicalizes a snapshot on the way in, so a writer that skipped
+// that step would hand back nil groups and a non-UTC anchor where persistence
+// has [] and UTC. The store-side twin of this is TestCreateScheduleStoresCanonicalSnapshot.
+func TestCreateScheduleReturnsCanonicalSnapshot(t *testing.T) {
+	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
+
+	// The configuration leaves L2 disabled with no groups, which is exactly
+	// the nil slice persistence turns into [].
+	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	if err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+
+	if rev.Snapshot.L2.Groups == nil {
+		t.Fatal("returned snapshot still carries a nil group slice")
+	}
+	if loc := rev.Snapshot.L1.PhaseAnchorSlotStart.Location(); loc != time.UTC {
+		t.Fatalf("returned anchor location = %v, want UTC", loc)
+	}
+
+	stored := repo.Revisions(rev.ScheduleID)
+	if len(stored) != 1 {
+		t.Fatalf("got %d revisions, want 1", len(stored))
+	}
+	returned, err := rotation.EncodeSnapshot(rev.Snapshot)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot(returned): %v", err)
+	}
+	kept, err := rotation.EncodeSnapshot(stored[0].Snapshot)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot(stored): %v", err)
+	}
+	if string(returned) != string(kept) {
+		t.Fatalf("returned and stored snapshots differ:\n%s\n%s", returned, kept)
+	}
+}
+
 // A database hands back data, not aliases. The fake must do the same, or a
 // test that mutates a configuration after saving it would silently "change
 // history" and pass against behaviour PostgreSQL would never produce.

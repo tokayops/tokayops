@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/tokayops/tokayops/internal/rotation"
 )
 
 // Every writer of the revision model - the PostgreSQL repository and the
@@ -28,8 +30,13 @@ func normalizeRecordedAt(t time.Time) time.Time {
 	return NormalizeTimestamp(t)
 }
 
-// PrepareRevision normalizes a revision's timestamps and checks the structural
-// preconditions of storing it.
+// PrepareRevision normalizes a revision's snapshot and timestamps and checks
+// the structural preconditions of storing it.
+//
+// The snapshot is replaced by its canonical form rather than merely checked:
+// storage coerces nil group slices to [] and anchors to UTC, so a writer that
+// skipped this step would keep an in-memory revision that no longer matches
+// what a read returns.
 func PrepareRevision(revision *ScheduleRevision) error {
 	if revision == nil {
 		return fmt.Errorf("%w: nil revision", ErrInvariantViolation)
@@ -43,6 +50,15 @@ func PrepareRevision(revision *ScheduleRevision) error {
 		return fmt.Errorf("%w: revision version must start at 1, got %d",
 			ErrInvariantViolation, revision.Version)
 	}
+
+	// A snapshot that fails here is a bug, not bad user input: configuration
+	// is validated on the way into the planner, and the planner validates its
+	// own output.
+	canonical, err := rotation.CanonicalizeSnapshot(revision.Snapshot)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvariantViolation, err)
+	}
+	revision.Snapshot = canonical
 
 	revision.EffectiveFrom = NormalizeTimestamp(revision.EffectiveFrom)
 	if revision.EffectiveFrom.IsZero() {

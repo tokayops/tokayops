@@ -229,6 +229,68 @@ func TestCreateScheduleConcurrentSameTeam(t *testing.T) {
 	}
 }
 
+// The snapshot the caller holds after a write must survive the round-trip
+// unchanged. Persistence coerces nil group slices to [] and anchors to UTC, so
+// the writer applies that transformation up front instead of leaving the
+// caller with a value the database would return differently. The fake-side
+// twin of this is TestCreateScheduleReturnsCanonicalSnapshot.
+func TestCreateScheduleStoresCanonicalSnapshot(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops")
+
+	// revTestConfig leaves L2 disabled with no groups: the planner emits a nil
+	// slice there, which is exactly what storage turns into [].
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	rev, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig())
+	if err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+	if rev.Snapshot.L2.Groups == nil {
+		t.Fatal("returned snapshot still carries a nil group slice")
+	}
+	if loc := rev.Snapshot.L1.PhaseAnchorSlotStart.Location(); loc != time.UTC {
+		t.Fatalf("returned anchor location = %v, want UTC", loc)
+	}
+
+	stored := readRevision(t, s, rev.ScheduleID, start)
+	returned, err := rotation.EncodeSnapshot(rev.Snapshot)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot(returned): %v", err)
+	}
+	roundTripped, err := rotation.EncodeSnapshot(stored.Snapshot)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot(stored): %v", err)
+	}
+	if string(returned) != string(roundTripped) {
+		t.Fatalf("returned and persisted snapshots differ:\n%s\n%s", returned, roundTripped)
+	}
+}
+
+// A snapshot that fails validation is a bug in the writer, so it must be
+// refused before it reaches SQL rather than after.
+func TestInsertRevisionRejectsInvalidSnapshot(t *testing.T) {
+	s := setupTestDB(t)
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	rev := createSchedule(t, s, "devops", start)
+
+	err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {
+		return tx.InsertRevision(context.Background(), &scheduleconfig.ScheduleRevision{
+			ID:            "rev-invalid",
+			ScheduleID:    rev.ScheduleID,
+			Version:       2,
+			Snapshot:      rotation.ScheduleRevisionSnapshot{},
+			EffectiveFrom: start.Add(time.Hour),
+			RecordedAt:    start.Add(time.Hour),
+		})
+	})
+	if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
+		t.Fatalf("error = %v, want ErrInvariantViolation", err)
+	}
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_revisions`); n != 1 {
+		t.Fatalf("got %d revisions, want only the initial one", n)
+	}
+}
+
 // A team that does not exist is a caller mistake, so it must arrive as a typed
 // error rather than as a raw foreign key violation.
 func TestCreateScheduleForUnknownTeam(t *testing.T) {

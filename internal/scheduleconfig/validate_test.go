@@ -4,14 +4,61 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/rotation"
 )
 
-func testRevision() *ScheduleRevision {
+const (
+	testGroupA = "9b0a1e2c-3333-4a3b-8c4d-000000000001"
+	testGroupB = "9b0a1e2c-3333-4a3b-8c4d-000000000002"
+)
+
+var testEffectiveAt = time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+
+// testSnapshot builds a valid snapshot through the planner rather than by
+// hand, so the phase anchor is guaranteed to sit on a real grid boundary.
+// L2 is left disabled, which is what makes its Groups nil - the exact shape
+// storage coerces to [].
+func testSnapshot(t *testing.T) rotation.ScheduleRevisionSnapshot {
+	t.Helper()
+	monday := 1
+	weekly := rotation.RotationPolicy{
+		SchemaVersion: rotation.PolicySchemaVersion,
+		Cadence:       model.RotationWeekly,
+		HandoffTime:   "11:00",
+		HandoffDay:    &monday,
+	}
+	plan, err := rotation.PlanTransition(rotation.TransitionInput{
+		Desired: rotation.ScheduleConfiguration{
+			Timezone: "Europe/Amsterdam",
+			L1: rotation.LayerConfiguration{
+				Enabled: true,
+				Policy:  weekly,
+				Groups: []rotation.RotationGroup{
+					{ID: testGroupA, Members: []string{"alice"}},
+					{ID: testGroupB, Members: []string{"bob"}},
+				},
+			},
+			L2:                      rotation.LayerConfiguration{Enabled: false, Policy: weekly},
+			L2EscalationTimeoutMins: 5,
+		},
+		EffectiveAt: testEffectiveAt,
+	})
+	if err != nil {
+		t.Fatalf("PlanTransition: %v", err)
+	}
+	return plan.Snapshot
+}
+
+func testRevision(t *testing.T) *ScheduleRevision {
+	t.Helper()
 	return &ScheduleRevision{
 		ID:            "rev-1",
 		ScheduleID:    "sched-1",
 		Version:       1,
-		EffectiveFrom: time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC),
+		Snapshot:      testSnapshot(t),
+		EffectiveFrom: testEffectiveAt,
 	}
 }
 
@@ -50,7 +97,7 @@ func TestPrepareRevisionRejects(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rev := testRevision()
+			rev := testRevision(t)
 			tc.mutate(rev)
 			if err := PrepareRevision(rev); !errors.Is(err, ErrInvariantViolation) {
 				t.Fatalf("error = %v, want ErrInvariantViolation", err)
@@ -63,7 +110,7 @@ func TestPrepareRevisionRejects(t *testing.T) {
 }
 
 func TestPrepareRevisionNormalizesTimestamps(t *testing.T) {
-	rev := testRevision()
+	rev := testRevision(t)
 	rev.EffectiveFrom = rev.EffectiveFrom.Add(123 * time.Nanosecond)
 	to := rev.EffectiveFrom.Add(time.Hour + 456*time.Nanosecond)
 	rev.EffectiveTo = &to
@@ -86,9 +133,106 @@ func TestPrepareRevisionNormalizesTimestamps(t *testing.T) {
 	}
 }
 
+// Storage does not store a snapshot verbatim: it coerces nil group slices to
+// [] and anchors to UTC. PrepareRevision applies that transformation to the
+// caller's revision, so whoever holds it afterwards holds what a read will
+// return - and the fake and the database agree by construction rather than by
+// each remembering to do the same thing.
+func TestPrepareRevisionCanonicalizesSnapshot(t *testing.T) {
+	rev := testRevision(t)
+	if rev.Snapshot.L2.Groups != nil {
+		t.Fatal("fixture no longer exercises the nil-groups case")
+	}
+	amsterdam, err := time.LoadLocation("Europe/Amsterdam")
+	if err != nil {
+		t.Fatalf("LoadLocation: %v", err)
+	}
+	local := rev.Snapshot.L1.PhaseAnchorSlotStart.In(amsterdam)
+	rev.Snapshot.L1.PhaseAnchorSlotStart = &local
+
+	if err := PrepareRevision(rev); err != nil {
+		t.Fatalf("PrepareRevision: %v", err)
+	}
+
+	if rev.Snapshot.L2.Groups == nil {
+		t.Fatal("nil group slice was not coerced to an empty slice")
+	}
+	if len(rev.Snapshot.L2.Groups) != 0 {
+		t.Fatalf("empty layer gained %d groups", len(rev.Snapshot.L2.Groups))
+	}
+	if loc := rev.Snapshot.L1.PhaseAnchorSlotStart.Location(); loc != time.UTC {
+		t.Fatalf("anchor location = %v, want UTC", loc)
+	}
+	if !rev.Snapshot.L1.PhaseAnchorSlotStart.Equal(local) {
+		t.Fatal("canonicalizing the anchor moved the instant")
+	}
+
+	// Canonical form is a fixed point: preparing again changes nothing.
+	before, err := rotation.EncodeSnapshot(rev.Snapshot)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot: %v", err)
+	}
+	if err := PrepareRevision(rev); err != nil {
+		t.Fatalf("second PrepareRevision: %v", err)
+	}
+	after, err := rotation.EncodeSnapshot(rev.Snapshot)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("canonicalization is not idempotent:\n%s\n%s", before, after)
+	}
+}
+
+func TestPrepareRevisionRejectsInvalidSnapshot(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*rotation.ScheduleRevisionSnapshot)
+	}{
+		{
+			name:   "zero snapshot",
+			mutate: func(s *rotation.ScheduleRevisionSnapshot) { *s = rotation.ScheduleRevisionSnapshot{} },
+		},
+		{
+			name:   "unknown timezone",
+			mutate: func(s *rotation.ScheduleRevisionSnapshot) { s.Timezone = "Mars/Olympus" },
+		},
+		{
+			name: "active layer without a phase pair",
+			mutate: func(s *rotation.ScheduleRevisionSnapshot) {
+				s.L1.PhaseAnchorSlotStart = nil
+				s.L1.StartPosition = nil
+			},
+		},
+		{
+			name: "anchor off the grid",
+			mutate: func(s *rotation.ScheduleRevisionSnapshot) {
+				shifted := s.L1.PhaseAnchorSlotStart.Add(time.Minute)
+				s.L1.PhaseAnchorSlotStart = &shifted
+			},
+		},
+		{
+			name: "start position out of range",
+			mutate: func(s *rotation.ScheduleRevisionSnapshot) {
+				pos := len(s.L1.Groups)
+				s.L1.StartPosition = &pos
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rev := testRevision(t)
+			tc.mutate(&rev.Snapshot)
+			if err := PrepareRevision(rev); !errors.Is(err, ErrInvariantViolation) {
+				t.Fatalf("error = %v, want ErrInvariantViolation", err)
+			}
+		})
+	}
+}
+
 func TestPrepareInitialSchedule(t *testing.T) {
 	root := &ScheduleRoot{ID: "sched-1", TeamID: "devops"}
-	rev := testRevision()
+	rev := testRevision(t)
 
 	if err := PrepareInitialSchedule(root, rev); err != nil {
 		t.Fatalf("PrepareInitialSchedule: %v", err)
@@ -110,7 +254,7 @@ func TestPrepareInitialScheduleRejects(t *testing.T) {
 	tests := []struct {
 		name string
 		root *ScheduleRoot
-		rev  func() *ScheduleRevision
+		rev  func(*testing.T) *ScheduleRevision
 	}{
 		{name: "nil root", root: nil, rev: testRevision},
 		{name: "no root id", root: &ScheduleRoot{TeamID: "devops"}, rev: testRevision},
@@ -121,23 +265,23 @@ func TestPrepareInitialScheduleRejects(t *testing.T) {
 			// PostgreSQL always rejected.
 			name: "revision without an id",
 			root: &ScheduleRoot{ID: "sched-1", TeamID: "devops"},
-			rev:  func() *ScheduleRevision { r := testRevision(); r.ID = ""; return r },
+			rev:  func(t *testing.T) *ScheduleRevision { r := testRevision(t); r.ID = ""; return r },
 		},
 		{
 			name: "revision of another schedule",
 			root: &ScheduleRoot{ID: "sched-1", TeamID: "devops"},
-			rev:  func() *ScheduleRevision { r := testRevision(); r.ScheduleID = "sched-2"; return r },
+			rev:  func(t *testing.T) *ScheduleRevision { r := testRevision(t); r.ScheduleID = "sched-2"; return r },
 		},
 		{
 			name: "not version one",
 			root: &ScheduleRoot{ID: "sched-1", TeamID: "devops"},
-			rev:  func() *ScheduleRevision { r := testRevision(); r.Version = 2; return r },
+			rev:  func(t *testing.T) *ScheduleRevision { r := testRevision(t); r.Version = 2; return r },
 		},
 		{
 			name: "already closed",
 			root: &ScheduleRoot{ID: "sched-1", TeamID: "devops"},
-			rev: func() *ScheduleRevision {
-				r := testRevision()
+			rev: func(t *testing.T) *ScheduleRevision {
+				r := testRevision(t)
 				to := r.EffectiveFrom.Add(time.Hour)
 				r.EffectiveTo = &to
 				return r
@@ -146,7 +290,7 @@ func TestPrepareInitialScheduleRejects(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := PrepareInitialSchedule(tc.root, tc.rev()); !errors.Is(err, ErrInvariantViolation) {
+			if err := PrepareInitialSchedule(tc.root, tc.rev(t)); !errors.Is(err, ErrInvariantViolation) {
 				t.Fatalf("error = %v, want ErrInvariantViolation", err)
 			}
 		})
