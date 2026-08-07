@@ -87,11 +87,14 @@ func renderSlot(in slotInput) ([]Assignment, []Warning) {
 				Layer:              in.Layer,
 				Source:             SourceRotation,
 				GroupID:            in.Base.GroupID,
-				UserIDs:            append([]string(nil), in.Base.UserIDs...),
-				GridSlotStart:      in.Slot.Start,
-				GridSlotEnd:        in.Slot.End,
-				AssignmentStart:    span.Start,
-				AssignmentEnd:      span.End,
+				// The only place a group's members escape the package, so the
+				// only place they are copied: the base still borrows them from
+				// the revision snapshot.
+				UserIDs:         append([]string(nil), in.Base.UserIDs...),
+				GridSlotStart:   in.Slot.Start,
+				GridSlotEnd:     in.Slot.End,
+				AssignmentStart: span.Start,
+				AssignmentEnd:   span.End,
 			})
 		}
 		// No base and no override: nobody is on duty for this span. The gap

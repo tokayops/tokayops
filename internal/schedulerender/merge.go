@@ -154,7 +154,7 @@ func sameShift(a, b Shift) bool {
 		a.SlotCount == b.SlotCount
 }
 
-// SameShifts is SameShift over two sequences.
+// sameShifts is sameShift over two sequences.
 func sameShifts(a, b []Shift) bool {
 	if len(a) != len(b) {
 		return false

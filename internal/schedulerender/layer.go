@@ -52,11 +52,16 @@ func resolveLayer(rev scheduleconfig.ScheduleRevision, layer string) (layerState
 	}, nil
 }
 
-// groupAt returns the group at a rotation position, copying its members: an
-// assignment must not alias the snapshot it was derived from.
+// groupAt returns the group at a rotation position.
+//
+// Members are BORROWED from the snapshot, not copied. The copy belongs at the
+// one boundary where a slice actually escapes - renderSlot, building the
+// assignment it returns - and doing it here as well would allocate once per
+// slot to hand the copy straight to another copy. baseGroup never leaves this
+// package and is only ever consumed by renderSlot.
 func (s layerState) groupAt(position int) *baseGroup {
 	group := s.snapshot.Groups[position]
-	return &baseGroup{GroupID: group.ID, UserIDs: append([]string(nil), group.Members...)}
+	return &baseGroup{GroupID: group.ID, UserIDs: group.Members}
 }
 
 // nextPosition advances one slot along the grid. Consecutive slots differ by
