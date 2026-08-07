@@ -3,28 +3,60 @@ package store
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
-// GetCurrentOverrides projects the current override state.
+// normalizeBound keeps an optional query bound at database resolution. A
+// bound carrying nanoseconds would compare differently than the same value
+// does once stored.
+func normalizeBound(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return scheduleconfig.NormalizeTimestamp(*t)
+}
+
+// getOverrideProjection returns the winning revision per override_id.
 //
-// The order of the two steps is load-bearing: pick the latest revision per
-// override_id FIRST, then drop tombstones. Filtering `deleted` before the
-// grouping would let the revision preceding a delete win the MAX and
-// resurrect an override the user removed.
-func (t *scheduleConfigTx) GetCurrentOverrides(ctx context.Context, scheduleID string) ([]scheduleconfig.OverrideRevision, error) {
-	rows, err := t.tx.QueryContext(ctx,
+// Three steps, and their order is load-bearing:
+//
+//  1. pick the latest revision per override_id, bounded by asOf when the
+//     caller asks for the state as it was known at a system time;
+//  2. only THEN drop tombstones - filtering `deleted` before the grouping
+//     would let the revision preceding a delete win the MAX and resurrect an
+//     override the user removed;
+//  3. only THEN apply the validity range - filtering it inside the subquery
+//     would pick the latest revision that happens to overlap the range rather
+//     than the latest revision, and an earlier version of an override may
+//     well have covered a different interval.
+//
+// The winner is chosen by MAX(revision) rather than by recorded_at order:
+// two revisions of one override can share a microsecond, and revision numbers
+// are the only strictly ordered thing about them.
+//
+// A nil bound means unbounded on that side. The ::timestamptz casts are
+// required, not decorative: without them PostgreSQL cannot infer the type of
+// a nil parameter.
+func getOverrideProjection(ctx context.Context, q sqlQueryer, scheduleID string,
+	from, until, asOf *time.Time) ([]scheduleconfig.OverrideRevision, error) {
+	rows, err := q.QueryContext(ctx,
 		`SELECT o.revision_id, o.override_id, o.schedule_id, o.revision, o.layer, o.user_id,
 		        o.valid_from, o.valid_to, o.reason, o.deleted, o.recorded_at, o.recorded_by
 		 FROM schedule_override_revisions o
 		 JOIN (SELECT override_id, MAX(revision) AS revision
 		       FROM schedule_override_revisions
 		       WHERE schedule_id = $1
+		         AND ($2::timestamptz IS NULL OR recorded_at <= $2)
 		       GROUP BY override_id) last
 		   ON last.override_id = o.override_id AND last.revision = o.revision
-		 WHERE o.schedule_id = $1 AND NOT o.deleted
-		 ORDER BY o.valid_from, o.override_id`, scheduleID)
+		 WHERE o.schedule_id = $1
+		   AND NOT o.deleted
+		   AND ($3::timestamptz IS NULL OR o.valid_to > $3)
+		   AND ($4::timestamptz IS NULL OR o.valid_from < $4)
+		 ORDER BY o.valid_from, o.override_id`,
+		scheduleID, normalizeBound(asOf), normalizeBound(from), normalizeBound(until))
 	if err != nil {
 		return nil, err
 	}

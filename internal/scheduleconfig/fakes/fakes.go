@@ -208,7 +208,10 @@ func (r *ScheduleConfigRepo) WithinTx(ctx context.Context, fn func(scheduleconfi
 		return err
 	}
 	before := r.state.clone()
-	if err := fn(&scheduleConfigTx{repo: r}); err != nil {
+	tx := &scheduleConfigTx{repo: r}
+	// The command reads the live state, so it sees its own uncommitted writes.
+	tx.fakeReadView = fakeReadView{state: func() fakeState { return r.state }, record: r.record}
+	if err := fn(tx); err != nil {
 		r.state = before
 		return err
 	}
@@ -217,6 +220,32 @@ func (r *ScheduleConfigRepo) WithinTx(ctx context.Context, fn func(scheduleconfi
 		return err
 	}
 	return nil
+}
+
+// WithinSnapshot freezes the state before running fn, so every read inside
+// observes the same moment.
+//
+// The lock is released once the copy is taken rather than held for the whole
+// callback: holding it would make concurrent writes impossible instead of
+// merely invisible, which is not what a database snapshot does and would let
+// an isolation bug pass unnoticed.
+func (r *ScheduleConfigRepo) WithinSnapshot(ctx context.Context, fn func(scheduleconfig.ScheduleReadView) error) error {
+	r.mu.Lock()
+	if err := r.record("WithinSnapshot"); err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	frozen := r.state.clone()
+	r.mu.Unlock()
+
+	return fn(&fakeReadView{
+		state: func() fakeState { return frozen },
+		record: func(method string) error {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			return r.record(method)
+		},
+	})
 }
 
 // Root returns a stored schedule root, if present.
@@ -270,7 +299,121 @@ func (r *ScheduleConfigRepo) RootCount() int {
 	return len(r.state.roots)
 }
 
+// fakeReadView answers the read contract from whichever state it is given:
+// the live one inside a transaction, a frozen copy inside a snapshot.
+type fakeReadView struct {
+	state  func() fakeState
+	record func(string) error
+}
+
+func (v *fakeReadView) GetScheduleRoot(ctx context.Context, scheduleID string) (*scheduleconfig.ScheduleRoot, error) {
+	if err := v.record("GetScheduleRoot"); err != nil {
+		return nil, err
+	}
+	root, ok := v.state().roots[scheduleID]
+	if !ok {
+		return nil, scheduleconfig.ErrScheduleNotFound
+	}
+	found := cloneRoot(root)
+	return &found, nil
+}
+
+func (v *fakeReadView) GetScheduleRootByTeam(ctx context.Context, teamID string) (*scheduleconfig.ScheduleRoot, error) {
+	if err := v.record("GetScheduleRootByTeam"); err != nil {
+		return nil, err
+	}
+	s := v.state()
+	id, ok := s.teamIndex[teamID]
+	if !ok {
+		return nil, scheduleconfig.ErrScheduleNotFound
+	}
+	root, ok := s.roots[id]
+	if !ok {
+		return nil, scheduleconfig.ErrScheduleNotFound
+	}
+	found := cloneRoot(root)
+	return &found, nil
+}
+
+func (v *fakeReadView) GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*scheduleconfig.ScheduleRevision, error) {
+	if err := v.record("GetEffectiveRevision"); err != nil {
+		return nil, err
+	}
+	for _, rev := range v.state().revisions[scheduleID] {
+		if rev.EffectiveFrom.After(at) {
+			continue
+		}
+		if rev.EffectiveTo != nil && !rev.EffectiveTo.After(at) {
+			continue
+		}
+		found := cloneRevision(rev)
+		return &found, nil
+	}
+	return nil, scheduleconfig.ErrRevisionNotFound
+}
+
+// GetRevisionsInRange applies the half-open overlap test in both directions
+// and returns both kinds: a deleted period is a revision like any other.
+func (v *fakeReadView) GetRevisionsInRange(ctx context.Context, scheduleID string, from, until time.Time) ([]scheduleconfig.ScheduleRevision, error) {
+	if err := v.record("GetRevisionsInRange"); err != nil {
+		return nil, err
+	}
+	var out []scheduleconfig.ScheduleRevision
+	for _, rev := range v.state().revisions[scheduleID] {
+		if !rev.EffectiveFrom.Before(until) {
+			continue
+		}
+		if rev.EffectiveTo != nil && !rev.EffectiveTo.After(from) {
+			continue
+		}
+		out = append(out, cloneRevision(rev))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].EffectiveFrom.Before(out[j].EffectiveFrom) })
+	return out, nil
+}
+
+// GetOverrideProjectionInRange mirrors the SQL projection step for step:
+// pick the latest revision per override_id (bounded by asOf), only then drop
+// tombstones, only then apply the validity range. Any other order either
+// resurrects a deleted override or picks a stale version whose interval
+// happened to overlap.
+func (v *fakeReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]scheduleconfig.OverrideRevision, error) {
+	if err := v.record("GetOverrideProjectionInRange"); err != nil {
+		return nil, err
+	}
+	latest := map[string]scheduleconfig.OverrideRevision{}
+	for _, rev := range v.state().overrides[scheduleID] {
+		if asOf != nil && rev.RecordedAt.After(*asOf) {
+			continue
+		}
+		if cur, ok := latest[rev.OverrideID]; !ok || rev.Revision > cur.Revision {
+			latest[rev.OverrideID] = rev
+		}
+	}
+	out := make([]scheduleconfig.OverrideRevision, 0, len(latest))
+	for _, rev := range latest {
+		if rev.Deleted {
+			continue
+		}
+		if from != nil && !rev.ValidTo.After(*from) {
+			continue
+		}
+		if until != nil && !rev.ValidFrom.Before(*until) {
+			continue
+		}
+		out = append(out, cloneOverride(rev))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].ValidFrom.Equal(out[j].ValidFrom) {
+			return out[i].ValidFrom.Before(out[j].ValidFrom)
+		}
+		return out[i].OverrideID < out[j].OverrideID
+	})
+	return out, nil
+}
+
 type scheduleConfigTx struct {
+	fakeReadView
 	repo *ScheduleConfigRepo
 }
 
@@ -305,23 +448,6 @@ func (t *scheduleConfigTx) LockSchedule(ctx context.Context, scheduleID string) 
 	}
 	locked := cloneRoot(root)
 	return &locked, nil
-}
-
-func (t *scheduleConfigTx) GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*scheduleconfig.ScheduleRevision, error) {
-	if err := t.repo.record("GetEffectiveRevision"); err != nil {
-		return nil, err
-	}
-	for _, rev := range t.repo.state.revisions[scheduleID] {
-		if rev.EffectiveFrom.After(at) {
-			continue
-		}
-		if rev.EffectiveTo != nil && !rev.EffectiveTo.After(at) {
-			continue
-		}
-		found := cloneRevision(rev)
-		return &found, nil
-	}
-	return nil, scheduleconfig.ErrRevisionNotFound
 }
 
 func (t *scheduleConfigTx) GetTailRevision(ctx context.Context, scheduleID string) (*scheduleconfig.ScheduleRevision, error) {
@@ -408,35 +534,6 @@ func (t *scheduleConfigTx) InsertScheduleEvent(ctx context.Context, event *sched
 	}
 	s.events[event.ScheduleID] = append(s.events[event.ScheduleID], cloneEvent(*event))
 	return nil
-}
-
-// GetCurrentOverrides projects the latest revision per override_id and only
-// then drops tombstones - filtering first would resurrect the revision that
-// preceded a delete.
-func (t *scheduleConfigTx) GetCurrentOverrides(ctx context.Context, scheduleID string) ([]scheduleconfig.OverrideRevision, error) {
-	if err := t.repo.record("GetCurrentOverrides"); err != nil {
-		return nil, err
-	}
-	latest := map[string]scheduleconfig.OverrideRevision{}
-	for _, rev := range t.repo.state.overrides[scheduleID] {
-		if cur, ok := latest[rev.OverrideID]; !ok || rev.Revision > cur.Revision {
-			latest[rev.OverrideID] = rev
-		}
-	}
-	out := make([]scheduleconfig.OverrideRevision, 0, len(latest))
-	for _, rev := range latest {
-		if rev.Deleted {
-			continue
-		}
-		out = append(out, cloneOverride(rev))
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].ValidFrom.Equal(out[j].ValidFrom) {
-			return out[i].ValidFrom.Before(out[j].ValidFrom)
-		}
-		return out[i].OverrideID < out[j].OverrideID
-	})
-	return out, nil
 }
 
 func (t *scheduleConfigTx) InsertOverrideRevision(ctx context.Context, rev *scheduleconfig.OverrideRevision) error {
@@ -596,6 +693,8 @@ func (t *erasureTx) NullifyScheduleRevisionChangeReasons(ctx context.Context, us
 var (
 	_ scheduleconfig.ScheduleConfigRepository = (*ScheduleConfigRepo)(nil)
 	_ scheduleconfig.ScheduleConfigTx         = (*scheduleConfigTx)(nil)
+	_ scheduleconfig.ScheduleReadRepository   = (*ScheduleConfigRepo)(nil)
+	_ scheduleconfig.ScheduleReadView         = (*fakeReadView)(nil)
 	_ erasure.Repository                      = (*ErasureRepo)(nil)
 	_ erasure.Tx                              = (*erasureTx)(nil)
 )

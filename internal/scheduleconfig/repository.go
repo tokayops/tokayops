@@ -143,7 +143,13 @@ type ScheduleConfigRepository interface {
 }
 
 // ScheduleConfigTx is the command-side unit of work over one schedule.
+//
+// It embeds the read view so that a command reads through the same contract
+// the renderer uses. Two contracts over the same projection would be two
+// chances to project it differently.
 type ScheduleConfigTx interface {
+	ScheduleReadView
+
 	// CreateInitialSchedule is ATOMIC by construction: the root, revision 1,
 	// config_version = 1 and history_complete_from are written by this single
 	// operation. There is deliberately no "insert just the root" operation in
@@ -156,10 +162,6 @@ type ScheduleConfigTx interface {
 	// LockSchedule takes the row lock that serializes all writes to one
 	// schedule. Effective time is captured only after it succeeds.
 	LockSchedule(ctx context.Context, scheduleID string) (*ScheduleRoot, error)
-
-	// GetEffectiveRevision returns the revision in force at `at`, i.e. the one
-	// whose half-open interval [effective_from, effective_to) contains it.
-	GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*ScheduleRevision, error)
 
 	// GetTailRevision returns the open-ended revision, if any.
 	GetTailRevision(ctx context.Context, scheduleID string) (*ScheduleRevision, error)
@@ -175,10 +177,6 @@ type ScheduleConfigTx interface {
 	AdvanceVersion(ctx context.Context, scheduleID string, expected int64, at time.Time) error
 
 	InsertScheduleEvent(ctx context.Context, event *ScheduleEvent) error
-
-	// GetCurrentOverrides projects the current override state: the latest
-	// revision per override_id, tombstones excluded.
-	GetCurrentOverrides(ctx context.Context, scheduleID string) ([]OverrideRevision, error)
 
 	InsertOverrideRevision(ctx context.Context, rev *OverrideRevision) error
 }

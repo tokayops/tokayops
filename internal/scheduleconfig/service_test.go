@@ -358,11 +358,11 @@ func TestFakeCurrentOverridesDoNotResurrectDeleted(t *testing.T) {
 	var current []scheduleconfig.OverrideRevision
 	err = repo.WithinTx(context.Background(), func(tx scheduleconfig.ScheduleConfigTx) error {
 		var err error
-		current, err = tx.GetCurrentOverrides(context.Background(), scheduleID)
+		current, err = tx.GetOverrideProjectionInRange(context.Background(), scheduleID, nil, nil, nil)
 		return err
 	})
 	if err != nil {
-		t.Fatalf("GetCurrentOverrides: %v", err)
+		t.Fatalf("GetOverrideProjectionInRange: %v", err)
 	}
 	if len(current) != 0 {
 		t.Fatalf("got %d current overrides after delete, want 0", len(current))

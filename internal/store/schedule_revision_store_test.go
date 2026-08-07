@@ -993,11 +993,11 @@ func currentOverrides(t *testing.T, s *Store, scheduleID string) []scheduleconfi
 	var out []scheduleconfig.OverrideRevision
 	err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {
 		var err error
-		out, err = tx.GetCurrentOverrides(context.Background(), scheduleID)
+		out, err = tx.GetOverrideProjectionInRange(context.Background(), scheduleID, nil, nil, nil)
 		return err
 	})
 	if err != nil {
-		t.Fatalf("GetCurrentOverrides: %v", err)
+		t.Fatalf("GetOverrideProjectionInRange: %v", err)
 	}
 	return out
 }

@@ -33,6 +33,24 @@ const (
 const scheduleRevisionColumns = `id, schedule_id, version, kind, snapshot, effective_from, effective_to,
 	recorded_at, created_by, change_reason, change_summary`
 
+// scheduleRootColumns is the SELECT list every schedule root scan expects.
+const scheduleRootColumns = `id, team_id, config_version, history_complete_from, deleted_at`
+
+// sqlQueryer is the read surface shared by *sql.Tx and *sql.DB. Every query
+// below is written once against it and called from both the command-side
+// transaction and the read-only snapshot: a second copy of the same SQL is a
+// second thing to keep correct.
+type sqlQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// rowScanner unifies *sql.Row and *sql.Rows so one scan function serves both
+// the single-row and the multi-row queries.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
 // ScheduleConfigRepository exposes the schedule configuration unit of work.
 // It is intentionally not part of StoreInterface: the revision model is not
 // mirrored into the legacy mock.
@@ -56,7 +74,7 @@ func (r *scheduleConfigRepo) WithinTx(ctx context.Context, fn func(scheduleconfi
 		}
 	}()
 
-	if err := fn(&scheduleConfigTx{tx: tx}); err != nil {
+	if err := fn(&scheduleConfigTx{tx: tx, scheduleReadView: scheduleReadView{q: tx}}); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -66,7 +84,11 @@ func (r *scheduleConfigRepo) WithinTx(ctx context.Context, fn func(scheduleconfi
 	return nil
 }
 
+// scheduleConfigTx is the command-side unit of work. It embeds the read view
+// over the same transaction, so a command reads through exactly the contract
+// the renderer uses.
 type scheduleConfigTx struct {
+	scheduleReadView
 	tx *sql.Tx
 }
 
@@ -92,44 +114,11 @@ func (t *scheduleConfigTx) CreateInitialSchedule(ctx context.Context, root *sche
 	return t.InsertRevision(ctx, initial)
 }
 
-// LockSchedule takes the row lock that serializes writes to one schedule.
+// LockSchedule takes the row lock that serializes writes to one schedule. It
+// is the same projection as the read-side root lookup, plus the lock.
 func (t *scheduleConfigTx) LockSchedule(ctx context.Context, scheduleID string) (*scheduleconfig.ScheduleRoot, error) {
-	row := t.tx.QueryRowContext(ctx,
-		`SELECT id, team_id, config_version, history_complete_from, deleted_at
-		 FROM schedules WHERE id = $1 FOR UPDATE`, scheduleID)
-
-	var root scheduleconfig.ScheduleRoot
-	var historyFrom, deletedAt sql.NullTime
-	err := row.Scan(&root.ID, &root.TeamID, &root.ConfigVersion, &historyFrom, &deletedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, scheduleconfig.ErrScheduleNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	if historyFrom.Valid {
-		v := historyFrom.Time
-		root.HistoryCompleteFrom = &v
-	}
-	if deletedAt.Valid {
-		v := deletedAt.Time
-		root.DeletedAt = &v
-	}
-	return &root, nil
-}
-
-// GetEffectiveRevision returns the revision whose half-open interval contains
-// `at`. The lower bound is part of the predicate on purpose: without it a
-// future revision would answer a query about the past.
-func (t *scheduleConfigTx) GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*scheduleconfig.ScheduleRevision, error) {
-	row := t.tx.QueryRowContext(ctx,
-		`SELECT `+scheduleRevisionColumns+`
-		 FROM schedule_revisions
-		 WHERE schedule_id = $1
-		   AND effective_from <= $2
-		   AND (effective_to IS NULL OR effective_to > $2)`,
-		scheduleID, scheduleconfig.NormalizeTimestamp(at))
-	return scanScheduleRevision(row)
+	return scanScheduleRootRow(t.tx.QueryRowContext(ctx,
+		`SELECT `+scheduleRootColumns+` FROM schedules WHERE id = $1 FOR UPDATE`, scheduleID))
 }
 
 // GetTailRevision returns the open-ended revision of a schedule.
@@ -138,7 +127,7 @@ func (t *scheduleConfigTx) GetTailRevision(ctx context.Context, scheduleID strin
 		`SELECT `+scheduleRevisionColumns+`
 		 FROM schedule_revisions
 		 WHERE schedule_id = $1 AND effective_to IS NULL`, scheduleID)
-	return scanScheduleRevision(row)
+	return scanScheduleRevisionRow(row)
 }
 
 // CloseRevision closes exactly the revision it names. Anything other than one
@@ -199,7 +188,18 @@ func (t *scheduleConfigTx) AdvanceVersion(ctx context.Context, scheduleID string
 	return requireOneRow(res, scheduleconfig.ErrVersionConflict)
 }
 
-func scanScheduleRevision(row *sql.Row) (*scheduleconfig.ScheduleRevision, error) {
+// scanScheduleRevisionRow adapts the single-row queries: only there does "no
+// rows" mean the named revision does not exist. In a range query an empty
+// result is an ordinary answer.
+func scanScheduleRevisionRow(row *sql.Row) (*scheduleconfig.ScheduleRevision, error) {
+	rev, err := scanScheduleRevision(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, scheduleconfig.ErrRevisionNotFound
+	}
+	return rev, err
+}
+
+func scanScheduleRevision(row rowScanner) (*scheduleconfig.ScheduleRevision, error) {
 	var (
 		rev         scheduleconfig.ScheduleRevision
 		snapshot    []byte
@@ -210,9 +210,6 @@ func scanScheduleRevision(row *sql.Row) (*scheduleconfig.ScheduleRevision, error
 	)
 	err := row.Scan(&rev.ID, &rev.ScheduleID, &rev.Version, &rev.Kind, &snapshot,
 		&rev.EffectiveFrom, &effectiveTo, &rev.RecordedAt, &createdBy, &reason, &summary)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, scheduleconfig.ErrRevisionNotFound
-	}
 	if err != nil {
 		return nil, err
 	}

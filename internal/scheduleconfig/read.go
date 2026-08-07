@@ -1,0 +1,65 @@
+package scheduleconfig
+
+import (
+	"context"
+	"time"
+)
+
+// ScheduleReadRepository is the read side of schedule configuration.
+//
+// It hands out a consistent database snapshot instead of individual reads,
+// and that is the whole point of the interface: one rendered answer is built
+// from the schedule root, the revisions overlapping the range and the
+// override projection. Those are three statements, and a Save committing
+// between any two of them would splice two different states into one answer -
+// a rotation read from the old tail revision next to overrides read after the
+// edit. READ COMMITTED does not help, because it takes a fresh snapshot per
+// statement.
+//
+// There is deliberately no way to run a single read outside a snapshot: the
+// consistency of a render must not depend on every caller remembering to open
+// one.
+type ScheduleReadRepository interface {
+	// WithinSnapshot runs fn against one immutable view of the database. An
+	// error from fn is returned as is; nothing here writes, so there is
+	// nothing to roll back.
+	WithinSnapshot(ctx context.Context, fn func(ScheduleReadView) error) error
+}
+
+// ScheduleReadView is the set of reads a renderer or an on-call projection
+// needs. Every method observes the same state.
+//
+// The command-side ScheduleConfigTx embeds this view, so a command can read
+// with the same contract inside its own write transaction.
+type ScheduleReadView interface {
+	// GetScheduleRoot returns the aggregate root, including a soft-deleted
+	// one: history stays readable after a delete.
+	GetScheduleRoot(ctx context.Context, scheduleID string) (*ScheduleRoot, error)
+
+	// GetScheduleRootByTeam is the same lookup by the team that owns the
+	// schedule.
+	GetScheduleRootByTeam(ctx context.Context, teamID string) (*ScheduleRoot, error)
+
+	// GetRevisionsInRange returns the revisions whose half-open effective
+	// interval overlaps [from, until), ordered by effective_from. Revisions
+	// of both kinds are returned: the caller decides what a deleted period
+	// means, and hiding it here would turn it back into an unexplained gap.
+	//
+	// An empty result is not an error - a range can legitimately precede the
+	// first revision of a schedule.
+	GetRevisionsInRange(ctx context.Context, scheduleID string, from, until time.Time) ([]ScheduleRevision, error)
+
+	// GetEffectiveRevision returns the revision in force at `at`, which may
+	// be a deleted-kind revision. Callers must branch on Kind rather than
+	// assume a revision means an active schedule.
+	GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*ScheduleRevision, error)
+
+	// GetOverrideProjectionInRange returns the WINNING revision per
+	// override_id - not every revision of it - among those overlapping the
+	// range, ordered by valid_from then override_id.
+	//
+	// A nil bound means unbounded on that side. asOf nil means the current
+	// state; a value means the state as it was recorded at that system time,
+	// which is what lets history be replayed as it was known then.
+	GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]OverrideRevision, error)
+}
