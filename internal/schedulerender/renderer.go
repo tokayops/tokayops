@@ -50,47 +50,74 @@ type Result struct {
 // instant may decide what the grid looked like then. That is why the grid is
 // rebuilt per revision and per layer instead of once per query.
 func Render(in Input) (Result, error) {
-	if !in.Until.After(in.From) {
-		return Result{}, fmt.Errorf("schedulerender: range %v..%v is empty or inverted", in.From, in.Until)
+	// The database stores timestamps at microsecond resolution, so a range
+	// bound carrying nanoseconds cannot be answered exactly. It is normalized
+	// once, here, and reported back on the result: otherwise the renderer
+	// would clip with one value while the query that fetched the revisions
+	// used another, and a revision overlapping the range by less than a
+	// microsecond would be fetched or dropped depending on which end it fell.
+	from := scheduleconfig.NormalizeTimestamp(in.From)
+	until := scheduleconfig.NormalizeTimestamp(in.Until)
+	if !until.After(from) {
+		return Result{}, fmt.Errorf("schedulerender: range %v..%v is empty or inverted at %v resolution",
+			in.From, in.Until, scheduleconfig.TimestampResolution)
 	}
 
 	res := Result{
-		From:                in.From,
-		Until:               in.Until,
+		From:                from,
+		Until:               until,
 		HistoryCompleteFrom: in.Root.HistoryCompleteFrom,
 		DeletedAt:           in.Root.DeletedAt,
 		HistoryComplete:     true,
 	}
-	queryRange := interval{Start: in.From, End: in.Until}
+	queryRange := interval{Start: from, End: until}
 
 	revisions := append([]scheduleconfig.ScheduleRevision(nil), in.Revisions...)
 	sort.SliceStable(revisions, func(i, j int) bool {
-		return revisions[i].EffectiveFrom.Before(revisions[j].EffectiveFrom)
+		if !revisions[i].EffectiveFrom.Equal(revisions[j].EffectiveFrom) {
+			return revisions[i].EffectiveFrom.Before(revisions[j].EffectiveFrom)
+		}
+		// Two revisions starting at the same instant is corruption, but the
+		// order still has to be decided by the data rather than by however the
+		// query returned them.
+		return revisions[i].Version < revisions[j].Version
 	})
 
 	// History before the first recorded revision is not a gap in the chain,
 	// it is the part of the past this schedule cannot speak about. Saying
 	// "gap" there would cry damage on every schedule younger than the query.
-	if from := in.Root.HistoryCompleteFrom; from == nil || in.From.Before(*from) {
+	if hcf := in.Root.HistoryCompleteFrom; hcf == nil || from.Before(*hcf) {
 		res.HistoryComplete = false
-		until := in.Until
-		if from != nil {
-			until = minTime(in.Until, *from)
+		incompleteUntil := until
+		if hcf != nil {
+			incompleteUntil = minTime(until, *hcf)
 		}
 		res.Warnings = append(res.Warnings, Warning{
 			Code:  WarnHistoryIncomplete,
-			From:  in.From,
-			Until: until,
+			From:  from,
+			Until: incompleteUntil,
 		})
 	}
 
-	for i, rev := range revisions {
-		if i > 0 {
-			prev := revisions[i-1]
-			res.Warnings = appendGapWarning(res.Warnings, prev, rev, queryRange)
-		}
+	// The coverage cursor is what makes the three states distinguishable.
+	// Comparing only neighbouring pairs finds a revision lost in the middle
+	// but not one lost at either end, nor an empty chain, and those cases
+	// would come back as a silent empty stretch with HistoryComplete=true.
+	//
+	// It starts at the point from which this schedule's history is supposed
+	// to be exact. When that point is unknown, leading and trailing coverage
+	// cannot be asserted at all, so the cursor only starts tracking once the
+	// first revision has been seen and only inner gaps are reported.
+	cov := coverage{query: queryRange}
+	if hcf := in.Root.HistoryCompleteFrom; hcf != nil {
+		cov.start(maxTime(from, *hcf))
+	}
 
-		bound := revisionInterval(rev).intersect(queryRange)
+	for _, rev := range revisions {
+		revRange := revisionInterval(rev)
+		revRange, res.Warnings = cov.advance(revRange, rev, res.Warnings)
+
+		bound := revRange.intersect(queryRange)
 		if bound.empty() {
 			continue
 		}
@@ -117,6 +144,7 @@ func Render(in Input) (Result, error) {
 			res.Warnings = append(res.Warnings, warnings...)
 		}
 	}
+	res.Warnings = cov.finish(in.Root.HistoryCompleteFrom != nil, res.Warnings)
 
 	sort.SliceStable(res.Assignments, func(i, j int) bool {
 		if res.Assignments[i].Layer != res.Assignments[j].Layer {
@@ -213,21 +241,94 @@ func overridesOfLayer(overrides []scheduleconfig.OverrideRevision, layer string)
 	return out
 }
 
-// appendGapWarning reports a break between two revisions that should be
-// adjacent. With deleted periods recorded as revisions of their own, the only
-// remaining cause is a lost row.
-func appendGapWarning(out []Warning, prev, next scheduleconfig.ScheduleRevision, queryRange interval) []Warning {
-	if prev.EffectiveTo == nil || !next.EffectiveFrom.After(*prev.EffectiveTo) {
-		return out
+// coverage walks the revision chain and reports where it fails to tile the
+// part of the query range that is supposed to be covered.
+//
+// It exists because pairwise comparison is not enough. A revision lost in the
+// middle shows up as a hole between two neighbours, but a lost first or last
+// revision, or an entirely empty chain, leaves no pair to compare - and those
+// come back as a silent empty stretch that the caller cannot tell from "the
+// schedule genuinely had nobody on duty".
+type coverage struct {
+	query    interval
+	cursor   time.Time
+	tracking bool
+
+	// lastID names the revision the cursor currently ends at, so a gap can
+	// say what it sits between.
+	lastID string
+}
+
+func (c *coverage) start(at time.Time) {
+	c.cursor, c.tracking = at, true
+}
+
+// advance folds one revision into the cursor and returns its effective range,
+// clipped if it overlapped what was already covered.
+//
+// An overlap is corruption - the exclusion constraint forbids it - but the
+// renderer has to stay total, and two parallel assignments on one layer would
+// break the assumption every consumer makes. The EARLIER revision keeps the
+// disputed interval: an answer already given about the past must not change
+// because a later row has a wrong boundary.
+func (c *coverage) advance(revRange interval, rev scheduleconfig.ScheduleRevision, warnings []Warning) (interval, []Warning) {
+	if c.tracking {
+		switch {
+		case revRange.Start.After(c.cursor):
+			warnings = c.appendGap(warnings, c.cursor, revRange.Start, rev.ID)
+		case revRange.Start.Before(c.cursor):
+			if overlap := (interval{Start: revRange.Start, End: minTime(c.cursor, revRange.End)}).
+				intersect(c.query); !overlap.empty() {
+				warnings = append(warnings, Warning{
+					Code:       WarnRevisionOverlap,
+					From:       overlap.Start,
+					Until:      overlap.End,
+					RelatedIDs: relatedIDs(c.lastID, rev.ID),
+				})
+			}
+			revRange.Start = maxTime(revRange.Start, c.cursor)
+		}
 	}
-	gap := interval{Start: *prev.EffectiveTo, End: next.EffectiveFrom}.intersect(queryRange)
+
+	if !c.tracking || revRange.End.After(c.cursor) {
+		c.cursor = revRange.End
+	}
+	c.tracking = true
+	c.lastID = rev.ID
+	return revRange, warnings
+}
+
+// finish reports the stretch after the last revision. It only fires when the
+// schedule knows from when its history is exact: without that, the absence of
+// a tail revision cannot be distinguished from history that never started.
+func (c *coverage) finish(historyCompleteKnown bool, warnings []Warning) []Warning {
+	if !c.tracking || !historyCompleteKnown {
+		return warnings
+	}
+	return c.appendGap(warnings, c.cursor, c.query.End, "")
+}
+
+func (c *coverage) appendGap(warnings []Warning, from, until time.Time, nextID string) []Warning {
+	gap := interval{Start: from, End: until}.intersect(c.query)
 	if gap.empty() {
-		return out
+		return warnings
 	}
-	return append(out, Warning{
+	return append(warnings, Warning{
 		Code:       WarnRevisionGap,
 		From:       gap.Start,
 		Until:      gap.End,
-		RelatedIDs: []string{prev.ID, next.ID},
+		RelatedIDs: relatedIDs(c.lastID, nextID),
 	})
+}
+
+// relatedIDs names the revisions on either side of a break, dropping the ends
+// that do not exist: a gap before the first revision has nothing on its left.
+func relatedIDs(ids ...string) []string {
+	var out []string
+	for _, id := range ids {
+		if id != "" {
+			out = append(out, id)
+		}
+	}
+	return out
 }

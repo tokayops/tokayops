@@ -69,7 +69,7 @@ func TestOverrideSurvivesLayerBeingDisabled(t *testing.T) {
 	})
 
 	// The override must still cover its whole validity, across the boundary.
-	covered := coverage(assignmentsOf(res, LayerL1), SourceOverride)
+	covered := sourceSpan(assignmentsOf(res, LayerL1), SourceOverride)
 	if !covered.Start.Equal(utc(2026, 5, 1, 14, 0)) || !covered.End.Equal(utc(2026, 5, 1, 18, 0)) {
 		t.Fatalf("override covers %v..%v, want its full validity 14:00..18:00", covered.Start, covered.End)
 	}
@@ -105,7 +105,7 @@ func TestOverrideSurvivesGroupsBeingEmptied(t *testing.T) {
 		From: start, Until: utc(2026, 5, 2, 11, 0),
 	})
 
-	covered := coverage(assignmentsOf(res, LayerL1), SourceOverride)
+	covered := sourceSpan(assignmentsOf(res, LayerL1), SourceOverride)
 	if !covered.Start.Equal(utc(2026, 5, 1, 14, 0)) || !covered.End.Equal(utc(2026, 5, 1, 18, 0)) {
 		t.Fatalf("override covers %v..%v, want 14:00..18:00", covered.Start, covered.End)
 	}
@@ -186,6 +186,108 @@ func TestOverrideCrossesRevisionBoundary(t *testing.T) {
 	}
 }
 
+// TestOverrideSurvivesGridChange: the boundary case above moves the group
+// list, which leaves the grid alone. Here the edit changes the grid itself -
+// handoff time, cadence, timezone - and the override must still cover exactly
+// its own validity. An override is a statement about people and wall-clock
+// time; redrawing the handoff grid underneath it does not move it.
+func TestOverrideSurvivesGridChange(t *testing.T) {
+	start := utc(2026, 5, 4, 11, 0) // Monday
+	edit := utc(2026, 5, 4, 16, 0)
+	ovrStart, ovrEnd := utc(2026, 5, 4, 14, 0), utc(2026, 5, 4, 20, 0)
+
+	tests := []struct {
+		name  string
+		after rotation.ScheduleConfiguration
+	}{
+		{
+			name:  "handoff time",
+			after: config("UTC", dailyPolicy("18:00"), group(groupA, "alice")),
+		},
+		{
+			name:  "cadence",
+			after: config("UTC", weeklyPolicy("11:00", 1), group(groupA, "alice")),
+		},
+		{
+			name:  "timezone",
+			after: config("Europe/Berlin", dailyPolicy("11:00"), group(groupA, "alice")),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			revs := chain(t,
+				revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
+				revisionStep{at: edit, cfg: tc.after},
+			)
+			ovr := override("ovr-1", LayerL1, "carol", ovrStart, ovrEnd, start)
+
+			res := renderOf(t, Input{
+				Root: root(start), Revisions: revs, Overrides: []scheduleconfig.OverrideRevision{ovr},
+				From: start, Until: utc(2026, 5, 6, 11, 0),
+			})
+
+			l1 := assignmentsOf(res, LayerL1)
+			covered := sourceSpan(l1, SourceOverride)
+			if !covered.Start.Equal(ovrStart) || !covered.End.Equal(ovrEnd) {
+				t.Fatalf("override covers %v..%v, want its own validity %v..%v",
+					covered.Start, covered.End, ovrStart, ovrEnd)
+			}
+
+			// The pieces tile the override without a break, and each carries
+			// the grid slot it actually fell in. How MANY pieces there are is
+			// not asserted: the new grid decides that, and a changed handoff
+			// time can put a fresh slot boundary inside the override on top of
+			// the revision boundary.
+			var pieces []Assignment
+			for _, a := range l1 {
+				if a.Source == SourceOverride {
+					pieces = append(pieces, a)
+				}
+			}
+			if len(pieces) < 2 {
+				t.Fatalf("got %d override pieces, want at least one per revision", len(pieces))
+			}
+			for i := 1; i < len(pieces); i++ {
+				if !pieces[i-1].AssignmentEnd.Equal(pieces[i].AssignmentStart) {
+					t.Fatalf("override pieces %d and %d are not contiguous: %v then %v",
+						i-1, i, pieces[i-1].AssignmentEnd, pieces[i].AssignmentStart)
+				}
+			}
+			if assignmentAt(pieces, edit) == nil {
+				t.Fatal("no override piece covers the edit instant")
+			}
+
+			// Both boundaries matter: daily 11:00 and weekly Monday 11:00 put
+			// their slot starts on the same instant and differ only in where
+			// the slot ends.
+			type slotKey struct{ start, end time.Time }
+			slots := map[slotKey]bool{}
+			revisions := map[string]bool{}
+			for _, p := range pieces {
+				slots[slotKey{p.GridSlotStart, p.GridSlotEnd}] = true
+				revisions[p.ScheduleRevisionID] = true
+			}
+			if len(revisions) != 2 {
+				t.Fatalf("override pieces come from %d revisions, want both sides of the edit", len(revisions))
+			}
+			if len(slots) < 2 {
+				t.Fatal("all pieces report one grid slot; the edit redrew the grid")
+			}
+
+			// Merging keeps them one override: the grid moved, the duty did not.
+			shifts := MergeAdjacent(pieces)
+			if len(shifts) != 1 {
+				t.Fatalf("merged into %d shifts, want 1 continuous override", len(shifts))
+			}
+			if !shifts[0].Start.Equal(ovrStart) || !shifts[0].End.Equal(ovrEnd) {
+				t.Fatalf("merged override = %v..%v, want %v..%v",
+					shifts[0].Start, shifts[0].End, ovrStart, ovrEnd)
+			}
+		})
+	}
+}
+
 // TestOverlappingOverridesResolveDeterministically pins the rule: the later
 // recorded override wins, and the reader is told the two collided.
 func TestOverlappingOverridesResolveDeterministically(t *testing.T) {
@@ -255,7 +357,7 @@ func TestOverlapResolutionIsPermutationInvariant(t *testing.T) {
 
 // coverage returns the span from the first to the last assignment of a source,
 // which is enough to check an override was not truncated.
-func coverage(assignments []Assignment, source string) interval {
+func sourceSpan(assignments []Assignment, source string) interval {
 	var out interval
 	for _, a := range assignments {
 		if a.Source != source {

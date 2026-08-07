@@ -26,7 +26,16 @@ func New(repo scheduleconfig.ScheduleReadRepository) *Service {
 //
 // asOf selects the system time at which override state is read: nil means as
 // it stands now, a value replays the state as it was known then.
+//
+// The range is normalized to database resolution before anything is fetched.
+// Passing it raw would let the queries floor `until` while the renderer clips
+// with the nanosecond-precise value, and a revision overlapping the range by
+// less than a microsecond would be dropped by the query yet expected by the
+// renderer. Result.From/Until report the range that was actually answered.
 func (s *Service) RenderRange(ctx context.Context, scheduleID string, from, until time.Time, asOf *time.Time) (Result, error) {
+	from = scheduleconfig.NormalizeTimestamp(from)
+	until = scheduleconfig.NormalizeTimestamp(until)
+
 	var res Result
 	err := s.repo.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
 		root, err := view.GetScheduleRoot(ctx, scheduleID)
@@ -68,6 +77,12 @@ func (s *Service) RenderRange(ctx context.Context, scheduleID string, from, unti
 // dispatcher asking who to page must be told "nobody", not handed a failure
 // it has to interpret.
 func (s *Service) CurrentOnCall(ctx context.Context, scheduleID string, at time.Time) (OnCall, error) {
+	// Normalized for the same reason the render range is: the query that
+	// picks the effective revision floors `at`, so a sub-microsecond instant
+	// would be resolved against one revision and have its slot computed at
+	// another moment.
+	at = scheduleconfig.NormalizeTimestamp(at)
+
 	out := OnCall{At: at}
 	err := s.repo.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
 		rev, err := view.GetEffectiveRevision(ctx, scheduleID, at)

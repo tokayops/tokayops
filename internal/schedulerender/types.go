@@ -78,10 +78,16 @@ const (
 	// never returned as if it were recorded.
 	WarnHistoryIncomplete WarningCode = "history_incomplete"
 
-	// WarnRevisionGap means the revision chain has a hole: two revisions that
-	// should be adjacent are not. Since a deleted period is itself a
-	// revision, this only ever means data loss.
+	// WarnRevisionGap means the revision chain fails to cover a stretch it
+	// should have covered - between two revisions, before the first, or after
+	// the last. Since a deleted period is itself a revision, this only ever
+	// means data loss.
 	WarnRevisionGap WarningCode = "revision_gap"
+
+	// WarnRevisionOverlap means two revisions claim the same instant. The
+	// exclusion constraint forbids it, so this is corruption; the renderer
+	// resolves it in favour of the earlier revision and says so.
+	WarnRevisionOverlap WarningCode = "revision_overlap"
 
 	// WarnScheduleInactive marks the interval covered by a deleted-kind
 	// revision. It is an expected state, not damage.
