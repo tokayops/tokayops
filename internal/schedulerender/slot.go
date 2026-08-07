@@ -54,7 +54,7 @@ func renderSlot(in slotInput) ([]Assignment, []Warning) {
 		return nil, nil
 	}
 
-	covering := clipOverrides(in.Overrides, in.Bound)
+	covering := overridesForSlot(in.Overrides, in.Bound)
 	points := elementaryPoints(covering, in.Bound)
 
 	var (
@@ -107,16 +107,17 @@ func renderSlot(in slotInput) ([]Assignment, []Warning) {
 	return out, warnings
 }
 
-// clipOverrides restricts the overrides to the bound, drops the ones that do
-// not reach it, and sorts them by priority ASCENDING so that the last covering
-// entry always wins.
+// overridesForSlot keeps the overrides that reach the bound and sorts them by
+// priority ASCENDING, so that the last covering entry always wins. Their own
+// validity intervals are left intact: the bound decides which pieces are
+// reported, not what an override covers.
 //
 // The sort is what makes the result independent of the order the caller
 // supplied: overlapping overrides must resolve the same way no matter how the
 // projection happened to return them. Priority is the later recorded_at, and
 // for two recorded in the same microsecond the greater override_id - an
 // arbitrary but total rule, which is what determinism requires.
-func clipOverrides(overrides []scheduleconfig.OverrideRevision, bound interval) []scheduleconfig.OverrideRevision {
+func overridesForSlot(overrides []scheduleconfig.OverrideRevision, bound interval) []scheduleconfig.OverrideRevision {
 	out := make([]scheduleconfig.OverrideRevision, 0, len(overrides))
 	for _, o := range overrides {
 		if !o.ValidTo.After(bound.Start) || !o.ValidFrom.Before(bound.End) {
