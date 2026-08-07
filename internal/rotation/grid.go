@@ -179,69 +179,101 @@ func (g *grid) alignDate(at time.Time) civilDate {
 	return c
 }
 
-// nextAfter returns the first grid boundary strictly after cur, advancing
-// calendar dates from c. It skips dates whose boundary collapses into an
-// earlier one: a timezone can skip an entire calendar date (Pacific/Apia
-// 2011-12-30), making adjacent dates resolve to the same instant. Every
-// method derives the boundary sequence through this dedupe, so the grid is
-// the strictly increasing sequence of DISTINCT resolved instants.
-func (g *grid) nextAfter(c civilDate, cur time.Time) (civilDate, time.Time) {
+// boundaryCursor pairs a boundary instant with the SOURCE civil date it was
+// resolved from. The source date is NOT recoverable from the instant: a DST
+// gap can shift a boundary onto the NEXT calendar date without collapsing
+// into that date's own boundary (Asia/Dhaka 2009-06-19 23:30 resolves to
+// June 20 00:30 local, while June 20 has its own 23:30 boundary). Walking
+// from a date re-derived off the instant would skip that boundary, so every
+// walk carries the cursor instead.
+type boundaryCursor struct {
+	date    civilDate
+	instant time.Time
+}
+
+// nextAfter returns the first grid boundary strictly after cur.instant,
+// advancing calendar dates from cur.date. It skips dates whose boundary
+// collapses into an earlier one: a timezone can skip an entire calendar
+// date (Pacific/Apia 2011-12-30), making adjacent dates resolve to the same
+// instant. Every method derives the boundary sequence through this dedupe,
+// so the grid is the strictly increasing sequence of DISTINCT resolved
+// instants.
+func (g *grid) nextAfter(cur boundaryCursor) boundaryCursor {
+	c := cur.date
 	for {
 		c = c.addDays(g.stepDays)
-		if b := g.resolve(c); b.After(cur) {
-			return c, b
+		if b := g.resolve(c); b.After(cur.instant) {
+			return boundaryCursor{date: c, instant: b}
 		}
 	}
 }
 
-func (g *grid) SlotContaining(at time.Time) Slot {
+// slotContaining locates the slot around at and returns cursors for its
+// start and end boundaries. The backward scan recovers the true source date
+// of the start boundary (it steps back until the resolved boundary is <= at,
+// which lands on the gap-shifted source date, not on the date the instant
+// happens to fall on).
+func (g *grid) slotContaining(at time.Time) (start, end boundaryCursor) {
 	c := g.alignDate(at)
 	b := g.resolve(c)
 	for b.After(at) {
 		c = c.addDays(-g.stepDays)
 		b = g.resolve(c)
 	}
+	cur := boundaryCursor{date: c, instant: b}
 	for {
-		nc, nb := g.nextAfter(c, b)
-		if nb.After(at) {
-			return Slot{Start: b, End: nb}
+		next := g.nextAfter(cur)
+		if next.instant.After(at) {
+			return cur, next
 		}
-		c, b = nc, nb
+		cur = next
 	}
+}
+
+func (g *grid) SlotContaining(at time.Time) Slot {
+	start, end := g.slotContaining(at)
+	return Slot{Start: start.instant, End: end.instant}
 }
 
 func (g *grid) NextBoundary(after time.Time) time.Time {
-	return g.SlotContaining(after).End
+	_, end := g.slotContaining(after)
+	return end.instant
 }
 
-// SlotsBetween walks distinct boundaries from a to b. A calendar-step
-// estimate is NOT usable here: when a zone skips a whole date, two calendar
-// steps collapse into one boundary, so a calendar count both disagrees with
-// NextBoundary stepping and becomes ambiguous at the collapsed instant.
+// SlotsBetween walks distinct boundaries from a to b, carrying the source
+// civil date in the cursor the whole way. A calendar-step estimate is NOT
+// usable here (skipped dates collapse boundaries and make the count
+// ambiguous), and re-deriving the date from an instant is NOT usable either
+// (gap-shifted boundaries live on a different date - see boundaryCursor).
 // Consistency with NextBoundary holds by construction; the walk is O(days),
-// which is fine for multi-year anchors (a few thousand cheap resolver calls).
+// fine for multi-year anchors (a few thousand cheap resolver calls).
 func (g *grid) SlotsBetween(fromSlotStart, toSlotStart time.Time) (int, error) {
-	if s := g.SlotContaining(fromSlotStart); !s.Start.Equal(fromSlotStart) {
+	fromCur, _ := g.slotContaining(fromSlotStart)
+	if !fromCur.instant.Equal(fromSlotStart) {
 		return 0, fmt.Errorf("rotation: %v is not a slot start of this grid", fromSlotStart)
 	}
-	if s := g.SlotContaining(toSlotStart); !s.Start.Equal(toSlotStart) {
+	toCur, _ := g.slotContaining(toSlotStart)
+	if !toCur.instant.Equal(toSlotStart) {
 		return 0, fmt.Errorf("rotation: %v is not a slot start of this grid", toSlotStart)
 	}
 	if fromSlotStart.Equal(toSlotStart) {
 		return 0, nil
 	}
 	sign := 1
-	a, b := fromSlotStart, toSlotStart
-	if b.Before(a) {
-		a, b = b, a
+	cur, target := fromCur, toCur.instant
+	if target.Before(cur.instant) {
+		cur, target = toCur, fromCur.instant
 		sign = -1
 	}
-	c := g.alignDate(a)
-	cur := a
 	n := 0
-	for cur.Before(b) {
-		c, cur = g.nextAfter(c, cur)
+	for cur.instant.Before(target) {
+		cur = g.nextAfter(cur)
 		n++
+	}
+	if !cur.instant.Equal(target) {
+		// Defensive: both ends were validated as slot starts, so the walk
+		// must land exactly on the target.
+		return 0, fmt.Errorf("rotation: boundary walk overshot %v to %v", target, cur.instant)
 	}
 	return sign * n, nil
 }
@@ -250,11 +282,11 @@ func (g *grid) SlotsOverlapping(from, until time.Time) []Slot {
 	if !until.After(from) {
 		return nil
 	}
-	cur := g.SlotContaining(from)
+	start, end := g.slotContaining(from)
 	var out []Slot
-	for cur.Start.Before(until) {
-		out = append(out, cur)
-		cur = g.SlotContaining(cur.End)
+	for start.instant.Before(until) {
+		out = append(out, Slot{Start: start.instant, End: end.instant})
+		start, end = end, g.nextAfter(end)
 	}
 	return out
 }

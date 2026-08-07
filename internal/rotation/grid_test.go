@@ -261,6 +261,61 @@ func TestGrid_SkippedCalendarDay_Apia(t *testing.T) {
 	}
 }
 
+// Asia/Dhaka started DST on 2009-06-19 at 23:00 (clocks jumped to June 20
+// 00:00). A daily 23:30 handoff on June 19 is gap-shifted onto the NEXT
+// calendar date (June 20 00:30 local) WITHOUT collapsing into June 20's own
+// 23:30 boundary. The boundary walk must carry the source civil date: a
+// walk restarted from the date re-derived off the instant (June 20) would
+// skip the June 20 23:30 boundary and undercount SlotsBetween by one -
+// shifting every later on-call position.
+func TestGrid_GapShiftedToNextDate_Dhaka(t *testing.T) {
+	g := mustGrid(t, "Asia/Dhaka", dailyPolicy("23:30"))
+	loc, err := time.LoadLocation("Asia/Dhaka")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// All three instants exist unambiguously in local time.
+	b19 := time.Date(2009, time.June, 20, 0, 30, 0, 0, loc).UTC()  // shifted boundary of June 19
+	b20 := time.Date(2009, time.June, 20, 23, 30, 0, 0, loc).UTC() // June 20's own boundary
+	b21 := time.Date(2009, time.June, 21, 23, 30, 0, 0, loc).UTC()
+
+	s := g.SlotContaining(utc(2009, time.June, 20, 10, 0))
+	if !s.Start.Equal(b19) || !s.End.Equal(b20) {
+		t.Fatalf("slot = [%v, %v), want [%v, %v)", s.Start, s.End, b19, b20)
+	}
+	if nb := g.NextBoundary(b19); !nb.Equal(b20) {
+		t.Fatalf("NextBoundary(shifted) = %v, want %v", nb, b20)
+	}
+	// The regression case: walking FROM the gap-shifted boundary must not
+	// skip the same-date boundary that follows it.
+	if n, err := g.SlotsBetween(b19, b20); err != nil || n != 1 {
+		t.Fatalf("SlotsBetween(b19,b20) = %d (%v), want 1", n, err)
+	}
+	if n, err := g.SlotsBetween(b19, b21); err != nil || n != 2 {
+		t.Fatalf("SlotsBetween(b19,b21) = %d (%v), want 2", n, err)
+	}
+	if n, err := g.SlotsBetween(b21, b19); err != nil || n != -2 {
+		t.Fatalf("SlotsBetween(b21,b19) = %d (%v), want -2", n, err)
+	}
+	// Tiling across the transition has no gaps and hits all three.
+	slots := g.SlotsOverlapping(utc(2009, time.June, 18, 0, 0), utc(2009, time.June, 22, 0, 0))
+	found := 0
+	for i, sl := range slots {
+		if !sl.Start.Before(sl.End) {
+			t.Fatalf("zero-length slot %d", i)
+		}
+		if i > 0 && !sl.Start.Equal(slots[i-1].End) {
+			t.Fatalf("gap at slot %d", i)
+		}
+		if sl.Start.Equal(b19) || sl.Start.Equal(b20) || sl.Start.Equal(b21) {
+			found++
+		}
+	}
+	if found != 3 {
+		t.Fatalf("tiling found %d of the 3 expected boundaries", found)
+	}
+}
+
 func TestGrid_SlotsBetween_MultiYear(t *testing.T) {
 	g := mustGrid(t, "Europe/Berlin", dailyPolicy("09:00"))
 	a := g.SlotContaining(inZone(t, "Europe/Berlin", 2020, time.January, 1, 12, 0)).Start
