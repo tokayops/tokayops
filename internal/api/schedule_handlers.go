@@ -4,14 +4,14 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/scheduler"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
-	"github.com/lib/pq"
 )
 
 // ========================================
@@ -42,38 +42,6 @@ type SetUsersRequest struct {
 // SetGroupsRequest represents a request to set L1 rotation groups
 type SetGroupsRequest struct {
 	Groups [][]string `json:"groups"` // Groups of user IDs, e.g. [["id1","id2"],["id3"]]
-}
-
-// OverrideRequest represents a request to create an override
-type OverrideRequest struct {
-	UserID         string    `json:"user_id"`          // User to assign
-	StartTime      time.Time `json:"start_time"`       // Legacy: UTC or offset-included time
-	EndTime        time.Time `json:"end_time"`         // Legacy: UTC or offset-included time
-	Reason         string    `json:"reason"`           // Optional reason
-	Timezone       string    `json:"timezone"`         // Optional: Timezone for local times
-	StartTimeLocal string    `json:"start_time_local"` // Optional: "2006-01-02T15:04"
-	EndTimeLocal   string    `json:"end_time_local"`   // Optional: "2006-01-02T15:04"
-}
-
-// RenderEntry represents a single calendar entry
-type RenderEntry struct {
-	UserIDs   []string  `json:"user_ids"`
-	UserNames []string  `json:"user_names"`
-	StartTime time.Time `json:"start_time"`
-	EndTime   time.Time `json:"end_time"`
-	Layer     string    `json:"layer"` // "l1", "l2", "override"
-	// Override-specific fields (only set when Layer == "override")
-	OverrideID    string     `json:"override_id,omitempty"`
-	ScheduleID    string     `json:"schedule_id,omitempty"`
-	OverrideStart *time.Time `json:"override_start,omitempty"`
-	OverrideEnd   *time.Time `json:"override_end,omitempty"`
-	Reason        string     `json:"reason,omitempty"`
-}
-
-// RenderResponse wraps calendar entries with schedule metadata
-type RenderResponse struct {
-	Timezone string        `json:"timezone"`
-	Entries  []RenderEntry `json:"entries"`
 }
 
 // GetTeamSchedule godoc
@@ -255,33 +223,6 @@ func (a *API) UpsertTeamSchedule(c echo.Context) error {
 	return c.JSON(http.StatusOK, schedule)
 }
 
-// DeleteTeamSchedule godoc
-// @Summary Delete schedule for a team
-// @Description Delete the on-call schedule configuration for a team
-// @Tags schedules
-// @Produce json
-// @Param id path string true "Team ID"
-// @Success 204
-// @Failure 404 {object} ErrorResponse
-// @Router /api/v1/teams/{id}/schedule [delete]
-func (a *API) DeleteTeamSchedule(c echo.Context) error {
-	teamID := c.Param("id")
-
-	schedule, err := a.store.GetScheduleByTeamID(teamID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "no schedule configured for this team"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
-	if err := a.store.DeleteSchedule(schedule.ID); err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
-	return c.NoContent(http.StatusNoContent)
-}
-
 // SetScheduleL1Groups godoc
 // @Summary Set L1 rotation groups
 // @Description Set the rotation groups for L1 (primary) rotation
@@ -331,7 +272,7 @@ func (a *API) SetScheduleL1Groups(c echo.Context) error {
 				}
 				seen[userID] = true
 				if !memberMap[userID] {
-					if _, err := a.store.GetUserByID(userID); err != nil {
+					if _, err := a.store.GetActiveUserByID(userID); err != nil {
 						return c.JSON(http.StatusBadRequest, ErrorResponse{Error: fmt.Sprintf("user %s not found", userID)})
 					}
 					return c.JSON(http.StatusBadRequest, ErrorResponse{Error: fmt.Sprintf("user %s is not a member of team %s", userID, teamID)})
@@ -393,7 +334,7 @@ func (a *API) setScheduleLayerUsers(c echo.Context, layer string) error {
 	for _, userID := range req.UserIDs {
 		if !memberMap[userID] {
 			// Check if user exists at all (for better error message)
-			if _, err := a.store.GetUserByID(userID); err != nil {
+			if _, err := a.store.GetActiveUserByID(userID); err != nil {
 				return c.JSON(http.StatusBadRequest, ErrorResponse{Error: fmt.Sprintf("user %s not found", userID)})
 			}
 			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: fmt.Sprintf("user %s is not a member of team %s", userID, teamID)})
@@ -436,468 +377,110 @@ func (a *API) GetTeamOnCall(c echo.Context) error {
 	return c.JSON(http.StatusOK, result)
 }
 
-// RenderSchedule godoc
-// @Summary Render schedule calendar
-// @Description Get schedule entries for a time range
-// @Tags schedules
-// @Produce json
-// @Param id path string true "Team ID"
-// @Param from query string true "Start time (RFC3339)"
-// @Param until query string true "End time (RFC3339)"
-// @Success 200 {array} RenderEntry
-// @Failure 400 {object} ErrorResponse
-// @Failure 404 {object} ErrorResponse
-// @Router /api/v1/teams/{id}/schedule/render [get]
-func (a *API) RenderSchedule(c echo.Context) error {
-	teamID := c.Param("id")
-
-	fromStr := c.QueryParam("from")
-	untilStr := c.QueryParam("until")
-
-	from, err := time.Parse(time.RFC3339, fromStr)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid 'from' parameter"})
-	}
-	until, err := time.Parse(time.RFC3339, untilStr)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid 'until' parameter"})
-	}
-
-	// Validate time range
-	if !until.After(from) {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "until must be after from"})
-	}
-	maxRange := 90 * 24 * time.Hour
-	if until.Sub(from) > maxRange {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "range cannot exceed 90 days"})
-	}
-
-	schedule, err := a.store.GetScheduleByTeamID(teamID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "no schedule configured for this team"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
-	// Load L1 epochs for the time range
-	l1Epochs, err := a.store.GetRotationEpochs(schedule.ID, "l1", from, until)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to load L1 epochs"})
-	}
-
-	// Load L2 epochs if enabled
-	var l2Epochs []*model.RotationEpoch
-	if schedule.L2Enabled {
-		l2Epochs, err = a.store.GetRotationEpochs(schedule.ID, "l2", from, until)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to load L2 epochs"})
-		}
-	}
-
-	// Load overrides for the period
-	schedule.Overrides, err = a.store.GetScheduleOverrides(schedule.ID, from, until)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to load overrides"})
-	}
-
-	// Build user map for segment generator
-	userIDs := make(map[string]bool)
-	for _, epoch := range l1Epochs {
-		for _, group := range epoch.Groups {
-			for _, userID := range group {
-				userIDs[userID] = true
-			}
-		}
-	}
-	for _, epoch := range l2Epochs {
-		for _, group := range epoch.Groups {
-			for _, userID := range group {
-				userIDs[userID] = true
-			}
-		}
-	}
-	for _, o := range schedule.Overrides {
-		if o.User != nil {
-			// Already loaded? (Should not happen with current store implementation but safe to check)
-			// Ensure it's in the map later if we decide to re-assign
-		}
-		userIDs[o.UserID] = true
-	}
-
-	uniqueUserIDs := make([]string, 0, len(userIDs))
-	for id := range userIDs {
-		uniqueUserIDs = append(uniqueUserIDs, id)
-	}
-
-	fetchedUsers, err := a.store.GetUsersByIDs(uniqueUserIDs)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to batch load users: " + err.Error()})
-	}
-	users := make(map[string]*model.User)
-	for _, u := range fetchedUsers {
-		users[u.ID] = u
-	}
-
-	// Ensure overrides have user objects attached if they came preloaded (store-dependent)
-	// or from the batch fetch
-	for _, o := range schedule.Overrides {
-		if u, ok := users[o.UserID]; ok {
-			o.User = u // Attach for segment generator usage
-		}
-	}
-
-	// Generate L1 segments
-	gen := scheduler.NewSegmentGenerator()
-	segments := gen.GenerateSegments(schedule, l1Epochs, schedule.Overrides, users, from, until)
-
-	// Generate L2 segments and append
-	if schedule.L2Enabled && len(l2Epochs) > 0 {
-		l2Schedule := &model.Schedule{
-			ID:             schedule.ID,
-			Timezone:       schedule.Timezone,
-			L1RotationType: schedule.L2RotationType,
-			L1HandoffTime:  schedule.L2HandoffTime,
-			L1HandoffDay:   schedule.L2HandoffDay,
-		}
-		l2Segments := gen.GenerateSegments(l2Schedule, l2Epochs, nil, users, from, until)
-		// Mark as L2 layer
-		for i := range l2Segments {
-			l2Segments[i].Layer = "l2"
-		}
-		segments = append(segments, l2Segments...)
-	}
-
-	// Load timezone for calendar rendering (view timezone)
-	// Default to schedule's timezone if not specified in query
-	viewTzName := c.QueryParam("timezone")
-	if viewTzName == "" {
-		viewTzName = schedule.Timezone
-	}
-
-	loc, err := time.LoadLocation(viewTzName)
-	if err != nil {
-		// Fallback to schedule timezone if invalid
-		if l, err := time.LoadLocation(schedule.Timezone); err == nil {
-			loc = l
-		} else {
-			loc = time.UTC
-		}
-	}
-
-	// Prepare for calendar UI: split by days + merge adjacent same-user segments
-	// This splits segments based on MIDNIGHT in the VIEW timezone
-	segments = gen.RenderCalendarSchedule(segments, loc)
-
-	// Convert to RenderEntry format (Times are UTC)
-	entries := make([]RenderEntry, 0, len(segments))
-	for _, seg := range segments {
-		entry := RenderEntry{
-			UserIDs:   seg.UserIDs,
-			StartTime: seg.StartTime, // Return UTC
-			EndTime:   seg.EndTime,   // Return UTC
-			Layer:     seg.Layer,
-		}
-		for _, u := range seg.Users {
-			entry.UserNames = append(entry.UserNames, u.Name)
-		}
-		if seg.Override != nil {
-			entry.OverrideID = seg.Override.ID
-			entry.ScheduleID = seg.Override.ScheduleID
-			entry.OverrideStart = &seg.Override.StartTime
-			entry.OverrideEnd = &seg.Override.EndTime
-			entry.Reason = seg.Override.Reason
-		}
-		entries = append(entries, entry)
-	}
-
-	return c.JSON(http.StatusOK, RenderResponse{
-		Timezone: schedule.Timezone,
-		Entries:  entries,
-	})
-}
-
 // CreateScheduleOverride godoc
 // @Summary Create an override
-// @Description Create a temporary on-call override (vacation, swap)
+// @Description Records a temporary stand-in as a new append-only override revision.
 // @Tags schedules
 // @Accept json
 // @Produce json
 // @Param id path string true "Team ID"
-// @Param override body OverrideRequest true "Override data"
-// @Success 201 {object} model.ScheduleOverride
+// @Param override body ScheduleOverrideRequest true "Override"
+// @Success 201 {object} ScheduleOverrideDTO
 // @Failure 400 {object} ErrorResponse
 // @Failure 404 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse
+// @Failure 422 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule/overrides [post]
 func (a *API) CreateScheduleOverride(c echo.Context) error {
-	teamID := c.Param("id")
-
-	schedule, err := a.store.GetScheduleByTeamID(teamID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "no schedule configured for this team"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+	if !a.scheduleConfigReady() {
+		return serviceUnavailable(c, "schedule configuration service")
 	}
-
-	var req OverrideRequest
+	var req ScheduleOverrideRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
 	}
 
-	// Handle local time inputs if provided
-	if req.Timezone != "" {
-		loc, err := time.LoadLocation(req.Timezone)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid timezone"})
-		}
-
-		// Parse StartTimeLocal if present
-		if req.StartTimeLocal != "" {
-			// Try parsing ISO format (from datetime-local input)
-			// datetime-local format: "2006-01-02T15:04"
-			t, err := time.ParseInLocation("2006-01-02T15:04", req.StartTimeLocal, loc)
-			if err != nil {
-				return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid start_time_local format"})
-			}
-			req.StartTime = t.UTC()
-		}
-
-		// Parse EndTimeLocal if present
-		if req.EndTimeLocal != "" {
-			t, err := time.ParseInLocation("2006-01-02T15:04", req.EndTimeLocal, loc)
-			if err != nil {
-				return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid end_time_local format"})
-			}
-			req.EndTime = t.UTC()
-		}
-	}
-
-	if req.UserID == "" {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "user_id is required"})
-	}
-	if req.StartTime.IsZero() || req.EndTime.IsZero() {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "start_time and end_time (or local equivalents) are required"})
-	}
-	if !req.EndTime.After(req.StartTime) {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "end_time must be after start_time"})
-	}
-	if req.StartTime.Before(time.Now().UTC().Add(-5 * time.Minute)) {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "start_time cannot be in the past"})
-	}
-
-	// Verify user is a member of the team
-	members, err := a.store.GetTeamMembers(teamID)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to load team members: " + err.Error()})
-	}
-	isMember := false
-	for _, m := range members {
-		if m.ID == req.UserID {
-			isMember = true
-			break
-		}
-	}
-	if !isMember {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: fmt.Sprintf("user %s is not a member of team %s", req.UserID, teamID)})
-	}
-
-	// Check for conflicting overrides
-	existingOverrides, err := a.store.GetScheduleOverrides(schedule.ID, req.StartTime, req.EndTime)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to check existing overrides"})
-	}
-	if len(existingOverrides) > 0 {
-		return c.JSON(http.StatusConflict, map[string]interface{}{
-			"error":                 "override conflicts with existing override(s)",
-			"conflicting_overrides": existingOverrides,
+	rev, err := a.scheduleConfig.CreateOverride(c.Request().Context(), c.Param("id"),
+		scheduleconfig.OverrideCommand{
+			UserID:    req.UserID,
+			ValidFrom: req.ValidFrom,
+			ValidTo:   req.ValidTo,
+			Reason:    req.Reason,
+			ActorID:   actorID(c),
 		})
+	if err != nil {
+		return a.mapScheduleError(c, err)
 	}
-
-	// Get current user from context
-	createdBy := ""
-	if userID, ok := c.Get("user_id").(string); ok {
-		createdBy = userID
-	}
-
-	override := &model.ScheduleOverride{
-		ID:         uuid.New().String(),
-		ScheduleID: schedule.ID,
-		UserID:     req.UserID,
-		StartTime:  req.StartTime,
-		EndTime:    req.EndTime,
-		Reason:     req.Reason,
-		CreatedBy:  createdBy,
-	}
-
-	if err := a.store.CreateScheduleOverride(override); err != nil {
-		// Check for exclusion constraint violation (Postgres error 23P01)
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23P01" {
-			return c.JSON(http.StatusConflict, map[string]interface{}{
-				"error": "override conflicts with existing override(s) (race detected)",
-			})
-		}
-		// Fallback check
-		if strings.Contains(err.Error(), "exclusion constraint") || strings.Contains(err.Error(), "no_overlapping_overrides") {
-			return c.JSON(http.StatusConflict, map[string]interface{}{
-				"error": "override conflicts with existing override(s) (race detected)",
-			})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
-	// Load user for response
-	override.User, _ = a.store.GetUserByID(req.UserID)
-
-	return c.JSON(http.StatusCreated, override)
+	return c.JSON(http.StatusCreated, scheduleOverrideDTO(*rev))
 }
 
 // UpdateScheduleOverride godoc
 // @Summary Update an override
-// @Description Update an existing schedule override (user, times, reason)
+// @Description Appends the next revision of an override. expected_revision must match the current head.
 // @Tags schedules
 // @Accept json
 // @Produce json
 // @Param schedule_id path string true "Schedule ID"
 // @Param id path string true "Override ID"
-// @Param override body OverrideRequest true "Override data"
-// @Success 200 {object} model.ScheduleOverride
+// @Param override body ScheduleOverrideRequest true "Override"
+// @Success 200 {object} ScheduleOverrideDTO
 // @Failure 400 {object} ErrorResponse
 // @Failure 404 {object} ErrorResponse
 // @Failure 409 {object} ErrorResponse
 // @Router /api/v1/schedules/{schedule_id}/overrides/{id} [put]
 func (a *API) UpdateScheduleOverride(c echo.Context) error {
-	scheduleID := c.Param("schedule_id")
-	overrideID := c.Param("id")
-
-	// ScopeScheduleOverride middleware already verified ownership and loaded schedule
-	schedule, _ := c.Get("schedule").(*model.Schedule)
-	if schedule == nil {
-		return c.JSON(http.StatusNotFound, ErrorResponse{Error: "schedule not found"})
+	if !a.scheduleConfigReady() {
+		return serviceUnavailable(c, "schedule configuration service")
 	}
-
-	var req OverrideRequest
+	var req ScheduleOverrideRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
 	}
 
-	// Handle local time inputs if provided
-	if req.Timezone != "" {
-		loc, err := time.LoadLocation(req.Timezone)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid timezone"})
-		}
-
-		if req.StartTimeLocal != "" {
-			t, err := time.ParseInLocation("2006-01-02T15:04", req.StartTimeLocal, loc)
-			if err != nil {
-				return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid start_time_local format"})
-			}
-			req.StartTime = t.UTC()
-		}
-
-		if req.EndTimeLocal != "" {
-			t, err := time.ParseInLocation("2006-01-02T15:04", req.EndTimeLocal, loc)
-			if err != nil {
-				return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid end_time_local format"})
-			}
-			req.EndTime = t.UTC()
-		}
-	}
-
-	if req.UserID == "" {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "user_id is required"})
-	}
-	if req.StartTime.IsZero() || req.EndTime.IsZero() {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "start_time and end_time (or local equivalents) are required"})
-	}
-	if !req.EndTime.After(req.StartTime) {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "end_time must be after start_time"})
-	}
-
-	// Verify user is a member of the team
-	members, err := a.store.GetTeamMembers(schedule.TeamID)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to load team members: " + err.Error()})
-	}
-	isMember := false
-	for _, m := range members {
-		if m.ID == req.UserID {
-			isMember = true
-			break
-		}
-	}
-	if !isMember {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: fmt.Sprintf("user %s is not a member of team %s", req.UserID, schedule.TeamID)})
-	}
-
-	// Check for conflicting overrides (exclude self)
-	existingOverrides, err := a.store.GetScheduleOverrides(scheduleID, req.StartTime, req.EndTime)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to check existing overrides"})
-	}
-	var conflicts []*model.ScheduleOverride
-	for _, o := range existingOverrides {
-		if o.ID != overrideID {
-			conflicts = append(conflicts, o)
-		}
-	}
-	if len(conflicts) > 0 {
-		return c.JSON(http.StatusConflict, map[string]interface{}{
-			"error":                 "override conflicts with existing override(s)",
-			"conflicting_overrides": conflicts,
+	rev, err := a.scheduleConfig.UpdateOverride(c.Request().Context(),
+		c.Param("schedule_id"), c.Param("id"), req.ExpectedRevision,
+		scheduleconfig.OverrideCommand{
+			UserID:    req.UserID,
+			ValidFrom: req.ValidFrom,
+			ValidTo:   req.ValidTo,
+			Reason:    req.Reason,
+			ActorID:   actorID(c),
 		})
+	if err != nil {
+		return a.mapScheduleError(c, err)
 	}
-
-	override := &model.ScheduleOverride{
-		ID:        overrideID,
-		UserID:    req.UserID,
-		StartTime: req.StartTime,
-		EndTime:   req.EndTime,
-		Reason:    req.Reason,
-	}
-
-	if err := a.store.UpdateScheduleOverride(override); err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "override not found"})
-		}
-		// Check for exclusion constraint violation (race condition)
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23P01" {
-			return c.JSON(http.StatusConflict, map[string]interface{}{
-				"error": "override conflicts with existing override(s) (race detected)",
-			})
-		}
-		if strings.Contains(err.Error(), "exclusion constraint") || strings.Contains(err.Error(), "no_overlapping_overrides") {
-			return c.JSON(http.StatusConflict, map[string]interface{}{
-				"error": "override conflicts with existing override(s) (race detected)",
-			})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
-	// Load full override data for response
-	override.ScheduleID = scheduleID
-	override.User, _ = a.store.GetUserByID(req.UserID)
-
-	return c.JSON(http.StatusOK, override)
+	return c.JSON(http.StatusOK, scheduleOverrideDTO(*rev))
 }
 
 // DeleteScheduleOverride godoc
 // @Summary Delete an override
-// @Description Delete a schedule override
+// @Description Appends a tombstone. The override history is kept and stays replayable as of any past instant.
 // @Tags schedules
+// @Produce json
 // @Param schedule_id path string true "Schedule ID"
 // @Param id path string true "Override ID"
+// @Param expected_revision query int true "Revision the caller loaded"
 // @Success 204
+// @Failure 400 {object} ErrorResponse
 // @Failure 404 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse
 // @Router /api/v1/schedules/{schedule_id}/overrides/{id} [delete]
 func (a *API) DeleteScheduleOverride(c echo.Context) error {
-
-	overrideID := c.Param("id")
-
-	if err := a.store.DeleteScheduleOverride(overrideID); err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+	if !a.scheduleConfigReady() {
+		return serviceUnavailable(c, "schedule configuration service")
+	}
+	// Query rather than body: a DELETE body is not carried reliably by every
+	// client and proxy, and losing it here would silently skip the conflict
+	// check the parameter exists to perform.
+	expected, err := strconv.ParseInt(c.QueryParam("expected_revision"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest,
+			ErrorResponse{Error: "expected_revision query parameter is required"})
 	}
 
+	if err := a.scheduleConfig.DeleteOverride(c.Request().Context(),
+		c.Param("schedule_id"), c.Param("id"), expected, actorID(c)); err != nil {
+		return a.mapScheduleError(c, err)
+	}
 	return c.NoContent(http.StatusNoContent)
 }

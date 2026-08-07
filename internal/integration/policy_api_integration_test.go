@@ -36,6 +36,7 @@ func setupPolicyAPITest(t *testing.T) *APIIntegrationEnv {
 	})
 
 	a := api.NewAPI(s, nil, nil, nil, "", api.NewProviderCapsAdapter(reg))
+	wireScheduleServices(a, s)
 	e := echo.New()
 	a.RegisterRoutes(e)
 	return &APIIntegrationEnv{S: s, API: a, Echo: e}

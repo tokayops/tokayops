@@ -7,10 +7,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/metrics"
+	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/scheduleconfig/fakes"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/labstack/echo/v4"
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,15 +30,55 @@ func addAuth(req *http.Request, userID string) {
 	req.AddCookie(&http.Cookie{Name: AuthCookieName, Value: token})
 }
 
+// scheduleTestEnv exposes the doubles behind the revision model so a test can
+// seed revisions and override the clock. Membership and users live in the mock
+// store; only the revision model lives in the fake.
+type scheduleTestEnv struct {
+	Config  *fakes.ScheduleConfigRepo
+	Erasure *testErasureRepo
+
+	// now is read through a pointer so a test can move the clock after the
+	// services are built.
+	now *time.Time
+}
+
+// SetNow moves the clock every schedule command and the preview read.
+func (env *scheduleTestEnv) SetNow(at time.Time) { *env.now = at }
+
 func setupTestAPI(t *testing.T) (*API, *store.MockStore, *echo.Echo) {
+	api, s, e, _ := setupScheduleAPI(t)
+	return api, s, e
+}
+
+// setupScheduleAPI wires the API with the real schedule and erasure services
+// over the test doubles. Every API test goes through here: the handlers refuse
+// to run unwired, and a suite where half the endpoints answer 503 would prove
+// nothing about them.
+func setupScheduleAPI(t *testing.T) (*API, *store.MockStore, *echo.Echo, *scheduleTestEnv) {
 	t.Helper()
 	s := store.NewMockStore()
 
 	api := NewAPI(s, nil, nil, nil, "", nil)
+
+	now := time.Now().UTC()
+	env := &scheduleTestEnv{
+		Config:  fakes.NewScheduleConfigRepo(),
+		Erasure: newTestErasureRepo(s),
+		now:     &now,
+	}
+	clock := func() time.Time { return *env.now }
+	repo := &testScheduleRepo{ScheduleConfigRepo: env.Config, store: s}
+
+	api.SetScheduleConfigService(scheduleconfig.NewService(repo,
+		scheduleconfig.WithClock(clock)))
+	api.SetScheduleReadRepository(repo)
+	api.SetScheduleRenderer(schedulerender.New(repo, schedulerender.WithClock(clock)))
+	api.SetUserEraser(erasure.NewService(env.Erasure, erasure.WithClock(clock)))
+
 	e := echo.New()
 	api.RegisterRoutes(e)
 
-	return api, s, e
+	return api, s, e, env
 }
 
 func createTestAlertGroup(t *testing.T, s store.StoreInterface, id, dedupKey string, status model.AlertGroupStatus) *model.AlertGroup {
@@ -887,40 +932,71 @@ func TestDeletedUserCannotAccess(t *testing.T) {
 }
 
 func TestDeleteTeamSchedule(t *testing.T) {
-	_, s, e := setupTestAPI(t)
+	_, s, e, _ := setupScheduleAPI(t)
 	defer s.Close()
 
 	t.Run("Success", func(t *testing.T) {
-		s.CreateSchedule(&model.Schedule{ID: "sched-del", TeamID: "devops", Timezone: "UTC"})
+		created := createSchedule(t, e, []string{"denis"})
 
-		req := httptest.NewRequest(http.MethodDelete, "/api/v1/teams/devops/schedule", nil)
+		req := httptest.NewRequest(http.MethodDelete,
+			fmt.Sprintf("/api/v1/teams/devops/schedule?expected_version=%d", created.Version), nil)
 		addAuth(req, "denis")
 		rec := httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusNoContent {
-			t.Errorf("Expected 204, got %d", rec.Code)
+			t.Fatalf("Expected 204, got %d: %s", rec.Code, rec.Body.String())
 		}
 
-		// Verify deleted - GET should return 404
-		req = httptest.NewRequest(http.MethodGet, "/api/v1/teams/devops/schedule", nil)
+		// The configuration endpoint still answers, with deleted_at set: the
+		// editor needs the last valid configuration to prefill a recreate.
+		req = httptest.NewRequest(http.MethodGet, "/api/v1/teams/devops/schedule/config", nil)
 		addAuth(req, "denis")
 		rec = httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("Expected 404 after delete, got %d", rec.Code)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Expected 200 after delete, got %d", rec.Code)
+		}
+		var cfg ScheduleConfigResponse
+		decodeJSON(t, rec, &cfg)
+		if cfg.DeletedAt == nil {
+			t.Fatal("deleted schedule must report deleted_at")
 		}
 	})
 
-	t.Run("NotFound", func(t *testing.T) {
-		// Team exists but no schedule (deleted in previous subtest)
-		req := httptest.NewRequest(http.MethodDelete, "/api/v1/teams/devops/schedule", nil)
+	t.Run("AlreadyDeleted", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete,
+			"/api/v1/teams/devops/schedule?expected_version=2", nil)
+		addAuth(req, "denis")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("Expected 409 for an already deleted schedule, got %d: %s",
+				rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("NoSchedule", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete,
+			"/api/v1/teams/triage/schedule?expected_version=1", nil)
 		addAuth(req, "denis")
 		rec := httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusNotFound {
-			t.Errorf("Expected 404 for no schedule, got %d", rec.Code)
+			t.Fatalf("Expected 404 for a team with no schedule, got %d", rec.Code)
+		}
+	})
+
+	t.Run("MissingExpectedVersion", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/teams/devops/schedule", nil)
+		addAuth(req, "denis")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("Expected 400 without expected_version, got %d", rec.Code)
 		}
 	})
 }
