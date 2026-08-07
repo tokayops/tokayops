@@ -15,6 +15,11 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// ErrUserNotFound means no user matched, or the one that did has been erased.
+// The two are the same answer on purpose: a command must not be able to tell
+// "this person never existed" from "this person was deleted".
+var ErrUserNotFound = errors.New("store: user not found")
+
 type Store struct {
 	db *sql.DB
 }
@@ -2290,10 +2295,34 @@ func (s *Store) CreateUser(u *model.User) error {
 	return err
 }
 
+// GetUserByID reads a user INCLUDING an erased one.
+//
+// It is the display read, and it exists so history stays legible: a revision
+// or an override that names an erased ID has to resolve to something, and
+// "Deleted user" is what anonymization left behind. Command paths and
+// authentication must not use it - they use GetActiveUserByID, or an erased
+// person keeps a working session and can be written back into the system.
 func (s *Store) GetUserByID(id string) (*model.User, error) {
 	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at FROM users WHERE id = $1`
-	row := s.db.QueryRow(query, id)
+	return scanUser(s.db.QueryRow(query, id))
+}
 
+// GetActiveUserByID reads a user that has not been erased.
+//
+// Soft delete has to be terminal, and this is the read that makes it so:
+// authentication and every command go through here, so an erased user's
+// session stops working on their next request and no command can act on them.
+func (s *Store) GetActiveUserByID(id string) (*model.User, error) {
+	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at
+			  FROM users WHERE id = $1 AND deleted_at IS NULL`
+	u, err := scanUser(s.db.QueryRow(query, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
+	return u, err
+}
+
+func scanUser(row *sql.Row) (*model.User, error) {
 	var u model.User
 	var email, role, passwordHash, authProvider sql.NullString
 	err := row.Scan(&u.ID, &email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
@@ -2358,11 +2387,17 @@ func (s *Store) GetAllUsers() ([]*model.User, error) {
 	return users, nil
 }
 
+// AddTeamMember grants a membership, and only to a user who has not been
+// erased: a bare INSERT would hand an erased identity a live grant back.
 func (s *Store) AddTeamMember(teamID, userID string, role model.TeamMemberRole) error {
-	query := `INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)
+	query := `INSERT INTO team_members (team_id, user_id, role)
+			  SELECT $1, $2, $3 FROM users WHERE id = $2 AND deleted_at IS NULL
 			  ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`
-	_, err := s.db.Exec(query, teamID, userID, role)
-	return err
+	res, err := s.db.Exec(query, teamID, userID, role)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 func (s *Store) GetTeamMembers(teamID string) ([]*model.TeamMemberDetail, error) {
@@ -2417,24 +2452,49 @@ func (s *Store) GetUserByEmail(email string) (*model.User, error) {
 	return &u, nil
 }
 
+// The three user mutations below all carry `deleted_at IS NULL` and check that
+// they affected a row.
+//
+// Without the filter each of them silently refills an erased row - name and
+// email, a password hash, a federated identity - and the erasure that was
+// supposed to be terminal becomes a stage a later request can undo. Without
+// the row count, an update that matched nothing reports success, which reads
+// as "the change was applied" to every caller.
+
 func (s *Store) UpdateUser(u *model.User) error {
-	query := `UPDATE users SET email = $1, name = $2, role = $3 WHERE id = $4`
-	_, err := s.db.Exec(query, u.Email, u.Name, u.Role, u.ID)
-	return err
+	query := `UPDATE users SET email = $1, name = $2, role = $3 WHERE id = $4 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, u.Email, u.Name, u.Role, u.ID)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 func (s *Store) UpdateUserPassword(id, hash string) error {
-	query := `UPDATE users SET password_hash = $1 WHERE id = $2`
-	_, err := s.db.Exec(query, hash, id)
-	return err
+	query := `UPDATE users SET password_hash = $1 WHERE id = $2 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, hash, id)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 func (s *Store) UpdateUserAuthProvider(id, provider string) error {
-	query := `UPDATE users SET auth_provider = $1 WHERE id = $2`
-	_, err := s.db.Exec(query, provider, id)
-	return err
+	query := `UPDATE users SET auth_provider = $1 WHERE id = $2 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, provider, id)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
+// DeleteUser physically removes a user.
+//
+// Deprecated: user deletion goes through erasure.Service, which soft-deletes
+// and anonymizes so the history that names the ID stays explainable, and which
+// refuses to erase someone who still holds an assignment. This remains only
+// for the tooling that has not moved yet and is removed with the rest of the
+// legacy schedule path.
 func (s *Store) DeleteUser(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM team_members WHERE user_id = $1`, id); err != nil {
 		return err
@@ -2459,7 +2519,17 @@ func (s *Store) GetUserTeamRole(userID, teamID string) (model.TeamMemberRole, er
 	return model.TeamMemberRole(role), nil
 }
 
-// SetUserRole updates a user's global role with transaction protection for last admin.
+// SetUserRole updates a user's global role, refusing to demote the last
+// administrator the system has left.
+//
+// It takes the admin-lifecycle advisory lock first, the same one erasure
+// takes, because these two commands change the same quantity from different
+// directions: without a shared mutex, erasing one of two admins and demoting
+// the other can both observe "there are two" and both commit.
+//
+// The count is of ACTIVE admins. Counting erased ones as living was the older
+// bug: after the first erasure the guard believed there were still two, and
+// the last real administrator could be demoted.
 func (s *Store) SetUserRole(userID string, role model.UserRole) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -2467,45 +2537,43 @@ func (s *Store) SetUserRole(userID string, role model.UserRole) error {
 	}
 	defer tx.Rollback()
 
-	// Get current role of target user
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, adminLifecycleLockKey); err != nil {
+		return err
+	}
+
 	var currentRole string
-	err = tx.QueryRow(`SELECT role FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&currentRole)
+	err = tx.QueryRow(`SELECT role FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, userID).Scan(&currentRole)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrUserNotFound
+	}
 	if err != nil {
 		return err
 	}
 
-	// If demoting from admin, lock ALL admin users and count them
 	if currentRole == string(model.UserRoleAdmin) && role != model.UserRoleAdmin {
-		// Lock all admin users to prevent parallel demotions
-		rows, err := tx.Query(`SELECT id FROM users WHERE role = 'admin' FOR UPDATE`)
-		if err != nil {
+		var adminCount int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL`).
+			Scan(&adminCount); err != nil {
 			return err
 		}
-		adminCount := 0
-		for rows.Next() {
-			var id string
-			rows.Scan(&id)
-			adminCount++
-		}
-		rows.Close()
-
 		if adminCount <= 1 {
 			return fmt.Errorf("cannot demote the last admin")
 		}
 	}
 
-	_, err = tx.Exec(`UPDATE users SET role = $1 WHERE id = $2`, role, userID)
-	if err != nil {
+	if _, err = tx.Exec(`UPDATE users SET role = $1 WHERE id = $2 AND deleted_at IS NULL`, role, userID); err != nil {
 		return err
 	}
 
 	return tx.Commit()
 }
 
-// CountAdmins returns the number of users with admin role.
+// CountAdmins returns the number of ACTIVE users with the admin role. An
+// erased admin is not an administrator the system can fall back on.
 func (s *Store) CountAdmins() (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&count)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL`).Scan(&count)
 	return count, err
 }
 

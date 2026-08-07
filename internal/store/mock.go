@@ -26,6 +26,7 @@ type MockStore struct {
 	incidentSeq            int
 	teams                  map[string]*model.Team
 	users                  map[string]*model.User
+	erasedUsers            map[string]bool
 	teamMembers            map[string]map[string]model.TeamMemberRole // teamID -> userID -> role
 	timelineEvents         map[string][]*model.TimelineEvent          // alertGroupID -> events
 	apiTokens              map[string]*model.APIToken                 // tokenID -> token
@@ -1159,6 +1160,35 @@ func (m *MockStore) GetUserByID(id string) (*model.User, error) {
 	return nil, sql.ErrNoRows
 }
 
+// GetActiveUserByID mirrors the store: an erased user is not found.
+func (m *MockStore) GetActiveUserByID(id string) (*model.User, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.GetUserByIDError != nil {
+		return nil, m.GetUserByIDError
+	}
+	if m.erasedUsers[id] {
+		return nil, ErrUserNotFound
+	}
+	if u, ok := m.users[id]; ok {
+		userCopy := *u
+		return &userCopy, nil
+	}
+	return nil, ErrUserNotFound
+}
+
+// EraseUser marks a mock user as soft-deleted: GetUserByID keeps returning
+// them for history, GetActiveUserByID stops.
+func (m *MockStore) EraseUser(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.erasedUsers == nil {
+		m.erasedUsers = map[string]bool{}
+	}
+	m.erasedUsers[id] = true
+}
+
 func (m *MockStore) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1186,51 +1216,69 @@ func (m *MockStore) GetUserByEmail(email string) (*model.User, error) {
 	return nil, sql.ErrNoRows
 }
 
+// GetAllUsers excludes erased users, like the store: the operator's user list
+// is a list of people who exist, not a log of who ever did.
 func (m *MockStore) GetAllUsers() ([]*model.User, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var result []*model.User
-	for _, u := range m.users {
+	for id, u := range m.users {
+		if m.erasedUsers[id] {
+			continue
+		}
 		userCopy := *u
 		result = append(result, &userCopy)
 	}
 	return result, nil
 }
 
+// AnonymizeUser strips the identifying fields, mirroring the erasure
+// primitive. id and role survive: the ID is what history joins on.
+func (m *MockStore) AnonymizeUser(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if u, ok := m.users[id]; ok {
+		u.Name = AnonymizedUserName
+		u.Email = ""
+		u.PasswordHash = ""
+		u.AuthProvider = ""
+	}
+}
+
 func (m *MockStore) UpdateUser(u *model.User) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if existing, ok := m.users[u.ID]; ok {
+	if existing, ok := m.users[u.ID]; ok && !m.erasedUsers[u.ID] {
 		existing.Email = u.Email
 		existing.Name = u.Name
 		existing.Role = u.Role
 		return nil
 	}
-	return sql.ErrNoRows
+	return ErrUserNotFound
 }
 
 func (m *MockStore) UpdateUserPassword(id, hash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if u, ok := m.users[id]; ok {
+	if u, ok := m.users[id]; ok && !m.erasedUsers[id] {
 		u.PasswordHash = hash
 		return nil
 	}
-	return sql.ErrNoRows
+	return ErrUserNotFound
 }
 
 func (m *MockStore) UpdateUserAuthProvider(id, provider string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if u, ok := m.users[id]; ok {
+	if u, ok := m.users[id]; ok && !m.erasedUsers[id] {
 		u.AuthProvider = provider
 		return nil
 	}
-	return sql.ErrNoRows
+	return ErrUserNotFound
 }
 
 func (m *MockStore) DeleteUser(id string) error {
@@ -1256,8 +1304,8 @@ func (m *MockStore) AddTeamMember(teamID, userID string, role model.TeamMemberRo
 	if _, ok := m.teams[teamID]; !ok {
 		return sql.ErrNoRows
 	}
-	if _, ok := m.users[userID]; !ok {
-		return sql.ErrNoRows
+	if _, ok := m.users[userID]; !ok || m.erasedUsers[userID] {
+		return ErrUserNotFound
 	}
 
 	if m.teamMembers[teamID] == nil {
@@ -1278,7 +1326,7 @@ func (m *MockStore) GetTeamMembers(teamID string) ([]*model.TeamMemberDetail, er
 
 	var result []*model.TeamMemberDetail
 	for userID, role := range members {
-		if u, ok := m.users[userID]; ok {
+		if u, ok := m.users[userID]; ok && !m.erasedUsers[userID] {
 			tm := &model.TeamMemberDetail{
 				User:     *u,
 				TeamRole: role,

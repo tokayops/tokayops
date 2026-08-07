@@ -116,7 +116,9 @@ func (a *API) Me(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
 	}
 
-	user, err := a.store.GetUserByID(userID)
+	// The active read: these are session paths, and an erased user has no
+	// session left. GetUserByID exists for hydrating history, not for this.
+	user, err := a.store.GetActiveUserByID(userID)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 	}
@@ -166,7 +168,9 @@ func (a *API) UpdateMe(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
 	}
 
-	user, err := a.store.GetUserByID(userID)
+	// The active read: these are session paths, and an erased user has no
+	// session left. GetUserByID exists for hydrating history, not for this.
+	user, err := a.store.GetActiveUserByID(userID)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 	}
@@ -225,9 +229,13 @@ func (a *API) AuthMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 			return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "invalid session"})
 		}
 
-		// Verify user still exists (protects against deleted users with valid JWTs)
-		if _, err := a.store.GetUserByID(claims.UserID); err != nil {
-			if err == sql.ErrNoRows {
+		// Verify the user still exists AND has not been erased. GetUserByID
+		// would answer for an erased user - it is the display read that keeps
+		// history legible - and that is exactly how an erased person's token
+		// kept working: soft delete has to end the session on the next
+		// request, not at the next natural expiry.
+		if _, err := a.store.GetActiveUserByID(claims.UserID); err != nil {
+			if errors.Is(err, store.ErrUserNotFound) || errors.Is(err, sql.ErrNoRows) {
 				return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 			}
 			return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "authentication error"})

@@ -148,8 +148,10 @@ var globalAdminActions = map[Action]bool{
 // HasPermission evaluates whether a user has permission to perform an action.
 // Returns (allowed, error). If error is non-nil, permission should be denied.
 func (c *Checker) HasPermission(userID string, action Action, scope Scope) (bool, error) {
-	// Get user to check global role
-	user, err := c.store.GetUserByID(userID)
+	// The ACTIVE read: authorization must not grant anything to an erased
+	// user. The session check already stops them a layer earlier; this is the
+	// same rule stated where the decision is actually made.
+	user, err := c.store.GetActiveUserByID(userID)
 	if err != nil {
 		return false, err
 	}
@@ -207,9 +209,10 @@ func (c *Checker) HasPermission(userID string, action Action, scope Scope) (bool
 	return false, nil
 }
 
-// IsAdmin returns true if the user has global admin role.
+// IsAdmin returns true if the user is an ACTIVE global admin. An erased user
+// is nobody's administrator.
 func (c *Checker) IsAdmin(userID string) (bool, error) {
-	user, err := c.store.GetUserByID(userID)
+	user, err := c.store.GetActiveUserByID(userID)
 	if err != nil {
 		return false, err
 	}

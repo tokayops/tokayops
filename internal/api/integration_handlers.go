@@ -523,7 +523,7 @@ func (a *API) testSlackIntegration(c echo.Context, integration *model.Integratio
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "could not determine current user"})
 	}
 
-	if _, err := a.store.GetUserByID(userID); err != nil {
+	if _, err := a.store.GetActiveUserByID(userID); err != nil {
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "could not fetch user"})
 	}
 
