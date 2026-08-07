@@ -182,6 +182,33 @@ func TestCreateScheduleRejectsInvalidInputBeforeWriting(t *testing.T) {
 	}
 }
 
+// The fake and the PostgreSQL repository share one preparation step, so a
+// value one stores is never one the other rejects. An ID source that runs dry
+// is the cheapest way to prove it: the fake used to keep a revision with an
+// empty ID that the database has always refused.
+func TestCreateScheduleRejectsWhatTheDatabaseWouldReject(t *testing.T) {
+	repo := fakes.NewScheduleConfigRepo()
+	n := 0
+	svc := scheduleconfig.NewService(repo, scheduleconfig.WithIDSource(func() string {
+		n++
+		if n == 1 {
+			return "schedule-1"
+		}
+		return ""
+	}))
+
+	_, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
+		t.Fatalf("error = %v, want ErrInvariantViolation", err)
+	}
+	if got := repo.RootCount(); got != 0 {
+		t.Fatalf("got %d schedule roots, want 0", got)
+	}
+	if got := repo.Revisions("schedule-1"); len(got) != 0 {
+		t.Fatalf("got %d revisions, want 0", len(got))
+	}
+}
+
 // A database hands back data, not aliases. The fake must do the same, or a
 // test that mutates a configuration after saving it would silently "change
 // history" and pass against behaviour PostgreSQL would never produce.

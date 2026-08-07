@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"fmt"
 
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
@@ -60,27 +59,9 @@ func (t *scheduleConfigTx) GetCurrentOverrides(ctx context.Context, scheduleID s
 // here ever updates or deletes an earlier row: create writes revision 1, edit
 // appends the next revision, delete appends a tombstone.
 func (t *scheduleConfigTx) InsertOverrideRevision(ctx context.Context, rev *scheduleconfig.OverrideRevision) error {
-	if rev == nil {
-		return fmt.Errorf("%w: nil override revision", scheduleconfig.ErrInvariantViolation)
+	if err := scheduleconfig.PrepareOverrideRevision(rev); err != nil {
+		return err
 	}
-	if rev.RevisionID == "" {
-		rev.RevisionID = generateUUID()
-	}
-	if rev.OverrideID == "" {
-		return fmt.Errorf("%w: override revision needs a logical override id", scheduleconfig.ErrInvariantViolation)
-	}
-	if rev.Revision < 1 {
-		return fmt.Errorf("%w: override revision number must start at 1, got %d",
-			scheduleconfig.ErrInvariantViolation, rev.Revision)
-	}
-	if rev.Layer == "" {
-		rev.Layer = scheduleconfig.LayerL1
-	}
-
-	rev.ValidFrom = scheduleconfig.NormalizeTimestamp(rev.ValidFrom)
-	rev.ValidTo = scheduleconfig.NormalizeTimestamp(rev.ValidTo)
-	rev.RecordedAt = normalizeRecordedAt(rev.RecordedAt)
-
 	_, err := t.tx.ExecContext(ctx,
 		`INSERT INTO schedule_override_revisions
 		 (revision_id, override_id, schedule_id, revision, layer, user_id,

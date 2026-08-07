@@ -78,48 +78,18 @@ type scheduleConfigTx struct {
 // Legacy mutable configuration columns are left to their defaults; the runtime
 // no longer reads them.
 func (t *scheduleConfigTx) CreateInitialSchedule(ctx context.Context, root *scheduleconfig.ScheduleRoot, initial *scheduleconfig.ScheduleRevision) error {
-	if root == nil || initial == nil {
-		return fmt.Errorf("%w: nil root or initial revision", scheduleconfig.ErrInvariantViolation)
-	}
-	if root.ID == "" || root.TeamID == "" {
-		return fmt.Errorf("%w: schedule root needs an id and a team id", scheduleconfig.ErrInvariantViolation)
-	}
-	if initial.ScheduleID != root.ID {
-		return fmt.Errorf("%w: initial revision belongs to schedule %q, not %q",
-			scheduleconfig.ErrInvariantViolation, initial.ScheduleID, root.ID)
-	}
-	if initial.Version != 1 {
-		return fmt.Errorf("%w: initial revision must be version 1, got %d",
-			scheduleconfig.ErrInvariantViolation, initial.Version)
-	}
-	if initial.EffectiveTo != nil {
-		return fmt.Errorf("%w: initial revision must be open-ended", scheduleconfig.ErrInvariantViolation)
-	}
-
-	effectiveFrom := scheduleconfig.NormalizeTimestamp(initial.EffectiveFrom)
-	if effectiveFrom.IsZero() {
-		return fmt.Errorf("%w: initial revision needs an effective_from", scheduleconfig.ErrInvariantViolation)
-	}
-	recordedAt := normalizeRecordedAt(initial.RecordedAt)
-
-	_, err := t.tx.ExecContext(ctx,
-		`INSERT INTO schedules (id, team_id, config_version, history_complete_from, created_at, updated_at)
-		 VALUES ($1, $2, 1, $3, $4, $4)`,
-		root.ID, root.TeamID, effectiveFrom, recordedAt)
-	if err != nil {
-		return mapScheduleWriteError(err)
-	}
-
-	initial.EffectiveFrom = effectiveFrom
-	initial.RecordedAt = recordedAt
-	if err := t.InsertRevision(ctx, initial); err != nil {
+	if err := scheduleconfig.PrepareInitialSchedule(root, initial); err != nil {
 		return err
 	}
 
-	root.ConfigVersion = 1
-	root.HistoryCompleteFrom = &effectiveFrom
-	root.DeletedAt = nil
-	return nil
+	_, err := t.tx.ExecContext(ctx,
+		`INSERT INTO schedules (id, team_id, config_version, history_complete_from, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $5)`,
+		root.ID, root.TeamID, root.ConfigVersion, initial.EffectiveFrom, initial.RecordedAt)
+	if err != nil {
+		return mapScheduleWriteError(err)
+	}
+	return t.InsertRevision(ctx, initial)
 }
 
 // LockSchedule takes the row lock that serializes writes to one schedule.
@@ -189,17 +159,8 @@ func (t *scheduleConfigTx) CloseRevision(ctx context.Context, scheduleID, expect
 }
 
 func (t *scheduleConfigTx) InsertRevision(ctx context.Context, revision *scheduleconfig.ScheduleRevision) error {
-	if revision == nil {
-		return fmt.Errorf("%w: nil revision", scheduleconfig.ErrInvariantViolation)
-	}
-	// An empty string is a perfectly good TEXT primary key, so an unset ID
-	// would be stored rather than rejected.
-	if revision.ID == "" || revision.ScheduleID == "" {
-		return fmt.Errorf("%w: revision needs an id and a schedule id", scheduleconfig.ErrInvariantViolation)
-	}
-	if revision.Version < 1 {
-		return fmt.Errorf("%w: revision version must start at 1, got %d",
-			scheduleconfig.ErrInvariantViolation, revision.Version)
+	if err := scheduleconfig.PrepareRevision(revision); err != nil {
+		return err
 	}
 	snapshot, err := rotation.EncodeSnapshot(revision.Snapshot)
 	if err != nil {
@@ -212,28 +173,16 @@ func (t *scheduleConfigTx) InsertRevision(ctx context.Context, revision *schedul
 		}
 	}
 
-	effectiveFrom := scheduleconfig.NormalizeTimestamp(revision.EffectiveFrom)
-	var effectiveTo *time.Time
-	if revision.EffectiveTo != nil {
-		v := scheduleconfig.NormalizeTimestamp(*revision.EffectiveTo)
-		effectiveTo = &v
-	}
-	recordedAt := normalizeRecordedAt(revision.RecordedAt)
-
 	_, err = t.tx.ExecContext(ctx,
 		`INSERT INTO schedule_revisions
 		 (id, schedule_id, version, snapshot, effective_from, effective_to, recorded_at, created_by, change_reason, change_summary)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		revision.ID, revision.ScheduleID, revision.Version, snapshot,
-		effectiveFrom, effectiveTo, recordedAt,
+		revision.EffectiveFrom, revision.EffectiveTo, revision.RecordedAt,
 		revision.CreatedBy, revision.ChangeReason, nullableJSON(summary))
 	if err != nil {
 		return mapScheduleWriteError(err)
 	}
-
-	revision.EffectiveFrom = effectiveFrom
-	revision.EffectiveTo = effectiveTo
-	revision.RecordedAt = recordedAt
 	return nil
 }
 
@@ -293,15 +242,6 @@ func scanScheduleRevision(row *sql.Row) (*scheduleconfig.ScheduleRevision, error
 		rev.ChangeSummary = &parsed
 	}
 	return &rev, nil
-}
-
-// normalizeRecordedAt keeps recorded time at database resolution and fills in
-// a value for callers that left it zero.
-func normalizeRecordedAt(t time.Time) time.Time {
-	if t.IsZero() {
-		t = time.Now().UTC()
-	}
-	return scheduleconfig.NormalizeTimestamp(t)
 }
 
 func nullableJSON(b []byte) any {

@@ -278,11 +278,8 @@ func (t *scheduleConfigTx) CreateInitialSchedule(ctx context.Context, root *sche
 	if err := t.repo.record("CreateInitialSchedule"); err != nil {
 		return err
 	}
-	if root == nil || initial == nil {
-		return fmt.Errorf("%w: nil root or revision", scheduleconfig.ErrInvariantViolation)
-	}
-	if initial.ScheduleID != root.ID || initial.Version != 1 || initial.EffectiveTo != nil {
-		return fmt.Errorf("%w: initial revision does not describe the root", scheduleconfig.ErrInvariantViolation)
+	if err := scheduleconfig.PrepareInitialSchedule(root, initial); err != nil {
+		return err
 	}
 	s := t.repo.state
 	if _, exists := s.teamIndex[root.TeamID]; exists {
@@ -291,10 +288,6 @@ func (t *scheduleConfigTx) CreateInitialSchedule(ctx context.Context, root *sche
 	if _, exists := s.roots[root.ID]; exists {
 		return fmt.Errorf("%w: duplicate schedule id %q", scheduleconfig.ErrInvariantViolation, root.ID)
 	}
-
-	from := initial.EffectiveFrom
-	root.ConfigVersion = 1
-	root.HistoryCompleteFrom = &from
 
 	s.roots[root.ID] = cloneRoot(*root)
 	s.teamIndex[root.TeamID] = root.ID
@@ -367,15 +360,8 @@ func (t *scheduleConfigTx) InsertRevision(ctx context.Context, revision *schedul
 	if err := t.repo.record("InsertRevision"); err != nil {
 		return err
 	}
-	if revision == nil {
-		return fmt.Errorf("%w: nil revision", scheduleconfig.ErrInvariantViolation)
-	}
-	if revision.ID == "" || revision.ScheduleID == "" {
-		return fmt.Errorf("%w: revision needs an id and a schedule id", scheduleconfig.ErrInvariantViolation)
-	}
-	if revision.Version < 1 {
-		return fmt.Errorf("%w: revision version must start at 1, got %d",
-			scheduleconfig.ErrInvariantViolation, revision.Version)
+	if err := scheduleconfig.PrepareRevision(revision); err != nil {
+		return err
 	}
 	s := t.repo.state
 	if _, ok := s.roots[revision.ScheduleID]; !ok {
@@ -413,16 +399,8 @@ func (t *scheduleConfigTx) InsertScheduleEvent(ctx context.Context, event *sched
 	if err := t.repo.record("InsertScheduleEvent"); err != nil {
 		return err
 	}
-	// Not a no-op on nil: an event that belongs to a configuration change must
-	// not let a failure to assemble it commit silently.
-	if event == nil {
-		return fmt.Errorf("%w: nil schedule event", scheduleconfig.ErrInvariantViolation)
-	}
-	if event.EventType == "" {
-		return fmt.Errorf("%w: schedule event needs a type", scheduleconfig.ErrInvariantViolation)
-	}
-	if len(event.Payload) > 0 && !json.Valid(event.Payload) {
-		return fmt.Errorf("%w: schedule event payload is not valid JSON", scheduleconfig.ErrInvariantViolation)
+	if err := scheduleconfig.PrepareScheduleEvent(event); err != nil {
+		return err
 	}
 	s := t.repo.state
 	if _, ok := s.roots[event.ScheduleID]; !ok {
@@ -465,8 +443,8 @@ func (t *scheduleConfigTx) InsertOverrideRevision(ctx context.Context, rev *sche
 	if err := t.repo.record("InsertOverrideRevision"); err != nil {
 		return err
 	}
-	if rev == nil {
-		return fmt.Errorf("%w: nil override revision", scheduleconfig.ErrInvariantViolation)
+	if err := scheduleconfig.PrepareOverrideRevision(rev); err != nil {
+		return err
 	}
 	s := t.repo.state
 	if _, ok := s.roots[rev.ScheduleID]; !ok {
