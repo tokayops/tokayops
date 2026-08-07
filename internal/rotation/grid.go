@@ -2,7 +2,6 @@ package rotation
 
 import (
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/model"
@@ -85,17 +84,20 @@ func (g *grid) resolve(c civilDate) time.Time {
 }
 
 func resolveLocalBoundary(loc *time.Location, c civilDate, hh, mm int) time.Time {
-	if occ := localOccurrences(loc, c, hh, mm); len(occ) > 0 {
+	if occ, n := localOccurrences(loc, c, hh, mm); n > 0 {
 		return occ[0]
 	}
-	// The local time does not exist: it falls into a spring-forward gap.
+	// The local time does not exist: it falls into a spring-forward gap. A
+	// gap can exceed a day when a zone skips an entire calendar date
+	// (Pacific/Apia 2011-12-30); the shifted time then lands on the next
+	// date and collapses with that date's own boundary - callers dedupe.
 	gap := gapSize(loc, c, hh, mm)
 	total := hh*60 + mm + int(gap/time.Minute)
 	for total >= 24*60 {
 		total -= 24 * 60
 		c = c.addDays(1)
 	}
-	if occ := localOccurrences(loc, c, total/60, total%60); len(occ) > 0 {
+	if occ, n := localOccurrences(loc, c, total/60, total%60); n > 0 {
 		return occ[0]
 	}
 	// Unreachable with a correct gap size; keep a deterministic fallback
@@ -104,27 +106,41 @@ func resolveLocalBoundary(loc *time.Location, c civilDate, hh, mm int) time.Time
 }
 
 // localOccurrences returns every UTC instant whose wall clock in loc reads
-// exactly c hh:mm, sorted ascending: none for a gap, one normally, two for a
-// fold. It probes the zone offsets around the target instead of trusting
-// time.Date's unspecified gap/fold normalization.
-func localOccurrences(loc *time.Location, c civilDate, hh, mm int) []time.Time {
+// exactly c hh:mm, ascending: none for a gap, one normally, two for a fold.
+// It probes the zone offsets around the target instead of trusting
+// time.Date's unspecified gap/fold normalization. Allocation-free: this is
+// the hot inner call of boundary walking.
+func localOccurrences(loc *time.Location, c civilDate, hh, mm int) (occ [2]time.Time, n int) {
 	guess := time.Date(c.y, c.m, c.d, hh, mm, 0, 0, time.UTC)
-	seen := make(map[int]struct{}, 3)
-	var out []time.Time
+	var seen [5]int
+	ns := 0
 	for _, dp := range [5]time.Duration{-30 * time.Hour, -12 * time.Hour, 0, 12 * time.Hour, 30 * time.Hour} {
 		_, off := guess.Add(dp).In(loc).Zone()
-		if _, ok := seen[off]; ok {
+		dup := false
+		for i := 0; i < ns; i++ {
+			if seen[i] == off {
+				dup = true
+				break
+			}
+		}
+		if dup {
 			continue
 		}
-		seen[off] = struct{}{}
+		seen[ns] = off
+		ns++
 		cand := guess.Add(-time.Duration(off) * time.Second)
 		lc := cand.In(loc)
 		if lc.Year() == c.y && lc.Month() == c.m && lc.Day() == c.d && lc.Hour() == hh && lc.Minute() == mm && lc.Second() == 0 {
-			out = append(out, cand.UTC())
+			if n < 2 {
+				occ[n] = cand.UTC()
+				n++
+			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
-	return out
+	if n == 2 && occ[1].Before(occ[0]) {
+		occ[0], occ[1] = occ[1], occ[0]
+	}
+	return occ, n
 }
 
 // gapSize returns the width of the offset jump of the transition nearest to
@@ -163,6 +179,21 @@ func (g *grid) alignDate(at time.Time) civilDate {
 	return c
 }
 
+// nextAfter returns the first grid boundary strictly after cur, advancing
+// calendar dates from c. It skips dates whose boundary collapses into an
+// earlier one: a timezone can skip an entire calendar date (Pacific/Apia
+// 2011-12-30), making adjacent dates resolve to the same instant. Every
+// method derives the boundary sequence through this dedupe, so the grid is
+// the strictly increasing sequence of DISTINCT resolved instants.
+func (g *grid) nextAfter(c civilDate, cur time.Time) (civilDate, time.Time) {
+	for {
+		c = c.addDays(g.stepDays)
+		if b := g.resolve(c); b.After(cur) {
+			return c, b
+		}
+	}
+}
+
 func (g *grid) SlotContaining(at time.Time) Slot {
 	c := g.alignDate(at)
 	b := g.resolve(c)
@@ -171,8 +202,7 @@ func (g *grid) SlotContaining(at time.Time) Slot {
 		b = g.resolve(c)
 	}
 	for {
-		nc := c.addDays(g.stepDays)
-		nb := g.resolve(nc)
+		nc, nb := g.nextAfter(c, b)
 		if nb.After(at) {
 			return Slot{Start: b, End: nb}
 		}
@@ -184,6 +214,12 @@ func (g *grid) NextBoundary(after time.Time) time.Time {
 	return g.SlotContaining(after).End
 }
 
+// SlotsBetween walks distinct boundaries from a to b. A calendar-step
+// estimate is NOT usable here: when a zone skips a whole date, two calendar
+// steps collapse into one boundary, so a calendar count both disagrees with
+// NextBoundary stepping and becomes ambiguous at the collapsed instant.
+// Consistency with NextBoundary holds by construction; the walk is O(days),
+// which is fine for multi-year anchors (a few thousand cheap resolver calls).
 func (g *grid) SlotsBetween(fromSlotStart, toSlotStart time.Time) (int, error) {
 	if s := g.SlotContaining(fromSlotStart); !s.Start.Equal(fromSlotStart) {
 		return 0, fmt.Errorf("rotation: %v is not a slot start of this grid", fromSlotStart)
@@ -191,22 +227,23 @@ func (g *grid) SlotsBetween(fromSlotStart, toSlotStart time.Time) (int, error) {
 	if s := g.SlotContaining(toSlotStart); !s.Start.Equal(toSlotStart) {
 		return 0, fmt.Errorf("rotation: %v is not a slot start of this grid", toSlotStart)
 	}
-	from := g.alignDate(fromSlotStart)
-	// Duration division is only ever an ESTIMATE here; the loop below
-	// brackets to the exact calendar answer, so multi-year spans, DST and
-	// historical timezone rule changes cannot skew the result.
-	n := int(toSlotStart.Sub(fromSlotStart) / (time.Duration(g.stepDays) * 24 * time.Hour))
-	for {
-		b := g.resolve(from.addDays(n * g.stepDays))
-		switch {
-		case b.After(toSlotStart):
-			n--
-		case b.Before(toSlotStart):
-			n++
-		default:
-			return n, nil
-		}
+	if fromSlotStart.Equal(toSlotStart) {
+		return 0, nil
 	}
+	sign := 1
+	a, b := fromSlotStart, toSlotStart
+	if b.Before(a) {
+		a, b = b, a
+		sign = -1
+	}
+	c := g.alignDate(a)
+	cur := a
+	n := 0
+	for cur.Before(b) {
+		c, cur = g.nextAfter(c, cur)
+		n++
+	}
+	return sign * n, nil
 }
 
 func (g *grid) SlotsOverlapping(from, until time.Time) []Slot {
@@ -214,12 +251,10 @@ func (g *grid) SlotsOverlapping(from, until time.Time) []Slot {
 		return nil
 	}
 	cur := g.SlotContaining(from)
-	c := g.alignDate(cur.Start)
 	var out []Slot
 	for cur.Start.Before(until) {
 		out = append(out, cur)
-		c = c.addDays(g.stepDays)
-		cur = Slot{Start: cur.End, End: g.resolve(c.addDays(g.stepDays))}
+		cur = g.SlotContaining(cur.End)
 	}
 	return out
 }

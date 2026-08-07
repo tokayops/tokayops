@@ -32,7 +32,18 @@ func PositionAt(g Grid, layer RotationLayerSnapshot, at time.Time) (int, Slot, e
 	if layer.PhaseAnchorSlotStart == nil || layer.StartPosition == nil {
 		return 0, Slot{}, fmt.Errorf("rotation: active layer has no phase pair")
 	}
+	// A corrupted phase pair is a data error, never silently repaired: a
+	// wrapped position or a rounded anchor would produce a plausible but
+	// wrong on-call instead of surfacing the corruption.
+	if *layer.StartPosition < 0 || *layer.StartPosition >= len(layer.Groups) {
+		return 0, Slot{}, fmt.Errorf("rotation: start_position %d out of range [0..%d)",
+			*layer.StartPosition, len(layer.Groups))
+	}
 	origin := g.SlotContaining(*layer.PhaseAnchorSlotStart)
+	if !origin.Start.Equal(*layer.PhaseAnchorSlotStart) {
+		return 0, Slot{}, fmt.Errorf("rotation: phase_anchor_slot_start %v is not a slot boundary of this grid",
+			*layer.PhaseAnchorSlotStart)
+	}
 	target := g.SlotContaining(at)
 	elapsed, err := g.SlotsBetween(origin.Start, target.Start)
 	if err != nil {

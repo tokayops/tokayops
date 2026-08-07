@@ -36,6 +36,7 @@ var propTimezones = []string{
 	"Asia/Kathmandu",
 	"Australia/Lord_Howe",
 	"America/Santiago",
+	"Pacific/Apia", // skipped the whole 2011-12-30 date; +13/+14 DST
 }
 
 func randTimezone(r *rand.Rand) string {
@@ -230,7 +231,7 @@ func TestProp_MetadataOnlySave_IdenticalProjection(t *testing.T) {
 // they are excluded here; property 1 covers full equality.
 func TestProp_CarryComposition_NoPhaseDrift(t *testing.T) {
 	r := newPropRand()
-	for iter := 0; iter < 150; iter++ {
+	for iter := 0; iter < 200; iter++ {
 		initial := randActiveSnapshot(t, r, iter)
 		cur := initial
 		at := randInstant(r, 2025, 2026)
@@ -271,11 +272,12 @@ func TestProp_CarryComposition_NoPhaseDrift(t *testing.T) {
 	}
 }
 
-// Property 3: SlotsBetween with a multi-year carry anchor agrees with naive
-// boundary stepping across every DST and historical rule change in between.
+// Property 3: PositionAt with a multi-year carry anchor agrees with a naive
+// NextBoundary-stepping reference across every DST and historical rule
+// change (including whole skipped dates) in between.
 func TestProp_MultiYearCarryAnchor_DST(t *testing.T) {
 	r := newPropRand()
-	for iter := 0; iter < 40; iter++ {
+	for iter := 0; iter < 200; iter++ {
 		tz := randTimezone(r)
 		policy := randPolicy(r)
 		g, err := NewGrid(tz, policy)
@@ -283,7 +285,8 @@ func TestProp_MultiYearCarryAnchor_DST(t *testing.T) {
 			propFatalf(t, iter, "NewGrid: %v", err)
 		}
 		anchor := g.SlotContaining(randInstant(r, 2020, 2021)).Start
-		target := g.SlotContaining(anchor.AddDate(0, 0, 800+r.IntN(1500)).Add(time.Duration(r.IntN(24)) * time.Hour)).Start
+		probe := anchor.AddDate(0, 0, 800+r.IntN(1500)).Add(time.Duration(r.IntN(24)) * time.Hour)
+		target := g.SlotContaining(probe).Start
 
 		n, err := g.SlotsBetween(anchor, target)
 		if err != nil {
@@ -307,6 +310,31 @@ func TestProp_MultiYearCarryAnchor_DST(t *testing.T) {
 		if err != nil || back != -n {
 			propFatalf(t, iter, "antisymmetry broken: %d vs %d (err=%v)", n, back, err)
 		}
+
+		// The plan-level check: PositionAt against the stepping reference.
+		nGroups := 1 + r.IntN(4)
+		sp := r.IntN(nGroups)
+		layer := RotationLayerSnapshot{
+			Enabled:              true,
+			Policy:               policy,
+			Groups:               make([]RotationGroup, nGroups),
+			PhaseAnchorSlotStart: &anchor,
+			StartPosition:        &sp,
+		}
+		for i := range layer.Groups {
+			layer.Groups[i] = RotationGroup{ID: gid[i], Members: []string{gid[i]}}
+		}
+		pos, slot, err := PositionAt(g, layer, probe)
+		if err != nil {
+			propFatalf(t, iter, "PositionAt: %v", err)
+		}
+		if want := floorMod(sp+count, nGroups); pos != want {
+			propFatalf(t, iter, "PositionAt=%d, reference=%d (sp=%d count=%d n=%d tz=%s)",
+				pos, want, sp, count, nGroups, tz)
+		}
+		if !slot.Start.Equal(target) {
+			propFatalf(t, iter, "PositionAt slot %v != target %v", slot.Start, target)
+		}
 	}
 }
 
@@ -314,7 +342,7 @@ func TestProp_MultiYearCarryAnchor_DST(t *testing.T) {
 // consistent with SlotContaining and NextBoundary.
 func TestProp_SlotsOverlapping_TilesRangeNoGaps(t *testing.T) {
 	r := newPropRand()
-	for iter := 0; iter < 150; iter++ {
+	for iter := 0; iter < 200; iter++ {
 		tz := randTimezone(r)
 		policy := randPolicy(r)
 		g, err := NewGrid(tz, policy)
@@ -354,7 +382,7 @@ func TestProp_SlotsOverlapping_TilesRangeNoGaps(t *testing.T) {
 // Property 5: the codec round-trips any valid snapshot byte-stably.
 func TestProp_CodecRoundTrip(t *testing.T) {
 	r := newPropRand()
-	for iter := 0; iter < 150; iter++ {
+	for iter := 0; iter < 200; iter++ {
 		snap := randActiveSnapshot(t, r, iter)
 		b1, err := EncodeSnapshot(snap)
 		if err != nil {
@@ -378,7 +406,7 @@ func TestProp_CodecRoundTrip(t *testing.T) {
 // weekday convention (0=Sunday) at the grid level.
 func TestProp_WeeklyBoundaryWeekday(t *testing.T) {
 	r := newPropRand()
-	for iter := 0; iter < 100; iter++ {
+	for iter := 0; iter < 200; iter++ {
 		day := r.IntN(7)
 		tz := randTimezone(r)
 		policy := RotationPolicy{SchemaVersion: 1, Cadence: model.RotationWeekly,

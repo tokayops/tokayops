@@ -64,6 +64,62 @@ func TestSnapshotCodec_RoundTripByteStable(t *testing.T) {
 	}
 }
 
+// Second golden: both layers active, weekly policies, non-UTC timezone.
+const goldenSnapshot2JSON = `{"schema_version":1,"timezone":"America/New_York","slack_usergroup_id":"",` +
+	`"l1":{"enabled":true,"policy":{"schema_version":1,"cadence":"weekly","handoff_time":"09:00","handoff_day":0},` +
+	`"groups":[{"id":"2e0f8f5e-4bda-4a44-9b8e-7f4a1f6de333","members":["carol","erik"]}],` +
+	`"phase_anchor_slot_start":"2026-08-02T13:00:00Z","start_position":0},` +
+	`"l2":{"enabled":true,"policy":{"schema_version":1,"cadence":"weekly","handoff_time":"09:00","handoff_day":0},` +
+	`"groups":[{"id":"xavier","members":["xavier"]},{"id":"yulia","members":["yulia"]}],` +
+	`"phase_anchor_slot_start":"2026-08-02T13:00:00Z","start_position":1},` +
+	`"l2_escalation_timeout_mins":30}`
+
+func TestSnapshotCodec_RoundTripByteStable_ActiveL2(t *testing.T) {
+	// Sun 2026-08-02 09:00 America/New_York (EDT, UTC-4) = 13:00Z.
+	snap := ScheduleRevisionSnapshot{
+		SchemaVersion: 1,
+		Timezone:      "America/New_York",
+		L1: RotationLayerSnapshot{
+			Enabled: true,
+			Policy:  weeklyPolicy("09:00", 0),
+			Groups: []RotationGroup{
+				{ID: gid[2], Members: []string{"carol", "erik"}},
+			},
+			PhaseAnchorSlotStart: timep(utc(2026, time.August, 2, 13, 0)),
+			StartPosition:        intp(0),
+		},
+		L2: RotationLayerSnapshot{
+			Enabled: true,
+			Policy:  weeklyPolicy("09:00", 0),
+			Groups: []RotationGroup{
+				{ID: "xavier", Members: []string{"xavier"}},
+				{ID: "yulia", Members: []string{"yulia"}},
+			},
+			PhaseAnchorSlotStart: timep(utc(2026, time.August, 2, 13, 0)),
+			StartPosition:        intp(1),
+		},
+		L2EscalationTimeoutMins: 30,
+	}
+	encoded, err := EncodeSnapshot(snap)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot: %v", err)
+	}
+	if string(encoded) != goldenSnapshot2JSON {
+		t.Fatalf("encode does not match golden 2:\n got: %s\nwant: %s", encoded, goldenSnapshot2JSON)
+	}
+	decoded, err := DecodeSnapshot(encoded)
+	if err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+	re, err := EncodeSnapshot(decoded)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	if string(re) != goldenSnapshot2JSON {
+		t.Fatalf("round trip not byte-stable:\n got: %s", re)
+	}
+}
+
 func TestEncodeSnapshot_NormalizesAnchorToUTC(t *testing.T) {
 	s := goldenSnapshot()
 	msk, err := time.LoadLocation("Europe/Moscow")
@@ -123,6 +179,44 @@ func TestDecodeSnapshot_Errors(t *testing.T) {
 			want: "out of range",
 		},
 		{name: "array instead of object", in: `[1,2]`, want: "snapshot decode"},
+		// Presence-aware contract: an ABSENT field is an error even where
+		// its zero value or null would be legal - null and missing stay
+		// distinguishable.
+		{
+			name: "missing slack_usergroup_id",
+			in:   strings.Replace(goldenSnapshotJSON, `"slack_usergroup_id":"S0123",`, ``, 1),
+			want: `missing field "slack_usergroup_id"`,
+		},
+		{
+			name: "missing phase field in disabled layer",
+			in:   strings.Replace(goldenSnapshotJSON, `"phase_anchor_slot_start":null,"start_position":null`, `"start_position":null`, 1),
+			want: `missing field "phase_anchor_slot_start"`,
+		},
+		{
+			name: "missing enabled",
+			in:   strings.Replace(goldenSnapshotJSON, `"l2":{"enabled":false,`, `"l2":{`, 1),
+			want: `missing field "enabled"`,
+		},
+		{
+			name: "null groups",
+			in:   strings.Replace(goldenSnapshotJSON, `"groups":[],`, `"groups":null,`, 1),
+			want: "groups must not be null",
+		},
+		{
+			name: "null timezone",
+			in:   strings.Replace(goldenSnapshotJSON, `"timezone":"Europe/Moscow"`, `"timezone":null`, 1),
+			want: "must not be null",
+		},
+		{
+			name: "missing handoff_day",
+			in:   strings.Replace(goldenSnapshotJSON, `"handoff_time":"11:00","handoff_day":null`, `"handoff_time":"11:00"`, 1),
+			want: `missing field "handoff_day"`,
+		},
+		{
+			name: "unknown nested field",
+			in:   strings.Replace(goldenSnapshotJSON, `"l1":{"enabled":true,`, `"l1":{"enabled":true,"extra":1,`, 1),
+			want: `unknown field "extra"`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

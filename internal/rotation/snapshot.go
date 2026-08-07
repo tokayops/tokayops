@@ -2,7 +2,6 @@ package rotation
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -49,15 +48,17 @@ type ScheduleRevisionSnapshot struct {
 	L2EscalationTimeoutMins int                   `json:"l2_escalation_timeout_mins"`
 }
 
-// isCanonicalUUID accepts only the dashed canonical form (case-insensitive).
-// uuid.Parse alone is too permissive: it also accepts raw hex, urn:uuid: and
-// braced forms, which must not become group IDs.
+// isCanonicalUUID accepts only the dashed lowercase canonical form. Group
+// identity is compared as a plain string everywhere (transition planner,
+// duplicate checks), so there must be exactly ONE spelling of an ID:
+// uppercase variants are rejected, not normalized. uuid.Parse alone is too
+// permissive: it also accepts raw hex, urn:uuid:, braced and uppercase forms.
 func isCanonicalUUID(s string) bool {
 	u, err := uuid.Parse(s)
 	if err != nil {
 		return false
 	}
-	return u.String() == strings.ToLower(s)
+	return u.String() == s
 }
 
 func validateL1Group(g RotationGroup) error {

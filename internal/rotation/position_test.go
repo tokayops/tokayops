@@ -126,11 +126,31 @@ func TestPositionAt_TargetInsideOriginSlot(t *testing.T) {
 
 func TestPositionAt_InvalidLayer(t *testing.T) {
 	g := mustGrid(t, "UTC", dailyPolicy("11:00"))
+	at := utc(2026, time.August, 4, 0, 0)
+
 	l := baseSnapshot().L1
 	l.PhaseAnchorSlotStart = nil
 	l.StartPosition = nil
-	if _, _, err := PositionAt(g, l, utc(2026, time.August, 4, 0, 0)); err == nil {
+	if _, _, err := PositionAt(g, l, at); err == nil {
 		t.Fatalf("active layer without phase pair must be an error in PositionAt")
+	}
+
+	// A corrupted phase pair surfaces as an error, never as a silently
+	// repaired (wrapped/rounded) plausible answer.
+	l = baseSnapshot().L1
+	l.StartPosition = intp(3) // == len(groups), out of range
+	if _, _, err := PositionAt(g, l, at); err == nil {
+		t.Fatalf("start_position out of range must be an error, not floorMod-wrapped")
+	}
+	l = baseSnapshot().L1
+	l.StartPosition = intp(-1)
+	if _, _, err := PositionAt(g, l, at); err == nil {
+		t.Fatalf("negative start_position must be an error")
+	}
+	l = baseSnapshot().L1
+	l.PhaseAnchorSlotStart = timep(utc(2026, time.August, 3, 11, 30)) // off-boundary
+	if _, _, err := PositionAt(g, l, at); err == nil {
+		t.Fatalf("anchor off a grid boundary must be an error, not rounded")
 	}
 }
 

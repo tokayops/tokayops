@@ -12,8 +12,11 @@ func TestIsCanonicalUUID(t *testing.T) {
 		want bool
 	}{
 		{in: "0c8f8f5e-4bda-4a44-9b8e-7f4a1f6de111", want: true},
-		{in: "0C8F8F5E-4BDA-4A44-9B8E-7F4A1F6DE111", want: true}, // case-insensitive dashed form
-		{in: "0c8f8f5e4bda4a449b8e7f4a1f6de111", want: false},    // raw hex
+		// Exactly ONE spelling of an identity: transition compares IDs as
+		// plain strings, so uppercase forms are rejected, not normalized.
+		{in: "0C8F8F5E-4BDA-4A44-9B8E-7F4A1F6DE111", want: false},
+		{in: "0c8f8f5e-4bda-4a44-9B8E-7f4a1f6de111", want: false}, // mixed case
+		{in: "0c8f8f5e4bda4a449b8e7f4a1f6de111", want: false},     // raw hex
 		{in: "urn:uuid:0c8f8f5e-4bda-4a44-9b8e-7f4a1f6de111", want: false},
 		{in: "{0c8f8f5e-4bda-4a44-9b8e-7f4a1f6de111}", want: false},
 		{in: "not-a-uuid", want: false},

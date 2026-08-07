@@ -214,6 +214,53 @@ func TestGrid_NonHourOffset(t *testing.T) {
 	}
 }
 
+// Pacific/Apia skipped the entire calendar date 2011-12-30 (jump across the
+// date line). The boundary for the skipped date collapses into the next
+// date's boundary; the grid must dedupe: no zero-length slots, and
+// SlotsBetween must count DISTINCT boundaries consistently with
+// NextBoundary. Ordinary DST tests cannot catch this.
+func TestGrid_SkippedCalendarDay_Apia(t *testing.T) {
+	g := mustGrid(t, "Pacific/Apia", dailyPolicy("08:00"))
+	loc, err := time.LoadLocation("Pacific/Apia")
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := time.Date(2011, time.December, 29, 8, 0, 0, 0, loc).UTC() // exists
+	z := time.Date(2011, time.December, 31, 8, 0, 0, 0, loc).UTC() // exists; Dec 30 does not
+	w := time.Date(2012, time.January, 1, 8, 0, 0, 0, loc).UTC()
+
+	// One long slot spans the skipped date.
+	s := g.SlotContaining(z.Add(-time.Hour))
+	if !s.Start.Equal(x) || !s.End.Equal(z) {
+		t.Fatalf("slot across skipped day = [%v, %v), want [%v, %v)", s.Start, s.End, x, z)
+	}
+	if !s.Start.Before(s.End) {
+		t.Fatalf("zero-length slot: [%v, %v)", s.Start, s.End)
+	}
+	if nb := g.NextBoundary(x); !nb.Equal(z) {
+		t.Fatalf("NextBoundary across skip = %v, want %v", nb, z)
+	}
+
+	// Distinct-boundary counting: x -> z is ONE slot, x -> w is two.
+	if n, err := g.SlotsBetween(x, z); err != nil || n != 1 {
+		t.Fatalf("SlotsBetween(x,z) = %d (%v), want 1", n, err)
+	}
+	if n, err := g.SlotsBetween(x, w); err != nil || n != 2 {
+		t.Fatalf("SlotsBetween(x,w) = %d (%v), want 2", n, err)
+	}
+
+	// No zero-length or overlapping slots across the skip.
+	slots := g.SlotsOverlapping(utc(2011, time.December, 27, 0, 0), utc(2012, time.January, 3, 0, 0))
+	for i, sl := range slots {
+		if !sl.Start.Before(sl.End) {
+			t.Fatalf("zero-length slot %d: [%v, %v)", i, sl.Start, sl.End)
+		}
+		if i > 0 && !sl.Start.Equal(slots[i-1].End) {
+			t.Fatalf("gap/overlap at slot %d", i)
+		}
+	}
+}
+
 func TestGrid_SlotsBetween_MultiYear(t *testing.T) {
 	g := mustGrid(t, "Europe/Berlin", dailyPolicy("09:00"))
 	a := g.SlotContaining(inZone(t, "Europe/Berlin", 2020, time.January, 1, 12, 0)).Start
