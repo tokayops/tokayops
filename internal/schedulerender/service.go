@@ -16,10 +16,26 @@ import (
 // that ever existed.
 type Service struct {
 	repo scheduleconfig.ScheduleReadRepository
+	now  func() time.Time
 }
 
-func New(repo scheduleconfig.ScheduleReadRepository) *Service {
-	return &Service{repo: repo}
+// Option customizes a Service.
+type Option func(*Service)
+
+// WithClock overrides the wall clock the preview evaluates against.
+func WithClock(now func() time.Time) Option {
+	return func(s *Service) { s.now = now }
+}
+
+func New(repo scheduleconfig.ScheduleReadRepository, opts ...Option) *Service {
+	s := &Service{
+		repo: repo,
+		now:  func() time.Time { return time.Now().UTC() },
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // RenderRange answers who was on duty across [from, until).
@@ -83,37 +99,54 @@ func (s *Service) CurrentOnCall(ctx context.Context, scheduleID string, at time.
 	// another moment.
 	at = scheduleconfig.NormalizeTimestamp(at)
 
-	out := OnCall{At: at}
+	var out OnCall
 	err := s.repo.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
-		rev, err := view.GetEffectiveRevision(ctx, scheduleID, at)
-		if errors.Is(err, scheduleconfig.ErrRevisionNotFound) || errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if rev.Kind == scheduleconfig.RevisionDeleted {
-			return nil
-		}
-
-		slots, err := onCallSlots(*rev, at)
-		if err != nil {
-			return err
-		}
-		from, until, ok := onCallOverrideRange(slots)
-		if !ok {
-			return nil
-		}
-		overrides, err := view.GetOverrideProjectionInRange(ctx, scheduleID, &from, &until, nil)
-		if err != nil {
-			return err
-		}
-
-		out = projectOnCall(*rev, at, slots, overrides)
-		return nil
+		var err error
+		out, err = onCallWithin(ctx, view, scheduleID, at)
+		return err
 	})
 	if err != nil {
 		return OnCall{}, err
 	}
 	return out, nil
+}
+
+// onCallWithin is the projection itself, over a view the caller already holds.
+// The preview needs the same answer from inside its own snapshot, and computing
+// it twice would be two chances to project one state differently.
+func onCallWithin(ctx context.Context, view scheduleconfig.ScheduleReadView,
+	scheduleID string, at time.Time) (OnCall, error) {
+
+	out := OnCall{At: at}
+	rev, err := view.GetEffectiveRevision(ctx, scheduleID, at)
+	if errors.Is(err, scheduleconfig.ErrRevisionNotFound) || errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
+		return out, nil
+	}
+	if err != nil {
+		return OnCall{}, err
+	}
+	if rev.Kind == scheduleconfig.RevisionDeleted {
+		return out, nil
+	}
+	return onCallOfRevision(ctx, view, *rev, at)
+}
+
+// onCallOfRevision projects one revision - stored or hypothetical - against
+// the override state of the same snapshot.
+func onCallOfRevision(ctx context.Context, view scheduleconfig.ScheduleReadView,
+	rev scheduleconfig.ScheduleRevision, at time.Time) (OnCall, error) {
+
+	slots, err := onCallSlots(rev, at)
+	if err != nil {
+		return OnCall{}, err
+	}
+	from, until, ok := onCallOverrideRange(slots)
+	if !ok {
+		return OnCall{At: at}, nil
+	}
+	overrides, err := view.GetOverrideProjectionInRange(ctx, rev.ScheduleID, &from, &until, nil)
+	if err != nil {
+		return OnCall{}, err
+	}
+	return projectOnCall(rev, at, slots, overrides), nil
 }
