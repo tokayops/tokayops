@@ -537,6 +537,109 @@ func (s *Store) InitDB() error {
 		return err
 	}
 
+	// Schedule revision history: append-only configuration snapshots plus the
+	// aggregate-root columns that carry version and history completeness.
+	//
+	// Nothing in the runtime reads these tables yet; they are created here so
+	// the schema exists before the write path is switched over. All range
+	// constraints use tstzrange — the legacy no_overlapping_overrides
+	// constraint above uses naive tsrange over TIMESTAMPTZ columns and is not
+	// a template to follow.
+	revisionQuery := `
+	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS config_version BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS history_complete_from TIMESTAMPTZ;
+	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+	-- Mutable config columns are no longer written when a schedule root is
+	-- created; l1_rotation_start would otherwise reject the insert.
+	ALTER TABLE schedules ALTER COLUMN l1_rotation_start DROP NOT NULL;
+
+	ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+	-- ON DELETE RESTRICT: a schedule with history is never physically deleted
+	-- (soft delete via schedules.deleted_at), so cascading the history away
+	-- must be impossible at the schema level too.
+	CREATE TABLE IF NOT EXISTS schedule_revisions (
+		id             TEXT PRIMARY KEY,
+		schedule_id    TEXT NOT NULL REFERENCES schedules(id) ON DELETE RESTRICT,
+		version        BIGINT NOT NULL,
+		snapshot       JSONB NOT NULL,
+		effective_from TIMESTAMPTZ NOT NULL,
+		effective_to   TIMESTAMPTZ,
+		recorded_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		created_by     TEXT,
+		change_reason  TEXT,
+		change_summary JSONB,
+
+		UNIQUE (schedule_id, version),
+		CHECK (effective_to IS NULL OR effective_to > effective_from)
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_revisions_one_tail
+		ON schedule_revisions(schedule_id)
+		WHERE effective_to IS NULL;
+	CREATE INDEX IF NOT EXISTS idx_schedule_revisions_range
+		ON schedule_revisions(schedule_id, effective_from);
+
+	-- Defence in depth only: non-overlap is guaranteed by the schedule row
+	-- lock and a single transaction (an empty history has no revision row to
+	-- lock). Skipped when btree_gist is unavailable.
+	DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_schedule_revisions') THEN
+			ALTER TABLE schedule_revisions ADD CONSTRAINT no_overlapping_schedule_revisions
+				EXCLUDE USING gist (schedule_id WITH =, tstzrange(effective_from, effective_to, '[)') WITH &&);
+		END IF;
+	EXCEPTION WHEN undefined_function OR undefined_object THEN
+		RAISE NOTICE 'schedule_revisions exclusion constraint not created (btree_gist not available)';
+	END $$;
+
+	-- Append-only override history. Deliberately without an exclusion
+	-- constraint: overlap is a property of the CURRENT projection (latest
+	-- revision per override_id, tombstones excluded), which no per-row
+	-- constraint can express. The service validates it under the schedule
+	-- lock. user_id/recorded_by carry no FK so history survives user deletion.
+	CREATE TABLE IF NOT EXISTS schedule_override_revisions (
+		revision_id TEXT PRIMARY KEY,
+		override_id TEXT NOT NULL,
+		schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE RESTRICT,
+		revision    BIGINT NOT NULL,
+		layer       TEXT NOT NULL DEFAULT 'l1' CHECK (layer IN ('l1', 'l2')),
+		user_id     TEXT NOT NULL,
+		valid_from  TIMESTAMPTZ NOT NULL,
+		valid_to    TIMESTAMPTZ NOT NULL,
+		reason      TEXT,
+		deleted     BOOLEAN NOT NULL DEFAULT FALSE,
+		recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		recorded_by TEXT,
+
+		UNIQUE (override_id, revision),
+		CHECK (valid_to > valid_from)
+	);
+	CREATE INDEX IF NOT EXISTS idx_schedule_override_revisions_range
+		ON schedule_override_revisions(schedule_id, valid_from);
+
+	-- Schedule domain events, written in the same transaction as the revision
+	-- they describe. Delivery columns are intentionally absent: consumers are
+	-- internal, event_outbox stays bound to alert_groups.
+	CREATE TABLE IF NOT EXISTS schedule_events (
+		id          TEXT PRIMARY KEY,
+		schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE RESTRICT,
+		event_type  TEXT NOT NULL,
+		payload     JSONB NOT NULL DEFAULT '{}',
+		recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_schedule_events_schedule
+		ON schedule_events(schedule_id, recorded_at);
+
+	-- Markers for one-shot operational migrations that must never run twice.
+	CREATE TABLE IF NOT EXISTS migration_markers (
+		name       TEXT PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	`
+	if _, err := s.db.Exec(revisionQuery); err != nil {
+		return err
+	}
+
 	// API Tokens table (for automation access)
 	apiTokensQuery := `
 	CREATE TABLE IF NOT EXISTS api_tokens (
@@ -2167,11 +2270,12 @@ func (s *Store) GetUserByID(id string) (*model.User, error) {
 	row := s.db.QueryRow(query, id)
 
 	var u model.User
-	var role, passwordHash, authProvider sql.NullString
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
+	var email, role, passwordHash, authProvider sql.NullString
+	err := row.Scan(&u.ID, &email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
+	u.Email = email.String
 	u.Role = model.UserRole(role.String)
 	u.PasswordHash = passwordHash.String
 	u.AuthProvider = authProvider.String
@@ -2192,10 +2296,11 @@ func (s *Store) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	var users []*model.User
 	for rows.Next() {
 		var u model.User
-		var role, passwordHash, authProvider sql.NullString
-		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
+		var email, role, passwordHash, authProvider sql.NullString
+		if err := rows.Scan(&u.ID, &email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
 			return nil, err
 		}
+		u.Email = email.String
 		u.Role = model.UserRole(role.String)
 		u.PasswordHash = passwordHash.String
 		u.AuthProvider = authProvider.String
@@ -2215,10 +2320,11 @@ func (s *Store) GetAllUsers() ([]*model.User, error) {
 	var users []*model.User
 	for rows.Next() {
 		var u model.User
-		var role, passwordHash, authProvider sql.NullString
-		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
+		var email, role, passwordHash, authProvider sql.NullString
+		if err := rows.Scan(&u.ID, &email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
 			return nil, err
 		}
+		u.Email = email.String
 		u.Role = model.UserRole(role.String)
 		u.PasswordHash = passwordHash.String
 		u.AuthProvider = authProvider.String
@@ -2248,10 +2354,12 @@ func (s *Store) GetTeamMembers(teamID string) ([]*model.TeamMemberDetail, error)
 	var members []*model.TeamMemberDetail
 	for rows.Next() {
 		var tm model.TeamMemberDetail
+		var email sql.NullString
 		var role string
-		if err := rows.Scan(&tm.ID, &tm.Email, &tm.Name, &tm.CreatedAt, &role); err != nil {
+		if err := rows.Scan(&tm.ID, &email, &tm.Name, &tm.CreatedAt, &role); err != nil {
 			return nil, err
 		}
+		tm.Email = email.String
 		tm.TeamRole = model.TeamMemberRole(role)
 		members = append(members, &tm)
 	}
@@ -2264,16 +2372,20 @@ func (s *Store) RemoveTeamMember(teamID, userID string) error {
 	return err
 }
 
+// GetUserByEmail looks a user up by address. An anonymized user has a NULL
+// email, so this returns sql.ErrNoRows for their former address - it can never
+// resurface an erased identity.
 func (s *Store) GetUserByEmail(email string) (*model.User, error) {
 	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at FROM users WHERE email = $1`
 	row := s.db.QueryRow(query, email)
 
 	var u model.User
-	var role, passwordHash, authProvider sql.NullString
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
+	var storedEmail, role, passwordHash, authProvider sql.NullString
+	err := row.Scan(&u.ID, &storedEmail, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
+	u.Email = storedEmail.String
 	u.Role = model.UserRole(role.String)
 	u.PasswordHash = passwordHash.String
 	u.AuthProvider = authProvider.String
@@ -2701,13 +2813,14 @@ func (s *Store) GetScheduleOverrides(scheduleID string, from, until time.Time) (
 	var overrides []*model.ScheduleOverride
 	for rows.Next() {
 		var o model.ScheduleOverride
-		var reason, createdBy sql.NullString
+		var reason, createdBy, email sql.NullString
 		var u model.User
 
 		if err := rows.Scan(&o.ID, &o.ScheduleID, &o.UserID, &o.StartTime, &o.EndTime, &reason, &createdBy, &o.CreatedAt,
-			&u.ID, &u.Email, &u.Name); err != nil {
+			&u.ID, &email, &u.Name); err != nil {
 			return nil, err
 		}
+		u.Email = email.String
 		o.Reason = reason.String
 		o.CreatedBy = createdBy.String
 		o.User = &u

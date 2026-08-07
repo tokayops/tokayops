@@ -1,0 +1,190 @@
+// Package scheduleconfig owns the application-level command side of schedule
+// configuration: the persistence envelopes around a rotation snapshot, the
+// narrow repository/unit-of-work interfaces a store must implement, and the
+// service that turns user intent into revisions.
+//
+// It imports no persistence package. The store implements these interfaces;
+// the dependency never points the other way.
+package scheduleconfig
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/tokayops/tokayops/internal/rotation"
+)
+
+// TimestampResolution is the resolution PostgreSQL stores TIMESTAMPTZ at. Go
+// clocks carry nanoseconds, so every effective/recorded timestamp is truncated
+// to this resolution before it is compared or written: otherwise two values
+// that differ only below a microsecond collapse into one after the database
+// round-trip and the strict ordering of revisions breaks.
+const TimestampResolution = time.Microsecond
+
+// Typed errors. No SQL error ever escapes a repository implementation.
+var (
+	// ErrScheduleExists means the team already owns a schedule.
+	ErrScheduleExists = errors.New("scheduleconfig: schedule already exists for team")
+
+	// ErrScheduleNotFound means no schedule row matches the ID.
+	ErrScheduleNotFound = errors.New("scheduleconfig: schedule not found")
+
+	// ErrVersionConflict means config_version did not match the expected value.
+	ErrVersionConflict = errors.New("scheduleconfig: schedule config version conflict")
+
+	// ErrRevisionMismatch means a revision-closing update did not affect
+	// exactly the one revision it named. History must never be torn silently.
+	ErrRevisionMismatch = errors.New("scheduleconfig: revision to close did not match")
+
+	// ErrRevisionNotFound means no revision satisfies the query.
+	ErrRevisionNotFound = errors.New("scheduleconfig: revision not found")
+
+	// ErrInvariantViolation means the database rejected a write in a way that
+	// cannot be explained by concurrent legitimate use. It is a bug signal,
+	// not a condition callers can recover from.
+	ErrInvariantViolation = errors.New("scheduleconfig: invariant violation")
+)
+
+// ScheduleRoot is the aggregate identity and concurrency root of a schedule.
+// It carries no configuration: configuration lives only in revisions.
+type ScheduleRoot struct {
+	ID                  string
+	TeamID              string
+	ConfigVersion       int64
+	HistoryCompleteFrom *time.Time
+	DeletedAt           *time.Time
+}
+
+// ScheduleRevision is the persistence envelope around one configuration
+// snapshot. EffectiveTo nil marks the tail revision - the one in force from
+// EffectiveFrom onwards.
+//
+// The rotation math reads Snapshot only; ID, Version, the effective interval
+// and the audit fields exist for diagnostics, events and history rendering.
+type ScheduleRevision struct {
+	ID            string
+	ScheduleID    string
+	Version       int64
+	Snapshot      rotation.ScheduleRevisionSnapshot
+	EffectiveFrom time.Time
+	EffectiveTo   *time.Time
+	RecordedAt    time.Time
+	CreatedBy     *string
+	ChangeReason  *string
+	ChangeSummary *rotation.ChangeSummary
+}
+
+// OverrideRevision is one append-only version of a logical override.
+// OverrideID is the stable logical identity; RevisionID identifies this
+// version. Delete appends a revision with Deleted set, it never removes rows.
+type OverrideRevision struct {
+	RevisionID string
+	OverrideID string
+	ScheduleID string
+	Revision   int64
+	Layer      string
+	UserID     string
+	ValidFrom  time.Time
+	ValidTo    time.Time
+	Reason     *string
+	Deleted    bool
+	RecordedAt time.Time
+	RecordedBy *string
+}
+
+// Override layers. An override belongs to exactly one layer and the renderer
+// applies it to that layer only.
+const (
+	LayerL1 = "l1"
+	LayerL2 = "l2"
+)
+
+// ScheduleEvent is a domain event recorded in the same transaction as the
+// change it describes.
+type ScheduleEvent struct {
+	ID         string
+	ScheduleID string
+	EventType  string
+	Payload    json.RawMessage
+	RecordedAt time.Time
+}
+
+// ScheduleConfigRepository hands out a unit of work. Everything a command does
+// happens inside one WithinTx call; an error returned from fn rolls the whole
+// transaction back.
+type ScheduleConfigRepository interface {
+	WithinTx(ctx context.Context, fn func(ScheduleConfigTx) error) error
+}
+
+// ScheduleConfigTx is the command-side unit of work over one schedule.
+type ScheduleConfigTx interface {
+	// CreateInitialSchedule is ATOMIC by construction: the root, revision 1,
+	// config_version = 1 and history_complete_from are written by this single
+	// operation. There is deliberately no "insert just the root" operation in
+	// this contract - the state "schedule without a revision" is structurally
+	// inexpressible rather than merely forbidden by test discipline.
+	//
+	// A concurrent create for the same team returns ErrScheduleExists.
+	CreateInitialSchedule(ctx context.Context, root *ScheduleRoot, initial *ScheduleRevision) error
+
+	// LockSchedule takes the row lock that serializes all writes to one
+	// schedule. Effective time is captured only after it succeeds.
+	LockSchedule(ctx context.Context, scheduleID string) (*ScheduleRoot, error)
+
+	// GetEffectiveRevision returns the revision in force at `at`, i.e. the one
+	// whose half-open interval [effective_from, effective_to) contains it.
+	GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*ScheduleRevision, error)
+
+	// GetTailRevision returns the open-ended revision, if any.
+	GetTailRevision(ctx context.Context, scheduleID string) (*ScheduleRevision, error)
+
+	// CloseRevision closes the revision named by expectedRevisionID and no
+	// other. Zero or more than one affected row is ErrRevisionMismatch: a gap
+	// in history must not pass unnoticed.
+	CloseRevision(ctx context.Context, scheduleID, expectedRevisionID string, at time.Time) error
+
+	InsertRevision(ctx context.Context, revision *ScheduleRevision) error
+
+	// AdvanceVersion is a compare-and-set on config_version.
+	AdvanceVersion(ctx context.Context, scheduleID string, expected int64, at time.Time) error
+
+	InsertScheduleEvent(ctx context.Context, event *ScheduleEvent) error
+
+	// GetCurrentOverrides projects the current override state: the latest
+	// revision per override_id, tombstones excluded.
+	GetCurrentOverrides(ctx context.Context, scheduleID string) ([]OverrideRevision, error)
+
+	InsertOverrideRevision(ctx context.Context, rev *OverrideRevision) error
+}
+
+// NormalizeTimestamp truncates to the resolution the database stores, so a
+// value compares the same before and after a round-trip. It also drops the
+// monotonic clock reading that time.Now carries.
+func NormalizeTimestamp(t time.Time) time.Time {
+	return t.Truncate(TimestampResolution)
+}
+
+// NextEffectiveAt is the monotonicity rule for effective time:
+//
+//	max(now, tail.effective_from + 1 resolution unit)
+//
+// Two saves in the same instant, or a clock stepping backwards, would
+// otherwise produce a zero-length or inverted revision interval and fail the
+// effective_to > effective_from check on an otherwise valid operation.
+//
+// Both inputs are normalized first: a sub-resolution difference is not a
+// difference at all once stored, so `now = tail + 500ns` must still advance to
+// tail + 1µs. now must be read AFTER the schedule lock is held.
+func NextEffectiveAt(tailEffectiveFrom *time.Time, now time.Time) time.Time {
+	candidate := NormalizeTimestamp(now)
+	if tailEffectiveFrom == nil {
+		return candidate
+	}
+	floor := NormalizeTimestamp(*tailEffectiveFrom).Add(TimestampResolution)
+	if candidate.Before(floor) {
+		return floor
+	}
+	return candidate
+}

@@ -151,6 +151,34 @@ func main() {
 			}
 			return
 
+		case "migrate":
+			// Destructive operations are their own subcommand on purpose: they
+			// must never be a variant of a normal start. InitDB has already run
+			// above (schema only) — HTTP, the scheduler and the background
+			// workers are all started further down and are never reached here.
+			if len(os.Args) < 3 {
+				log.Fatal("Usage: tokayops migrate reset-schedules")
+			}
+			switch subCmd := os.Args[2]; subCmd {
+			case "reset-schedules":
+				if len(os.Args) > 3 {
+					log.Fatal("Usage: tokayops migrate reset-schedules")
+				}
+				res, err := st.ResetLegacySchedules()
+				if err != nil {
+					log.Fatalf("Schedule reset failed: %v", err)
+				}
+				if res.AlreadyApplied {
+					log.Println("Schedule reset already applied — nothing to do.")
+					return
+				}
+				log.Printf("Schedule reset complete: %d schedule(s) deleted. "+
+					"Recreate schedules with the new binary running.", res.SchedulesDeleted)
+				return
+			default:
+				log.Fatalf("Unknown migrate command: %s", subCmd)
+			}
+
 		case "user":
 			if len(os.Args) < 3 {
 				log.Fatal("Usage: tokayops user create <email> <password> [name]")
