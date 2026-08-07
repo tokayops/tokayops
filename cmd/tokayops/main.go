@@ -17,10 +17,13 @@ import (
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/engine"
+	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/ingester"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbox"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -320,6 +323,19 @@ func main() {
 	// 8. API
 	apiService := api.NewAPI(st, oidcProvider, slackProvider, integrationCache, cfg.Global.SelfURL, api.NewProviderCapsAdapter(disp.Providers()))
 	apiService.SetCardRenderer(slackProvider)
+
+	// Schedule configuration (revision model). The command service, the read
+	// side and the renderer are built from the store's narrow repositories
+	// rather than from StoreInterface: the revision model is deliberately not
+	// part of that interface.
+	scheduleMetrics := metrics.ScheduleMetrics{}
+	scheduleConfigService := scheduleconfig.NewService(st.ScheduleConfigRepository(),
+		scheduleconfig.WithMetrics(scheduleMetrics))
+	apiService.SetScheduleConfigService(scheduleConfigService)
+	apiService.SetScheduleReadRepository(st.ScheduleReadRepository())
+	apiService.SetScheduleRenderer(schedulerender.New(st.ScheduleReadRepository()))
+	apiService.SetScheduleMetrics(scheduleMetrics)
+	apiService.SetUserEraser(erasure.NewService(st.ErasureRepository()))
 	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle (Epic 8 Sprint 3)
 	// Register the Telegram webhook at boot so TOKAY_SELF_URL + restart suffices (no
 	// need to re-save the integration). Best-effort; goroutine so a slow/unreachable
