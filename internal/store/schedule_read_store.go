@@ -101,6 +101,76 @@ func (v *scheduleReadView) GetOverrideProjectionInRange(ctx context.Context, sch
 	return getOverrideProjection(ctx, v.q, scheduleID, from, until, asOf)
 }
 
+// GetRevisionByID scopes the lookup by schedule as well as by revision. A
+// revision ID belonging to another team's schedule has to answer "not found":
+// the RBAC check upstream authorized one schedule, not one identifier.
+func (v *scheduleReadView) GetRevisionByID(ctx context.Context, scheduleID, revisionID string) (*scheduleconfig.ScheduleRevision, error) {
+	return scanScheduleRevisionRow(v.q.QueryRowContext(ctx,
+		`SELECT `+scheduleRevisionColumns+`
+		 FROM schedule_revisions
+		 WHERE schedule_id = $1 AND id = $2`, scheduleID, revisionID))
+}
+
+// ListRevisions pages the audit trail newest first. The cursor is the version
+// rather than an offset: versions are dense and strictly increasing per
+// schedule, so a page cannot shift under a reader the way an OFFSET can.
+func (v *scheduleReadView) ListRevisions(ctx context.Context, scheduleID string, limit int, beforeVersion *int64) ([]scheduleconfig.ScheduleRevision, error) {
+	var before any
+	if beforeVersion != nil {
+		before = *beforeVersion
+	}
+	rows, err := v.q.QueryContext(ctx,
+		`SELECT `+scheduleRevisionColumns+`
+		 FROM schedule_revisions
+		 WHERE schedule_id = $1
+		   AND ($2::bigint IS NULL OR version < $2)
+		 ORDER BY version DESC
+		 LIMIT $3`, scheduleID, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []scheduleconfig.ScheduleRevision
+	for rows.Next() {
+		rev, err := scanScheduleRevision(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *rev)
+	}
+	return out, rows.Err()
+}
+
+// GetTeamMemberIDs lists the ACTIVE members of a team.
+//
+// The join to users and the deleted_at filter are what stop an erased person
+// being validated back into a rotation: team_members alone still holds the row
+// until erasure removes it, and even after that a stale editor payload naming
+// the ID must be rejected rather than accepted because the ID "looks fine".
+func (v *scheduleReadView) GetTeamMemberIDs(ctx context.Context, teamID string) ([]string, error) {
+	rows, err := v.q.QueryContext(ctx,
+		`SELECT u.id
+		 FROM team_members tm
+		 JOIN users u ON u.id = tm.user_id
+		 WHERE tm.team_id = $1 AND u.deleted_at IS NULL
+		 ORDER BY u.id`, teamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // Compile-time proof the store satisfies the read contract, and that both
 // *sql.Tx and *sql.DB are usable as the shared queryer.
 var (
