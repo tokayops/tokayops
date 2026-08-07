@@ -145,6 +145,30 @@ definitions:
       total:
         type: integer
     type: object
+  api.LayerOnCallDTO:
+    properties:
+      assignment_end:
+        type: string
+      assignment_start:
+        type: string
+      grid_slot_end:
+        type: string
+      grid_slot_start:
+        type: string
+      group_id:
+        type: string
+      override_id:
+        type: string
+      revision_id:
+        type: string
+      source:
+        description: rotation | override
+        type: string
+      user_ids:
+        items:
+          type: string
+        type: array
+    type: object
   api.LoginRequest:
     properties:
       email:
@@ -168,29 +192,14 @@ definitions:
       login_url:
         type: string
     type: object
-  api.OverrideRequest:
+  api.OnCallDTO:
     properties:
-      end_time:
-        description: 'Legacy: UTC or offset-included time'
+      at:
         type: string
-      end_time_local:
-        description: 'Optional: "2006-01-02T15:04"'
-        type: string
-      reason:
-        description: Optional reason
-        type: string
-      start_time:
-        description: 'Legacy: UTC or offset-included time'
-        type: string
-      start_time_local:
-        description: 'Optional: "2006-01-02T15:04"'
-        type: string
-      timezone:
-        description: 'Optional: Timezone for local times'
-        type: string
-      user_id:
-        description: User to assign
-        type: string
+      l1:
+        $ref: '#/definitions/api.LayerOnCallDTO'
+      l2:
+        $ref: '#/definitions/api.LayerOnCallDTO'
     type: object
   api.PolicyRequest:
     properties:
@@ -249,39 +258,200 @@ definitions:
           $ref: '#/definitions/api.ProviderCapability'
         type: array
     type: object
-  api.RenderEntry:
+  api.PutScheduleConfigRequest:
     properties:
-      end_time:
-        type: string
-      layer:
-        description: '"l1", "l2", "override"'
-        type: string
-      override_end:
-        type: string
-      override_id:
-        description: Override-specific fields (only set when Layer == "override")
-        type: string
-      override_start:
-        type: string
+      expected_version:
+        description: |-
+          ExpectedVersion is the config_version the editor loaded. Zero means
+          "there is no schedule yet"; anything else must match or the save is
+          rejected with the current version.
+        type: integer
+      l1:
+        $ref: '#/definitions/api.ScheduleL1DTO'
+      l2:
+        $ref: '#/definitions/api.ScheduleL2DTO'
       reason:
+        description: Reason is free text recorded with the revision.
         type: string
-      schedule_id:
+      slack_usergroup_id:
         type: string
-      start_time:
+      timezone:
         type: string
-      user_ids:
-        items:
-          type: string
-        type: array
-      user_names:
-        items:
-          type: string
-        type: array
+    type: object
+  api.PutScheduleConfigResponse:
+    properties:
+      created:
+        type: boolean
+      noop:
+        type: boolean
+      on_call_after:
+        $ref: '#/definitions/api.OnCallDTO'
+      recreated:
+        type: boolean
+      revision_id:
+        type: string
+      version:
+        type: integer
     type: object
   api.RequestSlackCodeRequest:
     properties:
       slack_user_id:
         type: string
+    type: object
+  api.ScheduleConfigDTO:
+    properties:
+      l1:
+        $ref: '#/definitions/api.ScheduleL1DTO'
+      l2:
+        $ref: '#/definitions/api.ScheduleL2DTO'
+      slack_usergroup_id:
+        type: string
+      timezone:
+        type: string
+    type: object
+  api.ScheduleConfigResponse:
+    properties:
+      config:
+        $ref: '#/definitions/api.ScheduleConfigDTO'
+      deleted_at:
+        type: string
+      effective_from:
+        type: string
+      revision_id:
+        type: string
+      schedule_id:
+        type: string
+      version:
+        type: integer
+    type: object
+  api.ScheduleGroupDTO:
+    properties:
+      id:
+        type: string
+      user_ids:
+        items:
+          type: string
+        type: array
+    type: object
+  api.ScheduleL1DTO:
+    properties:
+      enabled:
+        type: boolean
+      groups:
+        items:
+          $ref: '#/definitions/api.ScheduleGroupDTO'
+        type: array
+      handoff_day:
+        description: weekly only, 0=Sunday
+        type: integer
+      handoff_time:
+        description: local "HH:MM"
+        type: string
+      rotation_type:
+        description: daily | weekly
+        type: string
+    type: object
+  api.ScheduleL2DTO:
+    properties:
+      enabled:
+        type: boolean
+      escalation_timeout_minutes:
+        type: integer
+      handoff_day:
+        type: integer
+      handoff_time:
+        type: string
+      rotation_type:
+        type: string
+      user_ids:
+        items:
+          type: string
+        type: array
+    type: object
+  api.ScheduleOverrideDTO:
+    properties:
+      override_id:
+        type: string
+      reason:
+        type: string
+      recorded_at:
+        type: string
+      recorded_by:
+        type: string
+      revision:
+        type: integer
+      user_id:
+        type: string
+      valid_from:
+        type: string
+      valid_to:
+        type: string
+    type: object
+  api.ScheduleOverrideListResponse:
+    properties:
+      overrides:
+        items:
+          $ref: '#/definitions/api.ScheduleOverrideDTO'
+        type: array
+    type: object
+  api.ScheduleOverrideRequest:
+    properties:
+      expected_revision:
+        type: integer
+      reason:
+        type: string
+      user_id:
+        type: string
+      valid_from:
+        type: string
+      valid_to:
+        type: string
+    type: object
+  api.SchedulePreviewResponse:
+    properties:
+      base_version:
+        type: integer
+      entries:
+        items:
+          $ref: '#/definitions/api.ShiftDTO'
+        type: array
+      evaluated_at:
+        type: string
+      on_call_after:
+        $ref: '#/definitions/api.OnCallDTO'
+      on_call_before:
+        $ref: '#/definitions/api.OnCallDTO'
+      on_call_changed:
+        type: boolean
+      warnings:
+        items:
+          $ref: '#/definitions/api.ScheduleWarningDTO'
+        type: array
+    type: object
+  api.ScheduleRenderResponse:
+    properties:
+      deleted_at:
+        type: string
+      entries:
+        items:
+          $ref: '#/definitions/api.ShiftDTO'
+        type: array
+      from:
+        type: string
+      history_complete:
+        description: |-
+          HistoryComplete is false when part of the range precedes the point from
+          which this schedule's history is exact. Inferred history is never
+          returned as if it had been recorded.
+        type: boolean
+      history_complete_from:
+        type: string
+      until:
+        type: string
+      warnings:
+        items:
+          $ref: '#/definitions/api.ScheduleWarningDTO'
+        type: array
     type: object
   api.ScheduleRequest:
     properties:
@@ -318,6 +488,58 @@ definitions:
         description: IANA timezone
         type: string
     type: object
+  api.ScheduleRevisionDTO:
+    properties:
+      change_reason:
+        type: string
+      change_summary:
+        $ref: '#/definitions/rotation.ChangeSummary'
+      config:
+        $ref: '#/definitions/api.ScheduleConfigDTO'
+      created_by:
+        type: string
+      effective_from:
+        type: string
+      effective_to:
+        type: string
+      kind:
+        description: active | deleted
+        type: string
+      recorded_at:
+        type: string
+      revision_id:
+        type: string
+      version:
+        type: integer
+    type: object
+  api.ScheduleRevisionListResponse:
+    properties:
+      next_before_version:
+        description: |-
+          NextBeforeVersion is the cursor for the following page, absent when this
+          page is the end. A version cursor rather than an offset: versions are
+          dense and strictly increasing, so a page cannot shift under a reader.
+        type: integer
+      revisions:
+        items:
+          $ref: '#/definitions/api.ScheduleRevisionDTO'
+        type: array
+    type: object
+  api.ScheduleWarningDTO:
+    properties:
+      code:
+        type: string
+      from:
+        type: string
+      layer:
+        type: string
+      related_ids:
+        items:
+          type: string
+        type: array
+      until:
+        type: string
+    type: object
   api.SetGroupsRequest:
     properties:
       groups:
@@ -332,6 +554,39 @@ definitions:
     properties:
       user_ids:
         description: Ordered list of user IDs (L2 only)
+        items:
+          type: string
+        type: array
+    type: object
+  api.ShiftDTO:
+    properties:
+      end:
+        type: string
+      grid_slot_end:
+        type: string
+      grid_slot_start:
+        type: string
+      group_id:
+        type: string
+      layer:
+        type: string
+      override_id:
+        type: string
+      override_revision_id:
+        type: string
+      revision_ids:
+        description: 'RevisionIDs is provenance: which revisions contributed, in order.'
+        items:
+          type: string
+        type: array
+      slot_count:
+        description: SlotCount is how many grid slots this shift spans.
+        type: integer
+      source:
+        type: string
+      start:
+        type: string
+      user_ids:
         items:
           type: string
         type: array
@@ -741,6 +996,13 @@ definitions:
     - RotationWeekly
   model.Schedule:
     properties:
+      config_version:
+        description: |-
+          ConfigVersion is non-zero when this schedule is governed by the revision
+          model, in which case the mutable columns below are stale leftovers and
+          nothing may read them. It is scanned so the legacy readers can refuse
+          such a row instead of answering from data nobody maintains.
+        type: integer
       created_at:
         type: string
       id:
@@ -1014,6 +1276,27 @@ definitions:
     x-enum-varnames:
     - WebhookScopeGlobal
     - WebhookScopeTeam
+  rotation.ChangeSummary:
+    properties:
+      l1_group_selection:
+        type: string
+      l1_groups_changed:
+        type: boolean
+      l1_phase_action:
+        type: string
+      l1_policy_changed:
+        type: boolean
+      l2_changed:
+        type: boolean
+      l2_group_selection:
+        type: string
+      l2_phase_action:
+        type: string
+      slack_usergroup_changed:
+        type: boolean
+      timezone_changed:
+        type: boolean
+    type: object
 info:
   contact: {}
   description: TokayOps API
@@ -1840,7 +2123,8 @@ paths:
       - providers
   /api/v1/schedules/{schedule_id}/overrides/{id}:
     delete:
-      description: Delete a schedule override
+      description: Appends a tombstone. The override history is kept and stays replayable
+        as of any past instant.
       parameters:
       - description: Schedule ID
         in: path
@@ -1852,11 +2136,26 @@ paths:
         name: id
         required: true
         type: string
+      - description: Revision the caller loaded
+        in: query
+        name: expected_revision
+        required: true
+        type: integer
+      produces:
+      - application/json
       responses:
         "204":
           description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
         "404":
           description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
           schema:
             $ref: '#/definitions/api.ErrorResponse'
       summary: Delete an override
@@ -1865,7 +2164,8 @@ paths:
     put:
       consumes:
       - application/json
-      description: Update an existing schedule override (user, times, reason)
+      description: Appends the next revision of an override. expected_revision must
+        match the current head.
       parameters:
       - description: Schedule ID
         in: path
@@ -1877,19 +2177,19 @@ paths:
         name: id
         required: true
         type: string
-      - description: Override data
+      - description: Override
         in: body
         name: override
         required: true
         schema:
-          $ref: '#/definitions/api.OverrideRequest'
+          $ref: '#/definitions/api.ScheduleOverrideRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/model.ScheduleOverride'
+            $ref: '#/definitions/api.ScheduleOverrideDTO'
         "400":
           description: Bad Request
           schema:
@@ -2213,23 +2513,37 @@ paths:
       - schedules
   /api/v1/teams/{id}/schedule:
     delete:
-      description: Delete the on-call schedule configuration for a team
+      description: Deactivates the schedule and tombstones its live overrides. History
+        is kept.
       parameters:
       - description: Team ID
         in: path
         name: id
         required: true
         type: string
+      - description: config_version the caller loaded
+        in: query
+        name: expected_version
+        required: true
+        type: integer
       produces:
       - application/json
       responses:
         "204":
           description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
         "404":
           description: Not Found
           schema:
             $ref: '#/definitions/api.ErrorResponse'
-      summary: Delete schedule for a team
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Delete the schedule of a team
       tags:
       - schedules
     get:
@@ -2286,6 +2600,69 @@ paths:
           schema:
             $ref: '#/definitions/api.ErrorResponse'
       summary: Create or update schedule for a team
+      tags:
+      - schedules
+  /api/v1/teams/{id}/schedule/config:
+    get:
+      description: Returns the configuration in force, or the last valid one plus
+        deleted_at for a deleted schedule.
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ScheduleConfigResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get the schedule configuration of a team
+      tags:
+      - schedules
+    put:
+      consumes:
+      - application/json
+      description: Creates, edits or recreates the schedule depending on its current
+        state. expected_version must be 0 when no schedule exists.
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Desired configuration
+        in: body
+        name: config
+        required: true
+        schema:
+          $ref: '#/definitions/api.PutScheduleConfigRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.PutScheduleConfigResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Save the schedule configuration of a team
       tags:
       - schedules
   /api/v1/teams/{id}/schedule/l1-groups:
@@ -2355,29 +2732,52 @@ paths:
       tags:
       - schedules
   /api/v1/teams/{id}/schedule/overrides:
-    post:
-      consumes:
-      - application/json
-      description: Create a temporary on-call override (vacation, swap)
+    get:
+      description: The head revision of every override that still exists - the only
+        source of expected_revision for an edit.
       parameters:
       - description: Team ID
         in: path
         name: id
         required: true
         type: string
-      - description: Override data
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ScheduleOverrideListResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: List the current overrides of a team's schedule
+      tags:
+      - schedules
+    post:
+      consumes:
+      - application/json
+      description: Records a temporary stand-in as a new append-only override revision.
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Override
         in: body
         name: override
         required: true
         schema:
-          $ref: '#/definitions/api.OverrideRequest'
+          $ref: '#/definitions/api.ScheduleOverrideRequest'
       produces:
       - application/json
       responses:
         "201":
           description: Created
           schema:
-            $ref: '#/definitions/model.ScheduleOverride'
+            $ref: '#/definitions/api.ScheduleOverrideDTO'
         "400":
           description: Bad Request
           schema:
@@ -2386,24 +2786,73 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
       summary: Create an override
       tags:
       - schedules
-  /api/v1/teams/{id}/schedule/render:
-    get:
-      description: Get schedule entries for a time range
+  /api/v1/teams/{id}/schedule/preview:
+    post:
+      consumes:
+      - application/json
+      description: Renders what a save would do without writing anything.
       parameters:
       - description: Team ID
         in: path
         name: id
         required: true
         type: string
-      - description: Start time (RFC3339)
+      - description: End of the previewed window (RFC3339); defaults to 14 days, capped
+          at 90
+        in: query
+        name: until
+        type: string
+      - description: Desired configuration
+        in: body
+        name: config
+        required: true
+        schema:
+          $ref: '#/definitions/api.PutScheduleConfigRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.SchedulePreviewResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Preview a schedule configuration
+      tags:
+      - schedules
+  /api/v1/teams/{id}/schedule/render:
+    get:
+      description: Who was on duty across a range, derived from the revision chain.
+        Range is capped at 90 days.
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Start of the range (RFC3339)
         in: query
         name: from
         required: true
         type: string
-      - description: End time (RFC3339)
+      - description: End of the range (RFC3339)
         in: query
         name: until
         required: true
@@ -2414,9 +2863,7 @@ paths:
         "200":
           description: OK
           schema:
-            items:
-              $ref: '#/definitions/api.RenderEntry'
-            type: array
+            $ref: '#/definitions/api.ScheduleRenderResponse'
         "400":
           description: Bad Request
           schema:
@@ -2425,7 +2872,67 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/api.ErrorResponse'
-      summary: Render schedule calendar
+      summary: Render the schedule calendar of a team
+      tags:
+      - schedules
+  /api/v1/teams/{id}/schedule/revisions:
+    get:
+      description: Audit trail, newest first, paged by a version cursor. Read-only.
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Page size (default 100, max 500)
+        in: query
+        name: limit
+        type: integer
+      - description: Return revisions strictly below this version
+        in: query
+        name: before_version
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ScheduleRevisionListResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: List the revisions of a team's schedule
+      tags:
+      - schedules
+  /api/v1/teams/{id}/schedule/revisions/{revision_id}:
+    get:
+      description: Returns the revision with the configuration snapshot it carried.
+        Read-only.
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Revision ID
+        in: path
+        name: revision_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ScheduleRevisionDTO'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get one revision of a team's schedule
       tags:
       - schedules
   /api/v1/tokens:
