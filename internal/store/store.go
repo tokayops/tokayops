@@ -20,6 +20,10 @@ import (
 // "this person never existed" from "this person was deleted".
 var ErrUserNotFound = errors.New("store: user not found")
 
+// ErrScheduleSuperseded means the schedule row belongs to the revision model
+// and the legacy readers must not answer from its mutable columns.
+var ErrScheduleSuperseded = errors.New("store: schedule is managed by the revision model")
+
 type Store struct {
 	db *sql.DB
 }
@@ -2630,6 +2634,11 @@ func (s *Store) GetTimelineEvents(alertGroupID string) ([]*model.TimelineEvent, 
 // Schedule CRUD (Phase 3)
 // ========================================
 
+// CreateSchedule inserts a legacy schedule row.
+//
+// Deprecated: schedule configuration is written by scheduleconfig.Service,
+// which records it as a revision. This remains only for fixtures that have not
+// moved yet and is removed with the rest of the legacy schedule path.
 func (s *Store) CreateSchedule(sch *model.Schedule) error {
 	if sch.CreatedAt.IsZero() {
 		sch.CreatedAt = time.Now()
@@ -2651,29 +2660,58 @@ func (s *Store) CreateSchedule(sch *model.Schedule) error {
 	return err
 }
 
+// legacyScheduleColumns is the projection both legacy readers share.
+// config_version is part of it although no legacy consumer wants the value:
+// it is what the guard in scanSchedule needs to recognize a row it must not
+// answer from.
+const legacyScheduleColumns = `id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at, config_version`
+
 func (s *Store) GetScheduleByTeamID(teamID string) (*model.Schedule, error) {
-	query := `SELECT id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at
-			  FROM schedules WHERE team_id = $1`
-	return s.scanSchedule(s.db.QueryRow(query, teamID))
+	return s.scanSchedule(s.db.QueryRow(
+		`SELECT `+legacyScheduleColumns+` FROM schedules WHERE team_id = $1`, teamID))
 }
 
 func (s *Store) GetScheduleByID(id string) (*model.Schedule, error) {
-	query := `SELECT id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at
-			  FROM schedules WHERE id = $1`
-	return s.scanSchedule(s.db.QueryRow(query, id))
+	return s.scanSchedule(s.db.QueryRow(
+		`SELECT `+legacyScheduleColumns+` FROM schedules WHERE id = $1`, id))
 }
 
+// scanSchedule reads a legacy schedule row and refuses the ones that belong to
+// the revision model.
+//
+// The mutable columns on such a row are whatever they were before the upgrade;
+// the rotation that actually decides who is on call lives in the revisions.
+// Answering from the stale columns would not fail, it would page the wrong
+// person - so mixing the two eras is made an error here, in the one place both
+// readers pass through, rather than in each of the ten callers.
+//
+// What each caller does with the refusal is deliberately different. The team
+// listing ignores it and shows "not configured"; the engine and the escalation
+// builder let it surface, because a schedule they cannot read is not something
+// to page around silently.
 func (s *Store) scanSchedule(row *sql.Row) (*model.Schedule, error) {
 	var sch model.Schedule
 	var l1HandoffDay, l2HandoffDay sql.NullInt64
+	var l1RotationType, l1HandoffTime sql.NullString
 	var l2RotationType, l2HandoffTime, slackUsergroupID sql.NullString
-	var l2RotationStart sql.NullTime
+	var l1RotationStart, l2RotationStart sql.NullTime
 
-	err := row.Scan(&sch.ID, &sch.TeamID, &sch.Timezone, &sch.L1RotationType, &sch.L1HandoffTime, &l1HandoffDay, &sch.L1RotationStart, &sch.L2Enabled, &sch.L2EscalationTimeout, &l2RotationType, &l2HandoffTime, &l2HandoffDay, &l2RotationStart, &slackUsergroupID, &sch.CreatedAt, &sch.UpdatedAt)
+	// Every legacy column is scanned as nullable, including the ones a
+	// pre-upgrade row always had. A schedule created by the revision model
+	// leaves them at their defaults, so scanning them into non-nullable types
+	// would fail with a driver error BEFORE the guard below could give the
+	// caller the answer it actually needs.
+	err := row.Scan(&sch.ID, &sch.TeamID, &sch.Timezone, &l1RotationType, &l1HandoffTime, &l1HandoffDay, &l1RotationStart, &sch.L2Enabled, &sch.L2EscalationTimeout, &l2RotationType, &l2HandoffTime, &l2HandoffDay, &l2RotationStart, &slackUsergroupID, &sch.CreatedAt, &sch.UpdatedAt, &sch.ConfigVersion)
 	if err != nil {
 		return nil, err
 	}
+	if sch.ConfigVersion > 0 {
+		return nil, ErrScheduleSuperseded
+	}
 
+	sch.L1RotationType = model.RotationType(l1RotationType.String)
+	sch.L1HandoffTime = l1HandoffTime.String
+	sch.L1RotationStart = l1RotationStart.Time
 	if l1HandoffDay.Valid {
 		d := int(l1HandoffDay.Int64)
 		sch.L1HandoffDay = &d
@@ -2692,6 +2730,11 @@ func (s *Store) scanSchedule(row *sql.Row) (*model.Schedule, error) {
 	return &sch, nil
 }
 
+// UpdateSchedule rewrites a legacy schedule row in place.
+//
+// Deprecated: configuration changes go through scheduleconfig.Service, which
+// appends a revision instead of overwriting the previous one. This remains
+// only for fixtures that have not moved yet.
 func (s *Store) UpdateSchedule(sch *model.Schedule) error {
 	sch.UpdatedAt = time.Now()
 	query := `UPDATE schedules SET timezone = $1, l1_rotation_type = $2, l1_handoff_time = $3, l1_handoff_day = $4, l1_rotation_start = $5, l2_enabled = $6, l2_escalation_timeout_min = $7, l2_rotation_type = $8, l2_handoff_time = $9, l2_handoff_day = $10, l2_rotation_start = $11, slack_usergroup_id = $12, updated_at = $13 WHERE id = $14`
