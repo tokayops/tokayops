@@ -11,6 +11,30 @@ import (
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
+// scheduleErrorStatuses is the plain half of the error table: a sentinel, the
+// status it answers with, and the message.
+//
+// It is data rather than a switch so it can be read against the contract in
+// one glance. The order is the order it is scanned in, which only matters if
+// two sentinels ever wrap each other - none of these do.
+var scheduleErrorStatuses = []struct {
+	err     error
+	status  int
+	message string
+}{
+	{scheduleconfig.ErrScheduleNotFound, http.StatusNotFound, "schedule not found"},
+	{scheduleconfig.ErrRevisionNotFound, http.StatusNotFound, "revision not found"},
+	{scheduleconfig.ErrOverrideNotFound, http.StatusNotFound, "override not found"},
+	{scheduleconfig.ErrTeamNotFound, http.StatusNotFound, "team not found"},
+	{erasure.ErrUserNotFound, http.StatusNotFound, "user not found"},
+
+	{scheduleconfig.ErrScheduleExists, http.StatusConflict, "this team already has a schedule"},
+	{scheduleconfig.ErrScheduleDeleted, http.StatusConflict, "schedule is deleted"},
+	{scheduleconfig.ErrLegacySchedule, http.StatusConflict,
+		"this schedule predates the revision model and must be reset before it can be edited"},
+	{erasure.ErrLastAdmin, http.StatusConflict, "last active admin"},
+}
+
 // mapScheduleError is the ONLY translation from a command-side error to an
 // HTTP response. Handlers below never choose a status themselves.
 //
@@ -20,31 +44,44 @@ import (
 // silently produce a 500 in one handler and a 400 in another.
 func (a *API) mapScheduleError(c echo.Context, err error) error {
 	// Structured errors first: they carry the details the response needs, and
-	// each unwraps to the sentinel the classification below would have used.
+	// each unwraps to a sentinel the table below would have matched instead.
+	if status, body, ok := scheduleErrorDetails(err); ok {
+		return c.JSON(status, body)
+	}
+	for _, entry := range scheduleErrorStatuses {
+		if errors.Is(err, entry.err) {
+			return c.JSON(entry.status, ErrorResponse{Error: entry.message})
+		}
+	}
+	return a.mapScheduleFault(c, err)
+}
+
+// scheduleErrorDetails renders the errors that carry more than a class.
+func scheduleErrorDetails(err error) (int, any, bool) {
 	var validation *scheduleconfig.ValidationError
 	if errors.As(err, &validation) {
-		return c.JSON(http.StatusBadRequest, map[string]any{
+		return http.StatusBadRequest, map[string]any{
 			"error": validation.Msg,
 			"field": validation.Field,
-		})
+		}, true
 	}
 
 	var versionConflict *scheduleconfig.VersionConflictError
 	if errors.As(err, &versionConflict) {
-		return c.JSON(http.StatusConflict, map[string]any{
+		return http.StatusConflict, map[string]any{
 			"error":            "schedule was modified by someone else",
 			"expected_version": versionConflict.Expected,
 			"current_version":  versionConflict.Current,
-		})
+		}, true
 	}
 
 	var revisionConflict *scheduleconfig.OverrideRevisionConflictError
 	if errors.As(err, &revisionConflict) {
-		return c.JSON(http.StatusConflict, map[string]any{
+		return http.StatusConflict, map[string]any{
 			"error":             "override was modified by someone else",
 			"expected_revision": revisionConflict.Expected,
 			"current_revision":  revisionConflict.Current,
-		})
+		}, true
 	}
 
 	var overlap *scheduleconfig.OverrideOverlapError
@@ -58,64 +95,49 @@ func (a *API) mapScheduleError(c echo.Context, err error) error {
 				"valid_to":    ref.ValidTo,
 			}
 		}
-		return c.JSON(http.StatusConflict, map[string]any{
+		return http.StatusConflict, map[string]any{
 			"error":                 "override conflicts with existing override(s)",
 			"conflicting_overrides": conflicts,
-		})
+		}, true
 	}
 
 	// 422 rather than 409: nothing collided, the payload names people who do
 	// not belong to the team, and only editing it can fix that.
 	var notMember *scheduleconfig.UserNotTeamMemberError
 	if errors.As(err, &notMember) {
-		return c.JSON(http.StatusUnprocessableEntity, map[string]any{
+		return http.StatusUnprocessableEntity, map[string]any{
 			"error":    "some users are not members of this team",
 			"user_ids": notMember.UserIDs,
-		})
+		}, true
 	}
 
+	// The same 409 body from two packages. erasure reports the conflict
+	// globally and scheduleconfig per team; they stay separate types because
+	// erasure knows nothing about schedule configuration, and the price is
+	// exactly these two branches building the same shape.
 	var memberOnCall *scheduleconfig.MemberOnCallError
 	if errors.As(err, &memberOnCall) {
-		return c.JSON(http.StatusConflict, map[string]any{
-			"error":     "user holds a current on-call assignment",
-			"schedules": scheduleRefs(memberOnCall.Schedules),
-		})
+		refs := make([]map[string]string, 0, len(memberOnCall.Schedules))
+		for _, ref := range memberOnCall.Schedules {
+			refs = append(refs, scheduleRef(ref.ScheduleID, ref.TeamID))
+		}
+		return http.StatusConflict, onCallConflictBody(refs), true
 	}
-
 	var userOnCall *erasure.UserOnCallError
 	if errors.As(err, &userOnCall) {
-		refs := make([]scheduleconfig.ScheduleRef, len(userOnCall.Schedules))
-		for i, s := range userOnCall.Schedules {
-			refs[i] = scheduleconfig.ScheduleRef{ScheduleID: s.ScheduleID, TeamID: s.TeamID}
+		refs := make([]map[string]string, 0, len(userOnCall.Schedules))
+		for _, ref := range userOnCall.Schedules {
+			refs = append(refs, scheduleRef(ref.ScheduleID, ref.TeamID))
 		}
-		return c.JSON(http.StatusConflict, map[string]any{
-			"error":     "user holds a current on-call assignment",
-			"schedules": scheduleRefs(refs),
-		})
+		return http.StatusConflict, onCallConflictBody(refs), true
 	}
 
+	return 0, nil, false
+}
+
+// mapScheduleFault answers the errors that are nobody's fault but ours.
+func (a *API) mapScheduleFault(c echo.Context, err error) error {
 	switch {
-	case errors.Is(err, scheduleconfig.ErrScheduleNotFound),
-		errors.Is(err, scheduleconfig.ErrRevisionNotFound),
-		errors.Is(err, scheduleconfig.ErrOverrideNotFound),
-		errors.Is(err, scheduleconfig.ErrTeamNotFound),
-		errors.Is(err, erasure.ErrUserNotFound):
-		return c.JSON(http.StatusNotFound, ErrorResponse{Error: err.Error()})
-
-	case errors.Is(err, scheduleconfig.ErrScheduleExists):
-		return c.JSON(http.StatusConflict, ErrorResponse{Error: "this team already has a schedule"})
-
-	case errors.Is(err, scheduleconfig.ErrScheduleDeleted):
-		return c.JSON(http.StatusConflict, ErrorResponse{Error: "schedule is deleted"})
-
-	case errors.Is(err, scheduleconfig.ErrLegacySchedule):
-		return c.JSON(http.StatusConflict, ErrorResponse{
-			Error: "this schedule predates the revision model and must be reset before it can be edited",
-		})
-
-	case errors.Is(err, erasure.ErrLastAdmin):
-		return c.JSON(http.StatusConflict, ErrorResponse{Error: "last active admin"})
-
 	// A snapshot that will not decode is corruption, and the one thing that
 	// must never happen here is answering with an empty rotation: an empty
 	// rotation is a valid state someone chose, so a caller cannot tell the two
@@ -130,16 +152,20 @@ func (a *API) mapScheduleError(c echo.Context, err error) error {
 		log.Printf("ALERT schedule_config: invariant violation: %v", err)
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "schedule invariant violation"})
 	}
-
 	return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 }
 
-func scheduleRefs(refs []scheduleconfig.ScheduleRef) []map[string]string {
-	out := make([]map[string]string, len(refs))
-	for i, ref := range refs {
-		out[i] = map[string]string{"schedule_id": ref.ScheduleID, "team_id": ref.TeamID}
+func scheduleRef(scheduleID, teamID string) map[string]string {
+	return map[string]string{"schedule_id": scheduleID, "team_id": teamID}
+}
+
+// onCallConflictBody is the 409 that lists the schedules blocking a removal or
+// an erasure.
+func onCallConflictBody(schedules []map[string]string) map[string]any {
+	return map[string]any{
+		"error":     "user holds a current on-call assignment",
+		"schedules": schedules,
 	}
-	return out
 }
 
 // scheduleMetrics is the metrics sink, never nil: an unwired API still runs.
