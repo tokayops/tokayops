@@ -74,65 +74,45 @@ func (s *Service) Preview(ctx context.Context, teamID string,
 	return out, nil
 }
 
+// previewBase is the state a preview is computed against, loaded once.
+//
+// A team with no schedule yet is not a special case here: it is a base with an
+// empty schedule id, no current configuration, nobody on call and no overrides.
+// Answering "does this schedule exist" once, at load time, is what keeps the
+// computation below free of a flag threaded through five branches.
+type previewBase struct {
+	// scheduleID is empty when the team has no schedule. Nothing below queries
+	// by it without checking, because there is nothing to find.
+	scheduleID string
+
+	root      scheduleconfig.ScheduleRoot
+	current   *rotation.ScheduleRevisionSnapshot
+	onCall    OnCall
+	revisions []scheduleconfig.ScheduleRevision
+	overrides []scheduleconfig.OverrideRevision
+}
+
 func (s *Service) preview(ctx context.Context, view scheduleconfig.ScheduleReadView, teamID string,
 	desired rotation.ScheduleConfiguration, until *time.Time) (*PreviewResult, error) {
 
 	evaluatedAt := scheduleconfig.NormalizeTimestamp(s.now().UTC())
+	windowUntil := previewWindow(evaluatedAt, until)
 
-	root, err := view.GetScheduleRootByTeam(ctx, teamID)
-	absent := errors.Is(err, scheduleconfig.ErrScheduleNotFound)
-	if err != nil && !absent {
+	// Load first, validate second, in that order because Save refuses a
+	// pre-revision schedule before it looks at membership. A preview that
+	// reported the membership problem where the save reports the legacy one
+	// would send the editor to fix the wrong thing.
+	base, err := loadPreviewBase(ctx, view, teamID, evaluatedAt, windowUntil)
+	if err != nil {
 		return nil, err
 	}
-	if !absent && scheduleconfig.IsLegacyRoot(root) {
-		// The same refusal Save gives. Rendering a legacy schedule here would
-		// show a plan that Save then rejects.
-		return nil, scheduleconfig.ErrLegacySchedule
-	}
-
 	if err := scheduleconfig.ValidateMembership(ctx, view, teamID,
 		scheduleconfig.ConfigurationUserIDs(desired)); err != nil {
 		return nil, err
 	}
 
-	res := &PreviewResult{EvaluatedAt: evaluatedAt}
-	var (
-		current   *rotation.ScheduleRevisionSnapshot
-		revisions []scheduleconfig.ScheduleRevision
-	)
-	windowUntil := previewWindow(evaluatedAt, until)
-
-	if absent {
-		// A schedule that does not exist yet has version 0, and the create
-		// branch of Save requires exactly that.
-		root = &scheduleconfig.ScheduleRoot{TeamID: teamID, HistoryCompleteFrom: &evaluatedAt}
-	} else {
-		// Every existing root reports its real version, deleted included: a
-		// recreate is a save against that version, and reporting 0 would make
-		// the first recreate fail optimistic concurrency every time.
-		res.BaseVersion = root.ConfigVersion
-
-		effective, err := view.GetEffectiveRevision(ctx, root.ID, evaluatedAt)
-		if err != nil && !errors.Is(err, scheduleconfig.ErrRevisionNotFound) {
-			return nil, err
-		}
-		// A deleted period carries a copy of the last valid snapshot so the
-		// column stays decodable. It is not a configuration in force, so the
-		// planner is given nothing - exactly as the recreate branch of Save.
-		if err == nil && effective.Kind == scheduleconfig.RevisionActive {
-			current = &effective.Snapshot
-		}
-		if res.OnCallBefore, err = onCallWithin(ctx, view, root.ID, evaluatedAt); err != nil {
-			return nil, err
-		}
-		if revisions, err = view.GetRevisionsInRange(ctx, root.ID, evaluatedAt, windowUntil); err != nil {
-			return nil, err
-		}
-	}
-	res.OnCallBefore.At = evaluatedAt
-
 	plan, err := rotation.PlanTransition(rotation.TransitionInput{
-		Current:     current,
+		Current:     base.current,
 		Desired:     desired,
 		EffectiveAt: evaluatedAt,
 	})
@@ -143,55 +123,127 @@ func (s *Service) preview(ctx context.Context, view scheduleconfig.ScheduleReadV
 	// A no-op previews the chain as it stands. Splicing in a hypothetical
 	// revision that is byte-identical to the tail would only invent a
 	// boundary the save would never create.
-	hypothetical := revisions
+	hypothetical := base.revisions
 	if !plan.Noop {
-		hypothetical = spliceHypothetical(revisions, root.ID, root.ConfigVersion+1, plan.Snapshot, evaluatedAt)
-	}
-
-	// Existing overrides survive a save untouched, so the preview has to show
-	// them: a rendered window without them would promise the rotation is on
-	// duty during a stand-in someone already arranged.
-	var overrides []scheduleconfig.OverrideRevision
-	if !absent {
-		if overrides, err = view.GetOverrideProjectionInRange(ctx, root.ID,
-			&evaluatedAt, &windowUntil, nil); err != nil {
-			return nil, err
-		}
+		hypothetical = spliceHypothetical(base.revisions, base.scheduleID,
+			base.root.ConfigVersion+1, plan.Snapshot, evaluatedAt)
 	}
 
 	rendered, err := Render(Input{
-		Root:      previewRoot(*root, evaluatedAt),
+		Root:      base.root,
 		Revisions: hypothetical,
-		Overrides: overrides,
+		Overrides: base.overrides,
 		From:      evaluatedAt,
 		Until:     windowUntil,
 	})
 	if err != nil {
 		return nil, err
 	}
-	res.Entries = MergeAdjacent(rendered.Assignments)
-	res.Warnings = rendered.Warnings
 
+	res := &PreviewResult{
+		EvaluatedAt:  evaluatedAt,
+		BaseVersion:  base.root.ConfigVersion,
+		OnCallBefore: base.onCall,
+		Entries:      MergeAdjacent(rendered.Assignments),
+		Warnings:     rendered.Warnings,
+	}
 	if plan.Noop {
 		res.OnCallAfter = res.OnCallBefore
-		res.OnCallChanged = false
 		return res, nil
 	}
 
-	after, err := onCallOfRevision(ctx, view, scheduleconfig.ScheduleRevision{
-		ID:            PreviewRevisionID,
-		ScheduleID:    root.ID,
-		Version:       root.ConfigVersion + 1,
-		Kind:          scheduleconfig.RevisionActive,
-		Snapshot:      plan.Snapshot,
-		EffectiveFrom: evaluatedAt,
-	}, evaluatedAt)
+	after, err := s.onCallAfter(ctx, view, base, plan.Snapshot, evaluatedAt)
 	if err != nil {
 		return nil, err
 	}
 	res.OnCallAfter = after
 	res.OnCallChanged = !sameDuty(res.OnCallBefore, res.OnCallAfter)
 	return res, nil
+}
+
+// loadPreviewBase reads everything the preview computes against, in one pass
+// over the snapshot.
+//
+// The root it returns is the one the renderer should see, not the one on disk:
+// deleted_at is cleared because the save being previewed brings the schedule
+// back, and a missing history horizon is set to the moment of evaluation so a
+// hypothetical is not reported as incomplete history.
+func loadPreviewBase(ctx context.Context, view scheduleconfig.ScheduleReadView, teamID string,
+	evaluatedAt, windowUntil time.Time) (previewBase, error) {
+
+	base := previewBase{
+		root:   scheduleconfig.ScheduleRoot{TeamID: teamID, HistoryCompleteFrom: &evaluatedAt},
+		onCall: OnCall{At: evaluatedAt},
+	}
+
+	root, err := view.GetScheduleRootByTeam(ctx, teamID)
+	if errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
+		// Version 0, which is exactly what the create branch of Save requires.
+		return base, nil
+	}
+	if err != nil {
+		return previewBase{}, err
+	}
+	if scheduleconfig.IsLegacyRoot(root) {
+		// The same refusal Save gives. Rendering a legacy schedule here would
+		// show a plan that Save then rejects.
+		return previewBase{}, scheduleconfig.ErrLegacySchedule
+	}
+
+	// An existing root reports its real version, deleted included: a recreate
+	// is a save against that version, and reporting 0 would make the first
+	// recreate fail optimistic concurrency every time.
+	base.scheduleID = root.ID
+	base.root = previewRoot(*root, evaluatedAt)
+
+	effective, err := view.GetEffectiveRevision(ctx, root.ID, evaluatedAt)
+	if err != nil && !errors.Is(err, scheduleconfig.ErrRevisionNotFound) {
+		return previewBase{}, err
+	}
+	// A deleted period carries a copy of the last valid snapshot so the column
+	// stays decodable. It is not a configuration in force, so the planner is
+	// given nothing - exactly as the recreate branch of Save.
+	if err == nil && effective.Kind == scheduleconfig.RevisionActive {
+		base.current = &effective.Snapshot
+	}
+
+	if base.onCall, err = onCallWithin(ctx, view, root.ID, evaluatedAt); err != nil {
+		return previewBase{}, err
+	}
+	base.onCall.At = evaluatedAt
+
+	if base.revisions, err = view.GetRevisionsInRange(ctx, root.ID, evaluatedAt, windowUntil); err != nil {
+		return previewBase{}, err
+	}
+	// Existing overrides survive a save untouched, so the preview has to show
+	// them: a window without them would promise the rotation is on duty during
+	// a stand-in someone already arranged.
+	if base.overrides, err = view.GetOverrideProjectionInRange(ctx, root.ID,
+		&evaluatedAt, &windowUntil, nil); err != nil {
+		return previewBase{}, err
+	}
+	return base, nil
+}
+
+// onCallAfter projects the hypothetical revision.
+//
+// A team with no schedule has no overrides to fetch, and asking for them by an
+// empty id would be a query that can only return nothing.
+func (s *Service) onCallAfter(ctx context.Context, view scheduleconfig.ScheduleReadView,
+	base previewBase, snapshot rotation.ScheduleRevisionSnapshot, at time.Time) (OnCall, error) {
+
+	rev := scheduleconfig.ScheduleRevision{
+		ID:            PreviewRevisionID,
+		ScheduleID:    base.scheduleID,
+		Version:       base.root.ConfigVersion + 1,
+		Kind:          scheduleconfig.RevisionActive,
+		Snapshot:      snapshot,
+		EffectiveFrom: at,
+	}
+	if base.scheduleID == "" {
+		return projectRevisionOnCall(rev, at, nil)
+	}
+	return onCallOfRevision(ctx, view, rev, at)
 }
 
 // previewWindow clamps the requested end of the entries window. Unlike the

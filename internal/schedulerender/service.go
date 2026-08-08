@@ -132,7 +132,8 @@ func onCallWithin(ctx context.Context, view scheduleconfig.ScheduleReadView,
 }
 
 // onCallOfRevision projects one revision - stored or hypothetical - against
-// the override state of the same snapshot.
+// the override state of the same snapshot, fetching exactly the overrides the
+// layers' slots can be affected by.
 func onCallOfRevision(ctx context.Context, view scheduleconfig.ScheduleReadView,
 	rev scheduleconfig.ScheduleRevision, at time.Time) (OnCall, error) {
 
@@ -145,6 +146,19 @@ func onCallOfRevision(ctx context.Context, view scheduleconfig.ScheduleReadView,
 		return OnCall{At: at}, nil
 	}
 	overrides, err := view.GetOverrideProjectionInRange(ctx, rev.ScheduleID, &from, &until, nil)
+	if err != nil {
+		return OnCall{}, err
+	}
+	return projectOnCall(rev, at, slots, overrides), nil
+}
+
+// projectRevisionOnCall is the same projection against overrides the caller
+// already holds. It exists for the preview of a schedule that does not exist
+// yet, which has none and therefore has nothing to query for.
+func projectRevisionOnCall(rev scheduleconfig.ScheduleRevision, at time.Time,
+	overrides []scheduleconfig.OverrideRevision) (OnCall, error) {
+
+	slots, err := onCallSlots(rev, at)
 	if err != nil {
 		return OnCall{}, err
 	}
