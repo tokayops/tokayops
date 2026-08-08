@@ -5,9 +5,23 @@ import { Page } from '@playwright/test';
  * Get an on-call row that has a configured schedule.
  * Returns null if no rows with schedules exist.
  */
+/**
+ * A team with a schedule that can actually be edited.
+ *
+ * Selected by the state the row declares, not by whether it carries a schedule
+ * id: a deleted schedule keeps its id so it can be recreated, and a row in
+ * that state offers Recreate rather than Delete - so a test that picked it
+ * would fail looking for controls that are correctly absent.
+ */
 async function getOnCallRowWithSchedule(page: Page) {
-  // Find row that has a non-empty data-schedule-id attribute
-  const rowWithSchedule = page.locator('.oncall-row[data-schedule-id]:not([data-schedule-id=""])').first();
+  // The standing fixture first: it is the one schedule no other test mutates.
+  // Picking "any active row" would mean picking another worker's team, which
+  // that worker is free to delete halfway through this test.
+  const standing = page.locator('.oncall-row[data-team-id="e2e-standing"][data-schedule-state="active"]');
+  if (await standing.count() > 0) {
+    return standing.first();
+  }
+  const rowWithSchedule = page.locator('.oncall-row[data-schedule-state="active"]').first();
   if (await rowWithSchedule.count() > 0) {
     return rowWithSchedule;
   }
@@ -253,16 +267,38 @@ test.describe('Schedule Deletion', () => {
     expect([200, 201]).toContain(createTeamResponse.status());
 
     try {
-      // Create schedule via API
-      const createScheduleResponse = await page.request.put(`/api/v1/teams/${teamId}/schedule`, {
-        data: {
-          timezone: 'UTC',
-          l1_rotation_type: 'daily',
-          l1_handoff_time: '11:00',
-          l1_rotation_start: new Date().toISOString(),
-        },
+      // A member, because a rotation group cannot name someone outside the
+      // team, and then the schedule in one save.
+      await page.request.post('/api/v1/users', {
+        data: { id: 'e2e-del-user', email: 'e2e-del-user@test.com', name: 'E2E Del' },
       });
-      expect([200, 201]).toContain(createScheduleResponse.status());
+      await page.request.post(`/api/v1/teams/${teamId}/members`, {
+        data: { user_id: 'e2e-del-user', role: 'team_member' },
+      });
+
+      const createScheduleResponse = await page.request.put(
+        `/api/v1/teams/${teamId}/schedule/config`, {
+          data: {
+            expected_version: 0,
+            timezone: 'UTC',
+            l1: {
+              enabled: true,
+              rotation_type: 'daily',
+              handoff_time: '11:00',
+              handoff_day: null,
+              groups: [{ id: crypto.randomUUID(), user_ids: ['e2e-del-user'] }],
+            },
+            l2: {
+              enabled: false,
+              escalation_timeout_minutes: 5,
+              rotation_type: 'daily',
+              handoff_time: '11:00',
+              handoff_day: null,
+              user_ids: [],
+            },
+          },
+        });
+      expect(createScheduleResponse.status(), await createScheduleResponse.text()).toBe(200);
 
       // Reload on-call page
       await schedulesPage.gotoOnCall();

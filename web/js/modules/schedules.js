@@ -30,6 +30,11 @@ let editingScheduleId = null;
 let returnToCalendar = false;
 let currentOverrideTz = null;
 
+// Which occurrence to take when an entered local time happens twice. The
+// defaults widen the window rather than narrowing it, so an ambiguous hour
+// cannot silently shorten the cover; either can be switched per field.
+let overrideFold = { start: 'earlier', end: 'later' };
+
 // What the editor loaded. expected_version comes from here and nowhere else:
 // the preview reports the version it evaluated against, and taking that would
 // be pinning the save to whatever was seen last rather than to what was
@@ -91,7 +96,11 @@ function conflictingOverridesText(error) {
  * every page that lists them.
  */
 async function loadTeamOnCall(teamId) {
-    const response = await API.schedules.currentOnCall(teamId).catch(() => null);
+    // Not caught here. The endpoint answers 200 for a team with no schedule,
+    // so anything thrown is a real failure - and turning it into an empty
+    // projection would render "not configured" over a database that is down,
+    // which is the one thing the server side of this refuses to do.
+    const response = await API.schedules.currentOnCall(teamId);
 
     const onCall = response?.on_call || null;
     const names = await resolveNames([
@@ -99,14 +108,37 @@ async function loadTeamOnCall(teamId) {
         ...(onCall?.l2?.user_ids || []),
     ]);
 
+    // Three separate facts, because the UI answers three different questions
+    // with them and none of them can be derived from the projection. A team
+    // with no schedule, a deleted one and a live one between shifts all put
+    // nobody on duty: the calendar is worth offering for the last two, an
+    // override only for the last, and "Deleted" is not "Not configured".
+    const scheduleId = response?.schedule_id || '';
+    const deletedAt = response?.deleted_at || null;
+
     return {
         onCall,
-        // Not derived from the projection: a team with no schedule, a deleted
-        // one and a live one between shifts all put nobody on duty, and the
-        // widget has to offer "Configure" for the first two and not the third.
-        configured: !!response?.schedule_id && !response?.deleted_at,
-        scheduleId: response?.schedule_id || '',
+        scheduleId,
+        deletedAt,
+        exists: !!scheduleId,
+        active: !!scheduleId && !deletedAt,
         names,
+    };
+}
+
+/** The widget context for a team whose state could not be read. */
+function unavailableContext(teamId) {
+    return { teamId, unavailable: true, exists: false, active: false, names: new Map() };
+}
+
+function widgetContext(teamId, state) {
+    return {
+        teamId,
+        scheduleId: state.scheduleId,
+        deletedAt: state.deletedAt,
+        exists: state.exists,
+        active: state.active,
+        names: state.names,
     };
 }
 
@@ -124,16 +156,12 @@ export async function loadOnCallWidget(teamId, container) {
 
     try {
         const state = await loadTeamOnCall(teamId);
-        container.innerHTML = Components.onCallWidget(state.onCall, {
-            teamId,
-            scheduleId: state.scheduleId,
-            configured: state.configured,
-            names: state.names,
-        });
-        if (window.lucide) lucide.createIcons();
+        container.innerHTML = Components.onCallWidget(state.onCall, widgetContext(teamId, state));
     } catch (error) {
         console.error('Failed to load on-call widget:', error);
+        container.innerHTML = Components.onCallWidget(null, unavailableContext(teamId));
     }
+    if (window.lucide) lucide.createIcons();
 }
 
 async function refreshOnCallUI(teamId) {
@@ -144,12 +172,7 @@ async function refreshOnCallUI(teamId) {
         const safeId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(teamId) : teamId;
         const widgets = document.querySelectorAll(`.oncall-row[data-team-id="${safeId}"], .on-call-widget[data-team-id="${safeId}"]`);
         const team = State.teams.find(t => t.id === teamId) || { id: teamId, name: teamId };
-        const ctx = {
-            teamId,
-            scheduleId: state.scheduleId,
-            configured: state.configured,
-            names: state.names,
-        };
+        const ctx = widgetContext(teamId, state);
 
         if (widgets.length > 0) {
             widgets.forEach(widget => {
@@ -189,18 +212,14 @@ export async function loadOnCallOverviewRow(team, container) {
 
     try {
         const state = await loadTeamOnCall(team.id);
-        container.innerHTML = Components.onCallOverviewRow(state.onCall, team, {
-            teamId: team.id,
-            scheduleId: state.scheduleId,
-            configured: state.configured,
-            names: state.names,
-        });
-        if (window.lucide) lucide.createIcons();
+        container.innerHTML = Components.onCallOverviewRow(
+            state.onCall, team, widgetContext(team.id, state));
     } catch (error) {
         console.error('Failed to load on-call overview row:', error);
-        container.innerHTML = Components.onCallOverviewRow(null, team, { teamId: team.id });
-        if (window.lucide) lucide.createIcons();
+        container.innerHTML = Components.onCallOverviewRow(
+            null, team, unavailableContext(team.id));
     }
+    if (window.lucide) lucide.createIcons();
 }
 
 // ========================================
@@ -573,15 +592,16 @@ function validateConfig(config) {
  * would report "this differs from the preview" for every save, including the
  * ones that changed nothing about who is on call.
  */
+function sameLayerDuty(x, y) {
+    if (!x || !y) return !x && !y;
+    if (x.source !== y.source) return false;
+    const left = [...(x.user_ids || [])].sort();
+    const right = [...(y.user_ids || [])].sort();
+    return left.length === right.length && left.every((id, i) => id === right[i]);
+}
+
 function sameDuty(a, b) {
-    const sameLayer = (x, y) => {
-        if (!x || !y) return !x && !y;
-        if (x.source !== y.source) return false;
-        const left = [...(x.user_ids || [])].sort();
-        const right = [...(y.user_ids || [])].sort();
-        return left.length === right.length && left.every((id, i) => id === right[i]);
-    };
-    return sameLayer(a?.l1, b?.l1) && sameLayer(a?.l2, b?.l2);
+    return sameLayerDuty(a?.l1, b?.l1) && sameLayerDuty(a?.l2, b?.l2);
 }
 
 async function handleScheduleSubmit(e) {
@@ -591,6 +611,10 @@ async function handleScheduleSubmit(e) {
     const teamId = form.dataset.teamId;
     const expectedVersion = parseInt(form.dataset.expectedVersion, 10) || 0;
     const config = collectConfig();
+    // Read here, with everything else. By the time Confirm is pressed the
+    // field is off screen, and reaching for it then is how it silently became
+    // an empty string.
+    const reason = document.getElementById('schedule-reason')?.value || '';
 
     const invalid = validateConfig(config);
     if (invalid) {
@@ -616,7 +640,7 @@ async function handleScheduleSubmit(e) {
             return;
         }
 
-        await showPreviewStep(teamId, config, preview, expectedVersion);
+        await showPreviewStep(teamId, config, preview, expectedVersion, reason);
     } catch (error) {
         console.error('Failed to preview schedule:', error);
         handleSaveError(error, teamId);
@@ -625,7 +649,7 @@ async function handleScheduleSubmit(e) {
     }
 }
 
-async function showPreviewStep(teamId, config, preview, expectedVersion) {
+async function showPreviewStep(teamId, config, preview, expectedVersion, reason) {
     const modalTitle = document.getElementById('modal-title');
     const modalContent = document.getElementById('modal-body');
     const modalFooter = document.getElementById('modal-footer');
@@ -638,34 +662,43 @@ async function showPreviewStep(teamId, config, preview, expectedVersion) {
     const names = await resolveNames(ids);
 
     const previousTitle = modalTitle.textContent;
-    const previousBody = modalContent.innerHTML;
     const previousFooter = modalFooter.innerHTML;
 
+    // The form is hidden, not serialized. Reading innerHTML captures markup,
+    // and what someone typed lives in the elements rather than in their
+    // attributes - so restoring from a string would quietly hand back the
+    // handoff time, the L2 toggle and the reason as they were when the modal
+    // opened. Keeping the live nodes also keeps their listeners and the
+    // timezone picker, so nothing has to be rebound on the way back.
+    const form = document.getElementById('schedule-form');
+    if (form) form.style.display = 'none';
+
+    const previewHost = document.createElement('div');
+    previewHost.id = 'schedule-preview-host';
+    previewHost.innerHTML = Components.schedulePreview(preview, names, config.timezone);
+    modalContent.appendChild(previewHost);
+
     modalTitle.textContent = 'Review changes';
-    modalContent.innerHTML = Components.schedulePreview(preview, names, config.timezone);
     modalFooter.innerHTML = `
         <button type="button" class="btn btn-secondary" id="preview-back">Back to editing</button>
         <button type="button" class="btn btn-primary" id="preview-confirm">Save schedule</button>
     `;
     if (window.lucide) lucide.createIcons();
 
-    // Going back restores the form as it was, with its group IDs intact -
-    // re-rendering it from the loaded configuration would silently discard
-    // everything typed since.
-    document.getElementById('preview-back')?.addEventListener('click', () => {
+    const restoreForm = () => {
+        previewHost.remove();
+        if (form) form.style.display = '';
         modalTitle.textContent = previousTitle;
-        modalContent.innerHTML = previousBody;
         modalFooter.innerHTML = previousFooter;
         if (window.lucide) lucide.createIcons();
-        bindScheduleFormEvents();
-        initTimezonePicker('schedule-timezone', { selected: config.timezone });
-    });
+    };
+
+    document.getElementById('preview-back')?.addEventListener('click', restoreForm);
 
     document.getElementById('preview-confirm')?.addEventListener('click', async () => {
         const confirmBtn = document.getElementById('preview-confirm');
         if (confirmBtn) confirmBtn.disabled = true;
         try {
-            const reason = document.getElementById('schedule-reason')?.value || '';
             const saved = await API.schedules.saveConfig(teamId, config, expectedVersion, reason);
 
             if (saved.noop) {
@@ -683,12 +716,28 @@ async function showPreviewStep(teamId, config, preview, expectedVersion) {
             // specific outcome, and quietly delivering another one is how
             // trust in the preview is lost.
             if (!saved.noop && !sameDuty(preview.on_call_after, saved.on_call_after)) {
-                const actual = Components.onCallNames(saved.on_call_after?.l1, names) || 'nobody';
+                // Resolved from what was actually saved, not from the preview:
+                // if a concurrent override put someone new on duty, their name
+                // was never in the preview and reusing that map would announce
+                // the surprise as "Unknown user".
+                const savedNames = await resolveNames([
+                    ...(saved.on_call_after?.l1?.user_ids || []),
+                    ...(saved.on_call_after?.l2?.user_ids || []),
+                ]);
+                const changed = ['l1', 'l2']
+                    .filter(layer => !sameLayerDuty(preview.on_call_after?.[layer],
+                                                    saved.on_call_after?.[layer]))
+                    .map(layer => {
+                        const who = Components.onCallNames(
+                            saved.on_call_after?.[layer], savedNames) || 'nobody';
+                        return `${layer.toUpperCase()}: ${who}`;
+                    });
                 showToast(
-                    `Saved, but on-call differs from the preview: ${actual} is on duty now.`,
+                    `Saved, but on-call differs from the preview - ${changed.join(', ')}.`,
                     'warning');
             }
 
+            previewHost.remove();
             closeModal();
             await refreshOnCallUI(teamId);
         } catch (error) {
@@ -975,13 +1024,7 @@ async function openOverrideModal(teamId) {
         const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
         initTimezonePicker('override-timezone', {
             selected: browserTz,
-            onChange: (newTz) => {
-                // The typed wall-clock time is kept and reinterpreted in the
-                // new zone. Converting the instant instead would silently move
-                // the times someone just entered.
-                currentOverrideTz = newTz;
-                describeOverrideTimes();
-            }
+            onChange: (newTz) => retimeOverrideFields(newTz),
         });
         currentOverrideTz = browserTz;
 
@@ -1012,7 +1055,47 @@ function bindOverrideFormEvents() {
         document.getElementById(id)?.addEventListener('change', describeOverrideTimes);
     }
 
+    document.getElementById('override-time-note')?.addEventListener('click', (e) => {
+        const toggle = e.target.closest('.override-fold-toggle');
+        if (!toggle) return;
+        e.preventDefault();
+        overrideFold = { ...overrideFold, [toggle.dataset.field]: toggle.dataset.prefer };
+        describeOverrideTimes();
+    });
+
     form.addEventListener('submit', handleOverrideSubmit);
+}
+
+/**
+ * Show the same moments in a different zone.
+ *
+ * The picker chooses how times are displayed and entered; it is not part of an
+ * override, which is stored as two instants. So changing it re-renders those
+ * instants and never moves them. Keeping the wall-clock digits instead would
+ * mean that opening an override saved as 09:00Z, switching the display from
+ * Moscow to UTC and editing only the reason would save it as 12:00Z - the
+ * override silently rescheduled by three hours by a control that claims to
+ * change nothing.
+ *
+ * A time that does not exist in the old zone has no instant to carry over, so
+ * its digits stay put and the note explains why.
+ */
+function retimeOverrideFields(newTz) {
+    const oldTz = currentOverrideTz;
+    currentOverrideTz = newTz;
+    if (!oldTz || oldTz === newTz) {
+        describeOverrideTimes();
+        return;
+    }
+
+    const startInput = document.getElementById('override-start');
+    const endInput = document.getElementById('override-end');
+    const { from, to } = resolveWindow(startInput?.value, endInput?.value, oldTz);
+
+    if (startInput && from.instant) startInput.value = instantToLocalInput(from.instant, newTz);
+    if (endInput && to.instant) endInput.value = instantToLocalInput(to.instant, newTz);
+
+    describeOverrideTimes();
 }
 
 /**
@@ -1028,33 +1111,56 @@ function describeOverrideTimes() {
     if (!note) return;
 
     const tz = currentOverrideTz || 'UTC';
-    const startValue = document.getElementById('override-start')?.value;
-    const endValue = document.getElementById('override-end')?.value;
-    if (!startValue || !endValue) {
+    if (!document.getElementById('override-start')?.value ||
+        !document.getElementById('override-end')?.value) {
         note.innerHTML = '';
         return;
     }
 
-    const { from, to } = resolveWindow(startValue, endValue, tz);
-    const messages = [];
+    const { from, to } = currentOverrideWindow();
+    const lines = [];
 
-    if (from.kind === 'gap') messages.push({ level: 'error', text: `Start: ${gapMessage(tz)}` });
-    if (to.kind === 'gap') messages.push({ level: 'error', text: `End: ${gapMessage(tz)}` });
+    if (from.kind === 'gap') {
+        lines.push(`<div class="override-time-note-line is-error">${escapeHtml('Start: ' + gapMessage(tz))}</div>`);
+    }
+    if (to.kind === 'gap') {
+        lines.push(`<div class="override-time-note-line is-error">${escapeHtml('End: ' + gapMessage(tz))}</div>`);
+    }
+
+    // An ambiguous time is not decided quietly. The choice is stated, and it
+    // can be changed - the default only says which way to lean, not which
+    // moment someone meant.
+    const foldLine = (field, result, chosenWord, otherWord) => {
+        const other = overrideFold[field] === 'earlier' ? 'later' : 'earlier';
+        return `
+            <div class="override-time-note-line is-info">
+                ${escapeHtml(`${field === 'start' ? 'Start' : 'End'} happens twice in ${tz}; using the ${chosenWord} one (${result.offsetLabel}).`)}
+                <button type="button" class="btn-link override-fold-toggle" data-field="${field}" data-prefer="${other}">
+                    ${escapeHtml(`Use the ${otherWord} one instead`)}
+                </button>
+            </div>`;
+    };
     if (from.kind === 'ambiguous') {
-        messages.push({
-            level: 'info',
-            text: `Start happens twice in ${tz}; using the first (${from.offsetLabel}).`,
-        });
+        const first = overrideFold.start === 'earlier';
+        lines.push(foldLine('start', from, first ? 'first' : 'second', first ? 'second' : 'first'));
     }
     if (to.kind === 'ambiguous') {
-        messages.push({
-            level: 'info',
-            text: `End happens twice in ${tz}; using the second (${to.offsetLabel}), so the cover is not cut short.`,
-        });
+        const first = overrideFold.end === 'earlier';
+        lines.push(foldLine('end', to, first ? 'first' : 'second', first ? 'second' : 'first'));
     }
 
-    note.innerHTML = messages.map(m =>
-        `<div class="override-time-note-line is-${m.level}">${escapeHtml(m.text)}</div>`).join('');
+    note.innerHTML = lines.join('');
+}
+
+/** The entered window, resolved with the current fold choices. */
+function currentOverrideWindow() {
+    const tz = currentOverrideTz || 'UTC';
+    const startValue = document.getElementById('override-start')?.value;
+    const endValue = document.getElementById('override-end')?.value;
+    return {
+        from: resolveLocalTime(startValue, tz, { prefer: overrideFold.start }),
+        to: resolveLocalTime(endValue, tz, { prefer: overrideFold.end }),
+    };
 }
 
 async function handleOverrideSubmit(e) {
@@ -1076,7 +1182,7 @@ async function handleOverrideSubmit(e) {
         return;
     }
 
-    const { from, to } = resolveWindow(startValue, endValue, timezone);
+    const { from, to } = currentOverrideWindow();
     if (from.kind === 'gap' || to.kind === 'gap' || !from.instant || !to.instant) {
         describeOverrideTimes();
         showToast(gapMessage(timezone), 'error');
@@ -1113,6 +1219,7 @@ async function handleOverrideSubmit(e) {
                 refreshOnCallUI(teamId),
             ]);
         } else {
+            previewHost.remove();
             closeModal();
             await refreshOnCallUI(teamId);
         }
@@ -1146,6 +1253,7 @@ function handleOverrideError(error, teamId, scheduleId) {
 }
 
 function resetOverrideForm() {
+    overrideFold = { start: 'earlier', end: 'later' };
     editingOverrideId = null;
     editingOverrideRevision = null;
     editingScheduleId = null;

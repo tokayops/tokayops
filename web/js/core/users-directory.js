@@ -26,11 +26,57 @@ const RESOLVE_CHUNK = 500;
 /** id -> {name, fetchedAt} */
 const names = new Map();
 
-/** id -> Promise, so N renders asking at once make one request. */
-const inFlight = new Map();
+/**
+ * IDs asked for during this tick, and the flush that will fetch them.
+ *
+ * Batching is per tick rather than per call because the callers are renderers:
+ * the on-call page draws a row per team, and each row asks about its own two
+ * or three people. Resolving per call made that one request per row - a number
+ * that grows with the number of teams, on a page that is opened constantly.
+ * Coalescing costs one microtask and turns the page back into one request.
+ */
+let pendingIds = new Set();
+let pendingFlush = null;
 
 function isFresh(entry, now) {
     return entry && (now - entry.fetchedAt) < NAME_TTL_MS;
+}
+
+function scheduleFlush() {
+    if (pendingFlush) return pendingFlush;
+
+    pendingFlush = Promise.resolve().then(async () => {
+        const ids = [...pendingIds];
+        pendingIds = new Set();
+        pendingFlush = null;
+        if (ids.length === 0) return;
+
+        for (let i = 0; i < ids.length; i += RESOLVE_CHUNK) {
+            const chunk = ids.slice(i, i + RESOLVE_CHUNK);
+            try {
+                const response = await API.users.resolve(chunk);
+                const fetchedAt = Date.now();
+                const resolved = new Set();
+                for (const user of response?.users || []) {
+                    names.set(user.id, { name: user.name, fetchedAt });
+                    resolved.add(user.id);
+                }
+                // An ID the server does not know is an answer too, and it is
+                // cached like any other. Without this, every render of a
+                // calendar naming a since-purged user asks again, for the
+                // whole life of the page.
+                for (const id of chunk) {
+                    if (!resolved.has(id)) names.set(id, { name: null, fetchedAt });
+                }
+            } catch (error) {
+                // Deliberately left uncached: a failed lookup is not evidence
+                // that the person does not exist, so the next render retries.
+                console.warn('Failed to resolve user names', error);
+            }
+        }
+    });
+
+    return pendingFlush;
 }
 
 /**
@@ -47,36 +93,18 @@ export async function resolveNames(ids) {
     const wanted = [...new Set((ids || []).filter(Boolean))];
     const now = Date.now();
 
-    const missing = wanted.filter(id => !isFresh(names.get(id), now) && !inFlight.has(id));
-    for (let i = 0; i < missing.length; i += RESOLVE_CHUNK) {
-        const chunk = missing.slice(i, i + RESOLVE_CHUNK);
-        const request = API.users.resolve(chunk)
-            .then(response => {
-                const fetchedAt = Date.now();
-                for (const user of response?.users || []) {
-                    names.set(user.id, { name: user.name, fetchedAt });
-                }
-                return response;
-            })
-            .catch(error => {
-                console.warn('Failed to resolve user names', error);
-                return null;
-            })
-            .finally(() => {
-                for (const id of chunk) inFlight.delete(id);
-            });
-        for (const id of chunk) inFlight.set(id, request);
+    const missing = wanted.filter(id => !isFresh(names.get(id), now));
+    if (missing.length > 0) {
+        for (const id of missing) pendingIds.add(id);
+        // Two renderers asking in the same tick wait on the same flush, so
+        // they make one request between them rather than one each.
+        await scheduleFlush();
     }
-
-    // Wait on every request covering a wanted id, including ones another
-    // caller started: two panels rendering the same shift must not race into
-    // two identical requests.
-    await Promise.all(wanted.map(id => inFlight.get(id)).filter(Boolean));
 
     const out = new Map();
     for (const id of wanted) {
         const entry = names.get(id);
-        if (entry) out.set(id, entry.name);
+        if (entry?.name) out.set(id, entry.name);
     }
     return out;
 }

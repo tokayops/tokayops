@@ -1258,6 +1258,11 @@ const Components = {
         const isOverride = l1?.source === 'override';
         const l1Names = Components.onCallNames(l1, names);
 
+        // Four states, not two. "Nobody is on duty" is a fact about a working
+        // schedule; "we could not find out" is not, and rendering the second
+        // as the first turns an outage into a reassuring blank.
+        const status = Components.onCallStatus(ctx, l1Names);
+
         // Two values, never one. The grid slot is where the handoff math puts
         // the shift; the assignment is when this particular composition
         // actually took effect. After a mid-shift edit or an override they
@@ -1265,7 +1270,9 @@ const Components = {
         const times = Components.assignmentTimes(l1);
 
         return `
-            <div class="on-call-widget" data-team-id="${escapeAttr(teamId)}" data-schedule-id="${escapeAttr(scheduleId)}">
+            <div class="on-call-widget" data-team-id="${escapeAttr(teamId)}"
+                 data-schedule-id="${escapeAttr(scheduleId)}"
+                 data-schedule-state="${Components.scheduleState(ctx)}">
                 <div class="on-call-header">
                     <i data-lucide="phone-call" class="on-call-icon"></i>
                     <span class="on-call-title">On-Call Now</span>
@@ -1276,7 +1283,7 @@ const Components = {
                     </div>
                     <div class="on-call-user-info">
                         <span class="on-call-user-name-wrap${l1Names ? ' text-tip' : ''}"${l1Names ? ` data-tip="${escapeAttr(l1Names)}"` : ''}>
-                            <span class="on-call-user-name">${l1Names ? escapeHtml(l1Names) : (ctx.configured ? 'No one on duty' : 'Not configured')}</span>
+                            <span class="on-call-user-name ${status.className}">${escapeHtml(status.label)}</span>
                         </span>
                         ${isOverride ? `
                             <span class="on-call-override-group">
@@ -1306,14 +1313,20 @@ const Components = {
                     ${Permissions.can('manage_schedule', { teamId: teamId }) ? `
                     <button class="btn btn-sm btn-secondary edit-schedule-btn" data-team-id="${escapeAttr(teamId)}">
                         <i data-lucide="settings"></i>
-                        Configure
+                        ${ctx.deletedAt ? 'Recreate' : 'Configure'}
                     </button>
                     ` : ''}
+                    ${ctx.exists ? `
+                    <!-- Offered for a deleted schedule too: its past shifts are
+                         still there, and they are often exactly what someone is
+                         looking for after it was turned off. Not offered when
+                         there is no schedule at all, where it opens onto a 404. -->
                     <button class="btn btn-sm btn-secondary view-schedule-btn" data-team-id="${escapeAttr(teamId)}">
                         <i data-lucide="calendar-days"></i>
                         View Schedule
                     </button>
-                    ${ctx.configured && Permissions.can('create_override', { teamId: teamId }) ? `
+                    ` : ''}
+                    ${ctx.active && Permissions.can('create_override', { teamId: teamId }) ? `
                     <button class="btn btn-sm btn-primary create-override-btn" data-team-id="${escapeAttr(teamId)}">
                         <i data-lucide="user-plus"></i>
                         Override
@@ -1322,6 +1335,39 @@ const Components = {
                 </div>
             </div>
         `;
+    },
+
+    /**
+     * The state of a team's schedule, as one word.
+     *
+     * Written into the DOM because the presence of a schedule id does not mean
+     * there is a schedule to act on - a deleted one keeps its id so it can be
+     * recreated - and anything reading the page, tests included, would
+     * otherwise have to reconstruct that rule for itself.
+     */
+    scheduleState: (ctx) => {
+        if (ctx.unavailable) return 'unavailable';
+        if (!ctx.exists) return 'absent';
+        if (ctx.deletedAt) return 'deleted';
+        return 'active';
+    },
+
+    /**
+     * What to say when nobody's name can be shown.
+     *
+     * Each of these means something different to whoever is reading it: set
+     * one up, wait for the handoff, recreate it, or go and look at why the
+     * request failed. Collapsing them into "Not configured" sends three of
+     * those four people to the wrong place.
+     */
+    onCallStatus: (ctx, names) => {
+        if (ctx.unavailable) {
+            return { label: 'On-call unavailable', className: 'is-unavailable' };
+        }
+        if (names) return { label: names, className: '' };
+        if (!ctx.exists) return { label: 'Not configured', className: 'is-muted' };
+        if (ctx.deletedAt) return { label: 'Schedule deleted', className: 'is-muted' };
+        return { label: 'No one on duty', className: 'is-muted' };
     },
 
     /**
@@ -1394,7 +1440,6 @@ const Components = {
         const teamInitial = teamName ? teamName.charAt(0).toUpperCase() : '?';
         const names = ctx.names || new Map();
         const scheduleId = ctx.scheduleId || '';
-        const configured = !!ctx.configured;
 
         const l1 = onCall?.l1 || null;
         const isOverride = l1?.source === 'override';
@@ -1412,13 +1457,31 @@ const Components = {
             })
             : '';
 
-        const statusLabel = !configured ? 'Not configured'
-            : (isOverride ? 'Override' : (hasOnCall ? 'Scheduled' : 'No one on-call'));
-        const statusClass = !configured ? 'unconfigured'
-            : (isOverride ? 'override' : (hasOnCall ? 'scheduled' : 'unconfigured'));
+        let statusLabel, statusClass;
+        if (ctx.unavailable) {
+            statusLabel = 'Unavailable';
+            statusClass = 'unavailable';
+        } else if (!ctx.exists) {
+            statusLabel = 'Not configured';
+            statusClass = 'unconfigured';
+        } else if (ctx.deletedAt) {
+            statusLabel = 'Deleted';
+            statusClass = 'unconfigured';
+        } else if (isOverride) {
+            statusLabel = 'Override';
+            statusClass = 'override';
+        } else if (hasOnCall) {
+            statusLabel = 'Scheduled';
+            statusClass = 'scheduled';
+        } else {
+            statusLabel = 'No one on-call';
+            statusClass = 'unconfigured';
+        }
 
         return `
-            <div class="oncall-row" data-team-id="${escapeHtml(teamId)}" data-schedule-id="${escapeAttr(scheduleId)}">
+            <div class="oncall-row" data-team-id="${escapeHtml(teamId)}"
+                 data-schedule-id="${escapeAttr(scheduleId)}"
+                 data-schedule-state="${Components.scheduleState(ctx)}">
                 <div class="oncall-cell oncall-cell-primary">
                     <div class="oncall-avatar">
                         <span>${escapeHtml(teamInitial)}</span>
@@ -1441,13 +1504,13 @@ const Components = {
                     </span>
                 </div>
                 <div class="oncall-cell oncall-cell-actions">
-                    ${canOverride && configured ? `
+                    ${canOverride && ctx.active ? `
                     <button class="btn btn-sm btn-secondary create-override-btn" data-team-id="${escapeAttr(teamId)}">
                         <i data-lucide="user-plus"></i>
                         Override
                     </button>
                     ` : ''}
-                    ${configured ? `
+                    ${ctx.exists ? `
                     <button class="btn btn-sm btn-secondary view-schedule-btn" data-team-id="${escapeAttr(teamId)}">
                         <i data-lucide="calendar-days"></i>
                         Schedule

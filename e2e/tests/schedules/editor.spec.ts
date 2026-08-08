@@ -15,8 +15,20 @@ interface Env {
   members: string[];
 }
 
+/**
+ * Teams created by the test that is currently running, removed when it ends.
+ *
+ * Left behind, they accumulate: the on-call overview draws a row per team and
+ * asks each one who is on duty, so every fixture that outlives its test makes
+ * every later test slower. That compounds across a run until the slower
+ * browser starts timing out, which looks like flakiness and is really just
+ * litter.
+ */
+let createdTeams: string[] = [];
+
 async function seedTeam(page: Page, prefix: string): Promise<Env> {
   const teamId = `e2e-${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  createdTeams.push(teamId);
   const res = await page.request.post('/api/v1/teams', { data: { id: teamId, name: `Editor ${prefix}` } });
   expect([200, 201]).toContain(res.status());
 
@@ -78,7 +90,19 @@ async function openEditor(page: Page, teamId: string) {
   await page.locator('#schedule-form').waitFor({ state: 'visible' });
 }
 
+// Deleting the team cascades to its schedule and overrides.
+test.afterEach(async ({ page }) => {
+  const teams = createdTeams;
+  createdTeams = [];
+  await Promise.all(teams.map(id => page.request.delete(`/api/v1/teams/${id}`).catch(() => null)));
+});
+
 test.describe('Schedule editor', () => {
+  // Each of these seeds a team, saves through the API and then drives the UI
+  // over several screens. The default per-test budget is sized for a single
+  // interaction, and running out of it here says nothing about the product.
+  test.describe.configure({ timeout: 60_000 });
+
   /**
    * The scenario the epic was opened for.
    *
@@ -161,6 +185,57 @@ test.describe('Schedule editor', () => {
     await page.locator('#schedule-form').waitFor({ state: 'visible' });
     const after = await readConfig(page, env.teamId);
     expect(after.version).toBe(before.version);
+  });
+
+  test('going back to the form keeps what was typed', async ({ page }) => {
+    const env = await seedTeam(page, 'back');
+    await save(page, env.teamId, config([['e2e-ann']], 0));
+
+    await openEditor(page, env.teamId);
+
+    // Values a person changes live in the elements, not in their attributes -
+    // so a preview that rebuilt the form from its own markup would hand all of
+    // this back as it was when the modal opened.
+    await page.locator('#l1-handoff-time').fill('17:30');
+    await page.locator('#slack-usergroup-id').fill('S99999');
+    await page.locator('#schedule-reason').fill('cover for the release');
+    await page.locator('#l2-enabled').check();
+    await page.locator('#l1-add-group').click();
+    await page.locator('.group-row').last().locator('.group-add-user').selectOption('e2e-ben');
+
+    await page.locator('#schedule-form-submit').click();
+    await page.locator('.schedule-preview').waitFor({ state: 'visible' });
+    await page.locator('#preview-back').click();
+    await page.locator('#schedule-form').waitFor({ state: 'visible' });
+
+    await expect(page.locator('#l1-handoff-time')).toHaveValue('17:30');
+    await expect(page.locator('#slack-usergroup-id')).toHaveValue('S99999');
+    await expect(page.locator('#schedule-reason')).toHaveValue('cover for the release');
+    await expect(page.locator('#l2-enabled')).toBeChecked();
+    await expect(page.locator('.group-row')).toHaveCount(2);
+  });
+
+  test('the reason typed before the preview is the reason recorded', async ({ page }) => {
+    const env = await seedTeam(page, 'reason');
+    await save(page, env.teamId, config([['e2e-ann']], 0));
+    const before = await readConfig(page, env.teamId);
+
+    await openEditor(page, env.teamId);
+    await page.locator('#schedule-reason').fill('adding the new joiner');
+    await page.locator('#l1-add-group').click();
+    await page.locator('.group-row').last().locator('.group-add-user').selectOption('e2e-ben');
+
+    await page.locator('#schedule-form-submit').click();
+    await page.locator('.schedule-preview').waitFor({ state: 'visible' });
+    await page.locator('#preview-confirm').click();
+    await expect(page.locator('#modal-overlay')).not.toHaveClass(/active/);
+
+    // The field is off screen by the time Confirm is pressed, which is how it
+    // used to arrive empty.
+    const revisions = await (await page.request.get(
+      `/api/v1/teams/${env.teamId}/schedule/revisions`)).json();
+    const latest = revisions.revisions.find((r: any) => r.version > before.version);
+    expect(latest?.change_reason).toBe('adding the new joiner');
   });
 
   test('the preview says who is on duty before and after', async ({ page }) => {
@@ -255,7 +330,19 @@ test.describe('Schedule editor', () => {
       `/api/v1/teams/${env.teamId}/schedule?expected_version=${created.version}`);
     expect(deleted.status()).toBe(204);
 
-    await openEditor(page, env.teamId);
+    // Deleted is not "not configured": the calendar is still worth opening,
+    // and the button says what saving would do. Asserted on the same page load
+    // the editor is opened from - loading the on-call overview costs a request
+    // per team, and doing it twice for one test is most of its runtime.
+    await page.goto('/#/ops/oncall');
+    const row = page.locator(`.oncall-row[data-team-id="${env.teamId}"]`);
+    await row.waitFor({ state: 'visible' });
+    await expect(row).toContainText('Deleted');
+    await expect(row.locator('.view-schedule-btn')).toHaveCount(1);
+    await expect(row.locator('.create-override-btn')).toHaveCount(0);
+
+    await row.locator('.edit-schedule-btn').click();
+    await page.locator('#schedule-form').waitFor({ state: 'visible' });
     await expect(page.locator('#recreate-banner')).toBeVisible();
     await expect(page.locator('.group-row'), 'the last configuration is offered back').toHaveCount(2);
 
@@ -312,6 +399,72 @@ test.describe('Schedule editor', () => {
     await row.waitFor({ state: 'visible' });
     await expect(row).toContainText('E2E ann');
     await expect(row).toContainText('E2E ben');
+  });
+});
+
+test.describe('Override times', () => {
+  /**
+   * The timezone control chooses how times are shown and entered. It is not
+   * part of an override, which is stored as two absolute instants - so
+   * changing it must re-render those instants, never move them.
+   *
+   * Before this was fixed, opening an override saved as 09:00Z, switching the
+   * display from Moscow to UTC and saving without touching the times wrote
+   * 12:00Z: the override silently rescheduled by three hours by a control that
+   * claims to change nothing.
+   */
+  test('switching the display timezone does not move the override', async ({ page }) => {
+    const env = await seedTeam(page, 'tz');
+    await save(page, env.teamId, config([['e2e-ann']], 0));
+
+    const validFrom = new Date(Date.now() + 24 * 3600 * 1000);
+    validFrom.setUTCMinutes(0, 0, 0);
+    const validTo = new Date(validFrom.getTime() + 4 * 3600 * 1000);
+
+    const created = await page.request.post(`/api/v1/teams/${env.teamId}/schedule/overrides`, {
+      data: {
+        user_id: 'e2e-ben',
+        valid_from: validFrom.toISOString(),
+        valid_to: validTo.toISOString(),
+        reason: 'cover',
+      },
+    });
+    expect(created.status(), await created.text()).toBe(201);
+
+    await page.goto('/#/ops/oncall');
+    const overrideBtn = page.locator(`.oncall-row[data-team-id="${env.teamId}"] .create-override-btn`);
+    await overrideBtn.waitFor({ state: 'visible' });
+    await overrideBtn.click();
+    await page.locator('#override-form').waitFor({ state: 'visible' });
+
+    // Load it into the form, then change only the display zone.
+    await page.locator('.edit-override-btn').first().click();
+    const startBefore = await page.locator('#override-start').inputValue();
+
+    // The dropdown is appended to the body, to escape the modal's clipping,
+    // so it is not found under the picker's own container.
+    await page.locator('#override-timezone .tz-picker-display').click();
+    const dropdown = page.locator('.tz-picker-dropdown:visible');
+    // Chatham, because the offset is unusual enough that a wrong conversion
+    // would be obvious, and the engine lists it under exactly this name -
+    // Chromium still calls Kathmandu "Asia/Katmandu", for instance.
+    await dropdown.locator('.tz-picker-search').fill('Chatham');
+    await dropdown.locator('.tz-picker-item').first().click();
+
+    // The wall-clock digits move, because the same moment reads differently
+    // in another zone. That is the point.
+    const startAfter = await page.locator('#override-start').inputValue();
+    expect(startAfter, 'the field re-renders in the new zone').not.toBe(startBefore);
+
+    await page.locator('#modal-footer button[type="submit"]').click();
+    await expect(page.locator('#toast-container')).toContainText(/updated/i);
+
+    const overrides = await (await page.request.get(
+      `/api/v1/teams/${env.teamId}/schedule/overrides`)).json();
+    const head = overrides.overrides.find((o: any) => o.user_id === 'e2e-ben');
+    expect(new Date(head.valid_from).toISOString(),
+      'the stored instant is untouched').toBe(validFrom.toISOString());
+    expect(new Date(head.valid_to).toISOString()).toBe(validTo.toISOString());
   });
 });
 
