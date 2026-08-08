@@ -214,7 +214,7 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.GET("/teams/:id/incidents", a.GetTeamAlertGroups, a.Require(rbac.ActionAlertView, ScopeGlobal()))
 	v1.GET("/teams/:id/members", a.GetTeamMembers, a.Require(rbac.ActionTeamView, ScopeFromResource("team", "id")))
 	v1.POST("/teams/:id/members", a.AddTeamMember, a.Require(rbac.ActionTeamMemberAdd, ScopeFromResource("team", "id")))
-	v1.DELETE("/teams/:id/members/:user_id", a.RemoveTeamMember, a.Require(rbac.ActionTeamMemberRemove, ScopeFromResource("team", "id")))
+	v1.DELETE("/teams/:id/members/:user_id", a.RemoveTeamMember, a.requireScheduleStack, a.Require(rbac.ActionTeamMemberRemove, ScopeFromResource("team", "id")))
 
 	// Users
 	v1.GET("/users", a.ListUsers, a.Require(rbac.ActionUserList, ScopeGlobal()))
@@ -222,7 +222,7 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.POST("/users", a.CreateUser, a.Require(rbac.ActionUserCreate, ScopeGlobal()))
 	v1.PUT("/users/:id", a.UpdateUser, a.Require(rbac.ActionUserUpdate, ScopeGlobal()))
 	v1.PUT("/users/:id/password", a.UpdateUserPassword, a.Require(rbac.ActionUserPasswordUpdate, ScopeUserSelfOrAdmin("id")))
-	v1.DELETE("/users/:id", a.DeleteUser, a.Require(rbac.ActionUserDelete, ScopeGlobal()))
+	v1.DELETE("/users/:id", a.DeleteUser, a.requireUserEraser, a.Require(rbac.ActionUserDelete, ScopeGlobal()))
 
 	// Schedules
 	v1.GET("/teams/:id/schedule", a.GetTeamSchedule, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
@@ -237,17 +237,17 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	// schedule.view: a preview takes the same payload as a save and is a
 	// write-intent tool, and revisions carry created_by and change_reason.
 	// Loosening a permission later is easy; tightening one is not.
-	v1.GET("/teams/:id/schedule/config", a.GetScheduleConfig, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
-	v1.PUT("/teams/:id/schedule/config", a.PutScheduleConfig, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.POST("/teams/:id/schedule/preview", a.PostSchedulePreview, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.DELETE("/teams/:id/schedule", a.DeleteTeamSchedule, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.GET("/teams/:id/schedule/revisions", a.ListScheduleRevisions, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.GET("/teams/:id/schedule/revisions/:revision_id", a.GetScheduleRevision, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.GET("/teams/:id/schedule/render", a.RenderSchedule, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
-	v1.GET("/teams/:id/schedule/overrides", a.ListScheduleOverrides, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
-	v1.POST("/teams/:id/schedule/overrides", a.CreateScheduleOverride, a.Require(rbac.ActionOverrideCreate, ScopeFromResource("team", "id")))
-	v1.PUT("/schedules/:schedule_id/overrides/:id", a.UpdateScheduleOverride, a.Require(rbac.ActionOverrideUpdate, ScopeScheduleOverride("schedule_id", "id")))
-	v1.DELETE("/schedules/:schedule_id/overrides/:id", a.DeleteScheduleOverride, a.Require(rbac.ActionOverrideDelete, ScopeScheduleOverride("schedule_id", "id")))
+	v1.GET("/teams/:id/schedule/config", a.GetScheduleConfig, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
+	v1.PUT("/teams/:id/schedule/config", a.PutScheduleConfig, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.POST("/teams/:id/schedule/preview", a.PostSchedulePreview, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.DELETE("/teams/:id/schedule", a.DeleteTeamSchedule, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/revisions", a.ListScheduleRevisions, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/revisions/:revision_id", a.GetScheduleRevision, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/render", a.RenderSchedule, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/overrides", a.ListScheduleOverrides, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
+	v1.POST("/teams/:id/schedule/overrides", a.CreateScheduleOverride, a.requireScheduleStack, a.Require(rbac.ActionOverrideCreate, ScopeFromResource("team", "id")))
+	v1.PUT("/schedules/:schedule_id/overrides/:id", a.UpdateScheduleOverride, a.requireScheduleStack, a.Require(rbac.ActionOverrideUpdate, ScopeScheduleOverride("schedule_id", "id")))
+	v1.DELETE("/schedules/:schedule_id/overrides/:id", a.DeleteScheduleOverride, a.requireScheduleStack, a.Require(rbac.ActionOverrideDelete, ScopeScheduleOverride("schedule_id", "id")))
 
 	// API Tokens
 	// These usually belong to user. Assuming self-management for now.
@@ -1492,13 +1492,8 @@ func (a *API) UpdateUserPassword(c echo.Context) error {
 // @Failure 500 {object} ErrorResponse
 // @Router /api/v1/users/{id} [delete]
 func (a *API) DeleteUser(c echo.Context) error {
-	// Erasure is the only entry point. A hard DELETE would break every
-	// revision, override and event that names the ID, so there is no fallback
-	// path here: an unwired eraser refuses rather than reaching for the old
-	// one.
-	if a.userEraser == nil {
-		return serviceUnavailable(c, "user erasure service")
-	}
+	// Erasure is the only entry point; the route's middleware has already
+	// refused the request if it was not wired.
 	if err := a.userEraser.Erase(c.Request().Context(), c.Param("id")); err != nil {
 		return a.mapScheduleError(c, err)
 	}
@@ -1613,9 +1608,6 @@ func (a *API) RemoveTeamMember(c echo.Context) error {
 	// assignment: a membership is what makes a rotation entry resolvable, so
 	// removing one out from under a live assignment leaves the schedule
 	// pointing at a non-member.
-	if a.scheduleConfig == nil {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	if err := a.scheduleConfig.RemoveTeamMember(c.Request().Context(), teamID, targetUserID); err != nil {
 		return a.mapScheduleError(c, err)
 	}

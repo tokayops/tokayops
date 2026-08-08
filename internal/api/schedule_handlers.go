@@ -392,9 +392,6 @@ func (a *API) GetTeamOnCall(c echo.Context) error {
 // @Failure 422 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule/overrides [post]
 func (a *API) CreateScheduleOverride(c echo.Context) error {
-	if !a.scheduleConfigReady() {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	var req ScheduleOverrideRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
@@ -429,9 +426,6 @@ func (a *API) CreateScheduleOverride(c echo.Context) error {
 // @Failure 409 {object} ErrorResponse
 // @Router /api/v1/schedules/{schedule_id}/overrides/{id} [put]
 func (a *API) UpdateScheduleOverride(c echo.Context) error {
-	if !a.scheduleConfigReady() {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	var req ScheduleOverrideRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
@@ -466,9 +460,6 @@ func (a *API) UpdateScheduleOverride(c echo.Context) error {
 // @Failure 409 {object} ErrorResponse
 // @Router /api/v1/schedules/{schedule_id}/overrides/{id} [delete]
 func (a *API) DeleteScheduleOverride(c echo.Context) error {
-	if !a.scheduleConfigReady() {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	// Query rather than body: a DELETE body is not carried reliably by every
 	// client and proxy, and losing it here would silently skip the conflict
 	// check the parameter exists to perform.

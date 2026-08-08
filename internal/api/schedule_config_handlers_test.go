@@ -35,19 +35,21 @@ func configRequest(expectedVersion int64, groups ...[]string) PutScheduleConfigR
 	}
 	return PutScheduleConfigRequest{
 		ExpectedVersion: expectedVersion,
-		Timezone:        "UTC",
-		L1: ScheduleL1DTO{
-			Enabled:      true,
-			RotationType: "weekly",
-			HandoffTime:  "11:00",
-			HandoffDay:   &monday,
-			Groups:       dto,
-		},
-		L2: ScheduleL2DTO{
-			EscalationTimeoutMinutes: 5,
-			RotationType:             "weekly",
-			HandoffTime:              "11:00",
-			HandoffDay:               &monday,
+		ScheduleConfigDTO: ScheduleConfigDTO{
+			Timezone: "UTC",
+			L1: ScheduleL1DTO{
+				Enabled:      true,
+				RotationType: "weekly",
+				HandoffTime:  "11:00",
+				HandoffDay:   &monday,
+				Groups:       dto,
+			},
+			L2: ScheduleL2DTO{
+				EscalationTimeoutMinutes: 5,
+				RotationType:             "weekly",
+				HandoffTime:              "11:00",
+				HandoffDay:               &monday,
+			},
 		},
 	}
 }
@@ -90,6 +92,49 @@ func createSchedule(t *testing.T, e *echo.Echo, groups ...[]string) PutScheduleC
 	var out PutScheduleConfigResponse
 	decodeJSON(t, rec, &out)
 	return out
+}
+
+// The previous version of this guard never fired - c.JSON returns nil, so the
+// `if err := check(c); err != nil` around it was always false, and the first
+// unwired request reached the handler and panicked on a nil service. The check
+// is middleware now, and this is the test that says so.
+func TestScheduleRoutesRefuseWhenUnwired(t *testing.T) {
+	s := store.NewMockStore()
+	defer s.Close()
+	api := NewAPI(s, nil, nil, nil, "", nil) // deliberately unwired
+	e := echo.New()
+	api.RegisterRoutes(e)
+
+	from := time.Now().UTC()
+	routes := []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodGet, "/api/v1/teams/devops/schedule/config", nil},
+		{http.MethodPut, "/api/v1/teams/devops/schedule/config", configRequest(0, []string{"denis"})},
+		{http.MethodPost, "/api/v1/teams/devops/schedule/preview", configRequest(0, []string{"denis"})},
+		{http.MethodDelete, "/api/v1/teams/devops/schedule?expected_version=1", nil},
+		{http.MethodGet, "/api/v1/teams/devops/schedule/revisions", nil},
+		{http.MethodGet, "/api/v1/teams/devops/schedule/revisions/rev-1", nil},
+		{http.MethodGet, "/api/v1/teams/devops/schedule/render?from=" +
+			from.Format(time.RFC3339) + "&until=" + from.Add(time.Hour).Format(time.RFC3339), nil},
+		{http.MethodGet, "/api/v1/teams/devops/schedule/overrides", nil},
+		{http.MethodPost, "/api/v1/teams/devops/schedule/overrides", ScheduleOverrideRequest{UserID: "alex"}},
+		{http.MethodPut, "/api/v1/schedules/s1/overrides/o1", ScheduleOverrideRequest{UserID: "alex"}},
+		{http.MethodDelete, "/api/v1/schedules/s1/overrides/o1?expected_revision=1", nil},
+		{http.MethodDelete, "/api/v1/teams/devops/members/alex", nil},
+		{http.MethodDelete, "/api/v1/users/alex", nil},
+	}
+
+	for _, r := range routes {
+		t.Run(r.method+" "+r.path, func(t *testing.T) {
+			rec := doJSON(t, e, r.method, r.path, r.body, "denis")
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("want 503 from an unwired API, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
 }
 
 // One endpoint, three outcomes, chosen by the state of the schedule rather

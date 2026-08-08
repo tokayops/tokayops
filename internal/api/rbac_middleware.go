@@ -93,6 +93,9 @@ func ScopeCurrentUser() ScopeResolver {
 // on the override routes, and those go through ScopeScheduleOverride, which
 // reads the revision contract; a resolver built on the legacy schedule reader
 // would refuse every schedule the revision model governs.
+//
+// It assumes the read repository is wired, because requireScheduleStack runs
+// ahead of it on every route that uses it.
 func ScopeFromResource(kind, paramName string) ScopeResolver {
 	return func(c echo.Context, api *API) (rbac.Scope, error) {
 		id := c.Param(paramName)
@@ -169,11 +172,6 @@ func ScopeScheduleOverride(scheduleIDParam, overrideIDParam string) ScopeResolve
 		if scheduleID == "" || overrideID == "" {
 			return rbac.Scope{}, echo.NewHTTPError(http.StatusBadRequest, "missing schedule or override id")
 		}
-		if api.scheduleRead == nil {
-			return rbac.Scope{}, echo.NewHTTPError(http.StatusServiceUnavailable,
-				"schedule configuration service is not available")
-		}
-
 		ctx := c.Request().Context()
 		var teamID string
 		err := api.scheduleRead.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {

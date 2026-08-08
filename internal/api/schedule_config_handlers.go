@@ -19,16 +19,37 @@ const (
 	revisionPageMax     = 500
 )
 
-// scheduleConfigReady reports whether the command side is wired. Checking is
-// not paranoia: the setters are optional by construction, since the API is
-// built before the services it serves exist, and a nil dereference would
-// answer with a stack trace rather than a diagnosis.
+// requireScheduleStack refuses a request when the schedule services were not
+// wired, before the handler can dereference one of them.
 //
-// It returns a bool rather than an error because c.JSON returns nil on
-// success: an "err != nil" guard around it would never fire and the check
-// would be decorative.
-func (a *API) scheduleConfigReady() bool {
-	return a.scheduleConfig != nil && a.scheduleRead != nil
+// It is middleware rather than a line in each handler because the check is a
+// property of the route, not of the request: the API is constructed before the
+// services it serves exist, so "wired" is a deployment fact and every schedule
+// route shares it. The stack is checked whole - a partially wired API is a
+// misconfiguration, not a mode worth serving.
+//
+// The earlier per-handler version was also silently broken: c.JSON returns nil
+// on success, so an `if err := check(c); err != nil` guard around it never
+// fired.
+func (a *API) requireScheduleStack(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		if a.scheduleConfig == nil || a.scheduleRead == nil || a.scheduleRenderer == nil {
+			return serviceUnavailable(c, "schedule configuration service")
+		}
+		return next(c)
+	}
+}
+
+// requireUserEraser is the same for the one route that deletes a user. There
+// is no fallback to the old hard delete: it would break every revision that
+// names the id.
+func (a *API) requireUserEraser(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		if a.userEraser == nil {
+			return serviceUnavailable(c, "user erasure service")
+		}
+		return next(c)
+	}
 }
 
 func serviceUnavailable(c echo.Context, what string) error {
@@ -50,9 +71,6 @@ func actorID(c echo.Context) string {
 // @Failure 404 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule/config [get]
 func (a *API) GetScheduleConfig(c echo.Context) error {
-	if !a.scheduleConfigReady() {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	teamID := c.Param("id")
 
 	var out ScheduleConfigResponse
@@ -109,9 +127,6 @@ func (a *API) GetScheduleConfig(c echo.Context) error {
 // @Failure 422 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule/config [put]
 func (a *API) PutScheduleConfig(c echo.Context) error {
-	if !a.scheduleConfigReady() {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	teamID := c.Param("id")
 
 	var req PutScheduleConfigRequest
@@ -122,7 +137,7 @@ func (a *API) PutScheduleConfig(c echo.Context) error {
 	ctx := c.Request().Context()
 	res, err := a.scheduleConfig.Save(ctx, teamID, scheduleconfig.SaveCommand{
 		ExpectedVersion: req.ExpectedVersion,
-		Desired:         req.config().toConfiguration(),
+		Desired:         req.ScheduleConfigDTO.toConfiguration(),
 		ActorID:         actorID(c),
 		Reason:          req.Reason,
 	})
@@ -166,9 +181,6 @@ func (a *API) PutScheduleConfig(c echo.Context) error {
 // @Failure 422 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule/preview [post]
 func (a *API) PostSchedulePreview(c echo.Context) error {
-	if a.scheduleRenderer == nil {
-		return serviceUnavailable(c, "schedule renderer")
-	}
 	teamID := c.Param("id")
 
 	var req PutScheduleConfigRequest
@@ -185,7 +197,7 @@ func (a *API) PostSchedulePreview(c echo.Context) error {
 	}
 
 	res, err := a.scheduleRenderer.Preview(c.Request().Context(), teamID,
-		req.config().toConfiguration(), until)
+		req.ScheduleConfigDTO.toConfiguration(), until)
 	if err != nil {
 		return a.mapScheduleError(c, err)
 	}
@@ -214,9 +226,6 @@ func (a *API) PostSchedulePreview(c echo.Context) error {
 // @Failure 409 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule [delete]
 func (a *API) DeleteTeamSchedule(c echo.Context) error {
-	if !a.scheduleConfigReady() {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	// A query parameter rather than a body: a DELETE with a body is not
 	// carried reliably by every client and proxy in the path.
 	expected, err := strconv.ParseInt(c.QueryParam("expected_version"), 10, 64)
@@ -246,9 +255,6 @@ func (a *API) DeleteTeamSchedule(c echo.Context) error {
 // @Failure 404 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule/revisions [get]
 func (a *API) ListScheduleRevisions(c echo.Context) error {
-	if !a.scheduleConfigReady() {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	limit, err := revisionLimit(c.QueryParam("limit"))
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
@@ -304,9 +310,6 @@ func (a *API) ListScheduleRevisions(c echo.Context) error {
 // @Failure 404 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule/revisions/{revision_id} [get]
 func (a *API) GetScheduleRevision(c echo.Context) error {
-	if !a.scheduleConfigReady() {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	ctx := c.Request().Context()
 
 	var out ScheduleRevisionDTO
@@ -340,9 +343,6 @@ func (a *API) GetScheduleRevision(c echo.Context) error {
 // @Failure 404 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule/overrides [get]
 func (a *API) ListScheduleOverrides(c echo.Context) error {
-	if !a.scheduleConfigReady() {
-		return serviceUnavailable(c, "schedule configuration service")
-	}
 	ctx := c.Request().Context()
 
 	out := ScheduleOverrideListResponse{Overrides: []ScheduleOverrideDTO{}}

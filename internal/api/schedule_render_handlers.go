@@ -28,10 +28,6 @@ const maxRenderRange = 90 * 24 * time.Hour
 // @Failure 404 {object} ErrorResponse
 // @Router /api/v1/teams/{id}/schedule/render [get]
 func (a *API) RenderSchedule(c echo.Context) error {
-	if a.scheduleRenderer == nil || a.scheduleRead == nil {
-		return serviceUnavailable(c, "schedule renderer")
-	}
-
 	from, err := time.Parse(time.RFC3339, c.QueryParam("from"))
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid 'from' parameter"})
