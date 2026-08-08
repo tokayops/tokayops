@@ -23,57 +23,77 @@ const NAME_TTL_MS = 60 * 1000;
 // The server bounds a resolve request; the client splits to stay under it.
 const RESOLVE_CHUNK = 500;
 
-/** id -> {name, fetchedAt} */
+/** id -> {name, fetchedAt}; name is null for an id the server does not know. */
 const names = new Map();
 
 /**
- * IDs asked for during this tick, and the flush that will fetch them.
+ * Two separate things, easy to confuse.
  *
- * Batching is per tick rather than per call because the callers are renderers:
- * the on-call page draws a row per team, and each row asks about its own two
- * or three people. Resolving per call made that one request per row - a number
- * that grows with the number of teams, on a page that is opened constantly.
- * Coalescing costs one microtask and turns the page back into one request.
+ * `pendingIds` is what has been asked for during this tick and not sent yet;
+ * coalescing it means several renderers running back to back make one request
+ * instead of one each.
+ *
+ * `inFlight` is what is already being fetched. It is not the same as having a
+ * batch queued: the batch slot frees as soon as its request is dispatched, so
+ * without this a caller arriving while the network is busy would ask for the
+ * very same ids again. Keeping both is what makes "one request per id in
+ * flight" true rather than merely intended.
  */
 let pendingIds = new Set();
 let pendingFlush = null;
+const inFlight = new Map();
 
 function isFresh(entry, now) {
     return entry && (now - entry.fetchedAt) < NAME_TTL_MS;
 }
 
+function fetchChunk(chunk) {
+    const request = API.users.resolve(chunk)
+        .then(response => {
+            const fetchedAt = Date.now();
+            const resolved = new Set();
+            for (const user of response?.users || []) {
+                names.set(user.id, { name: user.name, fetchedAt });
+                resolved.add(user.id);
+            }
+            // An id the server does not know is an answer too, and it is
+            // cached like any other. Without this, every render of a calendar
+            // naming a since-purged user asks again, for the life of the page.
+            for (const id of chunk) {
+                if (!resolved.has(id)) names.set(id, { name: null, fetchedAt });
+            }
+        })
+        .catch(error => {
+            // Deliberately left uncached: a failed lookup is not evidence that
+            // the person does not exist, so the next render retries.
+            console.warn('Failed to resolve user names', error);
+        })
+        .finally(() => {
+            for (const id of chunk) {
+                if (inFlight.get(id) === request) inFlight.delete(id);
+            }
+        });
+
+    for (const id of chunk) inFlight.set(id, request);
+    return request;
+}
+
 function scheduleFlush() {
     if (pendingFlush) return pendingFlush;
 
-    pendingFlush = Promise.resolve().then(async () => {
+    pendingFlush = Promise.resolve().then(() => {
         const ids = [...pendingIds];
         pendingIds = new Set();
+        // Freed here, before the network work: the next tick gets its own
+        // batch. Requests already dispatched are tracked by inFlight.
         pendingFlush = null;
         if (ids.length === 0) return;
 
+        const requests = [];
         for (let i = 0; i < ids.length; i += RESOLVE_CHUNK) {
-            const chunk = ids.slice(i, i + RESOLVE_CHUNK);
-            try {
-                const response = await API.users.resolve(chunk);
-                const fetchedAt = Date.now();
-                const resolved = new Set();
-                for (const user of response?.users || []) {
-                    names.set(user.id, { name: user.name, fetchedAt });
-                    resolved.add(user.id);
-                }
-                // An ID the server does not know is an answer too, and it is
-                // cached like any other. Without this, every render of a
-                // calendar naming a since-purged user asks again, for the
-                // whole life of the page.
-                for (const id of chunk) {
-                    if (!resolved.has(id)) names.set(id, { name: null, fetchedAt });
-                }
-            } catch (error) {
-                // Deliberately left uncached: a failed lookup is not evidence
-                // that the person does not exist, so the next render retries.
-                console.warn('Failed to resolve user names', error);
-            }
+            requests.push(fetchChunk(ids.slice(i, i + RESOLVE_CHUNK)));
         }
+        return Promise.all(requests);
     });
 
     return pendingFlush;
@@ -93,13 +113,16 @@ export async function resolveNames(ids) {
     const wanted = [...new Set((ids || []).filter(Boolean))];
     const now = Date.now();
 
-    const missing = wanted.filter(id => !isFresh(names.get(id), now));
+    // Neither cached nor already on its way.
+    const missing = wanted.filter(id => !isFresh(names.get(id), now) && !inFlight.has(id));
     if (missing.length > 0) {
         for (const id of missing) pendingIds.add(id);
-        // Two renderers asking in the same tick wait on the same flush, so
-        // they make one request between them rather than one each.
         await scheduleFlush();
     }
+
+    // Then wait on anything covering a wanted id that someone else started,
+    // so two panels rendering the same shift resolve it once between them.
+    await Promise.all(wanted.map(id => inFlight.get(id)).filter(Boolean));
 
     const out = new Map();
     for (const id of wanted) {

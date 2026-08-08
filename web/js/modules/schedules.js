@@ -16,7 +16,7 @@ import { showToast, escapeHtml } from '/js/core/utils.js';
 import { State } from '/js/core/state.js';
 import { initTimezonePicker } from '/js/core/timezone-picker.js';
 import { resolveNames, assignableMembers, invalidateNames } from '/js/core/users-directory.js';
-import { resolveLocalTime, resolveWindow, gapMessage, instantToLocalInput } from '/js/core/zoned-time.js';
+import { resolveLocalTime, gapMessage, instantToLocalInput } from '/js/core/zoned-time.js';
 
 // ========================================
 // State
@@ -662,7 +662,6 @@ async function showPreviewStep(teamId, config, preview, expectedVersion, reason)
     const names = await resolveNames(ids);
 
     const previousTitle = modalTitle.textContent;
-    const previousFooter = modalFooter.innerHTML;
 
     // The form is hidden, not serialized. Reading innerHTML captures markup,
     // and what someone typed lives in the elements rather than in their
@@ -678,18 +677,30 @@ async function showPreviewStep(teamId, config, preview, expectedVersion, reason)
     previewHost.innerHTML = Components.schedulePreview(preview, names, config.timezone);
     modalContent.appendChild(previewHost);
 
-    modalTitle.textContent = 'Review changes';
-    modalFooter.innerHTML = `
+    // The footer is hidden rather than replaced, for the same reason as the
+    // form: rewriting its markup gives back buttons that look right and do
+    // nothing, because the listeners were bound to the nodes that were thrown
+    // away. Cancel is one of those.
+    const previousButtons = [...modalFooter.children];
+    for (const button of previousButtons) button.style.display = 'none';
+
+    const previewButtons = document.createElement('span');
+    previewButtons.className = 'preview-footer-buttons';
+    previewButtons.innerHTML = `
         <button type="button" class="btn btn-secondary" id="preview-back">Back to editing</button>
         <button type="button" class="btn btn-primary" id="preview-confirm">Save schedule</button>
     `;
+    modalFooter.appendChild(previewButtons);
+
+    modalTitle.textContent = 'Review changes';
     if (window.lucide) lucide.createIcons();
 
     const restoreForm = () => {
         previewHost.remove();
+        previewButtons.remove();
+        for (const button of previousButtons) button.style.display = '';
         if (form) form.style.display = '';
         modalTitle.textContent = previousTitle;
-        modalFooter.innerHTML = previousFooter;
         if (window.lucide) lucide.createIcons();
     };
 
@@ -922,6 +933,7 @@ document.addEventListener('click', (e) => {
 // ========================================
 
 function populateOverrideEditForm(data) {
+    overrideFold = { start: 'earlier', end: 'later' };
     editingOverrideId = data.overrideId;
     editingOverrideRevision = data.revision !== undefined ? parseInt(data.revision, 10) : null;
     editingScheduleId = data.scheduleId;
@@ -1006,9 +1018,14 @@ async function openOverrideModal(teamId) {
 
         // Reset edit state. returnToCalendar is intentionally preserved: it is
         // set before this runs, by the calendar edit flow.
+        //
+        // The fold choice is reset here as well as in resetOverrideForm,
+        // because closing the modal with X never reaches that - and a choice
+        // made about one override has nothing to say about the next.
         editingOverrideId = null;
         editingOverrideRevision = null;
         editingScheduleId = null;
+        overrideFold = { start: 'earlier', end: 'later' };
 
         modalTitle.textContent = 'Manage Overrides';
         modalContent.innerHTML = Components.overrideModal(state, teamId);
@@ -1090,7 +1107,11 @@ function retimeOverrideFields(newTz) {
 
     const startInput = document.getElementById('override-start');
     const endInput = document.getElementById('override-end');
-    const { from, to } = resolveWindow(startInput?.value, endInput?.value, oldTz);
+    // Resolved with the occurrence that was chosen, not the default: someone
+    // who picked the second pass of an ambiguous hour and then changed the
+    // display zone would otherwise be handed the first one back.
+    const from = resolveLocalTime(startInput?.value, oldTz, { prefer: overrideFold.start });
+    const to = resolveLocalTime(endInput?.value, oldTz, { prefer: overrideFold.end });
 
     if (startInput && from.instant) startInput.value = instantToLocalInput(from.instant, newTz);
     if (endInput && to.instant) endInput.value = instantToLocalInput(to.instant, newTz);
@@ -1219,7 +1240,6 @@ async function handleOverrideSubmit(e) {
                 refreshOnCallUI(teamId),
             ]);
         } else {
-            previewHost.remove();
             closeModal();
             await refreshOnCallUI(teamId);
         }

@@ -215,6 +215,24 @@ test.describe('Schedule editor', () => {
     await expect(page.locator('.group-row')).toHaveCount(2);
   });
 
+  test('cancel still works after coming back from the preview', async ({ page }) => {
+    const env = await seedTeam(page, 'cancel');
+    await save(page, env.teamId, config([['e2e-ann']], 0));
+
+    await openEditor(page, env.teamId);
+    await page.locator('#l1-add-group').click();
+    await page.locator('.group-row').last().locator('.group-add-user').selectOption('e2e-ben');
+    await page.locator('#schedule-form-submit').click();
+    await page.locator('.schedule-preview').waitFor({ state: 'visible' });
+    await page.locator('#preview-back').click();
+    await page.locator('#schedule-form').waitFor({ state: 'visible' });
+
+    // The footer buttons are the originals, hidden and shown again. Rebuilt
+    // from markup they would look right and do nothing.
+    await page.locator('#schedule-cancel').click();
+    await expect(page.locator('#modal-overlay')).not.toHaveClass(/active/);
+  });
+
   test('the reason typed before the preview is the reason recorded', async ({ page }) => {
     const env = await seedTeam(page, 'reason');
     await save(page, env.teamId, config([['e2e-ann']], 0));
@@ -402,7 +420,44 @@ test.describe('Schedule editor', () => {
   });
 });
 
-test.describe('Override times', () => {
+test.describe('Overrides', () => {
+  /**
+   * The plain path: create one from the on-call page and see the modal close.
+   *
+   * The assertions after the toast are the point. A stray reference in the
+   * save handler once threw after the override had been written and the
+   * success toast shown - so the override existed, the API said so, and the
+   * only visible symptom was a second toast and a modal that would not close.
+   * A test that stopped at "created" and checked the API would have called
+   * that a pass.
+   */
+  test('creating an override closes the modal and reports nothing else', async ({ page }) => {
+    const env = await seedTeam(page, 'ovr');
+    await save(page, env.teamId, config([['e2e-ann']], 0));
+
+    await page.goto('/#/ops/oncall');
+    const overrideBtn = page.locator(`.oncall-row[data-team-id="${env.teamId}"] .create-override-btn`);
+    await overrideBtn.waitFor({ state: 'visible' });
+    await overrideBtn.click();
+    await page.locator('#override-form').waitFor({ state: 'visible' });
+
+    await page.locator('#override-user').selectOption('e2e-ben');
+    await page.locator('#override-reason').fill('swap');
+    await page.locator('#modal-footer button[type="submit"]').click();
+
+    await expect(page.locator('#toast-container')).toContainText(/created/i);
+    await expect(page.locator('#modal-overlay'), 'the modal closes when the save succeeds')
+      .not.toHaveClass(/active/, { timeout: 10_000 });
+    await expect(page.locator('#toast-container'), 'and nothing reports a failure')
+      .not.toContainText(/failed|error/i);
+
+    const overrides = await (await page.request.get(
+      `/api/v1/teams/${env.teamId}/schedule/overrides`)).json();
+    expect(overrides.overrides).toHaveLength(1);
+    expect(overrides.overrides[0].user_id).toBe('e2e-ben');
+  });
+
+
   /**
    * The timezone control chooses how times are shown and entered. It is not
    * part of an override, which is stored as two absolute instants - so
