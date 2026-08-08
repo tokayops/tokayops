@@ -298,6 +298,12 @@ func TestEffectiveAtCapturedAfterLock(t *testing.T) {
 	if lockUsers < 0 || lock < 0 || lockUsers > lock {
 		t.Fatalf("users must be locked before the schedule, calls: %v", calls)
 	}
+	// And the set locked is the one the configuration names: locking fewer
+	// leaves a gap erasure can commit through.
+	last := f.repo.LockedUsers[len(f.repo.LockedUsers)-1]
+	if len(last) != 1 || last[0] != "bob" {
+		t.Fatalf("locked users = %v, want the users the save names", last)
+	}
 }
 
 // Only the monotonicity floor may put a revision ahead of the clock, and only
@@ -561,13 +567,8 @@ func TestSaveRevalidatesMembershipAfterLock(t *testing.T) {
 	f := newFixture(t)
 	f.mustSave(t, scheduleconfig.SaveCommand{Desired: groupsConfig(group(groupAlice, "alice"))})
 
-	calls := f.calls()
-	lock := indexOf(calls, "LockSchedule")
-	if lock < 0 {
-		// The create branch has no row to lock; the ordering it must respect
-		// is proved by the edit below.
-		lock = 0
-	}
+	// The create branch has no row to lock, so the ordering is asserted on the
+	// edit below, with the call log reset to just that command.
 	f.clock.advance(time.Hour)
 	f.repo.Calls = nil
 	f.mustSave(t, scheduleconfig.SaveCommand{
@@ -575,7 +576,7 @@ func TestSaveRevalidatesMembershipAfterLock(t *testing.T) {
 		Desired:         groupsConfig(group(groupBob, "bob")),
 	})
 
-	calls = f.calls()
+	calls := f.calls()
 	lockIdx := indexOf(calls, "LockSchedule")
 	memberIdx := indexOf(calls, "GetTeamMemberIDs")
 	if lockIdx < 0 || memberIdx < 0 {

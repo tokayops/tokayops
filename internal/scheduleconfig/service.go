@@ -133,9 +133,8 @@ func (s *Service) Save(ctx context.Context, teamID string, cmd SaveCommand) (*Sa
 		return nil, err
 	}
 
-	started := s.now()
 	var result *SaveResult
-	err = s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
+	err = s.runCommand(ctx, func(tx ScheduleConfigTx) error {
 		res, err := s.save(ctx, tx, teamID, desired, cmd)
 		if err != nil {
 			return err
@@ -143,11 +142,7 @@ func (s *Service) Save(ctx context.Context, teamID string, cmd SaveCommand) (*Sa
 		result = res
 		return nil
 	})
-	s.metrics.TransitionDuration(s.now().Sub(started))
 	if err != nil {
-		if errors.Is(err, ErrVersionConflict) {
-			s.metrics.TransitionConflict()
-		}
 		return nil, err
 	}
 	if result.Noop {
@@ -156,6 +151,20 @@ func (s *Service) Save(ctx context.Context, teamID string, cmd SaveCommand) (*Sa
 		s.metrics.RevisionCreated(triggerOf(result))
 	}
 	return result, nil
+}
+
+// runCommand is the one place a configuration command opens a transaction and
+// reports on it. Every command times the same span - lock wait included - and
+// counts a conflict the same way, so there is no path where one of them
+// silently stops being measured.
+func (s *Service) runCommand(ctx context.Context, fn func(ScheduleConfigTx) error) error {
+	started := s.now()
+	err := s.repo.WithinTx(ctx, fn)
+	s.metrics.TransitionDuration(s.now().Sub(started))
+	if errors.Is(err, ErrVersionConflict) {
+		s.metrics.TransitionConflict()
+	}
+	return err
 }
 
 func triggerOf(res *SaveResult) string {
@@ -192,18 +201,44 @@ func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	if err != nil {
 		return nil, err
 	}
+
+	target, err := s.lockForWrite(ctx, tx, root, cmd.ExpectedVersion)
+	if err != nil {
+		return nil, err
+	}
+	return s.rewrite(ctx, tx, target, teamID, desired, cmd)
+}
+
+// writeTarget is the schedule a command has taken the lock on: the root as it
+// was under that lock, the revision in force, and the instant the change takes
+// effect. The three travel together because they are only valid together -
+// each was read after the lock and against the same state.
+type writeTarget struct {
+	root        *ScheduleRoot
+	tail        *ScheduleRevision
+	effectiveAt time.Time
+}
+
+// lockForWrite is the preamble every write to an existing schedule shares:
+// refuse a pre-revision row, take the row lock, check the caller is not stale,
+// read the revision in force and check it agrees with the deleted projection.
+//
+// Effective time is captured last, and that ordering is the point of the
+// function: the wait for the lock can be long, and an instant read before it
+// would place the change in a slot that has already passed.
+func (s *Service) lockForWrite(ctx context.Context, tx ScheduleConfigTx,
+	root *ScheduleRoot, expectedVersion int64) (*writeTarget, error) {
+
 	if err := s.refuseLegacyRoot(ctx, tx, root); err != nil {
 		return nil, err
 	}
-
 	locked, err := tx.LockSchedule(ctx, root.ID)
 	if err != nil {
 		return nil, err
 	}
-	if locked.ConfigVersion != cmd.ExpectedVersion {
-		return nil, &VersionConflictError{Expected: cmd.ExpectedVersion, Current: locked.ConfigVersion}
+	if locked.ConfigVersion != expectedVersion {
+		return nil, &VersionConflictError{Expected: expectedVersion, Current: locked.ConfigVersion}
 	}
-
 	tail, err := tx.GetTailRevision(ctx, locked.ID)
 	if err != nil {
 		return nil, err
@@ -211,19 +246,26 @@ func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	if err := checkDeletionConsistency(locked, tail); err != nil {
 		return nil, err
 	}
-	// Only now: the wait for the lock may have been long, and an instant
-	// captured before it would place the change in a slot that has passed.
-	effectiveAt := NextEffectiveAt(&tail.EffectiveFrom, s.now().UTC())
+	return &writeTarget{
+		root:        locked,
+		tail:        tail,
+		effectiveAt: NextEffectiveAt(&tail.EffectiveFrom, s.now().UTC()),
+	}, nil
+}
+
+// rewrite is the edit and recreate branch: validate, plan, guard, and either
+// report a no-op or append the revision.
+func (s *Service) rewrite(ctx context.Context, tx ScheduleConfigTx, target *writeTarget,
+	teamID string, desired rotation.ScheduleConfiguration, cmd SaveCommand) (*SaveResult, error) {
 
 	// A deleted schedule is recreated, not edited. Its tail snapshot is a copy
 	// kept so the column stays decodable - it is not a configuration in force,
 	// so the planner is given no current state at all and starts the rotation
 	// from the first group.
-	current := &tail.Snapshot
-	res := &SaveResult{}
-	if locked.DeletedAt != nil {
-		current = nil
-		res.Recreated = true
+	recreate := target.root.DeletedAt != nil
+	var current *rotation.ScheduleRevisionSnapshot
+	if !recreate {
+		current = &target.tail.Snapshot
 	}
 
 	// Deliberately re-read, and after the lock. The list LockUsers was built
@@ -236,7 +278,7 @@ func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	plan, err := s.planTransition(rotation.TransitionInput{
 		Current:     current,
 		Desired:     desired,
-		EffectiveAt: effectiveAt,
+		EffectiveAt: target.effectiveAt,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
@@ -245,89 +287,121 @@ func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 		// An early return, not an error: the empty transaction commits.
 		// Rolling back would read as a failure in every log and metric that
 		// watches this path, and nothing happened that needs undoing.
-		res.Noop = true
-		res.Revision = tail
-		res.Version = locked.ConfigVersion
-		res.EffectiveAt = effectiveAt
-		return res, nil
+		return &SaveResult{
+			Revision:    target.tail,
+			Version:     target.root.ConfigVersion,
+			EffectiveAt: target.effectiveAt,
+			Noop:        true,
+		}, nil
 	}
 
-	before, after, err := s.guardTransition(current, plan, effectiveAt)
+	before, after, err := s.activeGroupsAround(current, plan, target.effectiveAt)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.guardTransition(plan, current != nil, before, after, target.effectiveAt); err != nil {
 		return nil, err
 	}
 
 	summary := plan.Change
 	revision := &ScheduleRevision{
 		ID:            s.newID(),
-		ScheduleID:    locked.ID,
-		Version:       locked.ConfigVersion + 1,
+		ScheduleID:    target.root.ID,
+		Version:       target.root.ConfigVersion + 1,
 		Kind:          RevisionActive,
 		Snapshot:      plan.Snapshot,
-		EffectiveFrom: effectiveAt,
-		RecordedAt:    effectiveAt,
+		EffectiveFrom: target.effectiveAt,
+		RecordedAt:    target.effectiveAt,
 		CreatedBy:     optionalString(cmd.ActorID),
 		ChangeReason:  cmd.Reason,
 		ChangeSummary: &summary,
 	}
 
-	if err := tx.CloseRevision(ctx, locked.ID, tail.ID, effectiveAt); err != nil {
-		return nil, err
-	}
-	if err := tx.InsertRevision(ctx, revision); err != nil {
-		return nil, err
-	}
-	if res.Recreated {
-		if err := tx.SetScheduleDeleted(ctx, locked.ID, nil); err != nil {
-			return nil, err
-		}
-	}
-	if err := tx.AdvanceVersion(ctx, locked.ID, locked.ConfigVersion, effectiveAt); err != nil {
-		return nil, err
-	}
 	trigger := TriggerSaved
-	if res.Recreated {
+	if recreate {
 		trigger = TriggerRecreated
 	}
-	if err := s.recordChange(ctx, tx, trigger, &tail.ID, revision,
-		locked.ConfigVersion, effectiveAt, cmd.ActorID, before, after); err != nil {
+	if err := s.appendRevision(ctx, tx, target, revision, recreate, trigger, cmd.ActorID, before, after); err != nil {
 		return nil, err
 	}
+	return &SaveResult{
+		Revision:    revision,
+		Version:     revision.Version,
+		EffectiveAt: target.effectiveAt,
+		Recreated:   recreate,
+	}, nil
+}
 
-	res.Revision = revision
-	res.Version = revision.Version
-	res.EffectiveAt = effectiveAt
-	return res, nil
+// appendRevision is the write half, in the only order that keeps history
+// intact: close the tail, insert its successor, move the deleted projection if
+// the schedule is coming back, advance the version, record the event.
+func (s *Service) appendRevision(ctx context.Context, tx ScheduleConfigTx, target *writeTarget,
+	revision *ScheduleRevision, clearDeleted bool, trigger, actorID string,
+	before, after activeGroupPair) error {
+
+	if err := tx.CloseRevision(ctx, target.root.ID, target.tail.ID, target.effectiveAt); err != nil {
+		return err
+	}
+	if err := tx.InsertRevision(ctx, revision); err != nil {
+		return err
+	}
+	if clearDeleted {
+		if err := tx.SetScheduleDeleted(ctx, target.root.ID, nil); err != nil {
+			return err
+		}
+	}
+	if err := tx.AdvanceVersion(ctx, target.root.ID, target.root.ConfigVersion, target.effectiveAt); err != nil {
+		return err
+	}
+	return s.recordChange(ctx, tx, trigger, &target.tail.ID, revision,
+		target.root.ConfigVersion, target.effectiveAt, actorID, before, after)
 }
 
 // CreateSchedule creates a schedule and its first revision in one transaction.
 //
-// It is the programmatic entry point - tests and future tooling - while the
-// editor reaches the same code through Save. Both end up in initialize, so
-// there is exactly one definition of what a freshly created schedule is.
+// It is the programmatic entry point - tests and tooling - while the editor
+// reaches the same code through Save. Both end in initialize, so there is
+// exactly one definition of what a freshly created schedule is.
 //
-// A concurrent create for the same team yields ErrScheduleExists.
+// It does NOT delegate to Save. A caller that asks to create says nothing
+// about versions, so "the team already has a schedule" is the answer it needs;
+// Save reports the same fact as a version conflict carrying the current
+// version, which is what an editor holding a stale form needs. Deriving one
+// from the other would mean reading a version number back out of an error to
+// guess which situation it described.
+//
+// A concurrent create for the same team yields ErrScheduleExists too, from the
+// unique constraint on team_id.
 func (s *Service) CreateSchedule(ctx context.Context, teamID string,
 	config rotation.ScheduleConfiguration, actorID string, reason *string) (*ScheduleRevision, error) {
 
-	res, err := s.Save(ctx, teamID, SaveCommand{
-		ExpectedVersion: 0,
-		Desired:         config,
-		ActorID:         actorID,
-		Reason:          reason,
-	})
-	// Save reports "the team already has a schedule at version N" as a version
-	// conflict, which is right for an editor holding a stale form. A caller
-	// that asked to create says nothing about versions, so the same fact is
-	// reported as what it means to them.
-	var conflict *VersionConflictError
-	if errors.As(err, &conflict) && conflict.Expected == 0 {
-		return nil, ErrScheduleExists
+	if teamID == "" {
+		return nil, invalidField("team_id", "is required")
 	}
+	desired, err := NormalizeConfiguration(config)
 	if err != nil {
 		return nil, err
 	}
-	return res.Revision, nil
+
+	var created *SaveResult
+	err = s.runCommand(ctx, func(tx ScheduleConfigTx) error {
+		if err := tx.LockUsers(ctx, ConfigurationUserIDs(desired)); err != nil {
+			return err
+		}
+		switch _, err := tx.GetScheduleRootByTeam(ctx, teamID); {
+		case err == nil:
+			return ErrScheduleExists
+		case !errors.Is(err, ErrScheduleNotFound):
+			return err
+		}
+		created, err = s.initialize(ctx, tx, teamID, desired, actorID, reason)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.metrics.RevisionCreated(TriggerCreated)
+	return created.Revision, nil
 }
 
 // initialize writes the root, revision 1 and the creation event.
@@ -355,8 +429,11 @@ func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID st
 	if plan.Noop {
 		return nil, fmt.Errorf("%w: initial transition reported as no-op", ErrInvariantViolation)
 	}
-	before, after, err := s.guardTransition(nil, plan, effectiveAt)
+	before, after, err := s.activeGroupsAround(nil, plan, effectiveAt)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.guardTransition(plan, false, before, after, effectiveAt); err != nil {
 		return nil, err
 	}
 
@@ -403,15 +480,10 @@ func (s *Service) Delete(ctx context.Context, teamID string, cmd DeleteCommand) 
 		return invalidField("team_id", "is required")
 	}
 
-	started := s.now()
-	err := s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
+	err := s.runCommand(ctx, func(tx ScheduleConfigTx) error {
 		return s.delete(ctx, tx, teamID, cmd)
 	})
-	s.metrics.TransitionDuration(s.now().Sub(started))
 	if err != nil {
-		if errors.Is(err, ErrVersionConflict) {
-			s.metrics.TransitionConflict()
-		}
 		return err
 	}
 	s.metrics.RevisionCreated(TriggerDeleted)
@@ -423,64 +495,50 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 	if err != nil {
 		return err
 	}
-	if err := s.refuseLegacyRoot(ctx, tx, root); err != nil {
-		return err
-	}
-
-	locked, err := tx.LockSchedule(ctx, root.ID)
+	target, err := s.lockForWrite(ctx, tx, root, cmd.ExpectedVersion)
 	if err != nil {
 		return err
 	}
-	if locked.ConfigVersion != cmd.ExpectedVersion {
-		return &VersionConflictError{Expected: cmd.ExpectedVersion, Current: locked.ConfigVersion}
-	}
-	if locked.DeletedAt != nil {
+	if target.root.DeletedAt != nil {
 		return ErrScheduleDeleted
 	}
 
-	tail, err := tx.GetTailRevision(ctx, locked.ID)
-	if err != nil {
-		return err
-	}
-	if err := checkDeletionConsistency(locked, tail); err != nil {
-		return err
-	}
-	effectiveAt := NextEffectiveAt(&tail.EffectiveFrom, s.now().UTC())
-
-	before, err := activeGroups(&tail.Snapshot, effectiveAt)
+	before, err := activeGroups(&target.tail.Snapshot, target.effectiveAt)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvariantViolation, err)
 	}
 
 	deleted := &ScheduleRevision{
 		ID:            s.newID(),
-		ScheduleID:    locked.ID,
-		Version:       locked.ConfigVersion + 1,
+		ScheduleID:    target.root.ID,
+		Version:       target.root.ConfigVersion + 1,
 		Kind:          RevisionDeleted,
-		Snapshot:      tail.Snapshot,
-		EffectiveFrom: effectiveAt,
-		RecordedAt:    effectiveAt,
+		Snapshot:      target.tail.Snapshot,
+		EffectiveFrom: target.effectiveAt,
+		RecordedAt:    target.effectiveAt,
 		CreatedBy:     optionalString(cmd.ActorID),
 		ChangeReason:  cmd.Reason,
 	}
 
-	if err := tx.CloseRevision(ctx, locked.ID, tail.ID, effectiveAt); err != nil {
+	if err := tx.CloseRevision(ctx, target.root.ID, target.tail.ID, target.effectiveAt); err != nil {
 		return err
 	}
 	if err := tx.InsertRevision(ctx, deleted); err != nil {
 		return err
 	}
-	if err := s.tombstoneLiveOverrides(ctx, tx, locked.ID, effectiveAt, cmd.ActorID); err != nil {
+	if err := s.tombstoneLiveOverrides(ctx, tx, target.root.ID, target.effectiveAt, cmd.ActorID); err != nil {
 		return err
 	}
-	if err := tx.SetScheduleDeleted(ctx, locked.ID, &effectiveAt); err != nil {
+	if err := tx.SetScheduleDeleted(ctx, target.root.ID, &target.effectiveAt); err != nil {
 		return err
 	}
-	if err := tx.AdvanceVersion(ctx, locked.ID, locked.ConfigVersion, effectiveAt); err != nil {
+	if err := tx.AdvanceVersion(ctx, target.root.ID, target.root.ConfigVersion, target.effectiveAt); err != nil {
 		return err
 	}
-	return s.recordChange(ctx, tx, TriggerDeleted, &tail.ID, deleted,
-		locked.ConfigVersion, effectiveAt, cmd.ActorID, before, activeGroupPair{})
+	// Nobody is on duty after a delete, so the "after" pair is empty by
+	// construction rather than computed.
+	return s.recordChange(ctx, tx, TriggerDeleted, &target.tail.ID, deleted,
+		target.root.ConfigVersion, target.effectiveAt, cmd.ActorID, before, activeGroupPair{})
 }
 
 // tombstoneLiveOverrides appends a delete revision to every override that is
@@ -720,14 +778,14 @@ func activeGroupID(timezone string, layer rotation.RotationLayerSnapshot, at tim
 	return group.ID, nil
 }
 
-// guardTransition is the commit post-condition: the rotation the planner
-// promised has to be the rotation the snapshot it produced actually yields.
+// activeGroupsAround resolves who the old and the new snapshot each put on
+// duty at the transition instant.
 //
-// The expected active group is checked ALWAYS. Equality of the old and the new
-// active group is checked only when the plan claims to preserve it - a
-// successor or first selection legitimately changes who is on duty, and
-// demanding equality there would roll back valid edits.
-func (s *Service) guardTransition(current *rotation.ScheduleRevisionSnapshot,
+// It is separate from the guard because the answer has two consumers: the
+// guard checks it, and the commit log records it. Folding the computation into
+// the guard made a validator that also returned data, which is how a "guard"
+// ends up being called for its side effects.
+func (s *Service) activeGroupsAround(current *rotation.ScheduleRevisionSnapshot,
 	plan rotation.TransitionPlan, at time.Time) (before, after activeGroupPair, err error) {
 
 	if before, err = activeGroups(current, at); err != nil {
@@ -736,6 +794,21 @@ func (s *Service) guardTransition(current *rotation.ScheduleRevisionSnapshot,
 	if after, err = activeGroups(&plan.Snapshot, at); err != nil {
 		return activeGroupPair{}, activeGroupPair{}, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
 	}
+	return before, after, nil
+}
+
+// guardTransition is the commit post-condition: the rotation the planner
+// promised has to be the rotation the snapshot it produced actually yields.
+//
+// The expected active group is checked ALWAYS. Equality of the old and the new
+// active group is checked only when the plan claims to preserve it - a
+// successor or first selection legitimately changes who is on duty, and
+// demanding equality there would roll back valid edits.
+//
+// It reads nothing and computes nothing: given a plan and the two answers, it
+// either agrees or it does not.
+func (s *Service) guardTransition(plan rotation.TransitionPlan, hadCurrent bool,
+	before, after activeGroupPair, at time.Time) error {
 
 	layers := [2]struct {
 		name       string
@@ -753,26 +826,20 @@ func (s *Service) guardTransition(current *rotation.ScheduleRevisionSnapshot,
 		}
 		if l.after != expected {
 			s.metrics.GuardViolation()
-			return activeGroupPair{}, activeGroupPair{}, fmt.Errorf(
-				"%w: %s plan expects active group %q at %v, snapshot yields %q",
+			return fmt.Errorf("%w: %s plan expects active group %q at %v, snapshot yields %q",
 				ErrInvariantViolation, l.name, expected, at, l.after)
 		}
-		if l.transition.PreservesActiveGroup && current != nil && l.before != l.after {
+		if l.transition.PreservesActiveGroup && hadCurrent && l.before != l.after {
 			s.metrics.GuardViolation()
-			return activeGroupPair{}, activeGroupPair{}, fmt.Errorf(
-				"%w: %s claims to preserve the active group but %q became %q",
+			return fmt.Errorf("%w: %s claims to preserve the active group but %q became %q",
 				ErrInvariantViolation, l.name, l.before, l.after)
 		}
 	}
-	return before, after, nil
+	return nil
 }
 
 // recordChange writes the domain event in the same transaction as the revision
 // it describes, then logs the commit.
-//
-// The log line names IDs, versions and the diff summary only. The snapshot
-// itself is deliberately absent: it is already stored, it is large, and a log
-// aggregator is not a place to keep a second copy of who is on call.
 func (s *Service) recordChange(ctx context.Context, tx ScheduleConfigTx, trigger string,
 	oldRevisionID *string, revision *ScheduleRevision, oldVersion int64,
 	effectiveAt time.Time, actorID string, before, after activeGroupPair) error {
@@ -798,6 +865,18 @@ func (s *Service) recordChange(ctx context.Context, tx ScheduleConfigTx, trigger
 		return err
 	}
 
+	s.logCommit(trigger, oldRevisionID, revision, oldVersion, effectiveAt, actorID, before, after)
+	return nil
+}
+
+// logCommit writes one line per committed change.
+//
+// It names ids, versions and the diff summary. The snapshot is deliberately
+// absent: it is already stored, it is large, and a log aggregator is not a
+// place to keep a second copy of who is on call.
+func (s *Service) logCommit(trigger string, oldRevisionID *string, revision *ScheduleRevision,
+	oldVersion int64, effectiveAt time.Time, actorID string, before, after activeGroupPair) {
+
 	summary := ""
 	if revision.ChangeSummary != nil {
 		if encoded, err := json.Marshal(revision.ChangeSummary); err == nil {
@@ -810,7 +889,6 @@ func (s *Service) recordChange(ctx context.Context, tx ScheduleConfigTx, trigger
 		trigger, revision.ScheduleID, derefOr(oldRevisionID, "-"), revision.ID,
 		oldVersion, revision.Version, effectiveAt.Format(time.RFC3339Nano), orDash(actorID), summary,
 		orDash(before.L1), orDash(after.L1), orDash(before.L2), orDash(after.L2))
-	return nil
 }
 
 func derefOr(s *string, fallback string) string {
