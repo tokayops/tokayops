@@ -173,25 +173,26 @@ test.describe('Schedule Configuration', () => {
     await editBtn.click();
     await schedulesPage.expectScheduleModalVisible();
 
-    // Find save button (in modal footer)
-    const saveBtn = page.locator('#schedule-form-submit');
-    await expect(saveBtn).toBeVisible();
+    // Saving is two steps: the first asks what the save would do, the second
+    // makes it. Nothing is written until the second.
+    const reviewBtn = page.locator('#schedule-form-submit');
+    await expect(reviewBtn).toBeVisible();
+    await reviewBtn.click();
 
-    // Set up API response listener
+    await expect(page.locator('.schedule-preview')).toBeVisible();
+
     const responsePromise = page.waitForResponse(
-      (response) => response.url().includes('/api/v1/teams/') &&
-                    response.url().includes('/schedule') &&
+      (response) => response.url().includes('/schedule/config') &&
                     response.request().method() === 'PUT'
     );
+    await page.locator('#preview-confirm').click();
 
-    await saveBtn.click();
-
-    // Wait for API response
     const response = await responsePromise;
     expect([200, 201, 204]).toContain(response.status());
 
-    // Should show success toast
-    await schedulesPage.expectToastVisible('saved');
+    // A no-op save says so rather than claiming to have saved, so the toast
+    // is matched on either outcome.
+    await expect(page.locator('#toast-container')).toContainText(/saved|No changes to save/i);
   });
 });
 
@@ -234,8 +235,9 @@ test.describe('Schedule Deletion', () => {
     const dangerZone = page.locator('.team-modal-section').filter({ hasText: 'Danger Zone' });
     await expect(dangerZone).toBeVisible();
 
-    // Should have warning text
-    await expect(dangerZone).toContainText('cannot be undone');
+    // The warning says what is actually true: the rotation stops and overrides
+    // are cleared, while past shifts and the record itself survive.
+    await expect(dangerZone).toContainText('Past shifts stay in the calendar');
 
     await schedulesPage.closeScheduleModal();
   });

@@ -43,27 +43,48 @@ async function seedTestEnv(page: Page, suffix: string): Promise<TestEnv> {
   });
   expect([200, 201]).toContain(addBob.status());
 
-  // Create schedule
-  const schedRes = await page.request.put(`/api/v1/teams/${teamId}/schedule`, {
-    data: {
-      timezone: 'UTC',
-      l1_rotation_type: 'daily',
-      l1_handoff_time: '09:00',
-      l1_rotation_start: new Date().toISOString(),
-    },
+  // One save, carrying the whole configuration. Each member is their own
+  // group, which is what the flat rotation of the old model meant.
+  const schedRes = await page.request.put(`/api/v1/teams/${teamId}/schedule/config`, {
+    data: scheduleConfig([['e2e-alice'], ['e2e-bob']], 0),
   });
-  expect([200, 201]).toContain(schedRes.status());
-  const schedule = await schedRes.json();
+  expect(schedRes.status(), await schedRes.text()).toBe(200);
 
-  // Set L1 groups (each user as singleton group, equivalent to old flat list)
-  await page.request.put(`/api/v1/teams/${teamId}/schedule/l1-groups`, {
-    data: { groups: [['e2e-alice'], ['e2e-bob']] },
-  });
+  const config = await (await page.request.get(`/api/v1/teams/${teamId}/schedule/config`)).json();
 
   return {
     teamId,
-    scheduleId: schedule.id,
+    scheduleId: config.schedule_id,
     memberIds: ['e2e-alice', 'e2e-bob'],
+  };
+}
+
+/**
+ * A complete configuration payload.
+ *
+ * The L2 policy is present even though the layer is off: the server validates
+ * both layers regardless, so a disabled layer still needs a cadence and a
+ * handoff time that parse.
+ */
+export function scheduleConfig(groups: string[][], expectedVersion: number, timezone = 'UTC') {
+  return {
+    expected_version: expectedVersion,
+    timezone,
+    l1: {
+      enabled: true,
+      rotation_type: 'daily',
+      handoff_time: '09:00',
+      handoff_day: null,
+      groups: groups.map(userIds => ({ id: crypto.randomUUID(), user_ids: userIds })),
+    },
+    l2: {
+      enabled: false,
+      escalation_timeout_minutes: 5,
+      rotation_type: 'daily',
+      handoff_time: '09:00',
+      handoff_day: null,
+      user_ids: [],
+    },
   };
 }
 
@@ -79,9 +100,9 @@ async function createOverrideViaAPI(
   reason: string,
 ) {
   const res = await page.request.post(`/api/v1/teams/${teamId}/schedule/overrides`, {
-    data: { user_id: userId, start_time: startTime, end_time: endTime, reason },
+    data: { user_id: userId, valid_from: startTime, valid_to: endTime, reason },
   });
-  expect(res.status()).toBe(201);
+  expect(res.status(), await res.text()).toBe(201);
   return await res.json();
 }
 
@@ -506,20 +527,19 @@ test.describe('Calendar Override Data Attributes', () => {
 
     const entry = schedulesPage.calendarOverrideEntries.first();
 
-    // Verify data attributes are present and correct
+    // A calendar entry is a shift, not an override record. It carries enough
+    // to identify which override to act on; the revision and the reason are
+    // read from the override list when one is opened, because a shift does not
+    // know them and guessing would be how a stale edit gets through.
     const overrideId = await entry.getAttribute('data-override-id');
-    const scheduleId = await entry.getAttribute('data-schedule-id');
     const userId = await entry.getAttribute('data-user-id');
-    const startTime = await entry.getAttribute('data-start-time');
-    const endTime = await entry.getAttribute('data-end-time');
-    const reason = await entry.getAttribute('data-reason');
+    const validFrom = await entry.getAttribute('data-valid-from');
+    const validTo = await entry.getAttribute('data-valid-to');
 
     expect(overrideId).toBeTruthy();
-    expect(scheduleId).toBe(env.scheduleId);
     expect(userId).toBe('e2e-bob');
-    expect(startTime).toBeTruthy();
-    expect(endTime).toBeTruthy();
-    expect(reason).toBe('Data attrs test');
+    expect(validFrom).toBeTruthy();
+    expect(validTo).toBeTruthy();
 
     // The entry should display "OVERRIDE" label and user name
     await expect(entry.locator('.entry-layer')).toContainText(/override/i);

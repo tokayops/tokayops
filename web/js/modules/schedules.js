@@ -83,12 +83,12 @@ function conflictingOverridesText(error) {
 // ========================================
 
 /**
- * Everything the widgets need about a team's schedule.
+ * Everything the widgets need about a team's schedule, in one request.
  *
- * Two requests rather than one, because they answer different questions and
- * only together tell "not configured" from "configured, nobody on duty":
- * on-call answers 200 with empty layers in both cases, and the configuration
- * is what says whether a schedule exists at all.
+ * The on-call endpoint reports whether a schedule exists and whether it was
+ * deleted alongside the projection, so this does not also have to ask for the
+ * configuration - a request whose ordinary answer is 404, once per team on
+ * every page that lists them.
  */
 async function loadTeamOnCall(teamId) {
     const response = await API.schedules.currentOnCall(teamId).catch(() => null);
@@ -939,6 +939,10 @@ async function refreshOverridesList(teamId, scheduleId) {
     if (window.lucide) lucide.createIcons();
 }
 
+/**
+ * @returns {Object|null} the state it rendered, so a caller that needs the
+ * override heads does not fetch them a second time.
+ */
 async function openOverrideModal(teamId) {
     currentTeamId = teamId;
 
@@ -982,9 +986,11 @@ async function openOverrideModal(teamId) {
         currentOverrideTz = browserTz;
 
         bindOverrideFormEvents();
+        return state;
     } catch (error) {
         console.error('Failed to open override modal:', error);
         showToast('Failed to load overrides: ' + error.message, 'error');
+        return null;
     }
 }
 
@@ -1217,9 +1223,12 @@ async function openViewScheduleModal(teamId) {
     modal.classList.add('active');
     document.body.style.overflow = 'hidden';
 
-    await renderCalendarView(teamId, currentViewTimezone);
-
+    // Bound before the calendar is fetched, not after. The button is on screen
+    // as soon as the footer is written, and a button that is visible but inert
+    // for as long as a request takes is a button that gets clicked twice.
     document.getElementById('calendar-close')?.addEventListener('click', closeModal);
+
+    await renderCalendarView(teamId, currentViewTimezone);
 }
 
 // ========================================
@@ -1328,24 +1337,24 @@ export function bindScheduleEvents() {
 
             if (!currentTeamId || !overrideId) return;
 
-            // The head carries the revision and the reason; the calendar entry
-            // carries neither, because a shift is not an override.
-            const head = await currentOverrideRevision(currentTeamId, overrideId);
-            if (!head) {
-                showToast('This override no longer exists.', 'error');
-                await renderCalendarView(currentTeamId, currentViewTimezone);
-                return;
-            }
-            const config = await API.schedules.getConfig(currentTeamId).catch(() => null);
-            const scheduleId = config?.schedule_id || '';
-
             if (action === 'edit') {
+                // The modal loads the override heads and the schedule ID on
+                // its way in, so the form is filled from what it already has.
+                // A calendar entry is a shift: it knows which override it came
+                // from, but not the revision to edit against.
                 returnToCalendar = true;
-                await openOverrideModal(currentTeamId);
+                const state = await openOverrideModal(currentTeamId);
+                const head = (state?.overrides || []).find(o => o.override_id === overrideId);
+                if (!head) {
+                    showToast('This override no longer exists.', 'error');
+                    returnToCalendar = false;
+                    await openViewScheduleModal(currentTeamId);
+                    return;
+                }
                 populateOverrideEditForm({
                     overrideId: head.override_id,
                     revision: head.revision,
-                    scheduleId,
+                    scheduleId: state.scheduleId,
                     userId: head.user_id,
                     validFrom: head.valid_from,
                     validTo: head.valid_to,
@@ -1354,8 +1363,16 @@ export function bindScheduleEvents() {
             }
 
             if (action === 'delete') {
+                const head = await currentOverrideRevision(currentTeamId, overrideId);
+                if (!head) {
+                    showToast('This override no longer exists.', 'error');
+                    await renderCalendarView(currentTeamId, currentViewTimezone);
+                    return;
+                }
                 if (!confirm('Remove this override?')) return;
-                const removed = await deleteOverride(scheduleId, head.override_id, head.revision, currentTeamId);
+                const config = await API.schedules.getConfig(currentTeamId).catch(() => null);
+                const removed = await deleteOverride(
+                    config?.schedule_id || '', head.override_id, head.revision, currentTeamId);
                 if (removed && currentViewTimezone) {
                     await Promise.all([
                         renderCalendarView(currentTeamId, currentViewTimezone),
