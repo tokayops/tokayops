@@ -190,14 +190,28 @@ type LayerOnCallDTO struct {
 
 // OnCallDTO is the current-assignment projection. A null layer means nobody is
 // on duty there.
+//
+// Warnings belong here rather than beside the projection: an override overlap
+// is no less real for being seen through the current view than through the
+// history, and a caller that got the projection without them would have to
+// re-render a range to find out that the answer is contested. Carrying them
+// inside the value means every path that returns a projection - the on-call
+// endpoint, the preview's before/after, the save's result - reports the same
+// thing without three chances to forget.
 type OnCallDTO struct {
-	At time.Time       `json:"at"`
-	L1 *LayerOnCallDTO `json:"l1"`
-	L2 *LayerOnCallDTO `json:"l2"`
+	At       time.Time            `json:"at"`
+	L1       *LayerOnCallDTO      `json:"l1"`
+	L2       *LayerOnCallDTO      `json:"l2"`
+	Warnings []ScheduleWarningDTO `json:"warnings"`
 }
 
 func onCallDTO(o schedulerender.OnCall) OnCallDTO {
-	return OnCallDTO{At: o.At, L1: layerOnCallDTO(o.L1), L2: layerOnCallDTO(o.L2)}
+	return OnCallDTO{
+		At:       o.At,
+		L1:       layerOnCallDTO(o.L1),
+		L2:       layerOnCallDTO(o.L2),
+		Warnings: warningDTOs(o.Warnings),
+	}
 }
 
 func layerOnCallDTO(l *schedulerender.LayerOnCall) *LayerOnCallDTO {
@@ -259,6 +273,15 @@ func shiftDTOs(shifts []schedulerender.Shift) []ShiftDTO {
 		}
 	}
 	return out
+}
+
+// ScheduleOnCallResponse is who is on duty right now.
+//
+// ScheduleID is present so the editor can address override mutations without a
+// second request, and is empty when the team has no schedule at all.
+type ScheduleOnCallResponse struct {
+	ScheduleID string    `json:"schedule_id,omitempty"`
+	OnCall     OnCallDTO `json:"on_call"`
 }
 
 // ScheduleWarningDTO is a structured condition the caller has to branch on.

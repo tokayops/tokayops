@@ -2157,6 +2157,41 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/teams/{id}/schedule/on-call": {
+            "get": {
+                "description": "The current-assignment projection, derived from the revision chain. A team with no schedule, a schedule from before the revision model and a deleted one all answer 200 with null layers: the question is who is on duty, and \"nobody\" is an answer.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "schedules"
+                ],
+                "summary": "Get who is on duty for a team right now",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Team ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.ScheduleOnCallResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/teams/{id}/schedule/overrides": {
             "get": {
                 "description": "The head revision of every override that still exists - the only source of expected_revision for an edit.",
@@ -2648,6 +2683,46 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/users/resolve": {
+            "post": {
+                "description": "Display read for historical data. Includes erased users, whose row survives so history that names their ID stays legible. Returns only id and name.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "users"
+                ],
+                "summary": "Resolve user IDs to display names",
+                "parameters": [
+                    {
+                        "description": "User IDs",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.ResolveUsersRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.ResolveUsersResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/users/{id}": {
             "get": {
                 "description": "Get detailed information about a specific user",
@@ -3035,6 +3110,9 @@ const docTemplate = `{
         "api.ErrorResponse": {
             "type": "object",
             "properties": {
+                "code": {
+                    "type": "string"
+                },
                 "error": {
                     "type": "string"
                 }
@@ -3137,6 +3215,12 @@ const docTemplate = `{
                 },
                 "l2": {
                     "$ref": "#/definitions/api.LayerOnCallDTO"
+                },
+                "warnings": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.ScheduleWarningDTO"
+                    }
                 }
             }
         },
@@ -3281,6 +3365,39 @@ const docTemplate = `{
                 }
             }
         },
+        "api.ResolveUsersRequest": {
+            "type": "object",
+            "properties": {
+                "user_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "api.ResolveUsersResponse": {
+            "type": "object",
+            "properties": {
+                "users": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.ResolvedUserDTO"
+                    }
+                }
+            }
+        },
+        "api.ResolvedUserDTO": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
         "api.ScheduleConfigDTO": {
             "type": "object",
             "properties": {
@@ -3384,6 +3501,17 @@ const docTemplate = `{
                     "items": {
                         "type": "string"
                     }
+                }
+            }
+        },
+        "api.ScheduleOnCallResponse": {
+            "type": "object",
+            "properties": {
+                "on_call": {
+                    "$ref": "#/definitions/api.OnCallDTO"
+                },
+                "schedule_id": {
+                    "type": "string"
                 }
             }
         },

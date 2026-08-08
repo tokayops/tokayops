@@ -119,6 +119,7 @@ func TestScheduleRoutesRefuseWhenUnwired(t *testing.T) {
 		{http.MethodGet, "/api/v1/teams/devops/schedule/revisions/rev-1", nil},
 		{http.MethodGet, "/api/v1/teams/devops/schedule/render?from=" +
 			from.Format(time.RFC3339) + "&until=" + from.Add(time.Hour).Format(time.RFC3339), nil},
+		{http.MethodGet, "/api/v1/teams/devops/schedule/on-call", nil},
 		{http.MethodGet, "/api/v1/teams/devops/schedule/overrides", nil},
 		{http.MethodPost, "/api/v1/teams/devops/schedule/overrides", ScheduleOverrideRequest{UserID: "alex"}},
 		{http.MethodPut, "/api/v1/schedules/s1/overrides/o1", ScheduleOverrideRequest{UserID: "alex"}},
@@ -868,6 +869,7 @@ func TestScheduleConfigRBACMatrix(t *testing.T) {
 				time.Now().UTC().Format(time.RFC3339) + "&until=" +
 				time.Now().UTC().Add(time.Hour).Format(time.RFC3339), nil, "alex", allowed},
 		{"list overrides as member", http.MethodGet, "/api/v1/teams/devops/schedule/overrides", nil, "alex", allowed},
+		{"on-call as outsider", http.MethodGet, "/api/v1/teams/devops/schedule/on-call", nil, "charlie", allowed},
 
 		{"save config as member", http.MethodPut, "/api/v1/teams/devops/schedule/config",
 			configRequest(1, []string{"denis"}), "alex", forbidden},

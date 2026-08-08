@@ -111,6 +111,17 @@ func (s *Service) CurrentOnCall(ctx context.Context, scheduleID string, at time.
 	return out, nil
 }
 
+// CurrentOnCallNow is the same projection at the service's own clock.
+//
+// It exists so a caller that means "right now" does not have to reach for
+// time.Now() itself. That would be a second clock: the preview already
+// evaluates against s.now, and a handler answering from wall time would drift
+// from it under WithClock - silently in production, and visibly in any test
+// that moves time forward.
+func (s *Service) CurrentOnCallNow(ctx context.Context, scheduleID string) (OnCall, error) {
+	return s.CurrentOnCall(ctx, scheduleID, s.now().UTC())
+}
+
 // onCallWithin is the projection itself, over a view the caller already holds.
 // The preview needs the same answer from inside its own snapshot, and computing
 // it twice would be two chances to project one state differently.

@@ -219,6 +219,10 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	// Users
 	v1.GET("/users", a.ListUsers, a.Require(rbac.ActionUserList, ScopeGlobal()))
 	v1.GET("/users/:id", a.GetUser, a.Require(rbac.ActionUserView, ScopeGlobal()))
+	// Display read for historical data: it answers for erased users, which
+	// GET /users/:id deliberately does not. Same permission as viewing a user,
+	// and it returns strictly less.
+	v1.POST("/users/resolve", a.ResolveUsers, a.Require(rbac.ActionUserView, ScopeGlobal()))
 	v1.POST("/users", a.CreateUser, a.Require(rbac.ActionUserCreate, ScopeGlobal()))
 	v1.PUT("/users/:id", a.UpdateUser, a.Require(rbac.ActionUserUpdate, ScopeGlobal()))
 	v1.PUT("/users/:id/password", a.UpdateUserPassword, a.Require(rbac.ActionUserPasswordUpdate, ScopeUserSelfOrAdmin("id")))
@@ -244,6 +248,7 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.GET("/teams/:id/schedule/revisions", a.ListScheduleRevisions, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
 	v1.GET("/teams/:id/schedule/revisions/:revision_id", a.GetScheduleRevision, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
 	v1.GET("/teams/:id/schedule/render", a.RenderSchedule, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/on-call", a.GetScheduleOnCall, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
 	v1.GET("/teams/:id/schedule/overrides", a.ListScheduleOverrides, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
 	v1.POST("/teams/:id/schedule/overrides", a.CreateScheduleOverride, a.requireScheduleStack, a.Require(rbac.ActionOverrideCreate, ScopeFromResource("team", "id")))
 	v1.PUT("/schedules/:schedule_id/overrides/:id", a.UpdateScheduleOverride, a.requireScheduleStack, a.Require(rbac.ActionOverrideUpdate, ScopeScheduleOverride("schedule_id", "id")))
@@ -341,8 +346,17 @@ type TeamMemberListResponse struct {
 }
 
 // ErrorResponse represents an error response.
+//
+// Code is the machine-readable half. A status alone is not a contract: the
+// schedule editor answers 409 in six different senses, and each one needs a
+// different reaction from the client - reload the form, reload the override
+// list, show the conflicting intervals, switch to recreate. A client that had
+// to tell them apart by parsing the message would break on the first
+// rewording. Codes are defined in schedule_errors.go; the field is omitempty
+// so responses that predate it are unchanged on the wire.
 type ErrorResponse struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
 
 // ManualAlertGroupRequest represents a request to create a manual alert group.
@@ -812,6 +826,52 @@ type TeamListResponse struct {
 	Total int               `json:"total"`
 }
 
+// teamsWithSchedule answers which of these teams have a live schedule.
+//
+// It reads the revision root rather than the legacy row. The legacy read now
+// refuses a revision-managed schedule outright (store.ErrScheduleSuperseded),
+// and the previous version of this loop discarded that error with `schedule,
+// _ :=`, so every configured team reported itself as unconfigured. The insured
+// failure became a silent wrong answer at exactly the point the insurance was
+// meant to make loud.
+//
+// So: absent and pre-revision schedules are "not configured", a soft-deleted
+// one is too, and any OTHER repository error fails the request. Swallowing
+// errors is what produced the defect; it is not reproduced here.
+//
+// One snapshot for the whole page, not one per team: the list is a single
+// answer, and reading each team in its own transaction would let a save
+// between two of them show a state no instant ever had.
+func (a *API) teamsWithSchedule(ctx context.Context, teams []*model.Team) (map[string]struct{}, error) {
+	out := make(map[string]struct{}, len(teams))
+	// The schedule stack is optional wiring; without it there is nothing to
+	// report and an empty set is the honest answer.
+	if a.scheduleRead == nil {
+		return out, nil
+	}
+
+	err := a.scheduleRead.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
+		for _, team := range teams {
+			root, err := view.GetScheduleRootByTeam(ctx, team.ID)
+			switch {
+			case errors.Is(err, scheduleconfig.ErrScheduleNotFound):
+				continue
+			case err != nil:
+				return err
+			}
+			if scheduleconfig.IsLegacyRoot(root) || root.DeletedAt != nil {
+				continue
+			}
+			out[team.ID] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ListTeams godoc
 // @Summary List teams
 // @Description Get all teams with configuration status
@@ -831,6 +891,11 @@ func (a *API) ListTeams(c echo.Context) error {
 		teams = []*model.Team{}
 	}
 
+	configured, err := a.teamsWithSchedule(c.Request().Context(), teams)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error(), Code: CodeInternal})
+	}
+
 	// Enrich teams with configuration status
 	enrichedTeams := make([]*TeamWithConfig, len(teams))
 	for i, team := range teams {
@@ -841,9 +906,7 @@ func (a *API) ListTeams(c echo.Context) error {
 			memberCount = len(members)
 		}
 
-		// Check if on-call schedule is configured
-		schedule, _ := a.store.GetScheduleByTeamID(team.ID)
-		onCallConfigured := schedule != nil
+		_, onCallConfigured := configured[team.ID]
 
 		enrichedTeams[i] = &TeamWithConfig{
 			Team:             team,

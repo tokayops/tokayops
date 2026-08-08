@@ -53,7 +53,8 @@ func (a *API) requireUserEraser(next echo.HandlerFunc) echo.HandlerFunc {
 }
 
 func serviceUnavailable(c echo.Context, what string) error {
-	return c.JSON(http.StatusServiceUnavailable, ErrorResponse{Error: what + " is not available"})
+	return c.JSON(http.StatusServiceUnavailable,
+		ErrorResponse{Error: what + " is not available", Code: CodeServiceUnavailable})
 }
 
 func actorID(c echo.Context) string {
@@ -131,7 +132,7 @@ func (a *API) PutScheduleConfig(c echo.Context) error {
 
 	var req PutScheduleConfigRequest
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		return badRequest(c, CodeInvalidRequestBody, "invalid request body")
 	}
 
 	ctx := c.Request().Context()
@@ -185,13 +186,13 @@ func (a *API) PostSchedulePreview(c echo.Context) error {
 
 	var req PutScheduleConfigRequest
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		return badRequest(c, CodeInvalidRequestBody, "invalid request body")
 	}
 	var until *time.Time
 	if raw := c.QueryParam("until"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339, raw)
 		if err != nil {
-			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid 'until' parameter"})
+			return badRequest(c, CodeInvalidParameter, "invalid 'until' parameter")
 		}
 		until = &parsed
 	}
@@ -230,8 +231,7 @@ func (a *API) DeleteTeamSchedule(c echo.Context) error {
 	// carried reliably by every client and proxy in the path.
 	expected, err := strconv.ParseInt(c.QueryParam("expected_version"), 10, 64)
 	if err != nil {
-		return c.JSON(http.StatusBadRequest,
-			ErrorResponse{Error: "expected_version query parameter is required"})
+		return badRequest(c, CodeInvalidParameter, "expected_version query parameter is required")
 	}
 
 	if err := a.scheduleConfig.Delete(c.Request().Context(), c.Param("id"), scheduleconfig.DeleteCommand{
@@ -257,13 +257,13 @@ func (a *API) DeleteTeamSchedule(c echo.Context) error {
 func (a *API) ListScheduleRevisions(c echo.Context) error {
 	limit, err := revisionLimit(c.QueryParam("limit"))
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		return badRequest(c, CodeInvalidParameter, err.Error())
 	}
 	var before *int64
 	if raw := c.QueryParam("before_version"); raw != "" {
 		parsed, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid before_version"})
+			return badRequest(c, CodeInvalidParameter, "invalid before_version")
 		}
 		before = &parsed
 	}
@@ -331,6 +331,52 @@ func (a *API) GetScheduleRevision(c echo.Context) error {
 		return a.mapScheduleError(c, err)
 	}
 	return c.JSON(http.StatusOK, out)
+}
+
+// GetScheduleOnCall godoc
+// @Summary Get who is on duty for a team right now
+// @Description The current-assignment projection, derived from the revision chain. A team with no schedule, a schedule from before the revision model and a deleted one all answer 200 with null layers: the question is who is on duty, and "nobody" is an answer.
+// @Tags schedules
+// @Produce json
+// @Param id path string true "Team ID"
+// @Success 200 {object} ScheduleOnCallResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /api/v1/teams/{id}/schedule/on-call [get]
+func (a *API) GetScheduleOnCall(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	var scheduleID string
+	err := a.scheduleRead.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
+		root, err := view.GetScheduleRootByTeam(ctx, c.Param("id"))
+		if err != nil {
+			return err
+		}
+		scheduleID = root.ID
+		return nil
+	})
+	// A team with no schedule, or one from before the revision model, is
+	// answered rather than refused: this endpoint reports who is on duty, and
+	// "nobody" is a true answer, not a missing resource. The widget tells the
+	// two states apart from GET /config, which it loads anyway - and a client
+	// forced to read 404 as "nobody" would swallow a real 404 from a mistyped
+	// team along with it.
+	//
+	// The empty schedule ID is then passed through rather than short-circuited:
+	// the projection of a schedule with no revisions is already "nobody at the
+	// service clock", and building that answer here would be a second place
+	// that decides what an absent schedule looks like.
+	if err != nil && !errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
+		return a.mapScheduleError(c, err)
+	}
+
+	onCall, err := a.scheduleRenderer.CurrentOnCallNow(ctx, scheduleID)
+	if err != nil {
+		return a.mapScheduleError(c, err)
+	}
+	return c.JSON(http.StatusOK, ScheduleOnCallResponse{
+		ScheduleID: scheduleID,
+		OnCall:     onCallDTO(onCall),
+	})
 }
 
 // ListScheduleOverrides godoc
