@@ -345,51 +345,26 @@ func (a *API) GetScheduleRevision(c echo.Context) error {
 func (a *API) GetScheduleOnCall(c echo.Context) error {
 	ctx := c.Request().Context()
 
-	var scheduleID string
-	var deletedAt *time.Time
-	var legacy bool
-	err := a.scheduleRead.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
-		root, err := view.GetScheduleRootByTeam(ctx, c.Param("id"))
-		if err != nil {
-			return err
-		}
-		scheduleID = root.ID
-		deletedAt = root.DeletedAt
-		legacy = scheduleconfig.IsLegacyRoot(root)
-		return nil
-	})
+	// One call, one snapshot. This is the most frequently read endpoint here,
+	// and fetching the root separately cost a second read-only transaction on
+	// every request; the renderer also owns the rules about absent,
+	// pre-revision and deleted schedules, which this handler used to keep its
+	// own copy of.
+	//
 	// A team with no schedule, or one from before the revision model, is
 	// answered rather than refused: this endpoint reports who is on duty, and
 	// "nobody" is a true answer, not a missing resource. A client forced to
 	// read 404 as "nobody" would swallow a real 404 from a mistyped team along
 	// with it.
-	//
-	// The empty schedule ID is then passed through rather than short-circuited:
-	// the projection of a schedule with no revisions is already "nobody at the
-	// service clock", and building that answer here would be a second place
-	// that decides what an absent schedule looks like.
-	if err != nil && !errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
-		return a.mapScheduleError(c, err)
-	}
-
-	onCall, err := a.scheduleRenderer.CurrentOnCallNow(ctx, scheduleID)
+	res, err := a.scheduleRenderer.CurrentTeamOnCallNow(ctx, c.Param("id"))
 	if err != nil {
 		return a.mapScheduleError(c, err)
 	}
 	return c.JSON(http.StatusOK, ScheduleOnCallResponse{
-		// A pre-revision row is reported as no schedule at all, which is what
-		// it is in this model - the same answer GET /config gives it.
-		ScheduleID: scheduleIDIfManaged(scheduleID, legacy),
-		DeletedAt:  deletedAt,
-		OnCall:     onCallDTO(onCall),
+		ScheduleID: res.ScheduleID,
+		DeletedAt:  res.DeletedAt,
+		OnCall:     onCallDTO(res.OnCall),
 	})
-}
-
-func scheduleIDIfManaged(scheduleID string, legacy bool) string {
-	if legacy {
-		return ""
-	}
-	return scheduleID
 }
 
 // ListScheduleOverrides godoc

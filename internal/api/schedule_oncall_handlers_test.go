@@ -308,6 +308,49 @@ func TestScheduleOnCallRefusesWhenUnwired(t *testing.T) {
 	}
 }
 
+// The endpoint answers from one read-only transaction.
+//
+// This is a cost test more than a correctness one: it is the most frequently
+// read thing in the product, and it used to open a second snapshot just to
+// fetch the root row. The assertion is here because that kind of regression is
+// invisible in behaviour - the answer stays right, it just costs twice as
+// much.
+func TestScheduleOnCallReadsOneSnapshot(t *testing.T) {
+	_, s, e, env := setupScheduleAPI(t)
+	defer s.Close()
+
+	env.SetNow(time.Date(2026, 5, 6, 15, 0, 0, 0, time.UTC))
+	createSchedule(t, e, []string{"denis"})
+
+	// Only the request under test is counted; creating the schedule takes its
+	// own reads.
+	env.Config.Calls = nil
+
+	rec := doJSON(t, e, http.MethodGet, onCallPath, nil, "denis")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// One entry into the read repository for the whole answer.
+	snapshots := 0
+	for _, call := range env.Config.Calls {
+		if call == "WithinSnapshot" {
+			snapshots++
+		}
+	}
+	if snapshots != 1 {
+		t.Fatalf("the endpoint opened %d read transactions, want exactly 1: %v",
+			snapshots, env.Config.Calls)
+	}
+
+	// And it still answers: schedule state and duty from the same read.
+	var out ScheduleOnCallResponse
+	decodeJSON(t, rec, &out)
+	if out.ScheduleID == "" || out.DeletedAt != nil || out.OnCall.L1 == nil {
+		t.Fatalf("inconsistent answer: %+v", out)
+	}
+}
+
 // A repository failure is not "nobody on call": answering an empty projection
 // would report the schedule as unstaffed, which is the worst way for this
 // endpoint to fail.
