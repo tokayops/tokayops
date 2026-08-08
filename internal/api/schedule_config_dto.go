@@ -54,7 +54,12 @@ type ScheduleConfigDTO struct {
 	L2               ScheduleL2DTO `json:"l2"`
 }
 
-// PutScheduleConfigRequest is the body of PUT /schedule/config.
+// PutScheduleConfigRequest is the body of PUT /schedule/config: the
+// configuration itself plus what the caller believes about it.
+//
+// The configuration is embedded rather than copied field by field, so the
+// request and the GET response cannot drift apart in shape. JSON promotes the
+// embedded fields to the top level, which is the wire format either way.
 type PutScheduleConfigRequest struct {
 	// ExpectedVersion is the config_version the editor loaded. Zero means
 	// "there is no schedule yet"; anything else must match or the save is
@@ -64,23 +69,7 @@ type PutScheduleConfigRequest struct {
 	// Reason is free text recorded with the revision.
 	Reason *string `json:"reason,omitempty"`
 
-	Timezone         string        `json:"timezone"`
-	SlackUsergroupID string        `json:"slack_usergroup_id,omitempty"`
-	L1               ScheduleL1DTO `json:"l1"`
-	L2               ScheduleL2DTO `json:"l2"`
-}
-
-// config converts the payload into the domain configuration. Only the shape
-// this layer owns is checked here - which strings are cadences, whether a
-// handoff time parses - because everything else is validated identically for
-// the save and the preview inside the domain.
-func (r *PutScheduleConfigRequest) config() ScheduleConfigDTO {
-	return ScheduleConfigDTO{
-		Timezone:         r.Timezone,
-		SlackUsergroupID: r.SlackUsergroupID,
-		L1:               r.L1,
-		L2:               r.L2,
-	}
+	ScheduleConfigDTO
 }
 
 func (d ScheduleConfigDTO) toConfiguration() rotation.ScheduleConfiguration {

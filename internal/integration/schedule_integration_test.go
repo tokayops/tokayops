@@ -28,13 +28,15 @@ func seedRevisionSchedule(t *testing.T, env *APIIntegrationEnv, teamID, actorID 
 		dto[i] = api.ScheduleGroupDTO{ID: ids[i], UserIDs: members}
 	}
 	body, err := json.Marshal(api.PutScheduleConfigRequest{
-		Timezone: "UTC",
-		L1: api.ScheduleL1DTO{
-			Enabled: true, RotationType: "daily", HandoffTime: "09:00", Groups: dto,
-		},
-		L2: api.ScheduleL2DTO{
-			EscalationTimeoutMinutes: 5, RotationType: "weekly",
-			HandoffTime: "09:00", HandoffDay: &monday,
+		ScheduleConfigDTO: api.ScheduleConfigDTO{
+			Timezone: "UTC",
+			L1: api.ScheduleL1DTO{
+				Enabled: true, RotationType: "daily", HandoffTime: "09:00", Groups: dto,
+			},
+			L2: api.ScheduleL2DTO{
+				EscalationTimeoutMinutes: 5, RotationType: "weekly",
+				HandoffTime: "09:00", HandoffDay: &monday,
+			},
 		},
 	})
 	if err != nil {
