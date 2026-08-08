@@ -62,16 +62,16 @@ func (s *Store) BindExternalIdentity(ei *model.ExternalIdentity) error {
 	}
 	ei.UpdatedAt = now
 
-	query := fmt.Sprintf(activeUserCTE, "$2") + `
+	query := activeUserCTE + `
 		INSERT INTO external_identities (id, user_id, provider, external_id, chat_id, display_name, created_at, updated_at)
-		SELECT $1, active.id, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7, $8 FROM active
+		SELECT $2, active.id, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7, $8 FROM active
 		ON CONFLICT (user_id, provider) DO UPDATE SET
 			external_id  = EXCLUDED.external_id,
 			chat_id      = EXCLUDED.chat_id,
 			display_name = EXCLUDED.display_name,
 			updated_at   = EXCLUDED.updated_at
 	`
-	res, err := s.db.Exec(query, ei.ID, ei.UserID, ei.Provider, ei.ExternalID, ei.ChatID, ei.DisplayName, ei.CreatedAt, ei.UpdatedAt)
+	res, err := s.db.Exec(query, ei.UserID, ei.ID, ei.Provider, ei.ExternalID, ei.ChatID, ei.DisplayName, ei.CreatedAt, ei.UpdatedAt)
 	if err != nil {
 		if isProviderExternalConflict(err) {
 			return ErrExternalIdentityAlreadyLinked
@@ -99,15 +99,20 @@ func (s *Store) BindExternalIdentity(ei *model.ExternalIdentity) error {
 // Callers can ignore (false, nil) silently and decide whether to surface the
 // already-linked conflict.
 func (s *Store) BindExternalIdentityIfAbsent(userID, provider, externalID, displayName string) (bool, error) {
-	// An erased user matches nothing in the CTE, so the result is the same as
-	// a conflict: nothing changed. That is the honest answer here - callers of
-	// this variant are documented to ignore (false, nil) - and the outcome
-	// that matters is that no identity was created.
-	res, err := s.db.Exec(fmt.Sprintf(activeUserCTE, "$2")+`
+	// KNOWN LIMITATION. ON CONFLICT DO NOTHING makes zero affected rows mean
+	// two things - "already linked" and "the user has been erased" - and this
+	// statement cannot tell them apart. Both come back as (false, nil).
+	//
+	// The security property holds either way: no identity is created for an
+	// erased user. What is lost is the ability to say why, and callers of this
+	// variant are documented to ignore (false, nil) anyway. Separating the two
+	// would cost a transaction - lock the user, then upsert - which is what a
+	// caller should reach for if it ever needs the distinction.
+	res, err := s.db.Exec(activeUserCTE+`
 		INSERT INTO external_identities (id, user_id, provider, external_id, chat_id, display_name, created_at, updated_at)
-		SELECT $1, active.id, $3, $4, NULL, NULLIF($5, ''), NOW(), NOW() FROM active
+		SELECT $2, active.id, $3, $4, NULL, NULLIF($5, ''), NOW(), NOW() FROM active
 		ON CONFLICT (user_id, provider) DO NOTHING
-	`, uuid.New().String(), userID, provider, externalID, displayName)
+	`, userID, uuid.New().String(), provider, externalID, displayName)
 	if err != nil {
 		if isProviderExternalConflict(err) {
 			return false, ErrExternalIdentityAlreadyLinked
@@ -214,9 +219,9 @@ func (s *Store) IssueLinkToken(userID, provider, externalID, token string, expir
 		return errors.New("token is required")
 	}
 	id := uuid.New().String()
-	query := fmt.Sprintf(activeUserCTE, "$2") + `
+	query := activeUserCTE + `
 		INSERT INTO link_tokens (id, user_id, provider, token_hash, external_id, attempts, expires_at, created_at)
-		SELECT $1, active.id, $3, $4, NULLIF($5, ''), 0, $6, NOW() FROM active
+		SELECT $2, active.id, $3, $4, NULLIF($5, ''), 0, $6, NOW() FROM active
 		ON CONFLICT (user_id, provider) DO UPDATE SET
 			token_hash  = EXCLUDED.token_hash,
 			external_id = EXCLUDED.external_id,
@@ -224,7 +229,7 @@ func (s *Store) IssueLinkToken(userID, provider, externalID, token string, expir
 			expires_at  = EXCLUDED.expires_at,
 			created_at  = NOW()
 	`
-	res, err := s.db.Exec(query, id, userID, provider, hashLinkToken(token), externalID, expiresAt)
+	res, err := s.db.Exec(query, userID, id, provider, hashLinkToken(token), externalID, expiresAt)
 	if err != nil {
 		return err
 	}
@@ -403,8 +408,12 @@ func (s *Store) ConsumeLinkToken(provider, token, externalID, chatID, displayNam
 		}
 		return nil, err
 	}
-	// The owner cannot change under a token hash, but saying so costs one
-	// comparison and turns a silent surprise into a refusal.
+	// Load-bearing, not a formality. The row was read once without a lock and
+	// again with one, and between those two reads it can be deleted and a new
+	// token issued under the same hash for somebody else. Binding then would
+	// give user B an identity while this transaction holds user A's lock -
+	// which is to say, with no protection for B at all. Refuse instead: the
+	// caller retries with a token whose owner is the one that got locked.
 	if userID != owner {
 		return nil, ErrLinkTokenInvalid
 	}

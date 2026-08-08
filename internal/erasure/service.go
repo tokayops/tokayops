@@ -122,18 +122,12 @@ func (s *Service) Erase(ctx context.Context, userID string) error {
 // expired override does not block - its history stays explainable without the
 // person, which is the whole point of anonymizing rather than deleting.
 //
-// The tails are passed in rather than read here: reading them is what takes
-// the last lock, and the instant the erasure is recorded at has to be captured
-// after that, not before.
+// The tails arrive already read, because reading them is what takes the last
+// lock and the instant has to be captured after that.
 func (s *Service) guardAssignments(ctx context.Context, tx Tx, userID string,
 	at time.Time, tails []ScheduleTail) error {
 
-	blocking := map[string]ScheduleRef{}
-	for _, tail := range tails {
-		if snapshotNames(tail.Snapshot, userID) {
-			blocking[tail.ScheduleID] = ScheduleRef{ScheduleID: tail.ScheduleID, TeamID: tail.TeamID}
-		}
-	}
+	blocking := blockedByRotation(tails, userID)
 
 	overrides, err := tx.ListLiveOverrideHeadsForUser(ctx, userID, at)
 	if err != nil {
@@ -152,6 +146,18 @@ func (s *Service) guardAssignments(ctx context.Context, tx Tx, userID string,
 	}
 	sort.Slice(refs, func(i, j int) bool { return refs[i].ScheduleID < refs[j].ScheduleID })
 	return &UserOnCallError{Schedules: refs}
+}
+
+// blockedByRotation is the half of the guard that needs nothing but the tails
+// it is given, keyed by schedule so the two sources cannot report one twice.
+func blockedByRotation(tails []ScheduleTail, userID string) map[string]ScheduleRef {
+	blocking := map[string]ScheduleRef{}
+	for _, tail := range tails {
+		if snapshotNames(tail.Snapshot, userID) {
+			blocking[tail.ScheduleID] = ScheduleRef{ScheduleID: tail.ScheduleID, TeamID: tail.TeamID}
+		}
+	}
+	return blocking
 }
 
 // guardLastAdmin refuses to erase the only administrator left.

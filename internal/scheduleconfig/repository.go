@@ -237,6 +237,18 @@ type ScheduleConfigTx interface {
 	// makes do with the unlocked membership read.
 	LockUsers(ctx context.Context, userIDs []string) error
 
+	// ActiveUserIDs filters a set of user IDs down to the ones that exist and
+	// have not been erased.
+	//
+	// It lives on the command side, not on the read view: the renderer has no
+	// use for it, and the one caller reads it with the rows already locked by
+	// LockUsers - which is what makes the answer stable long enough to act on.
+	//
+	// It asks a different question from GetTeamMemberIDs, which is team-scoped:
+	// the author of a change need not belong to the team whose schedule they
+	// are editing.
+	ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error)
+
 	// DeleteTeamMembership removes one membership. It is reachable only
 	// through Service.RemoveTeamMember, which holds the guard that stops a
 	// person being removed out from under a live assignment.

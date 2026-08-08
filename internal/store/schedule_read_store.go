@@ -6,8 +6,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/lib/pq"
-
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
@@ -101,32 +99,6 @@ func (v *scheduleReadView) GetRevisionsInRange(ctx context.Context, scheduleID s
 
 func (v *scheduleReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]scheduleconfig.OverrideRevision, error) {
 	return getOverrideProjection(ctx, v.q, scheduleID, from, until, asOf)
-}
-
-// ActiveUserIDs filters a set of IDs down to the users that have not been
-// erased. Unlike GetTeamMemberIDs this is not team-scoped: it answers "is this
-// person still someone", which is what an author has to be.
-func (v *scheduleReadView) ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error) {
-	if len(userIDs) == 0 {
-		return nil, nil
-	}
-	rows, err := v.q.QueryContext(ctx,
-		`SELECT id FROM users WHERE id = ANY($1) AND deleted_at IS NULL ORDER BY id`,
-		pq.Array(userIDs))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
 }
 
 // GetRevisionByID scopes the lookup by schedule as well as by revision. A

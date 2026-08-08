@@ -24,7 +24,7 @@ func (s *Service) CreateOverride(ctx context.Context, teamID string, cmd Overrid
 	err := s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
 		// Users before schedules, as in Save: the target of an override is an
 		// assignment, and the actor's reason text is theirs to have erased.
-		if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, []string{cmd.UserID})); err != nil {
+		if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, cmd.UserID)); err != nil {
 			return err
 		}
 		if err := requireActiveActor(ctx, tx, cmd.ActorID); err != nil {
@@ -81,7 +81,7 @@ func (s *Service) UpdateOverride(ctx context.Context, scheduleID, overrideID str
 	}
 	var updated *OverrideRevision
 	err := s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
-		if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, []string{cmd.UserID})); err != nil {
+		if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, cmd.UserID)); err != nil {
 			return err
 		}
 		if err := requireActiveActor(ctx, tx, cmd.ActorID); err != nil {
@@ -139,7 +139,7 @@ func (s *Service) DeleteOverride(ctx context.Context, scheduleID, overrideID str
 	return s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
 		// A delete adds no assignment, but it does record who did it and copies
 		// the reason forward, so the actor is still locked and checked.
-		if err := tx.LockUsers(ctx, commandUserIDs(actorID, nil)); err != nil {
+		if err := tx.LockUsers(ctx, commandUserIDs(actorID)); err != nil {
 			return err
 		}
 		if err := requireActiveActor(ctx, tx, actorID); err != nil {

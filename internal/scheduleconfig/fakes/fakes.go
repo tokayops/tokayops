@@ -522,22 +522,6 @@ func (v *fakeReadView) ListRevisions(ctx context.Context, scheduleID string, lim
 	return out, nil
 }
 
-func (v *fakeReadView) ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error) {
-	if err := v.record("ActiveUserIDs"); err != nil {
-		return nil, err
-	}
-	s := v.state()
-	var out []string
-	for _, id := range userIDs {
-		if s.erased[id] || !s.knownUsers[id] {
-			continue
-		}
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
 // GetTeamMemberIDs excludes erased users, the way the JOIN in the store does.
 func (v *fakeReadView) GetTeamMemberIDs(ctx context.Context, teamID string) ([]string, error) {
 	if err := v.record("GetTeamMemberIDs"); err != nil {
@@ -994,6 +978,22 @@ func (t *scheduleConfigTx) LockUsers(ctx context.Context, userIDs []string) erro
 	sort.Strings(locked)
 	t.repo.LockedUsers = append(t.repo.LockedUsers, locked)
 	return nil
+}
+
+func (t *scheduleConfigTx) ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error) {
+	if err := t.repo.record("ActiveUserIDs"); err != nil {
+		return nil, err
+	}
+	s := t.repo.state
+	var out []string
+	for _, id := range userIDs {
+		if s.erased[id] || !s.knownUsers[id] {
+			continue
+		}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (t *scheduleConfigTx) DeleteTeamMembership(ctx context.Context, teamID, userID string) error {

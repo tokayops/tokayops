@@ -21,8 +21,10 @@ var userOwnedWrites = []struct {
 	name string
 	// write creates something owned by userID.
 	write func(s StoreInterface, userID string) error
-	// wantErr is what the write must answer once the user is erased. Some
-	// paths report "nothing changed" instead, and say so here.
+	// tolerateSilence marks the paths that cannot report why they did nothing.
+	// Today that is only the DO NOTHING upsert, whose zero affected rows mean
+	// both "already linked" and "erased"; see BindExternalIdentityIfAbsent.
+	// Every other path must name ErrUserNotFound.
 	tolerateSilence bool
 }{
 	{

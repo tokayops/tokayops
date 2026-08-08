@@ -50,10 +50,6 @@ func (v *testScheduleView) GetTeamMemberIDs(ctx context.Context, teamID string) 
 	return activeTeamMemberIDs(v.store, teamID)
 }
 
-func (v *testScheduleView) ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error) {
-	return activeUserIDs(v.store, userIDs)
-}
-
 type testScheduleTx struct {
 	scheduleconfig.ScheduleConfigTx
 	store *store.MockStore

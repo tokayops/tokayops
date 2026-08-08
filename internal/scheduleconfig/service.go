@@ -190,7 +190,7 @@ func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	// Users before schedules, always. Erasure locks the user it is erasing and
 	// then scans schedules; a command that locked the schedule first and the
 	// users second would be the other half of an AB-BA deadlock.
-	if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, ConfigurationUserIDs(desired))); err != nil {
+	if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, ConfigurationUserIDs(desired)...)); err != nil {
 		return nil, err
 	}
 	if err := requireActiveActor(ctx, tx, cmd.ActorID); err != nil {
@@ -396,7 +396,7 @@ func (s *Service) CreateSchedule(ctx context.Context, teamID string,
 
 	var created *SaveResult
 	err = s.runCommand(ctx, func(tx ScheduleConfigTx) error {
-		if err := tx.LockUsers(ctx, commandUserIDs(actorID, ConfigurationUserIDs(desired))); err != nil {
+		if err := tx.LockUsers(ctx, commandUserIDs(actorID, ConfigurationUserIDs(desired)...)); err != nil {
 			return err
 		}
 		if err := requireActiveActor(ctx, tx, actorID); err != nil {
@@ -514,7 +514,7 @@ func (s *Service) Delete(ctx context.Context, teamID string, cmd DeleteCommand) 
 func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string, cmd DeleteCommand) (*commitLog, error) {
 	// The deleted revision records the actor and their reason, so the actor is
 	// locked and checked here exactly as in a save.
-	if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, nil)); err != nil {
+	if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID)); err != nil {
 		return nil, err
 	}
 	if err := requireActiveActor(ctx, tx, cmd.ActorID); err != nil {
@@ -753,7 +753,7 @@ func checkDeletionConsistency(root *ScheduleRoot, tail *ScheduleRevision) error 
 // change reason, an override reason - and erasure promises to have cleared
 // everything an erased person wrote. Without the lock a save can commit just
 // after an erasure and leave behind text that nothing will ever clean again.
-func commandUserIDs(actorID string, configured []string) []string {
+func commandUserIDs(actorID string, configured ...string) []string {
 	if actorID == "" {
 		return configured
 	}
@@ -770,13 +770,13 @@ func commandUserIDs(actorID string, configured []string) []string {
 // It runs with the actor's row already locked, so the answer cannot change
 // underneath. Being authorized when the request arrived is not the same as
 // still existing when it writes.
-func requireActiveActor(ctx context.Context, view ScheduleReadView, actorID string) error {
+func requireActiveActor(ctx context.Context, tx ScheduleConfigTx, actorID string) error {
 	if actorID == "" {
 		// A programmatic caller with no author. Nothing it writes carries a
 		// person's name, so there is nobody for erasure to have missed.
 		return nil
 	}
-	active, err := view.ActiveUserIDs(ctx, []string{actorID})
+	active, err := tx.ActiveUserIDs(ctx, []string{actorID})
 	if err != nil {
 		return err
 	}

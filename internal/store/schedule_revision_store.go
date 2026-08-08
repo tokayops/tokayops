@@ -255,6 +255,32 @@ func (t *scheduleConfigTx) LockUsers(ctx context.Context, userIDs []string) erro
 	return rows.Err()
 }
 
+// ActiveUserIDs filters a set of IDs down to the users that have not been
+// erased. It is a command-side read: the caller holds the shared lock on these
+// rows already, so the answer cannot change before it is acted on.
+func (t *scheduleConfigTx) ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := t.tx.QueryContext(ctx,
+		`SELECT id FROM users WHERE id = ANY($1) AND deleted_at IS NULL ORDER BY id`,
+		pq.Array(userIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // DeleteTeamMembership removes one membership.
 //
 // A membership that is not there is not an error: the caller asked for the

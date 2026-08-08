@@ -26,8 +26,14 @@ import (
 //
 // Without the lock the predicate alone is not enough: an insert that was still
 // uncommitted when erasure deleted the table would survive it.
+//
+// THE USER ID IS ALWAYS $1. That is the whole convention, and it is why this
+// is a constant concatenated onto a query rather than a format string: a
+// placeholder index chosen per call site is a silent coupling to the argument
+// order, and getting it wrong locks the wrong person while every test that
+// uses one user still passes.
 const activeUserCTE = `WITH active AS (
-	SELECT id FROM users WHERE id = %s AND deleted_at IS NULL FOR SHARE
+	SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR SHARE
 )`
 
 // lockActiveUserTx is activeUserCTE for a transaction that writes more than
@@ -56,6 +62,14 @@ var ErrUserNotFound = errors.New("store: user not found")
 // administrator. It is a sentinel because the API has to answer 409 for it,
 // and the alternative - matching on the message text - is a contract nobody
 // can see and the mock could never reproduce.
+//
+// erasure declares a sentinel of the same name for the same invariant seen
+// from its side. The duplication is deliberate and is the second instance of
+// this trade in the codebase, after UserOnCallError and MemberOnCallError: the
+// erasure package knows nothing about the store, and one shared sentinel would
+// buy a line of code at the price of an import that means nothing. If a third
+// instance appears, that is the signal to give these invariants a home of
+// their own rather than to keep paying.
 var ErrLastAdmin = errors.New("store: cannot demote the last admin")
 
 // ErrScheduleSuperseded means the schedule row belongs to the revision model
@@ -2378,6 +2392,14 @@ func scanUser(row *sql.Row) (*model.User, error) {
 	return &u, nil
 }
 
+// GetUsersByIDs is a DISPLAY read and deliberately does NOT filter erased
+// users, unlike GetAllUsers directly above it.
+//
+// This is what hydrates names onto rendered history, and history names people
+// who have since been erased: dropping them here would leave a shift with an
+// ID and no name at all, which is worse than "Deleted user". The rule is by
+// purpose, not by table - "align these two" is a change that silently breaks
+// the calendar.
 func (s *Store) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	if len(ids) == 0 {
 		return []*model.User{}, nil
@@ -2436,11 +2458,11 @@ func (s *Store) GetAllUsers() ([]*model.User, error) {
 // AddTeamMember grants a membership, and only to a user who has not been
 // erased: a bare INSERT would hand an erased identity a live grant back.
 func (s *Store) AddTeamMember(teamID, userID string, role model.TeamMemberRole) error {
-	query := fmt.Sprintf(activeUserCTE, "$2") + `
+	query := activeUserCTE + `
 		INSERT INTO team_members (team_id, user_id, role)
-		SELECT $1, active.id, $3 FROM active
+		SELECT $2, active.id, $3 FROM active
 		ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`
-	res, err := s.db.Exec(query, teamID, userID, role)
+	res, err := s.db.Exec(query, userID, teamID, role)
 	if err != nil {
 		return err
 	}
@@ -3134,10 +3156,10 @@ func (s *Store) CreateAPIToken(token *model.APIToken) error {
 	if token.CreatedAt.IsZero() {
 		token.CreatedAt = time.Now()
 	}
-	query := fmt.Sprintf(activeUserCTE, "$2") + `
+	query := activeUserCTE + `
 		INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, created_at)
-		SELECT $1, active.id, $3, $4, $5, $6 FROM active`
-	res, err := s.db.Exec(query, token.ID, token.UserID, token.Name, token.TokenHash, token.ExpiresAt, token.CreatedAt)
+		SELECT $2, active.id, $3, $4, $5, $6 FROM active`
+	res, err := s.db.Exec(query, token.UserID, token.ID, token.Name, token.TokenHash, token.ExpiresAt, token.CreatedAt)
 	if err != nil {
 		return err
 	}
