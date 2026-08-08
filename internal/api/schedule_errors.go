@@ -33,6 +33,10 @@ var scheduleErrorStatuses = []struct {
 	{scheduleconfig.ErrLegacySchedule, http.StatusConflict,
 		"this schedule predates the revision model and must be reset before it can be edited"},
 	{erasure.ErrLastAdmin, http.StatusConflict, "last active admin"},
+
+	// 401, not 403: the caller was authorized when the request arrived and has
+	// been erased since. There is no permission they could be granted.
+	{scheduleconfig.ErrActorNotActive, http.StatusUnauthorized, "user not found"},
 }
 
 // mapScheduleError is the ONLY translation from a command-side error to an

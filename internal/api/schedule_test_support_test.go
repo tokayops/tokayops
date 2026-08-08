@@ -50,6 +50,10 @@ func (v *testScheduleView) GetTeamMemberIDs(ctx context.Context, teamID string) 
 	return activeTeamMemberIDs(v.store, teamID)
 }
 
+func (v *testScheduleView) ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error) {
+	return activeUserIDs(v.store, userIDs)
+}
+
 type testScheduleTx struct {
 	scheduleconfig.ScheduleConfigTx
 	store *store.MockStore
@@ -57,6 +61,10 @@ type testScheduleTx struct {
 
 func (t *testScheduleTx) GetTeamMemberIDs(ctx context.Context, teamID string) ([]string, error) {
 	return activeTeamMemberIDs(t.store, teamID)
+}
+
+func (t *testScheduleTx) ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error) {
+	return activeUserIDs(t.store, userIDs)
 }
 
 func (t *testScheduleTx) DeleteTeamMembership(ctx context.Context, teamID, userID string) error {
@@ -76,6 +84,19 @@ func activeTeamMemberIDs(s *store.MockStore, teamID string) ([]string, error) {
 			continue
 		}
 		out = append(out, m.ID)
+	}
+	return out, nil
+}
+
+// activeUserIDs answers "which of these people still exist" from the mock,
+// which is where the API tests keep users.
+func activeUserIDs(s *store.MockStore, userIDs []string) ([]string, error) {
+	var out []string
+	for _, id := range userIDs {
+		if _, err := s.GetActiveUserByID(id); err != nil {
+			continue
+		}
+		out = append(out, id)
 	}
 	return out, nil
 }

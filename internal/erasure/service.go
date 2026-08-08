@@ -52,7 +52,6 @@ func (s *Service) Erase(ctx context.Context, userID string) error {
 	if userID == "" {
 		return ErrUserNotFound
 	}
-	erasedAt := s.now().UTC()
 
 	return s.repo.WithinTx(ctx, func(tx Tx) error {
 		if err := tx.LockAdminLifecycle(ctx); err != nil {
@@ -66,7 +65,23 @@ func (s *Service) Erase(ctx context.Context, userID string) error {
 			return nil
 		}
 
-		if err := s.guardAssignments(ctx, tx, userID, erasedAt); err != nil {
+		// The schedule scan is the LAST thing that can block, because it takes
+		// a shared lock on rows a save holds exclusively. Everything above it
+		// can wait too, so the instant is captured only once every lock this
+		// transaction needs is held.
+		//
+		// Capturing it any earlier backdates the erasure across somebody
+		// else's commit. An erasure that stamped T0, then waited here for a
+		// save that removed the user from the rotation at T1, would leave
+		// history claiming they were already gone throughout T0..T1 - while
+		// the revision in force still had them on call.
+		tails, err := tx.ListScheduleTailsLocked(ctx)
+		if err != nil {
+			return err
+		}
+		erasedAt := s.now().UTC()
+
+		if err := s.guardAssignments(ctx, tx, userID, erasedAt, tails); err != nil {
 			return err
 		}
 		if err := guardLastAdmin(ctx, tx, user); err != nil {
@@ -106,11 +121,13 @@ func (s *Service) Erase(ctx context.Context, userID string) error {
 // or future assignment pointing at an identity that no longer resolves. An
 // expired override does not block - its history stays explainable without the
 // person, which is the whole point of anonymizing rather than deleting.
-func (s *Service) guardAssignments(ctx context.Context, tx Tx, userID string, at time.Time) error {
-	tails, err := tx.ListScheduleTailsLocked(ctx)
-	if err != nil {
-		return err
-	}
+//
+// The tails are passed in rather than read here: reading them is what takes
+// the last lock, and the instant the erasure is recorded at has to be captured
+// after that, not before.
+func (s *Service) guardAssignments(ctx context.Context, tx Tx, userID string,
+	at time.Time, tails []ScheduleTail) error {
+
 	blocking := map[string]ScheduleRef{}
 	for _, tail := range tails {
 		if snapshotNames(tail.Snapshot, userID) {

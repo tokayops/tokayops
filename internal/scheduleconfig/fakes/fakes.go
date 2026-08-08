@@ -54,17 +54,23 @@ type fakeState struct {
 	// rollback has to put it back.
 	members map[string][]string
 	erased  map[string]bool
+
+	// knownUsers is everyone who exists, member or not. An actor need not
+	// belong to the team whose schedule they edit, so "is a member" and "is a
+	// person" are different questions here as they are in the store.
+	knownUsers map[string]bool
 }
 
 func newState() fakeState {
 	return fakeState{
-		roots:     map[string]scheduleconfig.ScheduleRoot{},
-		teamIndex: map[string]string{},
-		revisions: map[string][]scheduleconfig.ScheduleRevision{},
-		overrides: map[string][]scheduleconfig.OverrideRevision{},
-		events:    map[string][]scheduleconfig.ScheduleEvent{},
-		members:   map[string][]string{},
-		erased:    map[string]bool{},
+		roots:      map[string]scheduleconfig.ScheduleRoot{},
+		teamIndex:  map[string]string{},
+		revisions:  map[string][]scheduleconfig.ScheduleRevision{},
+		overrides:  map[string][]scheduleconfig.OverrideRevision{},
+		events:     map[string][]scheduleconfig.ScheduleEvent{},
+		members:    map[string][]string{},
+		erased:     map[string]bool{},
+		knownUsers: map[string]bool{},
 	}
 }
 
@@ -95,6 +101,9 @@ func (s fakeState) clone() fakeState {
 	}
 	for k, v := range s.erased {
 		c.erased[k] = v
+	}
+	for k, v := range s.knownUsers {
+		c.knownUsers[k] = v
 	}
 	return c
 }
@@ -331,11 +340,25 @@ func (r *ScheduleConfigRepo) SeedLegacyRoot(scheduleID, teamID string) {
 	r.state.teamIndex[teamID] = scheduleID
 }
 
-// SetTeamMembers replaces a team's membership.
+// SetTeamMembers replaces a team's membership. The members are people, so they
+// are registered as existing users too.
 func (r *ScheduleConfigRepo) SetTeamMembers(teamID string, userIDs ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.state.members[teamID] = append([]string(nil), userIDs...)
+	for _, id := range userIDs {
+		r.state.knownUsers[id] = true
+	}
+}
+
+// AddUsers registers people who exist without belonging to any team - a global
+// admin acting on someone else's schedule, for instance.
+func (r *ScheduleConfigRepo) AddUsers(userIDs ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range userIDs {
+		r.state.knownUsers[id] = true
+	}
 }
 
 // TeamMembers reports a team's membership, erased users included: it is the
@@ -496,6 +519,22 @@ func (v *fakeReadView) ListRevisions(ctx context.Context, scheduleID string, lim
 	if limit >= 0 && len(out) > limit {
 		out = out[:limit]
 	}
+	return out, nil
+}
+
+func (v *fakeReadView) ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error) {
+	if err := v.record("ActiveUserIDs"); err != nil {
+		return nil, err
+	}
+	s := v.state()
+	var out []string
+	for _, id := range userIDs {
+		if s.erased[id] || !s.knownUsers[id] {
+			continue
+		}
+		out = append(out, id)
+	}
+	sort.Strings(out)
 	return out, nil
 }
 

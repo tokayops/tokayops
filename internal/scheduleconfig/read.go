@@ -87,6 +87,14 @@ type ScheduleReadView interface {
 	// it against a concurrent membership change.
 	GetTeamMemberIDs(ctx context.Context, teamID string) ([]string, error)
 
+	// ActiveUserIDs filters a set of user IDs down to the ones that exist and
+	// have not been erased.
+	//
+	// It answers a different question from GetTeamMemberIDs, which is
+	// team-scoped: the author of a change need not be a member of the team
+	// whose schedule they are editing.
+	ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error)
+
 	// GetOverrideHead returns the LAST revision of one logical override,
 	// including a tombstone. The projection deliberately hides tombstones, but
 	// an update, a delete and an ownership check all have to tell "deleted"

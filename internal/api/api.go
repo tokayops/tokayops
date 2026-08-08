@@ -1404,10 +1404,14 @@ func (a *API) UpdateUser(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid role"})
 		}
 
-		// Enforce safety check (e.g. Last Admin) via SetUserRole
+		// Role changes go through SetUserRole and nowhere else: it is what
+		// serializes the last-admin invariant against erasure.
 		if err := a.store.SetUserRole(user.ID, model.UserRole(req.Role)); err != nil {
-			if err.Error() == "cannot demote the last admin" {
-				return c.JSON(http.StatusConflict, ErrorResponse{Error: err.Error()})
+			switch {
+			case errors.Is(err, store.ErrLastAdmin):
+				return c.JSON(http.StatusConflict, ErrorResponse{Error: "cannot demote the last admin"})
+			case errors.Is(err, store.ErrUserNotFound):
+				return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 			}
 			return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 		}

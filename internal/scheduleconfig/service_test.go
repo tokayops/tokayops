@@ -51,6 +51,9 @@ func newService(t *testing.T, now time.Time) (*scheduleconfig.Service, *fakes.Sc
 	t.Helper()
 	repo := fakes.NewScheduleConfigRepo()
 	repo.SetTeamMembers("devops", "alice", "bob", "carol", "dave")
+	// The actor exists without being on the team: an admin editing someone
+	// else's schedule is the normal case.
+	repo.AddUsers("actor")
 	n := 0
 	svc := scheduleconfig.NewService(repo,
 		scheduleconfig.WithClock(func() time.Time { return now }),
@@ -190,6 +193,7 @@ func TestCreateScheduleRejectsInvalidInputBeforeWriting(t *testing.T) {
 func TestCreateScheduleRejectsWhatTheDatabaseWouldReject(t *testing.T) {
 	repo := fakes.NewScheduleConfigRepo()
 	repo.SetTeamMembers("devops", "alice", "bob")
+	repo.AddUsers("actor")
 	n := 0
 	svc := scheduleconfig.NewService(repo, scheduleconfig.WithIDSource(func() string {
 		n++

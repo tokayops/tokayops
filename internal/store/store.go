@@ -15,10 +15,48 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// activeUserCTE is the head of every statement that creates something owned by
+// a user: a token, an identity, a link, a membership.
+//
+// It does two jobs in one statement, and both are needed. The predicate makes
+// "this user is alive" and "the row is inserted" atomic, so there is no window
+// between checking and writing. The FOR SHARE makes erasure - which takes FOR
+// UPDATE on the same row - wait for this transaction, so its sweep of the
+// child tables runs after the insert rather than before it and misses nothing.
+//
+// Without the lock the predicate alone is not enough: an insert that was still
+// uncommitted when erasure deleted the table would survive it.
+const activeUserCTE = `WITH active AS (
+	SELECT id FROM users WHERE id = %s AND deleted_at IS NULL FOR SHARE
+)`
+
+// lockActiveUserTx is activeUserCTE for a transaction that writes more than
+// one statement: take the shared lock on the user first, and only then touch
+// the rows that belong to them.
+//
+// Order matters as much as the lock. Erasure locks the user and then deletes
+// the child rows; a transaction that locked a child row first and reached for
+// the user second would be the other half of an AB-BA deadlock.
+func lockActiveUserTx(tx *sql.Tx, userID string) error {
+	var id string
+	err := tx.QueryRow(
+		`SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR SHARE`, userID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrUserNotFound
+	}
+	return err
+}
+
 // ErrUserNotFound means no user matched, or the one that did has been erased.
 // The two are the same answer on purpose: a command must not be able to tell
 // "this person never existed" from "this person was deleted".
 var ErrUserNotFound = errors.New("store: user not found")
+
+// ErrLastAdmin means the change would leave the system with no active
+// administrator. It is a sentinel because the API has to answer 409 for it,
+// and the alternative - matching on the message text - is a contract nobody
+// can see and the mock could never reproduce.
+var ErrLastAdmin = errors.New("store: cannot demote the last admin")
 
 // ErrScheduleSuperseded means the schedule row belongs to the revision model
 // and the legacy readers must not answer from its mutable columns.
@@ -2367,8 +2405,12 @@ func (s *Store) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	return users, nil
 }
 
+// GetAllUsers lists the people who exist. An erased user is a tombstone kept
+// so history resolves, not a member of the directory - and the mock has always
+// said so, which meant unit tests and production disagreed.
 func (s *Store) GetAllUsers() ([]*model.User, error) {
-	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at FROM users ORDER BY name`
+	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at
+			  FROM users WHERE deleted_at IS NULL ORDER BY name`
 	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
@@ -2394,9 +2436,10 @@ func (s *Store) GetAllUsers() ([]*model.User, error) {
 // AddTeamMember grants a membership, and only to a user who has not been
 // erased: a bare INSERT would hand an erased identity a live grant back.
 func (s *Store) AddTeamMember(teamID, userID string, role model.TeamMemberRole) error {
-	query := `INSERT INTO team_members (team_id, user_id, role)
-			  SELECT $1, $2, $3 FROM users WHERE id = $2 AND deleted_at IS NULL
-			  ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`
+	query := fmt.Sprintf(activeUserCTE, "$2") + `
+		INSERT INTO team_members (team_id, user_id, role)
+		SELECT $1, active.id, $3 FROM active
+		ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`
 	res, err := s.db.Exec(query, teamID, userID, role)
 	if err != nil {
 		return err
@@ -2465,9 +2508,16 @@ func (s *Store) GetUserByEmail(email string) (*model.User, error) {
 // the row count, an update that matched nothing reports success, which reads
 // as "the change was applied" to every caller.
 
+// UpdateUser writes profile fields only. role is deliberately NOT among them.
+//
+// Role is an invariant, not a field: the system must keep one active
+// administrator, and SetUserRole is what serializes that check against
+// erasure. A profile update that also carried role could undo a promotion it
+// never saw - read B as a user, let someone promote B and erase the last other
+// admin, then write B back as a user and leave nobody in charge.
 func (s *Store) UpdateUser(u *model.User) error {
-	query := `UPDATE users SET email = $1, name = $2, role = $3 WHERE id = $4 AND deleted_at IS NULL`
-	res, err := s.db.Exec(query, u.Email, u.Name, u.Role, u.ID)
+	query := `UPDATE users SET email = $1, name = $2 WHERE id = $3 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, u.Email, u.Name, u.ID)
 	if err != nil {
 		return err
 	}
@@ -2562,7 +2612,7 @@ func (s *Store) SetUserRole(userID string, role model.UserRole) error {
 			return err
 		}
 		if adminCount <= 1 {
-			return fmt.Errorf("cannot demote the last admin")
+			return ErrLastAdmin
 		}
 	}
 
@@ -3078,15 +3128,20 @@ func (s *Store) GetCurrentEpoch(scheduleID, layer string) (*model.RotationEpoch,
 // API Tokens CRUD
 // ========================================
 
-// CreateAPIToken creates a new API token
+// CreateAPIToken issues a token, and only to a user who has not been erased.
+// A credential is the last thing an erased identity should get back.
 func (s *Store) CreateAPIToken(token *model.APIToken) error {
 	if token.CreatedAt.IsZero() {
 		token.CreatedAt = time.Now()
 	}
-	query := `INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, created_at) 
-			  VALUES ($1, $2, $3, $4, $5, $6)`
-	_, err := s.db.Exec(query, token.ID, token.UserID, token.Name, token.TokenHash, token.ExpiresAt, token.CreatedAt)
-	return err
+	query := fmt.Sprintf(activeUserCTE, "$2") + `
+		INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, created_at)
+		SELECT $1, active.id, $3, $4, $5, $6 FROM active`
+	res, err := s.db.Exec(query, token.ID, token.UserID, token.Name, token.TokenHash, token.ExpiresAt, token.CreatedAt)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 // GetAPITokenByHash retrieves an API token by its hash
@@ -3113,9 +3168,18 @@ func (s *Store) GetAPITokenByID(id string) (*model.APIToken, error) {
 	return &token, nil
 }
 
+// GetAPITokenByHash resolves a bearer token, and a token belonging to an
+// erased user does not resolve.
+//
+// The join is what makes soft delete terminal on this path. The cookie path
+// checks the user; without this, a token that outlived its owner by a race
+// would keep authenticating one, and Bearer requests never look at users at
+// all.
 func (s *Store) GetAPITokenByHash(hash string) (*model.APIToken, error) {
-	query := `SELECT id, user_id, name, token_hash, expires_at, last_used_at, created_at 
-			  FROM api_tokens WHERE token_hash = $1`
+	query := `SELECT t.id, t.user_id, t.name, t.token_hash, t.expires_at, t.last_used_at, t.created_at
+			  FROM api_tokens t
+			  JOIN users u ON u.id = t.user_id AND u.deleted_at IS NULL
+			  WHERE t.token_hash = $1`
 	row := s.db.QueryRow(query, hash)
 
 	var token model.APIToken

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
@@ -934,5 +935,266 @@ func assertNoErasedUserOnCall(t *testing.T, s *Store, userID string, errs ...err
 				}
 			}
 		}
+	}
+}
+
+// Erasure has to be terminal against every path that creates something owned
+// by a user, not only against schedule assignments. Each of these ran
+// concurrently with an erasure before the shared lock protocol existed, and
+// each could leave the erased user holding a live credential, identity, link
+// or membership.
+func TestConcurrentUserOwnedWritesAndErasure(t *testing.T) {
+	writes := []struct {
+		name string
+		// create runs against a user that may be erased underneath it. It
+		// returns the error the store gave.
+		create func(s *Store, userID string) error
+		// survivors counts what the write would have left behind.
+		survivors func(t *testing.T, s *Store, userID string) int
+	}{
+		{
+			name: "api token",
+			create: func(s *Store, userID string) error {
+				return s.CreateAPIToken(&model.APIToken{
+					ID: "tok-" + userID, UserID: userID, Name: "ci", TokenHash: "hash-" + userID,
+				})
+			},
+			survivors: func(t *testing.T, s *Store, userID string) int {
+				return countRows(t, s, `SELECT COUNT(*) FROM api_tokens WHERE user_id = $1`, userID)
+			},
+		},
+		{
+			name: "external identity",
+			create: func(s *Store, userID string) error {
+				return s.BindExternalIdentity(&model.ExternalIdentity{
+					UserID: userID, Provider: "slack", ExternalID: "U-" + userID,
+				})
+			},
+			survivors: func(t *testing.T, s *Store, userID string) int {
+				return countRows(t, s, `SELECT COUNT(*) FROM external_identities WHERE user_id = $1`, userID)
+			},
+		},
+		{
+			name: "link token",
+			create: func(s *Store, userID string) error {
+				return s.IssueLinkToken(userID, "telegram", "", "123456", time.Now().Add(time.Hour))
+			},
+			survivors: func(t *testing.T, s *Store, userID string) int {
+				return countRows(t, s, `SELECT COUNT(*) FROM link_tokens WHERE user_id = $1`, userID)
+			},
+		},
+		{
+			name: "team membership",
+			create: func(s *Store, userID string) error {
+				return s.AddTeamMember("devops", userID, model.TeamMemberRoleMember)
+			},
+			survivors: func(t *testing.T, s *Store, userID string) int {
+				return countRows(t, s, `SELECT COUNT(*) FROM team_members WHERE user_id = $1`, userID)
+			},
+		},
+	}
+
+	for _, w := range writes {
+		t.Run(w.name, func(t *testing.T) {
+			s := setupTestDB(t)
+			seedTeam(t, s, "devops", "alice")
+			if err := s.CreateUser(&model.User{ID: "carol", Name: "carol",
+				Email: "carol@example.test"}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			// alice is the bootstrap admin; carol must not be the last one.
+			if err := s.SetUserRole("alice", model.UserRoleAdmin); err != nil {
+				t.Fatalf("SetUserRole: %v", err)
+			}
+			ctx := context.Background()
+
+			var (
+				wg        sync.WaitGroup
+				createErr error
+				eraseErr  error
+				start     = make(chan struct{})
+			)
+			wg.Add(2)
+			go func() { defer wg.Done(); <-start; createErr = w.create(s, "carol") }()
+			go func() {
+				defer wg.Done()
+				<-start
+				eraseErr = erasure.NewService(s.ErasureRepository()).Erase(ctx, "carol")
+			}()
+			close(start)
+			wg.Wait()
+
+			requireNoDeadlock(t, createErr)
+			requireNoDeadlock(t, eraseErr)
+			if eraseErr != nil {
+				t.Fatalf("erasure was refused: %v", eraseErr)
+			}
+			// Whichever order the two committed in, nothing may be left: either
+			// the create was refused because the user was already gone, or it
+			// committed first and the erasure swept it.
+			if n := w.survivors(t, s, "carol"); n != 0 {
+				t.Fatalf("%d rows survived the erasure (create error: %v)", n, createErr)
+			}
+			if _, err := s.GetActiveUserByID("carol"); !errors.Is(err, ErrUserNotFound) {
+				t.Fatalf("carol is still active after erasure: %v", err)
+			}
+		})
+	}
+}
+
+// A bearer token is the one credential that never looked at users at all.
+func TestErasedUserBearerTokenStopsResolving(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops", "alice")
+	// The bootstrap rule makes the first user an admin, and the last one
+	// cannot be erased; this test is about tokens, not about that guard.
+	if err := s.CreateUser(&model.User{ID: "root", Name: "root",
+		Email: "root@example.test", Role: model.UserRoleAdmin}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := s.SetUserRole("root", model.UserRoleAdmin); err != nil {
+		t.Fatalf("SetUserRole: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := s.CreateAPIToken(&model.APIToken{
+		ID: "tok-1", UserID: "alice", Name: "ci", TokenHash: "hash-1",
+	}); err != nil {
+		t.Fatalf("CreateAPIToken: %v", err)
+	}
+	if _, err := s.GetAPITokenByHash("hash-1"); err != nil {
+		t.Fatalf("token should resolve before the erasure: %v", err)
+	}
+
+	if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "alice"); err != nil {
+		t.Fatalf("Erase: %v", err)
+	}
+	if _, err := s.GetAPITokenByHash("hash-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("token lookup after erasure = %v, want no rows", err)
+	}
+
+	// And a row that somehow outlived the sweep still resolves to nothing.
+	if _, err := s.db.Exec(
+		`INSERT INTO api_tokens (id, user_id, name, token_hash, created_at)
+		 VALUES ('tok-2', 'alice', 'stray', 'hash-2', NOW())`); err != nil {
+		t.Fatalf("insert stray token: %v", err)
+	}
+	if _, err := s.GetAPITokenByHash("hash-2"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("a stray token of an erased user resolved: %v", err)
+	}
+	if _, err := s.GetUserByExternalID("slack", "U-alice"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("an erased user was found by external id: %v", err)
+	}
+}
+
+// A command records its author's free text, and erasure promises to have
+// cleared everything that author wrote. Whichever order they commit in, no
+// reason authored by the erased user may be left behind.
+func TestConcurrentSaveAndActorErasure(t *testing.T) {
+	s := setupTestDB(t)
+	at := time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC)
+	seedCommandSchedule(t, s, at)
+	if err := s.CreateUser(&model.User{ID: "editor", Name: "editor",
+		Email: "editor@example.test"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	ctx := context.Background()
+
+	reason := "reorganising the rota"
+	var (
+		wg       sync.WaitGroup
+		saveErr  error
+		eraseErr error
+		start    = make(chan struct{})
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, saveErr = newTestScheduleService(s, at.Add(time.Hour)).Save(ctx, "devops",
+			scheduleconfig.SaveCommand{
+				ExpectedVersion: 1,
+				Desired:         cmdConfig("bob", "alice"),
+				ActorID:         "editor",
+				Reason:          &reason,
+			})
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		eraseErr = erasure.NewService(s.ErasureRepository()).Erase(ctx, "editor")
+	}()
+	close(start)
+	wg.Wait()
+
+	requireNoDeadlock(t, saveErr)
+	requireNoDeadlock(t, eraseErr)
+	if eraseErr != nil {
+		t.Fatalf("erasure was refused: %v", eraseErr)
+	}
+	if n := countRows(t, s,
+		`SELECT COUNT(*) FROM schedule_revisions WHERE created_by = $1 AND change_reason IS NOT NULL`,
+		"editor"); n != 0 {
+		t.Fatalf("%d change reasons written by an erased author survived (save error: %v)", n, saveErr)
+	}
+}
+
+// Demoting and updating a profile are different operations on different
+// fields. A profile write that also carried role could undo a promotion it
+// never saw and leave the system without an administrator.
+func TestUpdateUserDoesNotChangeRole(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops")
+	if err := s.CreateUser(&model.User{ID: "root", Name: "root",
+		Email: "root@example.test", Role: model.UserRoleAdmin}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := s.SetUserRole("root", model.UserRoleAdmin); err != nil {
+		t.Fatalf("SetUserRole: %v", err)
+	}
+
+	// A stale profile write that believes root is an ordinary user.
+	if err := s.UpdateUser(&model.User{ID: "root", Name: "Root Renamed",
+		Email: "root@example.test", Role: model.UserRoleUser}); err != nil {
+		t.Fatalf("UpdateUser: %v", err)
+	}
+
+	user, err := s.GetActiveUserByID("root")
+	if err != nil {
+		t.Fatalf("GetActiveUserByID: %v", err)
+	}
+	if user.Role != model.UserRoleAdmin {
+		t.Fatalf("role = %q, want it untouched by a profile update", user.Role)
+	}
+	if user.Name != "Root Renamed" {
+		t.Fatalf("name = %q, want the profile update applied", user.Name)
+	}
+	if count, err := s.CountAdmins(); err != nil || count != 1 {
+		t.Fatalf("CountAdmins = %d (%v), want the administrator still there", count, err)
+	}
+}
+
+// An erased user is a tombstone kept so history resolves, not a directory
+// entry. The mock has always said so; the store now agrees.
+func TestGetAllUsersExcludesErased(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops", "alice", "bob")
+	ctx := context.Background()
+
+	if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "bob"); err != nil {
+		t.Fatalf("Erase: %v", err)
+	}
+	users, err := s.GetAllUsers()
+	if err != nil {
+		t.Fatalf("GetAllUsers: %v", err)
+	}
+	for _, u := range users {
+		if u.ID == "bob" {
+			t.Fatalf("an erased user is listed as live: %+v", u)
+		}
+	}
+	// Still resolvable one by one, which is what history needs.
+	if _, err := s.GetUserByID("bob"); err != nil {
+		t.Fatalf("history can no longer resolve the erased id: %v", err)
 	}
 }

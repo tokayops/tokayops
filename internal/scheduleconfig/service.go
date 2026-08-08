@@ -104,6 +104,11 @@ type SaveResult struct {
 	Noop      bool
 	Recreated bool
 	Created   bool
+
+	// commit is the line to write once the transaction is known to have
+	// committed. Unexported: it is plumbing between the pipeline and the
+	// caller inside this package, not part of the answer.
+	commit *commitLog
 }
 
 // DeleteCommand deactivates a schedule.
@@ -145,6 +150,7 @@ func (s *Service) Save(ctx context.Context, teamID string, cmd SaveCommand) (*Sa
 	if err != nil {
 		return nil, err
 	}
+	s.logCommit(result.commit)
 	if result.Noop {
 		s.metrics.TransitionNoop()
 	} else {
@@ -184,7 +190,10 @@ func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	// Users before schedules, always. Erasure locks the user it is erasing and
 	// then scans schedules; a command that locked the schedule first and the
 	// users second would be the other half of an AB-BA deadlock.
-	if err := tx.LockUsers(ctx, ConfigurationUserIDs(desired)); err != nil {
+	if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, ConfigurationUserIDs(desired))); err != nil {
+		return nil, err
+	}
+	if err := requireActiveActor(ctx, tx, cmd.ActorID); err != nil {
 		return nil, err
 	}
 
@@ -321,7 +330,8 @@ func (s *Service) rewrite(ctx context.Context, tx ScheduleConfigTx, target *writ
 	if recreate {
 		trigger = TriggerRecreated
 	}
-	if err := s.appendRevision(ctx, tx, target, revision, recreate, trigger, cmd.ActorID, before, after); err != nil {
+	commit, err := s.appendRevision(ctx, tx, target, revision, recreate, trigger, cmd.ActorID, before, after)
+	if err != nil {
 		return nil, err
 	}
 	return &SaveResult{
@@ -329,6 +339,7 @@ func (s *Service) rewrite(ctx context.Context, tx ScheduleConfigTx, target *writ
 		Version:     revision.Version,
 		EffectiveAt: target.effectiveAt,
 		Recreated:   recreate,
+		commit:      commit,
 	}, nil
 }
 
@@ -337,21 +348,21 @@ func (s *Service) rewrite(ctx context.Context, tx ScheduleConfigTx, target *writ
 // the schedule is coming back, advance the version, record the event.
 func (s *Service) appendRevision(ctx context.Context, tx ScheduleConfigTx, target *writeTarget,
 	revision *ScheduleRevision, clearDeleted bool, trigger, actorID string,
-	before, after activeGroupPair) error {
+	before, after activeGroupPair) (*commitLog, error) {
 
 	if err := tx.CloseRevision(ctx, target.root.ID, target.tail.ID, target.effectiveAt); err != nil {
-		return err
+		return nil, err
 	}
 	if err := tx.InsertRevision(ctx, revision); err != nil {
-		return err
+		return nil, err
 	}
 	if clearDeleted {
 		if err := tx.SetScheduleDeleted(ctx, target.root.ID, nil); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if err := tx.AdvanceVersion(ctx, target.root.ID, target.root.ConfigVersion, target.effectiveAt); err != nil {
-		return err
+		return nil, err
 	}
 	return s.recordChange(ctx, tx, trigger, &target.tail.ID, revision,
 		target.root.ConfigVersion, target.effectiveAt, actorID, before, after)
@@ -385,7 +396,10 @@ func (s *Service) CreateSchedule(ctx context.Context, teamID string,
 
 	var created *SaveResult
 	err = s.runCommand(ctx, func(tx ScheduleConfigTx) error {
-		if err := tx.LockUsers(ctx, ConfigurationUserIDs(desired)); err != nil {
+		if err := tx.LockUsers(ctx, commandUserIDs(actorID, ConfigurationUserIDs(desired))); err != nil {
+			return err
+		}
+		if err := requireActiveActor(ctx, tx, actorID); err != nil {
 			return err
 		}
 		switch _, err := tx.GetScheduleRootByTeam(ctx, teamID); {
@@ -400,6 +414,7 @@ func (s *Service) CreateSchedule(ctx context.Context, teamID string,
 	if err != nil {
 		return nil, err
 	}
+	s.logCommit(created.commit)
 	s.metrics.RevisionCreated(TriggerCreated)
 	return created.Revision, nil
 }
@@ -455,7 +470,8 @@ func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID st
 	if err := tx.CreateInitialSchedule(ctx, root, revision); err != nil {
 		return nil, err
 	}
-	if err := s.recordChange(ctx, tx, TriggerCreated, nil, revision, 0, effectiveAt, actorID, before, after); err != nil {
+	commit, err := s.recordChange(ctx, tx, TriggerCreated, nil, revision, 0, effectiveAt, actorID, before, after)
+	if err != nil {
 		return nil, err
 	}
 
@@ -464,6 +480,7 @@ func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID st
 		Version:     revision.Version,
 		EffectiveAt: effectiveAt,
 		Created:     true,
+		commit:      commit,
 	}, nil
 }
 
@@ -480,32 +497,45 @@ func (s *Service) Delete(ctx context.Context, teamID string, cmd DeleteCommand) 
 		return invalidField("team_id", "is required")
 	}
 
+	var commit *commitLog
 	err := s.runCommand(ctx, func(tx ScheduleConfigTx) error {
-		return s.delete(ctx, tx, teamID, cmd)
+		var err error
+		commit, err = s.delete(ctx, tx, teamID, cmd)
+		return err
 	})
 	if err != nil {
 		return err
 	}
+	s.logCommit(commit)
 	s.metrics.RevisionCreated(TriggerDeleted)
 	return nil
 }
 
-func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string, cmd DeleteCommand) error {
+func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string, cmd DeleteCommand) (*commitLog, error) {
+	// The deleted revision records the actor and their reason, so the actor is
+	// locked and checked here exactly as in a save.
+	if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, nil)); err != nil {
+		return nil, err
+	}
+	if err := requireActiveActor(ctx, tx, cmd.ActorID); err != nil {
+		return nil, err
+	}
+
 	root, err := tx.GetScheduleRootByTeam(ctx, teamID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	target, err := s.lockForWrite(ctx, tx, root, cmd.ExpectedVersion)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if target.root.DeletedAt != nil {
-		return ErrScheduleDeleted
+		return nil, ErrScheduleDeleted
 	}
 
 	before, err := activeGroups(&target.tail.Snapshot, target.effectiveAt)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvariantViolation, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
 	}
 
 	deleted := &ScheduleRevision{
@@ -521,19 +551,19 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 	}
 
 	if err := tx.CloseRevision(ctx, target.root.ID, target.tail.ID, target.effectiveAt); err != nil {
-		return err
+		return nil, err
 	}
 	if err := tx.InsertRevision(ctx, deleted); err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.tombstoneLiveOverrides(ctx, tx, target.root.ID, target.effectiveAt, cmd.ActorID); err != nil {
-		return err
+		return nil, err
 	}
 	if err := tx.SetScheduleDeleted(ctx, target.root.ID, &target.effectiveAt); err != nil {
-		return err
+		return nil, err
 	}
 	if err := tx.AdvanceVersion(ctx, target.root.ID, target.root.ConfigVersion, target.effectiveAt); err != nil {
-		return err
+		return nil, err
 	}
 	// Nobody is on duty after a delete, so the "after" pair is empty by
 	// construction rather than computed.
@@ -716,6 +746,46 @@ func checkDeletionConsistency(root *ScheduleRoot, tail *ScheduleRevision) error 
 	return nil
 }
 
+// commandUserIDs is the set a command locks: everyone it is about to put on
+// call, plus whoever is issuing it.
+//
+// The actor belongs in the set because a command records their free text - a
+// change reason, an override reason - and erasure promises to have cleared
+// everything an erased person wrote. Without the lock a save can commit just
+// after an erasure and leave behind text that nothing will ever clean again.
+func commandUserIDs(actorID string, configured []string) []string {
+	if actorID == "" {
+		return configured
+	}
+	for _, id := range configured {
+		if id == actorID {
+			return configured
+		}
+	}
+	return append(append([]string(nil), configured...), actorID)
+}
+
+// requireActiveActor refuses a command whose author has been erased.
+//
+// It runs with the actor's row already locked, so the answer cannot change
+// underneath. Being authorized when the request arrived is not the same as
+// still existing when it writes.
+func requireActiveActor(ctx context.Context, view ScheduleReadView, actorID string) error {
+	if actorID == "" {
+		// A programmatic caller with no author. Nothing it writes carries a
+		// person's name, so there is nobody for erasure to have missed.
+		return nil
+	}
+	active, err := view.ActiveUserIDs(ctx, []string{actorID})
+	if err != nil {
+		return err
+	}
+	if len(active) == 0 {
+		return ErrActorNotActive
+	}
+	return nil
+}
+
 // ConfigurationUserIDs is every user the configuration names, deduplicated in
 // first-seen order. It is both the set to lock and the set to validate, and it
 // is exported so the preview validates exactly the set a save would.
@@ -838,11 +908,29 @@ func (s *Service) guardTransition(plan rotation.TransitionPlan, hadCurrent bool,
 	return nil
 }
 
+// commitLog is one line about a committed change, assembled while the facts
+// are at hand and written only once the transaction is known to have
+// committed. Logging it inside the transaction, as this used to, claims a
+// revision exists the moment before a failing COMMIT proves it does not.
+type commitLog struct {
+	trigger       string
+	scheduleID    string
+	oldRevisionID *string
+	newRevisionID string
+	oldVersion    int64
+	newVersion    int64
+	effectiveAt   time.Time
+	actorID       string
+	changeSummary string
+	before        activeGroupPair
+	after         activeGroupPair
+}
+
 // recordChange writes the domain event in the same transaction as the revision
-// it describes, then logs the commit.
+// it describes, and returns the line to log after the commit.
 func (s *Service) recordChange(ctx context.Context, tx ScheduleConfigTx, trigger string,
 	oldRevisionID *string, revision *ScheduleRevision, oldVersion int64,
-	effectiveAt time.Time, actorID string, before, after activeGroupPair) error {
+	effectiveAt time.Time, actorID string, before, after activeGroupPair) (*commitLog, error) {
 
 	payload, err := json.Marshal(ConfigurationChangedPayload{
 		Trigger:       trigger,
@@ -854,7 +942,7 @@ func (s *Service) recordChange(ctx context.Context, tx ScheduleConfigTx, trigger
 		ActorID:       optionalString(actorID),
 	})
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvariantViolation, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
 	}
 	if err := tx.InsertScheduleEvent(ctx, &ScheduleEvent{
 		ScheduleID: revision.ScheduleID,
@@ -862,33 +950,47 @@ func (s *Service) recordChange(ctx context.Context, tx ScheduleConfigTx, trigger
 		Payload:    payload,
 		RecordedAt: effectiveAt,
 	}); err != nil {
-		return err
+		return nil, err
 	}
 
-	s.logCommit(trigger, oldRevisionID, revision, oldVersion, effectiveAt, actorID, before, after)
-	return nil
+	entry := &commitLog{
+		trigger:       trigger,
+		scheduleID:    revision.ScheduleID,
+		oldRevisionID: oldRevisionID,
+		newRevisionID: revision.ID,
+		oldVersion:    oldVersion,
+		newVersion:    revision.Version,
+		effectiveAt:   effectiveAt,
+		actorID:       actorID,
+		before:        before,
+		after:         after,
+	}
+	if revision.ChangeSummary != nil {
+		if encoded, err := json.Marshal(revision.ChangeSummary); err == nil {
+			entry.changeSummary = string(encoded)
+		}
+	}
+	return entry, nil
 }
 
 // logCommit writes one line per committed change.
 //
 // It names ids, versions and the diff summary. The snapshot is deliberately
 // absent: it is already stored, it is large, and a log aggregator is not a
-// place to keep a second copy of who is on call.
-func (s *Service) logCommit(trigger string, oldRevisionID *string, revision *ScheduleRevision,
-	oldVersion int64, effectiveAt time.Time, actorID string, before, after activeGroupPair) {
-
-	summary := ""
-	if revision.ChangeSummary != nil {
-		if encoded, err := json.Marshal(revision.ChangeSummary); err == nil {
-			summary = string(encoded)
-		}
+// place to keep a second copy of who is on call. A nil entry means the command
+// wrote nothing, which is not an event.
+func (s *Service) logCommit(entry *commitLog) {
+	if entry == nil {
+		return
 	}
 	s.logf("schedule_config: trigger=%s schedule_id=%s old_revision_id=%s new_revision_id=%s "+
 		"old_version=%d new_version=%d effective_at=%s actor_id=%s change_summary=%s "+
 		"active_l1_before=%s active_l1_after=%s active_l2_before=%s active_l2_after=%s",
-		trigger, revision.ScheduleID, derefOr(oldRevisionID, "-"), revision.ID,
-		oldVersion, revision.Version, effectiveAt.Format(time.RFC3339Nano), orDash(actorID), summary,
-		orDash(before.L1), orDash(after.L1), orDash(before.L2), orDash(after.L2))
+		entry.trigger, entry.scheduleID, derefOr(entry.oldRevisionID, "-"), entry.newRevisionID,
+		entry.oldVersion, entry.newVersion, entry.effectiveAt.Format(time.RFC3339Nano),
+		orDash(entry.actorID), entry.changeSummary,
+		orDash(entry.before.L1), orDash(entry.after.L1),
+		orDash(entry.before.L2), orDash(entry.after.L2))
 }
 
 func derefOr(s *string, fallback string) string {

@@ -110,6 +110,46 @@ func TestEraseBlockedByOverrideTarget(t *testing.T) {
 	}
 }
 
+// The scan of the schedule tails is the last lock this transaction takes, and
+// it waits on any save holding a schedule. An instant captured before it is an
+// instant from before somebody else's commit: history would then claim the
+// user was gone during a stretch in which the revision in force still had them
+// on call.
+func TestEraseStampsTimeAfterTheLastLock(t *testing.T) {
+	repo := fakes.NewErasureRepo()
+	repo.AddUser("alice", string(model.UserRoleUser))
+
+	// The clock records what had already happened when it was read.
+	var callsAtClockRead int
+	read := false
+	svc := erasure.NewService(repo, erasure.WithClock(func() time.Time {
+		if !read {
+			callsAtClockRead = len(repo.Calls)
+			read = true
+		}
+		return erasedAt
+	}))
+
+	if err := svc.Erase(context.Background(), "alice"); err != nil {
+		t.Fatalf("Erase: %v", err)
+	}
+
+	scan := -1
+	for i, call := range repo.Calls {
+		if strings.HasPrefix(call, "ListScheduleTailsLocked") {
+			scan = i
+			break
+		}
+	}
+	if scan < 0 {
+		t.Fatalf("the schedule scan never ran: %v", repo.Calls)
+	}
+	if callsAtClockRead <= scan {
+		t.Fatalf("the clock was read after %d calls, before the scan at %d: %v",
+			callsAtClockRead, scan, repo.Calls)
+	}
+}
+
 func TestEraseBlockedForLastActiveAdmin(t *testing.T) {
 	svc, repo := newEraser(t)
 

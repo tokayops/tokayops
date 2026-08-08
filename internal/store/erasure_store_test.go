@@ -178,13 +178,19 @@ func TestErasureAnonymizesUserAndKeepsReadsWorking(t *testing.T) {
 		}
 	})
 
-	t.Run("list all", func(t *testing.T) {
+	// The directory is the one read that drops an erased user. Resolving one
+	// by id still works - that is what history needs - but listing "the
+	// people" must not show a tombstone as an ordinary colleague.
+	t.Run("list all excludes the erased user", func(t *testing.T) {
 		users, err := s.GetAllUsers()
 		if err != nil {
 			t.Fatalf("GetAllUsers: %v", err)
 		}
-		if len(users) != 2 {
-			t.Fatalf("got %d users, want 2", len(users))
+		if len(users) != 1 {
+			t.Fatalf("got %d users, want only the surviving one", len(users))
+		}
+		if users[0].ID == "alice" {
+			t.Fatal("the erased user is still listed")
 		}
 	})
 

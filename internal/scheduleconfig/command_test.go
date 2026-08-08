@@ -587,6 +587,94 @@ func TestSaveRevalidatesMembershipAfterLock(t *testing.T) {
 	}
 }
 
+// Erasure promises that everything an erased person wrote is gone. A command
+// that committed after their erasure would leave a change reason behind that
+// nothing will ever clean up again, so the actor is locked and checked like
+// any other user the command names.
+func TestCommandsRefuseAnErasedActor(t *testing.T) {
+	reason := "left a note"
+
+	t.Run("save", func(t *testing.T) {
+		f := newFixture(t)
+		f.mustSave(t, scheduleconfig.SaveCommand{
+			Desired: groupsConfig(group(groupAlice, "alice")),
+			ActorID: "bob",
+		})
+		f.repo.EraseUser("bob")
+		f.clock.advance(time.Hour)
+
+		_, err := f.svc.Save(context.Background(), "devops", scheduleconfig.SaveCommand{
+			ExpectedVersion: 1,
+			Desired:         groupsConfig(group(groupCarol, "carol")),
+			ActorID:         "bob",
+			Reason:          &reason,
+		})
+		if !errors.Is(err, scheduleconfig.ErrActorNotActive) {
+			t.Fatalf("error = %v, want ErrActorNotActive", err)
+		}
+		if got := len(f.repo.Revisions(f.scheduleID(t))); got != 1 {
+			t.Fatalf("a refused save wrote %d revisions", got)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		f := newFixture(t)
+		f.mustSave(t, scheduleconfig.SaveCommand{
+			Desired: groupsConfig(group(groupAlice, "alice")),
+			ActorID: "alice",
+		})
+		f.repo.EraseUser("bob")
+		f.clock.advance(time.Hour)
+
+		err := f.svc.Delete(context.Background(), "devops", scheduleconfig.DeleteCommand{
+			ExpectedVersion: 1, ActorID: "bob", Reason: &reason,
+		})
+		if !errors.Is(err, scheduleconfig.ErrActorNotActive) {
+			t.Fatalf("error = %v, want ErrActorNotActive", err)
+		}
+	})
+
+	t.Run("override", func(t *testing.T) {
+		f := newFixture(t)
+		f.mustSave(t, scheduleconfig.SaveCommand{
+			Desired: groupsConfig(group(groupAlice, "alice")),
+			ActorID: "alice",
+		})
+		f.repo.EraseUser("bob")
+
+		_, err := f.svc.CreateOverride(context.Background(), "devops", scheduleconfig.OverrideCommand{
+			UserID:    "carol",
+			ValidFrom: f.clock.at.Add(24 * time.Hour),
+			ValidTo:   f.clock.at.Add(48 * time.Hour),
+			Reason:    &reason,
+			ActorID:   "bob",
+		})
+		if !errors.Is(err, scheduleconfig.ErrActorNotActive) {
+			t.Fatalf("error = %v, want ErrActorNotActive", err)
+		}
+	})
+
+	// The actor is locked along with everyone the command names, so an erasure
+	// running beside it can only land on one side of the command.
+	t.Run("the actor is in the lock set", func(t *testing.T) {
+		f := newFixture(t)
+		f.mustSave(t, scheduleconfig.SaveCommand{
+			Desired: groupsConfig(group(groupAlice, "alice")),
+			ActorID: "dave",
+		})
+		locked := f.repo.LockedUsers[0]
+		var sawActor bool
+		for _, id := range locked {
+			if id == "dave" {
+				sawActor = true
+			}
+		}
+		if !sawActor {
+			t.Fatalf("locked users = %v, want the actor among them", locked)
+		}
+	})
+}
+
 func TestSaveOnLegacyRootRefuses(t *testing.T) {
 	f := newFixture(t)
 	f.repo.SeedLegacyRoot("legacy-1", "devops")

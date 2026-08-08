@@ -23,8 +23,11 @@ func (s *Service) CreateOverride(ctx context.Context, teamID string, cmd Overrid
 	var created *OverrideRevision
 	err := s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
 		// Users before schedules, as in Save: the target of an override is an
-		// assignment, so erasure has to be excluded from it too.
-		if err := tx.LockUsers(ctx, []string{cmd.UserID}); err != nil {
+		// assignment, and the actor's reason text is theirs to have erased.
+		if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, []string{cmd.UserID})); err != nil {
+			return err
+		}
+		if err := requireActiveActor(ctx, tx, cmd.ActorID); err != nil {
 			return err
 		}
 		root, err := tx.GetScheduleRootByTeam(ctx, teamID)
@@ -78,7 +81,10 @@ func (s *Service) UpdateOverride(ctx context.Context, scheduleID, overrideID str
 	}
 	var updated *OverrideRevision
 	err := s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
-		if err := tx.LockUsers(ctx, []string{cmd.UserID}); err != nil {
+		if err := tx.LockUsers(ctx, commandUserIDs(cmd.ActorID, []string{cmd.UserID})); err != nil {
+			return err
+		}
+		if err := requireActiveActor(ctx, tx, cmd.ActorID); err != nil {
 			return err
 		}
 		locked, recordedAt, err := s.lockForOverride(ctx, tx, scheduleID)
@@ -131,8 +137,14 @@ func (s *Service) DeleteOverride(ctx context.Context, scheduleID, overrideID str
 	expectedRevision int64, actorID string) error {
 
 	return s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
-		// No user lock here: a delete adds no assignment, so there is nothing
-		// for erasure to race with.
+		// A delete adds no assignment, but it does record who did it and copies
+		// the reason forward, so the actor is still locked and checked.
+		if err := tx.LockUsers(ctx, commandUserIDs(actorID, nil)); err != nil {
+			return err
+		}
+		if err := requireActiveActor(ctx, tx, actorID); err != nil {
+			return err
+		}
 		_, recordedAt, err := s.lockForOverride(ctx, tx, scheduleID)
 		if err != nil {
 			return err

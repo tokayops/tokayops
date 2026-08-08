@@ -49,6 +49,11 @@ var (
 	// a current assignment.
 	ErrMemberOnCall = errors.New("scheduleconfig: user holds a current on-call assignment")
 
+	// ErrActorNotActive means the user on whose behalf a command runs has been
+	// erased. It is not a permission problem: they were authorized when the
+	// request started and are gone by the time it writes.
+	ErrActorNotActive = errors.New("scheduleconfig: the acting user has been erased")
+
 	// ErrSnapshotDecode means a stored snapshot could not be decoded. It is
 	// never softened into an empty rotation: empty is a valid configuration a
 	// person chose, corruption is not.
