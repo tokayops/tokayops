@@ -77,7 +77,7 @@ func (a *API) ListPolicies(c echo.Context) error {
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
 	}
-	user, err := a.store.GetUserByID(userID)
+	user, err := a.store.GetActiveUserByID(userID)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 	}

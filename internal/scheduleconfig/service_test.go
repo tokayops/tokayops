@@ -50,6 +50,10 @@ func validConfig() rotation.ScheduleConfiguration {
 func newService(t *testing.T, now time.Time) (*scheduleconfig.Service, *fakes.ScheduleConfigRepo) {
 	t.Helper()
 	repo := fakes.NewScheduleConfigRepo()
+	repo.SetTeamMembers("devops", "alice", "bob", "carol", "dave")
+	// The actor exists without being on the team: an admin editing someone
+	// else's schedule is the normal case.
+	repo.AddUsers("actor")
 	n := 0
 	svc := scheduleconfig.NewService(repo,
 		scheduleconfig.WithClock(func() time.Time { return now }),
@@ -66,7 +70,7 @@ func TestCreateScheduleWritesRootAndFirstRevisionTogether(t *testing.T) {
 	now := time.Date(2026, 5, 4, 8, 30, 0, 123456789, time.UTC)
 	svc, repo := newService(t, now)
 
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -108,10 +112,10 @@ func TestCreateScheduleWritesRootAndFirstRevisionTogether(t *testing.T) {
 func TestCreateScheduleSecondCreateForSameTeamConflicts(t *testing.T) {
 	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
 
-	if _, err := svc.CreateSchedule(context.Background(), "devops", validConfig()); err != nil {
+	if _, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil); err != nil {
 		t.Fatalf("first CreateSchedule: %v", err)
 	}
-	_, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	_, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
 	if !errors.Is(err, scheduleconfig.ErrScheduleExists) {
 		t.Fatalf("second CreateSchedule error = %v, want ErrScheduleExists", err)
 	}
@@ -130,7 +134,7 @@ func TestCreateScheduleRollsBackEveryStep(t *testing.T) {
 			svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
 			repo.FailOn[step] = boom
 
-			rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+			rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
 			if !errors.Is(err, boom) {
 				t.Fatalf("error = %v, want injected failure", err)
 			}
@@ -167,7 +171,7 @@ func TestCreateScheduleRejectsInvalidInputBeforeWriting(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
-			if _, err := svc.CreateSchedule(context.Background(), tc.teamID, tc.config); err == nil {
+			if _, err := svc.CreateSchedule(context.Background(), tc.teamID, tc.config, "actor", nil); err == nil {
 				t.Fatal("expected an error")
 			}
 			if got := repo.RootCount(); got != 0 {
@@ -188,6 +192,8 @@ func TestCreateScheduleRejectsInvalidInputBeforeWriting(t *testing.T) {
 // empty ID that the database has always refused.
 func TestCreateScheduleRejectsWhatTheDatabaseWouldReject(t *testing.T) {
 	repo := fakes.NewScheduleConfigRepo()
+	repo.SetTeamMembers("devops", "alice", "bob")
+	repo.AddUsers("actor")
 	n := 0
 	svc := scheduleconfig.NewService(repo, scheduleconfig.WithIDSource(func() string {
 		n++
@@ -197,7 +203,7 @@ func TestCreateScheduleRejectsWhatTheDatabaseWouldReject(t *testing.T) {
 		return ""
 	}))
 
-	_, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	_, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
 	if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
 		t.Fatalf("error = %v, want ErrInvariantViolation", err)
 	}
@@ -218,7 +224,7 @@ func TestCreateScheduleReturnsCanonicalSnapshot(t *testing.T) {
 
 	// The configuration leaves L2 disabled with no groups, which is exactly
 	// the nil slice persistence turns into [].
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -253,7 +259,7 @@ func TestCreateScheduleReturnsCanonicalSnapshot(t *testing.T) {
 func TestFakeStoresSnapshotsByValue(t *testing.T) {
 	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
 
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -299,7 +305,7 @@ func TestFakeStoresSnapshotsByValue(t *testing.T) {
 
 func TestFakeRollbackRestoresDeepState(t *testing.T) {
 	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -325,7 +331,7 @@ func TestFakeRollbackRestoresDeepState(t *testing.T) {
 // revision that preceded a delete.
 func TestFakeCurrentOverridesDoNotResurrectDeleted(t *testing.T) {
 	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig())
+	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}

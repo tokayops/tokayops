@@ -70,7 +70,15 @@ type StoreInterface interface {
 
 	// Users
 	CreateUser(u *model.User) error
+
+	// GetUserByID is the DISPLAY read: it returns erased users too, so history
+	// that names an ID still resolves to "Deleted user". Authentication and
+	// commands must use GetActiveUserByID instead.
 	GetUserByID(id string) (*model.User, error)
+
+	// GetActiveUserByID excludes erased users and answers ErrUserNotFound for
+	// them, which is what makes a soft delete terminal.
+	GetActiveUserByID(id string) (*model.User, error)
 	GetUsersByIDs(ids []string) ([]*model.User, error)
 	GetUserByEmail(email string) (*model.User, error)
 	GetAllUsers() ([]*model.User, error)

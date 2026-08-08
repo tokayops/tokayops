@@ -4,95 +4,108 @@ package integration
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/api"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/testutil"
 )
 
-func TestSchedule_Overrides_Conflict(t *testing.T) {
-	env := setupAPITest(t) // Reusing from api_integration_test.go
+// seedRevisionSchedule creates a schedule through the revision-model endpoint
+// and returns its config_version. The legacy store writer is deliberately not
+// used: a row it produces is refused by the new commands, which is the point
+// of the guard.
+func seedRevisionSchedule(t *testing.T, env *APIIntegrationEnv, teamID, actorID string, groups ...[]string) int64 {
+	t.Helper()
+	monday := 1
+	ids := [...]string{"5f0a1e2c-3333-4a3b-8c4d-000000000001", "5f0a1e2c-3333-4a3b-8c4d-000000000002"}
+	dto := make([]api.ScheduleGroupDTO, len(groups))
+	for i, members := range groups {
+		dto[i] = api.ScheduleGroupDTO{ID: ids[i], UserIDs: members}
+	}
+	body, err := json.Marshal(api.PutScheduleConfigRequest{
+		ScheduleConfigDTO: api.ScheduleConfigDTO{
+			Timezone: "UTC",
+			L1: api.ScheduleL1DTO{
+				Enabled: true, RotationType: "daily", HandoffTime: "09:00", Groups: dto,
+			},
+			L2: api.ScheduleL2DTO{
+				EscalationTimeoutMinutes: 5, RotationType: "weekly",
+				HandoffTime: "09:00", HandoffDay: &monday,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
 
-	// Setup Data
+	req := createAuthenticatedRequest(t, http.MethodPut,
+		"/api/v1/teams/"+teamID+"/schedule/config", body, actorID)
+	rec := httptest.NewRecorder()
+	env.Echo.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create schedule config: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var out api.PutScheduleConfigResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode config response: %v", err)
+	}
+	return out.Version
+}
+
+// scheduleIDOfTeam reads the schedule ID from the configuration endpoint.
+func scheduleIDOfTeam(t *testing.T, env *APIIntegrationEnv, teamID, actorID string) string {
+	t.Helper()
+	req := createAuthenticatedRequest(t, http.MethodGet,
+		"/api/v1/teams/"+teamID+"/schedule/config", nil, actorID)
+	rec := httptest.NewRecorder()
+	env.Echo.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET config: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var out api.ScheduleConfigResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	return out.ScheduleID
+}
+
+// Overlap is a property of the current override projection, so the service
+// checks it under the schedule lock rather than leaning on a row constraint.
+func TestSchedule_Overrides_Conflict(t *testing.T) {
+	env := setupAPITest(t)
+
 	admin := testutil.SeedUser(t, env.S, "admin@example.com")
 	team := testutil.SeedTeam(t, env.S, "sched-team")
 	user1 := testutil.SeedUser(t, env.S, "u1@example.com")
 	testutil.SeedTeamMember(t, env.S, team.ID, user1.ID, model.TeamMemberRoleMember)
+	seedRevisionSchedule(t, env, team.ID, admin.ID, []string{user1.ID})
 
-	// Create Schedule
-	sched := &model.Schedule{
-		ID:              "sched-1",
-		TeamID:          team.ID,
-		Timezone:        "UTC",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "09:00",
-		L1RotationStart: time.Now(),
-		L1Groups:        [][]*model.User{{user1}},
-		CreatedAt:       time.Now(),
-		UpdatedAt:       time.Now(),
-	}
-	if err := env.S.CreateSchedule(sched); err != nil {
-		t.Fatalf("Failed to create schedule: %v", err)
-	}
-
-	// Helper to create override via API
-	createOverride := func(start, end time.Time) int {
-		reqBody := map[string]interface{}{
-			"user_id":    user1.ID,
-			"start_time": start,
-			"end_time":   end,
-			"reason":     "Test Override",
-		}
-		jsonBody, _ := json.Marshal(reqBody)
-
-		req := createAuthenticatedRequest(t, http.MethodPost, "/api/v1/teams/"+team.ID+"/schedule/overrides", jsonBody, admin.ID)
+	createOverride := func(from, to time.Time) int {
+		body, _ := json.Marshal(api.ScheduleOverrideRequest{
+			UserID: user1.ID, ValidFrom: from, ValidTo: to,
+		})
+		req := createAuthenticatedRequest(t, http.MethodPost,
+			"/api/v1/teams/"+team.ID+"/schedule/overrides", body, admin.ID)
 		rec := httptest.NewRecorder()
 		env.Echo.ServeHTTP(rec, req)
 		return rec.Code
 	}
 
-	now := time.Now().Truncate(time.Minute)
-	start1 := now.Add(1 * time.Hour)
-	end1 := now.Add(3 * time.Hour)
-
-	// 1. Create Valid Override (10:00 - 12:00)
-	code := createOverride(start1, end1)
-	if code != http.StatusCreated {
-		t.Errorf("Expected 201 Created for first override, got %d", code)
+	now := time.Now().UTC().Truncate(time.Minute)
+	if code := createOverride(now.Add(time.Hour), now.Add(3*time.Hour)); code != http.StatusCreated {
+		t.Fatalf("first override: want 201, got %d", code)
 	}
-
-	// 2. Create Overlapping Override (11:00 - 13:00) -> Should Fail
-	start2 := now.Add(2 * time.Hour)
-	end2 := now.Add(4 * time.Hour)
-	code = createOverride(start2, end2)
-	if code != http.StatusConflict { // Expecting 409 from optimized handler
-		// If handler isn't fully updated to map SQL error to 409 yet, it might return 500.
-		// Proposal implied P2 fix for this. If not implemented, this might be 500.
-		// Let's check strict expectation or allow 500 if known limitation?
-		// User instructions said "Review Feedback... P2: Override Conflict Error Handling... Update ... to return 409".
-		// I assume that P2 was addressed or is part of expectations.
-		// If it fails with 500, I'll know.
-		if code == http.StatusInternalServerError {
-			t.Logf("Got 500 for conflict. Might need handler update for mapping SQL constraint to 409.")
-		} else {
-			t.Errorf("Expected 409 Conflict for overlapping override, got %d", code)
-		}
+	if code := createOverride(now.Add(2*time.Hour), now.Add(4*time.Hour)); code != http.StatusConflict {
+		t.Errorf("overlapping override: want 409, got %d", code)
 	}
-
-	// 3. Create Non-Overlapping Override (13:00 - 14:00)
-	start3 := now.Add(3 * time.Hour) // right at end of first? No, first ended at +3h.
-	// start1 +3h = end1.
-	// Wait, start1=1h, end1=3h.
-	// start2=2h, end2=4h. (Overlap 2h-3h)
-	// start3=3h, end3=5h. (Adjacent).
-	// Postgres range && overlaps does NOT include adjacent points if inclusive/exclusive handled correctly.
-	// Usually tsrange is [).
-	code = createOverride(start3, start3.Add(1*time.Hour))
-	if code != http.StatusCreated {
-		t.Errorf("Expected 201 Created for adjacent override, got %d", code)
+	// Adjacent, not overlapping: the interval is half-open.
+	if code := createOverride(now.Add(3*time.Hour), now.Add(4*time.Hour)); code != http.StatusCreated {
+		t.Errorf("adjacent override: want 201, got %d", code)
 	}
 }
 
@@ -220,62 +233,40 @@ func TestSchedule_Delete(t *testing.T) {
 	team := testutil.SeedTeam(t, env.S, "del-team")
 	user1 := testutil.SeedUser(t, env.S, "del-u1@example.com")
 	testutil.SeedTeamMember(t, env.S, team.ID, user1.ID, model.TeamMemberRoleMember)
+	version := seedRevisionSchedule(t, env, team.ID, admin.ID, []string{user1.ID})
 
-	// Create schedule
-	sched := &model.Schedule{
-		ID:              "sched-del",
-		TeamID:          team.ID,
-		Timezone:        "UTC",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "09:00",
-		L1RotationStart: time.Now(),
-		CreatedAt:       time.Now(),
-		UpdatedAt:       time.Now(),
-	}
-	if err := env.S.CreateSchedule(sched); err != nil {
-		t.Fatalf("Failed to create schedule: %v", err)
+	deleteAt := func(expected int64) *httptest.ResponseRecorder {
+		req := createAuthenticatedRequest(t, http.MethodDelete,
+			fmt.Sprintf("/api/v1/teams/%s/schedule?expected_version=%d", team.ID, expected), nil, admin.ID)
+		rec := httptest.NewRecorder()
+		env.Echo.ServeHTTP(rec, req)
+		return rec
 	}
 
-	// Set L1 groups
-	groupsReq := map[string]interface{}{"groups": [][]string{{user1.ID}}}
-	groupsJson, _ := json.Marshal(groupsReq)
-	req := createAuthenticatedRequest(t, http.MethodPut, "/api/v1/teams/"+team.ID+"/schedule/l1-groups", groupsJson, admin.ID)
+	if rec := deleteAt(version); rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: want 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The configuration endpoint keeps answering, with deleted_at set: the
+	// editor prefills a recreate from it rather than making a second request.
+	req := createAuthenticatedRequest(t, http.MethodGet,
+		"/api/v1/teams/"+team.ID+"/schedule/config", nil, admin.ID)
 	rec := httptest.NewRecorder()
 	env.Echo.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 for setting groups, got %d", rec.Code)
+		t.Fatalf("GET config after delete: want 200, got %d", rec.Code)
+	}
+	var cfg api.ScheduleConfigResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &cfg); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if cfg.DeletedAt == nil {
+		t.Fatal("a deleted schedule must report deleted_at")
 	}
 
-	// Verify schedule exists via GET
-	req = createAuthenticatedRequest(t, http.MethodGet, "/api/v1/teams/"+team.ID+"/schedule", nil, admin.ID)
-	rec = httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 for GET schedule, got %d", rec.Code)
-	}
-
-	// Delete schedule
-	req = createAuthenticatedRequest(t, http.MethodDelete, "/api/v1/teams/"+team.ID+"/schedule", nil, admin.ID)
-	rec = httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("Expected 204, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// Verify deleted - GET should return 404
-	req = createAuthenticatedRequest(t, http.MethodGet, "/api/v1/teams/"+team.ID+"/schedule", nil, admin.ID)
-	rec = httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("Expected 404 after delete, got %d", rec.Code)
-	}
-
-	// Delete again - should return 404
-	req = createAuthenticatedRequest(t, http.MethodDelete, "/api/v1/teams/"+team.ID+"/schedule", nil, admin.ID)
-	rec = httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("Expected 404 for double delete, got %d", rec.Code)
+	// Deleting again is a conflict, not a second delete.
+	if rec := deleteAt(cfg.Version); rec.Code != http.StatusConflict {
+		t.Errorf("double delete: want 409, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -455,8 +446,8 @@ func TestSchedule_GetTeamSchedule_ReturnsL1Groups(t *testing.T) {
 	}
 }
 
-// TestSchedule_RenderSchedule_MultiUserGroup verifies that render entries for
-// a multi-user group include user_ids and user_names arrays.
+// TestSchedule_RenderSchedule_MultiUserGroup checks that a rendered shift for
+// a multi-person group names everyone in it.
 func TestSchedule_RenderSchedule_MultiUserGroup(t *testing.T) {
 	env := setupAPITest(t)
 
@@ -466,176 +457,104 @@ func TestSchedule_RenderSchedule_MultiUserGroup(t *testing.T) {
 	uB := testutil.SeedUser(t, env.S, "rb@example.com")
 	testutil.SeedTeamMember(t, env.S, team.ID, uA.ID, model.TeamMemberRoleMember)
 	testutil.SeedTeamMember(t, env.S, team.ID, uB.ID, model.TeamMemberRoleMember)
+	seedRevisionSchedule(t, env, team.ID, admin.ID, []string{uA.ID, uB.ID})
 
-	if err := env.S.CreateSchedule(&model.Schedule{
-		ID:              "sched-render-multi",
-		TeamID:          team.ID,
-		Timezone:        "UTC",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "09:00",
-		L1RotationStart: time.Now().Add(-7 * 24 * time.Hour),
-	}); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
-	if err := env.S.SetScheduleGroups("sched-render-multi", [][]string{{uA.ID, uB.ID}}); err != nil {
-		t.Fatalf("SetScheduleGroups: %v", err)
-	}
-
-	// GET render
-	from := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339)
-	until := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	url := "/api/v1/teams/" + team.ID + "/schedule/render?from=" + from + "&until=" + until
-	req := createAuthenticatedRequest(t, http.MethodGet, url, nil, admin.ID)
-	rec := httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET render: expected 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	var resp struct {
-		Entries []struct {
-			UserIDs   []string `json:"user_ids"`
-			UserNames []string `json:"user_names"`
-			Layer     string   `json:"layer"`
-		} `json:"entries"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-
+	resp := renderRange(t, env, team.ID, admin.ID,
+		time.Now().UTC().Add(-time.Hour), time.Now().UTC().Add(24*time.Hour))
 	if len(resp.Entries) == 0 {
-		t.Fatal("Expected at least one render entry")
+		t.Fatal("expected at least one rendered shift")
 	}
 
-	// Each L1 entry must contain both users in user_ids and user_names
-	foundMulti := false
+	found := false
 	for _, e := range resp.Entries {
-		if e.Layer != "l1" {
+		if e.Layer != "l1" || len(e.UserIDs) != 2 {
 			continue
 		}
-		if len(e.UserIDs) == 2 && len(e.UserNames) == 2 {
-			gotIDs := map[string]bool{e.UserIDs[0]: true, e.UserIDs[1]: true}
-			if gotIDs[uA.ID] && gotIDs[uB.ID] {
-				foundMulti = true
-				break
-			}
+		got := map[string]bool{e.UserIDs[0]: true, e.UserIDs[1]: true}
+		if got[uA.ID] && got[uB.ID] {
+			found = true
+			break
 		}
 	}
-	if !foundMulti {
-		t.Errorf("Expected at least one L1 entry with both users, got: %+v", resp.Entries)
+	if !found {
+		t.Errorf("no L1 shift named both members: %+v", resp.Entries)
 	}
 }
 
-// TestSchedule_RenderSchedule_OverrideMetadata verifies that override entries
-// in the render response include all metadata fields.
+// TestSchedule_RenderSchedule_OverrideMetadata checks that an override shows up
+// in the rendered range carrying the identity a caller can act on.
 func TestSchedule_RenderSchedule_OverrideMetadata(t *testing.T) {
 	env := setupAPITest(t)
 
 	admin := testutil.SeedUser(t, env.S, "admin@example.com")
-	team := testutil.SeedTeam(t, env.S, "render-override-team")
-	uA := testutil.SeedUser(t, env.S, "rova@example.com")
-	uC := testutil.SeedUser(t, env.S, "rovc@example.com")
-	testutil.SeedTeamMember(t, env.S, team.ID, uA.ID, model.TeamMemberRoleMember)
-	testutil.SeedTeamMember(t, env.S, team.ID, uC.ID, model.TeamMemberRoleMember)
+	team := testutil.SeedTeam(t, env.S, "render-ovr-team")
+	base := testutil.SeedUser(t, env.S, "base@example.com")
+	stand := testutil.SeedUser(t, env.S, "stand@example.com")
+	testutil.SeedTeamMember(t, env.S, team.ID, base.ID, model.TeamMemberRoleMember)
+	testutil.SeedTeamMember(t, env.S, team.ID, stand.ID, model.TeamMemberRoleMember)
+	seedRevisionSchedule(t, env, team.ID, admin.ID, []string{base.ID})
 
-	if err := env.S.CreateSchedule(&model.Schedule{
-		ID:              "sched-render-override",
-		TeamID:          team.ID,
-		Timezone:        "UTC",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "09:00",
-		L1RotationStart: time.Now().Add(-7 * 24 * time.Hour),
-	}); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
-	if err := env.S.SetScheduleGroups("sched-render-override", [][]string{{uA.ID}}); err != nil {
-		t.Fatalf("SetScheduleGroups: %v", err)
-	}
-
-	// Override on uC covering current time
-	now := time.Now().UTC().Truncate(time.Minute)
-	overrideStart := now.Add(-1 * time.Hour)
-	overrideEnd := now.Add(2 * time.Hour)
-	if err := env.S.CreateScheduleOverride(&model.ScheduleOverride{
-		ID:         "ovr-render-1",
-		ScheduleID: "sched-render-override",
-		UserID:     uC.ID,
-		StartTime:  overrideStart,
-		EndTime:    overrideEnd,
-		Reason:     "Vacation cover",
-		CreatedBy:  admin.ID,
-	}); err != nil {
-		t.Fatalf("CreateScheduleOverride: %v", err)
-	}
-
-	from := now.Add(-2 * time.Hour).Format(time.RFC3339)
-	until := now.Add(24 * time.Hour).Format(time.RFC3339)
-	url := "/api/v1/teams/" + team.ID + "/schedule/render?from=" + from + "&until=" + until
-	req := createAuthenticatedRequest(t, http.MethodGet, url, nil, admin.ID)
+	from := time.Now().UTC().Truncate(time.Minute).Add(time.Hour)
+	until := from.Add(2 * time.Hour)
+	reason := "swap"
+	body, _ := json.Marshal(api.ScheduleOverrideRequest{
+		UserID: stand.ID, ValidFrom: from, ValidTo: until, Reason: &reason,
+	})
+	req := createAuthenticatedRequest(t, http.MethodPost,
+		"/api/v1/teams/"+team.ID+"/schedule/overrides", body, admin.ID)
 	rec := httptest.NewRecorder()
 	env.Echo.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET render: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create override: want 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var created api.ScheduleOverrideDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode override: %v", err)
 	}
 
-	var resp struct {
-		Entries []struct {
-			UserIDs       []string   `json:"user_ids"`
-			UserNames     []string   `json:"user_names"`
-			Layer         string     `json:"layer"`
-			OverrideID    string     `json:"override_id,omitempty"`
-			ScheduleID    string     `json:"schedule_id,omitempty"`
-			OverrideStart *time.Time `json:"override_start,omitempty"`
-			OverrideEnd   *time.Time `json:"override_end,omitempty"`
-			Reason        string     `json:"reason,omitempty"`
-		} `json:"entries"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-
-	var override *struct {
-		UserIDs       []string   `json:"user_ids"`
-		UserNames     []string   `json:"user_names"`
-		Layer         string     `json:"layer"`
-		OverrideID    string     `json:"override_id,omitempty"`
-		ScheduleID    string     `json:"schedule_id,omitempty"`
-		OverrideStart *time.Time `json:"override_start,omitempty"`
-		OverrideEnd   *time.Time `json:"override_end,omitempty"`
-		Reason        string     `json:"reason,omitempty"`
-	}
+	resp := renderRange(t, env, team.ID, admin.ID, from.Add(-time.Hour), until.Add(time.Hour))
+	var got *api.ShiftDTO
 	for i := range resp.Entries {
-		if resp.Entries[i].Layer == "override" {
-			override = &resp.Entries[i]
+		if resp.Entries[i].Source == "override" {
+			got = &resp.Entries[i]
 			break
 		}
 	}
-	if override == nil {
-		t.Fatalf("Expected at least one override entry, got: %+v", resp.Entries)
+	if got == nil {
+		t.Fatalf("no override entry in the rendered range: %+v", resp.Entries)
 	}
+	if got.OverrideID != created.OverrideID {
+		t.Errorf("override_id = %q, want %q", got.OverrideID, created.OverrideID)
+	}
+	if len(got.UserIDs) != 1 || got.UserIDs[0] != stand.ID {
+		t.Errorf("override entry names %v, want the stand-in %s", got.UserIDs, stand.ID)
+	}
+	if !got.Start.Equal(from) || !got.End.Equal(until) {
+		t.Errorf("override entry spans %v..%v, want %v..%v", got.Start, got.End, from, until)
+	}
+	// The override interrupts the rotation, so the base user is still on duty
+	// on either side of it.
+	if len(resp.Entries) < 2 {
+		t.Errorf("expected the rotation to resume around the override: %+v", resp.Entries)
+	}
+}
 
-	// Verify all metadata fields populated
-	if override.OverrideID != "ovr-render-1" {
-		t.Errorf("OverrideID: expected ovr-render-1, got %q", override.OverrideID)
+// renderRange calls the render endpoint and decodes the response.
+func renderRange(t *testing.T, env *APIIntegrationEnv, teamID, actorID string, from, until time.Time) api.ScheduleRenderResponse {
+	t.Helper()
+	url := fmt.Sprintf("/api/v1/teams/%s/schedule/render?from=%s&until=%s",
+		teamID, from.Format(time.RFC3339), until.Format(time.RFC3339))
+	req := createAuthenticatedRequest(t, http.MethodGet, url, nil, actorID)
+	rec := httptest.NewRecorder()
+	env.Echo.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET render: want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if override.ScheduleID != "sched-render-override" {
-		t.Errorf("ScheduleID: expected sched-render-override, got %q", override.ScheduleID)
+	var out api.ScheduleRenderResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode render: %v", err)
 	}
-	if override.OverrideStart == nil {
-		t.Errorf("OverrideStart: expected non-nil")
-	}
-	if override.OverrideEnd == nil {
-		t.Errorf("OverrideEnd: expected non-nil")
-	}
-	if override.Reason != "Vacation cover" {
-		t.Errorf("Reason: expected 'Vacation cover', got %q", override.Reason)
-	}
-	if len(override.UserIDs) != 1 || override.UserIDs[0] != uC.ID {
-		t.Errorf("UserIDs: expected [%s], got %v", uC.ID, override.UserIDs)
-	}
-	if len(override.UserNames) != 1 {
-		t.Errorf("UserNames: expected length 1, got %d", len(override.UserNames))
-	}
+	return out
 }
 
 func TestSchedule_SlackUsergroupID_Persistence(t *testing.T) {

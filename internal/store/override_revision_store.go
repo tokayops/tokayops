@@ -3,10 +3,16 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
+
+// overrideRevisionColumns is the SELECT list every override scan expects,
+// qualified with the alias the queries below use.
+const overrideRevisionColumns = `o.revision_id, o.override_id, o.schedule_id, o.revision, o.layer, o.user_id,
+	o.valid_from, o.valid_to, o.reason, o.deleted, o.recorded_at, o.recorded_by`
 
 // normalizeBound keeps an optional query bound at database resolution. A
 // bound carrying nanoseconds would compare differently than the same value
@@ -16,6 +22,81 @@ func normalizeBound(t *time.Time) any {
 		return nil
 	}
 	return scheduleconfig.NormalizeTimestamp(*t)
+}
+
+func scanOverrideRevision(row rowScanner) (*scheduleconfig.OverrideRevision, error) {
+	var (
+		rev        scheduleconfig.OverrideRevision
+		reason     sql.NullString
+		recordedBy sql.NullString
+	)
+	if err := row.Scan(&rev.RevisionID, &rev.OverrideID, &rev.ScheduleID, &rev.Revision,
+		&rev.Layer, &rev.UserID, &rev.ValidFrom, &rev.ValidTo, &reason, &rev.Deleted,
+		&rev.RecordedAt, &recordedBy); err != nil {
+		return nil, err
+	}
+	if reason.Valid {
+		v := reason.String
+		rev.Reason = &v
+	}
+	if recordedBy.Valid {
+		v := recordedBy.String
+		rev.RecordedBy = &v
+	}
+	return &rev, nil
+}
+
+// GetOverrideHead returns the newest revision of one logical override,
+// tombstone included.
+//
+// It is deliberately not expressed through getOverrideProjection: that query
+// hides tombstones, and an update or a delete has to be able to tell a removed
+// override from one that never existed. Reusing it would let an update of a
+// deleted override start numbering at revision 1 again and resurrect it.
+func (v *scheduleReadView) GetOverrideHead(ctx context.Context, scheduleID, overrideID string) (*scheduleconfig.OverrideRevision, error) {
+	rev, err := scanOverrideRevision(v.q.QueryRowContext(ctx,
+		`SELECT `+overrideRevisionColumns+`
+		 FROM schedule_override_revisions o
+		 WHERE o.schedule_id = $1 AND o.override_id = $2
+		 ORDER BY o.revision DESC
+		 LIMIT 1`, scheduleID, overrideID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, scheduleconfig.ErrOverrideNotFound
+	}
+	return rev, err
+}
+
+// ListOverrideHeads returns the head revision of every logical override of a
+// schedule. includeDeleted false is the editor's view - the overrides that
+// still exist - and it filters tombstones AFTER the grouping, for the same
+// reason the projection does: filtering first would let the revision before a
+// delete win the MAX and bring the override back.
+func (v *scheduleReadView) ListOverrideHeads(ctx context.Context, scheduleID string, includeDeleted bool) ([]scheduleconfig.OverrideRevision, error) {
+	rows, err := v.q.QueryContext(ctx,
+		`SELECT `+overrideRevisionColumns+`
+		 FROM schedule_override_revisions o
+		 JOIN (SELECT override_id, MAX(revision) AS revision
+		       FROM schedule_override_revisions
+		       WHERE schedule_id = $1
+		       GROUP BY override_id) last
+		   ON last.override_id = o.override_id AND last.revision = o.revision
+		 WHERE o.schedule_id = $1
+		   AND ($2 OR NOT o.deleted)
+		 ORDER BY o.valid_from, o.override_id`, scheduleID, includeDeleted)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []scheduleconfig.OverrideRevision
+	for rows.Next() {
+		rev, err := scanOverrideRevision(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *rev)
+	}
+	return out, rows.Err()
 }
 
 // getOverrideProjection returns the winning revision per override_id.
@@ -42,8 +123,7 @@ func normalizeBound(t *time.Time) any {
 func getOverrideProjection(ctx context.Context, q sqlQueryer, scheduleID string,
 	from, until, asOf *time.Time) ([]scheduleconfig.OverrideRevision, error) {
 	rows, err := q.QueryContext(ctx,
-		`SELECT o.revision_id, o.override_id, o.schedule_id, o.revision, o.layer, o.user_id,
-		        o.valid_from, o.valid_to, o.reason, o.deleted, o.recorded_at, o.recorded_by
+		`SELECT `+overrideRevisionColumns+`
 		 FROM schedule_override_revisions o
 		 JOIN (SELECT override_id, MAX(revision) AS revision
 		       FROM schedule_override_revisions
@@ -64,25 +144,11 @@ func getOverrideProjection(ctx context.Context, q sqlQueryer, scheduleID string,
 
 	var out []scheduleconfig.OverrideRevision
 	for rows.Next() {
-		var (
-			rev        scheduleconfig.OverrideRevision
-			reason     sql.NullString
-			recordedBy sql.NullString
-		)
-		if err := rows.Scan(&rev.RevisionID, &rev.OverrideID, &rev.ScheduleID, &rev.Revision,
-			&rev.Layer, &rev.UserID, &rev.ValidFrom, &rev.ValidTo, &reason, &rev.Deleted,
-			&rev.RecordedAt, &recordedBy); err != nil {
+		rev, err := scanOverrideRevision(rows)
+		if err != nil {
 			return nil, err
 		}
-		if reason.Valid {
-			v := reason.String
-			rev.Reason = &v
-		}
-		if recordedBy.Valid {
-			v := recordedBy.String
-			rev.RecordedBy = &v
-		}
-		out = append(out, rev)
+		out = append(out, *rev)
 	}
 	return out, rows.Err()
 }

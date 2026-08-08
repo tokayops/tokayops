@@ -11,6 +11,7 @@ import (
 
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rbac"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/labstack/echo/v4"
 )
@@ -86,7 +87,15 @@ func ScopeCurrentUser() ScopeResolver {
 }
 
 // ScopeFromResource returns a resolver that loads a resource by ID from the URL param.
-// Supported kinds: "team", "alert_group", "schedule".
+// Supported kinds: "team", "alert_group", "token", "policy".
+//
+// There is deliberately no "schedule" kind. Scoping by schedule ID happens only
+// on the override routes, and those go through ScopeScheduleOverride, which
+// reads the revision contract; a resolver built on the legacy schedule reader
+// would refuse every schedule the revision model governs.
+//
+// It assumes the read repository is wired, because requireScheduleStack runs
+// ahead of it on every route that uses it.
 func ScopeFromResource(kind, paramName string) ScopeResolver {
 	return func(c echo.Context, api *API) (rbac.Scope, error) {
 		id := c.Param(paramName)
@@ -118,17 +127,6 @@ func ScopeFromResource(kind, paramName string) ScopeResolver {
 			c.Set("alert_group", ag)
 			return rbac.TeamScope(ag.TeamID), nil
 
-		case "schedule":
-			sched, err := api.store.GetScheduleByID(id)
-			if err != nil {
-				if err == sql.ErrNoRows {
-					return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "schedule not found")
-				}
-				return rbac.Scope{}, err
-			}
-			c.Set("schedule", sched)
-			return rbac.TeamScope(sched.TeamID), nil
-
 		case "token":
 			token, err := api.store.GetAPITokenByID(id)
 			if err != nil {
@@ -159,8 +157,13 @@ func ScopeFromResource(kind, paramName string) ScopeResolver {
 	}
 }
 
-// ScopeScheduleOverride checks that override exists AND belongs to the schedule (IDOR protection).
-// Returns TeamScope of the schedule.
+// ScopeScheduleOverride checks that the override exists AND belongs to the
+// named schedule (IDOR protection), then scopes to the owning team.
+//
+// It reads through the revision contract rather than the legacy schedule
+// reader. That reader now refuses any schedule governed by revisions, so
+// leaving it here would turn every override request into a 500 - and the
+// override tables it would be consulting are not the ones the commands write.
 func ScopeScheduleOverride(scheduleIDParam, overrideIDParam string) ScopeResolver {
 	return func(c echo.Context, api *API) (rbac.Scope, error) {
 		scheduleID := c.Param(scheduleIDParam)
@@ -169,27 +172,33 @@ func ScopeScheduleOverride(scheduleIDParam, overrideIDParam string) ScopeResolve
 		if scheduleID == "" || overrideID == "" {
 			return rbac.Scope{}, echo.NewHTTPError(http.StatusBadRequest, "missing schedule or override id")
 		}
-
-		// Check ownership (IDOR)
-		belongs, err := api.store.OverrideBelongsToSchedule(overrideID, scheduleID)
-		if err != nil {
-			return rbac.Scope{}, err
-		}
-		if !belongs {
-			return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "override not found in this schedule")
-		}
-
-		// Load schedule to get TeamID for scope
-		schedule, err := api.store.GetScheduleByID(scheduleID)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "schedule not found")
+		ctx := c.Request().Context()
+		var teamID string
+		err := api.scheduleRead.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
+			root, err := view.GetScheduleRoot(ctx, scheduleID)
+			if err != nil {
+				return err
 			}
+			// A tombstoned head still proves ownership, so it passes here and
+			// the command refuses it with "not found". Authorization decides
+			// who may act on this schedule; whether the override is still
+			// there is the command's question, asked under its lock.
+			if _, err := view.GetOverrideHead(ctx, scheduleID, overrideID); err != nil {
+				return err
+			}
+			teamID = root.TeamID
+			return nil
+		})
+		switch {
+		case errors.Is(err, scheduleconfig.ErrScheduleNotFound):
+			return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "schedule not found")
+		case errors.Is(err, scheduleconfig.ErrOverrideNotFound):
+			return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "override not found in this schedule")
+		case err != nil:
 			return rbac.Scope{}, err
 		}
 
-		c.Set("schedule", schedule)
-		return rbac.TeamScope(schedule.TeamID), nil
+		return rbac.TeamScope(teamID), nil
 	}
 }
 

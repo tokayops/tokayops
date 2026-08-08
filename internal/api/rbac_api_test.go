@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -370,11 +371,12 @@ func TestRBAC_ScheduleManagement(t *testing.T) {
 	})
 
 	t.Run("Delete Schedule", func(t *testing.T) {
-		// Re-create schedule (may have been modified by previous subtests)
-		s.CreateSchedule(&model.Schedule{ID: "sched-a-del", TeamID: "team-a", Timezone: "UTC"})
+		// A revision-model schedule, created through the API by the team admin.
+		created := createTeamSchedule(t, e, "team-a", "alice", "alice")
 
 		// Team Member -> 403
-		req := httptest.NewRequest(http.MethodDelete, "/api/v1/teams/team-a/schedule", nil)
+		req := httptest.NewRequest(http.MethodDelete,
+			fmt.Sprintf("/api/v1/teams/team-a/schedule?expected_version=%d", created.Version), nil)
 		addAuth(req, "bob")
 		rec := httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
@@ -383,7 +385,8 @@ func TestRBAC_ScheduleManagement(t *testing.T) {
 		}
 
 		// Non-member -> 403
-		req = httptest.NewRequest(http.MethodDelete, "/api/v1/teams/team-a/schedule", nil)
+		req = httptest.NewRequest(http.MethodDelete,
+			fmt.Sprintf("/api/v1/teams/team-a/schedule?expected_version=%d", created.Version), nil)
 		addAuth(req, "charlie")
 		rec = httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
@@ -392,74 +395,80 @@ func TestRBAC_ScheduleManagement(t *testing.T) {
 		}
 
 		// Team Admin -> 204
-		req = httptest.NewRequest(http.MethodDelete, "/api/v1/teams/team-a/schedule", nil)
+		req = httptest.NewRequest(http.MethodDelete,
+			fmt.Sprintf("/api/v1/teams/team-a/schedule?expected_version=%d", created.Version), nil)
 		addAuth(req, "alice")
 		rec = httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
 		if rec.Code != http.StatusNoContent {
-			t.Errorf("Team Admin delete schedule: want 204, got %d", rec.Code)
+			t.Errorf("Team Admin delete schedule: want 204, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
 }
 
+// createTeamSchedule creates a revision-model schedule for a team, with the
+// named members as the single rotation group.
+func createTeamSchedule(t *testing.T, e *echo.Echo, teamID, actor string, members ...string) PutScheduleConfigResponse {
+	t.Helper()
+	rec := doJSON(t, e, http.MethodPut, "/api/v1/teams/"+teamID+"/schedule/config",
+		configRequest(0, members), actor)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create schedule for %s: want 200, got %d: %s", teamID, rec.Code, rec.Body.String())
+	}
+	var out PutScheduleConfigResponse
+	decodeJSON(t, rec, &out)
+	return out
+}
+
 func TestRBAC_ScheduleOverrides(t *testing.T) {
 	_, s, e := setupRBACEnv(t)
-	// Seed schedule for team-a
-	sched := &model.Schedule{ID: "sched-a", TeamID: "team-a"}
-	s.CreateSchedule(sched)
+	defer s.Close()
+	createTeamSchedule(t, e, "team-a", "alice", "alice")
 
+	scheduleID := func() string {
+		rec := doJSON(t, e, http.MethodGet, "/api/v1/teams/team-a/schedule/config", nil, "alice")
+		var cfg ScheduleConfigResponse
+		decodeJSON(t, rec, &cfg)
+		return cfg.ScheduleID
+	}()
+
+	override := ScheduleOverrideRequest{
+		UserID:    "alice",
+		ValidFrom: time.Date(2099, 1, 1, 10, 0, 0, 0, time.UTC),
+		ValidTo:   time.Date(2099, 1, 1, 11, 0, 0, 0, time.UTC),
+	}
+
+	var created ScheduleOverrideDTO
 	t.Run("Create Override", func(t *testing.T) {
-		body := `{"user_id": "alice", "start_time": "2099-01-01T10:00:00Z", "end_time": "2099-01-01T11:00:00Z"}`
-
 		// Team Member -> 201
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/teams/team-a/schedule/overrides", strings.NewReader(body))
-		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-		addAuth(req, "bob")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
+		rec := doJSON(t, e, http.MethodPost, "/api/v1/teams/team-a/schedule/overrides", override, "bob")
 		if rec.Code != http.StatusCreated {
-			t.Errorf("Team Member create override: want 201, got %d", rec.Code)
+			t.Fatalf("Team Member create override: want 201, got %d: %s", rec.Code, rec.Body.String())
 		}
+		decodeJSON(t, rec, &created)
 
 		// Non-Member -> 403
-		req = httptest.NewRequest(http.MethodPost, "/api/v1/teams/team-a/schedule/overrides", strings.NewReader(body))
-		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-		addAuth(req, "charlie")
-		rec = httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
+		rec = doJSON(t, e, http.MethodPost, "/api/v1/teams/team-a/schedule/overrides", override, "charlie")
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("Non-Member create override: want 403, got %d", rec.Code)
 		}
 	})
 
 	t.Run("Update Override", func(t *testing.T) {
-		// Seed override directly
-		s.CreateScheduleOverride(&model.ScheduleOverride{
-			ID:         "ov-rbac",
-			ScheduleID: "sched-a",
-			UserID:     "alice",
-			StartTime:  time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC),
-			EndTime:    time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC),
-		})
-
-		body := `{"user_id": "alice", "start_time": "2024-06-01T10:00:00Z", "end_time": "2024-06-01T12:00:00Z"}`
+		path := fmt.Sprintf("/api/v1/schedules/%s/overrides/%s", scheduleID, created.OverrideID)
+		edit := override
+		edit.ExpectedRevision = created.Revision
+		edit.ValidTo = override.ValidTo.Add(time.Hour)
 
 		// Team Member -> 200
-		req := httptest.NewRequest(http.MethodPut, "/api/v1/schedules/sched-a/overrides/ov-rbac", strings.NewReader(body))
-		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-		addAuth(req, "bob")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
+		rec := doJSON(t, e, http.MethodPut, path, edit, "bob")
 		if rec.Code != http.StatusOK {
-			t.Errorf("Team Member update override: want 200, got %d: %s", rec.Code, rec.Body.String())
+			t.Fatalf("Team Member update override: want 200, got %d: %s", rec.Code, rec.Body.String())
 		}
 
 		// Non-Member -> 403
-		req = httptest.NewRequest(http.MethodPut, "/api/v1/schedules/sched-a/overrides/ov-rbac", strings.NewReader(body))
-		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-		addAuth(req, "charlie")
-		rec = httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
+		edit.ExpectedRevision = created.Revision + 1
+		rec = doJSON(t, e, http.MethodPut, path, edit, "charlie")
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("Non-Member update override: want 403, got %d", rec.Code)
 		}

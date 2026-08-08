@@ -292,6 +292,12 @@ type Schedule struct {
 	TeamID   string `json:"team_id"`
 	Timezone string `json:"timezone"` // IANA timezone, e.g., "Asia/Bangkok"
 
+	// ConfigVersion is non-zero when this schedule is governed by the revision
+	// model, in which case the mutable columns below are stale leftovers and
+	// nothing may read them. It is scanned so the legacy readers can refuse
+	// such a row instead of answering from data nobody maintains.
+	ConfigVersion int64 `json:"config_version"`
+
 	// Slack Usergroup Sync (optional)
 	SlackUsergroupID string `json:"slack_usergroup_id,omitempty"`
 

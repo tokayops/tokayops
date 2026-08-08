@@ -26,6 +26,7 @@ type MockStore struct {
 	incidentSeq            int
 	teams                  map[string]*model.Team
 	users                  map[string]*model.User
+	erasedUsers            map[string]bool
 	teamMembers            map[string]map[string]model.TeamMemberRole // teamID -> userID -> role
 	timelineEvents         map[string][]*model.TimelineEvent          // alertGroupID -> events
 	apiTokens              map[string]*model.APIToken                 // tokenID -> token
@@ -1159,6 +1160,35 @@ func (m *MockStore) GetUserByID(id string) (*model.User, error) {
 	return nil, sql.ErrNoRows
 }
 
+// GetActiveUserByID mirrors the store: an erased user is not found.
+func (m *MockStore) GetActiveUserByID(id string) (*model.User, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.GetUserByIDError != nil {
+		return nil, m.GetUserByIDError
+	}
+	if m.erasedUsers[id] {
+		return nil, ErrUserNotFound
+	}
+	if u, ok := m.users[id]; ok {
+		userCopy := *u
+		return &userCopy, nil
+	}
+	return nil, ErrUserNotFound
+}
+
+// EraseUser marks a mock user as soft-deleted: GetUserByID keeps returning
+// them for history, GetActiveUserByID stops.
+func (m *MockStore) EraseUser(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.erasedUsers == nil {
+		m.erasedUsers = map[string]bool{}
+	}
+	m.erasedUsers[id] = true
+}
+
 func (m *MockStore) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1186,51 +1216,70 @@ func (m *MockStore) GetUserByEmail(email string) (*model.User, error) {
 	return nil, sql.ErrNoRows
 }
 
+// GetAllUsers excludes erased users, like the store: the operator's user list
+// is a list of people who exist, not a log of who ever did.
 func (m *MockStore) GetAllUsers() ([]*model.User, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var result []*model.User
-	for _, u := range m.users {
+	for id, u := range m.users {
+		if m.erasedUsers[id] {
+			continue
+		}
 		userCopy := *u
 		result = append(result, &userCopy)
 	}
 	return result, nil
 }
 
+// AnonymizeUser strips the identifying fields, mirroring the erasure
+// primitive. id and role survive: the ID is what history joins on.
+func (m *MockStore) AnonymizeUser(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if u, ok := m.users[id]; ok {
+		u.Name = AnonymizedUserName
+		u.Email = ""
+		u.PasswordHash = ""
+		u.AuthProvider = ""
+	}
+}
+
 func (m *MockStore) UpdateUser(u *model.User) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if existing, ok := m.users[u.ID]; ok {
+	// Profile fields only, as in the store: role changes go through SetUserRole,
+	// which is the one place the last-admin invariant is serialized.
+	if existing, ok := m.users[u.ID]; ok && !m.erasedUsers[u.ID] {
 		existing.Email = u.Email
 		existing.Name = u.Name
-		existing.Role = u.Role
 		return nil
 	}
-	return sql.ErrNoRows
+	return ErrUserNotFound
 }
 
 func (m *MockStore) UpdateUserPassword(id, hash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if u, ok := m.users[id]; ok {
+	if u, ok := m.users[id]; ok && !m.erasedUsers[id] {
 		u.PasswordHash = hash
 		return nil
 	}
-	return sql.ErrNoRows
+	return ErrUserNotFound
 }
 
 func (m *MockStore) UpdateUserAuthProvider(id, provider string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if u, ok := m.users[id]; ok {
+	if u, ok := m.users[id]; ok && !m.erasedUsers[id] {
 		u.AuthProvider = provider
 		return nil
 	}
-	return sql.ErrNoRows
+	return ErrUserNotFound
 }
 
 func (m *MockStore) DeleteUser(id string) error {
@@ -1256,8 +1305,8 @@ func (m *MockStore) AddTeamMember(teamID, userID string, role model.TeamMemberRo
 	if _, ok := m.teams[teamID]; !ok {
 		return sql.ErrNoRows
 	}
-	if _, ok := m.users[userID]; !ok {
-		return sql.ErrNoRows
+	if _, ok := m.users[userID]; !ok || m.erasedUsers[userID] {
+		return ErrUserNotFound
 	}
 
 	if m.teamMembers[teamID] == nil {
@@ -1278,7 +1327,7 @@ func (m *MockStore) GetTeamMembers(teamID string) ([]*model.TeamMemberDetail, er
 
 	var result []*model.TeamMemberDetail
 	for userID, role := range members {
-		if u, ok := m.users[userID]; ok {
+		if u, ok := m.users[userID]; ok && !m.erasedUsers[userID] {
 			tm := &model.TeamMemberDetail{
 				User:     *u,
 				TeamRole: role,
@@ -1678,10 +1727,27 @@ func (m *MockStore) GetCurrentEpoch(scheduleID, layer string) (*model.RotationEp
 // API Tokens
 // ========================================
 
+// activeUser mirrors the lifecycle rule the store enforces in SQL: nothing
+// owned by a user may be created for, or resolved to, someone who has been
+// erased. The mock has to agree, or API tests keep passing against states
+// production has made impossible.
+//
+// Callers hold the lock.
+func (m *MockStore) activeUser(userID string) bool {
+	if m.erasedUsers[userID] {
+		return false
+	}
+	_, ok := m.users[userID]
+	return ok
+}
+
 func (m *MockStore) CreateAPIToken(token *model.APIToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if !m.activeUser(token.UserID) {
+		return ErrUserNotFound
+	}
 	if token.CreatedAt.IsZero() {
 		token.CreatedAt = time.Now()
 	}
@@ -1695,7 +1761,7 @@ func (m *MockStore) GetAPITokenByHash(hash string) (*model.APIToken, error) {
 	defer m.mu.RUnlock()
 
 	for _, t := range m.apiTokens {
-		if t.TokenHash == hash {
+		if t.TokenHash == hash && m.activeUser(t.UserID) {
 			tokenCopy := *t
 			return &tokenCopy, nil
 		}
@@ -1759,6 +1825,9 @@ func (m *MockStore) BindExternalIdentity(ei *model.ExternalIdentity) error {
 }
 
 func (m *MockStore) bindIdentityLocked(ei *model.ExternalIdentity) error {
+	if !m.activeUser(ei.UserID) {
+		return ErrUserNotFound
+	}
 	// (provider, external_id) must be globally unique across users
 	for _, other := range m.externalIdentities {
 		if other.Provider == ei.Provider && other.ExternalID == ei.ExternalID && other.UserID != ei.UserID {
@@ -1790,6 +1859,10 @@ func (m *MockStore) BindExternalIdentityIfAbsent(userID, provider, externalID, d
 	if _, ok := m.externalIdentities[userID+"|"+provider]; ok {
 		return false, nil
 	}
+	// An erased user is the same answer as a conflict here: nothing changed.
+	if !m.activeUser(userID) {
+		return false, nil
+	}
 	ei := &model.ExternalIdentity{
 		UserID: userID, Provider: provider, ExternalID: externalID, DisplayName: displayName,
 	}
@@ -1813,11 +1886,9 @@ func (m *MockStore) GetUserByExternalID(provider, externalID string) (*model.Use
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, ei := range m.externalIdentities {
-		if ei.Provider == provider && ei.ExternalID == externalID {
-			if u, ok := m.users[ei.UserID]; ok {
-				copy := *u
-				return &copy, nil
-			}
+		if ei.Provider == provider && ei.ExternalID == externalID && m.activeUser(ei.UserID) {
+			copy := *m.users[ei.UserID]
+			return &copy, nil
 		}
 	}
 	return nil, sql.ErrNoRows
@@ -1866,6 +1937,9 @@ func (m *MockStore) IssueLinkToken(userID, provider, externalID, token string, e
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.activeUser(userID) {
+		return ErrUserNotFound
+	}
 	hash := mockHashToken(token)
 	// (provider, token_hash) global uniqueness — collisions retry at the caller.
 	for k, lt := range m.linkTokens {
@@ -1883,6 +1957,9 @@ func (m *MockStore) IssueLinkToken(userID, provider, externalID, token string, e
 func (m *MockStore) ConfirmIdentityLink(userID, provider, token string) (*model.ExternalIdentity, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.activeUser(userID) {
+		return nil, ErrUserNotFound
+	}
 	key := userID + "|" + provider
 	lt, ok := m.linkTokens[key]
 	if !ok {
@@ -1937,6 +2014,9 @@ func (m *MockStore) ConsumeLinkToken(provider, token, externalID, chatID, displa
 	if !ok {
 		return nil, ErrLinkTokenInvalid
 	}
+	if !m.activeUser(found.UserID) {
+		return nil, ErrUserNotFound
+	}
 	if time.Now().After(found.ExpiresAt) {
 		delete(m.linkTokens, key)
 		return nil, ErrLinkTokenExpired
@@ -1985,21 +2065,23 @@ func (m *MockStore) SetUserRole(userID string, role model.UserRole) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	user, ok := m.users[userID]
-	if !ok {
-		return sql.ErrNoRows
+	// Role is part of the lifecycle, like everything else a user owns: an
+	// erased user has no role to change, and does not count as one of the
+	// administrators the system is required to keep.
+	if !m.activeUser(userID) {
+		return ErrUserNotFound
 	}
+	user := m.users[userID]
 
-	// If demoting from admin, check we're not removing the last admin
 	if user.Role == model.UserRoleAdmin && role != model.UserRoleAdmin {
 		adminCount := 0
-		for _, u := range m.users {
-			if u.Role == model.UserRoleAdmin {
+		for id, u := range m.users {
+			if u.Role == model.UserRoleAdmin && m.activeUser(id) {
 				adminCount++
 			}
 		}
 		if adminCount <= 1 {
-			return sql.ErrNoRows // simulates "cannot demote last admin"
+			return ErrLastAdmin
 		}
 	}
 
@@ -2008,13 +2090,15 @@ func (m *MockStore) SetUserRole(userID string, role model.UserRole) error {
 }
 
 // CountAdmins returns the number of users with admin role.
+// CountAdmins counts ACTIVE admins. An erased one is not an administrator the
+// system can fall back on.
 func (m *MockStore) CountAdmins() (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	count := 0
-	for _, u := range m.users {
-		if u.Role == model.UserRoleAdmin {
+	for id, u := range m.users {
+		if u.Role == model.UserRoleAdmin && m.activeUser(id) {
 			count++
 		}
 	}

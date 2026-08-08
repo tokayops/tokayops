@@ -62,22 +62,25 @@ func (s *Store) BindExternalIdentity(ei *model.ExternalIdentity) error {
 	}
 	ei.UpdatedAt = now
 
-	query := `
+	query := activeUserCTE + `
 		INSERT INTO external_identities (id, user_id, provider, external_id, chat_id, display_name, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7, $8)
+		SELECT $2, active.id, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7, $8 FROM active
 		ON CONFLICT (user_id, provider) DO UPDATE SET
 			external_id  = EXCLUDED.external_id,
 			chat_id      = EXCLUDED.chat_id,
 			display_name = EXCLUDED.display_name,
 			updated_at   = EXCLUDED.updated_at
 	`
-	if _, err := s.db.Exec(query, ei.ID, ei.UserID, ei.Provider, ei.ExternalID, ei.ChatID, ei.DisplayName, ei.CreatedAt, ei.UpdatedAt); err != nil {
+	res, err := s.db.Exec(query, ei.UserID, ei.ID, ei.Provider, ei.ExternalID, ei.ChatID, ei.DisplayName, ei.CreatedAt, ei.UpdatedAt)
+	if err != nil {
 		if isProviderExternalConflict(err) {
 			return ErrExternalIdentityAlreadyLinked
 		}
 		return err
 	}
-	return nil
+	// An erased user matches nothing in the CTE, so no row is written and the
+	// caller is told the identity has nobody to belong to.
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 // BindExternalIdentityIfAbsent is the safe auto-link path for SSO / interactive
@@ -96,11 +99,20 @@ func (s *Store) BindExternalIdentity(ei *model.ExternalIdentity) error {
 // Callers can ignore (false, nil) silently and decide whether to surface the
 // already-linked conflict.
 func (s *Store) BindExternalIdentityIfAbsent(userID, provider, externalID, displayName string) (bool, error) {
-	res, err := s.db.Exec(`
+	// KNOWN LIMITATION. ON CONFLICT DO NOTHING makes zero affected rows mean
+	// two things - "already linked" and "the user has been erased" - and this
+	// statement cannot tell them apart. Both come back as (false, nil).
+	//
+	// The security property holds either way: no identity is created for an
+	// erased user. What is lost is the ability to say why, and callers of this
+	// variant are documented to ignore (false, nil) anyway. Separating the two
+	// would cost a transaction - lock the user, then upsert - which is what a
+	// caller should reach for if it ever needs the distinction.
+	res, err := s.db.Exec(activeUserCTE+`
 		INSERT INTO external_identities (id, user_id, provider, external_id, chat_id, display_name, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, NULL, NULLIF($5, ''), NOW(), NOW())
+		SELECT $2, active.id, $3, $4, NULL, NULLIF($5, ''), NOW(), NOW() FROM active
 		ON CONFLICT (user_id, provider) DO NOTHING
-	`, uuid.New().String(), userID, provider, externalID, displayName)
+	`, userID, uuid.New().String(), provider, externalID, displayName)
 	if err != nil {
 		if isProviderExternalConflict(err) {
 			return false, ErrExternalIdentityAlreadyLinked
@@ -127,9 +139,12 @@ func (s *Store) GetExternalIdentity(userID, provider string) (*model.ExternalIde
 // GetUserByExternalID is the reverse lookup (Slack button click → TokayOps user)
 // that replaces GetUserBySlackID.
 func (s *Store) GetUserByExternalID(provider, externalID string) (*model.User, error) {
+	// Active only. This is how an inbound Slack or Telegram message finds who
+	// it came from, and an erased user must not be found by it - not even if
+	// an identity row outlived them by a race.
 	query := `SELECT u.id, u.email, u.name, u.role, u.password_hash, u.auth_provider, u.created_at
 	          FROM users u JOIN external_identities ei ON ei.user_id = u.id
-	          WHERE ei.provider = $1 AND ei.external_id = $2`
+	          WHERE ei.provider = $1 AND ei.external_id = $2 AND u.deleted_at IS NULL`
 	row := s.db.QueryRow(query, provider, externalID)
 
 	var u model.User
@@ -204,9 +219,9 @@ func (s *Store) IssueLinkToken(userID, provider, externalID, token string, expir
 		return errors.New("token is required")
 	}
 	id := uuid.New().String()
-	query := `
+	query := activeUserCTE + `
 		INSERT INTO link_tokens (id, user_id, provider, token_hash, external_id, attempts, expires_at, created_at)
-		VALUES ($1, $2, $3, $4, NULLIF($5, ''), 0, $6, NOW())
+		SELECT $2, active.id, $3, $4, NULLIF($5, ''), 0, $6, NOW() FROM active
 		ON CONFLICT (user_id, provider) DO UPDATE SET
 			token_hash  = EXCLUDED.token_hash,
 			external_id = EXCLUDED.external_id,
@@ -214,10 +229,14 @@ func (s *Store) IssueLinkToken(userID, provider, externalID, token string, expir
 			expires_at  = EXCLUDED.expires_at,
 			created_at  = NOW()
 	`
-	if _, err := s.db.Exec(query, id, userID, provider, hashLinkToken(token), externalID, expiresAt); err != nil {
+	res, err := s.db.Exec(query, userID, id, provider, hashLinkToken(token), externalID, expiresAt)
+	if err != nil {
 		return err
 	}
-	return nil
+	// An erased user matches nothing in the CTE, so no row is written - and
+	// silence here would be worse than a plain failure: the caller goes on to
+	// send an OTP or a deep link for a token that does not exist.
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 // ConfirmIdentityLink consumes a pending link token and binds the external identity
@@ -231,6 +250,12 @@ func (s *Store) ConfirmIdentityLink(userID, provider, token string) (*model.Exte
 		return nil, err
 	}
 	defer tx.Rollback()
+
+	// Users before the rows that belong to them, and an erased user has no
+	// link to confirm.
+	if err := lockActiveUserTx(tx, userID); err != nil {
+		return nil, err
+	}
 
 	var storedHash string
 	var externalIDNull sql.NullString
@@ -352,6 +377,25 @@ func (s *Store) ConsumeLinkToken(provider, token, externalID, chatID, displayNam
 	}
 	defer tx.Rollback()
 
+	// Who the token belongs to has to be known before the user can be locked,
+	// and the user has to be locked before the token row - erasure goes user
+	// first and would deadlock against the opposite order. So the token is
+	// read once without a lock to learn the owner, and then again under its
+	// own lock, because anything could have happened to it while this
+	// transaction waited on the user.
+	var owner string
+	switch err := tx.QueryRow(
+		`SELECT user_id FROM link_tokens WHERE provider = $1 AND token_hash = $2`,
+		provider, tokenHash).Scan(&owner); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, ErrLinkTokenInvalid
+	case err != nil:
+		return nil, err
+	}
+	if err := lockActiveUserTx(tx, owner); err != nil {
+		return nil, err
+	}
+
 	var userID string
 	var expiresAt time.Time
 	row := tx.QueryRow(
@@ -363,6 +407,15 @@ func (s *Store) ConsumeLinkToken(provider, token, externalID, chatID, displayNam
 			return nil, ErrLinkTokenInvalid
 		}
 		return nil, err
+	}
+	// Load-bearing, not a formality. The row was read once without a lock and
+	// again with one, and between those two reads it can be deleted and a new
+	// token issued under the same hash for somebody else. Binding then would
+	// give user B an identity while this transaction holds user A's lock -
+	// which is to say, with no protection for B at all. Refuse instead: the
+	// caller retries with a token whose owner is the one that got locked.
+	if userID != owner {
+		return nil, ErrLinkTokenInvalid
 	}
 
 	if time.Now().After(expiresAt) {

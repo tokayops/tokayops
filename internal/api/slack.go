@@ -56,7 +56,7 @@ func (a *API) RequestSlackCode(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
 	}
 
-	if _, err := a.store.GetUserByID(userID); err != nil {
+	if _, err := a.store.GetActiveUserByID(userID); err != nil {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 	}
 
@@ -129,7 +129,7 @@ func (a *API) ConfirmSlackCode(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
 	}
 
-	user, err := a.store.GetUserByID(userID)
+	user, err := a.store.GetActiveUserByID(userID)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 	}

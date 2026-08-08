@@ -15,6 +15,67 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// activeUserCTE is the head of every statement that creates something owned by
+// a user: a token, an identity, a link, a membership.
+//
+// It does two jobs in one statement, and both are needed. The predicate makes
+// "this user is alive" and "the row is inserted" atomic, so there is no window
+// between checking and writing. The FOR SHARE makes erasure - which takes FOR
+// UPDATE on the same row - wait for this transaction, so its sweep of the
+// child tables runs after the insert rather than before it and misses nothing.
+//
+// Without the lock the predicate alone is not enough: an insert that was still
+// uncommitted when erasure deleted the table would survive it.
+//
+// THE USER ID IS ALWAYS $1. That is the whole convention, and it is why this
+// is a constant concatenated onto a query rather than a format string: a
+// placeholder index chosen per call site is a silent coupling to the argument
+// order, and getting it wrong locks the wrong person while every test that
+// uses one user still passes.
+const activeUserCTE = `WITH active AS (
+	SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR SHARE
+)`
+
+// lockActiveUserTx is activeUserCTE for a transaction that writes more than
+// one statement: take the shared lock on the user first, and only then touch
+// the rows that belong to them.
+//
+// Order matters as much as the lock. Erasure locks the user and then deletes
+// the child rows; a transaction that locked a child row first and reached for
+// the user second would be the other half of an AB-BA deadlock.
+func lockActiveUserTx(tx *sql.Tx, userID string) error {
+	var id string
+	err := tx.QueryRow(
+		`SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR SHARE`, userID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrUserNotFound
+	}
+	return err
+}
+
+// ErrUserNotFound means no user matched, or the one that did has been erased.
+// The two are the same answer on purpose: a command must not be able to tell
+// "this person never existed" from "this person was deleted".
+var ErrUserNotFound = errors.New("store: user not found")
+
+// ErrLastAdmin means the change would leave the system with no active
+// administrator. It is a sentinel because the API has to answer 409 for it,
+// and the alternative - matching on the message text - is a contract nobody
+// can see and the mock could never reproduce.
+//
+// erasure declares a sentinel of the same name for the same invariant seen
+// from its side. The duplication is deliberate and is the second instance of
+// this trade in the codebase, after UserOnCallError and MemberOnCallError: the
+// erasure package knows nothing about the store, and one shared sentinel would
+// buy a line of code at the price of an import that means nothing. If a third
+// instance appears, that is the signal to give these invariants a home of
+// their own rather than to keep paying.
+var ErrLastAdmin = errors.New("store: cannot demote the last admin")
+
+// ErrScheduleSuperseded means the schedule row belongs to the revision model
+// and the legacy readers must not answer from its mutable columns.
+var ErrScheduleSuperseded = errors.New("store: schedule is managed by the revision model")
+
 type Store struct {
 	db *sql.DB
 }
@@ -2290,10 +2351,34 @@ func (s *Store) CreateUser(u *model.User) error {
 	return err
 }
 
+// GetUserByID reads a user INCLUDING an erased one.
+//
+// It is the display read, and it exists so history stays legible: a revision
+// or an override that names an erased ID has to resolve to something, and
+// "Deleted user" is what anonymization left behind. Command paths and
+// authentication must not use it - they use GetActiveUserByID, or an erased
+// person keeps a working session and can be written back into the system.
 func (s *Store) GetUserByID(id string) (*model.User, error) {
 	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at FROM users WHERE id = $1`
-	row := s.db.QueryRow(query, id)
+	return scanUser(s.db.QueryRow(query, id))
+}
 
+// GetActiveUserByID reads a user that has not been erased.
+//
+// Soft delete has to be terminal, and this is the read that makes it so:
+// authentication and every command go through here, so an erased user's
+// session stops working on their next request and no command can act on them.
+func (s *Store) GetActiveUserByID(id string) (*model.User, error) {
+	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at
+			  FROM users WHERE id = $1 AND deleted_at IS NULL`
+	u, err := scanUser(s.db.QueryRow(query, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
+	return u, err
+}
+
+func scanUser(row *sql.Row) (*model.User, error) {
 	var u model.User
 	var email, role, passwordHash, authProvider sql.NullString
 	err := row.Scan(&u.ID, &email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
@@ -2307,6 +2392,14 @@ func (s *Store) GetUserByID(id string) (*model.User, error) {
 	return &u, nil
 }
 
+// GetUsersByIDs is a DISPLAY read and deliberately does NOT filter erased
+// users, unlike GetAllUsers directly above it.
+//
+// This is what hydrates names onto rendered history, and history names people
+// who have since been erased: dropping them here would leave a shift with an
+// ID and no name at all, which is worse than "Deleted user". The rule is by
+// purpose, not by table - "align these two" is a change that silently breaks
+// the calendar.
 func (s *Store) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	if len(ids) == 0 {
 		return []*model.User{}, nil
@@ -2334,8 +2427,12 @@ func (s *Store) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	return users, nil
 }
 
+// GetAllUsers lists the people who exist. An erased user is a tombstone kept
+// so history resolves, not a member of the directory - and the mock has always
+// said so, which meant unit tests and production disagreed.
 func (s *Store) GetAllUsers() ([]*model.User, error) {
-	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at FROM users ORDER BY name`
+	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at
+			  FROM users WHERE deleted_at IS NULL ORDER BY name`
 	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
@@ -2358,11 +2455,18 @@ func (s *Store) GetAllUsers() ([]*model.User, error) {
 	return users, nil
 }
 
+// AddTeamMember grants a membership, and only to a user who has not been
+// erased: a bare INSERT would hand an erased identity a live grant back.
 func (s *Store) AddTeamMember(teamID, userID string, role model.TeamMemberRole) error {
-	query := `INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)
-			  ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`
-	_, err := s.db.Exec(query, teamID, userID, role)
-	return err
+	query := activeUserCTE + `
+		INSERT INTO team_members (team_id, user_id, role)
+		SELECT $2, active.id, $3 FROM active
+		ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`
+	res, err := s.db.Exec(query, userID, teamID, role)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 func (s *Store) GetTeamMembers(teamID string) ([]*model.TeamMemberDetail, error) {
@@ -2417,24 +2521,56 @@ func (s *Store) GetUserByEmail(email string) (*model.User, error) {
 	return &u, nil
 }
 
+// The three user mutations below all carry `deleted_at IS NULL` and check that
+// they affected a row.
+//
+// Without the filter each of them silently refills an erased row - name and
+// email, a password hash, a federated identity - and the erasure that was
+// supposed to be terminal becomes a stage a later request can undo. Without
+// the row count, an update that matched nothing reports success, which reads
+// as "the change was applied" to every caller.
+
+// UpdateUser writes profile fields only. role is deliberately NOT among them.
+//
+// Role is an invariant, not a field: the system must keep one active
+// administrator, and SetUserRole is what serializes that check against
+// erasure. A profile update that also carried role could undo a promotion it
+// never saw - read B as a user, let someone promote B and erase the last other
+// admin, then write B back as a user and leave nobody in charge.
 func (s *Store) UpdateUser(u *model.User) error {
-	query := `UPDATE users SET email = $1, name = $2, role = $3 WHERE id = $4`
-	_, err := s.db.Exec(query, u.Email, u.Name, u.Role, u.ID)
-	return err
+	query := `UPDATE users SET email = $1, name = $2 WHERE id = $3 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, u.Email, u.Name, u.ID)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 func (s *Store) UpdateUserPassword(id, hash string) error {
-	query := `UPDATE users SET password_hash = $1 WHERE id = $2`
-	_, err := s.db.Exec(query, hash, id)
-	return err
+	query := `UPDATE users SET password_hash = $1 WHERE id = $2 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, hash, id)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 func (s *Store) UpdateUserAuthProvider(id, provider string) error {
-	query := `UPDATE users SET auth_provider = $1 WHERE id = $2`
-	_, err := s.db.Exec(query, provider, id)
-	return err
+	query := `UPDATE users SET auth_provider = $1 WHERE id = $2 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, provider, id)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
+// DeleteUser physically removes a user.
+//
+// Deprecated: user deletion goes through erasure.Service, which soft-deletes
+// and anonymizes so the history that names the ID stays explainable, and which
+// refuses to erase someone who still holds an assignment. This remains only
+// for the tooling that has not moved yet and is removed with the rest of the
+// legacy schedule path.
 func (s *Store) DeleteUser(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM team_members WHERE user_id = $1`, id); err != nil {
 		return err
@@ -2459,7 +2595,17 @@ func (s *Store) GetUserTeamRole(userID, teamID string) (model.TeamMemberRole, er
 	return model.TeamMemberRole(role), nil
 }
 
-// SetUserRole updates a user's global role with transaction protection for last admin.
+// SetUserRole updates a user's global role, refusing to demote the last
+// administrator the system has left.
+//
+// It takes the admin-lifecycle advisory lock first, the same one erasure
+// takes, because these two commands change the same quantity from different
+// directions: without a shared mutex, erasing one of two admins and demoting
+// the other can both observe "there are two" and both commit.
+//
+// The count is of ACTIVE admins. Counting erased ones as living was the older
+// bug: after the first erasure the guard believed there were still two, and
+// the last real administrator could be demoted.
 func (s *Store) SetUserRole(userID string, role model.UserRole) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -2467,45 +2613,43 @@ func (s *Store) SetUserRole(userID string, role model.UserRole) error {
 	}
 	defer tx.Rollback()
 
-	// Get current role of target user
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, adminLifecycleLockKey); err != nil {
+		return err
+	}
+
 	var currentRole string
-	err = tx.QueryRow(`SELECT role FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&currentRole)
+	err = tx.QueryRow(`SELECT role FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, userID).Scan(&currentRole)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrUserNotFound
+	}
 	if err != nil {
 		return err
 	}
 
-	// If demoting from admin, lock ALL admin users and count them
 	if currentRole == string(model.UserRoleAdmin) && role != model.UserRoleAdmin {
-		// Lock all admin users to prevent parallel demotions
-		rows, err := tx.Query(`SELECT id FROM users WHERE role = 'admin' FOR UPDATE`)
-		if err != nil {
+		var adminCount int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL`).
+			Scan(&adminCount); err != nil {
 			return err
 		}
-		adminCount := 0
-		for rows.Next() {
-			var id string
-			rows.Scan(&id)
-			adminCount++
-		}
-		rows.Close()
-
 		if adminCount <= 1 {
-			return fmt.Errorf("cannot demote the last admin")
+			return ErrLastAdmin
 		}
 	}
 
-	_, err = tx.Exec(`UPDATE users SET role = $1 WHERE id = $2`, role, userID)
-	if err != nil {
+	if _, err = tx.Exec(`UPDATE users SET role = $1 WHERE id = $2 AND deleted_at IS NULL`, role, userID); err != nil {
 		return err
 	}
 
 	return tx.Commit()
 }
 
-// CountAdmins returns the number of users with admin role.
+// CountAdmins returns the number of ACTIVE users with the admin role. An
+// erased admin is not an administrator the system can fall back on.
 func (s *Store) CountAdmins() (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&count)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL`).Scan(&count)
 	return count, err
 }
 
@@ -2562,6 +2706,11 @@ func (s *Store) GetTimelineEvents(alertGroupID string) ([]*model.TimelineEvent, 
 // Schedule CRUD (Phase 3)
 // ========================================
 
+// CreateSchedule inserts a legacy schedule row.
+//
+// Deprecated: schedule configuration is written by scheduleconfig.Service,
+// which records it as a revision. This remains only for fixtures that have not
+// moved yet and is removed with the rest of the legacy schedule path.
 func (s *Store) CreateSchedule(sch *model.Schedule) error {
 	if sch.CreatedAt.IsZero() {
 		sch.CreatedAt = time.Now()
@@ -2583,29 +2732,58 @@ func (s *Store) CreateSchedule(sch *model.Schedule) error {
 	return err
 }
 
+// legacyScheduleColumns is the projection both legacy readers share.
+// config_version is part of it although no legacy consumer wants the value:
+// it is what the guard in scanSchedule needs to recognize a row it must not
+// answer from.
+const legacyScheduleColumns = `id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at, config_version`
+
 func (s *Store) GetScheduleByTeamID(teamID string) (*model.Schedule, error) {
-	query := `SELECT id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at
-			  FROM schedules WHERE team_id = $1`
-	return s.scanSchedule(s.db.QueryRow(query, teamID))
+	return s.scanSchedule(s.db.QueryRow(
+		`SELECT `+legacyScheduleColumns+` FROM schedules WHERE team_id = $1`, teamID))
 }
 
 func (s *Store) GetScheduleByID(id string) (*model.Schedule, error) {
-	query := `SELECT id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at
-			  FROM schedules WHERE id = $1`
-	return s.scanSchedule(s.db.QueryRow(query, id))
+	return s.scanSchedule(s.db.QueryRow(
+		`SELECT `+legacyScheduleColumns+` FROM schedules WHERE id = $1`, id))
 }
 
+// scanSchedule reads a legacy schedule row and refuses the ones that belong to
+// the revision model.
+//
+// The mutable columns on such a row are whatever they were before the upgrade;
+// the rotation that actually decides who is on call lives in the revisions.
+// Answering from the stale columns would not fail, it would page the wrong
+// person - so mixing the two eras is made an error here, in the one place both
+// readers pass through, rather than in each of the ten callers.
+//
+// What each caller does with the refusal is deliberately different. The team
+// listing ignores it and shows "not configured"; the engine and the escalation
+// builder let it surface, because a schedule they cannot read is not something
+// to page around silently.
 func (s *Store) scanSchedule(row *sql.Row) (*model.Schedule, error) {
 	var sch model.Schedule
 	var l1HandoffDay, l2HandoffDay sql.NullInt64
+	var l1RotationType, l1HandoffTime sql.NullString
 	var l2RotationType, l2HandoffTime, slackUsergroupID sql.NullString
-	var l2RotationStart sql.NullTime
+	var l1RotationStart, l2RotationStart sql.NullTime
 
-	err := row.Scan(&sch.ID, &sch.TeamID, &sch.Timezone, &sch.L1RotationType, &sch.L1HandoffTime, &l1HandoffDay, &sch.L1RotationStart, &sch.L2Enabled, &sch.L2EscalationTimeout, &l2RotationType, &l2HandoffTime, &l2HandoffDay, &l2RotationStart, &slackUsergroupID, &sch.CreatedAt, &sch.UpdatedAt)
+	// Every legacy column is scanned as nullable, including the ones a
+	// pre-upgrade row always had. A schedule created by the revision model
+	// leaves them at their defaults, so scanning them into non-nullable types
+	// would fail with a driver error BEFORE the guard below could give the
+	// caller the answer it actually needs.
+	err := row.Scan(&sch.ID, &sch.TeamID, &sch.Timezone, &l1RotationType, &l1HandoffTime, &l1HandoffDay, &l1RotationStart, &sch.L2Enabled, &sch.L2EscalationTimeout, &l2RotationType, &l2HandoffTime, &l2HandoffDay, &l2RotationStart, &slackUsergroupID, &sch.CreatedAt, &sch.UpdatedAt, &sch.ConfigVersion)
 	if err != nil {
 		return nil, err
 	}
+	if sch.ConfigVersion > 0 {
+		return nil, ErrScheduleSuperseded
+	}
 
+	sch.L1RotationType = model.RotationType(l1RotationType.String)
+	sch.L1HandoffTime = l1HandoffTime.String
+	sch.L1RotationStart = l1RotationStart.Time
 	if l1HandoffDay.Valid {
 		d := int(l1HandoffDay.Int64)
 		sch.L1HandoffDay = &d
@@ -2624,6 +2802,11 @@ func (s *Store) scanSchedule(row *sql.Row) (*model.Schedule, error) {
 	return &sch, nil
 }
 
+// UpdateSchedule rewrites a legacy schedule row in place.
+//
+// Deprecated: configuration changes go through scheduleconfig.Service, which
+// appends a revision instead of overwriting the previous one. This remains
+// only for fixtures that have not moved yet.
 func (s *Store) UpdateSchedule(sch *model.Schedule) error {
 	sch.UpdatedAt = time.Now()
 	query := `UPDATE schedules SET timezone = $1, l1_rotation_type = $2, l1_handoff_time = $3, l1_handoff_day = $4, l1_rotation_start = $5, l2_enabled = $6, l2_escalation_timeout_min = $7, l2_rotation_type = $8, l2_handoff_time = $9, l2_handoff_day = $10, l2_rotation_start = $11, slack_usergroup_id = $12, updated_at = $13 WHERE id = $14`
@@ -2967,15 +3150,20 @@ func (s *Store) GetCurrentEpoch(scheduleID, layer string) (*model.RotationEpoch,
 // API Tokens CRUD
 // ========================================
 
-// CreateAPIToken creates a new API token
+// CreateAPIToken issues a token, and only to a user who has not been erased.
+// A credential is the last thing an erased identity should get back.
 func (s *Store) CreateAPIToken(token *model.APIToken) error {
 	if token.CreatedAt.IsZero() {
 		token.CreatedAt = time.Now()
 	}
-	query := `INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, created_at) 
-			  VALUES ($1, $2, $3, $4, $5, $6)`
-	_, err := s.db.Exec(query, token.ID, token.UserID, token.Name, token.TokenHash, token.ExpiresAt, token.CreatedAt)
-	return err
+	query := activeUserCTE + `
+		INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, created_at)
+		SELECT $2, active.id, $3, $4, $5, $6 FROM active`
+	res, err := s.db.Exec(query, token.UserID, token.ID, token.Name, token.TokenHash, token.ExpiresAt, token.CreatedAt)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 // GetAPITokenByHash retrieves an API token by its hash
@@ -3002,9 +3190,18 @@ func (s *Store) GetAPITokenByID(id string) (*model.APIToken, error) {
 	return &token, nil
 }
 
+// GetAPITokenByHash resolves a bearer token, and a token belonging to an
+// erased user does not resolve.
+//
+// The join is what makes soft delete terminal on this path. The cookie path
+// checks the user; without this, a token that outlived its owner by a race
+// would keep authenticating one, and Bearer requests never look at users at
+// all.
 func (s *Store) GetAPITokenByHash(hash string) (*model.APIToken, error) {
-	query := `SELECT id, user_id, name, token_hash, expires_at, last_used_at, created_at 
-			  FROM api_tokens WHERE token_hash = $1`
+	query := `SELECT t.id, t.user_id, t.name, t.token_hash, t.expires_at, t.last_used_at, t.created_at
+			  FROM api_tokens t
+			  JOIN users u ON u.id = t.user_id AND u.deleted_at IS NULL
+			  WHERE t.token_hash = $1`
 	row := s.db.QueryRow(query, hash)
 
 	var token model.APIToken

@@ -135,6 +135,35 @@ type ScheduleEvent struct {
 	RecordedAt time.Time
 }
 
+// EventScheduleConfigurationChanged is the one event type every configuration
+// command emits. Create, save, delete and recreate are the same fact -
+// "the configuration of this schedule is now different" - and a consumer that
+// cares which one it was reads the trigger. Four event types would force every
+// consumer to subscribe to all four to stay correct.
+const EventScheduleConfigurationChanged = "schedule.configuration_changed"
+
+// Triggers of EventScheduleConfigurationChanged.
+const (
+	TriggerCreated   = "created"
+	TriggerSaved     = "saved"
+	TriggerDeleted   = "deleted"
+	TriggerRecreated = "recreated"
+)
+
+// ConfigurationChangedPayload is the body of EventScheduleConfigurationChanged.
+// It names the revisions on both sides of the change rather than carrying the
+// configuration: a consumer that needs the snapshot reads the revision, and an
+// event log is not the place to duplicate it.
+type ConfigurationChangedPayload struct {
+	Trigger       string    `json:"trigger"`
+	OldRevisionID *string   `json:"old_revision_id"`
+	NewRevisionID string    `json:"new_revision_id"`
+	OldVersion    int64     `json:"old_version"`
+	NewVersion    int64     `json:"new_version"`
+	EffectiveAt   time.Time `json:"effective_at"`
+	ActorID       *string   `json:"actor_id"`
+}
+
 // ScheduleConfigRepository hands out a unit of work. Everything a command does
 // happens inside one WithinTx call; an error returned from fn rolls the whole
 // transaction back.
@@ -179,6 +208,51 @@ type ScheduleConfigTx interface {
 	InsertScheduleEvent(ctx context.Context, event *ScheduleEvent) error
 
 	InsertOverrideRevision(ctx context.Context, rev *OverrideRevision) error
+
+	// SetScheduleDeleted moves the deleted-at projection. A value sets it
+	// (delete), nil clears it (recreate). The projection is derived from the
+	// revision chain, never the other way round: the chain is the history.
+	SetScheduleDeleted(ctx context.Context, scheduleID string, deletedAt *time.Time) error
+
+	// MaxOverrideRecordedAt is the newest recorded_at across ALL override
+	// revisions of a schedule, tombstones included; nil when there are none.
+	//
+	// It is a read rather than SQL inside the insert so that the monotonicity
+	// rule lives next to the clock the service injects. Expressed in SQL it
+	// would have to be restated in the fake, and the two statements of one
+	// rule would be free to drift.
+	MaxOverrideRecordedAt(ctx context.Context, scheduleID string) (*time.Time, error)
+
+	// LockUsers takes a shared row lock on the named users, in ID order, and
+	// is the serialization point against erasure - not a source of data. It is
+	// taken BEFORE the schedule lock by every command, because erasure locks
+	// the user first and then scans schedules: the opposite order in one
+	// command is an AB-BA deadlock.
+	//
+	// IDs that name nobody are not an error here; membership validation is
+	// what rejects them, and it runs after the schedule lock.
+	//
+	// It exists only on the command transaction: PostgreSQL forbids row locks
+	// in a read-only transaction, so the read-only preview cannot take one and
+	// makes do with the unlocked membership read.
+	LockUsers(ctx context.Context, userIDs []string) error
+
+	// ActiveUserIDs filters a set of user IDs down to the ones that exist and
+	// have not been erased.
+	//
+	// It lives on the command side, not on the read view: the renderer has no
+	// use for it, and the one caller reads it with the rows already locked by
+	// LockUsers - which is what makes the answer stable long enough to act on.
+	//
+	// It asks a different question from GetTeamMemberIDs, which is team-scoped:
+	// the author of a change need not belong to the team whose schedule they
+	// are editing.
+	ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error)
+
+	// DeleteTeamMembership removes one membership. It is reachable only
+	// through Service.RemoveTeamMember, which holds the guard that stops a
+	// person being removed out from under a live assignment.
+	DeleteTeamMembership(ctx context.Context, teamID, userID string) error
 }
 
 // NormalizeTimestamp truncates to the resolution the database stores, so a

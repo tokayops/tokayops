@@ -1,8 +1,10 @@
 package scheduleconfig
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +22,61 @@ import (
 // They are named Prepare rather than Validate because they also fill in
 // defaults and normalize timestamps to database resolution; calling that
 // "validation" would understate what they do to their argument.
+
+// NormalizeConfiguration canonicalizes a desired configuration and reports a
+// rejection as the typed error the API maps to 400.
+//
+// Save and Preview both go through here rather than calling the rotation
+// validator directly. The rotation package is pure math and returns prose; if
+// each caller wrapped that prose itself, the preview and the save it previews
+// could disagree about what is acceptable, and the editor would show a
+// calculation the save then refuses.
+func NormalizeConfiguration(c rotation.ScheduleConfiguration) (rotation.ScheduleConfiguration, error) {
+	normalized, err := rotation.NormalizeConfiguration(c)
+	if err != nil {
+		return rotation.ScheduleConfiguration{}, invalidConfiguration(err)
+	}
+	return normalized, nil
+}
+
+// ValidateMembership rejects a configuration that puts someone outside the
+// owning team on call.
+//
+// It is exported because the preview has to refuse exactly what a save would
+// refuse. Two copies of this rule would let the editor show a calculation that
+// the save it is previewing then rejects.
+//
+// Every offender is listed rather than the first one: the editor shows them
+// together, and reporting them one failed save at a time would make fixing a
+// group a sequence of round-trips.
+func ValidateMembership(ctx context.Context, view ScheduleReadView, teamID string, wanted []string) error {
+	if len(wanted) == 0 {
+		return nil
+	}
+	// Read after the schedule lock, and unlocked: this is the authoritative
+	// membership, while the shared user locks taken earlier only serialize
+	// against erasure.
+	members, err := view.GetTeamMemberIDs(ctx, teamID)
+	if err != nil {
+		return err
+	}
+	member := make(map[string]struct{}, len(members))
+	for _, id := range members {
+		member[id] = struct{}{}
+	}
+
+	var offenders []string
+	for _, id := range wanted {
+		if _, ok := member[id]; !ok {
+			offenders = append(offenders, id)
+		}
+	}
+	if len(offenders) == 0 {
+		return nil
+	}
+	sort.Strings(offenders)
+	return &UserNotTeamMemberError{UserIDs: offenders}
+}
 
 // normalizeRecordedAt keeps recorded time at database resolution and fills in
 // a value for callers that left it zero.

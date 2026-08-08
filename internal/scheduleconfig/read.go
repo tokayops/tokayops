@@ -62,4 +62,40 @@ type ScheduleReadView interface {
 	// state; a value means the state as it was recorded at that system time,
 	// which is what lets history be replayed as it was known then.
 	GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]OverrideRevision, error)
+
+	// GetRevisionByID returns one revision of one schedule. The schedule ID is
+	// part of the lookup, not a convenience: a revision ID guessed from
+	// another team's schedule must answer "not found", not hand over its
+	// snapshot.
+	GetRevisionByID(ctx context.Context, scheduleID, revisionID string) (*ScheduleRevision, error)
+
+	// ListRevisions pages the audit trail newest first. beforeVersion nil
+	// starts at the tail; a value continues from the last version the caller
+	// saw, exclusive. Both kinds are returned - a deleted period is part of
+	// the history someone is auditing.
+	//
+	// limit is applied as given; normalizing it to a sane page size belongs to
+	// the handler that knows what the API promises.
+	ListRevisions(ctx context.Context, scheduleID string, limit int, beforeVersion *int64) ([]ScheduleRevision, error)
+
+	// GetTeamMemberIDs lists the ACTIVE members of a team: erased users are
+	// excluded, so a soft-deleted person can never be validated back into a
+	// rotation by the next save.
+	//
+	// It takes no lock. Membership is read for validation after the schedule
+	// lock is already held, and that lock - not this read - is what serializes
+	// it against a concurrent membership change.
+	GetTeamMemberIDs(ctx context.Context, teamID string) ([]string, error)
+
+	// GetOverrideHead returns the LAST revision of one logical override,
+	// including a tombstone. The projection deliberately hides tombstones, but
+	// an update, a delete and an ownership check all have to tell "deleted"
+	// apart from "never existed": without the tombstone, editing a removed
+	// override would start its numbering again at revision 1.
+	GetOverrideHead(ctx context.Context, scheduleID, overrideID string) (*OverrideRevision, error)
+
+	// ListOverrideHeads returns the head revision of every logical override of
+	// a schedule. includeDeleted false drops tombstoned ones, which is the
+	// editor's view: the overrides that currently exist.
+	ListOverrideHeads(ctx context.Context, scheduleID string, includeDeleted bool) ([]OverrideRevision, error)
 }

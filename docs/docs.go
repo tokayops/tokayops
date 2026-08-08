@@ -1249,7 +1249,7 @@ const docTemplate = `{
         },
         "/api/v1/schedules/{schedule_id}/overrides/{id}": {
             "put": {
-                "description": "Update an existing schedule override (user, times, reason)",
+                "description": "Appends the next revision of an override. expected_revision must match the current head.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1276,12 +1276,12 @@ const docTemplate = `{
                         "required": true
                     },
                     {
-                        "description": "Override data",
+                        "description": "Override",
                         "name": "override",
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/api.OverrideRequest"
+                            "$ref": "#/definitions/api.ScheduleOverrideRequest"
                         }
                     }
                 ],
@@ -1289,7 +1289,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/model.ScheduleOverride"
+                            "$ref": "#/definitions/api.ScheduleOverrideDTO"
                         }
                     },
                     "400": {
@@ -1313,7 +1313,10 @@ const docTemplate = `{
                 }
             },
             "delete": {
-                "description": "Delete a schedule override",
+                "description": "Appends a tombstone. The override history is kept and stays replayable as of any past instant.",
+                "produces": [
+                    "application/json"
+                ],
                 "tags": [
                     "schedules"
                 ],
@@ -1332,14 +1335,33 @@ const docTemplate = `{
                         "name": "id",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Revision the caller loaded",
+                        "name": "expected_revision",
+                        "in": "query",
+                        "required": true
                     }
                 ],
                 "responses": {
                     "204": {
                         "description": "No Content"
                     },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
                         "schema": {
                             "$ref": "#/definitions/api.ErrorResponse"
                         }
@@ -1894,14 +1916,65 @@ const docTemplate = `{
                 }
             },
             "delete": {
-                "description": "Delete the on-call schedule configuration for a team",
+                "description": "Deactivates the schedule and tombstones its live overrides. History is kept.",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "schedules"
                 ],
-                "summary": "Delete schedule for a team",
+                "summary": "Delete the schedule of a team",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Team ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "config_version the caller loaded",
+                        "name": "expected_version",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/teams/{id}/schedule/config": {
+            "get": {
+                "description": "Returns the configuration in force, or the last valid one plus deleted_at for a deleted schedule.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "schedules"
+                ],
+                "summary": "Get the schedule configuration of a team",
                 "parameters": [
                     {
                         "type": "string",
@@ -1912,11 +1985,71 @@ const docTemplate = `{
                     }
                 ],
                 "responses": {
-                    "204": {
-                        "description": "No Content"
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.ScheduleConfigResponse"
+                        }
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "description": "Creates, edits or recreates the schedule depending on its current state. expected_version must be 0 when no schedule exists.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "schedules"
+                ],
+                "summary": "Save the schedule configuration of a team",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Team ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Desired configuration",
+                        "name": "config",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.PutScheduleConfigRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.PutScheduleConfigResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
                         "schema": {
                             "$ref": "#/definitions/api.ErrorResponse"
                         }
@@ -2025,8 +2158,41 @@ const docTemplate = `{
             }
         },
         "/api/v1/teams/{id}/schedule/overrides": {
+            "get": {
+                "description": "The head revision of every override that still exists - the only source of expected_revision for an edit.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "schedules"
+                ],
+                "summary": "List the current overrides of a team's schedule",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Team ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.ScheduleOverrideListResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            },
             "post": {
-                "description": "Create a temporary on-call override (vacation, swap)",
+                "description": "Records a temporary stand-in as a new append-only override revision.",
                 "consumes": [
                     "application/json"
                 ],
@@ -2046,12 +2212,12 @@ const docTemplate = `{
                         "required": true
                     },
                     {
-                        "description": "Override data",
+                        "description": "Override",
                         "name": "override",
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/api.OverrideRequest"
+                            "$ref": "#/definitions/api.ScheduleOverrideRequest"
                         }
                     }
                 ],
@@ -2059,7 +2225,133 @@ const docTemplate = `{
                     "201": {
                         "description": "Created",
                         "schema": {
-                            "$ref": "#/definitions/model.ScheduleOverride"
+                            "$ref": "#/definitions/api.ScheduleOverrideDTO"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/teams/{id}/schedule/preview": {
+            "post": {
+                "description": "Renders what a save would do without writing anything.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "schedules"
+                ],
+                "summary": "Preview a schedule configuration",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Team ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "End of the previewed window (RFC3339); defaults to 14 days, capped at 90",
+                        "name": "until",
+                        "in": "query"
+                    },
+                    {
+                        "description": "Desired configuration",
+                        "name": "config",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.PutScheduleConfigRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.SchedulePreviewResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/teams/{id}/schedule/render": {
+            "get": {
+                "description": "Who was on duty across a range, derived from the revision chain. Range is capped at 90 days.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "schedules"
+                ],
+                "summary": "Render the schedule calendar of a team",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Team ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Start of the range (RFC3339)",
+                        "name": "from",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "End of the range (RFC3339)",
+                        "name": "until",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.ScheduleRenderResponse"
                         }
                     },
                     "400": {
@@ -2077,16 +2369,63 @@ const docTemplate = `{
                 }
             }
         },
-        "/api/v1/teams/{id}/schedule/render": {
+        "/api/v1/teams/{id}/schedule/revisions": {
             "get": {
-                "description": "Get schedule entries for a time range",
+                "description": "Audit trail, newest first, paged by a version cursor. Read-only.",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "schedules"
                 ],
-                "summary": "Render schedule calendar",
+                "summary": "List the revisions of a team's schedule",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Team ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 100, max 500)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Return revisions strictly below this version",
+                        "name": "before_version",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.ScheduleRevisionListResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/teams/{id}/schedule/revisions/{revision_id}": {
+            "get": {
+                "description": "Returns the revision with the configuration snapshot it carried. Read-only.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "schedules"
+                ],
+                "summary": "Get one revision of a team's schedule",
                 "parameters": [
                     {
                         "type": "string",
@@ -2097,16 +2436,9 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Start time (RFC3339)",
-                        "name": "from",
-                        "in": "query",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "End time (RFC3339)",
-                        "name": "until",
-                        "in": "query",
+                        "description": "Revision ID",
+                        "name": "revision_id",
+                        "in": "path",
                         "required": true
                     }
                 ],
@@ -2114,16 +2446,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "type": "array",
-                            "items": {
-                                "$ref": "#/definitions/api.RenderEntry"
-                            }
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/api.ErrorResponse"
+                            "$ref": "#/definitions/api.ScheduleRevisionDTO"
                         }
                     },
                     "404": {
@@ -2731,6 +3054,42 @@ const docTemplate = `{
                 }
             }
         },
+        "api.LayerOnCallDTO": {
+            "type": "object",
+            "properties": {
+                "assignment_end": {
+                    "type": "string"
+                },
+                "assignment_start": {
+                    "type": "string"
+                },
+                "grid_slot_end": {
+                    "type": "string"
+                },
+                "grid_slot_start": {
+                    "type": "string"
+                },
+                "group_id": {
+                    "type": "string"
+                },
+                "override_id": {
+                    "type": "string"
+                },
+                "revision_id": {
+                    "type": "string"
+                },
+                "source": {
+                    "description": "rotation | override",
+                    "type": "string"
+                },
+                "user_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
         "api.LoginRequest": {
             "type": "object",
             "properties": {
@@ -2767,36 +3126,17 @@ const docTemplate = `{
                 }
             }
         },
-        "api.OverrideRequest": {
+        "api.OnCallDTO": {
             "type": "object",
             "properties": {
-                "end_time": {
-                    "description": "Legacy: UTC or offset-included time",
+                "at": {
                     "type": "string"
                 },
-                "end_time_local": {
-                    "description": "Optional: \"2006-01-02T15:04\"",
-                    "type": "string"
+                "l1": {
+                    "$ref": "#/definitions/api.LayerOnCallDTO"
                 },
-                "reason": {
-                    "description": "Optional reason",
-                    "type": "string"
-                },
-                "start_time": {
-                    "description": "Legacy: UTC or offset-included time",
-                    "type": "string"
-                },
-                "start_time_local": {
-                    "description": "Optional: \"2006-01-02T15:04\"",
-                    "type": "string"
-                },
-                "timezone": {
-                    "description": "Optional: Timezone for local times",
-                    "type": "string"
-                },
-                "user_id": {
-                    "description": "User to assign",
-                    "type": "string"
+                "l2": {
+                    "$ref": "#/definitions/api.LayerOnCallDTO"
                 }
             }
         },
@@ -2885,46 +3225,51 @@ const docTemplate = `{
                 }
             }
         },
-        "api.RenderEntry": {
+        "api.PutScheduleConfigRequest": {
             "type": "object",
             "properties": {
-                "end_time": {
-                    "type": "string"
+                "expected_version": {
+                    "description": "ExpectedVersion is the config_version the editor loaded. Zero means\n\"there is no schedule yet\"; anything else must match or the save is\nrejected with the current version.",
+                    "type": "integer"
                 },
-                "layer": {
-                    "description": "\"l1\", \"l2\", \"override\"",
-                    "type": "string"
+                "l1": {
+                    "$ref": "#/definitions/api.ScheduleL1DTO"
                 },
-                "override_end": {
-                    "type": "string"
-                },
-                "override_id": {
-                    "description": "Override-specific fields (only set when Layer == \"override\")",
-                    "type": "string"
-                },
-                "override_start": {
-                    "type": "string"
+                "l2": {
+                    "$ref": "#/definitions/api.ScheduleL2DTO"
                 },
                 "reason": {
+                    "description": "Reason is free text recorded with the revision.",
                     "type": "string"
                 },
-                "schedule_id": {
+                "slack_usergroup_id": {
                     "type": "string"
                 },
-                "start_time": {
+                "timezone": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.PutScheduleConfigResponse": {
+            "type": "object",
+            "properties": {
+                "created": {
+                    "type": "boolean"
+                },
+                "noop": {
+                    "type": "boolean"
+                },
+                "on_call_after": {
+                    "$ref": "#/definitions/api.OnCallDTO"
+                },
+                "recreated": {
+                    "type": "boolean"
+                },
+                "revision_id": {
                     "type": "string"
                 },
-                "user_ids": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "user_names": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
+                "version": {
+                    "type": "integer"
                 }
             }
         },
@@ -2933,6 +3278,237 @@ const docTemplate = `{
             "properties": {
                 "slack_user_id": {
                     "type": "string"
+                }
+            }
+        },
+        "api.ScheduleConfigDTO": {
+            "type": "object",
+            "properties": {
+                "l1": {
+                    "$ref": "#/definitions/api.ScheduleL1DTO"
+                },
+                "l2": {
+                    "$ref": "#/definitions/api.ScheduleL2DTO"
+                },
+                "slack_usergroup_id": {
+                    "type": "string"
+                },
+                "timezone": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.ScheduleConfigResponse": {
+            "type": "object",
+            "properties": {
+                "config": {
+                    "$ref": "#/definitions/api.ScheduleConfigDTO"
+                },
+                "deleted_at": {
+                    "type": "string"
+                },
+                "effective_from": {
+                    "type": "string"
+                },
+                "revision_id": {
+                    "type": "string"
+                },
+                "schedule_id": {
+                    "type": "string"
+                },
+                "version": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.ScheduleGroupDTO": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string"
+                },
+                "user_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "api.ScheduleL1DTO": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
+                "groups": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.ScheduleGroupDTO"
+                    }
+                },
+                "handoff_day": {
+                    "description": "weekly only, 0=Sunday",
+                    "type": "integer"
+                },
+                "handoff_time": {
+                    "description": "local \"HH:MM\"",
+                    "type": "string"
+                },
+                "rotation_type": {
+                    "description": "daily | weekly",
+                    "type": "string"
+                }
+            }
+        },
+        "api.ScheduleL2DTO": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
+                "escalation_timeout_minutes": {
+                    "type": "integer"
+                },
+                "handoff_day": {
+                    "type": "integer"
+                },
+                "handoff_time": {
+                    "type": "string"
+                },
+                "rotation_type": {
+                    "type": "string"
+                },
+                "user_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "api.ScheduleOverrideDTO": {
+            "type": "object",
+            "properties": {
+                "override_id": {
+                    "type": "string"
+                },
+                "reason": {
+                    "type": "string"
+                },
+                "recorded_at": {
+                    "type": "string"
+                },
+                "recorded_by": {
+                    "type": "string"
+                },
+                "revision": {
+                    "type": "integer"
+                },
+                "user_id": {
+                    "type": "string"
+                },
+                "valid_from": {
+                    "type": "string"
+                },
+                "valid_to": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.ScheduleOverrideListResponse": {
+            "type": "object",
+            "properties": {
+                "overrides": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.ScheduleOverrideDTO"
+                    }
+                }
+            }
+        },
+        "api.ScheduleOverrideRequest": {
+            "type": "object",
+            "properties": {
+                "expected_revision": {
+                    "type": "integer"
+                },
+                "reason": {
+                    "type": "string"
+                },
+                "user_id": {
+                    "type": "string"
+                },
+                "valid_from": {
+                    "type": "string"
+                },
+                "valid_to": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.SchedulePreviewResponse": {
+            "type": "object",
+            "properties": {
+                "base_version": {
+                    "type": "integer"
+                },
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.ShiftDTO"
+                    }
+                },
+                "evaluated_at": {
+                    "type": "string"
+                },
+                "on_call_after": {
+                    "$ref": "#/definitions/api.OnCallDTO"
+                },
+                "on_call_before": {
+                    "$ref": "#/definitions/api.OnCallDTO"
+                },
+                "on_call_changed": {
+                    "type": "boolean"
+                },
+                "warnings": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.ScheduleWarningDTO"
+                    }
+                }
+            }
+        },
+        "api.ScheduleRenderResponse": {
+            "type": "object",
+            "properties": {
+                "deleted_at": {
+                    "type": "string"
+                },
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.ShiftDTO"
+                    }
+                },
+                "from": {
+                    "type": "string"
+                },
+                "history_complete": {
+                    "description": "HistoryComplete is false when part of the range precedes the point from\nwhich this schedule's history is exact. Inferred history is never\nreturned as if it had been recorded.",
+                    "type": "boolean"
+                },
+                "history_complete_from": {
+                    "type": "string"
+                },
+                "until": {
+                    "type": "string"
+                },
+                "warnings": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.ScheduleWarningDTO"
+                    }
                 }
             }
         },
@@ -2985,6 +3561,80 @@ const docTemplate = `{
                 }
             }
         },
+        "api.ScheduleRevisionDTO": {
+            "type": "object",
+            "properties": {
+                "change_reason": {
+                    "type": "string"
+                },
+                "change_summary": {
+                    "$ref": "#/definitions/rotation.ChangeSummary"
+                },
+                "config": {
+                    "$ref": "#/definitions/api.ScheduleConfigDTO"
+                },
+                "created_by": {
+                    "type": "string"
+                },
+                "effective_from": {
+                    "type": "string"
+                },
+                "effective_to": {
+                    "type": "string"
+                },
+                "kind": {
+                    "description": "active | deleted",
+                    "type": "string"
+                },
+                "recorded_at": {
+                    "type": "string"
+                },
+                "revision_id": {
+                    "type": "string"
+                },
+                "version": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.ScheduleRevisionListResponse": {
+            "type": "object",
+            "properties": {
+                "next_before_version": {
+                    "description": "NextBeforeVersion is the cursor for the following page, absent when this\npage is the end. A version cursor rather than an offset: versions are\ndense and strictly increasing, so a page cannot shift under a reader.",
+                    "type": "integer"
+                },
+                "revisions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.ScheduleRevisionDTO"
+                    }
+                }
+            }
+        },
+        "api.ScheduleWarningDTO": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                },
+                "from": {
+                    "type": "string"
+                },
+                "layer": {
+                    "type": "string"
+                },
+                "related_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "until": {
+                    "type": "string"
+                }
+            }
+        },
         "api.SetGroupsRequest": {
             "type": "object",
             "properties": {
@@ -3005,6 +3655,55 @@ const docTemplate = `{
             "properties": {
                 "user_ids": {
                     "description": "Ordered list of user IDs (L2 only)",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "api.ShiftDTO": {
+            "type": "object",
+            "properties": {
+                "end": {
+                    "type": "string"
+                },
+                "grid_slot_end": {
+                    "type": "string"
+                },
+                "grid_slot_start": {
+                    "type": "string"
+                },
+                "group_id": {
+                    "type": "string"
+                },
+                "layer": {
+                    "type": "string"
+                },
+                "override_id": {
+                    "type": "string"
+                },
+                "override_revision_id": {
+                    "type": "string"
+                },
+                "revision_ids": {
+                    "description": "RevisionIDs is provenance: which revisions contributed, in order.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "slot_count": {
+                    "description": "SlotCount is how many grid slots this shift spans.",
+                    "type": "integer"
+                },
+                "source": {
+                    "type": "string"
+                },
+                "start": {
+                    "type": "string"
+                },
+                "user_ids": {
                     "type": "array",
                     "items": {
                         "type": "string"
@@ -3608,6 +4307,10 @@ const docTemplate = `{
         "model.Schedule": {
             "type": "object",
             "properties": {
+                "config_version": {
+                    "description": "ConfigVersion is non-zero when this schedule is governed by the revision\nmodel, in which case the mutable columns below are stale leftovers and\nnothing may read them. It is scanned so the legacy readers can refuse\nsuch a row instead of answering from data nobody maintains.",
+                    "type": "integer"
+                },
                 "created_at": {
                     "type": "string"
                 },
@@ -4004,6 +4707,38 @@ const docTemplate = `{
                 "WebhookScopeGlobal",
                 "WebhookScopeTeam"
             ]
+        },
+        "rotation.ChangeSummary": {
+            "type": "object",
+            "properties": {
+                "l1_group_selection": {
+                    "type": "string"
+                },
+                "l1_groups_changed": {
+                    "type": "boolean"
+                },
+                "l1_phase_action": {
+                    "type": "string"
+                },
+                "l1_policy_changed": {
+                    "type": "boolean"
+                },
+                "l2_changed": {
+                    "type": "boolean"
+                },
+                "l2_group_selection": {
+                    "type": "string"
+                },
+                "l2_phase_action": {
+                    "type": "string"
+                },
+                "slack_usergroup_changed": {
+                    "type": "boolean"
+                },
+                "timezone_changed": {
+                    "type": "boolean"
+                }
+            }
         }
     }
 }`

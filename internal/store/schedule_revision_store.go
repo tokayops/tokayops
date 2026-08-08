@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/lib/pq"
@@ -188,6 +189,112 @@ func (t *scheduleConfigTx) AdvanceVersion(ctx context.Context, scheduleID string
 	return requireOneRow(res, scheduleconfig.ErrVersionConflict)
 }
 
+// SetScheduleDeleted moves the soft-delete projection. A missing row is
+// ErrScheduleNotFound rather than a silent no-op: the caller believed it held
+// a locked schedule, and being wrong about that is not something to swallow.
+func (t *scheduleConfigTx) SetScheduleDeleted(ctx context.Context, scheduleID string, deletedAt *time.Time) error {
+	var at any
+	if deletedAt != nil {
+		at = scheduleconfig.NormalizeTimestamp(*deletedAt)
+	}
+	res, err := t.tx.ExecContext(ctx,
+		`UPDATE schedules SET deleted_at = $1 WHERE id = $2`, at, scheduleID)
+	if err != nil {
+		return mapScheduleWriteError(err)
+	}
+	return requireOneRow(res, scheduleconfig.ErrScheduleNotFound)
+}
+
+// MaxOverrideRecordedAt is the newest recorded_at across every override
+// revision of a schedule, tombstones included. Nil means the schedule has no
+// override history at all.
+func (t *scheduleConfigTx) MaxOverrideRecordedAt(ctx context.Context, scheduleID string) (*time.Time, error) {
+	var max sql.NullTime
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT MAX(recorded_at) FROM schedule_override_revisions WHERE schedule_id = $1`,
+		scheduleID).Scan(&max)
+	if err != nil {
+		return nil, err
+	}
+	if !max.Valid {
+		return nil, nil
+	}
+	v := scheduleconfig.NormalizeTimestamp(max.Time)
+	return &v, nil
+}
+
+// LockUsers takes a shared row lock on the named users, in ID order.
+//
+// FOR SHARE, not FOR UPDATE: two commands naming overlapping users have no
+// reason to wait for each other, and only erasure - which takes FOR UPDATE on
+// the one user it erases - needs to be excluded. Sorting the IDs first is
+// belt and braces for a lock that cannot self-deadlock anyway.
+//
+// IDs that match nothing are silently absent from the result. That is correct:
+// this is a serialization point, and rejecting an unknown user is membership
+// validation's job, which runs later and against fresher state.
+func (t *scheduleConfigTx) LockUsers(ctx context.Context, userIDs []string) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	sorted := append([]string(nil), userIDs...)
+	sort.Strings(sorted)
+
+	rows, err := t.tx.QueryContext(ctx,
+		`SELECT id FROM users WHERE id = ANY($1) ORDER BY id FOR SHARE`, pq.Array(sorted))
+	if err != nil {
+		return mapScheduleWriteError(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// ActiveUserIDs filters a set of IDs down to the users that have not been
+// erased. It is a command-side read: the caller holds the shared lock on these
+// rows already, so the answer cannot change before it is acted on.
+func (t *scheduleConfigTx) ActiveUserIDs(ctx context.Context, userIDs []string) ([]string, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := t.tx.QueryContext(ctx,
+		`SELECT id FROM users WHERE id = ANY($1) AND deleted_at IS NULL ORDER BY id`,
+		pq.Array(userIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// DeleteTeamMembership removes one membership.
+//
+// A membership that is not there is not an error: the caller asked for the
+// person to end up outside the team, and they are. The guard that decides
+// whether the removal is allowed at all lives in the service, above this.
+func (t *scheduleConfigTx) DeleteTeamMembership(ctx context.Context, teamID, userID string) error {
+	_, err := t.tx.ExecContext(ctx,
+		`DELETE FROM team_members WHERE team_id = $1 AND user_id = $2`, teamID, userID)
+	if err != nil {
+		return mapScheduleWriteError(err)
+	}
+	return nil
+}
+
 // scanScheduleRevisionRow adapts the single-row queries: only there does "no
 // rows" mean the named revision does not exist. In a range query an empty
 // result is an ordinary answer.
@@ -215,9 +322,11 @@ func scanScheduleRevision(row rowScanner) (*scheduleconfig.ScheduleRevision, err
 	}
 
 	// A corrupt snapshot surfaces as a decode error, never as an empty
-	// rotation: empty is a valid explicit configuration, not a fallback.
+	// rotation: empty is a valid explicit configuration, not a fallback. The
+	// sentinel is what the API error mapper turns into a 500 with an alert
+	// rather than into a plausible-looking answer.
 	if rev.Snapshot, err = rotation.DecodeSnapshot(snapshot); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: revision %s: %w", scheduleconfig.ErrSnapshotDecode, rev.ID, err)
 	}
 	if effectiveTo.Valid {
 		v := effectiveTo.Time
