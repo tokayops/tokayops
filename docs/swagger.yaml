@@ -397,6 +397,8 @@ definitions:
     type: object
   api.ScheduleOnCallResponse:
     properties:
+      deleted_at:
+        type: string
       on_call:
         $ref: '#/definitions/api.OnCallDTO'
       schedule_id:

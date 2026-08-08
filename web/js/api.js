@@ -42,6 +42,12 @@ async function request(endpoint, options = {}) {
         ...options,
     };
 
+    // Statuses that are an answer rather than a failure. A 404 from "does this
+    // team have a schedule" means "no", and logging it as an error would fill
+    // the console with noise on every page that asks - which is how real
+    // errors stop being noticed.
+    const silent = options.silentStatuses || [];
+
     try {
         const response = await fetch(url, config);
 
@@ -82,7 +88,9 @@ async function request(endpoint, options = {}) {
 
         return await response.json();
     } catch (error) {
-        console.error(`API Error [${options.method || 'GET'} ${endpoint}]:`, error);
+        if (!silent.includes(error?.status)) {
+            console.error(`API Error [${options.method || 'GET'} ${endpoint}]:`, error);
+        }
         throw error;
     }
 }
@@ -503,7 +511,8 @@ const API = {
          * @param {string} teamId
          * @returns {Promise<{schedule_id, version, revision_id, effective_from, deleted_at?, config}>}
          */
-        getConfig: (teamId) => request(`/teams/${encodeURIComponent(teamId)}/schedule/config`),
+        getConfig: (teamId) => request(`/teams/${encodeURIComponent(teamId)}/schedule/config`,
+            { silentStatuses: [404] }),
 
         /**
          * Save the whole configuration.

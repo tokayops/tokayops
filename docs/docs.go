@@ -3507,6 +3507,9 @@ const docTemplate = `{
         "api.ScheduleOnCallResponse": {
             "type": "object",
             "properties": {
+                "deleted_at": {
+                    "type": "string"
+                },
                 "on_call": {
                     "$ref": "#/definitions/api.OnCallDTO"
                 },

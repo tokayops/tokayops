@@ -277,11 +277,18 @@ func shiftDTOs(shifts []schedulerender.Shift) []ShiftDTO {
 
 // ScheduleOnCallResponse is who is on duty right now.
 //
-// ScheduleID is present so the editor can address override mutations without a
-// second request, and is empty when the team has no schedule at all.
+// It also answers "is there a schedule here at all", which is a different
+// question from "is anyone on duty" and cannot be derived from the projection:
+// a team with no schedule, a deleted one and a live one between shifts all put
+// nobody on call. ScheduleID is empty when there is no schedule in this model,
+// and DeletedAt is set when there is one but it has been deactivated.
+//
+// Carrying both here is what lets a widget render without also fetching the
+// configuration - a request whose ordinary answer would be 404, once per team.
 type ScheduleOnCallResponse struct {
-	ScheduleID string    `json:"schedule_id,omitempty"`
-	OnCall     OnCallDTO `json:"on_call"`
+	ScheduleID string     `json:"schedule_id,omitempty"`
+	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
+	OnCall     OnCallDTO  `json:"on_call"`
 }
 
 // ScheduleWarningDTO is a structured condition the caller has to branch on.

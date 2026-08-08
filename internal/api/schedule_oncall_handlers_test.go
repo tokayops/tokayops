@@ -105,14 +105,17 @@ func TestScheduleOnCallSeparatesHandoffFromAssignment(t *testing.T) {
 // is true for all of them. 404 is reserved for a team that does not exist.
 func TestScheduleOnCallAnswersNobodyRatherThanNotFound(t *testing.T) {
 	cases := []struct {
-		name  string
-		setup func(t *testing.T, e *echo.Echo, env *scheduleTestEnv)
+		name string
+		// configured is whether a schedule exists in this model at all, which
+		// is a different question from whether anyone is on duty.
+		configured bool
+		setup      func(t *testing.T, e *echo.Echo, env *scheduleTestEnv)
 	}{
-		{"no schedule at all", func(t *testing.T, e *echo.Echo, env *scheduleTestEnv) {}},
-		{"schedule from before the revision model", func(t *testing.T, e *echo.Echo, env *scheduleTestEnv) {
+		{"no schedule at all", false, func(t *testing.T, e *echo.Echo, env *scheduleTestEnv) {}},
+		{"schedule from before the revision model", false, func(t *testing.T, e *echo.Echo, env *scheduleTestEnv) {
 			env.Config.SeedLegacyRoot("legacy-1", "devops")
 		}},
-		{"deleted schedule", func(t *testing.T, e *echo.Echo, env *scheduleTestEnv) {
+		{"deleted schedule", true, func(t *testing.T, e *echo.Echo, env *scheduleTestEnv) {
 			created := createSchedule(t, e, []string{"denis"})
 			env.SetNow(time.Now().UTC().Add(time.Hour))
 			rec := doJSON(t, e, http.MethodDelete,
@@ -138,6 +141,21 @@ func TestScheduleOnCallAnswersNobodyRatherThanNotFound(t *testing.T) {
 			decodeJSON(t, rec, &out)
 			if out.OnCall.L1 != nil || out.OnCall.L2 != nil {
 				t.Fatalf("want nobody on duty, got %+v", out.OnCall)
+			}
+			// "Nobody on duty" is also what a live schedule between shifts
+			// answers, so the response has to say separately whether there is
+			// a schedule here at all - otherwise a widget cannot decide
+			// between offering "Configure" and saying "nobody right now".
+			if tc.configured {
+				if out.ScheduleID == "" {
+					t.Fatal("a deleted schedule still has an id, and the client needs it")
+				}
+				if out.DeletedAt == nil {
+					t.Fatal("a deleted schedule must report deleted_at")
+				}
+			} else if out.ScheduleID != "" {
+				t.Fatalf("schedule_id = %q, want empty for a team with no schedule in this model",
+					out.ScheduleID)
 			}
 			if out.OnCall.At.IsZero() {
 				t.Fatal("at must be set even when nobody is on duty")

@@ -209,29 +209,50 @@ export async function openPolicyEditor(policyId = null) {
 }
 
 /**
- * Load schedule ID for a team
+ * Load the schedule a team's escalation steps can target.
+ *
+ * A deleted schedule keeps its ID: recreating one goes through the same
+ * record, so a step pointing at it starts working again the moment it comes
+ * back. Clearing the target here would quietly break policies that a recreate
+ * would have healed, and nobody would connect the two events.
  */
 async function loadTeamSchedule(teamId) {
-    try {
-        const schedule = await API.schedules.get(teamId);
-        State.currentScheduleId = schedule?.id || null;
+    let scheduleId = null;
+    let label = null;
 
-        // Update any existing schedule selectors
-        document.querySelectorAll('.target-id-input option[data-schedule-placeholder]').forEach(opt => {
-            opt.value = State.currentScheduleId || '';
-            if (!State.currentScheduleId) {
-                opt.textContent = 'No schedule configured for this team';
-                opt.parentElement.disabled = true;
-            } else {
-                const team = State.teams.find(t => t.id === teamId);
-                opt.textContent = `Team Schedule (${team?.name || 'Unknown'})`;
-                opt.parentElement.disabled = false;
-            }
-        });
+    try {
+        const config = await API.schedules.getConfig(teamId);
+        scheduleId = config?.schedule_id || null;
+        if (config?.deleted_at) {
+            label = 'Schedule inactive (deleted)';
+        }
     } catch (e) {
-        console.warn('Failed to load schedule for team', teamId, e);
-        State.currentScheduleId = null;
+        if (e?.status !== 404) {
+            console.warn('Failed to load schedule for team', teamId, e);
+        }
+        scheduleId = null;
     }
+
+    State.currentScheduleId = scheduleId;
+
+    document.querySelectorAll('.target-id-input option[data-schedule-placeholder]').forEach(opt => {
+        opt.value = scheduleId || '';
+        if (!scheduleId) {
+            opt.textContent = 'No schedule configured for this team';
+            opt.parentElement.disabled = true;
+            return;
+        }
+        if (label) {
+            // Still selectable in the sense that an existing step keeps
+            // pointing at it, but not offered as a new choice.
+            opt.textContent = label;
+            opt.parentElement.disabled = true;
+            return;
+        }
+        const team = State.teams.find(t => t.id === teamId);
+        opt.textContent = `Team Schedule (${team?.name || 'Unknown'})`;
+        opt.parentElement.disabled = false;
+    });
 }
 
 /**
