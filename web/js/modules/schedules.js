@@ -35,12 +35,6 @@ let currentOverrideTz = null;
 // cannot silently shorten the cover; either can be switched per field.
 let overrideFold = { start: 'earlier', end: 'later' };
 
-// What the editor loaded. expected_version comes from here and nowhere else:
-// the preview reports the version it evaluated against, and taking that would
-// be pinning the save to whatever was seen last rather than to what was
-// edited - the exact class of stale write the version exists to refuse.
-let loadedConfig = null;
-
 // ========================================
 // Errors
 // ========================================
@@ -52,20 +46,28 @@ let loadedConfig = null;
  * the first time a message is reworded, and one that matched only on 409 would
  * have to guess between six different recoveries.
  *
+ * Handlers may be async; the promise is returned so a caller can wait on the
+ * recovery, and a rejection inside one is reported rather than becoming an
+ * unhandled rejection.
+ *
  * @param {Error} error - carries status, code and body
- * @param {Object} handlers - code -> handler, plus optional `fallback`
- * @returns {boolean} whether a handler ran
+ * @param {Object} handlers - code -> handler
+ * @returns {Promise<void>}
  */
-function onScheduleError(error, handlers = {}) {
+async function onScheduleError(error, handlers = {}) {
     const handler = handlers[error?.code];
-    if (handler) {
-        handler(error);
-        return true;
+    if (!handler) {
+        // An unrecognised code still has a server message. Inventing an
+        // interpretation for it would be worse than passing it through.
+        showToast(error?.message || 'Request failed', 'error');
+        return;
     }
-    // An unrecognised code still has a server message. Inventing an
-    // interpretation for it would be worse than passing it through.
-    showToast(error?.message || 'Request failed', 'error');
-    return false;
+    try {
+        await handler(error);
+    } catch (failure) {
+        console.error('Failed to recover from a schedule error:', failure);
+        showToast(error?.message || 'Request failed', 'error');
+    }
 }
 
 function conflictingOverridesText(error) {
@@ -244,7 +246,6 @@ async function openScheduleConfigModal(teamId) {
         ]);
 
         teamMembers = members;
-        loadedConfig = config;
 
         const mentioned = [
             ...(config?.config?.l1?.groups || []).flatMap(g => g.user_ids || []),
@@ -286,7 +287,7 @@ async function openScheduleConfigModal(teamId) {
         });
     } catch (error) {
         console.error('Failed to open schedule modal:', error);
-        onScheduleError(error, {
+        await onScheduleError(error, {
             legacy_schedule: () => showToast(
                 'This schedule predates the current data model and cannot be edited until the ' +
                 'upgrade reset has been run.', 'error'),
@@ -609,6 +610,10 @@ async function handleScheduleSubmit(e) {
 
     const form = e.target;
     const teamId = form.dataset.teamId;
+    // The version the form was loaded at, carried on the form itself. Never
+    // the preview's base_version: taking that would pin the save to whatever
+    // was seen last rather than to what was edited, which is the stale write
+    // the version exists to refuse.
     const expectedVersion = parseInt(form.dataset.expectedVersion, 10) || 0;
     const config = collectConfig();
     // Read here, with everything else. By the time Confirm is pressed the
@@ -643,7 +648,7 @@ async function handleScheduleSubmit(e) {
         await showPreviewStep(teamId, config, preview, expectedVersion, reason);
     } catch (error) {
         console.error('Failed to preview schedule:', error);
-        handleSaveError(error, teamId);
+        await handleSaveError(error, teamId);
     } finally {
         if (submitBtn) submitBtn.disabled = false;
     }
@@ -753,7 +758,7 @@ async function showPreviewStep(teamId, config, preview, expectedVersion, reason)
             await refreshOnCallUI(teamId);
         } catch (error) {
             console.error('Failed to save schedule:', error);
-            handleSaveError(error, teamId);
+            await handleSaveError(error, teamId);
         } finally {
             if (confirmBtn) confirmBtn.disabled = false;
         }
@@ -761,7 +766,7 @@ async function showPreviewStep(teamId, config, preview, expectedVersion, reason)
 }
 
 function handleSaveError(error, teamId) {
-    onScheduleError(error, {
+    return onScheduleError(error, {
         schedule_version_conflict: () => {
             showToast('Someone else changed this schedule. Reopening it with their changes.', 'error');
             closeModal();
@@ -809,7 +814,7 @@ async function handleScheduleDelete(teamId) {
         await refreshOnCallUI(teamId);
     } catch (error) {
         console.error('Failed to delete schedule:', error);
-        onScheduleError(error, {
+        await onScheduleError(error, {
             schedule_version_conflict: () => {
                 showToast('Someone else changed this schedule. Reopening it.', 'error');
                 closeModal();
@@ -1245,12 +1250,12 @@ async function handleOverrideSubmit(e) {
         }
     } catch (error) {
         console.error('Failed to save override:', error);
-        handleOverrideError(error, teamId, scheduleId);
+        await handleOverrideError(error, teamId, scheduleId);
     }
 }
 
 function handleOverrideError(error, teamId, scheduleId) {
-    onScheduleError(error, {
+    return onScheduleError(error, {
         override_overlap: (err) => showToast(
             `This override was not saved. ${conflictingOverridesText(err)}`, 'error'),
         override_revision_conflict: async () => {
@@ -1370,7 +1375,7 @@ async function deleteOverride(scheduleId, overrideId, revision, teamId) {
         return true;
     } catch (error) {
         console.error('Failed to delete override:', error);
-        handleOverrideError(error, teamId, scheduleId);
+        await handleOverrideError(error, teamId, scheduleId);
         return false;
     }
 }
