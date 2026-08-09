@@ -87,13 +87,29 @@ test-dispatcher:
 e2e-install:
 	cd e2e && npm install && npx playwright install chromium firefox
 
-e2e-up:
+# Always from a fresh volume. The environment is built by seeding and then
+# resetting, and the reset records a marker that makes it a no-op afterwards -
+# so running this twice against a surviving database would re-seed the legacy
+# schedules and have nothing left to remove them. Starting clean is also what
+# e2e-test already assumed: it tears the stack down after every run.
+e2e-up: e2e-down
 	docker compose -f docker-compose.e2e.yml up -d --build
 	@echo "Waiting for application to be ready..."
 	@while ! curl -s http://localhost:8081/swagger/index.html > /dev/null 2>&1; do sleep 2; done
 	@echo "Application is ready!"
 	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops user create admin@example.com 'Admin123!' 'Test Admin' || true
 	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops seed || true
+	@# The seed still writes schedules the old way, so the environment is put
+	@# through the same destructive reset the upgrade performs. Without it the
+	@# suite would be testing the one state the app no longer supports: seeded
+	@# schedules would read as unconfigured and creating one would be refused
+	@# as a pre-revision schedule. Reset is idempotent, and the volume is
+	@# recreated by e2e-down, so repeated runs are fine.
+	@#
+	@# Nothing may run `seed` after this point: it would put the legacy rows
+	@# straight back. Schedules for the tests are created through the API by
+	@# the Playwright setup project.
+	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops migrate reset-schedules
 
 e2e-down:
 	docker compose -f docker-compose.e2e.yml down -v --remove-orphans

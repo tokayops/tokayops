@@ -309,6 +309,10 @@ export class SchedulesPage {
 
   async expectOverrideModalVisible() {
     await expect(this.overrideModal).toHaveClass(/active/, { timeout: 10000 });
+    // The overlay is already active whenever any modal is open, including the
+    // calendar this one is reached from - so waiting on it alone would return
+    // before the override modal had rendered.
+    await expect(this.page.locator('#override-form')).toBeVisible({ timeout: 10000 });
   }
 
   async expectOverrideModalHidden() {

@@ -111,6 +111,80 @@ func (s *Service) CurrentOnCall(ctx context.Context, scheduleID string, at time.
 	return out, nil
 }
 
+// CurrentOnCallNow is the same projection at the service's own clock.
+//
+// It exists so a caller that means "right now" does not have to reach for
+// time.Now() itself. That would be a second clock: the preview already
+// evaluates against s.now, and a handler answering from wall time would drift
+// from it under WithClock - silently in production, and visibly in any test
+// that moves time forward.
+func (s *Service) CurrentOnCallNow(ctx context.Context, scheduleID string) (OnCall, error) {
+	return s.CurrentOnCall(ctx, scheduleID, s.now().UTC())
+}
+
+// TeamOnCall is who is on duty for a team, together with what kind of schedule
+// produced that answer.
+//
+// The two travel together because neither is enough alone: a team with no
+// schedule, a deleted one and a live one between shifts all put nobody on
+// duty, and a caller has to tell them apart to know whether to offer to
+// configure one.
+type TeamOnCall struct {
+	// ScheduleID is empty when the team has no schedule in this model,
+	// including a row left over from before it.
+	ScheduleID string
+	DeletedAt  *time.Time
+	OnCall     OnCall
+}
+
+// CurrentTeamOnCallNow answers both questions from one snapshot.
+//
+// The reason is cost, not correctness. A snapshot is a real read-only
+// repeatable-read transaction, and asking for the root separately made this -
+// the most frequently read thing in the product - open two of them per
+// request, the first to fetch a single row. One transaction answers both
+// halves.
+//
+// It also puts the rules about absent, pre-revision and deleted schedules in
+// one place. A caller that assembled the answer itself needed its own copy of
+// them, and two copies of "what a schedule that is not there looks like" is
+// how they drift.
+//
+// Consistency comes along for free: a delete landing between two separate
+// reads could have produced an answer describing no state that ever existed.
+// That was never likely - schedules change a few times a year, the window is
+// sub-millisecond - and it is not what this is for.
+func (s *Service) CurrentTeamOnCallNow(ctx context.Context, teamID string) (TeamOnCall, error) {
+	at := scheduleconfig.NormalizeTimestamp(s.now().UTC())
+
+	out := TeamOnCall{OnCall: OnCall{At: at}}
+	err := s.repo.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
+		root, err := view.GetScheduleRootByTeam(ctx, teamID)
+		// No schedule is an answer, not a failure: the question is who is on
+		// duty, and "nobody" is true.
+		if errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		// A row from before the revision model has no configuration here, so
+		// it is reported as no schedule - the same answer GET /config gives it.
+		if scheduleconfig.IsLegacyRoot(root) {
+			return nil
+		}
+
+		out.ScheduleID = root.ID
+		out.DeletedAt = root.DeletedAt
+		out.OnCall, err = onCallWithin(ctx, view, root.ID, at)
+		return err
+	})
+	if err != nil {
+		return TeamOnCall{}, err
+	}
+	return out, nil
+}
+
 // onCallWithin is the projection itself, over a view the caller already holds.
 // The preview needs the same answer from inside its own snapshot, and computing
 // it twice would be two chances to project one state differently.

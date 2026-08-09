@@ -30,17 +30,17 @@ const maxRenderRange = 90 * 24 * time.Hour
 func (a *API) RenderSchedule(c echo.Context) error {
 	from, err := time.Parse(time.RFC3339, c.QueryParam("from"))
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid 'from' parameter"})
+		return badRequest(c, CodeInvalidParameter, "invalid 'from' parameter")
 	}
 	until, err := time.Parse(time.RFC3339, c.QueryParam("until"))
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid 'until' parameter"})
+		return badRequest(c, CodeInvalidParameter, "invalid 'until' parameter")
 	}
 	if !until.After(from) {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "until must be after from"})
+		return badRequest(c, CodeInvalidParameter, "until must be after from")
 	}
 	if until.Sub(from) > maxRenderRange {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "range cannot exceed 90 days"})
+		return badRequest(c, CodeRangeTooLarge, "range cannot exceed 90 days")
 	}
 
 	ctx := c.Request().Context()

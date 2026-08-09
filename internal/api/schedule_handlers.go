@@ -394,7 +394,7 @@ func (a *API) GetTeamOnCall(c echo.Context) error {
 func (a *API) CreateScheduleOverride(c echo.Context) error {
 	var req ScheduleOverrideRequest
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		return badRequest(c, CodeInvalidRequestBody, "invalid request body")
 	}
 
 	rev, err := a.scheduleConfig.CreateOverride(c.Request().Context(), c.Param("id"),
@@ -428,7 +428,7 @@ func (a *API) CreateScheduleOverride(c echo.Context) error {
 func (a *API) UpdateScheduleOverride(c echo.Context) error {
 	var req ScheduleOverrideRequest
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		return badRequest(c, CodeInvalidRequestBody, "invalid request body")
 	}
 
 	rev, err := a.scheduleConfig.UpdateOverride(c.Request().Context(),
@@ -465,8 +465,7 @@ func (a *API) DeleteScheduleOverride(c echo.Context) error {
 	// check the parameter exists to perform.
 	expected, err := strconv.ParseInt(c.QueryParam("expected_revision"), 10, 64)
 	if err != nil {
-		return c.JSON(http.StatusBadRequest,
-			ErrorResponse{Error: "expected_revision query parameter is required"})
+		return badRequest(c, CodeInvalidParameter, "expected_revision query parameter is required")
 	}
 
 	if err := a.scheduleConfig.DeleteOverride(c.Request().Context(),

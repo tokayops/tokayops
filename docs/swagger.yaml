@@ -133,6 +133,8 @@ definitions:
     type: object
   api.ErrorResponse:
     properties:
+      code:
+        type: string
       error:
         type: string
     type: object
@@ -200,6 +202,10 @@ definitions:
         $ref: '#/definitions/api.LayerOnCallDTO'
       l2:
         $ref: '#/definitions/api.LayerOnCallDTO'
+      warnings:
+        items:
+          $ref: '#/definitions/api.ScheduleWarningDTO'
+        type: array
     type: object
   api.PolicyRequest:
     properties:
@@ -298,6 +304,27 @@ definitions:
       slack_user_id:
         type: string
     type: object
+  api.ResolveUsersRequest:
+    properties:
+      user_ids:
+        items:
+          type: string
+        type: array
+    type: object
+  api.ResolveUsersResponse:
+    properties:
+      users:
+        items:
+          $ref: '#/definitions/api.ResolvedUserDTO'
+        type: array
+    type: object
+  api.ResolvedUserDTO:
+    properties:
+      id:
+        type: string
+      name:
+        type: string
+    type: object
   api.ScheduleConfigDTO:
     properties:
       l1:
@@ -367,6 +394,15 @@ definitions:
         items:
           type: string
         type: array
+    type: object
+  api.ScheduleOnCallResponse:
+    properties:
+      deleted_at:
+        type: string
+      on_call:
+        $ref: '#/definitions/api.OnCallDTO'
+      schedule_id:
+        type: string
     type: object
   api.ScheduleOverrideDTO:
     properties:
@@ -2731,6 +2767,32 @@ paths:
       summary: Set L2 rotation users
       tags:
       - schedules
+  /api/v1/teams/{id}/schedule/on-call:
+    get:
+      description: 'The current-assignment projection, derived from the revision chain.
+        A team with no schedule, a schedule from before the revision model and a deleted
+        one all answer 200 with null layers: the question is who is on duty, and "nobody"
+        is an answer.'
+      parameters:
+      - description: Team ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ScheduleOnCallResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get who is on duty for a team right now
+      tags:
+      - schedules
   /api/v1/teams/{id}/schedule/overrides:
     get:
       description: The head revision of every override that still exists - the only
@@ -3183,6 +3245,34 @@ paths:
           schema:
             $ref: '#/definitions/api.ErrorResponse'
       summary: Update a user's password
+      tags:
+      - users
+  /api/v1/users/resolve:
+    post:
+      consumes:
+      - application/json
+      description: Display read for historical data. Includes erased users, whose
+        row survives so history that names their ID stays legible. Returns only id
+        and name.
+      parameters:
+      - description: User IDs
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/api.ResolveUsersRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ResolveUsersResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Resolve user IDs to display names
       tags:
       - users
 swagger: "2.0"

@@ -30,64 +30,9 @@ const SEVERITY_PRIORITY = {
 
 const SORT_PAUSE_MS = 8000;
 const HIGHLIGHT_MS = 8000;
-const ON_CALL_CACHE_TTL = 60 * 1000;
 
 let sortResumeTimer = null;
 let highlightTimer = null;
-
-async function fetchOnCallForTeam(teamId) {
-    if (!teamId) return null;
-    const cached = State.onCallByTeam[teamId];
-    const now = Date.now();
-    if (cached && (now - cached.fetchedAt) < ON_CALL_CACHE_TTL) {
-        return cached.data;
-    }
-
-    try {
-        const data = await API.schedules.getOnCall(teamId);
-        State.onCallByTeam[teamId] = { data, fetchedAt: now };
-        return data;
-    } catch (error) {
-        State.onCallByTeam[teamId] = { data: null, fetchedAt: now };
-        return null;
-    }
-}
-
-function prefetchOnCallForTeams(teamIds) {
-    const unique = Array.from(new Set(teamIds.filter(Boolean)));
-    if (unique.length === 0) return;
-
-    const now = Date.now();
-    const toFetch = unique.filter(teamId => {
-        const cached = State.onCallByTeam[teamId];
-        return !cached || (now - cached.fetchedAt) >= ON_CALL_CACHE_TTL;
-    });
-
-    if (toFetch.length === 0) return;
-
-    Promise.allSettled(toFetch.map(teamId =>
-        API.schedules.getOnCall(teamId)
-            .then(data => ({ teamId, data }))
-            .catch(() => ({ teamId, data: null }))
-    )).then(results => {
-        let changed = false;
-        results.forEach(result => {
-            if (!result || result.status !== 'fulfilled') return;
-            const { teamId, data } = result.value;
-            const prev = State.onCallByTeam[teamId]?.data;
-            const prevName = (prev?.l1_users || []).map(u => u.name).join(', ');
-            const nextName = (data?.l1_users || []).map(u => u.name).join(', ');
-            if (prevName !== nextName || (!prev && data) || (prev && !data)) {
-                changed = true;
-            }
-            State.onCallByTeam[teamId] = { data, fetchedAt: Date.now() };
-        });
-
-        if (changed) {
-            renderAlertGroups();
-        }
-    });
-}
 
 function normalizeSeverity(severity) {
     const normalized = severity?.toLowerCase();

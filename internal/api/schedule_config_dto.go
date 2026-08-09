@@ -190,14 +190,28 @@ type LayerOnCallDTO struct {
 
 // OnCallDTO is the current-assignment projection. A null layer means nobody is
 // on duty there.
+//
+// Warnings belong here rather than beside the projection: an override overlap
+// is no less real for being seen through the current view than through the
+// history, and a caller that got the projection without them would have to
+// re-render a range to find out that the answer is contested. Carrying them
+// inside the value means every path that returns a projection - the on-call
+// endpoint, the preview's before/after, the save's result - reports the same
+// thing without three chances to forget.
 type OnCallDTO struct {
-	At time.Time       `json:"at"`
-	L1 *LayerOnCallDTO `json:"l1"`
-	L2 *LayerOnCallDTO `json:"l2"`
+	At       time.Time            `json:"at"`
+	L1       *LayerOnCallDTO      `json:"l1"`
+	L2       *LayerOnCallDTO      `json:"l2"`
+	Warnings []ScheduleWarningDTO `json:"warnings"`
 }
 
 func onCallDTO(o schedulerender.OnCall) OnCallDTO {
-	return OnCallDTO{At: o.At, L1: layerOnCallDTO(o.L1), L2: layerOnCallDTO(o.L2)}
+	return OnCallDTO{
+		At:       o.At,
+		L1:       layerOnCallDTO(o.L1),
+		L2:       layerOnCallDTO(o.L2),
+		Warnings: warningDTOs(o.Warnings),
+	}
 }
 
 func layerOnCallDTO(l *schedulerender.LayerOnCall) *LayerOnCallDTO {
@@ -259,6 +273,22 @@ func shiftDTOs(shifts []schedulerender.Shift) []ShiftDTO {
 		}
 	}
 	return out
+}
+
+// ScheduleOnCallResponse is who is on duty right now.
+//
+// It also answers "is there a schedule here at all", which is a different
+// question from "is anyone on duty" and cannot be derived from the projection:
+// a team with no schedule, a deleted one and a live one between shifts all put
+// nobody on call. ScheduleID is empty when there is no schedule in this model,
+// and DeletedAt is set when there is one but it has been deactivated.
+//
+// Carrying both here is what lets a widget render without also fetching the
+// configuration - a request whose ordinary answer would be 404, once per team.
+type ScheduleOnCallResponse struct {
+	ScheduleID string     `json:"schedule_id,omitempty"`
+	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
+	OnCall     OnCallDTO  `json:"on_call"`
 }
 
 // ScheduleWarningDTO is a structured condition the caller has to branch on.

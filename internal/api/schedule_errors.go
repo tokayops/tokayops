@@ -11,8 +11,42 @@ import (
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
+// Error codes. Every schedule-editor error carries one, including the ones a
+// handler answers directly before the service is reached - otherwise a client
+// would still need a prose fallback for half the contract, and the promise
+// "branch on the code" would be false exactly where it is least obvious.
+//
+// They are values rather than free strings so that adding a branch to the
+// editor and forgetting to emit the code is a compile error here, not a
+// silent default in the browser.
+const (
+	CodeScheduleNotFound   = "schedule_not_found"
+	CodeRevisionNotFound   = "revision_not_found"
+	CodeOverrideNotFound   = "override_not_found"
+	CodeTeamNotFound       = "team_not_found"
+	CodeUserNotFound       = "user_not_found"
+	CodeScheduleExists     = "schedule_exists"
+	CodeScheduleDeleted    = "schedule_deleted"
+	CodeLegacySchedule     = "legacy_schedule"
+	CodeLastAdmin          = "last_admin"
+	CodeActorNotActive     = "actor_not_active"
+	CodeVersionConflict    = "schedule_version_conflict"
+	CodeRevisionConflict   = "override_revision_conflict"
+	CodeOverrideOverlap    = "override_overlap"
+	CodeUserNotTeamMember  = "user_not_team_member"
+	CodeMemberOnCall       = "member_on_call"
+	CodeValidationFailed   = "validation_failed"
+	CodeInvalidRequestBody = "invalid_request_body"
+	CodeInvalidParameter   = "invalid_parameter"
+	CodeRangeTooLarge      = "range_too_large"
+	CodeSnapshotCorrupt    = "snapshot_corrupt"
+	CodeInvariantViolation = "invariant_violation"
+	CodeServiceUnavailable = "service_unavailable"
+	CodeInternal           = "internal_error"
+)
+
 // scheduleErrorStatuses is the plain half of the error table: a sentinel, the
-// status it answers with, and the message.
+// status it answers with, the machine code and the message.
 //
 // It is data rather than a switch so it can be read against the contract in
 // one glance. The order is the order it is scanned in, which only matters if
@@ -20,23 +54,25 @@ import (
 var scheduleErrorStatuses = []struct {
 	err     error
 	status  int
+	code    string
 	message string
 }{
-	{scheduleconfig.ErrScheduleNotFound, http.StatusNotFound, "schedule not found"},
-	{scheduleconfig.ErrRevisionNotFound, http.StatusNotFound, "revision not found"},
-	{scheduleconfig.ErrOverrideNotFound, http.StatusNotFound, "override not found"},
-	{scheduleconfig.ErrTeamNotFound, http.StatusNotFound, "team not found"},
-	{erasure.ErrUserNotFound, http.StatusNotFound, "user not found"},
+	{scheduleconfig.ErrScheduleNotFound, http.StatusNotFound, CodeScheduleNotFound, "schedule not found"},
+	{scheduleconfig.ErrRevisionNotFound, http.StatusNotFound, CodeRevisionNotFound, "revision not found"},
+	{scheduleconfig.ErrOverrideNotFound, http.StatusNotFound, CodeOverrideNotFound, "override not found"},
+	{scheduleconfig.ErrTeamNotFound, http.StatusNotFound, CodeTeamNotFound, "team not found"},
+	{erasure.ErrUserNotFound, http.StatusNotFound, CodeUserNotFound, "user not found"},
 
-	{scheduleconfig.ErrScheduleExists, http.StatusConflict, "this team already has a schedule"},
-	{scheduleconfig.ErrScheduleDeleted, http.StatusConflict, "schedule is deleted"},
-	{scheduleconfig.ErrLegacySchedule, http.StatusConflict,
+	{scheduleconfig.ErrScheduleExists, http.StatusConflict, CodeScheduleExists,
+		"this team already has a schedule"},
+	{scheduleconfig.ErrScheduleDeleted, http.StatusConflict, CodeScheduleDeleted, "schedule is deleted"},
+	{scheduleconfig.ErrLegacySchedule, http.StatusConflict, CodeLegacySchedule,
 		"this schedule predates the revision model and must be reset before it can be edited"},
-	{erasure.ErrLastAdmin, http.StatusConflict, "last active admin"},
+	{erasure.ErrLastAdmin, http.StatusConflict, CodeLastAdmin, "last active admin"},
 
 	// 401, not 403: the caller was authorized when the request arrived and has
 	// been erased since. There is no permission they could be granted.
-	{scheduleconfig.ErrActorNotActive, http.StatusUnauthorized, "user not found"},
+	{scheduleconfig.ErrActorNotActive, http.StatusUnauthorized, CodeActorNotActive, "user not found"},
 }
 
 // mapScheduleError is the ONLY translation from a command-side error to an
@@ -54,10 +90,16 @@ func (a *API) mapScheduleError(c echo.Context, err error) error {
 	}
 	for _, entry := range scheduleErrorStatuses {
 		if errors.Is(err, entry.err) {
-			return c.JSON(entry.status, ErrorResponse{Error: entry.message})
+			return c.JSON(entry.status, ErrorResponse{Error: entry.message, Code: entry.code})
 		}
 	}
 	return a.mapScheduleFault(c, err)
+}
+
+// badRequest is the direct-answer half of the contract: the checks a handler
+// makes before the service is reached still have to name themselves.
+func badRequest(c echo.Context, code, message string) error {
+	return c.JSON(http.StatusBadRequest, ErrorResponse{Error: message, Code: code})
 }
 
 // scheduleErrorDetails renders the errors that carry more than a class.
@@ -66,6 +108,7 @@ func scheduleErrorDetails(err error) (int, any, bool) {
 	if errors.As(err, &validation) {
 		return http.StatusBadRequest, map[string]any{
 			"error": validation.Msg,
+			"code":  CodeValidationFailed,
 			"field": validation.Field,
 		}, true
 	}
@@ -74,6 +117,7 @@ func scheduleErrorDetails(err error) (int, any, bool) {
 	if errors.As(err, &versionConflict) {
 		return http.StatusConflict, map[string]any{
 			"error":            "schedule was modified by someone else",
+			"code":             CodeVersionConflict,
 			"expected_version": versionConflict.Expected,
 			"current_version":  versionConflict.Current,
 		}, true
@@ -83,6 +127,7 @@ func scheduleErrorDetails(err error) (int, any, bool) {
 	if errors.As(err, &revisionConflict) {
 		return http.StatusConflict, map[string]any{
 			"error":             "override was modified by someone else",
+			"code":              CodeRevisionConflict,
 			"expected_revision": revisionConflict.Expected,
 			"current_revision":  revisionConflict.Current,
 		}, true
@@ -101,6 +146,7 @@ func scheduleErrorDetails(err error) (int, any, bool) {
 		}
 		return http.StatusConflict, map[string]any{
 			"error":                 "override conflicts with existing override(s)",
+			"code":                  CodeOverrideOverlap,
 			"conflicting_overrides": conflicts,
 		}, true
 	}
@@ -111,6 +157,7 @@ func scheduleErrorDetails(err error) (int, any, bool) {
 	if errors.As(err, &notMember) {
 		return http.StatusUnprocessableEntity, map[string]any{
 			"error":    "some users are not members of this team",
+			"code":     CodeUserNotTeamMember,
 			"user_ids": notMember.UserIDs,
 		}, true
 	}
@@ -149,14 +196,16 @@ func (a *API) mapScheduleFault(c echo.Context, err error) error {
 	case errors.Is(err, scheduleconfig.ErrSnapshotDecode):
 		a.scheduleMetrics().SnapshotDecodeError()
 		log.Printf("ALERT schedule_config: stored snapshot could not be decoded: %v", err)
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "stored schedule data is corrupt"})
+		return c.JSON(http.StatusInternalServerError,
+			ErrorResponse{Error: "stored schedule data is corrupt", Code: CodeSnapshotCorrupt})
 
 	case errors.Is(err, scheduleconfig.ErrInvariantViolation),
 		errors.Is(err, scheduleconfig.ErrRevisionMismatch):
 		log.Printf("ALERT schedule_config: invariant violation: %v", err)
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "schedule invariant violation"})
+		return c.JSON(http.StatusInternalServerError,
+			ErrorResponse{Error: "schedule invariant violation", Code: CodeInvariantViolation})
 	}
-	return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+	return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error(), Code: CodeInternal})
 }
 
 func scheduleRef(scheduleID, teamID string) map[string]string {
@@ -168,6 +217,7 @@ func scheduleRef(scheduleID, teamID string) map[string]string {
 func onCallConflictBody(schedules []map[string]string) map[string]any {
 	return map[string]any{
 		"error":     "user holds a current on-call assignment",
+		"code":      CodeMemberOnCall,
 		"schedules": schedules,
 	}
 }
