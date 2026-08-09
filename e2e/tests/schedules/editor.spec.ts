@@ -1,5 +1,6 @@
 import { test, expect } from '../../fixtures/auth.fixture';
 import { Page } from '@playwright/test';
+import { TeamFixtures } from '../../fixtures/team.fixture';
 
 /**
  * The editor, end to end.
@@ -15,34 +16,20 @@ interface Env {
   members: string[];
 }
 
-/**
- * Teams created by the test that is currently running, removed when it ends.
- *
- * Left behind, they accumulate: the on-call overview draws a row per team and
- * asks each one who is on duty, so every fixture that outlives its test makes
- * every later test slower. That compounds across a run until the slower
- * browser starts timing out, which looks like flakiness and is really just
- * litter.
- */
-let createdTeams: string[] = [];
+const MEMBERS = ['e2e-ann', 'e2e-ben', 'e2e-cal', 'e2e-dee'];
+
+let fixtures: TeamFixtures;
+
+test.beforeEach(async ({ page }) => {
+  fixtures = new TeamFixtures(page);
+});
+
+test.afterEach(async () => {
+  await fixtures.cleanup();
+});
 
 async function seedTeam(page: Page, prefix: string): Promise<Env> {
-  const teamId = `e2e-${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createdTeams.push(teamId);
-  const res = await page.request.post('/api/v1/teams', { data: { id: teamId, name: `Editor ${prefix}` } });
-  expect([200, 201]).toContain(res.status());
-
-  const members = ['e2e-ann', 'e2e-ben', 'e2e-cal', 'e2e-dee'];
-  for (const id of members) {
-    await page.request.post('/api/v1/users', {
-      data: { id, email: `${id}@test.com`, name: id.replace('e2e-', 'E2E ') },
-    });
-    const add = await page.request.post(`/api/v1/teams/${teamId}/members`, {
-      data: { user_id: id, role: 'team_member' },
-    });
-    expect([200, 201]).toContain(add.status());
-  }
-  return { teamId, members };
+  return { teamId: await fixtures.team(prefix, MEMBERS), members: MEMBERS };
 }
 
 function config(groups: string[][], expectedVersion: number) {
@@ -89,13 +76,6 @@ async function openEditor(page: Page, teamId: string) {
   await button.click();
   await page.locator('#schedule-form').waitFor({ state: 'visible' });
 }
-
-// Deleting the team cascades to its schedule and overrides.
-test.afterEach(async ({ page }) => {
-  const teams = createdTeams;
-  createdTeams = [];
-  await Promise.all(teams.map(id => page.request.delete(`/api/v1/teams/${id}`).catch(() => null)));
-});
 
 test.describe('Schedule editor', () => {
   // Each of these seeds a team, saves through the API and then drives the UI
@@ -520,6 +500,70 @@ test.describe('Overrides', () => {
     expect(new Date(head.valid_from).toISOString(),
       'the stored instant is untouched').toBe(validFrom.toISOString());
     expect(new Date(head.valid_to).toISOString()).toBe(validTo.toISOString());
+  });
+});
+
+test.describe('On-call overview', () => {
+  /**
+   * The page draws a row per team. Each row names two or three people, and
+   * looking them up per row meant a request per team on a page that is opened
+   * constantly. They are resolved once for the page now.
+   *
+   * The second assertion matters more than the first: batching must not make
+   * the page fail as a whole. A team whose state cannot be read gets a row
+   * saying so, and the rest of the page is unaffected - which is what the
+   * per-row version already did.
+   */
+  test('resolves names once for the page, and survives a failing row', async ({ page }) => {
+    const a = await seedTeam(page, 'ovw-a');
+    const b = await seedTeam(page, 'ovw-b');
+    const broken = await seedTeam(page, 'ovw-x');
+
+    // a and b share a person on purpose: two rows that both load must name
+    // them once between them, which is what a single pass buys. The earlier
+    // version of this test shared the person with the row it then forced to
+    // fail, so the id never reached the pass and nothing was deduplicated.
+    await save(page, a.teamId, config([['e2e-ann']], 0));
+    await save(page, b.teamId, config([['e2e-ann']], 0));
+    await save(page, broken.teamId, config([['e2e-cal']], 0));
+
+    const resolveCalls: string[][] = [];
+    await page.route('**/api/v1/users/resolve', async route => {
+      const body = route.request().postDataJSON() as { user_ids: string[] };
+      resolveCalls.push(body.user_ids);
+      await route.continue();
+    });
+
+    // A third team cannot be read. Its row has to say so without taking the
+    // page with it.
+    await page.route(`**/api/v1/teams/${broken.teamId}/schedule/on-call`, route =>
+      route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"boom"}' }));
+
+    await page.goto('/#/ops/oncall');
+    for (const id of [a.teamId, b.teamId, broken.teamId]) {
+      await page.locator(`.oncall-row[data-team-id="${id}"]`).waitFor({ state: 'visible' });
+    }
+
+    await expect(page.locator(`.oncall-row[data-team-id="${a.teamId}"]`)).toContainText('E2E ann');
+    await expect(page.locator(`.oncall-row[data-team-id="${b.teamId}"]`)).toContainText('E2E ann');
+    await expect(page.locator(`.oncall-row[data-team-id="${broken.teamId}"]`))
+      .toContainText(/unavailable/i);
+
+    // Exactly one pass. There are people on this page, so a pass must happen;
+    // the directory splits at 500 ids and this page is nowhere near that.
+    // Per-row resolution scored one request per team with a distinct set of
+    // people - the standing fixture alone guarantees a second.
+    expect(resolveCalls.length,
+      `expected a single resolve pass, saw ${resolveCalls.length}`).toBe(1);
+
+    // The person shared by two loaded rows is asked about once, not twice.
+    //
+    // Only ids this test controls are asserted on: the page also lists teams
+    // left over from earlier tests, which cannot be deleted while they have
+    // schedule history (TD10), and their people are in the pass too.
+    const asked = resolveCalls[0];
+    expect(asked.filter(id => id === 'e2e-ann'),
+      'a person on two rows is asked about once').toHaveLength(1);
   });
 });
 

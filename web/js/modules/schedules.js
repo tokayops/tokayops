@@ -97,7 +97,7 @@ function conflictingOverridesText(error) {
  * configuration - a request whose ordinary answer is 404, once per team on
  * every page that lists them.
  */
-async function loadTeamOnCall(teamId) {
+async function loadTeamOnCall(teamId, { resolveOwnNames = true } = {}) {
     // Not caught here. The endpoint answers 200 for a team with no schedule,
     // so anything thrown is a real failure - and turning it into an empty
     // projection would render "not configured" over a database that is down,
@@ -105,10 +105,14 @@ async function loadTeamOnCall(teamId) {
     const response = await API.schedules.currentOnCall(teamId);
 
     const onCall = response?.on_call || null;
-    const names = await resolveNames([
-        ...(onCall?.l1?.user_ids || []),
-        ...(onCall?.l2?.user_ids || []),
-    ]);
+    // Skipped when the caller is resolving for several teams at once: doing it
+    // here as well would be the per-row lookup this exists to avoid.
+    const names = resolveOwnNames
+        ? await resolveNames([
+            ...(onCall?.l1?.user_ids || []),
+            ...(onCall?.l2?.user_ids || []),
+        ])
+        : new Map();
 
     // Three separate facts, because the UI answers three different questions
     // with them and none of them can be derived from the projection. A team
@@ -221,6 +225,54 @@ export async function loadOnCallOverviewRow(team, container) {
         container.innerHTML = Components.onCallOverviewRow(
             null, team, unavailableContext(team.id));
     }
+    if (window.lucide) lucide.createIcons();
+}
+
+/**
+ * Render the on-call row for every team, resolving names once.
+ *
+ * Drawing the rows one at a time means each asks after its own two or three
+ * people, so a page listing twenty teams made twenty lookups. Loading them
+ * together lets one lookup cover the lot.
+ *
+ * The loads are settled rather than joined: a team whose state cannot be read
+ * still gets a row saying so, and does not take the other nineteen down with
+ * it. That is what the per-row version already did, and a batched version has
+ * no business being less robust than the loop it replaces.
+ *
+ * @param {Array<{id, name}>} teams
+ * @param {(teamId: string) => HTMLElement|null} containerFor
+ */
+export async function loadOnCallOverviewRows(teams, containerFor) {
+    const loaded = await Promise.allSettled(
+        (teams || []).map(team => loadTeamOnCall(team.id, { resolveOwnNames: false })));
+
+    // Names for everyone the successful rows put on duty, in one pass. The
+    // directory chunks it if the page is large enough to need chunking.
+    const ids = [];
+    for (const result of loaded) {
+        if (result.status !== 'fulfilled') continue;
+        ids.push(...(result.value.onCall?.l1?.user_ids || []));
+        ids.push(...(result.value.onCall?.l2?.user_ids || []));
+    }
+    const names = await resolveNames(ids);
+
+    teams.forEach((team, i) => {
+        const container = containerFor(team.id);
+        if (!container) return;
+
+        const result = loaded[i];
+        if (result.status !== 'fulfilled') {
+            console.error('Failed to load on-call overview row:', result.reason);
+            container.innerHTML = Components.onCallOverviewRow(
+                null, team, unavailableContext(team.id));
+            return;
+        }
+        const state = result.value;
+        container.innerHTML = Components.onCallOverviewRow(
+            state.onCall, team, { ...widgetContext(team.id, state), names });
+    });
+
     if (window.lucide) lucide.createIcons();
 }
 

@@ -160,25 +160,25 @@ export async function joinNames(ids) {
 /**
  * Who may be assigned to a rotation or an override right now.
  *
- * The intersection of two lists that disagree on purpose: team membership does
- * not exclude erased users, and the user list does. Someone who left the
- * company is still named by past shifts - which is what resolveNames is for -
- * but must not be offered for a new one, because the save would refuse them
- * and the editor would be blaming the user for a choice it presented.
+ * Team membership is the whole answer. Erasing someone removes their
+ * memberships in the same transaction that marks them erased, and that is the
+ * only way a user is ever soft-deleted - so a team's member list cannot name
+ * an erased person.
+ *
+ * This used to intersect the member list with the full user list, guarding
+ * against a state that cannot occur, at the cost of fetching every user in the
+ * installation each time an editor was opened.
+ *
+ * Someone who left the team is a different matter: they are still named by
+ * past shifts, which is what resolveNames is for, and they are correctly
+ * absent here.
  *
  * @param {string} teamId
  * @returns {Promise<Array<{id, name}>>} in the order the team lists them
  */
 export async function assignableMembers(teamId) {
-    const [membersResponse, usersResponse] = await Promise.all([
-        API.teams.members(teamId),
-        API.users.list(),
-    ]);
-
-    const active = new Set((usersResponse?.users || []).map(u => u.id));
-    return (membersResponse?.users || [])
-        .filter(member => active.has(member.id))
-        .map(member => ({ id: member.id, name: member.name }));
+    const response = await API.teams.members(teamId);
+    return (response?.users || []).map(member => ({ id: member.id, name: member.name }));
 }
 
 /**

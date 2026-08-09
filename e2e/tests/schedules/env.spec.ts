@@ -1,4 +1,5 @@
 import { test, expect } from '../../fixtures/auth.fixture';
+import { TeamFixtures } from '../../fixtures/team.fixture';
 
 /**
  * The environment this suite runs against, asserted before anything is built
@@ -26,6 +27,16 @@ test.describe('e2e environment', () => {
   test.skip(({ browserName }) => browserName !== 'chromium',
     'environment invariants are browser-independent; asserted once');
 
+  let fixtures: TeamFixtures;
+
+  test.beforeEach(async ({ page }) => {
+    fixtures = new TeamFixtures(page);
+  });
+
+  test.afterEach(async () => {
+    await fixtures.cleanup();
+  });
+
   test('the reset removed the seeded pre-revision schedules', async ({ page }) => {
     // The load-bearing check. `seed` gives this team a schedule the old way,
     // so the legacy read answers 200 for it right up until the reset deletes
@@ -52,17 +63,31 @@ test.describe('e2e environment', () => {
     expect(team.on_call_configured).toBe(false);
   });
 
-  test('a new schedule starts at revision 1 and reads back as configured', async ({ page }) => {
-    // On a team of its own, so this stays true however often it runs.
-    const teamId = `e2e-env-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    expect([200, 201]).toContain(
-      (await page.request.post('/api/v1/teams', { data: { id: teamId, name: 'Env Check' } })).status());
+  /**
+   * The one schedule no test mutates. Specs that need "a team that has one"
+   * point at it; without it they latch onto another worker's fixture and fail
+   * when that worker deletes it. Its absence used to surface as failures
+   * somewhere else entirely.
+   */
+  test('the standing fixture exists and is active', async ({ page }) => {
+    const config = await page.request.get('/api/v1/teams/e2e-standing/schedule/config');
+    expect(config.status(),
+      'e2e-standing is missing: did global.setup create it?').toBe(200);
+    const body = await config.json();
+    expect(body.deleted_at, 'the standing fixture must not be left deleted').toBeFalsy();
+    expect(body.config.l1.groups.length).toBeGreaterThan(0);
 
-    await page.request.post('/api/v1/users',
-      { data: { id: 'e2e-env-user', email: 'e2e-env@test.com', name: 'E2E Env' } });
-    expect([200, 201]).toContain(
-      (await page.request.post(`/api/v1/teams/${teamId}/members`,
-        { data: { user_id: 'e2e-env-user', role: 'team_member' } })).status());
+    const teams = await (await page.request.get('/api/v1/teams')).json();
+    const team = teams.teams.find((t: any) => t.id === 'e2e-standing');
+    expect(team?.on_call_configured).toBe(true);
+  });
+
+  test('a new schedule starts at revision 1 and reads back as configured', async ({ page }) => {
+    // On a team of its own, so this stays true however often it runs, and
+    // through the shared fixture, so the team does not outlive the run: the
+    // on-call overview lists every team, and one left behind per run is the
+    // slow decay this fixture exists to prevent.
+    const teamId = await fixtures.team('env', ['e2e-env-user']);
 
     const saved = await page.request.put(`/api/v1/teams/${teamId}/schedule/config`, {
       data: {

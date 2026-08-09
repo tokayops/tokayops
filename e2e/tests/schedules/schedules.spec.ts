@@ -1,5 +1,6 @@
 import { test, expect } from '../../fixtures/auth.fixture';
 import { Page } from '@playwright/test';
+import { deleteTeam } from '../../fixtures/team.fixture';
 
 /**
  * Get an on-call row that has a configured schedule.
@@ -337,8 +338,10 @@ test.describe('Schedule Deletion', () => {
       // Modal should close
       await schedulesPage.expectScheduleModalHidden();
     } finally {
-      // Cleanup: always delete team (cascades to schedule)
-      await page.request.delete(`/api/v1/teams/${teamId}`);
+      // Through the shared helper: ignoring the response here counted a 500 as
+      // a successful cleanup. See deleteTeam for the team it cannot remove.
+      const outcome = await deleteTeam(page, teamId);
+      expect(outcome.result, `cleanup of ${teamId} failed`).not.toBe('failed');
     }
   });
 

@@ -1,5 +1,6 @@
 import { test, expect } from '../../fixtures/auth.fixture';
 import { Page } from '@playwright/test';
+import { deleteTeam } from '../../fixtures/team.fixture';
 
 // ========================================
 // Helper: seed test data via API
@@ -106,9 +107,11 @@ async function createOverrideViaAPI(
   return await res.json();
 }
 
-/** Cleanup: delete team (cascades to schedule + overrides) */
+/** Cleanup: through the shared helper, so a failed delete is not mistaken for
+ *  a successful one. See deleteTeam for why some teams are retained. */
 async function cleanup(page: Page, teamId: string) {
-  await page.request.delete(`/api/v1/teams/${teamId}`);
+  const outcome = await deleteTeam(page, teamId);
+  expect(outcome.result, `cleanup of ${teamId} failed`).not.toBe('failed');
 }
 
 /**

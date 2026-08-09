@@ -106,6 +106,45 @@ test.describe('users-directory', () => {
     expect(result.second).toEqual([]);
   });
 
+  /**
+   * The contract TD8 closed: team membership is the whole answer.
+   *
+   * Erasing someone removes their memberships in the same transaction that
+   * marks them erased, so a member list cannot name an erased person - and the
+   * intersection with the full user list that used to guard against it cost a
+   * fetch of every user in the installation each time an editor opened.
+   */
+  test('assignable members come from the team alone', async ({ page }) => {
+    const result = await page.evaluate(async (module: string) => {
+      const calls: string[] = [];
+      (window as any).API = {
+        teams: {
+          members: async (teamId: string) => {
+            calls.push(`members:${teamId}`);
+            return { users: [{ id: 'u1', name: 'One' }, { id: 'u2', name: 'Two' }] };
+          },
+        },
+        users: {
+          list: async () => {
+            calls.push('users.list');
+            return { users: [] };
+          },
+          resolve: async () => ({ users: [] }),
+        },
+      };
+      const mod = await import(module);
+      const members = await mod.assignableMembers('devops');
+      return { calls, members };
+    }, MODULE);
+
+    expect(result.calls, 'one request, and it is the team member list')
+      .toEqual(['members:devops']);
+    expect(result.members).toEqual([
+      { id: 'u1', name: 'One' },
+      { id: 'u2', name: 'Two' },
+    ]);
+  });
+
   test('a failed lookup is retried rather than cached as unknown', async ({ page }) => {
     const result = await page.evaluate(async (module: string) => {
       let attempts = 0;
