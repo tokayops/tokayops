@@ -82,14 +82,6 @@ func seedErasureFixture(t *testing.T, s *Store) (scheduleID string) {
 	}
 	scheduleID = rev.ScheduleID
 
-	// A legacy override so the join scan that reads u.email is covered too.
-	if _, err := s.db.Exec(
-		`INSERT INTO schedule_overrides (id, schedule_id, user_id, start_time, end_time, created_by)
-		 VALUES ('legacy-ovr', $1, 'alice', $2, $3, 'alice')`,
-		scheduleID, start.Add(24*time.Hour), start.Add(30*time.Hour)); err != nil {
-		t.Fatalf("insert legacy override: %v", err)
-	}
-
 	// Free-text reasons naming a person, on both history tables and for both
 	// the target and the author role.
 	aliceReason := "covering for Alice Smith"
@@ -145,7 +137,7 @@ func seedErasureFixture(t *testing.T, s *Store) (scheduleID string) {
 
 func TestErasureAnonymizesUserAndKeepsReadsWorking(t *testing.T) {
 	s := setupTestDB(t)
-	scheduleID := seedErasureFixture(t, s)
+	seedErasureFixture(t, s)
 	erasedAt := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 
 	eraseUser(t, s, "alice", erasedAt)
@@ -201,20 +193,6 @@ func TestErasureAnonymizesUserAndKeepsReadsWorking(t *testing.T) {
 		}
 		if len(members) != 2 {
 			t.Fatalf("got %d members, want 2", len(members))
-		}
-	})
-
-	t.Run("legacy override join", func(t *testing.T) {
-		from := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-		overrides, err := s.GetScheduleOverrides(scheduleID, from, from.Add(30*24*time.Hour))
-		if err != nil {
-			t.Fatalf("GetScheduleOverrides: %v", err)
-		}
-		if len(overrides) != 1 {
-			t.Fatalf("got %d overrides, want 1", len(overrides))
-		}
-		if overrides[0].User.Email != "" {
-			t.Fatalf("erased email resurfaced: %q", overrides[0].User.Email)
 		}
 	})
 

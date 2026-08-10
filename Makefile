@@ -126,16 +126,14 @@ e2e-wait:
 # environment, called from both places, is the only thing that stops that
 # happening again.
 #
-# The seed still writes schedules the old way, so the environment is put through
-# the same destructive reset the upgrade performs. Without it the suite would be
-# testing the one state the app no longer supports: seeded schedules would read
-# as unconfigured and creating one would be refused as a pre-revision schedule.
-# Reset is idempotent, and the volume is recreated by e2e-down, so repeated runs
-# are fine.
+# The reset no longer has anything to delete - `seed` stopped writing schedules
+# when the legacy write path was removed - and it stays anyway, without `|| true`,
+# so a failure fails the environment. On every run it puts the real CLI against
+# the real schema and leaves the marker a database has after an upgrade, which is
+# the state the suite is supposed to run against.
 #
-# Nothing may run `seed` after this point: it would put the legacy rows straight
-# back. Schedules for the tests are created through the API by the Playwright
-# setup project.
+# Schedules for the tests are created through the API by the Playwright setup
+# project.
 e2e-seed:
 	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops user create admin@example.com 'Admin123!' 'Test Admin' || true
 	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops seed || true

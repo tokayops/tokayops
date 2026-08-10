@@ -352,39 +352,6 @@ func TestGetTeamMemberIDsExcludesSoftDeleted(t *testing.T) {
 	}
 }
 
-// The legacy readers must refuse a schedule governed by revisions. Answering
-// from its stale mutable columns would not fail - it would page the wrong
-// person, which is worse.
-func TestLegacyReadersRefuseRevisionSchedules(t *testing.T) {
-	s := setupTestDB(t)
-	at := time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC)
-	scheduleID := seedCommandSchedule(t, s, at)
-
-	if _, err := s.GetScheduleByTeamID("devops"); !errors.Is(err, ErrScheduleSuperseded) {
-		t.Fatalf("GetScheduleByTeamID = %v, want ErrScheduleSuperseded", err)
-	}
-	if _, err := s.GetScheduleByID(scheduleID); !errors.Is(err, ErrScheduleSuperseded) {
-		t.Fatalf("GetScheduleByID = %v, want ErrScheduleSuperseded", err)
-	}
-
-	// A row from before the upgrade still reads as it always did.
-	seedTeam(t, s, "legacy-team")
-	legacy := &model.Schedule{
-		ID: "legacy-1", TeamID: "legacy-team", Timezone: "UTC",
-		L1RotationType: model.RotationDaily, L1HandoffTime: "09:00", L1RotationStart: at,
-	}
-	if err := s.CreateSchedule(legacy); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
-	got, err := s.GetScheduleByTeamID("legacy-team")
-	if err != nil {
-		t.Fatalf("legacy read: %v", err)
-	}
-	if got.ID != "legacy-1" || got.ConfigVersion != 0 {
-		t.Fatalf("legacy schedule = %+v", got)
-	}
-}
-
 // Every user mutation carries deleted_at IS NULL and checks it affected a row.
 // Without that, an erasure is a stage the next update quietly undoes.
 func TestErasedUserCannotBeRefilled(t *testing.T) {

@@ -1,11 +1,13 @@
 package store
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/rotation"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
 func TestGetMetricsSnapshot_ActiveAlertGroups(t *testing.T) {
@@ -46,116 +48,90 @@ func TestGetMetricsSnapshot_ActiveAlertGroups(t *testing.T) {
 	}
 }
 
-func TestGetMetricsSnapshot_TeamsWithoutOnCall(t *testing.T) {
+// The on-call gauges read the revision in force, so the fixtures are built
+// through the command service rather than by writing rows: what is being
+// asserted is that the query agrees with what a save actually produces.
+//
+// Both gauges are covered by one fixture on purpose. They are two questions
+// about the same six states, and building the states twice invites the two
+// tests to drift into describing different worlds.
+func TestGetMetricsSnapshotOnCallGauges(t *testing.T) {
 	s := setupTestDB(t)
+	at := time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC)
+	svc := newTestScheduleService(s, at)
 
-	now := time.Now()
+	// A rotation of two groups: somebody is on duty, and it is not always the
+	// same person.
+	seedTeam(t, s, "team-rotating", "alice", "bob")
+	mustCreateSchedule(t, svc, "team-rotating", revTestConfig())
 
-	// Team A: has schedule + L1 epoch with users → has on-call
-	if err := s.CreateTeam(&model.Team{ID: "team-a", Name: "Team A", CreatedAt: now}); err != nil {
-		t.Fatal(err)
-	}
-	schedA := &model.Schedule{
-		ID: uuid.New().String(), TeamID: "team-a", Timezone: "UTC",
-		L1RotationType: "daily", L1HandoffTime: "09:00",
-		CreatedAt: now,
-	}
-	if err := s.CreateSchedule(schedA); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CreateRotationEpoch(&model.RotationEpoch{
-		ID: uuid.New().String(), ScheduleID: schedA.ID, Layer: "l1",
-		Groups: [][]string{{"user1"}, {"user2"}}, StartTime: now, CreatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	// One group of one person: on duty, and always the same person.
+	seedTeam(t, s, "team-lonely", "carol")
+	mustCreateSchedule(t, svc, "team-lonely", layerConfig(
+		rotation.RotationGroup{ID: revGroupAlice, Members: []string{"carol"}}))
 
-	// Team B: has schedule + L1 epoch with EMPTY users → no on-call
-	if err := s.CreateTeam(&model.Team{ID: "team-b", Name: "Team B", CreatedAt: now}); err != nil {
-		t.Fatal(err)
-	}
-	schedB := &model.Schedule{
-		ID: uuid.New().String(), TeamID: "team-b", Timezone: "UTC",
-		L1RotationType: "daily", L1HandoffTime: "09:00",
-		CreatedAt: now,
-	}
-	if err := s.CreateSchedule(schedB); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CreateRotationEpoch(&model.RotationEpoch{
-		ID: uuid.New().String(), ScheduleID: schedB.ID, Layer: "l1",
-		Groups: [][]string{}, StartTime: now, CreatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
+	// One group of TWO people. They are on duty together and forever, so the
+	// team has on-call - but it is not a single assignee, and this is the case
+	// the pre-revision query got wrong: it counted groups, not people.
+	seedTeam(t, s, "team-pair", "dave", "erin")
+	mustCreateSchedule(t, svc, "team-pair", layerConfig(
+		rotation.RotationGroup{ID: revGroupAlice, Members: []string{"dave", "erin"}}))
+
+	// L1 switched off. Its groups survive in the snapshot - only the phase pair
+	// is cleared - so a query that looked at groups alone would report this
+	// team as covered, and by a single assignee at that.
+	seedTeam(t, s, "team-disabled", "frank")
+	disabled := layerConfig(rotation.RotationGroup{ID: revGroupAlice, Members: []string{"frank"}})
+	disabled.L1.Enabled = false
+	mustCreateSchedule(t, svc, "team-disabled", disabled)
+
+	// Deleted: the schedule existed, and does not now.
+	seedTeam(t, s, "team-deleted", "grace")
+	created := mustCreateSchedule(t, svc, "team-deleted", layerConfig(
+		rotation.RotationGroup{ID: revGroupAlice, Members: []string{"grace"}}))
+	deleter := newTestScheduleService(s, at.Add(time.Hour))
+	if err := deleter.Delete(context.Background(), "team-deleted",
+		scheduleconfig.DeleteCommand{ExpectedVersion: created.Version}); err != nil {
+		t.Fatalf("Delete: %v", err)
 	}
 
-	// Team C: no schedule at all → no on-call
-	if err := s.CreateTeam(&model.Team{ID: "team-c", Name: "Team C", CreatedAt: now}); err != nil {
-		t.Fatal(err)
-	}
+	// No schedule at all.
+	seedTeam(t, s, "team-none")
 
 	snap, err := s.GetMetricsSnapshot()
 	if err != nil {
 		t.Fatalf("GetMetricsSnapshot: %v", err)
 	}
 
-	// Team B (empty rotation) + Team C (no schedule) = 2 without on-call
-	if snap.TeamsWithoutOnCall != 2 {
-		t.Errorf("expected 2 teams without on-call, got %d", snap.TeamsWithoutOnCall)
+	// Covered: rotating, lonely, pair. Not covered: disabled, deleted, none.
+	if snap.TeamsWithoutOnCall != 3 {
+		t.Errorf("teams_without_oncall = %d, want 3 (disabled, deleted, no schedule)",
+			snap.TeamsWithoutOnCall)
+	}
+	// Only the one-group-of-one-person schedule. The pair is two people, the
+	// disabled one has nobody, the deleted one no longer exists.
+	if snap.TeamsWithPermanentOnCall != 1 {
+		t.Errorf("teams_with_permanent_oncall = %d, want 1 (only the single assignee)",
+			snap.TeamsWithPermanentOnCall)
 	}
 }
 
-func TestGetMetricsSnapshot_TeamsWithPermanentOnCall(t *testing.T) {
-	s := setupTestDB(t)
+// layerConfig is revTestConfig with L1 replaced by the given groups.
+func layerConfig(groups ...rotation.RotationGroup) rotation.ScheduleConfiguration {
+	cfg := revTestConfig()
+	cfg.L1.Groups = groups
+	return cfg
+}
 
-	now := time.Now()
+func mustCreateSchedule(t *testing.T, svc *scheduleconfig.Service, teamID string,
+	cfg rotation.ScheduleConfiguration) *scheduleconfig.ScheduleRevision {
 
-	// Team with single-user L1 rotation → permanent on-call
-	if err := s.CreateTeam(&model.Team{ID: "team-perm", Name: "Team Perm", CreatedAt: now}); err != nil {
-		t.Fatal(err)
-	}
-	sched := &model.Schedule{
-		ID: uuid.New().String(), TeamID: "team-perm", Timezone: "UTC",
-		L1RotationType: "daily", L1HandoffTime: "09:00",
-		CreatedAt: now,
-	}
-	if err := s.CreateSchedule(sched); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CreateRotationEpoch(&model.RotationEpoch{
-		ID: uuid.New().String(), ScheduleID: sched.ID, Layer: "l1",
-		Groups: [][]string{{"lonely-user"}}, StartTime: now, CreatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Team with 2-user rotation → not permanent
-	if err := s.CreateTeam(&model.Team{ID: "team-good", Name: "Team Good", CreatedAt: now}); err != nil {
-		t.Fatal(err)
-	}
-	sched2 := &model.Schedule{
-		ID: uuid.New().String(), TeamID: "team-good", Timezone: "UTC",
-		L1RotationType: "daily", L1HandoffTime: "09:00",
-		CreatedAt: now,
-	}
-	if err := s.CreateSchedule(sched2); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CreateRotationEpoch(&model.RotationEpoch{
-		ID: uuid.New().String(), ScheduleID: sched2.ID, Layer: "l1",
-		Groups: [][]string{{"user1"}, {"user2"}}, StartTime: now, CreatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	snap, err := s.GetMetricsSnapshot()
+	t.Helper()
+	res, err := svc.CreateSchedule(context.Background(), teamID, cfg, "", nil)
 	if err != nil {
-		t.Fatalf("GetMetricsSnapshot: %v", err)
+		t.Fatalf("CreateSchedule %s: %v", teamID, err)
 	}
-
-	if snap.TeamsWithPermanentOnCall != 1 {
-		t.Errorf("expected 1 team with permanent on-call, got %d", snap.TeamsWithPermanentOnCall)
-	}
+	return res
 }
 
 func TestGetMetricsSnapshot_TeamsWithoutPolicy(t *testing.T) {

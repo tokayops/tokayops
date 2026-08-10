@@ -51,54 +51,16 @@ func TestBusinessCollector_ActiveAlertGroups(t *testing.T) {
 	}
 }
 
-func TestBusinessCollector_TeamsWithoutOnCall(t *testing.T) {
-	s := store.NewMockStore()
-	// MockStore seeds "devops" and "triage" teams.
-	// Neither has a schedule, so both should count.
-	collected := collectMetrics(t, s)
+// The two on-call gauges are NOT asserted here, and that is a decision rather
+// than a gap. They are answers about the revision model, which the mock does
+// not implement - it would have to grow a second projection to do so, and two
+// implementations of "who is on duty" is the thing this epic removed. The mock
+// reports zero for both; a test over that would assert the double, not the
+// query.
+//
+// They are covered against a real database in
+// store.TestGetMetricsSnapshotOnCallGauges.
 
-	val := findGaugeValue(t, collected, "teams_without_oncall", nil)
-	if val != 2 {
-		t.Errorf("teams_without_oncall = %v, want 2 (devops + triage have no schedule)", val)
-	}
-
-	// Add a schedule with an active L1 epoch for devops -> count should drop by 1
-	s.CreateSchedule(&model.Schedule{ID: "sched1", TeamID: "devops"})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ID: "ep1", ScheduleID: "sched1", Layer: "l1",
-		Groups: [][]string{{"denis"}, {"alex"}}, EndTime: nil, // open epoch
-	})
-
-	collected = collectMetrics(t, s)
-	val = findGaugeValue(t, collected, "teams_without_oncall", nil)
-	if val != 1 {
-		t.Errorf("teams_without_oncall = %v, want 1 (only triage has no schedule)", val)
-	}
-}
-
-func TestBusinessCollector_TeamsWithPermanentOnCall(t *testing.T) {
-	s := store.NewMockStore()
-
-	// No schedules -> 0 permanent
-	collected := collectMetrics(t, s)
-	val := findGaugeValue(t, collected, "teams_with_permanent_oncall", nil)
-	if val != 0 {
-		t.Errorf("teams_with_permanent_oncall = %v, want 0", val)
-	}
-
-	// Schedule with 1 user -> permanent
-	s.CreateSchedule(&model.Schedule{ID: "sched1", TeamID: "devops"})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ID: "ep1", ScheduleID: "sched1", Layer: "l1",
-		Groups: [][]string{{"denis"}}, EndTime: nil,
-	})
-
-	collected = collectMetrics(t, s)
-	val = findGaugeValue(t, collected, "teams_with_permanent_oncall", nil)
-	if val != 1 {
-		t.Errorf("teams_with_permanent_oncall = %v, want 1", val)
-	}
-}
 
 func TestBusinessCollector_TeamsWithoutPolicy(t *testing.T) {
 	s := store.NewMockStore()

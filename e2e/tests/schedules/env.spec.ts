@@ -5,13 +5,13 @@ import { TeamFixtures } from '../../fixtures/team.fixture';
  * The environment this suite runs against, asserted before anything is built
  * on top of it.
  *
- * `seed` still writes schedules the old way, so `e2e-up` puts the database
- * through the same destructive reset the real upgrade performs. If that step
- * is ever dropped, the suite would silently start testing the one state the
- * app no longer supports - seeded schedules reading as unconfigured, and every
- * attempt to create one refused as pre-revision. These failures name that
- * cause directly, instead of leaving it to be inferred from a dozen unrelated
- * ones.
+ * There used to be a check here that the upgrade reset had run, and it worked
+ * by asking a pre-revision endpoint whether a seeded schedule was still there.
+ * Both halves are gone now: `seed` no longer writes schedules and the endpoint
+ * no longer exists, so the check could not fail for any reason and was removed
+ * rather than left standing. A test that cannot fail is worse than none, it
+ * occupies the place of a guarantee. The reset's own behaviour - guards,
+ * idempotency, marker - is covered in store/legacy_reset_test.go.
  *
  * Nothing here writes to seeded data. A spec that configured a seeded team
  * would pass once and then fail against its own leftovers - deleting a
@@ -35,22 +35,6 @@ test.describe('e2e environment', () => {
 
   test.afterEach(async () => {
     await fixtures.cleanup();
-  });
-
-  test('the reset removed the seeded pre-revision schedules', async ({ page }) => {
-    // The load-bearing check. `seed` gives this team a schedule the old way,
-    // so the legacy read answers 200 for it right up until the reset deletes
-    // the row. This is the one assertion that distinguishes "reset ran" from
-    // "reset was skipped" - the revision endpoints answer 404 either way,
-    // because a pre-revision row has no configuration in this model.
-    const legacy = await page.request.get(`/api/v1/teams/${seededTeam}/schedule`);
-    expect(legacy.status(),
-      'a seeded pre-revision schedule survived. Either e2e-up skipped ' +
-      '`migrate reset-schedules`, or it ran against a database that had ' +
-      'already been reset once - the reset is a no-op after its marker exists, ' +
-      'so a re-seed on a surviving volume is never cleaned up. Start from a ' +
-      'fresh volume: make e2e-down && make e2e-up.')
-      .toBe(404);
   });
 
   test('a seeded team carries no schedule and is reported unconfigured', async ({ page }) => {

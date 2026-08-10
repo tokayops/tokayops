@@ -489,41 +489,6 @@ definitions:
           $ref: '#/definitions/api.ScheduleWarningDTO'
         type: array
     type: object
-  api.ScheduleRequest:
-    properties:
-      l1_handoff_day:
-        description: 0=Sun, 1=Mon
-        type: integer
-      l1_handoff_time:
-        description: '"11:00"'
-        type: string
-      l1_rotation_start:
-        description: e.g., 2025-01-01T11:00:00Z
-        type: string
-      l1_rotation_type:
-        description: '"daily" | "weekly"'
-        type: string
-      l2_enabled:
-        description: Enable L2 layer
-        type: boolean
-      l2_escalation_timeout:
-        description: Minutes before escalating
-        type: integer
-      l2_handoff_day:
-        type: integer
-      l2_handoff_time:
-        type: string
-      l2_rotation_start:
-        type: string
-      l2_rotation_type:
-        type: string
-      slack_usergroup_id:
-        description: Optional Slack usergroup for on-call sync
-        type: string
-      timezone:
-        description: IANA timezone
-        type: string
-    type: object
   api.ScheduleRevisionDTO:
     properties:
       change_reason:
@@ -575,24 +540,6 @@ definitions:
         type: array
       until:
         type: string
-    type: object
-  api.SetGroupsRequest:
-    properties:
-      groups:
-        description: Groups of user IDs, e.g. [["id1","id2"],["id3"]]
-        items:
-          items:
-            type: string
-          type: array
-        type: array
-    type: object
-  api.SetUsersRequest:
-    properties:
-      user_ids:
-        description: Ordered list of user IDs (L2 only)
-        items:
-          type: string
-        type: array
     type: object
   api.ShiftDTO:
     properties:
@@ -1017,10 +964,6 @@ definitions:
         type: array
       l2_user:
         $ref: '#/definitions/model.User'
-      override:
-        allOf:
-        - $ref: '#/definitions/model.ScheduleOverride'
-        description: If override is active
       source:
         description: |-
           Source is "rotation" or "override": what put L1Users on duty. The
@@ -1028,103 +971,6 @@ definitions:
           whoever is really on call - Source is what keeps the fact that they are
           standing in from being lost, now that there is no legacy override row to
           point at. Empty on snapshots written before it existed.
-        type: string
-    type: object
-  model.RotationType:
-    enum:
-    - daily
-    - weekly
-    type: string
-    x-enum-varnames:
-    - RotationDaily
-    - RotationWeekly
-  model.Schedule:
-    properties:
-      config_version:
-        description: |-
-          ConfigVersion is non-zero when this schedule is governed by the revision
-          model, in which case the mutable columns below are stale leftovers and
-          nothing may read them. It is scanned so the legacy readers can refuse
-          such a row instead of answering from data nobody maintains.
-        type: integer
-      created_at:
-        type: string
-      id:
-        type: string
-      l1_groups:
-        items:
-          items:
-            $ref: '#/definitions/model.User'
-          type: array
-        type: array
-      l1_handoff_day:
-        description: 0=Sun, 1=Mon (for weekly)
-        type: integer
-      l1_handoff_time:
-        description: '"11:00" format'
-        type: string
-      l1_rotation_start:
-        description: When rotation started
-        type: string
-      l1_rotation_type:
-        allOf:
-        - $ref: '#/definitions/model.RotationType'
-        description: L1 Layer Config (Primary)
-      l2_enabled:
-        description: L2 Layer Config (Secondary, optional)
-        type: boolean
-      l2_escalation_timeout_min:
-        description: Minutes before escalating to L2
-        type: integer
-      l2_handoff_day:
-        type: integer
-      l2_handoff_time:
-        type: string
-      l2_rotation_start:
-        type: string
-      l2_rotation_type:
-        $ref: '#/definitions/model.RotationType'
-      l2_users:
-        items:
-          $ref: '#/definitions/model.User'
-        type: array
-      overrides:
-        items:
-          $ref: '#/definitions/model.ScheduleOverride'
-        type: array
-      slack_usergroup_id:
-        description: Slack Usergroup Sync (optional)
-        type: string
-      team_id:
-        type: string
-      timezone:
-        description: IANA timezone, e.g., "Asia/Bangkok"
-        type: string
-      updated_at:
-        type: string
-    type: object
-  model.ScheduleOverride:
-    properties:
-      created_at:
-        type: string
-      created_by:
-        type: string
-      end_time:
-        type: string
-      id:
-        type: string
-      reason:
-        type: string
-      schedule_id:
-        type: string
-      start_time:
-        description: Minute precision
-        type: string
-      user:
-        allOf:
-        - $ref: '#/definitions/model.User'
-        description: Populated on read
-      user_id:
         type: string
     type: object
   model.Team:
@@ -2532,29 +2378,6 @@ paths:
       summary: Remove a user from a team
       tags:
       - teams
-  /api/v1/teams/{id}/oncall:
-    get:
-      description: Get who is currently on-call for L1 and L2
-      parameters:
-      - description: Team ID
-        in: path
-        name: id
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/model.OnCallResult'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.ErrorResponse'
-      summary: Get current on-call for a team
-      tags:
-      - schedules
   /api/v1/teams/{id}/schedule:
     delete:
       description: Deactivates the schedule and tombstones its live overrides. History
@@ -2588,62 +2411,6 @@ paths:
           schema:
             $ref: '#/definitions/api.ErrorResponse'
       summary: Delete the schedule of a team
-      tags:
-      - schedules
-    get:
-      description: Get the on-call schedule configuration for a team
-      parameters:
-      - description: Team ID
-        in: path
-        name: id
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/model.Schedule'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.ErrorResponse'
-      summary: Get schedule for a team
-      tags:
-      - schedules
-    put:
-      consumes:
-      - application/json
-      description: Create or update the on-call schedule configuration
-      parameters:
-      - description: Team ID
-        in: path
-        name: id
-        required: true
-        type: string
-      - description: Schedule configuration
-        in: body
-        name: schedule
-        required: true
-        schema:
-          $ref: '#/definitions/api.ScheduleRequest'
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/model.Schedule'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/api.ErrorResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.ErrorResponse'
-      summary: Create or update schedule for a team
       tags:
       - schedules
   /api/v1/teams/{id}/schedule/config:
@@ -2707,72 +2474,6 @@ paths:
           schema:
             $ref: '#/definitions/api.ErrorResponse'
       summary: Save the schedule configuration of a team
-      tags:
-      - schedules
-  /api/v1/teams/{id}/schedule/l1-groups:
-    put:
-      consumes:
-      - application/json
-      description: Set the rotation groups for L1 (primary) rotation
-      parameters:
-      - description: Team ID
-        in: path
-        name: id
-        required: true
-        type: string
-      - description: Groups of user IDs
-        in: body
-        name: groups
-        required: true
-        schema:
-          $ref: '#/definitions/api.SetGroupsRequest'
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.ErrorResponse'
-      summary: Set L1 rotation groups
-      tags:
-      - schedules
-  /api/v1/teams/{id}/schedule/l2-users:
-    put:
-      consumes:
-      - application/json
-      description: Set the ordered list of users for L2 (secondary) rotation
-      parameters:
-      - description: Team ID
-        in: path
-        name: id
-        required: true
-        type: string
-      - description: User IDs in rotation order
-        in: body
-        name: users
-        required: true
-        schema:
-          $ref: '#/definitions/api.SetUsersRequest'
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.ErrorResponse'
-      summary: Set L2 rotation users
       tags:
       - schedules
   /api/v1/teams/{id}/schedule/on-call:
