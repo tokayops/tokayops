@@ -2107,7 +2107,7 @@ func (m *MockStore) CountAdmins() (int, error) {
 
 // Jobs Mocks (Phase 2)
 // NOTE: We add a map to store jobs for testing
-func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, error) {
+func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// Initialize maps if needed (hack for existing tests)
@@ -2126,8 +2126,8 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 		for _, existing := range m.jobs {
 			if existing.DedupKey != nil && *existing.DedupKey == *job.DedupKey {
 				if existing.Status == model.JobStatusPending || existing.Status == model.JobStatusRunning {
-					// Dedup: return existing job ID
-					return existing.ID, nil
+					// Dedup: return existing job ID, nothing was created
+					return existing.ID, false, nil
 				}
 			}
 		}
@@ -2144,7 +2144,7 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 		stepCopy := *step
 		m.jobSteps[step.ID] = &stepCopy
 	}
-	return job.ID, nil
+	return job.ID, true, nil
 }
 
 // EnsureEscalationJob atomically transitions an AG from new/processing → processing

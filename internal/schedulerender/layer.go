@@ -75,8 +75,10 @@ func (s layerState) nextPosition(position int) int {
 	return position
 }
 
+// layerError wraps a rotation-math failure in ErrRotation as well as the
+// original: the runtime classifies by the sentinel, a person reads the rest.
 func layerError(rev scheduleconfig.ScheduleRevision, layer string, err error) error {
-	return fmt.Errorf("schedulerender: revision %s layer %s: %w", rev.ID, layer, err)
+	return fmt.Errorf("%w: revision %s layer %s: %w", ErrRotation, rev.ID, layer, err)
 }
 
 // overridesOfLayer keeps the overrides belonging to one layer. An override

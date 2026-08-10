@@ -17,6 +17,9 @@ import (
 	"github.com/tokayops/tokayops/internal/engine"
 	"github.com/tokayops/tokayops/internal/ingester"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/rotation"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/tokayops/tokayops/internal/testutil"
 	"github.com/labstack/echo/v4"
@@ -29,6 +32,71 @@ type IntegrationTestEnv struct {
 	Disp     *dispatcher.Dispatcher
 	MockProv *MockProvider
 	Echo     *echo.Echo
+
+	// Schedules is the schedule configuration command service, and Renderer the
+	// projection the engine and the escalation builder read through. Schedules
+	// in these tests are created the way the product creates them - as
+	// revisions - because that is what the runtime now reads.
+	Schedules *scheduleconfig.Service
+	Renderer  *schedulerender.Service
+}
+
+// Rotation group identities for the schedules these tests configure. An L1
+// group ID must be a canonical UUID; an L2 group is a singleton whose identity
+// is the user ID itself.
+const (
+	pipelineGroupA = "aaaaaaaa-3333-4333-8333-000000000001"
+	pipelineGroupB = "bbbbbbbb-3333-4333-8333-000000000002"
+)
+
+// pipelineSchedule creates a schedule for a team the way the product does - as
+// the first revision of a configuration - and returns its ID.
+//
+// The users it names are added to the team first: the save pipeline refuses a
+// configuration that puts a non-member on call, so a fixture without membership
+// is a fixture that cannot exist.
+func pipelineSchedule(t *testing.T, env *IntegrationTestEnv, teamID string,
+	cfg rotation.ScheduleConfiguration, members ...string) string {
+
+	t.Helper()
+	for _, id := range members {
+		if err := env.S.AddTeamMember(teamID, id, model.TeamMemberRoleMember); err != nil {
+			t.Fatalf("AddTeamMember %s: %v", id, err)
+		}
+	}
+	rev, err := env.Schedules.CreateSchedule(context.Background(), teamID, cfg, "", nil)
+	if err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+	return rev.ScheduleID
+}
+
+// pipelineConfig is a daily rotation that hands over at midnight UTC, so the
+// group configured here is the one on duty for the rest of the test.
+func pipelineConfig(l1Groups []rotation.RotationGroup, l2User string) rotation.ScheduleConfiguration {
+	policy := rotation.RotationPolicy{
+		SchemaVersion: rotation.PolicySchemaVersion,
+		Cadence:       model.RotationDaily,
+		HandoffTime:   "00:00",
+	}
+	cfg := rotation.ScheduleConfiguration{
+		Timezone: "UTC",
+		L1: rotation.LayerConfiguration{
+			Enabled: true,
+			Policy:  policy,
+			Groups:  l1Groups,
+		},
+		L2:                      rotation.LayerConfiguration{Enabled: false, Policy: policy},
+		L2EscalationTimeoutMins: 5,
+	}
+	if l2User != "" {
+		cfg.L2 = rotation.LayerConfiguration{
+			Enabled: true,
+			Policy:  policy,
+			Groups:  []rotation.RotationGroup{{ID: l2User, Members: []string{l2User}}},
+		}
+	}
+	return cfg
 }
 
 // testSecretValidator implements ingester.WebhookSecretValidator for integration tests
@@ -117,7 +185,8 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 
 	// Components
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
-	eng := engine.NewEngine(s, cfg)
+	renderer := schedulerender.New(s.ScheduleReadRepository())
+	eng := engine.NewEngine(s, renderer, cfg)
 	disp, err := dispatcher.NewDispatcher(s, cfg)
 	if err != nil {
 		t.Fatalf("NewDispatcher failed: %v", err)
@@ -132,12 +201,14 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	ing.RegisterRoutes(e)
 
 	return &IntegrationTestEnv{
-		S:        s,
-		Ing:      ing,
-		Eng:      eng,
-		Disp:     disp,
-		MockProv: mockProvider,
-		Echo:     e,
+		S:         s,
+		Ing:       ing,
+		Eng:       eng,
+		Disp:      disp,
+		MockProv:  mockProvider,
+		Echo:      e,
+		Schedules: scheduleconfig.NewService(s.ScheduleConfigRepository()),
+		Renderer:  renderer,
 	}
 }
 
@@ -238,7 +309,7 @@ func TestPipeline_HappyPath(t *testing.T) {
 	}
 
 	// 2. Engine
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 	active, _ = env.S.GetActiveAlertGroup("test_dedup_1")
 	if active.Status != model.AlertGroupStatusProcessing {
 		t.Errorf("Expected status Processing, got %s", active.Status)
@@ -286,7 +357,7 @@ func TestPipeline_PartialUpdate(t *testing.T) {
 		]
 	}`
 	sendWebhook(t, env.Echo, payload1)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	// Execute steps (unified job: firehose=step0, policy=step1)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -337,7 +408,7 @@ func TestPipeline_FullResolve(t *testing.T) {
 		]
 	}`
 	sendWebhook(t, env.Echo, payload1)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	// Dispatch - unified job: firehose=step0, policy=step1
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -416,7 +487,7 @@ func TestPipeline_Dedup(t *testing.T) {
 	}
 
 	// 2. Advance state to Processing
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	// 3. Second Ingestion (Duplicate Payload)
 	sendWebhook(t, env.Echo, payload)
@@ -513,7 +584,7 @@ func TestPipeline_FirehoseOnly(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 
 	// 2. Engine
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 	active, _ := env.S.GetActiveAlertGroup("test_firehose_only_1")
 	if active.Status != model.AlertGroupStatusProcessing {
 		t.Errorf("Expected status Processing, got %s", active.Status)
@@ -576,7 +647,7 @@ func TestPipeline_ResolutionAllDeliveries(t *testing.T) {
 
 	// 1. Ingest and process
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	// 2. Execute both steps (firehose + policy)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -628,29 +699,11 @@ func TestPipeline_ResolutionAllDeliveries(t *testing.T) {
 func TestPipeline_ScheduleFanOut(t *testing.T) {
 	env := setupIntegrationTest(t)
 
-	// Create schedule with L1=U_TEST, L2=U_DEFAULT
-	schedID := "sched-fanout-integ"
-	l2Start := time.Now().Add(-24 * time.Hour)
-	if err := env.S.CreateSchedule(&model.Schedule{
-		ID:                  schedID,
-		TeamID:              "devops",
-		L2Enabled:           true,
-		L2EscalationTimeout: 5,
-		L2RotationType:      model.RotationDaily,
-		L2HandoffTime:       "09:00",
-		L2RotationStart:     &l2Start,
-		L1RotationType:      model.RotationDaily,
-		L1HandoffTime:       "09:00",
-		L1RotationStart:     time.Now().Add(-24 * time.Hour),
-	}); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
-	if err := env.S.SetScheduleGroups(schedID, [][]string{{"U_TEST"}}); err != nil {
-		t.Fatalf("SetScheduleGroups l1: %v", err)
-	}
-	if err := env.S.SetScheduleUsers(schedID, "l2", []string{"U_DEFAULT"}); err != nil {
-		t.Fatalf("SetScheduleUsers l2: %v", err)
-	}
+	// Schedule with L1=U_TEST, L2=U_DEFAULT
+	schedID := pipelineSchedule(t, env, "devops", pipelineConfig(
+		[]rotation.RotationGroup{{ID: pipelineGroupA, Members: []string{"U_TEST"}}},
+		"U_DEFAULT",
+	), "U_TEST", "U_DEFAULT")
 
 	// Policy with schedule target (fan-out)
 	fanoutPolicy := &model.EscalationPolicy{
@@ -691,7 +744,7 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 	}`
 
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	initialSentCount := env.MockProv.SentCount()
 
@@ -763,20 +816,11 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 	testutil.BindSlack(t, env.S, "U_ALICE", "S_ALICE")
 	testutil.BindSlack(t, env.S, "U_BOB", "S_BOB")
 
-	schedID := "sched-multi-fanout"
-	if err := env.S.CreateSchedule(&model.Schedule{
-		ID:              schedID,
-		TeamID:          "devops",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "09:00",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	}); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
 	// One group with both users — both should be on-call simultaneously
-	if err := env.S.SetScheduleGroups(schedID, [][]string{{"U_ALICE", "U_BOB"}}); err != nil {
-		t.Fatalf("SetScheduleGroups: %v", err)
-	}
+	schedID := pipelineSchedule(t, env, "devops", pipelineConfig(
+		[]rotation.RotationGroup{{ID: pipelineGroupA, Members: []string{"U_ALICE", "U_BOB"}}},
+		"",
+	), "U_ALICE", "U_BOB")
 
 	policy := &model.EscalationPolicy{
 		ID:   "multi_fanout_policy",
@@ -815,7 +859,7 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 	}`
 
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	initialSentCount := env.MockProv.SentCount()
 
@@ -895,32 +939,23 @@ func TestPipeline_ScheduleFanOut_OverrideOverGroup(t *testing.T) {
 	testutil.BindSlack(t, env.S, "U_ALICE", "S_ALICE")
 	testutil.BindSlack(t, env.S, "U_BOB", "S_BOB")
 
-	schedID := "sched-override-group"
-	if err := env.S.CreateSchedule(&model.Schedule{
-		ID:              schedID,
-		TeamID:          "devops",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "09:00",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	}); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
-	if err := env.S.SetScheduleGroups(schedID, [][]string{{"U_ALICE", "U_BOB"}}); err != nil {
-		t.Fatalf("SetScheduleGroups: %v", err)
-	}
+	schedID := pipelineSchedule(t, env, "devops", pipelineConfig(
+		[]rotation.RotationGroup{{ID: pipelineGroupA, Members: []string{"U_ALICE", "U_BOB"}}},
+		"",
+	), "U_ALICE", "U_BOB")
 
-	// Override for U_BOB covering current time — should replace the entire group
+	// Override for U_BOB covering the current instant — the projection overlays
+	// it onto the layer, so the group on duty becomes U_BOB alone.
 	now := time.Now().UTC()
-	if err := env.S.CreateScheduleOverride(&model.ScheduleOverride{
-		ID:         "ovr-1",
-		ScheduleID: schedID,
-		UserID:     "U_BOB",
-		StartTime:  now.Add(-1 * time.Hour),
-		EndTime:    now.Add(1 * time.Hour),
-		Reason:     "Test override",
-		CreatedBy:  "U_ALICE",
+	reason := "Test override"
+	if _, err := env.Schedules.CreateOverride(context.Background(), "devops", scheduleconfig.OverrideCommand{
+		UserID:    "U_BOB",
+		ValidFrom: now.Add(-1 * time.Hour),
+		ValidTo:   now.Add(1 * time.Hour),
+		Reason:    &reason,
+		ActorID:   "U_ALICE",
 	}); err != nil {
-		t.Fatalf("CreateScheduleOverride: %v", err)
+		t.Fatalf("CreateOverride: %v", err)
 	}
 
 	policy := &model.EscalationPolicy{
@@ -960,7 +995,7 @@ func TestPipeline_ScheduleFanOut_OverrideOverGroup(t *testing.T) {
 	}`
 
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	initialSentCount := env.MockProv.SentCount()
 
@@ -1017,28 +1052,10 @@ func TestPipeline_ScheduleFanOut_NoL2Additive(t *testing.T) {
 	testutil.BindSlack(t, env.S, "U_L1", "S_L1")
 	testutil.BindSlack(t, env.S, "U_L2", "S_L2")
 
-	schedID := "sched-no-l2-additive"
-	l2Start := time.Now().Add(-24 * time.Hour)
-	if err := env.S.CreateSchedule(&model.Schedule{
-		ID:                  schedID,
-		TeamID:              "devops",
-		L2Enabled:           true,
-		L2EscalationTimeout: 5,
-		L2RotationType:      model.RotationDaily,
-		L2HandoffTime:       "09:00",
-		L2RotationStart:     &l2Start,
-		L1RotationType:      model.RotationDaily,
-		L1HandoffTime:       "09:00",
-		L1RotationStart:     time.Now().Add(-24 * time.Hour),
-	}); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
-	if err := env.S.SetScheduleGroups(schedID, [][]string{{"U_L1"}}); err != nil {
-		t.Fatalf("SetScheduleGroups l1: %v", err)
-	}
-	if err := env.S.SetScheduleUsers(schedID, "l2", []string{"U_L2"}); err != nil {
-		t.Fatalf("SetScheduleUsers l2: %v", err)
-	}
+	schedID := pipelineSchedule(t, env, "devops", pipelineConfig(
+		[]rotation.RotationGroup{{ID: pipelineGroupA, Members: []string{"U_L1"}}},
+		"U_L2",
+	), "U_L1", "U_L2")
 
 	policy := &model.EscalationPolicy{
 		ID:   "no_l2_additive_policy",
@@ -1077,7 +1094,7 @@ func TestPipeline_ScheduleFanOut_NoL2Additive(t *testing.T) {
 	}`
 
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	initialSentCount := env.MockProv.SentCount()
 
@@ -1159,7 +1176,7 @@ func TestPipeline_DisabledProvider_PermanentFail(t *testing.T) {
 		"alerts": [{"fingerprint": "fp_disabled", "status": "firing", "labels": {"alertname": "DisabledProviderTest"}}]
 	}`
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1230,7 +1247,7 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 		"alerts": [{"fingerprint": "fp_chan", "status": "firing", "labels": {"alertname": "ChannelUpdateTest"}}]
 	}`
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1323,7 +1340,7 @@ func TestPipeline_EscalationUnlinked(t *testing.T) {
 		"alerts": [{"fingerprint": "fp_unlinked", "status": "firing", "labels": {"alertname": "UnlinkedTest"}}]
 	}`
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1408,7 +1425,7 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	}`
 
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

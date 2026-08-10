@@ -343,7 +343,11 @@ func scanScheduleRevision(row rowScanner) (*scheduleconfig.ScheduleRevision, err
 	if len(summary) > 0 {
 		var parsed rotation.ChangeSummary
 		if err := json.Unmarshal(summary, &parsed); err != nil {
-			return nil, fmt.Errorf("store: revision %s has undecodable change_summary: %w", rev.ID, err)
+			// Sentinel-wrapped for the same reason the snapshot decode is: a
+			// runtime reader projecting every schedule at once must be able to
+			// tell one corrupt revision from a failing connection, and it
+			// cannot do that from prose.
+			return nil, fmt.Errorf("%w: revision %s: %w", scheduleconfig.ErrRevisionMetadataDecode, rev.ID, err)
 		}
 		rev.ChangeSummary = &parsed
 	}

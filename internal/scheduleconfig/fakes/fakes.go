@@ -39,6 +39,10 @@ type ScheduleConfigRepo struct {
 
 	// LockedUsers records the sorted argument of each LockUsers call.
 	LockedUsers [][]string
+
+	// scheduleReadErrors maps a schedule ID to the error its revision read
+	// returns. See FailScheduleRead.
+	scheduleReadErrors map[string]error
 }
 
 type fakeState struct {
@@ -238,7 +242,11 @@ func (r *ScheduleConfigRepo) WithinTx(ctx context.Context, fn func(scheduleconfi
 	before := r.state.clone()
 	tx := &scheduleConfigTx{repo: r}
 	// The command reads the live state, so it sees its own uncommitted writes.
-	tx.fakeReadView = fakeReadView{state: func() fakeState { return r.state }, record: r.record}
+	tx.fakeReadView = fakeReadView{
+		state:        func() fakeState { return r.state },
+		record:       r.record,
+		failSchedule: func(id string) error { return r.scheduleReadErrors[id] },
+	}
 	if err := fn(tx); err != nil {
 		r.state = before
 		return err
@@ -272,6 +280,11 @@ func (r *ScheduleConfigRepo) WithinSnapshot(ctx context.Context, fn func(schedul
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			return r.record(method)
+		},
+		failSchedule: func(id string) error {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			return r.scheduleReadErrors[id]
 		},
 	})
 }
@@ -327,17 +340,43 @@ func (r *ScheduleConfigRepo) RootCount() int {
 	return len(r.state.roots)
 }
 
+// SeedRoot inserts a schedule root directly, with whatever revision chain it
+// already has - usually none.
+//
+// No command can produce a root without a chain, which is the point: a legacy
+// row, a broken chain and a missing history horizon are all states the readers
+// have to answer for, and none of them is reachable through the command side.
+func (r *ScheduleConfigRepo) SeedRoot(root scheduleconfig.ScheduleRoot) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.roots[root.ID] = cloneRoot(root)
+	r.state.teamIndex[root.TeamID] = root.ID
+}
+
 // SeedLegacyRoot inserts a schedule row from before the revision model: a root
 // at config_version 0 with no revision chain.
 //
-// No command can produce that state, which is the point - it is what the
-// upgrade leaves behind, and the commands have to refuse it. Without a way to
-// build it here, the refusal would be untestable.
+// It is what the upgrade leaves behind, and the commands have to refuse it
+// while the read paths have to report it as no schedule at all. Without a way
+// to build it here, neither would be testable.
 func (r *ScheduleConfigRepo) SeedLegacyRoot(scheduleID, teamID string) {
+	r.SeedRoot(scheduleconfig.ScheduleRoot{ID: scheduleID, TeamID: teamID})
+}
+
+// FailScheduleRead makes the revision read of one schedule fail with err,
+// leaving every other schedule readable.
+//
+// FailOn cannot express this: it fails a method for the whole repository, and
+// what the bulk projection has to be proven to survive is damage confined to
+// one schedule - a snapshot that no longer decodes while the connection is
+// perfectly healthy.
+func (r *ScheduleConfigRepo) FailScheduleRead(scheduleID string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.state.roots[scheduleID] = scheduleconfig.ScheduleRoot{ID: scheduleID, TeamID: teamID}
-	r.state.teamIndex[teamID] = scheduleID
+	if r.scheduleReadErrors == nil {
+		r.scheduleReadErrors = map[string]error{}
+	}
+	r.scheduleReadErrors[scheduleID] = err
 }
 
 // SetTeamMembers replaces a team's membership. The members are people, so they
@@ -382,6 +421,16 @@ func (r *ScheduleConfigRepo) EraseUser(userID string) {
 type fakeReadView struct {
 	state  func() fakeState
 	record func(string) error
+
+	// failSchedule reports the injected per-schedule read failure, if any.
+	failSchedule func(string) error
+}
+
+func (v *fakeReadView) scheduleFailure(scheduleID string) error {
+	if v.failSchedule == nil {
+		return nil
+	}
+	return v.failSchedule(scheduleID)
 }
 
 func (v *fakeReadView) GetScheduleRoot(ctx context.Context, scheduleID string) (*scheduleconfig.ScheduleRoot, error) {
@@ -413,8 +462,26 @@ func (v *fakeReadView) GetScheduleRootByTeam(ctx context.Context, teamID string)
 	return &found, nil
 }
 
+// ListScheduleRoots returns every root ordered by ID, soft-deleted included -
+// the filtering is the consumer's business, not the contract's.
+func (v *fakeReadView) ListScheduleRoots(ctx context.Context) ([]scheduleconfig.ScheduleRoot, error) {
+	if err := v.record("ListScheduleRoots"); err != nil {
+		return nil, err
+	}
+	s := v.state()
+	out := make([]scheduleconfig.ScheduleRoot, 0, len(s.roots))
+	for _, root := range s.roots {
+		out = append(out, cloneRoot(root))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
 func (v *fakeReadView) GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*scheduleconfig.ScheduleRevision, error) {
 	if err := v.record("GetEffectiveRevision"); err != nil {
+		return nil, err
+	}
+	if err := v.scheduleFailure(scheduleID); err != nil {
 		return nil, err
 	}
 	for _, rev := range v.state().revisions[scheduleID] {

@@ -12,7 +12,7 @@ import (
 // executor no longer derives it from the step type.
 func TestEscalationJobBuilder_SetsProviderName(t *testing.T) {
 	s := store.NewMockStore()
-	builder := NewEscalationJobBuilder(s, nil)
+	builder := NewEscalationJobBuilder(s, &fakeProjection{}, nil)
 
 	policy := &model.EscalationPolicy{
 		ID:   "pol-1",

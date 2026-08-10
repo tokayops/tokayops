@@ -342,6 +342,13 @@ type OnCallResult struct {
 	Override *ScheduleOverride `json:"override,omitempty"` // If override is active
 	L1Since  *time.Time        `json:"l1_since,omitempty"` // When L1 shift started
 	L1Until  *time.Time        `json:"l1_until,omitempty"` // When L1 shift ends. nil = forever/unknown
+
+	// Source is "rotation" or "override": what put L1Users on duty. The
+	// projection overlays an override onto the layer, so L1Users already names
+	// whoever is really on call - Source is what keeps the fact that they are
+	// standing in from being lost, now that there is no legacy override row to
+	// point at. Empty on snapshots written before it existed.
+	Source string `json:"source,omitempty"`
 }
 
 // ========================================

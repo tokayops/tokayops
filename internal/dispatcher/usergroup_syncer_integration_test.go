@@ -15,10 +15,17 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/rotation"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/tokayops/tokayops/internal/testutil"
 	"github.com/slack-go/slack"
 )
+
+// syncerUsergroup is the usergroup the fixture configures - in the snapshot,
+// which is the only place the revision model states it.
+const syncerUsergroup = "S_TEST_USERGROUP"
 
 // fakeSlack records each usergroups.users.update request body for verification.
 type fakeSlack struct {
@@ -72,14 +79,20 @@ func (fs *fakeSlack) calls() []string {
 	return out
 }
 
-// syncerEnv bundles store + syncer + schedule for syncer integration tests.
+// syncerEnv drives the syncer over the real projection against PostgreSQL. The
+// schedule service and the renderer share one clock, so a test that moves it
+// moves both the configuration's effective instant and the projected duty.
 type syncerEnv struct {
-	s        *store.Store
-	syncer   *UsergroupSyncer
-	schedID  string
-	fake     *fakeSlack
-	cleanup  func()
-	schedule *model.Schedule
+	t       *testing.T
+	s       *store.Store
+	config  *scheduleconfig.Service
+	syncer  *UsergroupSyncer
+	fake    *fakeSlack
+	cleanup func()
+	teamID  string
+	schedID string
+	now     time.Time
+	version int64
 }
 
 func setupSyncerEnv(t *testing.T) *syncerEnv {
@@ -87,9 +100,19 @@ func setupSyncerEnv(t *testing.T) *syncerEnv {
 	s := testutil.SetupDB(t)
 	fake := newFakeSlack(t)
 
-	// Seed users and bind their Slack external identities. Epic 7 moved Slack IDs
-	// out of the user row into external_identities; the syncer resolves each
-	// on-call user's Slack ID via that table. U_NOSLACK intentionally has none.
+	env := &syncerEnv{
+		t:       t,
+		s:       s,
+		fake:    fake,
+		cleanup: fake.close,
+		teamID:  "team-syncer",
+		now:     time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC),
+	}
+	clock := func() time.Time { return env.now }
+
+	// Epic 7 moved Slack IDs out of the user row into external_identities; the
+	// syncer resolves each on-call user's Slack ID via that table. U_NOSLACK
+	// intentionally has none.
 	users := []struct {
 		u       *model.User
 		slackID string
@@ -99,80 +122,85 @@ func setupSyncerEnv(t *testing.T) *syncerEnv {
 		{&model.User{ID: "U_C", Email: "uc@syncer.test", Name: "User C"}, "S_C"},
 		{&model.User{ID: "U_NOSLACK", Email: "noslack@syncer.test", Name: "No Slack"}, ""},
 	}
+	if err := s.CreateTeam(&model.Team{ID: env.teamID, Name: "Syncer Team"}); err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
 	for _, tc := range users {
 		if err := s.CreateUser(tc.u); err != nil {
 			t.Fatalf("CreateUser %s: %v", tc.u.ID, err)
+		}
+		if err := s.AddTeamMember(env.teamID, tc.u.ID, model.TeamMemberRoleMember); err != nil {
+			t.Fatalf("AddTeamMember %s: %v", tc.u.ID, err)
 		}
 		if tc.slackID != "" {
 			testutil.BindSlack(t, s, tc.u.ID, tc.slackID)
 		}
 	}
 
-	team := &model.Team{ID: "team-syncer", Name: "Syncer Team"}
-	if err := s.CreateTeam(team); err != nil {
-		t.Fatalf("CreateTeam: %v", err)
-	}
-
-	schedID := "sched-syncer"
-	schedule := &model.Schedule{
-		ID:               schedID,
-		TeamID:           team.ID,
-		Timezone:         "UTC",
-		SlackUsergroupID: "S_TEST_USERGROUP",
-		L1RotationType:   model.RotationDaily,
-		L1HandoffTime:    "09:00",
-		L1RotationStart:  time.Now().Add(-7 * 24 * time.Hour),
-	}
-	if err := s.CreateSchedule(schedule); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
-
-	// Construct syncer with test slack client pointing to fake server
-	syncer := &UsergroupSyncer{
+	env.config = scheduleconfig.NewService(s.ScheduleConfigRepository(),
+		scheduleconfig.WithClock(clock))
+	env.syncer = &UsergroupSyncer{
 		store:        s,
+		oncall:       schedulerender.New(s.ScheduleReadRepository(), schedulerender.WithClock(clock)),
 		slackClient:  slack.New("test-token", slack.OptionAPIURL(fake.server.URL+"/")),
 		syncInterval: time.Minute,
 		cache:        make(map[string]cacheEntry),
 	}
+	return env
+}
 
-	return &syncerEnv{
-		s:        s,
-		syncer:   syncer,
-		schedID:  schedID,
-		fake:     fake,
-		schedule: schedule,
-		cleanup:  fake.close,
+// usergroupConfig is the daily rotation the syncer fixture uses, carrying the
+// Slack usergroup in the configuration where the editor writes it.
+func usergroupConfig(usergroup string, groups ...rotation.RotationGroup) rotation.ScheduleConfiguration {
+	cfg := dailyConfig(groups...)
+	cfg.SlackUsergroupID = usergroup
+	return cfg
+}
+
+func (e *syncerEnv) save(cfg rotation.ScheduleConfiguration) {
+	e.t.Helper()
+	res, err := e.config.Save(context.Background(), e.teamID, scheduleconfig.SaveCommand{
+		ExpectedVersion: e.version,
+		Desired:         cfg,
+		ActorID:         "U_A",
+	})
+	if err != nil {
+		e.t.Fatalf("Save: %v", err)
+	}
+	e.version = res.Version
+	e.schedID = res.Revision.ScheduleID
+}
+
+func (e *syncerEnv) syncAll() {
+	e.t.Helper()
+	if err := e.syncer.SyncAll(context.Background()); err != nil {
+		e.t.Fatalf("SyncAll: %v", err)
 	}
 }
 
-// TestSyncer_MultiUserGroup_SendsCommaJoinedIDs verifies that all Slack IDs
-// from a multi-user group are sent in a single comma-separated update.
-func TestSyncer_MultiUserGroup_SendsCommaJoinedIDs(t *testing.T) {
+// TestSyncer_UsergroupComesFromTheSnapshot is the closing of the second defect:
+// the schedule is found and its usergroup read from the configuration in force.
+// The old query filtered on a mutable column the revision path never writes, so
+// it synced nothing and reported success.
+func TestSyncer_UsergroupComesFromTheSnapshot(t *testing.T) {
 	env := setupSyncerEnv(t)
 	defer env.cleanup()
 
-	if err := env.s.SetScheduleGroups(env.schedID, [][]string{{"U_A", "U_B"}}); err != nil {
-		t.Fatalf("SetScheduleGroups: %v", err)
-	}
-
-	if err := env.syncer.SyncSchedule(context.Background(), env.schedule); err != nil {
-		t.Fatalf("SyncSchedule: %v", err)
-	}
+	env.save(usergroupConfig(syncerUsergroup, group(handoffGroupA, "U_A", "U_B")))
+	env.syncAll()
 
 	calls := env.fake.calls()
 	if len(calls) != 1 {
 		t.Fatalf("Expected exactly 1 Slack API call, got %d", len(calls))
 	}
-
 	got := strings.Split(calls[0], ",")
 	sort.Strings(got)
-	want := []string{"S_A", "S_B"}
-	if !equalSlices(got, want) {
-		t.Errorf("Expected users param %v, got %v", want, got)
+	if !equalSlices(got, []string{"S_A", "S_B"}) {
+		t.Errorf("Expected users param [S_A S_B], got %v", got)
 	}
 
 	// Cache must hold sorted joined IDs
-	cached, ok := env.syncer.getCache("S_TEST_USERGROUP")
+	cached, ok := env.syncer.getCache(syncerUsergroup)
 	if !ok {
 		t.Fatal("Expected cache entry after sync")
 	}
@@ -181,45 +209,64 @@ func TestSyncer_MultiUserGroup_SendsCommaJoinedIDs(t *testing.T) {
 	}
 }
 
-// TestSyncer_GroupChangeUpdatesUsergroup verifies the [A,B]→[A,C] case:
-// the first user did not change, but the group did, so a second update must fire.
+// TestSyncer_GroupChangeUpdatesUsergroup verifies the [A,B]→[A,C] case: the
+// first user did not change, but the group did, so a second update must fire.
 func TestSyncer_GroupChangeUpdatesUsergroup(t *testing.T) {
 	env := setupSyncerEnv(t)
 	defer env.cleanup()
 
-	// First sync with [A, B]
-	if err := env.s.SetScheduleGroups(env.schedID, [][]string{{"U_A", "U_B"}}); err != nil {
-		t.Fatalf("SetScheduleGroups initial: %v", err)
-	}
-	if err := env.syncer.SyncSchedule(context.Background(), env.schedule); err != nil {
-		t.Fatalf("First SyncSchedule: %v", err)
-	}
+	env.save(usergroupConfig(syncerUsergroup, group(handoffGroupA, "U_A", "U_B")))
+	env.syncAll()
 
-	// Change group to [A, C]
-	if err := env.s.SetScheduleGroups(env.schedID, [][]string{{"U_A", "U_C"}}); err != nil {
-		t.Fatalf("SetScheduleGroups change: %v", err)
-	}
-	if err := env.syncer.SyncSchedule(context.Background(), env.schedule); err != nil {
-		t.Fatalf("Second SyncSchedule: %v", err)
-	}
+	env.now = env.now.Add(time.Hour)
+	env.save(usergroupConfig(syncerUsergroup, group(handoffGroupA, "U_A", "U_C")))
+	env.syncAll()
 
 	calls := env.fake.calls()
 	if len(calls) != 2 {
 		t.Fatalf("Expected 2 Slack API calls (initial + change), got %d", len(calls))
 	}
 
-	// First call: S_A,S_B
 	first := strings.Split(calls[0], ",")
 	sort.Strings(first)
 	if !equalSlices(first, []string{"S_A", "S_B"}) {
 		t.Errorf("First call expected [S_A S_B], got %v", first)
 	}
-
-	// Second call: S_A,S_C
 	second := strings.Split(calls[1], ",")
 	sort.Strings(second)
 	if !equalSlices(second, []string{"S_A", "S_C"}) {
 		t.Errorf("Second call expected [S_A S_C], got %v", second)
+	}
+}
+
+// TestSyncer_ActiveOverrideChangesTheGroup: the projection overlays the
+// override, so the usergroup holds whoever is really on duty.
+func TestSyncer_ActiveOverrideChangesTheGroup(t *testing.T) {
+	env := setupSyncerEnv(t)
+	defer env.cleanup()
+
+	env.save(usergroupConfig(syncerUsergroup, group(handoffGroupA, "U_A")))
+	env.syncAll()
+
+	from := env.now.Add(time.Hour)
+	if _, err := env.config.CreateOverride(context.Background(), env.teamID, scheduleconfig.OverrideCommand{
+		UserID:    "U_C",
+		ValidFrom: from,
+		ValidTo:   from.Add(2 * time.Hour),
+		ActorID:   "U_A",
+	}); err != nil {
+		t.Fatalf("CreateOverride: %v", err)
+	}
+
+	env.now = from.Add(30 * time.Minute)
+	env.syncAll()
+
+	calls := env.fake.calls()
+	if len(calls) != 2 {
+		t.Fatalf("Expected 2 Slack API calls, got %d: %v", len(calls), calls)
+	}
+	if calls[1] != "S_C" {
+		t.Errorf("Expected the stand-in S_C in the group, got %q", calls[1])
 	}
 }
 
@@ -229,47 +276,72 @@ func TestSyncer_NoChangeSkipsAPICall(t *testing.T) {
 	env := setupSyncerEnv(t)
 	defer env.cleanup()
 
-	if err := env.s.SetScheduleGroups(env.schedID, [][]string{{"U_A", "U_B"}}); err != nil {
-		t.Fatalf("SetScheduleGroups: %v", err)
-	}
-
-	// First sync
-	if err := env.syncer.SyncSchedule(context.Background(), env.schedule); err != nil {
-		t.Fatalf("First SyncSchedule: %v", err)
-	}
-
-	// Second sync — same group, cache hit, no API call
-	if err := env.syncer.SyncSchedule(context.Background(), env.schedule); err != nil {
-		t.Fatalf("Second SyncSchedule: %v", err)
-	}
+	env.save(usergroupConfig(syncerUsergroup, group(handoffGroupA, "U_A", "U_B")))
+	env.syncAll()
+	env.syncAll()
 
 	if got := env.fake.requestCount.Load(); got != 1 {
 		t.Errorf("Expected 1 API call (second hit cache), got %d", got)
 	}
 }
 
-// TestSyncer_SkipsMissingSlackIDs verifies that users without SlackUserID
-// are excluded from the comma-joined Slack ID list.
+// TestSyncer_SkipsMissingSlackIDs verifies that users with no Slack identity are
+// excluded from the comma-joined list.
 func TestSyncer_SkipsMissingSlackIDs(t *testing.T) {
 	env := setupSyncerEnv(t)
 	defer env.cleanup()
 
-	if err := env.s.SetScheduleGroups(env.schedID, [][]string{{"U_A", "U_NOSLACK"}}); err != nil {
-		t.Fatalf("SetScheduleGroups: %v", err)
-	}
-
-	if err := env.syncer.SyncSchedule(context.Background(), env.schedule); err != nil {
-		t.Fatalf("SyncSchedule: %v", err)
-	}
+	env.save(usergroupConfig(syncerUsergroup, group(handoffGroupA, "U_A", "U_NOSLACK")))
+	env.syncAll()
 
 	calls := env.fake.calls()
 	if len(calls) != 1 {
 		t.Fatalf("Expected 1 Slack API call, got %d", len(calls))
 	}
-
-	// Only S_A should be sent (U_NOSLACK skipped)
 	if calls[0] != "S_A" {
 		t.Errorf("Expected users=S_A, got %q", calls[0])
+	}
+}
+
+// TestSyncer_SchedulesWithoutUsergroupAreSkipped: the filter is in Go over the
+// projection, because the projection is where the usergroup is stated.
+func TestSyncer_SchedulesWithoutUsergroupAreSkipped(t *testing.T) {
+	env := setupSyncerEnv(t)
+	defer env.cleanup()
+
+	env.save(dailyConfig(group(handoffGroupA, "U_A")))
+	env.syncAll()
+
+	if got := env.fake.requestCount.Load(); got != 0 {
+		t.Errorf("Slack was called for a schedule with no usergroup (%d calls)", got)
+	}
+}
+
+// TestSyncer_DeletedScheduleIsNotSynced: deleting a schedule has never emptied
+// its usergroup, and it still does not.
+func TestSyncer_DeletedScheduleIsNotSynced(t *testing.T) {
+	env := setupSyncerEnv(t)
+	defer env.cleanup()
+
+	env.save(usergroupConfig(syncerUsergroup, group(handoffGroupA, "U_A")))
+	env.syncAll()
+	if got := env.fake.requestCount.Load(); got != 1 {
+		t.Fatalf("Expected 1 API call before the delete, got %d", got)
+	}
+
+	env.now = env.now.Add(time.Hour)
+	if err := env.config.Delete(context.Background(), env.teamID, scheduleconfig.DeleteCommand{
+		ExpectedVersion: env.version,
+		ActorID:         "U_A",
+	}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	env.now = env.now.Add(time.Hour)
+	env.syncAll()
+
+	if got := env.fake.requestCount.Load(); got != 1 {
+		t.Errorf("Slack was called for a deleted schedule (%d calls total)", got)
 	}
 }
 

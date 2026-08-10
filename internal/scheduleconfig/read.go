@@ -40,6 +40,16 @@ type ScheduleReadView interface {
 	// schedule.
 	GetScheduleRootByTeam(ctx context.Context, teamID string) (*ScheduleRoot, error)
 
+	// ListScheduleRoots returns every schedule root, soft-deleted ones
+	// included, ordered by ID.
+	//
+	// There is deliberately no includeDeleted flag. The consumer of this is the
+	// bulk on-call projection, and a schedule that was deleted is an answer it
+	// has to carry: the handoff notifier learns from it that a duty ended.
+	// Which consumer wants deleted rows dropped is knowledge that belongs to
+	// that consumer, not to the read contract.
+	ListScheduleRoots(ctx context.Context) ([]ScheduleRoot, error)
+
 	// GetRevisionsInRange returns the revisions whose half-open effective
 	// interval overlaps [from, until), ordered by effective_from. Revisions
 	// of both kinds are returned: the caller decides what a deleted period

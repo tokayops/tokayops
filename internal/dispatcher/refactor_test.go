@@ -141,7 +141,7 @@ func TestEscalationFlow_BuilderIntegration(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	// Build Job via Builder (now uses Store)
-	builder := builders.NewEscalationJobBuilder(s, cfg)
+	builder := builders.NewEscalationJobBuilder(s, &fakeTeamOnCall{}, cfg)
 	job, stages, steps, _, err := builder.Build(ag, "p1")
 	if err != nil {
 		t.Fatalf("Builder failed: %v", err)

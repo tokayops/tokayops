@@ -4414,6 +4414,10 @@
                             "$ref": "#/definitions/model.ScheduleOverride"
                         }
                     ]
+                },
+                "source": {
+                    "description": "Source is \"rotation\" or \"override\": what put L1Users on duty. The\nprojection overlays an override onto the layer, so L1Users already names\nwhoever is really on call - Source is what keeps the fact that they are\nstanding in from being lost, now that there is no legacy override row to\npoint at. Empty on snapshots written before it existed.",
+                    "type": "string"
                 }
             }
         },

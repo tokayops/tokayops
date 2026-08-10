@@ -58,6 +58,16 @@ var (
 	// never softened into an empty rotation: empty is a valid configuration a
 	// person chose, corruption is not.
 	ErrSnapshotDecode = errors.New("scheduleconfig: snapshot could not be decoded")
+
+	// ErrRevisionMetadataDecode means the audit metadata of a revision - its
+	// change summary - could not be decoded.
+	//
+	// It is separate from ErrSnapshotDecode because the damage is different:
+	// the configuration still reads, only the record of what changed is lost.
+	// It is a sentinel at all because a runtime reader has to tell it apart
+	// from a database failure: one schedule is corrupt, the connection is fine,
+	// and every other schedule still has to be projected.
+	ErrRevisionMetadataDecode = errors.New("scheduleconfig: revision metadata could not be decoded")
 )
 
 // ValidationError is a rejected input. Field is the payload field when the

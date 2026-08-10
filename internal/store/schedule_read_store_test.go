@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
@@ -324,5 +326,101 @@ func TestGetScheduleRootReadsSoftDeleted(t *testing.T) {
 	})
 	if !errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
 		t.Fatalf("error = %v, want ErrScheduleNotFound", err)
+	}
+}
+
+// TestListScheduleRootsReadsRevisionRows is the regression for the defect that
+// made this method necessary.
+//
+// The old list query selected the mutable rotation columns, which are nullable
+// now and which nothing on the revision path writes. One revision-managed row
+// therefore failed the scan and took the entire result set with it - so the
+// handoff notifier never finished warming up and no schedule, legacy ones
+// included, was ever notified. A mock cannot catch that: it performs no scan.
+// Any query that reads `schedules` in bulk has to be exercised against a real
+// revision row.
+func TestListScheduleRootsReadsRevisionRows(t *testing.T) {
+	s := setupTestDB(t)
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+
+	// A revision-managed schedule: no l1_rotation_start, no rotation type.
+	revision := createSchedule(t, s, "devops", start)
+
+	// A row from before the revision model, which is still reachable while
+	// legacy creates and the seed exist. It must be listed, not skipped: the
+	// projection decides what it means, the query only reports what is there.
+	if err := s.CreateTeam(&model.Team{ID: "legacy-team", Name: "legacy-team"}); err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	if err := s.CreateSchedule(&model.Schedule{
+		ID:              "sched-legacy",
+		TeamID:          "legacy-team",
+		Timezone:        "UTC",
+		L1RotationType:  model.RotationDaily,
+		L1HandoffTime:   "09:00",
+		L1RotationStart: start.Add(-24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("CreateSchedule (legacy): %v", err)
+	}
+
+	// A soft-deleted revision schedule, which the contract includes.
+	deleted := createSchedule(t, s, "platform", start)
+	deletedAt := start.Add(24 * time.Hour)
+	if _, err := s.db.Exec(`UPDATE schedules SET deleted_at = $1 WHERE id = $2`,
+		deletedAt, deleted.ScheduleID); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+
+	var roots []scheduleconfig.ScheduleRoot
+	err := withSnapshot(t, s, func(view scheduleconfig.ScheduleReadView) error {
+		var err error
+		roots, err = view.ListScheduleRoots(context.Background())
+		return err
+	})
+	if err != nil {
+		t.Fatalf("ListScheduleRoots: %v", err)
+	}
+	if len(roots) != 3 {
+		t.Fatalf("listed %d roots, want all three: %+v", len(roots), roots)
+	}
+
+	byID := map[string]scheduleconfig.ScheduleRoot{}
+	var ids []string
+	for _, root := range roots {
+		byID[root.ID] = root
+		ids = append(ids, root.ID)
+	}
+	if !sort.StringsAreSorted(ids) {
+		t.Errorf("roots are not ordered by id: %v", ids)
+	}
+
+	live, ok := byID[revision.ScheduleID]
+	if !ok {
+		t.Fatalf("the revision-managed schedule is missing: %v", ids)
+	}
+	if live.ConfigVersion != 1 {
+		t.Errorf("config_version = %d, want 1", live.ConfigVersion)
+	}
+	if live.HistoryCompleteFrom == nil || !live.HistoryCompleteFrom.Equal(start) {
+		t.Errorf("history_complete_from = %v, want %v", live.HistoryCompleteFrom, start)
+	}
+	if live.DeletedAt != nil {
+		t.Errorf("deleted_at = %v for a live schedule", live.DeletedAt)
+	}
+
+	legacy, ok := byID["sched-legacy"]
+	if !ok {
+		t.Fatalf("the legacy schedule is missing: %v", ids)
+	}
+	if legacy.ConfigVersion != 0 || legacy.HistoryCompleteFrom != nil {
+		t.Errorf("legacy root = %+v, want config_version 0 and no history horizon", legacy)
+	}
+
+	gone, ok := byID[deleted.ScheduleID]
+	if !ok {
+		t.Fatalf("the soft-deleted schedule is missing: %v", ids)
+	}
+	if gone.DeletedAt == nil || !gone.DeletedAt.Equal(deletedAt) {
+		t.Errorf("deleted_at = %v, want %v", gone.DeletedAt, deletedAt)
 	}
 }

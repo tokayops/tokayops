@@ -3,6 +3,7 @@ package schedulerender
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
@@ -88,10 +89,11 @@ func (s *Service) RenderRange(ctx context.Context, scheduleID string, from, unti
 // needed, and computing it directly keeps the hot path to a single position
 // calculation.
 //
-// A schedule that does not exist, has no revision covering `at`, or was
-// deleted before it yields an empty projection rather than an error. A
-// dispatcher asking who to page must be told "nobody", not handed a failure
-// it has to interpret.
+// A schedule that does not exist, predates the revision model, or was deleted
+// before `at` yields an empty projection rather than an error. A dispatcher
+// asking who to page must be told "nobody", not handed a failure it has to
+// interpret. Damage is the exception and does surface: a schedule whose chain
+// is broken has no honest answer to give.
 func (s *Service) CurrentOnCall(ctx context.Context, scheduleID string, at time.Time) (OnCall, error) {
 	// Normalized for the same reason the render range is: the query that
 	// picks the effective revision floors `at`, so a sub-microsecond instant
@@ -101,8 +103,15 @@ func (s *Service) CurrentOnCall(ctx context.Context, scheduleID string, at time.
 
 	var out OnCall
 	err := s.repo.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
-		var err error
-		out, err = onCallWithin(ctx, view, scheduleID, at)
+		root, err := view.GetScheduleRoot(ctx, scheduleID)
+		if errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
+			out = OnCall{At: at}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		out, err = onCallWithin(ctx, view, *root, at)
 		return err
 	})
 	if err != nil {
@@ -176,7 +185,7 @@ func (s *Service) CurrentTeamOnCallNow(ctx context.Context, teamID string) (Team
 
 		out.ScheduleID = root.ID
 		out.DeletedAt = root.DeletedAt
-		out.OnCall, err = onCallWithin(ctx, view, root.ID, at)
+		out.OnCall, err = onCallWithin(ctx, view, *root, at)
 		return err
 	})
 	if err != nil {
@@ -189,20 +198,63 @@ func (s *Service) CurrentTeamOnCallNow(ctx context.Context, teamID string) (Team
 // The preview needs the same answer from inside its own snapshot, and computing
 // it twice would be two chances to project one state differently.
 func onCallWithin(ctx context.Context, view scheduleconfig.ScheduleReadView,
-	scheduleID string, at time.Time) (OnCall, error) {
+	root scheduleconfig.ScheduleRoot, at time.Time) (OnCall, error) {
+
+	out, _, err := onCallOfRoot(ctx, view, root, at)
+	return out, err
+}
+
+// onCallOfRoot is the projection plus the revision it was read from.
+//
+// The revision travels back because two of its snapshot fields - the timezone
+// and the Slack usergroup - are answers about the schedule that consumers need
+// alongside the duty, and they belong to the configuration that was in force at
+// `at`. Fetching them separately would be a second read of the same row and,
+// worse, a second source of truth for them.
+//
+// It is also the one place the rules about what "nobody" means live:
+//
+//   - a legacy row has no configuration in this model, so it is no schedule at
+//     all. This branch dies with legacy creates; until then a seeded database
+//     reaches it normally and calling it corruption would be wrong;
+//   - an instant before the schedule's history horizon predates the schedule;
+//   - a deleted-kind revision means the schedule did not exist then.
+//
+// Everything else that fails to produce a revision is damage and says so. An
+// active root with no revision in force is a lost row, not a quiet "nobody":
+// answering nobody would page no one and look exactly like an empty rotation.
+func onCallOfRoot(ctx context.Context, view scheduleconfig.ScheduleReadView,
+	root scheduleconfig.ScheduleRoot, at time.Time) (OnCall, *scheduleconfig.ScheduleRevision, error) {
 
 	out := OnCall{At: at}
-	rev, err := view.GetEffectiveRevision(ctx, scheduleID, at)
+	if scheduleconfig.IsLegacyRoot(&root) {
+		return out, nil, nil
+	}
+	if root.HistoryCompleteFrom == nil {
+		return OnCall{}, nil, fmt.Errorf("%w: schedule %s", ErrHistoryMarkerMissing, root.ID)
+	}
+	if at.Before(*root.HistoryCompleteFrom) {
+		return out, nil, nil
+	}
+
+	rev, err := view.GetEffectiveRevision(ctx, root.ID, at)
 	if errors.Is(err, scheduleconfig.ErrRevisionNotFound) || errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
-		return out, nil
+		return OnCall{}, nil, fmt.Errorf("%w: schedule %s at %s", ErrRevisionGap, root.ID, at.Format(time.RFC3339))
 	}
 	if err != nil {
-		return OnCall{}, err
+		return OnCall{}, nil, err
 	}
 	if rev.Kind == scheduleconfig.RevisionDeleted {
-		return out, nil
+		// The deleted tail carries a copy of the last valid snapshot, which is
+		// why its timezone and usergroup are still answerable.
+		return out, rev, nil
 	}
-	return onCallOfRevision(ctx, view, *rev, at)
+
+	out, err = onCallOfRevision(ctx, view, *rev, at)
+	if err != nil {
+		return OnCall{}, nil, err
+	}
+	return out, rev, nil
 }
 
 // onCallOfRevision projects one revision - stored or hypothetical - against

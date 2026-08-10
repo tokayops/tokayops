@@ -1,28 +1,42 @@
 package builders
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/scheduler"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/google/uuid"
 )
 
+// OnCallProjection is the slice of the schedule projection the builder needs.
+//
+// It is an interface declared here rather than *schedulerender.Service because
+// the revision model is deliberately absent from the legacy MockStore: without
+// it, every builder unit test would have to run against PostgreSQL.
+type OnCallProjection interface {
+	// CurrentTeamOnCallNow answers who is on duty for a team and whether the
+	// team has a schedule at all.
+	CurrentTeamOnCallNow(ctx context.Context, teamID string) (schedulerender.TeamOnCall, error)
+
+	// CurrentOnCallNow answers for one schedule by ID.
+	CurrentOnCallNow(ctx context.Context, scheduleID string) (schedulerender.OnCall, error)
+}
+
 // EscalationJobBuilder builds escalation jobs from Store-based policies
 type EscalationJobBuilder struct {
 	Store  store.StoreInterface
+	OnCall OnCallProjection
 	Config *config.Config // for firehose channel config
 }
 
-func NewEscalationJobBuilder(s store.StoreInterface, cfg *config.Config) *EscalationJobBuilder {
-	return &EscalationJobBuilder{Store: s, Config: cfg}
+func NewEscalationJobBuilder(s store.StoreInterface, oncall OnCallProjection, cfg *config.Config) *EscalationJobBuilder {
+	return &EscalationJobBuilder{Store: s, OnCall: oncall, Config: cfg}
 }
 
 // Sprint 4 (Epic 7 L6): the legacy providerForStepType helper is gone —
@@ -315,31 +329,64 @@ func (b *EscalationJobBuilder) Build(ag *model.AlertGroup, policyID string) (*mo
 }
 
 // resolveScheduleUsers resolves the team's current schedule to on-call users.
-// It uses GetScheduleByTeamID to find the active schedule, falling back to
-// the provided scheduleID if the team has no schedule configured.
-// Override replaces the entire L1 group. Only L1 (or override) is returned —
-// L2 rotation is currently not exposed as an escalation target.
+//
+// The team is asked first and the stored schedule ID is only a fallback, which
+// is what keeps a policy step pointing at a schedule that was replaced from
+// paging whoever used to be on it.
+//
+// There is no override branch here any more: the projection overlays overrides
+// onto the layer, so L1 already names whoever is actually on duty. Escalating
+// "to the override user" separately would be a second, older answer to the same
+// question. Only L1 is returned - L2 is not an escalation target today.
 func (b *EscalationJobBuilder) resolveScheduleUsers(teamID, fallbackScheduleID string) ([]*model.User, error) {
-	scheduleID := fallbackScheduleID
+	ctx := context.Background()
+
 	if teamID != "" {
-		sched, err := b.Store.GetScheduleByTeamID(teamID)
-		switch {
-		case err == nil && sched != nil:
-			scheduleID = sched.ID
-		case errors.Is(err, sql.ErrNoRows):
-			// No schedule for this team — fall back to stored UUID
-		default:
+		team, err := b.OnCall.CurrentTeamOnCallNow(ctx, teamID)
+		if err != nil {
 			return nil, fmt.Errorf("failed to resolve team schedule for %s: %w", teamID, err)
+		}
+		// A team WITH a schedule answers for itself, even if that schedule is
+		// deleted or between shifts: "nobody" is its answer, and falling
+		// through to the stored ID would answer with someone else's schedule.
+		if team.ScheduleID != "" {
+			return b.hydrateOnCall(team.OnCall)
 		}
 	}
 
-	result, err := scheduler.FetchCurrentOnCall(b.Store, scheduleID)
+	if fallbackScheduleID == "" {
+		return nil, nil
+	}
+	onCall, err := b.OnCall.CurrentOnCallNow(ctx, fallbackScheduleID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve schedule %s: %w", fallbackScheduleID, err)
+	}
+	return b.hydrateOnCall(onCall)
+}
+
+// hydrateOnCall turns the projected L1 user IDs into user records, in the order
+// the projection gave them so step indices stay stable across ticks.
+//
+// Users the store does not return are dropped rather than escalated to: an
+// erased person has no identities left to notify, and a step aimed at them
+// would only fail.
+func (b *EscalationJobBuilder) hydrateOnCall(onCall schedulerender.OnCall) ([]*model.User, error) {
+	if onCall.L1 == nil || len(onCall.L1.UserIDs) == 0 {
+		return nil, nil
+	}
+	fetched, err := b.Store.GetUsersByIDs(onCall.L1.UserIDs)
 	if err != nil {
 		return nil, err
 	}
-
-	if result.Override != nil && result.Override.User != nil {
-		return []*model.User{result.Override.User}, nil
+	byID := make(map[string]*model.User, len(fetched))
+	for _, u := range fetched {
+		byID[u.ID] = u
 	}
-	return result.L1Users, nil
+	out := make([]*model.User, 0, len(onCall.L1.UserIDs))
+	for _, id := range onCall.L1.UserIDs {
+		if u, ok := byID[id]; ok {
+			out = append(out, u)
+		}
+	}
+	return out, nil
 }
