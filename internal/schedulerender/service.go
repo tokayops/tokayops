@@ -177,12 +177,6 @@ func (s *Service) CurrentTeamOnCallNow(ctx context.Context, teamID string) (Team
 		if err != nil {
 			return err
 		}
-		// A row from before the revision model has no configuration here, so
-		// it is reported as no schedule - the same answer GET /config gives it.
-		if scheduleconfig.IsLegacyRoot(root) {
-			return nil
-		}
-
 		out.ScheduleID = root.ID
 		out.DeletedAt = root.DeletedAt
 		out.OnCall, err = onCallWithin(ctx, view, *root, at)
@@ -212,11 +206,9 @@ func onCallWithin(ctx context.Context, view scheduleconfig.ScheduleReadView,
 // `at`. Fetching them separately would be a second read of the same row and,
 // worse, a second source of truth for them.
 //
-// It is also the one place the rules about what "nobody" means live:
+// It is also the one place the rules about what "nobody" means live, and there
+// are exactly two of them:
 //
-//   - a legacy row has no configuration in this model, so it is no schedule at
-//     all. This branch dies with legacy creates; until then a seeded database
-//     reaches it normally and calling it corruption would be wrong;
 //   - an instant before the schedule's history horizon predates the schedule;
 //   - a deleted-kind revision means the schedule did not exist then.
 //
@@ -227,9 +219,6 @@ func onCallOfRoot(ctx context.Context, view scheduleconfig.ScheduleReadView,
 	root scheduleconfig.ScheduleRoot, at time.Time) (OnCall, *scheduleconfig.ScheduleRevision, error) {
 
 	out := OnCall{At: at}
-	if scheduleconfig.IsLegacyRoot(&root) {
-		return out, nil, nil
-	}
 	if root.HistoryCompleteFrom == nil {
 		return OnCall{}, nil, fmt.Errorf("%w: schedule %s", ErrHistoryMarkerMissing, root.ID)
 	}

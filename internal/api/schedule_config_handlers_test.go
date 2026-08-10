@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -265,16 +266,16 @@ func TestGetConfigStates(t *testing.T) {
 		}
 	})
 
-	// A schedule left over from before the revision model has no configuration
-	// in this model, so it is not found rather than half-answered.
-	t.Run("Legacy404", func(t *testing.T) {
+	// A row with no history horizon is refused, not reported as missing. It is
+	// covered across every endpoint by TestRootWithoutHistoryIsRefusedEverywhere.
+	t.Run("RootWithoutHistoryIsAnInvariantViolation", func(t *testing.T) {
 		_, s, e, env := setupScheduleAPI(t)
 		defer s.Close()
-		env.Config.SeedLegacyRoot("legacy-1", "devops")
+		env.Config.SeedRootWithoutHistory("legacy-1", "devops")
 
 		rec := doJSON(t, e, http.MethodGet, "/api/v1/teams/devops/schedule/config", nil, "denis")
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("want 404, got %d: %s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("want 500, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
 
@@ -782,7 +783,6 @@ func TestErrorMappingTable(t *testing.T) {
 		{"user not found", erasure.ErrUserNotFound, http.StatusNotFound},
 		{"schedule exists", scheduleconfig.ErrScheduleExists, http.StatusConflict},
 		{"schedule deleted", scheduleconfig.ErrScheduleDeleted, http.StatusConflict},
-		{"legacy schedule", scheduleconfig.ErrLegacySchedule, http.StatusConflict},
 		{"last admin", erasure.ErrLastAdmin, http.StatusConflict},
 		{"version conflict", &scheduleconfig.VersionConflictError{Expected: 1, Current: 2}, http.StatusConflict},
 		{"override revision conflict", &scheduleconfig.OverrideRevisionConflictError{Expected: 1, Current: 2}, http.StatusConflict},
@@ -904,4 +904,163 @@ func scheduleIDOf(t *testing.T, env *scheduleTestEnv, teamID string) string {
 		t.Fatalf("team %s owns no schedule", teamID)
 	}
 	return root.ID
+}
+
+// TestRootWithoutHistoryIsRefusedEverywhere is the endpoint-by-endpoint form of
+// the rule, and it is a table rather than a handful of spot checks because the
+// two endpoints that were missing from an earlier draft of this work are
+// exactly the two that answered wrongly: /render loaded the root itself and
+// degraded to a 200 with history_complete=false, and /on-call reached the
+// renderer's sentinel, which had no HTTP mapping and came back as a generic
+// internal error.
+//
+// The fixture cannot be built through the API - after the legacy write path was
+// removed there is no way to create such a row in Go - which is itself part of
+// what is being asserted.
+//
+// Not in this table: GET /teams, the one deliberate exception, covered by
+// TestListTeamsReportsRootWithoutHistoryAsUnconfigured.
+func TestRootWithoutHistoryIsRefusedEverywhere(t *testing.T) {
+	from := time.Date(2026, 5, 6, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	until := time.Date(2026, 5, 13, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
+
+	cases := []struct {
+		name   string
+		method string
+		url    string
+		body   any
+	}{
+		{"config", http.MethodGet, "/api/v1/teams/devops/schedule/config", nil},
+		{"revisions", http.MethodGet, "/api/v1/teams/devops/schedule/revisions", nil},
+		{"overrides", http.MethodGet, "/api/v1/teams/devops/schedule/overrides", nil},
+		{"render", http.MethodGet, "/api/v1/teams/devops/schedule/render?from=" + from + "&until=" + until, nil},
+		{"on-call", http.MethodGet, "/api/v1/teams/devops/schedule/on-call", nil},
+		{"preview", http.MethodPost, "/api/v1/teams/devops/schedule/preview",
+			configRequest(0, []string{"denis"})},
+		{"save", http.MethodPut, "/api/v1/teams/devops/schedule/config",
+			configRequest(0, []string{"denis"})},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, s, e, env := setupScheduleAPI(t)
+			defer s.Close()
+			env.Config.SeedRootWithoutHistory("legacy-1", "devops")
+
+			rec := doJSON(t, e, tc.method, tc.url, tc.body, "denis")
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
+			}
+			var body map[string]any
+			decodeJSON(t, rec, &body)
+			// The point is the code, not the status. A generic internal_error
+			// here would mean this half of the surface still needs prose to be
+			// understood, which is the defect the machine codes exist to close.
+			if body["code"] != CodeInvariantViolation {
+				t.Fatalf("code = %v, want %q: %s", body["code"], CodeInvariantViolation, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestOverrideOfAnotherScheduleIsRefused: the override routes are keyed by
+// schedule ID and override ID, so naming someone else's override through a
+// schedule of your own must not reach it.
+//
+// There used to be a test for this, and it asserted the property against a
+// store helper no production path called - so the live guard had no coverage at
+// all. The helper is gone with the rest of the legacy store; the requirement is
+// not.
+//
+// Two layers refuse this, and the test pins both on purpose. The command refuses
+// it under the schedule lock, which is what makes the answer correct; the
+// authorization scope refuses it first, which is what keeps a mismatched pair
+// from ever opening a transaction. Asserting only the status code would pass
+// with the scope guard deleted - verified by removing it - because the command
+// answers 404 either way.
+func TestOverrideOfAnotherScheduleIsRefused(t *testing.T) {
+	_, s, e, env := setupScheduleAPI(t)
+	defer s.Close()
+
+	env.SetNow(time.Date(2026, 5, 6, 9, 0, 0, 0, time.UTC))
+	createSchedule(t, e, []string{"denis"})
+
+	validFrom := time.Date(2026, 5, 7, 9, 0, 0, 0, time.UTC)
+	rec := doJSON(t, e, http.MethodPost, "/api/v1/teams/devops/schedule/overrides",
+		ScheduleOverrideRequest{
+			UserID:    "alex",
+			ValidFrom: validFrom,
+			ValidTo:   validFrom.Add(4 * time.Hour),
+		}, "denis")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create override: want 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var override ScheduleOverrideDTO
+	decodeJSON(t, rec, &override)
+	// Without this the 404s below could be a missing override ID rather than
+	// the guard, and the test would pass while proving nothing.
+	if override.OverrideID == "" {
+		t.Fatalf("the fixture produced no override id: %s", rec.Body.String())
+	}
+
+	root, ok := env.Config.RootByTeam("devops")
+	if !ok {
+		t.Fatal("the team owns no schedule after a create")
+	}
+	// A second schedule, owned by another team. denis is a global admin, so
+	// authorization on that team passes and the only thing left to refuse the
+	// request is the override-belongs-to-schedule check itself.
+	other := "schedule-elsewhere"
+	env.Config.SeedRoot(scheduleconfig.ScheduleRoot{
+		ID: other, TeamID: "other-team", ConfigVersion: 1, HistoryCompleteFrom: &validFrom,
+	})
+	if other == root.ID {
+		t.Fatal("the fixture needs two distinct schedules")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		url    string
+		body   any
+	}{
+		{"update", http.MethodPut,
+			"/api/v1/schedules/" + other + "/overrides/" + override.OverrideID,
+			ScheduleOverrideRequest{
+				UserID: "alex", ValidFrom: validFrom, ValidTo: validFrom.Add(time.Hour),
+				ExpectedRevision: override.Revision,
+			}},
+		{"delete", http.MethodDelete,
+			"/api/v1/schedules/" + other + "/overrides/" + override.OverrideID +
+				"?expected_revision=" + strconv.FormatInt(override.Revision, 10), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env.Config.Calls = nil
+			rec := doJSON(t, e, tc.method, tc.url, tc.body, "denis")
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 for an override of another schedule: %s",
+					rec.Code, rec.Body.String())
+			}
+			// The scope answered, so the command never ran. Drop this and the
+			// test still passes with the scope guard removed, because the
+			// command refuses the same request one layer down.
+			for _, call := range env.Config.Calls {
+				if call == "WithinTx" {
+					t.Fatalf("a mismatched override opened a write transaction: %v", env.Config.Calls)
+				}
+			}
+		})
+	}
+
+	// And the override itself is untouched: a refused request must not be a
+	// partial one.
+	rec = doJSON(t, e, http.MethodGet, "/api/v1/teams/devops/schedule/overrides", nil, "denis")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list overrides: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var list ScheduleOverrideListResponse
+	decodeJSON(t, rec, &list)
+	if len(list.Overrides) != 1 {
+		t.Fatalf("got %d overrides, want the original still there", len(list.Overrides))
+	}
 }

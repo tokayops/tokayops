@@ -238,11 +238,13 @@ type writeTarget struct {
 func (s *Service) lockForWrite(ctx context.Context, tx ScheduleConfigTx,
 	root *ScheduleRoot, expectedVersion int64) (*writeTarget, error) {
 
-	if err := s.refuseLegacyRoot(ctx, tx, root); err != nil {
-		return nil, err
-	}
 	locked, err := tx.LockSchedule(ctx, root.ID)
 	if err != nil {
+		return nil, err
+	}
+	// Checked on the locked row rather than the one the caller resolved: this
+	// is the copy every other decision below is made from.
+	if err := requireInitializedRoot(locked); err != nil {
 		return nil, err
 	}
 	if locked.ConfigVersion != expectedVersion {
@@ -628,15 +630,11 @@ func (s *Service) RemoveTeamMember(ctx context.Context, teamID, userID string) e
 		if err != nil {
 			return err
 		}
-		// A legacy row keeps legacy semantics until the cutover removes it:
-		// its rotation lives in tables this package does not read, so a guard
-		// here could only be a guess.
-		if IsLegacyRoot(root) {
-			return tx.DeleteTeamMembership(ctx, teamID, userID)
-		}
-
 		locked, err := tx.LockSchedule(ctx, root.ID)
 		if err != nil {
+			return err
+		}
+		if err := requireInitializedRoot(locked); err != nil {
 			return err
 		}
 		// A deleted schedule has nobody on duty, so it blocks nothing -
@@ -701,35 +699,32 @@ func snapshotNames(snap rotation.ScheduleRevisionSnapshot, userID string) bool {
 	return false
 }
 
-// refuseLegacyRoot rejects a schedule row left over from before the revision
-// model: config_version 0 and no revision chain.
+// requireInitializedRoot refuses a schedule row that no live path could have
+// written.
 //
-// Grafting revisions onto it would produce a hybrid the legacy readers still
-// present as if it were theirs. The symmetry is deliberate: the new path
-// refuses old data, and the old path refuses new data.
-func (s *Service) refuseLegacyRoot(ctx context.Context, tx ScheduleConfigTx, root *ScheduleRoot) error {
-	if !IsLegacyRoot(root) {
-		return nil
-	}
-	_, err := tx.GetTailRevision(ctx, root.ID)
-	if errors.Is(err, ErrRevisionNotFound) {
-		return ErrLegacySchedule
-	}
-	if err != nil {
-		return err
-	}
-	return fmt.Errorf("%w: schedule %s has revisions at config_version 0", ErrInvariantViolation, root.ID)
-}
-
-// IsLegacyRoot reports whether a schedule row predates the revision model.
+// CreateInitialSchedule writes the row, config_version 1 and
+// history_complete_from in one statement, and nothing ever clears the horizon
+// afterwards. So an empty horizon does not mean "a schedule with little
+// history" - it means a row from before the revision model, in a database
+// where the destructive upgrade reset was never run.
 //
-// config_version is the discriminator because it is monotonic: the create flow
-// writes 1 with the first revision and nothing ever lowers it, so zero can
-// only mean "no revision was ever written for this row". Read-side callers
-// that have no transaction - the preview - use this directly; the command side
-// additionally proves the chain really is empty before saying so.
-func IsLegacyRoot(root *ScheduleRoot) bool {
-	return root != nil && root.ConfigVersion == 0
+// The horizon is the discriminator rather than config_version because the read
+// side already tests exactly this field and already calls its absence damage
+// (schedulerender.ErrHistoryMarkerMissing). One fact, checked the same way on
+// both sides, instead of two that merely happen to agree.
+//
+// It is an invariant violation rather than a class of its own: there is no
+// action the caller can take, and a dedicated error code would be a permanent
+// promise in the public contract about a state this binary cannot produce.
+func requireInitializedRoot(root *ScheduleRoot) error {
+	if root == nil {
+		return fmt.Errorf("%w: nil schedule root", ErrInvariantViolation)
+	}
+	if root.HistoryCompleteFrom == nil {
+		return fmt.Errorf("%w: schedule %s has no history horizon; the upgrade reset was not run",
+			ErrInvariantViolation, root.ID)
+	}
+	return nil
 }
 
 // checkDeletionConsistency compares the two statements of the same fact: the

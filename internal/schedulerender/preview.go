@@ -184,12 +184,6 @@ func loadPreviewBase(ctx context.Context, view scheduleconfig.ScheduleReadView, 
 	if err != nil {
 		return previewBase{}, err
 	}
-	if scheduleconfig.IsLegacyRoot(root) {
-		// The same refusal Save gives. Rendering a legacy schedule here would
-		// show a plan that Save then rejects.
-		return previewBase{}, scheduleconfig.ErrLegacySchedule
-	}
-
 	// An existing root reports its real version, deleted included: a recreate
 	// is a save against that version, and reporting 0 would make the first
 	// recreate fail optimistic concurrency every time.

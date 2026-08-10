@@ -1,6 +1,7 @@
 package schedulerender
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -14,9 +15,13 @@ import (
 // with HistoryComplete=true.
 
 func gapWarnings(res Result) []Warning {
+	return warningsOfCode(res, WarnRevisionGap)
+}
+
+func warningsOfCode(res Result, code WarningCode) []Warning {
 	var out []Warning
 	for _, w := range res.Warnings {
-		if w.Code == WarnRevisionGap {
+		if w.Code == code {
 			out = append(out, w)
 		}
 	}
@@ -94,10 +99,68 @@ func TestEmptyChainWithKnownHistoryIsAGap(t *testing.T) {
 	}
 }
 
-// TestUnknownHistoryStartDoesNotCryGap: without history_complete_from the
-// renderer cannot claim any stretch should have been covered, so only holes
-// between present revisions are reported.
-func TestUnknownHistoryStartDoesNotCryGap(t *testing.T) {
+// TestMissingHistoryStartIsRefused: a root with no history horizon is refused
+// outright rather than rendered as an honest-looking empty calendar.
+//
+// This replaces TestUnknownHistoryStartDoesNotCryGap, which asserted the
+// opposite and was right to: while pre-revision rows existed, an unknown
+// horizon was a reachable state and claiming coverage over it would have cried
+// damage on real schedules. The create flow now writes the horizon in the same
+// statement as the row, so the state is unreachable, and answering it with a
+// 200 would give a corrupt row the same reply as a schedule created yesterday.
+func TestMissingHistoryStartIsRefused(t *testing.T) {
+	created := utc(2026, 5, 1, 11, 0)
+	until := utc(2026, 5, 5, 11, 0)
+
+	revs := chain(t,
+		revisionStep{at: created, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
+	)
+	unknown := root(created)
+	unknown.HistoryCompleteFrom = nil
+
+	_, err := Render(Input{Root: unknown, Revisions: revs, From: created, Until: until})
+	if !errors.Is(err, ErrHistoryMarkerMissing) {
+		t.Fatalf("error = %v, want ErrHistoryMarkerMissing", err)
+	}
+}
+
+// TestQueryBeforeHistoryStartIsIncompleteNotAnError: the other half of the
+// predicate that used to answer both cases at once.
+//
+// A schedule younger than the question asked of it is ordinary, and it keeps
+// its ordinary answer: a 200 whose history_complete is false and whose warning
+// says which stretch is unknown. Losing this when the two cases were split
+// would have turned every young schedule into an error.
+func TestQueryBeforeHistoryStartIsIncompleteNotAnError(t *testing.T) {
+	created := utc(2026, 5, 1, 11, 0)
+	askedFrom := created.Add(-48 * time.Hour)
+	until := utc(2026, 5, 5, 11, 0)
+
+	revs := chain(t,
+		revisionStep{at: created, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
+	)
+
+	res := renderOf(t, Input{Root: root(created), Revisions: revs, From: askedFrom, Until: until})
+	if res.HistoryComplete {
+		t.Fatal("history reported complete for a range starting before the horizon")
+	}
+	if got := gapWarnings(res); len(got) != 0 {
+		t.Fatalf("got %+v, want the stretch before the horizon reported as incomplete, not as a gap", got)
+	}
+	incomplete := warningsOfCode(res, WarnHistoryIncomplete)
+	if len(incomplete) != 1 {
+		t.Fatalf("got %d history_incomplete warnings, want 1: %+v", len(incomplete), res.Warnings)
+	}
+	if !incomplete[0].From.Equal(askedFrom) || !incomplete[0].Until.Equal(created) {
+		t.Fatalf("incomplete = %v..%v, want %v..%v",
+			incomplete[0].From, incomplete[0].Until, askedFrom, created)
+	}
+}
+
+// TestInnerGapIsReportedBetweenPresentRevisions: two revisions that should be
+// adjacent and are not is damage, and it is reported as a gap rather than as
+// incomplete history - the chain is what is broken, not the horizon.
+func TestInnerGapIsReportedBetweenPresentRevisions(t *testing.T) {
 	created := utc(2026, 5, 1, 11, 0)
 	second := utc(2026, 5, 3, 11, 0)
 	until := utc(2026, 5, 5, 11, 0)
@@ -106,24 +169,11 @@ func TestUnknownHistoryStartDoesNotCryGap(t *testing.T) {
 		revisionStep{at: created, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
 		revisionStep{at: second, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"), group(groupB, "bob"))},
 	)
-	unknown := root(created)
-	unknown.HistoryCompleteFrom = nil
-
-	// A lost tail is invisible without a known history start.
-	res := renderOf(t, Input{Root: unknown, Revisions: revs[:1], From: created, Until: until})
-	if got := gapWarnings(res); len(got) != 0 {
-		t.Fatalf("got %+v, want no gap warning when the history start is unknown", got)
-	}
-	if res.HistoryComplete {
-		t.Fatal("history reported complete with no history_complete_from")
-	}
-
-	// A hole between two present revisions is still reported: two revisions
-	// that should be adjacent and are not is damage regardless.
 	damaged := []scheduleconfig.ScheduleRevision{revs[0], revs[1]}
 	closedEarly := second.Add(-24 * time.Hour)
 	damaged[0].EffectiveTo = &closedEarly
-	res = renderOf(t, Input{Root: unknown, Revisions: damaged, From: created, Until: until})
+
+	res := renderOf(t, Input{Root: root(created), Revisions: damaged, From: created, Until: until})
 	gaps := gapWarnings(res)
 	if len(gaps) != 1 {
 		t.Fatalf("got %d gap warnings, want the inner hole reported: %+v", len(gaps), res.Warnings)

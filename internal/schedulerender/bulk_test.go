@@ -184,30 +184,39 @@ func TestBulkOnCallReportsDeletedSchedules(t *testing.T) {
 	}
 }
 
-// TestBulkOnCallLegacyRootIsEmptyNotFailure: a legacy row is reachable while
-// legacy creates and the seed exist, so it is "no schedule", not damage.
-// Sprint 6B removes the branch together with the last way of producing one.
-func TestBulkOnCallLegacyRootIsEmptyNotFailure(t *testing.T) {
+// TestBulkOnCallRootWithoutHistoryIsDamage: a row with no history horizon can
+// no longer be produced by anything, so it is reported as the damage it is.
+//
+// The distinction it protects is the whole point of the failure list: an empty
+// projection means "nobody is on duty", which is a state someone chose, and a
+// corrupt row must never be able to say that. It also has to keep reaching the
+// consumer - a schedule that vanishes from the answer leaves the notifier's
+// cache holding a composition that no longer exists.
+func TestBulkOnCallRootWithoutHistoryIsDamage(t *testing.T) {
 	start := utc(2026, 5, 1, 11, 0)
 	repo := bulkRepo(t, bulkSchedule{
 		id: "sched-1", teamID: "devops", at: start,
 		cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice")),
 	})
-	repo.SeedLegacyRoot("sched-legacy", "legacy-team")
+	repo.SeedRootWithoutHistory("sched-broken", "broken-team")
 
 	bulk, err := New(repo).CurrentOnCallForAll(context.Background(), start.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("CurrentOnCallForAll: %v", err)
 	}
-	if len(bulk.Failures) != 0 {
-		t.Fatalf("failures = %v, want a legacy root to be no failure at all", bulk.Failures)
+	if len(bulk.Failures) != 1 {
+		t.Fatalf("failures = %v, want exactly the uninitialized root", bulk.Failures)
 	}
-	legacy, ok := scheduleByID(bulk, "sched-legacy")
-	if !ok {
-		t.Fatal("the legacy schedule is missing from the projection")
+	failure := bulk.Failures[0]
+	if failure.ScheduleID != "sched-broken" || failure.Reason != FailureHistoryMarkerMissing {
+		t.Errorf("failure = %+v, want sched-broken/%s", failure, FailureHistoryMarkerMissing)
 	}
-	if legacy.OnCall.L1 != nil || legacy.Timezone != "" || legacy.SlackUsergroupID != "" {
-		t.Errorf("legacy projection = %+v, want an empty one", legacy)
+	if _, ok := scheduleByID(bulk, "sched-broken"); ok {
+		t.Error("a schedule that could not be projected must not appear as a projection")
+	}
+	// The healthy schedule is unaffected: damage is per schedule.
+	if _, ok := scheduleByID(bulk, "sched-1"); !ok {
+		t.Error("one corrupt row stopped the rest of the tick")
 	}
 }
 
@@ -457,7 +466,8 @@ func TestBulkOnCallQueryCount(t *testing.T) {
 		// costs an active schedule's two reads.
 		mixedAt := start.Add(24 * time.Hour)
 		deletedAt := start.Add(12 * time.Hour)
-		// 3 active, 2 deleted, 1 before its own horizon, 1 legacy, 1 broken chain.
+		// 3 active, 2 deleted, 1 before its own horizon, 1 without a horizon at
+		// all, 1 broken chain.
 		schedules := []bulkSchedule{
 			{id: "sched-a1", teamID: "t-a1", at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
 			{id: "sched-a2", teamID: "t-a2", at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
@@ -467,7 +477,7 @@ func TestBulkOnCallQueryCount(t *testing.T) {
 			{id: "sched-f1", teamID: "t-f1", at: mixedAt.Add(24 * time.Hour), cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
 		}
 		repo := bulkRepo(t, schedules...)
-		repo.SeedLegacyRoot("sched-l1", "t-l1")
+		repo.SeedRootWithoutHistory("sched-l1", "t-l1")
 		repo.SeedRoot(scheduleconfig.ScheduleRoot{
 			ID: "sched-p1", TeamID: "t-p1", ConfigVersion: 1, HistoryCompleteFrom: &horizon,
 		})
@@ -477,13 +487,16 @@ func TestBulkOnCallQueryCount(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CurrentOnCallForAll: %v", err)
 		}
-		if len(bulk.Failures) != 1 {
-			t.Fatalf("failures = %v, want only the broken chain", bulk.Failures)
+		// Two damaged schedules now, not one: the row without a horizon is no
+		// longer quietly empty. It is still decided from the root alone, so it
+		// costs no read - which is what keeps the formula below unchanged.
+		if len(bulk.Failures) != 2 {
+			t.Fatalf("failures = %v, want the broken chain and the missing horizon", bulk.Failures)
 		}
 
 		// A = 3 (two reads each), D = 2 (no overrides to read), P = 1 (the
 		// refusal costs the revision read), and the schedule that starts later
-		// plus the legacy row cost nothing at all.
+		// plus the row without a horizon cost nothing at all.
 		if got, want := readCount(repo), 1+2*3+2+1; got != want {
 			t.Errorf("%d reads for the mixed fixture, want %d (%s)", got, want, callBreakdown(repo))
 		}

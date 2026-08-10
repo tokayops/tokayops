@@ -166,63 +166,6 @@ func TestRBAC_TeamMembers(t *testing.T) {
 	})
 }
 
-func TestRBAC_Schedule_Override_IDOR(t *testing.T) {
-	// This test specifically checks the IDOR guard that the user reported as missing in Mock.
-	_, s, _ := setupRBACEnv(t)
-
-	// Setup:
-	// Schedule S1 belongs to Team A.
-	// Schedule S2 belongs to Team B.
-	// Override O1 belongs to Schedule S2 (Team B).
-	// User Bob is member of Team A.
-	// Bob tries to DELETE Override O1 (which is in Team B).
-	// URL: DELETE /api/v1/schedules/S1/overrides/O1
-	// Bob has access to S1 (Team A).
-	// If the backend only checks "Bob can edit S1", then checks "Delete O1", preventing IDOR requires checking "O1 belongs to S1".
-	// If O1 belongs to S2, and we pass S1 in URL, backend must detect mismatch.
-
-	// In MockStore, we need to ensure OverrideBelongsToSchedule works.
-
-	// Create Overrides (Schedules are mocked via ID mainly in overrides for now as CreateSchedule isn't fully mocked yet in store_mock.go but overrides use ID directly)
-	// Actually, CreateScheduleOverride just stores it.
-	o1 := &model.ScheduleOverride{
-		ID:         "override-o1",
-		ScheduleID: "schedule-s2", // Belongs to S2
-		UserID:     "some-user",
-		StartTime:  time.Now(),
-		EndTime:    time.Now().Add(1 * time.Hour),
-	}
-	s.CreateScheduleOverride(o1)
-
-	// Bob (Team A member) tries to delete O1 via Schedule S1.
-	// We assume there is a route DELETE /api/v1/schedules/:schedule_id/overrides/:override_id
-	// And there is logic that checks if :schedule_id belongs to a team Bob can access.
-	// Let's assume S1 belongs to Team A. But since we don't have CreateSchedule in mock yet, how does API know S1 belongs to Team A?
-	// Ah, the API usually fetches the schedule to check permissions.
-	// If MockStore.GetScheduleByID is not implemented, the API will fail with 500 or 404 before reaching permission check.
-
-	// Wait, if GetScheduleByID is not implemented in mock (it returns ErrNoRows), then we cannot fully test the API flow unless we implement it or stub it.
-	// Let's check mock.go again.
-	// func (m *MockStore) GetScheduleByID(id string) (*model.Schedule, error) { return nil, sql.ErrNoRows }
-
-	// So checking IDOR via API end-to-end is blocked by missing Schedule mock.
-	// However, we can test the Store method directly first to verify the user's claim.
-
-	t.Run("Store_OverrideBelongsToSchedule_Check", func(t *testing.T) {
-		isMatch, _ := s.OverrideBelongsToSchedule("override-o1", "schedule-s2")
-		if !isMatch {
-			t.Error("Expected match for correct schedule")
-		}
-
-		isMatch, _ = s.OverrideBelongsToSchedule("override-o1", "schedule-s1")
-		if isMatch {
-			t.Error("IDOR FAILED: OverrideBelongsToSchedule returned true for mismatched schedule! The Mock is indeed broken or behaves unexpectedly.")
-		}
-	})
-
-	// If the above passes, the mock is FINE. If it fails, we fix it.
-}
-
 func TestRBAC_UserManagement(t *testing.T) {
 	_, _, e := setupRBACEnv(t)
 
@@ -308,67 +251,12 @@ func TestRBAC_UserManagement(t *testing.T) {
 
 func TestRBAC_ScheduleManagement(t *testing.T) {
 	_, s, e := setupRBACEnv(t)
-	// Seed schedule for team-a
-	sched := &model.Schedule{ID: "sched-a", TeamID: "team-a", Timezone: "UTC", L1RotationType: "weekly", L1HandoffTime: "10:00"}
-	s.CreateSchedule(sched)
+	_ = s
 
-	t.Run("Update Schedule", func(t *testing.T) {
-		body := `{"l1_rotation_type": "daily"}`
-
-		// Admin -> 200
-		req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/team-a/schedule", strings.NewReader(body))
-		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-		addAuth(req, "admin")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("Admin update schedule: want 200, got %d", rec.Code)
-		}
-
-		// Team Admin -> 200
-		req = httptest.NewRequest(http.MethodPut, "/api/v1/teams/team-a/schedule", strings.NewReader(body))
-		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-		addAuth(req, "alice")
-		rec = httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("Team Admin update schedule: want 200, got %d", rec.Code)
-		}
-
-		// Team Member -> 403
-		req = httptest.NewRequest(http.MethodPut, "/api/v1/teams/team-a/schedule", strings.NewReader(body))
-		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-		addAuth(req, "bob")
-		rec = httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("Team Member update schedule: want 403, got %d", rec.Code)
-		}
-	})
-
-	t.Run("L1 Groups", func(t *testing.T) {
-		body := `{"groups": [["alice"]]}`
-		// Team Admin -> 200
-		req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/team-a/schedule/l1-groups", strings.NewReader(body))
-		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-		addAuth(req, "alice")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-		// Usually returns 200 or 204
-		if rec.Code != http.StatusOK && rec.Code != http.StatusNoContent {
-			t.Errorf("Team Admin update L1 groups: want 200/204, got %d", rec.Code)
-		}
-
-		// Team Member -> 403
-		req = httptest.NewRequest(http.MethodPut, "/api/v1/teams/team-a/schedule/l1-groups", strings.NewReader(body))
-		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-		addAuth(req, "bob")
-		rec = httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("Team Member update L1 groups: want 403, got %d", rec.Code)
-		}
-	})
+	// Editing a schedule is authorized by TestScheduleConfigRBACMatrix, which
+	// exercises the revision endpoints this replaced. What is left here is
+	// deletion, whose scope resolves through the schedule rather than the team
+	// in the path.
 
 	t.Run("Delete Schedule", func(t *testing.T) {
 		// A revision-model schedule, created through the API by the team admin.

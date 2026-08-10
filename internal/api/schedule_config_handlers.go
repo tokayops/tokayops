@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -76,14 +77,9 @@ func (a *API) GetScheduleConfig(c echo.Context) error {
 
 	var out ScheduleConfigResponse
 	err := a.scheduleRead.WithinSnapshot(c.Request().Context(), func(view scheduleconfig.ScheduleReadView) error {
-		root, err := view.GetScheduleRootByTeam(c.Request().Context(), teamID)
+		root, err := a.revisionRoot(c.Request().Context(), view, teamID)
 		if err != nil {
 			return err
-		}
-		// A row from before the revision model has no configuration in this
-		// model, so it is not found here rather than half-answered.
-		if scheduleconfig.IsLegacyRoot(root) {
-			return scheduleconfig.ErrScheduleNotFound
 		}
 
 		// The tail is the highest version. For a deleted schedule that is the
@@ -400,16 +396,23 @@ func (a *API) ListScheduleOverrides(c echo.Context) error {
 	return c.JSON(http.StatusOK, out)
 }
 
-// revisionRoot resolves a team's schedule root for the read endpoints, giving
-// a legacy row the same answer as a missing one: in the revision model that
-// schedule does not exist.
+// revisionRoot resolves a team's schedule root for the read endpoints.
+//
+// It is also where those endpoints refuse a row with no history horizon. Such a
+// row cannot be created by this binary - the create flow writes the horizon in
+// the same statement as the row - so it means the destructive upgrade reset was
+// never run, and every answer built on it would be a guess about a schedule
+// whose configuration this model cannot see. It is reported as the invariant
+// violation it is, not as a missing schedule: a 404 here would tell an operator
+// the team has no schedule when in fact it has an unreadable one.
 func (a *API) revisionRoot(ctx context.Context, view scheduleconfig.ScheduleReadView, teamID string) (*scheduleconfig.ScheduleRoot, error) {
 	root, err := view.GetScheduleRootByTeam(ctx, teamID)
 	if err != nil {
 		return nil, err
 	}
-	if scheduleconfig.IsLegacyRoot(root) {
-		return nil, scheduleconfig.ErrScheduleNotFound
+	if root.HistoryCompleteFrom == nil {
+		return nil, fmt.Errorf("%w: schedule %s has no history horizon; the upgrade reset was not run",
+			scheduleconfig.ErrInvariantViolation, root.ID)
 	}
 	return root, nil
 }

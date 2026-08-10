@@ -339,11 +339,7 @@ async function openScheduleConfigModal(teamId) {
         });
     } catch (error) {
         console.error('Failed to open schedule modal:', error);
-        await onScheduleError(error, {
-            legacy_schedule: () => showToast(
-                'This schedule predates the current data model and cannot be edited until the ' +
-                'upgrade reset has been run.', 'error'),
-        });
+        await onScheduleError(error);
     }
 }
 
@@ -834,9 +830,6 @@ function handleSaveError(error, teamId) {
             closeModal();
             openScheduleConfigModal(teamId);
         },
-        legacy_schedule: () => showToast(
-            'This schedule predates the current data model. It has to be reset as part of the ' +
-            'upgrade before it can be edited.', 'error'),
         user_not_team_member: (err) => {
             const ids = err.body?.user_ids || [];
             showToast(

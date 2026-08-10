@@ -83,19 +83,29 @@ func Render(in Input) (Result, error) {
 		return revisions[i].Version < revisions[j].Version
 	})
 
+	// No horizon at all is damage, not a schedule with little history. The
+	// create flow writes it in the same statement as the row, and nothing
+	// clears it afterwards, so an empty value means a row written past the
+	// code - the same conclusion the projection reaches (onCallOfRoot).
+	//
+	// This is deliberately not folded into the check below. Rendering an empty
+	// calendar with history_complete=false would answer a corrupt row exactly
+	// as it answers a schedule created yesterday, and the caller cannot tell
+	// those apart.
+	hcf := in.Root.HistoryCompleteFrom
+	if hcf == nil {
+		return Result{}, fmt.Errorf("%w: schedule %s", ErrHistoryMarkerMissing, in.Root.ID)
+	}
+
 	// History before the first recorded revision is not a gap in the chain,
 	// it is the part of the past this schedule cannot speak about. Saying
 	// "gap" there would cry damage on every schedule younger than the query.
-	if hcf := in.Root.HistoryCompleteFrom; hcf == nil || from.Before(*hcf) {
+	if from.Before(*hcf) {
 		res.HistoryComplete = false
-		incompleteUntil := until
-		if hcf != nil {
-			incompleteUntil = minTime(until, *hcf)
-		}
 		res.Warnings = append(res.Warnings, Warning{
 			Code:  WarnHistoryIncomplete,
 			From:  from,
-			Until: incompleteUntil,
+			Until: minTime(until, *hcf),
 		})
 	}
 
@@ -104,14 +114,9 @@ func Render(in Input) (Result, error) {
 	// but not one lost at either end, nor an empty chain, and those cases
 	// would come back as a silent empty stretch with HistoryComplete=true.
 	//
-	// It starts at the point from which this schedule's history is supposed
-	// to be exact. When that point is unknown, leading and trailing coverage
-	// cannot be asserted at all, so the cursor only starts tracking once the
-	// first revision has been seen and only inner gaps are reported.
-	cov := coverage{query: queryRange}
-	if hcf := in.Root.HistoryCompleteFrom; hcf != nil {
-		cov.start(maxTime(from, *hcf))
-	}
+	// It starts at the point from which this schedule's history is supposed to
+	// be exact, which is always known here.
+	cov := coverage{query: queryRange, cursor: maxTime(from, *hcf)}
 
 	for _, rev := range revisions {
 		revRange := revisionInterval(rev)
@@ -144,7 +149,7 @@ func Render(in Input) (Result, error) {
 			res.Warnings = append(res.Warnings, warnings...)
 		}
 	}
-	res.Warnings = cov.finish(in.Root.HistoryCompleteFrom != nil, res.Warnings)
+	res.Warnings = cov.finish(res.Warnings)
 
 	sort.SliceStable(res.Assignments, func(i, j int) bool {
 		if res.Assignments[i].Layer != res.Assignments[j].Layer {
@@ -224,18 +229,18 @@ func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interv
 // revision, or an entirely empty chain, leaves no pair to compare - and those
 // come back as a silent empty stretch that the caller cannot tell from "the
 // schedule genuinely had nobody on duty".
+//
+// The cursor is always started: every schedule knows the instant from which its
+// history is exact, because a row without one is refused before the render
+// begins. There used to be an untracked mode for pre-revision rows, and it is
+// gone with them - leading and trailing coverage are now always assertable.
 type coverage struct {
-	query    interval
-	cursor   time.Time
-	tracking bool
+	query  interval
+	cursor time.Time
 
 	// lastID names the revision the cursor currently ends at, so a gap can
 	// say what it sits between.
 	lastID string
-}
-
-func (c *coverage) start(at time.Time) {
-	c.cursor, c.tracking = at, true
 }
 
 // advance folds one revision into the cursor and returns its effective range,
@@ -247,39 +252,31 @@ func (c *coverage) start(at time.Time) {
 // disputed interval: an answer already given about the past must not change
 // because a later row has a wrong boundary.
 func (c *coverage) advance(revRange interval, rev scheduleconfig.ScheduleRevision, warnings []Warning) (interval, []Warning) {
-	if c.tracking {
-		switch {
-		case revRange.Start.After(c.cursor):
-			warnings = c.appendGap(warnings, c.cursor, revRange.Start, rev.ID)
-		case revRange.Start.Before(c.cursor):
-			if overlap := (interval{Start: revRange.Start, End: minTime(c.cursor, revRange.End)}).
-				intersect(c.query); !overlap.empty() {
-				warnings = append(warnings, Warning{
-					Code:       WarnRevisionOverlap,
-					From:       overlap.Start,
-					Until:      overlap.End,
-					RelatedIDs: relatedIDs(c.lastID, rev.ID),
-				})
-			}
-			revRange.Start = maxTime(revRange.Start, c.cursor)
+	switch {
+	case revRange.Start.After(c.cursor):
+		warnings = c.appendGap(warnings, c.cursor, revRange.Start, rev.ID)
+	case revRange.Start.Before(c.cursor):
+		if overlap := (interval{Start: revRange.Start, End: minTime(c.cursor, revRange.End)}).
+			intersect(c.query); !overlap.empty() {
+			warnings = append(warnings, Warning{
+				Code:       WarnRevisionOverlap,
+				From:       overlap.Start,
+				Until:      overlap.End,
+				RelatedIDs: relatedIDs(c.lastID, rev.ID),
+			})
 		}
+		revRange.Start = maxTime(revRange.Start, c.cursor)
 	}
 
-	if !c.tracking || revRange.End.After(c.cursor) {
+	if revRange.End.After(c.cursor) {
 		c.cursor = revRange.End
 	}
-	c.tracking = true
 	c.lastID = rev.ID
 	return revRange, warnings
 }
 
-// finish reports the stretch after the last revision. It only fires when the
-// schedule knows from when its history is exact: without that, the absence of
-// a tail revision cannot be distinguished from history that never started.
-func (c *coverage) finish(historyCompleteKnown bool, warnings []Warning) []Warning {
-	if !c.tracking || !historyCompleteKnown {
-		return warnings
-	}
+// finish reports the stretch after the last revision.
+func (c *coverage) finish(warnings []Warning) []Warning {
 	return c.appendGap(warnings, c.cursor, c.query.End, "")
 }
 

@@ -353,13 +353,13 @@ func (r *ScheduleConfigRepo) SeedRoot(root scheduleconfig.ScheduleRoot) {
 	r.state.teamIndex[root.TeamID] = root.ID
 }
 
-// SeedLegacyRoot inserts a schedule row from before the revision model: a root
-// at config_version 0 with no revision chain.
+// SeedRootWithoutHistory inserts a schedule row that no live path could have
+// written: no history horizon, no revision chain, config_version 0.
 //
-// It is what the upgrade leaves behind, and the commands have to refuse it
-// while the read paths have to report it as no schedule at all. Without a way
-// to build it here, neither would be testable.
-func (r *ScheduleConfigRepo) SeedLegacyRoot(scheduleID, teamID string) {
+// It is what an upgrade leaves behind when the destructive schedule reset is
+// skipped. Every path has to refuse it loudly, and without a way to build one
+// here that could not be tested at all.
+func (r *ScheduleConfigRepo) SeedRootWithoutHistory(scheduleID, teamID string) {
 	r.SeedRoot(scheduleconfig.ScheduleRoot{ID: scheduleID, TeamID: teamID})
 }
 

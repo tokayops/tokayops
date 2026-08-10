@@ -9,6 +9,7 @@ import (
 
 	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
 // Error codes. Every schedule-editor error carries one, including the ones a
@@ -27,7 +28,6 @@ const (
 	CodeUserNotFound       = "user_not_found"
 	CodeScheduleExists     = "schedule_exists"
 	CodeScheduleDeleted    = "schedule_deleted"
-	CodeLegacySchedule     = "legacy_schedule"
 	CodeLastAdmin          = "last_admin"
 	CodeActorNotActive     = "actor_not_active"
 	CodeVersionConflict    = "schedule_version_conflict"
@@ -66,8 +66,6 @@ var scheduleErrorStatuses = []struct {
 	{scheduleconfig.ErrScheduleExists, http.StatusConflict, CodeScheduleExists,
 		"this team already has a schedule"},
 	{scheduleconfig.ErrScheduleDeleted, http.StatusConflict, CodeScheduleDeleted, "schedule is deleted"},
-	{scheduleconfig.ErrLegacySchedule, http.StatusConflict, CodeLegacySchedule,
-		"this schedule predates the revision model and must be reset before it can be edited"},
 	{erasure.ErrLastAdmin, http.StatusConflict, CodeLastAdmin, "last active admin"},
 
 	// 401, not 403: the caller was authorized when the request arrived and has
@@ -199,8 +197,20 @@ func (a *API) mapScheduleFault(c echo.Context, err error) error {
 		return c.JSON(http.StatusInternalServerError,
 			ErrorResponse{Error: "stored schedule data is corrupt", Code: CodeSnapshotCorrupt})
 
+	// The renderer's damage sentinels answer here too. Both describe a row that
+	// no live write path could have produced - a chain with a hole in it, or a
+	// schedule with no history horizon - so they are the same class of answer
+	// as the command side's invariant violation, and leaving them to the
+	// default below would have given half the schedule contract a machine code
+	// and the other half a prose fallback.
+	//
+	// Their other consumer is untouched: the bulk projection still classifies
+	// the same sentinels into per-schedule failure reasons. That is what having
+	// sentinels instead of error text buys.
 	case errors.Is(err, scheduleconfig.ErrInvariantViolation),
-		errors.Is(err, scheduleconfig.ErrRevisionMismatch):
+		errors.Is(err, scheduleconfig.ErrRevisionMismatch),
+		errors.Is(err, schedulerender.ErrHistoryMarkerMissing),
+		errors.Is(err, schedulerender.ErrRevisionGap):
 		log.Printf("ALERT schedule_config: invariant violation: %v", err)
 		return c.JSON(http.StatusInternalServerError,
 			ErrorResponse{Error: "schedule invariant violation", Code: CodeInvariantViolation})

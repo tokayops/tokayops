@@ -675,22 +675,67 @@ func TestCommandsRefuseAnErasedActor(t *testing.T) {
 	})
 }
 
-func TestSaveOnLegacyRootRefuses(t *testing.T) {
-	f := newFixture(t)
-	f.repo.SeedLegacyRoot("legacy-1", "devops")
+// TestWriteOnRootWithoutHistoryIsInvariantViolation: a schedule row with no
+// history horizon cannot be produced by any live path, so every command refuses
+// it as the corruption it is instead of adopting it at revision 1.
+//
+// Every write path is listed on purpose. The override commands are the reason
+// this test exists at all: they never read the revision chain, so without a
+// guard on the locked row they would be the one place a write SUCCEEDED,
+// appending an override revision to a schedule that has none.
+func TestWriteOnRootWithoutHistoryIsInvariantViolation(t *testing.T) {
+	ctx := context.Background()
+	validFrom := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
 
-	_, err := f.svc.Save(context.Background(), "devops", scheduleconfig.SaveCommand{
-		Desired: groupsConfig(group(groupAlice, "alice")),
-	})
-	if !errors.Is(err, scheduleconfig.ErrLegacySchedule) {
-		t.Fatalf("error = %v, want ErrLegacySchedule", err)
-	}
-	if got := len(f.repo.Revisions("legacy-1")); got != 0 {
-		t.Fatalf("revisions were grafted onto a legacy root: %d", got)
+	writes := []struct {
+		name string
+		call func(f *commandFixture) error
+	}{
+		{"save", func(f *commandFixture) error {
+			_, err := f.svc.Save(ctx, "devops", scheduleconfig.SaveCommand{
+				Desired: groupsConfig(group(groupAlice, "alice")),
+			})
+			return err
+		}},
+		{"delete", func(f *commandFixture) error {
+			return f.svc.Delete(ctx, "devops", scheduleconfig.DeleteCommand{})
+		}},
+		{"create override", func(f *commandFixture) error {
+			_, err := f.svc.CreateOverride(ctx, "devops", scheduleconfig.OverrideCommand{
+				UserID: "alice", ValidFrom: validFrom, ValidTo: validFrom.Add(time.Hour),
+			})
+			return err
+		}},
+		{"update override", func(f *commandFixture) error {
+			_, err := f.svc.UpdateOverride(ctx, "legacy-1", "ovr-1", 1, scheduleconfig.OverrideCommand{
+				UserID: "alice", ValidFrom: validFrom, ValidTo: validFrom.Add(time.Hour),
+			})
+			return err
+		}},
+		{"delete override", func(f *commandFixture) error {
+			return f.svc.DeleteOverride(ctx, "legacy-1", "ovr-1", 1, "")
+		}},
+		{"remove team member", func(f *commandFixture) error {
+			return f.svc.RemoveTeamMember(ctx, "devops", "bob")
+		}},
 	}
 
-	if err := f.svc.Delete(context.Background(), "devops", scheduleconfig.DeleteCommand{}); !errors.Is(err, scheduleconfig.ErrLegacySchedule) {
-		t.Fatalf("delete on a legacy root: %v, want ErrLegacySchedule", err)
+	for _, w := range writes {
+		t.Run(w.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.repo.SeedRootWithoutHistory("legacy-1", "devops")
+
+			err := w.call(f)
+			if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
+				t.Fatalf("error = %v, want ErrInvariantViolation", err)
+			}
+			if got := len(f.repo.Revisions("legacy-1")); got != 0 {
+				t.Fatalf("revisions were grafted onto an uninitialized root: %d", got)
+			}
+			if got := len(f.repo.OverrideRevisions("legacy-1")); got != 0 {
+				t.Fatalf("override revisions were written to a schedule with no chain: %d", got)
+			}
+		})
 	}
 }
 
@@ -940,16 +985,13 @@ func TestRemoveTeamMemberGuard(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy or absent schedule skips the guard", func(t *testing.T) {
+	// A team with no schedule at all has no assignment to protect. A root
+	// without history is NOT this case and must not be quietly let through -
+	// that is covered by TestWriteOnRootWithoutHistoryIsInvariantViolation.
+	t.Run("absent schedule skips the guard", func(t *testing.T) {
 		f := newFixture(t)
 		if err := f.svc.RemoveTeamMember(context.Background(), "devops", "bob"); err != nil {
 			t.Fatalf("no schedule at all: %v", err)
-		}
-
-		g := newFixture(t)
-		g.repo.SeedLegacyRoot("legacy-1", "devops")
-		if err := g.svc.RemoveTeamMember(context.Background(), "devops", "bob"); err != nil {
-			t.Fatalf("legacy schedule: %v", err)
 		}
 	})
 

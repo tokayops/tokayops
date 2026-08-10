@@ -13,6 +13,7 @@ import (
 
 	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
 // One status, several meanings. 409 alone tells the editor nothing about what
@@ -39,7 +40,6 @@ func TestScheduleErrorsCarryMachineCodes(t *testing.T) {
 
 		{"schedule exists", scheduleconfig.ErrScheduleExists, http.StatusConflict, CodeScheduleExists},
 		{"schedule deleted", scheduleconfig.ErrScheduleDeleted, http.StatusConflict, CodeScheduleDeleted},
-		{"legacy schedule", scheduleconfig.ErrLegacySchedule, http.StatusConflict, CodeLegacySchedule},
 		{"last admin", erasure.ErrLastAdmin, http.StatusConflict, CodeLastAdmin},
 		{"actor erased", scheduleconfig.ErrActorNotActive, http.StatusUnauthorized, CodeActorNotActive},
 
@@ -66,6 +66,18 @@ func TestScheduleErrorsCarryMachineCodes(t *testing.T) {
 		{"validation",
 			&scheduleconfig.ValidationError{Field: "timezone", Msg: reason},
 			http.StatusBadRequest, CodeValidationFailed},
+
+		// The renderer's damage sentinels are part of the same contract. They
+		// used to fall through to the generic internal error, which meant half
+		// the schedule surface answered with a machine code and the other half
+		// with prose - and the half without one was the half a caller is least
+		// able to guess about.
+		{"schedule has no history horizon",
+			fmt.Errorf("wrapped: %w", schedulerender.ErrHistoryMarkerMissing),
+			http.StatusInternalServerError, CodeInvariantViolation},
+		{"revision chain has a hole",
+			fmt.Errorf("wrapped: %w", schedulerender.ErrRevisionGap),
+			http.StatusInternalServerError, CodeInvariantViolation},
 	}
 
 	api := &API{}
