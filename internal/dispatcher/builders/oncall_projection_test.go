@@ -51,7 +51,7 @@ func buildFor(t *testing.T, b *EscalationJobBuilder, proj OnCallProjection, ag *
 
 	t.Helper()
 	ctx := context.Background()
-	return b.Build(ctx, ag, policyID, TeamOnCallRead(proj.CurrentTeamOnCallNow(ctx, ag.TeamID)))
+	return b.Build(ctx, ag, policyID, schedulerender.TeamOnCallRead(proj.CurrentTeamOnCallNow(ctx, ag.TeamID)))
 }
 
 var projectionBase = time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC)

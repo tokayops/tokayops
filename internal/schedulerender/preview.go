@@ -190,21 +190,26 @@ func loadPreviewBase(ctx context.Context, view scheduleconfig.ScheduleReadView, 
 	base.scheduleID = root.ID
 	base.root = previewRoot(*root, evaluatedAt)
 
-	effective, err := view.GetEffectiveRevision(ctx, root.ID, evaluatedAt)
-	if err != nil && !errors.Is(err, scheduleconfig.ErrRevisionNotFound) {
+	// One read, two answers. The projection already loads the revision in force
+	// to work out who is on duty, and asking for it again to fill `current` was
+	// a second round trip for a row that was already in hand - and, worse, a
+	// second chance for the two to disagree about which revision "in force"
+	// meant.
+	onCall, effective, err := onCallOfRoot(ctx, view, *root, evaluatedAt)
+	if err != nil {
 		return previewBase{}, err
 	}
+	base.onCall = onCall
+	base.onCall.At = evaluatedAt
+
 	// A deleted period carries a copy of the last valid snapshot so the column
 	// stays decodable. It is not a configuration in force, so the planner is
-	// given nothing - exactly as the recreate branch of Save.
-	if err == nil && effective.Kind == scheduleconfig.RevisionActive {
+	// given nothing - exactly as the recreate branch of Save. A nil revision is
+	// the same story from the other side: the instant precedes this schedule's
+	// history, so there is nothing in force to plan against.
+	if effective != nil && effective.Kind == scheduleconfig.RevisionActive {
 		base.current = &effective.Snapshot
 	}
-
-	if base.onCall, err = onCallWithin(ctx, view, *root, evaluatedAt); err != nil {
-		return previewBase{}, err
-	}
-	base.onCall.At = evaluatedAt
 
 	if base.revisions, err = view.GetRevisionsInRange(ctx, root.ID, evaluatedAt, windowUntil); err != nil {
 		return previewBase{}, err

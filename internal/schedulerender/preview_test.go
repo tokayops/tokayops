@@ -305,3 +305,34 @@ func TestPreviewKeepsExistingOverrides(t *testing.T) {
 		t.Fatal("the previewed window dropped an override that is in force")
 	}
 }
+
+// TestPreviewReadsTheEffectiveRevisionOnce pins a count rather than a shape,
+// because the defect it guards against does not change any answer.
+//
+// The preview needs the revision in force twice over: once to say who is on
+// duty now, once as the state the planner edits. Those used to be two reads of
+// the same row in the same snapshot. Nothing was WRONG with the second read -
+// that is exactly why it survived review - it was a round trip nobody needed
+// and a second place where "in force" could come to mean something else.
+//
+// A count is the only thing that fails when it comes back.
+func TestPreviewReadsTheEffectiveRevisionOnce(t *testing.T) {
+	f := newPreviewFixture(t)
+	f.save(t, 0, previewConfig(pvGroup(pvGroupA, "alice"), pvGroup(pvGroupB, "bob")))
+
+	f.repo.Calls = nil
+	if _, err := f.svc.Preview(context.Background(), "devops",
+		previewConfig(pvGroup(pvGroupA, "alice", "carol"), pvGroup(pvGroupB, "bob")), nil); err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+
+	var reads int
+	for _, call := range f.repo.Calls {
+		if call == "GetEffectiveRevision" {
+			reads++
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("GetEffectiveRevision called %d times, want 1: %v", reads, f.repo.Calls)
+	}
+}

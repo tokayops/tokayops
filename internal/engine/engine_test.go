@@ -514,7 +514,7 @@ func TestEngine_StaleProcessing_WithSucceededJob_NotReconciled(t *testing.T) {
 	// Simulate: escalation job already ran and succeeded
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
-	job, stages, steps, snapshot, _ := escBuilder.Build(context.Background(), ag, policyID, builders.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
+	job, stages, steps, snapshot, _ := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	// Create job directly (bypassing engine) and mark as succeeded
 	s.CreateJobWithDedup(job, stages, steps)
 	s.MarkJobSucceeded(ag.DedupKey)
@@ -565,7 +565,7 @@ func TestEnsureEscalationJob_SkipsAckedAG(t *testing.T) {
 	cfg := &config.Config{}
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
-	job, stages, steps, snapshot, err := escBuilder.Build(context.Background(), ag, policyID, builders.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
+	job, stages, steps, snapshot, err := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}

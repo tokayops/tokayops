@@ -14,13 +14,11 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 // mockSyncerStore serves the one store read the syncer still makes: the Slack
 // identities of the people the projection put on duty.
 type mockSyncerStore struct {
-	store.StoreInterface
 	slackIDs map[string]string // userID -> slack external id ("" = not linked → skipped)
 }
 

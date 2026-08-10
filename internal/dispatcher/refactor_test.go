@@ -143,7 +143,7 @@ func TestEscalationFlow_BuilderIntegration(t *testing.T) {
 
 	// Build Job via Builder (now uses Store)
 	builder := builders.NewEscalationJobBuilder(s, &fakeTeamOnCall{}, cfg)
-	job, stages, steps, _, err := builder.Build(context.Background(), ag, "p1", builders.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
+	job, stages, steps, _, err := builder.Build(context.Background(), ag, "p1", schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	if err != nil {
 		t.Fatalf("Builder failed: %v", err)
 	}

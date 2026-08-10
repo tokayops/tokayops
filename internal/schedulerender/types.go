@@ -1,14 +1,12 @@
 // Package schedulerender is the read side of schedule revisions: historical
 // rendering and the current on-call projection.
 //
-// It is a package of its own rather than files inside internal/scheduler
-// because the rule it must obey - rotation math reads revisions, never the
-// mutable schedule row - is worth having the compiler enforce. This package
-// imports internal/rotation and the envelope types of internal/scheduleconfig
-// and nothing else; there is no way to reach a *model.Schedule or the store
-// from here, so the ban is structural rather than a comment someone has to
-// remember. The legacy rotation math in internal/scheduler stays live until
-// the cutover removes it.
+// It is a package of its own because the rule it must obey - rotation math
+// reads revisions, never a mutable schedule row - is worth having the compiler
+// enforce. It imports internal/rotation and the envelope types of
+// internal/scheduleconfig and nothing else; the store is out of reach from
+// here, so the ban is structural rather than a comment someone has to
+// remember.
 package schedulerender
 
 import (

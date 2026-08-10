@@ -39,7 +39,7 @@ func TestGrid_NextBoundary_AtBoundary(t *testing.T) {
 }
 
 func TestGrid_Weekly_DayConvention(t *testing.T) {
-	// HandoffDay 0 = Sunday, matching model.Schedule and time.Weekday.
+	// HandoffDay 0 = Sunday, matching time.Weekday.
 	g := mustGrid(t, "UTC", weeklyPolicy("11:00", 0))
 	// 2026-08-05 is a Wednesday; previous Sunday is 2026-08-02.
 	s := g.SlotContaining(utc(2026, time.August, 5, 15, 0))
