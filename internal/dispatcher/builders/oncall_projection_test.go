@@ -2,8 +2,10 @@ package builders
 
 import (
 	"context"
+	"testing"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -35,6 +37,21 @@ func (f *fakeProjection) CurrentOnCallNow(ctx context.Context, scheduleID string
 		return schedulerender.OnCall{}, f.err
 	}
 	return f.schedules[scheduleID], nil
+}
+
+// buildFor runs Build the way the engine runs it: the team's on-call is read
+// ONCE and handed in, so every schedule-typed step of one job - and the snapshot
+// the engine stores next to it - describe the same moment.
+//
+// A read that fails is passed on AS a failed read, which is what the engine
+// does after logging it: the job still has to be built, and the builder still
+// has to know that nobody could tell it who is on duty.
+func buildFor(t *testing.T, b *EscalationJobBuilder, proj OnCallProjection, ag *model.AlertGroup,
+	policyID string) (*model.Job, []*model.JobStage, []*model.JobStep, *model.EscalationPolicySnapshot, error) {
+
+	t.Helper()
+	ctx := context.Background()
+	return b.Build(ctx, ag, policyID, TeamOnCallRead(proj.CurrentTeamOnCallNow(ctx, ag.TeamID)))
 }
 
 var projectionBase = time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC)

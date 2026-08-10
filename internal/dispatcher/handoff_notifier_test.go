@@ -347,7 +347,7 @@ func TestNotifierDamagedScheduleIsIsolated(t *testing.T) {
 	before := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
 		string(schedulerender.FailureSnapshotDecode)))
 
-	env.oncall.bulk = schedulerender.BulkOnCall{
+	env.oncall.setBulk(schedulerender.BulkOnCall{
 		Schedules: []schedulerender.ScheduleOnCall{rotationDuty("sched-healthy", "g-b", "bob")},
 		Failures: []schedulerender.ProjectionFailure{{
 			ScheduleID: "sched-broken",
@@ -355,7 +355,7 @@ func TestNotifierDamagedScheduleIsIsolated(t *testing.T) {
 			Reason:     schedulerender.FailureSnapshotDecode,
 			Err:        errors.New("snapshot could not be decoded"),
 		}},
-	}
+	})
 	if !env.notifier.checkAll(context.Background()) {
 		t.Fatal("a damaged schedule failed the whole tick")
 	}
@@ -379,7 +379,7 @@ func TestNotifierCallFailureTouchesNothing(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
 	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
 
-	env.oncall.err = errors.New("could not begin transaction")
+	env.oncall.fail(errors.New("could not begin transaction"))
 	if env.notifier.checkAll(context.Background()) {
 		t.Fatal("a read failure reported success")
 	}
@@ -387,7 +387,7 @@ func TestNotifierCallFailureTouchesNothing(t *testing.T) {
 		t.Fatalf("cache = %+v after a read failure, want it untouched", cached)
 	}
 
-	env.oncall.err = nil
+	env.oncall.fail(nil)
 	env.tick(rotationDuty("sched-1", "g-b", "bob"))
 	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
 		t.Fatalf("the retry notified %v, want the handoff it deferred", got)
@@ -400,13 +400,13 @@ func TestNotifierCallFailureTouchesNothing(t *testing.T) {
 // ever notified. Only a failure of the call itself may hold warm-up up.
 func TestNotifierWarmUpCompletesDespiteDamage(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
-	env.oncall.bulk = schedulerender.BulkOnCall{
+	env.oncall.setBulk(schedulerender.BulkOnCall{
 		Schedules: []schedulerender.ScheduleOnCall{rotationDuty("sched-healthy", "g-a", "alice")},
 		Failures: []schedulerender.ProjectionFailure{{
 			ScheduleID: "sched-broken", TeamID: "team-1",
 			Reason: schedulerender.FailureRevisionGap, Err: errors.New("no revision in force"),
 		}},
-	}
+	})
 	if !env.notifier.checkAll(context.Background()) {
 		t.Fatal("warm-up was blocked by a damaged schedule")
 	}
@@ -427,12 +427,12 @@ func TestNotifierWarmUpCompletesDespiteDamage(t *testing.T) {
 // it "observed with nobody on duty", would DM a group whose duty never changed.
 func TestNotifierRepairedScheduleIsSilentOnce(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
-	env.oncall.bulk = schedulerender.BulkOnCall{
+	env.oncall.setBulk(schedulerender.BulkOnCall{
 		Failures: []schedulerender.ProjectionFailure{{
 			ScheduleID: "sched-1", TeamID: "team-1",
 			Reason: schedulerender.FailureSnapshotDecode, Err: errors.New("boom"),
 		}},
-	}
+	})
 	if !env.notifier.checkAll(context.Background()) {
 		t.Fatal("warm-up was blocked by a damaged schedule")
 	}
@@ -461,7 +461,7 @@ func TestNotifierRepairedScheduleIsSilentOnce(t *testing.T) {
 // a first observation of a state it never actually saw.
 func TestNotifierWarmUpBlockedByCallFailure(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice"))
-	env.oncall.err = errors.New("no connection")
+	env.oncall.fail(errors.New("no connection"))
 
 	if env.notifier.checkAll(context.Background()) {
 		t.Fatal("warm-up completed on a tick that read nothing")

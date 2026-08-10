@@ -250,13 +250,13 @@ func TestSyncerSkipsUsersWithoutSlackIdentity(t *testing.T) {
 func TestSyncerDamagedScheduleDoesNotStopTheRest(t *testing.T) {
 	stub := newSlackStub(t)
 	oncall := &fakeOnCall{}
-	oncall.bulk = schedulerender.BulkOnCall{
+	oncall.setBulk(schedulerender.BulkOnCall{
 		Schedules: []schedulerender.ScheduleOnCall{usergroupDuty("sched-ok", "S-OK", "g-a", "alice")},
 		Failures: []schedulerender.ProjectionFailure{{
 			ScheduleID: "sched-broken", TeamID: "team-1",
 			Reason: schedulerender.FailureRotation, Err: errors.New("unknown time zone"),
 		}},
-	}
+	})
 	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
 
 	before := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
@@ -350,7 +350,8 @@ func TestSyncerFailedWriteIsNotCached(t *testing.T) {
 // defect this replaces.
 func TestSyncerCallFailureIsReported(t *testing.T) {
 	stub := newSlackStub(t)
-	oncall := &fakeOnCall{err: errors.New("could not begin transaction")}
+	oncall := &fakeOnCall{}
+	oncall.fail(errors.New("could not begin transaction"))
 	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
 
 	if err := syncer.SyncAll(context.Background()); err == nil {

@@ -44,13 +44,24 @@ type composition struct {
 	UserIDs []string
 }
 
-// observation is one schedule as one tick saw it: the composition plus the
-// three instants the messages print.
+// observation is one schedule as one tick saw it: the composition, the three
+// instants the messages print, and where the composition came from.
 type observation struct {
 	Composition     composition
 	GridSlotStart   time.Time
 	AssignmentStart time.Time
 	AssignmentEnd   time.Time
+
+	// RevisionID is the version of the configuration that put this composition
+	// on duty: the override revision when an override names the person, the
+	// schedule revision otherwise.
+	//
+	// It is provenance, not identity, and it belongs only to the occurrence key.
+	// AssignmentStart alone cannot carry it: editing an override leaves
+	// valid_from where it was, so swapping the stand-in out and back produces
+	// the same composition at the same instant twice, and the second - real -
+	// notification would be swallowed by the first job's dedup key.
+	RevisionID string
 }
 
 // observe reads the L1 layer of a projection.
@@ -66,6 +77,14 @@ func observe(sc schedulerender.ScheduleOnCall) observation {
 	}
 	users := append([]string(nil), l1.UserIDs...)
 	sort.Strings(users)
+
+	// An override says which of ITS versions is in force; a rotation says which
+	// revision of the schedule it is running.
+	revisionID := l1.ScheduleRevisionID
+	if l1.Source == schedulerender.SourceOverride {
+		revisionID = l1.OverrideRevisionID
+	}
+
 	return observation{
 		Composition: composition{
 			Source:  l1.Source,
@@ -75,6 +94,7 @@ func observe(sc schedulerender.ScheduleOnCall) observation {
 		GridSlotStart:   l1.GridSlotStart,
 		AssignmentStart: l1.AssignmentStart,
 		AssignmentEnd:   l1.AssignmentEnd,
+		RevisionID:      revisionID,
 	}
 }
 
@@ -174,18 +194,35 @@ func addedUsers(prev, next []string) []string {
 // A composition recurs: a rotation A -> B -> C comes back to A, and an edit
 // [B] -> [B,D] -> [B] -> [B,D] comes back to [B,D]. If the earlier job were
 // still pending or running, the second - entirely legitimate - notification
-// would be swallowed by the unique index on dedup_key. So the key carries the
-// moment the assignment took effect, which differs between two arrivals of the
-// same composition, and the kind, without which a lingering
-// added_to_active_shift would suppress the handoff that follows it.
+// would be swallowed by the unique index on dedup_key. So the key carries three
+// things beyond the composition:
+//
+//   - the kind, without which a lingering added_to_active_shift would suppress
+//     the handoff that follows it;
+//   - the moment the assignment took effect, which is what separates two turns
+//     of the same rotation;
+//   - the revision that put the composition on duty, which is what separates two
+//     edits that land inside one assignment. Editing an override does not move
+//     its valid_from, so the moment alone repeats when a stand-in is swapped out
+//     and back.
+//
+// Neither of the last two is redundant: a rotation serves many slots from one
+// revision, and an override serves many revisions from one valid_from.
 //
 // The moment lives here and not in the composition on purpose: put it there and
 // a schedule with one group would DM its members at every shift boundary.
+//
+// Two instances derive this from the same rows, so they derive the same key -
+// which is what lets the dedup key stop the second job.
 func occurrenceKey(kind, scheduleID string, next observation) string {
 	return strings.Join([]string{
 		kind,
 		scheduleID,
 		next.Composition.key(),
-		next.AssignmentStart.UTC().Format(time.RFC3339),
+		// Nano, not seconds: timestamps are stored to microsecond resolution,
+		// and a truncating format would merge two activations inside the same
+		// second into one key.
+		next.AssignmentStart.UTC().Format(time.RFC3339Nano),
+		next.RevisionID,
 	}, ":")
 }

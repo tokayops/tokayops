@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -513,7 +514,7 @@ func TestEngine_StaleProcessing_WithSucceededJob_NotReconciled(t *testing.T) {
 	// Simulate: escalation job already ran and succeeded
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
-	job, stages, steps, snapshot, _ := escBuilder.Build(ag, policyID)
+	job, stages, steps, snapshot, _ := escBuilder.Build(context.Background(), ag, policyID, builders.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	// Create job directly (bypassing engine) and mark as succeeded
 	s.CreateJobWithDedup(job, stages, steps)
 	s.MarkJobSucceeded(ag.DedupKey)
@@ -564,7 +565,7 @@ func TestEnsureEscalationJob_SkipsAckedAG(t *testing.T) {
 	cfg := &config.Config{}
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
-	job, stages, steps, snapshot, err := escBuilder.Build(ag, policyID)
+	job, stages, steps, snapshot, err := escBuilder.Build(context.Background(), ag, policyID, builders.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -897,5 +898,146 @@ func TestEngine_OnCallSnapshot_L2IsRecorded(t *testing.T) {
 	}
 	if updated.OnCallSnapshot.L2User.ID != backup.ID {
 		t.Errorf("L2User = %s, want %s", updated.OnCallSnapshot.L2User.ID, backup.ID)
+	}
+}
+
+// TestEngine_OnCallReadOncePerAlertGroup: the job and the snapshot are two
+// halves of one statement about who was on call. Reading on-call twice lets a
+// handoff land between them, and then the alert group records a group the job
+// never paged - so the engine reads once and hands the same answer to both.
+func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
+	s := store.NewMockStore()
+	outgoing := &model.User{ID: "user-outgoing", Name: "Alice"}
+	incoming := &model.User{ID: "user-incoming", Name: "Bob"}
+	s.CreateUser(outgoing)
+	s.CreateUser(incoming)
+
+	teamID := "team-handoff-race"
+	policyID := "pol-handoff-race"
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Schedule Policy",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
+			// A second step naming the SAME schedule: two steps of one job are
+			// one question, and they must not be answered differently either.
+			{ID: "s2", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
+		},
+	})
+	s.CreateTeam(&model.Team{ID: teamID, Name: "Handoff Race", DefaultPolicyID: policyID})
+
+	ag := &model.AlertGroup{
+		ID: "ag-handoff-race", DedupKey: "dk-handoff-race", TeamID: teamID, Severity: "info",
+		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	s.CreateAlertGroup(ag)
+
+	// The shift changes hands the instant after the first read.
+	after := teamSchedule("sched-1", onDuty("g-incoming", incoming.ID))
+	proj := &countingProjection{
+		first: teamSchedule("sched-1", onDuty("g-outgoing", outgoing.ID)),
+		then:  &after,
+	}
+	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
+
+	if proj.calls != 1 {
+		t.Errorf("projection read %d times for one alert group, want 1", proj.calls)
+	}
+
+	updated, err := s.GetAlertGroupByID(ag.ID)
+	if err != nil {
+		t.Fatalf("GetAlertGroupByID: %v", err)
+	}
+	if updated.OnCallSnapshot == nil || len(updated.OnCallSnapshot.L1Users) != 1 {
+		t.Fatalf("snapshot = %+v, want one user on call", updated.OnCallSnapshot)
+	}
+	snapshotUser := updated.OnCallSnapshot.L1Users[0].ID
+
+	job, err := s.GetJobByDedupKey(ag.DedupKey)
+	if err != nil || job == nil {
+		t.Fatalf("job not found: %v", err)
+	}
+	var targets []string
+	for _, step := range s.GetJobStepsByJobID(job.ID) {
+		if step.StepType != "dm" {
+			continue
+		}
+		var data model.EscalationStepData
+		if err := json.Unmarshal(step.Data, &data); err != nil {
+			t.Fatalf("unmarshal step data: %v", err)
+		}
+		targets = append(targets, data.TargetID)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("job has %d dm steps, want one per policy step: %v", len(targets), targets)
+	}
+	for _, target := range targets {
+		if target != snapshotUser {
+			t.Errorf("job step pages %q while the snapshot records %q", target, snapshotUser)
+		}
+	}
+}
+
+// TestEngine_OnCallReadFailure_NoSnapshotWritten: a tick that could not read the
+// projection records nothing and pages nobody.
+//
+// Writing an empty snapshot would state that nobody was on call, which is a
+// claim about the schedule rather than about the database that just refused to
+// answer. And the failure has to reach the builder AS a failure: handed on as a
+// zero value it reads as "this team has no schedule", which sends the builder to
+// the schedule ID stored on the policy step - here a schedule the team no longer
+// owns, which would answer, and page the wrong people.
+func TestEngine_OnCallReadFailure_NoSnapshotWritten(t *testing.T) {
+	s := store.NewMockStore()
+	stale := &model.User{ID: "user-stale", Name: "John"}
+	s.CreateUser(stale)
+
+	teamID := "team-unreadable"
+	policyID := "pol-unreadable"
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Unreadable Policy",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-old"},
+		},
+	})
+	s.CreateTeam(&model.Team{ID: teamID, Name: "Unreadable", DefaultPolicyID: policyID})
+	ag := &model.AlertGroup{
+		ID: "ag-unreadable", DedupKey: "dk-unreadable", TeamID: teamID, Severity: "info",
+		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	s.CreateAlertGroup(ag)
+
+	// The team read fails; the stale schedule would answer perfectly well.
+	proj := &countingProjection{
+		err:  errors.New("could not begin transaction"),
+		byID: map[string]schedulerender.OnCall{"sched-old": onDuty("g-old", stale.ID)},
+	}
+	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
+
+	updated, err := s.GetAlertGroupByID(ag.ID)
+	if err != nil {
+		t.Fatalf("GetAlertGroupByID: %v", err)
+	}
+	if updated.OnCallSnapshot != nil {
+		t.Errorf("snapshot = %+v after an unreadable projection, want none", updated.OnCallSnapshot)
+	}
+	if proj.scheduleCalls != 0 {
+		t.Errorf("the fallback schedule was read %d times after a failed team read, want 0", proj.scheduleCalls)
+	}
+
+	job, err := s.GetJobByDedupKey(ag.DedupKey)
+	if err != nil || job == nil {
+		t.Fatalf("job not found: %v", err)
+	}
+	for _, step := range s.GetJobStepsByJobID(job.ID) {
+		if step.StepType != "dm" {
+			continue
+		}
+		var data model.EscalationStepData
+		if err := json.Unmarshal(step.Data, &data); err != nil {
+			t.Fatalf("unmarshal step data: %v", err)
+		}
+		if data.TargetID != "" {
+			t.Errorf("job pages %q after a failed team read, want a marker step", data.TargetID)
+		}
 	}
 }

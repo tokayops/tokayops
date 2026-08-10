@@ -12,7 +12,8 @@ import (
 // executor no longer derives it from the step type.
 func TestEscalationJobBuilder_SetsProviderName(t *testing.T) {
 	s := store.NewMockStore()
-	builder := NewEscalationJobBuilder(s, &fakeProjection{}, nil)
+	proj := &fakeProjection{}
+	builder := NewEscalationJobBuilder(s, proj, nil)
 
 	policy := &model.EscalationPolicy{
 		ID:   "pol-1",
@@ -25,7 +26,7 @@ func TestEscalationJobBuilder_SetsProviderName(t *testing.T) {
 	ag := &model.AlertGroup{ID: "ag-1", DedupKey: "d1", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
-	_, _, steps, _, err := builder.Build(ag, "pol-1")
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, "pol-1")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}

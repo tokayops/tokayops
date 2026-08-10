@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -12,7 +13,14 @@ import (
 // The runtime consumers depend on this narrow interface rather than on the
 // renderer so that their unit tests need neither PostgreSQL nor revisions in
 // the legacy MockStore.
+//
+// It is guarded because the real thing is: a syncer manager can leave two
+// syncers alive at once, and each runs its own goroutine against this fake.
+// An unsynchronised double would report that as a data race in the test rather
+// than in the code under test.
 type fakeOnCall struct {
+	mu sync.Mutex
+
 	// bulk is what the next tick observes.
 	bulk schedulerender.BulkOnCall
 
@@ -24,6 +32,8 @@ type fakeOnCall struct {
 }
 
 func (f *fakeOnCall) CurrentOnCallForAllNow(ctx context.Context) (schedulerender.BulkOnCall, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	if f.err != nil {
 		return schedulerender.BulkOnCall{}, f.err
@@ -33,7 +43,27 @@ func (f *fakeOnCall) CurrentOnCallForAllNow(ctx context.Context) (schedulerender
 
 // set replaces what the projection reports from the next tick on.
 func (f *fakeOnCall) set(schedules ...schedulerender.ScheduleOnCall) {
-	f.bulk = schedulerender.BulkOnCall{Schedules: schedules}
+	f.setBulk(schedulerender.BulkOnCall{Schedules: schedules})
+}
+
+// setBulk is the same for a projection that also reports failures.
+func (f *fakeOnCall) setBulk(bulk schedulerender.BulkOnCall) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bulk = bulk
+}
+
+// fail makes the next tick a failure of the call itself; nil clears it.
+func (f *fakeOnCall) fail(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+func (f *fakeOnCall) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 // fakeTeamOnCall answers the single-schedule side of the projection, which is
@@ -75,6 +105,12 @@ type dutySpec struct {
 	slotStart time.Time
 	start     time.Time
 	end       time.Time
+
+	// revisionID is the version of the configuration that put this composition
+	// on duty - the override revision for an override, the schedule revision
+	// otherwise. It defaults to a constant, so an unchanged configuration
+	// observed twice really is unchanged.
+	revisionID string
 }
 
 // dutyBase is the shift boundary the specs default to: a fixed instant, because
@@ -112,17 +148,23 @@ func duty(spec dutySpec) schedulerender.ScheduleOnCall {
 	if end.IsZero() {
 		end = slotStart.Add(24 * time.Hour)
 	}
+	revisionID := spec.revisionID
+	if revisionID == "" {
+		revisionID = "rev-1"
+	}
 	sc.OnCall.L1 = &schedulerender.LayerOnCall{
-		GroupID:         spec.groupID,
-		UserIDs:         spec.users,
-		Source:          spec.source,
-		GridSlotStart:   slotStart,
-		GridSlotEnd:     slotStart.Add(24 * time.Hour),
-		AssignmentStart: start,
-		AssignmentEnd:   end,
+		GroupID:            spec.groupID,
+		UserIDs:            spec.users,
+		Source:             spec.source,
+		GridSlotStart:      slotStart,
+		GridSlotEnd:        slotStart.Add(24 * time.Hour),
+		AssignmentStart:    start,
+		AssignmentEnd:      end,
+		ScheduleRevisionID: revisionID,
 	}
 	if spec.source == schedulerender.SourceOverride {
 		sc.OnCall.L1.OverrideID = spec.groupID
+		sc.OnCall.L1.OverrideRevisionID = revisionID
 	}
 	return sc
 }

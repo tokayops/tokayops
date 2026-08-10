@@ -252,3 +252,107 @@ func TestObserveEmptyForNobodyOnCall(t *testing.T) {
 		t.Fatalf("composition = %+v, want the empty one", got.Composition)
 	}
 }
+
+// TestOccurrenceKeyDistinguishesOverrideEdits is the case AssignmentStart cannot
+// carry on its own.
+//
+// Editing an override leaves its valid_from where it was, so swapping the
+// stand-in out and back produces the same composition at the same instant twice.
+// Only the override revision changes - and without it in the key the second,
+// entirely real notification is swallowed while the first job is still pending.
+func TestOccurrenceKeyDistinguishesOverrideEdits(t *testing.T) {
+	// One override O, valid from 12:00, whose holder goes A -> B -> A -> B.
+	standIn := func(user, revisionID string) observation {
+		return observe(duty(dutySpec{
+			scheduleID: "sched-1",
+			source:     schedulerender.SourceOverride,
+			groupID:    "ovr-1",
+			users:      []string{user},
+			slotStart:  dutyBase,
+			start:      dutyBase, // valid_from never moves
+			end:        dutyBase.Add(8 * time.Hour),
+			revisionID: revisionID,
+		}))
+	}
+
+	firstB := standIn("bob", "ovr-1-r2")
+	secondB := standIn("bob", "ovr-1-r4")
+
+	if !firstB.AssignmentStart.Equal(secondB.AssignmentStart) {
+		t.Fatal("the fixture no longer models an edit inside one override interval")
+	}
+	if firstB.Composition.key() != secondB.Composition.key() {
+		t.Fatal("the fixture no longer models the same composition arriving twice")
+	}
+
+	if occurrenceKey(kindHandoff, "sched-1", firstB) == occurrenceKey(kindHandoff, "sched-1", secondB) {
+		t.Fatal("two edits of one override share a dedup key; the second notification would be suppressed")
+	}
+
+	// The same override, unedited, observed twice is still ONE occurrence -
+	// otherwise every tick would be a new notification.
+	if occurrenceKey(kindHandoff, "sched-1", firstB) != occurrenceKey(kindHandoff, "sched-1", standIn("bob", "ovr-1-r2")) {
+		t.Fatal("an unchanged override produced two different keys")
+	}
+}
+
+// TestOccurrenceKeyDistinguishesScheduleRevisions: the same argument for the
+// rotation side. Two edits of the group on duty inside one slot differ by the
+// schedule revision that made them.
+func TestOccurrenceKeyDistinguishesScheduleRevisions(t *testing.T) {
+	group := func(revisionID string) observation {
+		return observe(duty(dutySpec{
+			scheduleID: "sched-1",
+			source:     schedulerender.SourceRotation,
+			groupID:    "g-b",
+			users:      []string{"bob", "dave"},
+			slotStart:  dutyBase,
+			start:      dutyBase,
+			revisionID: revisionID,
+		}))
+	}
+	if occurrenceKey(kindAddedToActiveShift, "sched-1", group("rev-7")) ==
+		occurrenceKey(kindAddedToActiveShift, "sched-1", group("rev-9")) {
+		t.Fatal("two revisions producing the same members share a dedup key")
+	}
+}
+
+// TestOccurrenceKeyKeepsSubSecondActivations apart: timestamps are stored to
+// microsecond resolution, and a second-truncating format would merge two
+// activations inside one second into a single key.
+func TestOccurrenceKeyKeepsSubSecondActivations(t *testing.T) {
+	at := func(offset time.Duration) observation {
+		return observe(duty(dutySpec{
+			scheduleID: "sched-1",
+			source:     schedulerender.SourceRotation,
+			groupID:    "g-b",
+			users:      []string{"bob"},
+			slotStart:  dutyBase,
+			start:      dutyBase.Add(offset),
+		}))
+	}
+	if occurrenceKey(kindHandoff, "sched-1", at(0)) == occurrenceKey(kindHandoff, "sched-1", at(time.Microsecond)) {
+		t.Fatal("activations a microsecond apart share a dedup key")
+	}
+}
+
+// TestObserveCarriesProvenance: which revision the observation reports depends on
+// what put the composition on duty - the override's own version when an override
+// names the person, the schedule revision otherwise.
+func TestObserveCarriesProvenance(t *testing.T) {
+	rotation := observe(duty(dutySpec{
+		scheduleID: "sched-1", source: schedulerender.SourceRotation,
+		groupID: "g-a", users: []string{"alice"}, revisionID: "sched-rev-3",
+	}))
+	if rotation.RevisionID != "sched-rev-3" {
+		t.Errorf("rotation provenance = %q, want the schedule revision", rotation.RevisionID)
+	}
+
+	override := observe(duty(dutySpec{
+		scheduleID: "sched-1", source: schedulerender.SourceOverride,
+		groupID: "ovr-1", users: []string{"carol"}, revisionID: "ovr-rev-2",
+	}))
+	if override.RevisionID != "ovr-rev-2" {
+		t.Errorf("override provenance = %q, want the override revision", override.RevisionID)
+	}
+}

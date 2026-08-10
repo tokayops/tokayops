@@ -24,6 +24,15 @@ type LayerOnCall struct {
 	ScheduleRevisionID string
 	Source             string
 	OverrideID         string
+
+	// OverrideRevisionID identifies the VERSION of the override in force, and
+	// is set only for SourceOverride.
+	//
+	// It is what tells two arrivals of the same stand-in apart. Editing an
+	// override does not move its valid_from, so neither the composition nor
+	// AssignmentStart changes when the person on it is swapped and swapped
+	// back - only the revision does.
+	OverrideRevisionID string
 }
 
 // OnCall is the current-assignment projection. A nil layer means nobody is on
@@ -121,6 +130,7 @@ func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []la
 			ScheduleRevisionID: found.ScheduleRevisionID,
 			Source:             found.Source,
 			OverrideID:         found.OverrideID,
+			OverrideRevisionID: found.OverrideRevisionID,
 		}
 		if ls.layer == LayerL1 {
 			out.L1 = layerOnCall

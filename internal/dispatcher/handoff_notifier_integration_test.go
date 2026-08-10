@@ -525,3 +525,66 @@ func TestHandoffNotifierThreeGroupsNoRepeatWithinOneShift(t *testing.T) {
 		t.Fatalf("%d jobs from ticks inside one shift, want none: %+v", len(jobs), jobs)
 	}
 }
+
+// TestHandoffNotifierEditedOverrideIsNotDeduped is the end-to-end form of the
+// case AssignmentStart cannot carry.
+//
+// Editing an override leaves its valid_from alone, so the same person coming
+// back onto the same override yields the same composition, the same kind AND the
+// same instant. Only the override revision differs, and the second job must
+// still be created while the first is pending.
+func TestHandoffNotifierEditedOverrideIsNotDeduped(t *testing.T) {
+	env := setupHandoffEnv(t)
+	env.save(dailyConfig(group(handoffGroupA, "U_A")))
+	env.warmUp()
+
+	from := env.now
+	until := env.now.Add(8 * time.Hour)
+	override, err := env.config.CreateOverride(context.Background(), env.teamID, scheduleconfig.OverrideCommand{
+		UserID:    "U_B",
+		ValidFrom: from,
+		ValidTo:   until,
+		ActorID:   "U_A",
+	})
+	if err != nil {
+		t.Fatalf("CreateOverride: %v", err)
+	}
+	env.tick(time.Minute)
+
+	// U_C -> U_B -> U_C, all inside the one override interval. The first and
+	// third edits are the same event twice over: same holder, same override,
+	// same valid_from, same kind.
+	revision := override.Revision
+	for i, user := range []string{"U_C", "U_B", "U_C"} {
+		env.now = env.now.Add(time.Hour)
+		updated, err := env.config.UpdateOverride(context.Background(), env.schedID, override.OverrideID,
+			revision, scheduleconfig.OverrideCommand{
+				UserID:    user,
+				ValidFrom: from,
+				ValidTo:   until,
+				ActorID:   "U_A",
+			})
+		if err != nil {
+			t.Fatalf("UpdateOverride %d: %v", i, err)
+		}
+		revision = updated.Revision
+		env.tick(time.Minute)
+	}
+
+	jobs := env.handoffJobs()
+	// One per activation: U_B, then U_C, U_B, U_C.
+	if len(jobs) != 4 {
+		t.Fatalf("%d jobs over four activations, want 4: %+v", len(jobs), jobs)
+	}
+	if jobs[1].dedupKey == jobs[3].dedupKey {
+		t.Fatalf("both activations of U_C share the dedup key %q; the second was suppressed", jobs[1].dedupKey)
+	}
+	for _, j := range jobs {
+		if j.status != string(model.JobStatusPending) {
+			t.Errorf("job %s is %s; the test needs them pending for dedup to be live", j.id, j.status)
+		}
+	}
+	if got := env.stepTargets(jobs[3].id)["slack"]; got != "S_C" {
+		t.Errorf("the last job notified %q, want S_C back on the override", got)
+	}
+}

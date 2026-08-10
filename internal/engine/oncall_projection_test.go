@@ -60,3 +60,37 @@ func onDutyByOverride(overrideID string, users ...string) schedulerender.OnCall 
 func teamSchedule(scheduleID string, onCall schedulerender.OnCall) schedulerender.TeamOnCall {
 	return schedulerender.TeamOnCall{ScheduleID: scheduleID, OnCall: onCall}
 }
+
+// countingProjection answers like fakeProjection and records how many times it
+// was asked, so a test can prove the engine reads on-call once per alert group.
+//
+// It also lets a handoff land between two reads: everything after the first
+// answer comes from `then`. If the job and the snapshot were built from separate
+// reads, that is the moment they would disagree.
+type countingProjection struct {
+	first schedulerender.TeamOnCall
+	then  *schedulerender.TeamOnCall
+	err   error
+	calls int
+
+	// byID is what a read of a schedule BY ID would answer, and scheduleCalls
+	// counts those reads - the fallback path a failed team read must not take.
+	byID          map[string]schedulerender.OnCall
+	scheduleCalls int
+}
+
+func (c *countingProjection) CurrentTeamOnCallNow(ctx context.Context, teamID string) (schedulerender.TeamOnCall, error) {
+	c.calls++
+	if c.err != nil {
+		return schedulerender.TeamOnCall{}, c.err
+	}
+	if c.calls > 1 && c.then != nil {
+		return *c.then, nil
+	}
+	return c.first, nil
+}
+
+func (c *countingProjection) CurrentOnCallNow(ctx context.Context, scheduleID string) (schedulerender.OnCall, error) {
+	c.scheduleCalls++
+	return c.byID[scheduleID], nil
+}
