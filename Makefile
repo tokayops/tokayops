@@ -3,6 +3,7 @@
        test-integration test-integration-quick test-integration-run \
        test-pipeline test-dispatcher \
        e2e-install e2e-test e2e-test-ui e2e-test-headed e2e-up e2e-down \
+       e2e-wait e2e-seed \
        webhook-receiver webhook-receiver-build
 
 # Pin swag version for reproducible builds
@@ -94,21 +95,50 @@ e2e-install:
 # e2e-test already assumed: it tears the stack down after every run.
 e2e-up: e2e-down
 	docker compose -f docker-compose.e2e.yml up -d --build
+	$(MAKE) e2e-wait
+	$(MAKE) e2e-seed
+
+# e2e-wait blocks until the app answers, and gives up instead of hanging: an
+# unbounded wait is invisible locally (you see it and interrupt it) but in CI it
+# burns the whole job timeout and reports nothing about why the app never came
+# up. On timeout the app log is the first thing anyone would ask for.
+e2e-wait:
 	@echo "Waiting for application to be ready..."
-	@while ! curl -s http://localhost:8081/swagger/index.html > /dev/null 2>&1; do sleep 2; done
-	@echo "Application is ready!"
+	@for attempt in $$(seq 1 60); do \
+		if curl -s http://localhost:8081/swagger/index.html > /dev/null 2>&1; then \
+			echo "Application is ready!"; \
+			exit 0; \
+		fi; \
+		echo "Waiting for app... (attempt $$attempt/60)"; \
+		sleep 2; \
+	done; \
+	echo "Application failed to start"; \
+	docker compose -f docker-compose.e2e.yml logs tokay_app; \
+	exit 1
+
+# e2e-seed is the data half of the environment: the admin the suite logs in as,
+# the seeded teams, and the destructive reset.
+#
+# It is a target of its own so that CI calls it instead of keeping a copy of
+# these three commands. It used to keep one, and when Epic 10 Sprint 5.5 added
+# the reset below, the workflow's copy never got it - so `env.spec.ts` failed on
+# every branch in CI while every local run was green. One definition of the
+# environment, called from both places, is the only thing that stops that
+# happening again.
+#
+# The seed still writes schedules the old way, so the environment is put through
+# the same destructive reset the upgrade performs. Without it the suite would be
+# testing the one state the app no longer supports: seeded schedules would read
+# as unconfigured and creating one would be refused as a pre-revision schedule.
+# Reset is idempotent, and the volume is recreated by e2e-down, so repeated runs
+# are fine.
+#
+# Nothing may run `seed` after this point: it would put the legacy rows straight
+# back. Schedules for the tests are created through the API by the Playwright
+# setup project.
+e2e-seed:
 	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops user create admin@example.com 'Admin123!' 'Test Admin' || true
 	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops seed || true
-	@# The seed still writes schedules the old way, so the environment is put
-	@# through the same destructive reset the upgrade performs. Without it the
-	@# suite would be testing the one state the app no longer supports: seeded
-	@# schedules would read as unconfigured and creating one would be refused
-	@# as a pre-revision schedule. Reset is idempotent, and the volume is
-	@# recreated by e2e-down, so repeated runs are fine.
-	@#
-	@# Nothing may run `seed` after this point: it would put the legacy rows
-	@# straight back. Schedules for the tests are created through the API by
-	@# the Playwright setup project.
 	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops migrate reset-schedules
 
 e2e-down:
