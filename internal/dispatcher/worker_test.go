@@ -745,14 +745,14 @@ type JobCountingStoreWrapper struct {
 	JobsCreated int
 }
 
-func (w *JobCountingStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, error) {
+func (w *JobCountingStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
 	// Call real implementation
-	id, err := w.StoreInterface.CreateJobWithDedup(job, stages, steps)
-	if err == nil && id == job.ID {
+	id, created, err := w.StoreInterface.CreateJobWithDedup(job, stages, steps)
+	if created {
 		// Only count if THIS job was actually created (not deduped to existing)
 		w.JobsCreated++
 	}
-	return id, err
+	return id, created, err
 }
 
 // TestProcessAcknowledgedAlertGroups_NoDuplicateJobs_WithJobCompletion tests that
@@ -1132,10 +1132,10 @@ type FailingCreateJobStoreWrapper struct {
 	FailCount int
 }
 
-func (f *FailingCreateJobStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, error) {
+func (f *FailingCreateJobStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
 	if f.FailCount > 0 {
 		f.FailCount--
-		return "", errors.New("transient db error")
+		return "", false, errors.New("transient db error")
 	}
 	return f.StoreInterface.CreateJobWithDedup(job, stages, steps)
 }

@@ -255,8 +255,17 @@ func main() {
 	// Normal Server Startup
 
 	// 3. Init Components
+
+	// Schedule projection. It is constructed here, before its first consumer,
+	// because the engine, the escalation builder, the handoff notifier, the
+	// usergroup syncer and the API all read on-call state through it and must
+	// read it the same way. A second schedulerender.New would be a second
+	// object with its own clock, and the two would answer differently under
+	// WithClock - visibly in tests, silently in production.
+	scheduleRenderer := schedulerender.New(st.ScheduleReadRepository())
+
 	// Engine
-	eng := engine.NewEngine(st, cfg)
+	eng := engine.NewEngine(st, scheduleRenderer, cfg)
 
 	// 4. Integration Cache (for webhook secrets and Slack config)
 	integrationCache := store.NewIntegrationCache()
@@ -333,7 +342,7 @@ func main() {
 		scheduleconfig.WithMetrics(scheduleMetrics))
 	apiService.SetScheduleConfigService(scheduleConfigService)
 	apiService.SetScheduleReadRepository(st.ScheduleReadRepository())
-	apiService.SetScheduleRenderer(schedulerender.New(st.ScheduleReadRepository()))
+	apiService.SetScheduleRenderer(scheduleRenderer)
 	apiService.SetScheduleMetrics(scheduleMetrics)
 	apiService.SetUserEraser(erasure.NewService(st.ErasureRepository()))
 	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle (Epic 8 Sprint 3)
@@ -353,7 +362,7 @@ func main() {
 	go outboxWorker.Run(ctx)
 
 	// Usergroup Syncer Manager - allows dynamic start/stop when Slack integration changes
-	syncerManager := dispatcher.NewUsergroupSyncerManager(st, 5*time.Minute)
+	syncerManager := dispatcher.NewUsergroupSyncerManager(st, scheduleRenderer, 5*time.Minute)
 	apiService.SetUsergroupSyncerManager(ctx, syncerManager)
 
 	// Start syncer if token is already available
@@ -373,7 +382,7 @@ func main() {
 	// Handoff Notifier - DMs on-call user when shift starts. Provider lookup
 	// supplies the dm-capable set so the notifier doesn't fan out to
 	// identities from unregistered providers (Sprint 4 / Epic 7 L7).
-	handoffNotifier := dispatcher.NewHandoffNotifier(st, disp.Providers(), 60*time.Second)
+	handoffNotifier := dispatcher.NewHandoffNotifier(st, scheduleRenderer, disp.Providers(), 60*time.Second)
 	go handoffNotifier.Run(ctx)
 	log.Println("Handoff notifier enabled (60 second interval)")
 

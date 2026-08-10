@@ -1,30 +1,48 @@
 package dispatcher
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
-// mockNotifierStore implements the store interface methods required by HandoffNotifier
+// counterValue reads a counter the way the API tests do, so the assertions can
+// be about what was counted rather than about a metrics harness.
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+// mockNotifierStore implements the store methods HandoffNotifier still needs:
+// team names, linked identities and job creation. On-call state does not come
+// from here any more - it comes from the projection.
 type mockNotifierStore struct {
 	store.StoreInterface
-	schedules []*model.Schedule
-	teams     []*model.Team
-	epochs    map[string][]*model.RotationEpoch // scheduleID -> epochs
-	overrides map[string][]*model.ScheduleOverride
-	users     map[string]*model.User
-	slackIDs  map[string]string // userID -> slack external id (empty means "not linked")
-	jobs      []*createdJob
+	teams    []*model.Team
+	slackIDs map[string]string // userID -> slack external id ("" means not linked)
+	jobs     []*createdJob
 
-	getSchedulesErr error
-	getEpochsErr    error
-	createJobErr    error
+	getTeamsErr  error
+	createJobErr error
+
+	// dedupHits are dedup keys an active job already holds, as a second
+	// instance's write would find them.
+	dedupHits map[string]bool
 }
 
 type createdJob struct {
@@ -32,54 +50,15 @@ type createdJob struct {
 	steps []*model.JobStep
 }
 
-func (m *mockNotifierStore) GetAllSchedules() ([]*model.Schedule, error) {
-	if m.getSchedulesErr != nil {
-		return nil, m.getSchedulesErr
-	}
-	return m.schedules, nil
-}
-
 func (m *mockNotifierStore) GetAllTeams() ([]*model.Team, error) {
+	if m.getTeamsErr != nil {
+		return nil, m.getTeamsErr
+	}
 	return m.teams, nil
 }
 
-func (m *mockNotifierStore) GetRotationEpochs(scheduleID, layer string, from, until time.Time) ([]*model.RotationEpoch, error) {
-	if m.getEpochsErr != nil {
-		return nil, m.getEpochsErr
-	}
-	if epochs, ok := m.epochs[scheduleID]; ok {
-		return epochs, nil
-	}
-	return nil, nil
-}
-
-func (m *mockNotifierStore) GetScheduleOverrides(scheduleID string, from, until time.Time) ([]*model.ScheduleOverride, error) {
-	overrides, ok := m.overrides[scheduleID]
-	if !ok {
-		return nil, nil
-	}
-	// Filter like the real SQL: start_time < until AND end_time > from
-	var filtered []*model.ScheduleOverride
-	for _, o := range overrides {
-		if o.StartTime.Before(until) && o.EndTime.After(from) {
-			filtered = append(filtered, o)
-		}
-	}
-	return filtered, nil
-}
-
-func (m *mockNotifierStore) GetUsersByIDs(ids []string) ([]*model.User, error) {
-	var result []*model.User
-	for _, id := range ids {
-		if u, ok := m.users[id]; ok {
-			result = append(result, u)
-		}
-	}
-	return result, nil
-}
-
 // GetIdentitiesForUsers reads the per-test slackIDs map. A user with an empty or
-// missing entry mirrors the old "User.SlackUserID == ”" case → handoff skips them.
+// missing entry has no dm-capable identity → the notifier skips them.
 func (m *mockNotifierStore) GetIdentitiesForUsers(userIDs []string) (map[string][]*model.ExternalIdentity, error) {
 	out := make(map[string][]*model.ExternalIdentity)
 	for _, id := range userIDs {
@@ -92,579 +71,650 @@ func (m *mockNotifierStore) GetIdentitiesForUsers(userIDs []string) (map[string]
 	return out, nil
 }
 
-func (m *mockNotifierStore) CreateJobWithDedup(job *model.Job, _ []*model.JobStage, steps []*model.JobStep) (string, error) {
+func (m *mockNotifierStore) CreateJobWithDedup(job *model.Job, _ []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
 	if m.createJobErr != nil {
-		return "", m.createJobErr
+		return "", false, m.createJobErr
+	}
+	if job.DedupKey != nil && m.dedupHits[*job.DedupKey] {
+		return "existing-job", false, nil
 	}
 	m.jobs = append(m.jobs, &createdJob{job: job, steps: steps})
-	return job.ID, nil
+	return job.ID, true, nil
 }
 
-func newTestSchedule() *model.Schedule {
-	return &model.Schedule{
-		ID:              "sched-1",
-		TeamID:          "team-1",
-		Timezone:        "Asia/Bangkok",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "11:00",
-		L1RotationStart: time.Now().Add(-7 * 24 * time.Hour),
+func (m *mockNotifierStore) dedupKeys() []string {
+	var out []string
+	for _, j := range m.jobs {
+		if j.job.DedupKey != nil {
+			out = append(out, *j.job.DedupKey)
+		}
 	}
+	return out
 }
 
-func newTestUser(id, name, slackID string) *model.User {
-	return &model.User{
-		ID:    id,
-		Name:  name,
-		Email: name + "@example.com",
-	}
+// notifierEnv is a warmed-up notifier over a projection a test drives.
+type notifierEnv struct {
+	t        *testing.T
+	store    *mockNotifierStore
+	oncall   *fakeOnCall
+	notifier *HandoffNotifier
 }
 
-func newTestEpoch(scheduleID string, userIDs []string) *model.RotationEpoch {
-	// Wrap each user as a singleton group for the new Groups model
-	groups := make([][]string, len(userIDs))
-	for i, id := range userIDs {
-		groups[i] = []string{id}
-	}
-	return &model.RotationEpoch{
-		ID:         "epoch-1",
-		ScheduleID: scheduleID,
-		Layer:      "l1",
-		Groups:     groups,
-		StartTime:  time.Now().Add(-7 * 24 * time.Hour),
-	}
-}
-
-func TestHandoffNotifier_WarmUp_NoJobsCreated(t *testing.T) {
-	user := newTestUser("user-1", "Alice", "U11111")
-	schedule := newTestSchedule()
-
-	mockStore := &mockNotifierStore{
-		schedules: []*model.Schedule{schedule},
+func newNotifierEnv(t *testing.T, slackIDs map[string]string) *notifierEnv {
+	t.Helper()
+	st := &mockNotifierStore{
 		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		epochs: map[string][]*model.RotationEpoch{
-			"sched-1": {newTestEpoch("sched-1", []string{"user-1"})},
+		slackIDs:  slackIDs,
+		dedupHits: map[string]bool{},
+	}
+	oncall := &fakeOnCall{}
+	return &notifierEnv{
+		t:        t,
+		store:    st,
+		oncall:   oncall,
+		notifier: NewHandoffNotifier(st, oncall, staticDmProviders{"slack"}, time.Minute),
+	}
+}
+
+// tick observes one projection state. The first tick of a test is the warm-up
+// pass unless warmUp() already ran.
+func (e *notifierEnv) tick(schedules ...schedulerender.ScheduleOnCall) bool {
+	e.t.Helper()
+	e.oncall.set(schedules...)
+	return e.notifier.checkAll(context.Background())
+}
+
+// warmUp runs the silent first pass and asserts it created nothing.
+func (e *notifierEnv) warmUp(schedules ...schedulerender.ScheduleOnCall) {
+	e.t.Helper()
+	if !e.tick(schedules...) {
+		e.t.Fatal("warm-up tick reported a call failure")
+	}
+	if len(e.store.jobs) != 0 {
+		e.t.Fatalf("warm-up created %d jobs, want none", len(e.store.jobs))
+	}
+	e.notifier.cacheMu.Lock()
+	e.notifier.warmedUp = true
+	e.notifier.cacheMu.Unlock()
+}
+
+func (e *notifierEnv) jobs() []*createdJob { return e.store.jobs }
+
+// targets lists the DM recipients of the one job the test expects.
+func (e *notifierEnv) targets() []string {
+	e.t.Helper()
+	if len(e.store.jobs) != 1 {
+		e.t.Fatalf("expected exactly 1 job, got %d", len(e.store.jobs))
+	}
+	var out []string
+	for _, step := range e.store.jobs[0].steps {
+		var data model.HandoffStepData
+		if err := json.Unmarshal(step.Data, &data); err != nil {
+			e.t.Fatalf("unmarshal step data: %v", err)
+		}
+		out = append(out, data.TargetID)
+	}
+	return out
+}
+
+func (e *notifierEnv) message() string {
+	e.t.Helper()
+	if len(e.store.jobs) != 1 || len(e.store.jobs[0].steps) == 0 {
+		e.t.Fatalf("expected one job with steps, got %d jobs", len(e.store.jobs))
+	}
+	var data model.HandoffStepData
+	if err := json.Unmarshal(e.store.jobs[0].steps[0].Data, &data); err != nil {
+		e.t.Fatalf("unmarshal step data: %v", err)
+	}
+	return data.Message
+}
+
+func (e *notifierEnv) cached(scheduleID string) *composition {
+	return e.notifier.cached(scheduleID)
+}
+
+func slackIDsFor(users ...string) map[string]string {
+	out := make(map[string]string, len(users))
+	for _, u := range users {
+		out[u] = "U-" + strings.ToUpper(u)
+	}
+	return out
+}
+
+// TestNotifierNaturalHandoff: the incoming group hears about it, and only the
+// people who were not on duty a moment ago.
+func TestNotifierNaturalHandoff(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob", "carol"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice", "bob"))
+
+	env.tick(rotationDuty("sched-1", "g-b", "bob", "carol"))
+
+	if got := env.targets(); strings.Join(got, ",") != "U-CAROL" {
+		t.Fatalf("notified %v, want carol alone - bob was already on call", got)
+	}
+	if key := env.jobs()[0].job.DedupKey; key == nil || !strings.HasPrefix(*key, kindHandoff+":sched-1:") {
+		t.Fatalf("dedup key = %v, want a handoff key for sched-1", key)
+	}
+}
+
+// TestNotifierAddedToActiveShift: same group, new member. It is an edit, not a
+// rotation, and it says so.
+func TestNotifierAddedToActiveShift(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("bob", "dave"))
+	env.warmUp(rotationDuty("sched-1", "g-b", "bob"))
+
+	env.tick(rotationDuty("sched-1", "g-b", "bob", "dave"))
+
+	if got := env.targets(); strings.Join(got, ",") != "U-DAVE" {
+		t.Fatalf("notified %v, want dave alone", got)
+	}
+	if key := env.jobs()[0].job.DedupKey; key == nil || !strings.HasPrefix(*key, kindAddedToActiveShift+":") {
+		t.Fatalf("dedup key = %v, want an added_to_active_shift key", key)
+	}
+	if msg := env.message(); !strings.Contains(msg, "added to the on-call shift in progress") {
+		t.Fatalf("message does not announce joining a shift in progress:\n%s", msg)
+	}
+}
+
+// TestNotifierSilentTransitions collects every state change that must produce
+// nothing at all.
+func TestNotifierSilentTransitions(t *testing.T) {
+	tests := []struct {
+		name        string
+		first, then schedulerender.ScheduleOnCall
+	}{
+		{
+			name:  "somebody removed from the group on duty",
+			first: rotationDuty("sched-1", "g-b", "bob", "dave"),
+			then:  rotationDuty("sched-1", "g-b", "bob"),
 		},
-		overrides: map[string][]*model.ScheduleOverride{},
-		users:     map[string]*model.User{"user-1": user},
-		slackIDs:  map[string]string{"user-1": "U11111"},
-	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 0 {
-		t.Errorf("Expected 0 jobs during warm-up, got: %d", len(mockStore.jobs))
-	}
-
-	notifier.cacheMu.RLock()
-	cached, ok := notifier.cache["sched-1"]
-	notifier.cacheMu.RUnlock()
-	if !ok {
-		t.Fatal("Expected cache entry for sched-1")
-	}
-	if cached != "user-1" {
-		t.Errorf("Expected cached group key 'user-1', got: %s", cached)
-	}
-}
-
-func TestHandoffNotifier_HandoffDetected_CreatesJob(t *testing.T) {
-	user1 := newTestUser("user-1", "Alice", "U11111")
-	user2 := newTestUser("user-2", "Bob", "U22222")
-	schedule := newTestSchedule()
-
-	mockStore := &mockNotifierStore{
-		schedules: []*model.Schedule{schedule},
-		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		epochs: map[string][]*model.RotationEpoch{
-			"sched-1": {newTestEpoch("sched-1", []string{"user-1"})},
+		{
+			name:  "the same composition observed again",
+			first: rotationDuty("sched-1", "g-a", "alice"),
+			then:  rotationDuty("sched-1", "g-a", "alice"),
 		},
-		overrides: map[string][]*model.ScheduleOverride{},
-		users:     map[string]*model.User{"user-1": user1, "user-2": user2},
-		slackIDs:  map[string]string{"user-1": "U11111", "user-2": "U22222"},
-	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-
-	// Warm-up
-	notifier.checkAll()
-	notifier.cacheMu.Lock()
-	notifier.warmedUp = true
-	notifier.cacheMu.Unlock()
-
-	if len(mockStore.jobs) != 0 {
-		t.Fatalf("Expected 0 jobs after warm-up, got: %d", len(mockStore.jobs))
-	}
-
-	// Simulate user change
-	mockStore.epochs["sched-1"] = []*model.RotationEpoch{newTestEpoch("sched-1", []string{"user-2"})}
-
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 1 {
-		t.Fatalf("Expected 1 job after handoff, got: %d", len(mockStore.jobs))
-	}
-
-	job := mockStore.jobs[0]
-	if job.job.Type != "handoff_notify" {
-		t.Errorf("Expected job type 'handoff_notify', got: %s", job.job.Type)
-	}
-	if job.job.DedupKey == nil || *job.job.DedupKey != "handoff:sched-1:user-2" {
-		t.Errorf("Expected dedup key 'handoff:sched-1:user-2', got: %s", *job.job.DedupKey)
-	}
-	if len(job.steps) != 1 {
-		t.Fatalf("Expected 1 step, got: %d", len(job.steps))
-	}
-	if job.steps[0].StepType != "handoff_notify" {
-		t.Errorf("Expected step type 'handoff_notify', got: %s", job.steps[0].StepType)
-	}
-	if job.steps[0].MaxAttempts != 3 {
-		t.Errorf("Expected MaxAttempts 3, got: %d", job.steps[0].MaxAttempts)
-	}
-
-	var stepData model.HandoffStepData
-	if err := json.Unmarshal(job.steps[0].Data, &stepData); err != nil {
-		t.Fatalf("Failed to unmarshal step data: %v", err)
-	}
-	if stepData.TargetID != "U22222" {
-		t.Errorf("Expected target 'U22222', got: %s", stepData.TargetID)
-	}
-	if stepData.ScheduleID != "sched-1" {
-		t.Errorf("Expected schedule 'sched-1', got: %s", stepData.ScheduleID)
-	}
-	if stepData.TeamID != "team-1" {
-		t.Errorf("Expected team 'team-1', got: %s", stepData.TeamID)
-	}
-}
-
-func TestHandoffNotifier_NoChange_NoJob(t *testing.T) {
-	user := newTestUser("user-1", "Alice", "U11111")
-	schedule := newTestSchedule()
-
-	mockStore := &mockNotifierStore{
-		schedules: []*model.Schedule{schedule},
-		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		epochs: map[string][]*model.RotationEpoch{
-			"sched-1": {newTestEpoch("sched-1", []string{"user-1"})},
+		{
+			name:  "the group emptied",
+			first: rotationDuty("sched-1", "g-a", "alice"),
+			then:  emptyDuty("sched-1"),
 		},
-		overrides: map[string][]*model.ScheduleOverride{},
-		users:     map[string]*model.User{"user-1": user},
-		slackIDs:  map[string]string{"user-1": "U11111"},
 	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-
-	// Warm-up
-	notifier.checkAll()
-	notifier.cacheMu.Lock()
-	notifier.warmedUp = true
-	notifier.cacheMu.Unlock()
-
-	// Check again with same user
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 0 {
-		t.Errorf("Expected 0 jobs when user unchanged, got: %d", len(mockStore.jobs))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newNotifierEnv(t, slackIDsFor("alice", "bob", "dave"))
+			env.warmUp(tc.first)
+			env.tick(tc.then)
+			if len(env.jobs()) != 0 {
+				t.Fatalf("created %d jobs, want none", len(env.jobs()))
+			}
+		})
 	}
 }
 
-func TestHandoffNotifier_NoSlackUserID_Skipped(t *testing.T) {
-	user1 := newTestUser("user-1", "Alice", "U11111")
-	user2 := newTestUser("user-2", "Bob", "") // No Slack ID
-	schedule := newTestSchedule()
+// TestNotifierOverrideBoundaries: a stand-in is told the same way anyone coming
+// on call is, and so is the group the override hands duty back to.
+func TestNotifierOverrideBoundaries(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "carol"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
 
-	mockStore := &mockNotifierStore{
-		schedules: []*model.Schedule{schedule},
-		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		epochs: map[string][]*model.RotationEpoch{
-			"sched-1": {newTestEpoch("sched-1", []string{"user-1"})},
+	env.tick(overrideDuty("sched-1", "ovr-1", "carol"))
+	if got := env.targets(); strings.Join(got, ",") != "U-CAROL" {
+		t.Fatalf("override start notified %v, want the stand-in", got)
+	}
+
+	env.store.jobs = nil
+	env.tick(rotationDuty("sched-1", "g-a", "alice"))
+	if got := env.targets(); strings.Join(got, ",") != "U-ALICE" {
+		t.Fatalf("override end notified %v, want the returning group", got)
+	}
+}
+
+// TestNotifierSingleGroupScheduleAcrossBoundaries: the case that forbids putting
+// a slot boundary in the composition. The same person is on duty shift after
+// shift; they are told once, when they first come on, and never again.
+func TestNotifierSingleGroupScheduleAcrossBoundaries(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	for i := 1; i <= 3; i++ {
+		slot := dutyBase.Add(time.Duration(i) * 24 * time.Hour)
+		env.tick(duty(dutySpec{
+			scheduleID: "sched-1",
+			source:     schedulerender.SourceRotation,
+			groupID:    "g-a",
+			users:      []string{"alice"},
+			slotStart:  slot,
+		}))
+	}
+	if len(env.jobs()) != 0 {
+		t.Fatalf("created %d jobs over three boundaries, want none", len(env.jobs()))
+	}
+}
+
+// TestNotifierFirstObservationIsSilent: the cutover safeguard. The notifier
+// warms up against an empty database, the operator recreates schedules one by
+// one, and each one is a first observation - not twenty DM fan-outs in the
+// middle of a maintenance window.
+func TestNotifierFirstObservationIsSilent(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice"))
+	env.warmUp() // nothing exists yet
+
+	env.tick(rotationDuty("sched-1", "g-a", "alice"))
+
+	if len(env.jobs()) != 0 {
+		t.Fatalf("created %d jobs for a schedule seen for the first time, want none", len(env.jobs()))
+	}
+	if got := env.cached("sched-1"); got == nil || strings.Join(got.UserIDs, ",") != "alice" {
+		t.Fatalf("cache = %+v, want the observation recorded silently", got)
+	}
+}
+
+// TestNotifierDeleteAndRecreateNotifies: the reason the projection reports
+// deleted schedules. Filter them out and the cache keeps the old composition, so
+// recreating with the same group passes in silence even though duty was
+// interrupted.
+func TestNotifierDeleteAndRecreateNotifies(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	deletedAt := dutyBase.Add(time.Hour)
+	env.tick(duty(dutySpec{scheduleID: "sched-1", deletedAt: &deletedAt}))
+	if len(env.jobs()) != 0 {
+		t.Fatalf("the delete itself created %d jobs, want none", len(env.jobs()))
+	}
+	cached := env.cached("sched-1")
+	if cached == nil || !cached.empty() {
+		t.Fatalf("cache = %+v, want a recorded empty composition", cached)
+	}
+
+	env.tick(rotationDuty("sched-1", "g-a", "alice"))
+	if got := env.targets(); strings.Join(got, ",") != "U-ALICE" {
+		t.Fatalf("recreate notified %v, want alice - her duty was interrupted", got)
+	}
+}
+
+// TestNotifierDamagedScheduleIsIsolated: one corrupt schedule costs exactly
+// itself. The others are processed, its own cache is left alone - writing an
+// empty composition would turn corruption into "duty ended" and, on repair, into
+// a notification nobody earned - and the failure is counted.
+func TestNotifierDamagedScheduleIsIsolated(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.warmUp(
+		rotationDuty("sched-broken", "g-a", "alice"),
+		rotationDuty("sched-healthy", "g-a", "alice"),
+	)
+
+	before := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
+		string(schedulerender.FailureSnapshotDecode)))
+
+	env.oncall.setBulk(schedulerender.BulkOnCall{
+		Schedules: []schedulerender.ScheduleOnCall{rotationDuty("sched-healthy", "g-b", "bob")},
+		Failures: []schedulerender.ProjectionFailure{{
+			ScheduleID: "sched-broken",
+			TeamID:     "team-1",
+			Reason:     schedulerender.FailureSnapshotDecode,
+			Err:        errors.New("snapshot could not be decoded"),
+		}},
+	})
+	if !env.notifier.checkAll(context.Background()) {
+		t.Fatal("a damaged schedule failed the whole tick")
+	}
+
+	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+		t.Fatalf("notified %v, want the healthy schedule's handoff to bob", got)
+	}
+	if cached := env.cached("sched-broken"); cached == nil || strings.Join(cached.UserIDs, ",") != "alice" {
+		t.Fatalf("cache of the damaged schedule = %+v, want it untouched", cached)
+	}
+	after := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
+		string(schedulerender.FailureSnapshotDecode)))
+	if after-before != 1 {
+		t.Errorf("projection failure counter moved by %v, want 1", after-before)
+	}
+}
+
+// TestNotifierCallFailureTouchesNothing: a tick that could not read leaves every
+// cache as it was, so the next tick sees the same transitions it would have.
+func TestNotifierCallFailureTouchesNothing(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	env.oncall.fail(errors.New("could not begin transaction"))
+	if env.notifier.checkAll(context.Background()) {
+		t.Fatal("a read failure reported success")
+	}
+	if cached := env.cached("sched-1"); cached == nil || strings.Join(cached.UserIDs, ",") != "alice" {
+		t.Fatalf("cache = %+v after a read failure, want it untouched", cached)
+	}
+
+	env.oncall.fail(nil)
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+		t.Fatalf("the retry notified %v, want the handoff it deferred", got)
+	}
+}
+
+// TestNotifierWarmUpCompletesDespiteDamage is the regression against rebuilding
+// the blast radius through the state machine. The old checkAll returned false on
+// any error, so one damaged schedule meant warm-up never finished and NOBODY was
+// ever notified. Only a failure of the call itself may hold warm-up up.
+func TestNotifierWarmUpCompletesDespiteDamage(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.oncall.setBulk(schedulerender.BulkOnCall{
+		Schedules: []schedulerender.ScheduleOnCall{rotationDuty("sched-healthy", "g-a", "alice")},
+		Failures: []schedulerender.ProjectionFailure{{
+			ScheduleID: "sched-broken", TeamID: "team-1",
+			Reason: schedulerender.FailureRevisionGap, Err: errors.New("no revision in force"),
+		}},
+	})
+	if !env.notifier.checkAll(context.Background()) {
+		t.Fatal("warm-up was blocked by a damaged schedule")
+	}
+	env.notifier.cacheMu.Lock()
+	env.notifier.warmedUp = true
+	env.notifier.cacheMu.Unlock()
+
+	// The healthy schedule was seeded, so its next transition is a real one.
+	env.tick(rotationDuty("sched-healthy", "g-b", "bob"))
+	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+		t.Fatalf("notified %v, want the healthy schedule's handoff", got)
+	}
+}
+
+// TestNotifierRepairedScheduleIsSilentOnce: the accepted cost of the rule above.
+// A schedule damaged at start-up stays unknown, so its first transition after a
+// repair passes silently - like any first observation. The alternative, calling
+// it "observed with nobody on duty", would DM a group whose duty never changed.
+func TestNotifierRepairedScheduleIsSilentOnce(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.oncall.setBulk(schedulerender.BulkOnCall{
+		Failures: []schedulerender.ProjectionFailure{{
+			ScheduleID: "sched-1", TeamID: "team-1",
+			Reason: schedulerender.FailureSnapshotDecode, Err: errors.New("boom"),
+		}},
+	})
+	if !env.notifier.checkAll(context.Background()) {
+		t.Fatal("warm-up was blocked by a damaged schedule")
+	}
+	env.notifier.cacheMu.Lock()
+	env.notifier.warmedUp = true
+	env.notifier.cacheMu.Unlock()
+
+	if env.cached("sched-1") != nil {
+		t.Fatal("the damaged schedule was cached; it must stay unknown")
+	}
+
+	// Repaired: first observation, silent, cache filled.
+	env.tick(rotationDuty("sched-1", "g-a", "alice"))
+	if len(env.jobs()) != 0 {
+		t.Fatalf("the repair created %d jobs, want none", len(env.jobs()))
+	}
+	// And the next real transition is announced.
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+		t.Fatalf("notified %v, want the first transition after the repair", got)
+	}
+}
+
+// TestNotifierWarmUpBlockedByCallFailure: nothing was read, so nothing was
+// seeded, and finishing warm-up would make the next tick treat every schedule as
+// a first observation of a state it never actually saw.
+func TestNotifierWarmUpBlockedByCallFailure(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice"))
+	env.oncall.fail(errors.New("no connection"))
+
+	if env.notifier.checkAll(context.Background()) {
+		t.Fatal("warm-up completed on a tick that read nothing")
+	}
+	if env.cached("sched-1") != nil {
+		t.Fatal("something was cached by a failed tick")
+	}
+}
+
+// TestNotifierWarmUpBlockedByTeamReadFailure: the team name is only how the
+// message addresses the reader, but a tick that cannot read teams cannot be
+// trusted to have read anything else either.
+func TestNotifierWarmUpBlockedByTeamReadFailure(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice"))
+	env.store.getTeamsErr = errors.New("no connection")
+
+	if env.tick(rotationDuty("sched-1", "g-a", "alice")) {
+		t.Fatal("warm-up completed although teams could not be read")
+	}
+	if env.cached("sched-1") != nil {
+		t.Fatal("something was cached by a failed tick")
+	}
+}
+
+// TestNotifierSecondInstanceCountsOneNotification: two processes detect the same
+// transition, the dedup key lets one job through, and the metric counts what was
+// sent rather than what was noticed.
+func TestNotifierSecondInstanceCountsOneNotification(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	// The other instance got there first and its job is still pending.
+	next := observe(rotationDuty("sched-1", "g-b", "bob"))
+	env.store.dedupHits[occurrenceKey(kindHandoff, "sched-1", next)] = true
+
+	before := counterValue(t, metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kindHandoff))
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	after := counterValue(t, metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kindHandoff))
+
+	if len(env.jobs()) != 0 {
+		t.Fatalf("created %d jobs although one was already pending", len(env.jobs()))
+	}
+	if after != before {
+		t.Errorf("notification counter moved by %v for a job that was not created", after-before)
+	}
+	// The cache still advances: this instance has seen the transition, and
+	// re-detecting it every minute would be noise, not safety.
+	if cached := env.cached("sched-1"); cached == nil || strings.Join(cached.UserIDs, ",") != "bob" {
+		t.Errorf("cache = %+v, want the observed composition", cached)
+	}
+}
+
+// TestNotifierCountsCreatedJobs: one transition, one unit of the metric, however
+// many identities the fan-out reaches.
+func TestNotifierCountsCreatedJobs(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob", "carol"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	before := counterValue(t, metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kindHandoff))
+	env.tick(rotationDuty("sched-1", "g-b", "bob", "carol"))
+	after := counterValue(t, metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kindHandoff))
+
+	if len(env.targets()) != 2 {
+		t.Fatalf("fan-out reached %v, want both new members", env.targets())
+	}
+	if after-before != 1 {
+		t.Errorf("notification counter moved by %v for one transition, want 1", after-before)
+	}
+}
+
+// TestNotifierJobFailureRetriesNextTick: the cache is what makes the retry
+// happen, so it must not advance past a job that was never created.
+func TestNotifierJobFailureRetriesNextTick(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	env.store.createJobErr = errors.New("transient DB error")
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	if len(env.jobs()) != 0 {
+		t.Fatalf("created %d jobs despite the failure", len(env.jobs()))
+	}
+	if cached := env.cached("sched-1"); cached == nil || strings.Join(cached.UserIDs, ",") != "alice" {
+		t.Fatalf("cache = %+v, want the old composition so the retry still sees a change", cached)
+	}
+
+	env.store.createJobErr = nil
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+		t.Fatalf("the retry notified %v, want bob", got)
+	}
+}
+
+// TestNotifierSkipsUsersWithoutDmIdentity: someone with no dm-capable identity
+// cannot be reached, and a step aimed at them would only fail.
+func TestNotifierSkipsUsersWithoutDmIdentity(t *testing.T) {
+	env := newNotifierEnv(t, map[string]string{"alice": "U-ALICE", "carol": "U-CAROL"})
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	// bob has no identity at all; carol does.
+	env.tick(rotationDuty("sched-1", "g-b", "bob", "carol"))
+	if got := env.targets(); strings.Join(got, ",") != "U-CAROL" {
+		t.Fatalf("notified %v, want carol alone", got)
+	}
+
+	// Nobody reachable at all: no job, and the composition is still recorded so
+	// the next transition is measured from it.
+	env.store.jobs = nil
+	env.tick(rotationDuty("sched-1", "g-c", "bob"))
+	if len(env.jobs()) != 0 {
+		t.Fatalf("created %d jobs for an unreachable group, want none", len(env.jobs()))
+	}
+	if cached := env.cached("sched-1"); cached == nil || strings.Join(cached.UserIDs, ",") != "bob" {
+		t.Fatalf("cache = %+v, want the observed composition", cached)
+	}
+}
+
+// TestNotifierKindsDoNotSuppressEachOther: the same composition, the same
+// assignment boundary, two different events. Without the kind in the dedup key
+// the second would be swallowed while the first was still pending.
+func TestNotifierKindsDoNotSuppressEachOther(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("bob", "dave"))
+	env.warmUp(rotationDuty("sched-1", "g-b", "bob"))
+
+	added := duty(dutySpec{
+		scheduleID: "sched-1", source: schedulerender.SourceRotation, groupID: "g-b",
+		users: []string{"bob", "dave"}, slotStart: dutyBase, start: dutyBase,
+	})
+	env.tick(added)
+
+	// A handoff arriving at the same composition and the same boundary - the
+	// group that just gained dave is now serving a different slot of its own.
+	env.notifier.cacheMu.Lock()
+	env.notifier.cache["sched-1"] = composition{
+		Source: schedulerender.SourceRotation, GroupID: "g-a", UserIDs: []string{"alice"},
+	}
+	env.notifier.cacheMu.Unlock()
+	env.tick(added)
+
+	keys := env.store.dedupKeys()
+	if len(keys) != 2 {
+		t.Fatalf("created %d jobs, want one per kind: %v", len(keys), keys)
+	}
+	if keys[0] == keys[1] {
+		t.Fatalf("both kinds produced the dedup key %q", keys[0])
+	}
+	if !strings.HasPrefix(keys[0], kindAddedToActiveShift+":") || !strings.HasPrefix(keys[1], kindHandoff+":") {
+		t.Fatalf("dedup keys do not carry their kinds: %v", keys)
+	}
+}
+
+// TestNotifierMessagesCarryBothBoundaries: both texts print the three instants
+// the reader needs, in the schedule's own timezone, and differ in their first
+// line. The two pairs of boundaries diverge exactly where it matters - the shift
+// began at 11:00, the stand-in's assignment at 14:00.
+func TestNotifierMessagesCarryBothBoundaries(t *testing.T) {
+	slotStart := time.Date(2026, 5, 4, 4, 0, 0, 0, time.UTC)   // 11:00 in Bangkok
+	assignStart := time.Date(2026, 5, 4, 7, 0, 0, 0, time.UTC) // 14:00 in Bangkok
+	assignEnd := time.Date(2026, 5, 5, 4, 0, 0, 0, time.UTC)   // 11:00 next day
+
+	shift := dutySpec{
+		scheduleID: "sched-1", timezone: "Asia/Bangkok",
+		source: schedulerender.SourceRotation, groupID: "g-b", users: []string{"bob"},
+		slotStart: slotStart, start: assignStart, end: assignEnd,
+	}
+
+	tests := []struct {
+		name      string
+		first     schedulerender.ScheduleOnCall
+		then      schedulerender.ScheduleOnCall
+		firstLine string
+	}{
+		{
+			name:      kindHandoff,
+			first:     rotationDuty("sched-1", "g-a", "alice"),
+			then:      duty(shift),
+			firstLine: ":mega: You are now on-call for team *Backend*.",
 		},
-		overrides: map[string][]*model.ScheduleOverride{},
-		users:     map[string]*model.User{"user-1": user1, "user-2": user2},
-		slackIDs:  map[string]string{"user-1": "U11111"}, // user-2 intentionally has no slack identity
-	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-
-	// Warm-up
-	notifier.checkAll()
-	notifier.cacheMu.Lock()
-	notifier.warmedUp = true
-	notifier.cacheMu.Unlock()
-
-	// Simulate handoff to user without Slack ID
-	mockStore.epochs["sched-1"] = []*model.RotationEpoch{newTestEpoch("sched-1", []string{"user-2"})}
-
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 0 {
-		t.Errorf("Expected 0 jobs when user has no SlackUserID, got: %d", len(mockStore.jobs))
-	}
-}
-
-func TestHandoffNotifier_NoL1User_Skipped(t *testing.T) {
-	schedule := newTestSchedule()
-
-	mockStore := &mockNotifierStore{
-		schedules: []*model.Schedule{schedule},
-		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		epochs:    map[string][]*model.RotationEpoch{},
-		overrides: map[string][]*model.ScheduleOverride{},
-		users:     map[string]*model.User{},
-	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-	notifier.warmedUp = true
-
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 0 {
-		t.Errorf("Expected 0 jobs when no L1 user, got: %d", len(mockStore.jobs))
-	}
-}
-
-func TestFormatHandoffMessage_WithTimes(t *testing.T) {
-	loc, _ := time.LoadLocation("Asia/Bangkok")
-	start := time.Date(2025, 2, 12, 4, 0, 0, 0, time.UTC) // 11:00 ICT
-	end := time.Date(2025, 2, 13, 4, 0, 0, 0, time.UTC)   // 11:00 ICT next day
-
-	msg := formatHandoffMessage("Backend", "Asia/Bangkok", &start, &end)
-
-	startFormatted := start.In(loc).Format("Mon Jan 2, 15:04")
-	endFormatted := end.In(loc).Format("Mon Jan 2, 15:04")
-
-	expected := ":mega: You are now on-call for team *Backend*.\n\n" +
-		":clock1: *Shift start:* " + startFormatted + " (Asia/Bangkok)\n" +
-		":clock4: *Shift end:* " + endFormatted + " (Asia/Bangkok)\n" +
-		"\n_Shift end time is current as of now and may change if the schedule is modified._"
-
-	if msg != expected {
-		t.Errorf("Message mismatch.\nGot:\n%s\n\nExpected:\n%s", msg, expected)
-	}
-}
-
-func TestFormatHandoffMessage_Indefinite(t *testing.T) {
-	start := time.Date(2025, 2, 12, 4, 0, 0, 0, time.UTC)
-	msg := formatHandoffMessage("Backend", "Asia/Bangkok", &start, nil)
-
-	if !strings.Contains(msg, "indefinite") {
-		t.Errorf("Expected message to contain 'indefinite', got: %s", msg)
-	}
-}
-
-func TestHandoffNotifier_JobCreationError_RetriesNextTick(t *testing.T) {
-	user1 := newTestUser("user-1", "Alice", "U11111")
-	user2 := newTestUser("user-2", "Bob", "U22222")
-	schedule := newTestSchedule()
-
-	mockStore := &mockNotifierStore{
-		schedules: []*model.Schedule{schedule},
-		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		epochs: map[string][]*model.RotationEpoch{
-			"sched-1": {newTestEpoch("sched-1", []string{"user-1"})},
+		{
+			name: kindAddedToActiveShift,
+			first: duty(dutySpec{
+				scheduleID: "sched-1", timezone: "Asia/Bangkok",
+				source: schedulerender.SourceRotation, groupID: "g-b", users: []string{"alice"},
+				slotStart: slotStart, start: slotStart, end: assignEnd,
+			}),
+			then: duty(dutySpec{
+				scheduleID: "sched-1", timezone: "Asia/Bangkok",
+				source: schedulerender.SourceRotation, groupID: "g-b", users: []string{"alice", "bob"},
+				slotStart: slotStart, start: assignStart, end: assignEnd,
+			}),
+			firstLine: ":heavy_plus_sign: You have been added to the on-call shift in progress for team *Backend*.",
 		},
-		overrides: map[string][]*model.ScheduleOverride{},
-		users:     map[string]*model.User{"user-1": user1, "user-2": user2},
-		slackIDs:  map[string]string{"user-1": "U11111", "user-2": "U22222"},
 	}
 
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+			env.warmUp(tc.first)
+			env.tick(tc.then)
 
-	// Warm-up
-	notifier.checkAll()
-	notifier.cacheMu.Lock()
-	notifier.warmedUp = true
-	notifier.cacheMu.Unlock()
-
-	// Simulate handoff with DB error on job creation
-	mockStore.epochs["sched-1"] = []*model.RotationEpoch{newTestEpoch("sched-1", []string{"user-2"})}
-	mockStore.createJobErr = errors.New("transient DB error")
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 0 {
-		t.Fatalf("Expected 0 jobs when CreateJobWithDedup fails, got: %d", len(mockStore.jobs))
-	}
-
-	// Cache should NOT be updated (still has the old group key)
-	notifier.cacheMu.RLock()
-	cached := notifier.cache["sched-1"]
-	notifier.cacheMu.RUnlock()
-	if cached != "user-1" {
-		t.Errorf("Cache should still have 'user-1' after failed job creation, got: %s", cached)
-	}
-
-	// Fix DB error, retry
-	mockStore.createJobErr = nil
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 1 {
-		t.Fatalf("Expected 1 job after retry, got: %d", len(mockStore.jobs))
+			msg := env.message()
+			lines := strings.Split(msg, "\n")
+			if lines[0] != tc.firstLine {
+				t.Errorf("first line = %q, want %q", lines[0], tc.firstLine)
+			}
+			for _, want := range []string{
+				"Rotation shift started:         Mon May 4, 11:00 (Asia/Bangkok)",
+				"Your assignment effective from: Mon May 4, 14:00 (Asia/Bangkok)",
+				"Assignment ends:                Tue May 5, 11:00 (Asia/Bangkok)",
+			} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("message is missing %q:\n%s", want, msg)
+				}
+			}
+			if strings.Contains(msg, "indefinite") {
+				t.Errorf("message still offers an indefinite end:\n%s", msg)
+			}
+		})
 	}
 }
 
-func TestHandoffNotifier_MultiUserGroup_ChangeDetected(t *testing.T) {
-	// Critical: [A,B] -> [A,C] must be detected as a change even though A stays.
-	userA := newTestUser("user-a", "Alice", "UA")
-	userB := newTestUser("user-b", "Bob", "UB")
-	userC := newTestUser("user-c", "Carol", "UC")
-	schedule := newTestSchedule()
+// TestNotifierMessageUsesTheSnapshotTimezone: the zone comes from the
+// configuration in force, not from the schedule row - which is the whole reason
+// it travels with the projection.
+func TestNotifierMessageUsesTheSnapshotTimezone(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.warmUp(duty(dutySpec{
+		scheduleID: "sched-1", timezone: "America/New_York",
+		source: schedulerender.SourceRotation, groupID: "g-a", users: []string{"alice"},
+	}))
+	env.tick(duty(dutySpec{
+		scheduleID: "sched-1", timezone: "America/New_York",
+		source: schedulerender.SourceRotation, groupID: "g-b", users: []string{"bob"},
+		slotStart: time.Date(2026, 5, 4, 15, 0, 0, 0, time.UTC),
+	}))
 
-	// Start with group [A, B]
-	mockStore := &mockNotifierStore{
-		schedules: []*model.Schedule{schedule},
-		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		epochs: map[string][]*model.RotationEpoch{
-			"sched-1": {{
-				ID:         "epoch-1",
-				ScheduleID: "sched-1",
-				Layer:      "l1",
-				Groups:     [][]string{{"user-a", "user-b"}},
-				StartTime:  time.Now().Add(-7 * 24 * time.Hour),
-			}},
-		},
-		overrides: map[string][]*model.ScheduleOverride{},
-		users:     map[string]*model.User{"user-a": userA, "user-b": userB, "user-c": userC},
-		slackIDs:  map[string]string{"user-a": "UA", "user-b": "UB", "user-c": "UC"},
+	msg := env.message()
+	if !strings.Contains(msg, "(America/New_York)") {
+		t.Fatalf("message does not use the snapshot timezone:\n%s", msg)
 	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-
-	// Warm-up: cache should store "user-a,user-b"
-	notifier.checkAll()
-	notifier.cacheMu.Lock()
-	notifier.warmedUp = true
-	notifier.cacheMu.Unlock()
-
-	notifier.cacheMu.RLock()
-	cachedKey := notifier.cache["sched-1"]
-	notifier.cacheMu.RUnlock()
-	if cachedKey != "user-a,user-b" {
-		t.Fatalf("Expected cached key 'user-a,user-b', got: %s", cachedKey)
-	}
-
-	// Change group to [A, C] — A stays, B replaced by C
-	mockStore.epochs["sched-1"] = []*model.RotationEpoch{{
-		ID:         "epoch-2",
-		ScheduleID: "sched-1",
-		Layer:      "l1",
-		Groups:     [][]string{{"user-a", "user-c"}},
-		StartTime:  time.Now().Add(-1 * time.Hour),
-	}}
-
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 1 {
-		t.Fatalf("Expected 1 job for group change [A,B]->[A,C], got: %d", len(mockStore.jobs))
-	}
-
-	// Should create 2 steps (one for each user with SlackUserID)
-	job := mockStore.jobs[0]
-	if len(job.steps) != 2 {
-		t.Fatalf("Expected 2 steps (one per group member), got: %d", len(job.steps))
-	}
-
-	// Verify both users get notified
-	targets := make(map[string]bool)
-	for _, step := range job.steps {
-		var stepData model.HandoffStepData
-		json.Unmarshal(step.Data, &stepData)
-		targets[stepData.TargetID] = true
-	}
-	if !targets["UA"] || !targets["UC"] {
-		t.Errorf("Expected targets UA and UC, got: %v", targets)
+	if !strings.Contains(msg, "Mon May 4, 11:00") {
+		t.Fatalf("message does not render 15:00 UTC as 11:00 local:\n%s", msg)
 	}
 }
 
-func TestHandoffNotifier_MultiUserGroup_PartialSlackIDs(t *testing.T) {
-	// User without SlackUserID is skipped, others get notified
-	userA := newTestUser("user-a", "Alice", "UA")
-	userB := newTestUser("user-b", "Bob", "") // No Slack ID
-	schedule := newTestSchedule()
-
-	mockStore := &mockNotifierStore{
-		schedules: []*model.Schedule{schedule},
-		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		epochs: map[string][]*model.RotationEpoch{
-			"sched-1": {{
-				ID:         "epoch-1",
-				ScheduleID: "sched-1",
-				Layer:      "l1",
-				Groups:     [][]string{{"user-a", "user-b"}},
-				StartTime:  time.Now().Add(-7 * 24 * time.Hour),
-			}},
-		},
-		overrides: map[string][]*model.ScheduleOverride{},
-		users:     map[string]*model.User{"user-a": userA, "user-b": userB},
-		slackIDs:  map[string]string{"user-a": "UA"}, // user-b has no slack identity
-	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-	notifier.checkAll()
-	notifier.cacheMu.Lock()
-	notifier.warmedUp = true
-	// Simulate previous different group
-	notifier.cache["sched-1"] = "other"
-	notifier.cacheMu.Unlock()
-
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 1 {
-		t.Fatalf("Expected 1 job, got: %d", len(mockStore.jobs))
-	}
-	// Only 1 step (user-b has no Slack ID)
-	if len(mockStore.jobs[0].steps) != 1 {
-		t.Fatalf("Expected 1 step (user without SlackUserID skipped), got: %d", len(mockStore.jobs[0].steps))
-	}
-	var stepData model.HandoffStepData
-	json.Unmarshal(mockStore.jobs[0].steps[0].Data, &stepData)
-	if stepData.TargetID != "UA" {
-		t.Errorf("Expected target UA, got: %s", stepData.TargetID)
-	}
-}
-
-func TestHandoffNotifier_AfterOverride_ShiftStartIsOverrideEnd(t *testing.T) {
-	// Bug #3: After override ends, notification should show override end time
-	// as shift start, not the rotation period start.
-	//
-	// Setup: daily rotation, user1 on-call.
-	// Override by user3 from 14:00-18:00 (already ended).
-	// When notifier detects user1 is back, L1Since must be 18:00 (override end).
-	now := time.Now().UTC()
-	handoffToday := time.Date(now.Year(), now.Month(), now.Day(), 11, 0, 0, 0, time.UTC)
-
-	// Override ended 1 hour ago
-	overrideEnd := now.Add(-1 * time.Hour)
-	overrideStart := overrideEnd.Add(-4 * time.Hour)
-
-	user1 := newTestUser("user-1", "Alice", "U11111")
-	user3 := newTestUser("user-3", "Charlie", "U33333")
-
-	schedule := &model.Schedule{
-		ID:              "sched-1",
-		TeamID:          "team-1",
-		Timezone:        "UTC",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "11:00",
-		L1RotationStart: handoffToday.Add(-7 * 24 * time.Hour),
-	}
-
-	epoch := &model.RotationEpoch{
-		ID:         "epoch-1",
-		ScheduleID: "sched-1",
-		Layer:      "l1",
-		Groups:     [][]string{{"user-1"}},
-		StartTime:  handoffToday.Add(-7 * 24 * time.Hour),
-	}
-
-	override := &model.ScheduleOverride{
-		ID:        "override-1",
-		UserID:    "user-3",
-		StartTime: overrideStart,
-		EndTime:   overrideEnd,
-	}
-
-	mockStore := &mockNotifierStore{
-		schedules: []*model.Schedule{schedule},
-		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		epochs: map[string][]*model.RotationEpoch{
-			"sched-1": {epoch},
-		},
-		overrides: map[string][]*model.ScheduleOverride{
-			"sched-1": {override},
-		},
-		users:    map[string]*model.User{"user-1": user1, "user-3": user3},
-		slackIDs: map[string]string{"user-1": "U11111", "user-3": "U33333"},
-	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-
-	// Warm-up with user3 (override active)
-	notifier.cacheMu.Lock()
-	notifier.warmedUp = true
-	notifier.cache["sched-1"] = "user-3" // Simulate: last seen user was override user
-	notifier.cacheMu.Unlock()
-
-	// Now check — override has ended, user1 is back
-	notifier.checkAll()
-
-	if len(mockStore.jobs) != 1 {
-		t.Fatalf("Expected 1 job, got: %d", len(mockStore.jobs))
-	}
-
-	var stepData model.HandoffStepData
-	if err := json.Unmarshal(mockStore.jobs[0].steps[0].Data, &stepData); err != nil {
-		t.Fatalf("Failed to unmarshal step data: %v", err)
-	}
-
-	// The message must contain the override end time, not the handoff time (11:00)
-	overrideEndFormatted := overrideEnd.Format("15:04")
-	handoffFormatted := "11:00"
-
-	if !strings.Contains(stepData.Message, overrideEndFormatted) {
-		t.Errorf("Expected message to contain override end time %s, got:\n%s", overrideEndFormatted, stepData.Message)
-	}
-	if strings.Contains(stepData.Message, "Shift start:* "+handoffToday.Format("Mon Jan 2, ")+handoffFormatted) {
-		t.Errorf("Message should NOT show rotation period start (11:00), got:\n%s", stepData.Message)
-	}
-}
-
-func TestHandoffNotifier_WarmUp_FailsOnDBError(t *testing.T) {
-	mockStore := &mockNotifierStore{
-		getSchedulesErr: errors.New("DB connection error"),
-	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-
-	ok := notifier.checkAll()
-	if ok {
-		t.Error("Expected checkAll to return false on GetAllSchedules error")
-	}
-
-	notifier.cacheMu.RLock()
-	warmedUp := notifier.warmedUp
-	notifier.cacheMu.RUnlock()
-	if warmedUp {
-		t.Error("warmedUp should remain false after failed checkAll")
-	}
-}
-
-func TestHandoffNotifier_WarmUp_FailsOnPerScheduleError(t *testing.T) {
-	schedule := newTestSchedule()
-
-	mockStore := &mockNotifierStore{
-		schedules:    []*model.Schedule{schedule},
-		teams:        []*model.Team{{ID: "team-1", Name: "Backend"}},
-		getEpochsErr: errors.New("per-schedule DB error"),
-		overrides:    map[string][]*model.ScheduleOverride{},
-		users:        map[string]*model.User{},
-	}
-
-	notifier := NewHandoffNotifier(mockStore, staticDmProviders{"slack"}, time.Minute)
-
-	ok := notifier.checkAll()
-	if ok {
-		t.Error("Expected checkAll to return false on per-schedule epoch error")
-	}
-
-	notifier.cacheMu.RLock()
-	_, hasCached := notifier.cache["sched-1"]
-	notifier.cacheMu.RUnlock()
-	if hasCached {
-		t.Error("Expected no cache entry for schedule with epoch error")
-	}
-
-	// Fix error, warm-up should succeed
-	mockStore.getEpochsErr = nil
-	mockStore.epochs = map[string][]*model.RotationEpoch{
-		"sched-1": {newTestEpoch("sched-1", []string{"user-1"})},
-	}
-	mockStore.users = map[string]*model.User{
-		"user-1": newTestUser("user-1", "Alice", "U11111"),
-	}
-	mockStore.slackIDs = map[string]string{"user-1": "U11111"}
-
-	ok = notifier.checkAll()
-	if !ok {
-		t.Error("Expected checkAll to return true after error is fixed")
+// TestNotifierUnknownTimezoneFallsBackToUTC: a zone the runtime cannot load must
+// not stop the notification; the message says which zone it is printing.
+func TestNotifierUnknownTimezoneFallsBackToUTC(t *testing.T) {
+	got := formatHandoffMessage(kindHandoff, "Backend", "Mars/Olympus", observation{
+		GridSlotStart:   dutyBase,
+		AssignmentStart: dutyBase,
+		AssignmentEnd:   dutyBase.Add(24 * time.Hour),
+	})
+	if !strings.Contains(got, fmt.Sprintf("Mon May 4, 11:00 (%s)", "Mars/Olympus")) {
+		t.Fatalf("message did not fall back to UTC times:\n%s", got)
 	}
 }

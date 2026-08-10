@@ -53,6 +53,33 @@ func (v *scheduleReadView) GetScheduleRootByTeam(ctx context.Context, teamID str
 		`SELECT `+scheduleRootColumns+` FROM schedules WHERE team_id = $1`, teamID))
 }
 
+// ListScheduleRoots returns every schedule root, soft-deleted ones included.
+//
+// It selects the root columns only. Reading the legacy mutable columns here is
+// what makes the old list query unusable for a revision-managed schedule: they
+// are nullable now and nothing on the revision path writes them, so a single
+// revision row fails the scan and takes the whole result set with it.
+//
+// The ORDER BY is not cosmetic: the notifier tick and its log lines walk this
+// list, and an unordered one would reorder them run to run for no reason.
+func (v *scheduleReadView) ListScheduleRoots(ctx context.Context) ([]scheduleconfig.ScheduleRoot, error) {
+	rows, err := v.q.QueryContext(ctx, `SELECT `+scheduleRootColumns+` FROM schedules ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []scheduleconfig.ScheduleRoot
+	for rows.Next() {
+		root, err := scanScheduleRoot(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *root)
+	}
+	return out, rows.Err()
+}
+
 // GetEffectiveRevision returns the revision whose half-open interval contains
 // `at`. The lower bound is part of the predicate on purpose: without it a
 // future revision would answer a query about the past.
@@ -180,16 +207,23 @@ var (
 	_ sqlQueryer                            = (*sql.DB)(nil)
 )
 
+// scanScheduleRootRow adapts the single-row lookups: only there does "no rows"
+// mean the schedule does not exist. In a list query an empty result is an
+// ordinary answer.
 func scanScheduleRootRow(row *sql.Row) (*scheduleconfig.ScheduleRoot, error) {
+	root, err := scanScheduleRoot(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, scheduleconfig.ErrScheduleNotFound
+	}
+	return root, err
+}
+
+func scanScheduleRoot(row rowScanner) (*scheduleconfig.ScheduleRoot, error) {
 	var (
 		root                 scheduleconfig.ScheduleRoot
 		historyFrom, deleted sql.NullTime
 	)
-	err := row.Scan(&root.ID, &root.TeamID, &root.ConfigVersion, &historyFrom, &deleted)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, scheduleconfig.ErrScheduleNotFound
-	}
-	if err != nil {
+	if err := row.Scan(&root.ID, &root.TeamID, &root.ConfigVersion, &historyFrom, &deleted); err != nil {
 		return nil, err
 	}
 	if historyFrom.Valid {

@@ -1,28 +1,105 @@
 package builders
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/scheduler"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/google/uuid"
 )
 
+// OnCallProjection is the slice of the schedule projection the builder needs.
+//
+// It is an interface declared here rather than *schedulerender.Service because
+// the revision model is deliberately absent from the legacy MockStore: without
+// it, every builder unit test would have to run against PostgreSQL.
+type OnCallProjection interface {
+	// CurrentTeamOnCallNow answers who is on duty for a team and whether the
+	// team has a schedule at all.
+	CurrentTeamOnCallNow(ctx context.Context, teamID string) (schedulerender.TeamOnCall, error)
+
+	// CurrentOnCallNow answers for one schedule by ID.
+	CurrentOnCallNow(ctx context.Context, scheduleID string) (schedulerender.OnCall, error)
+}
+
 // EscalationJobBuilder builds escalation jobs from Store-based policies
 type EscalationJobBuilder struct {
 	Store  store.StoreInterface
+	OnCall OnCallProjection
 	Config *config.Config // for firehose channel config
 }
 
-func NewEscalationJobBuilder(s store.StoreInterface, cfg *config.Config) *EscalationJobBuilder {
-	return &EscalationJobBuilder{Store: s, Config: cfg}
+// TeamOnCallResult is the caller's answer to "who is on duty for this team",
+// and it has three states rather than two: the team has a schedule, the team has
+// none, or the question could not be answered at all.
+//
+// The third state has to survive the journey. Collapsed into the second - a zero
+// TeamOnCall, as a bare value would be - a failed read looks like a team that
+// never configured a schedule, and the builder does the one thing it must not do
+// after a failed read: fall back to the schedule ID stored on the policy step.
+// That ID can name a schedule the team no longer owns, so a transient error
+// would page last quarter's rotation while the alert group, which knows the read
+// failed, records nothing at all.
+//
+// The zero value means "this team has no schedule". Carry a real read with
+// TeamOnCallRead, which cannot drop the error because it takes it.
+type TeamOnCallResult struct {
+	onCall schedulerender.TeamOnCall
+	err    error
+}
+
+// TeamOnCallRead wraps what a projection read returned, error included. It takes
+// the pair so it can be applied directly to the call:
+//
+//	builders.TeamOnCallRead(projection.CurrentTeamOnCallNow(ctx, teamID))
+func TeamOnCallRead(onCall schedulerender.TeamOnCall, err error) TeamOnCallResult {
+	return TeamOnCallResult{onCall: onCall, err: err}
+}
+
+// Err reports why the team's on-call state is unknown, if it is.
+func (r TeamOnCallResult) Err() error { return r.err }
+
+// OnCall is the projection that was read. It is only meaningful when Err is nil.
+func (r TeamOnCallResult) OnCall() schedulerender.TeamOnCall { return r.onCall }
+
+// scheduleResolution is one schedule's answer as this build saw it, outcome
+// included: a read that failed is an answer to remember too, or two steps naming
+// one schedule would get a marker and a real recipient out of the same build.
+type scheduleResolution struct {
+	users []*model.User
+	err   error
+}
+
+// onCallResolver answers "who is on duty for this step" consistently within one
+// Build.
+//
+// The team's answer is read ONCE, by the caller, and handed in: the engine
+// stores that same answer on the alert group, and a job that pages one group
+// while the snapshot records another describes a state that never existed. A
+// schedule read by ID is remembered here for the same reason one step down - two
+// policy steps naming the same schedule are one question, and neither a handoff
+// nor a transient failure landing between them may split the answer.
+type onCallResolver struct {
+	builder *EscalationJobBuilder
+	team    TeamOnCallResult
+
+	// teamUsers is the team's answer hydrated into people. Nil means "not
+	// worked out yet" - a pointer rather than a value plus a flag, so the
+	// "computed" bit cannot drift away from what was computed, and a result
+	// that is legitimately empty is still a result.
+	teamUsers *scheduleResolution
+
+	byID map[string]scheduleResolution
+}
+
+func NewEscalationJobBuilder(s store.StoreInterface, oncall OnCallProjection, cfg *config.Config) *EscalationJobBuilder {
+	return &EscalationJobBuilder{Store: s, OnCall: oncall, Config: cfg}
 }
 
 // Sprint 4 (Epic 7 L6): the legacy providerForStepType helper is gone —
@@ -35,7 +112,19 @@ func NewEscalationJobBuilder(s store.StoreInterface, cfg *config.Config) *Escala
 // (see escalation_executor.go); parameterizing it is a future feature.
 const firehoseProvider = "slack"
 
-func (b *EscalationJobBuilder) Build(ag *model.AlertGroup, policyID string) (*model.Job, []*model.JobStage, []*model.JobStep, *model.EscalationPolicySnapshot, error) {
+// Build assembles the escalation job for one alert group.
+//
+// teamOnCall is who is on duty for the alert's team, read once by the caller,
+// with whether that read succeeded. It is a parameter rather than a read of its
+// own because the same answer has to serve every schedule-typed step of this job
+// AND the snapshot the caller stores on the alert group: two reads a moment
+// apart can straddle a handoff or a save, and then the people paged and the
+// people recorded are different people.
+func (b *EscalationJobBuilder) Build(ctx context.Context, ag *model.AlertGroup, policyID string,
+	teamOnCall TeamOnCallResult) (*model.Job, []*model.JobStage, []*model.JobStep, *model.EscalationPolicySnapshot, error) {
+
+	onCall := &onCallResolver{builder: b, team: teamOnCall}
+
 	// Determine firehose channel based on severity
 	firehoseChan := ""
 	if b.Config != nil {
@@ -178,7 +267,7 @@ func (b *EscalationJobBuilder) Build(ag *model.AlertGroup, policyID string) (*mo
 				stage := newStage()
 				status, nextRunAt := stepStatusFor(stageIndex)
 
-				users, resolveErr := b.resolveScheduleUsers(ag.TeamID, stepCfg.TargetID)
+				users, resolveErr := onCall.resolveScheduleUsers(ctx, stepCfg.TargetID)
 				if resolveErr != nil {
 					log.Printf("EscalationBuilder: Failed to resolve schedule %s: %v", stepCfg.TargetID, resolveErr)
 					// Create a single step that will fail gracefully
@@ -314,32 +403,88 @@ func (b *EscalationJobBuilder) Build(ag *model.AlertGroup, policyID string) (*mo
 	return job, allStages, allSteps, snapshot, nil
 }
 
-// resolveScheduleUsers resolves the team's current schedule to on-call users.
-// It uses GetScheduleByTeamID to find the active schedule, falling back to
-// the provided scheduleID if the team has no schedule configured.
-// Override replaces the entire L1 group. Only L1 (or override) is returned —
-// L2 rotation is currently not exposed as an escalation target.
-func (b *EscalationJobBuilder) resolveScheduleUsers(teamID, fallbackScheduleID string) ([]*model.User, error) {
-	scheduleID := fallbackScheduleID
-	if teamID != "" {
-		sched, err := b.Store.GetScheduleByTeamID(teamID)
-		switch {
-		case err == nil && sched != nil:
-			scheduleID = sched.ID
-		case errors.Is(err, sql.ErrNoRows):
-			// No schedule for this team — fall back to stored UUID
-		default:
-			return nil, fmt.Errorf("failed to resolve team schedule for %s: %w", teamID, err)
-		}
+// resolveScheduleUsers resolves one schedule-typed policy step to on-call users.
+//
+// The team is asked first and the stored schedule ID is only a fallback, which
+// is what keeps a policy step pointing at a schedule that was replaced from
+// paging whoever used to be on it.
+//
+// There is no override branch here any more: the projection overlays overrides
+// onto the layer, so L1 already names whoever is actually on duty. Escalating
+// "to the override user" separately would be a second, older answer to the same
+// question. Only L1 is returned - L2 is not an escalation target today.
+func (r *onCallResolver) resolveScheduleUsers(ctx context.Context, fallbackScheduleID string) ([]*model.User, error) {
+	// An unreadable team is not a team without a schedule. Falling through to
+	// the stored ID here would answer a question that could not be asked, out of
+	// a schedule the team may no longer own - and it would answer it from a
+	// second transaction, so the job would page people the alert group is not
+	// even recording.
+	if err := r.team.Err(); err != nil {
+		return nil, fmt.Errorf("team on-call state is unreadable: %w", err)
 	}
 
-	result, err := scheduler.FetchCurrentOnCall(b.Store, scheduleID)
+	// A team WITH a schedule answers for itself, even if that schedule is
+	// deleted or between shifts: "nobody" is its answer, and falling through to
+	// the stored ID would answer with someone else's schedule.
+	//
+	// The answer is hydrated once. The projection is already fixed for this
+	// build, but turning IDs into people is a database read of its own, and a
+	// transient failure in the middle of a two-step policy would otherwise leave
+	// one step with a marker and the other with real recipients - the same split
+	// answer the schedule memo below exists to prevent, one level down.
+	if team := r.team.OnCall(); team.ScheduleID != "" {
+		if r.teamUsers == nil {
+			users, err := r.builder.hydrateOnCall(team.OnCall)
+			r.teamUsers = &scheduleResolution{users: users, err: err}
+		}
+		return r.teamUsers.users, r.teamUsers.err
+	}
+
+	if fallbackScheduleID == "" {
+		return nil, nil
+	}
+	if seen, ok := r.byID[fallbackScheduleID]; ok {
+		return seen.users, seen.err
+	}
+
+	resolution := scheduleResolution{}
+	onCall, err := r.builder.OnCall.CurrentOnCallNow(ctx, fallbackScheduleID)
+	if err != nil {
+		resolution.err = fmt.Errorf("failed to resolve schedule %s: %w", fallbackScheduleID, err)
+	} else {
+		resolution.users, resolution.err = r.builder.hydrateOnCall(onCall)
+	}
+
+	if r.byID == nil {
+		r.byID = map[string]scheduleResolution{}
+	}
+	r.byID[fallbackScheduleID] = resolution
+	return resolution.users, resolution.err
+}
+
+// hydrateOnCall turns the projected L1 user IDs into user records, in the order
+// the projection gave them so step indices stay stable across ticks.
+//
+// Users the store does not return are dropped rather than escalated to: an
+// erased person has no identities left to notify, and a step aimed at them
+// would only fail.
+func (b *EscalationJobBuilder) hydrateOnCall(onCall schedulerender.OnCall) ([]*model.User, error) {
+	if onCall.L1 == nil || len(onCall.L1.UserIDs) == 0 {
+		return nil, nil
+	}
+	fetched, err := b.Store.GetUsersByIDs(onCall.L1.UserIDs)
 	if err != nil {
 		return nil, err
 	}
-
-	if result.Override != nil && result.Override.User != nil {
-		return []*model.User{result.Override.User}, nil
+	byID := make(map[string]*model.User, len(fetched))
+	for _, u := range fetched {
+		byID[u.ID] = u
 	}
-	return result.L1Users, nil
+	out := make([]*model.User, 0, len(onCall.L1.UserIDs))
+	for _, id := range onCall.L1.UserIDs {
+		if u, ok := byID[id]; ok {
+			out = append(out, u)
+		}
+	}
+	return out, nil
 }

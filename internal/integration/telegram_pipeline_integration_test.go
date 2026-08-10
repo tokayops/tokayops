@@ -21,6 +21,7 @@ import (
 	"github.com/tokayops/tokayops/internal/engine"
 	"github.com/tokayops/tokayops/internal/ingester"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/tokayops/tokayops/internal/testutil"
 	"github.com/labstack/echo/v4"
@@ -136,7 +137,7 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 	cfg := &config.Config{ConfigVersion: 3}
 
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
-	eng := engine.NewEngine(s, cfg)
+	eng := engine.NewEngine(s, schedulerender.New(s.ScheduleReadRepository()), cfg)
 	disp, err := dispatcher.NewDispatcher(s, cfg)
 	if err != nil {
 		t.Fatalf("NewDispatcher: %v", err)
@@ -207,7 +208,7 @@ func TestTelegramPipeline_SendCallbackAck(t *testing.T) {
 		"alerts": [{"fingerprint": "fp-tg-1", "status": "firing", "labels": {"alertname": "TGAlert"}}]
 	}`
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -297,7 +298,7 @@ func deliverCardForLinkedUser(t *testing.T, env *tgPipelineEnv, ctx context.Cont
 	}
 	payload := fmt.Sprintf(`{"groupKey":%q,"status":"firing","commonLabels":{"team":"tgteam","severity":"critical","alertname":"TGAlert"},"alerts":[{"fingerprint":"fp-%s","status":"firing","labels":{"alertname":"TGAlert"}}]}`, dedup, dedup)
 	sendWebhook(t, env.Echo, payload)
-	env.Eng.ProcessNewAlertGroups()
+	env.Eng.ProcessNewAlertGroups(context.Background())
 	go runDispatcherLoop(ctx, env.Disp)
 	waitForStepCompletion(t, env.S, dedup, 0)
 	ag, err := env.S.GetActiveAlertGroup(dedup)

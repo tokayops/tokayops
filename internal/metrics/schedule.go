@@ -50,6 +50,26 @@ var (
 		Name: "schedule_phase_guard_violations_total",
 		Help: "Commit-time post-condition failures in the schedule transition guard.",
 	})
+
+	// ScheduleOnCallNotificationsTotal counts notification jobs actually
+	// created, not on-call changes detected. The two differ whenever more than
+	// one instance is running: both observe the same handoff, the dedup key
+	// lets exactly one job through, and counting detections would report two
+	// notifications where one was sent.
+	ScheduleOnCallNotificationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "schedule_oncall_notifications_total",
+		Help: "On-call notification jobs created, by kind of transition.",
+	}, []string{"kind"})
+
+	// ScheduleOnCallProjectionFailuresTotal counts schedules the runtime could
+	// not project. It is deliberately separate from
+	// schedule_snapshot_decode_errors_total: that one counts a save being
+	// refused, this one counts a schedule whose duty roster can no longer be
+	// read at all. The alerts they deserve are not the same.
+	ScheduleOnCallProjectionFailuresTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "schedule_oncall_projection_failures_total",
+		Help: "Schedules that could not be projected by a runtime consumer, by reason.",
+	}, []string{"reason"})
 )
 
 // ScheduleMetrics is the Prometheus implementation of the metrics sink the
@@ -79,4 +99,6 @@ func init() {
 	prometheus.MustRegister(ScheduleTransitionDuration)
 	prometheus.MustRegister(ScheduleSnapshotDecodeErrorsTotal)
 	prometheus.MustRegister(SchedulePhaseGuardViolationsTotal)
+	prometheus.MustRegister(ScheduleOnCallNotificationsTotal)
+	prometheus.MustRegister(ScheduleOnCallProjectionFailuresTotal)
 }

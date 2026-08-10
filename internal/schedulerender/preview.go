@@ -207,7 +207,7 @@ func loadPreviewBase(ctx context.Context, view scheduleconfig.ScheduleReadView, 
 		base.current = &effective.Snapshot
 	}
 
-	if base.onCall, err = onCallWithin(ctx, view, root.ID, evaluatedAt); err != nil {
+	if base.onCall, err = onCallWithin(ctx, view, *root, evaluatedAt); err != nil {
 		return previewBase{}, err
 	}
 	base.onCall.At = evaluatedAt
