@@ -186,14 +186,18 @@ func TestDeleteTeamSeesAScheduleCommittedWhileItWaited(t *testing.T) {
 	s := setupTestDB(t)
 	seedTeam(t, s, "devops", "alice", "bob")
 
+	// Built on the test goroutine: revTestSnapshot calls t.Fatalf, and Fatal
+	// from a spawned goroutine ends that goroutine rather than the test.
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	snapshot := revTestSnapshot(t, start)
+
 	inserted := make(chan struct{})
 	commit := make(chan struct{})
 	created := make(chan error, 1)
 
 	go func() {
-		created <- s.ScheduleConfigRepository().WithinTx(context.Background(),
+		err := s.ScheduleConfigRepository().WithinTx(context.Background(),
 			func(tx scheduleconfig.ScheduleConfigTx) error {
-				start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
 				// This INSERT takes FOR KEY SHARE on the team row, which is
 				// what the delete will block on.
 				if err := tx.CreateInitialSchedule(context.Background(),
@@ -203,8 +207,8 @@ func TestDeleteTeamSeesAScheduleCommittedWhileItWaited(t *testing.T) {
 					},
 					&scheduleconfig.ScheduleRevision{
 						ID: "rev-1", ScheduleID: "sched-1", Version: 1,
-						Kind: scheduleconfig.RevisionActive,
-						Snapshot: revTestSnapshot(t, start), EffectiveFrom: start,
+						Kind:     scheduleconfig.RevisionActive,
+						Snapshot: snapshot, EffectiveFrom: start,
 					}); err != nil {
 					return err
 				}
@@ -212,6 +216,15 @@ func TestDeleteTeamSeesAScheduleCommittedWhileItWaited(t *testing.T) {
 				<-commit
 				return nil
 			})
+		// However this ended, the test must not wait on a signal that is never
+		// coming: a failed insert would otherwise hang here until the package
+		// timeout, and report nothing about why.
+		select {
+		case <-inserted:
+		default:
+			close(inserted)
+		}
+		created <- err
 	}()
 
 	<-inserted
