@@ -1,6 +1,10 @@
 package schedulerender
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
+)
 
 // Failures a read path can hit in the data of one schedule.
 //
@@ -15,15 +19,15 @@ var (
 	// never a normal state - it is a lost row.
 	ErrRevisionGap = errors.New("schedulerender: no revision in force")
 
-	// ErrHistoryMarkerMissing means a revision-managed root carries no
-	// history_complete_from. The create flow writes it in the same operation
-	// that writes config_version 1, so an empty value means a row written past
-	// the code or a lost column - not a schedule that merely has little
-	// history.
-	ErrHistoryMarkerMissing = errors.New("schedulerender: schedule has no history horizon")
-
 	// ErrRotation means the rotation math refused the stored configuration:
 	// an unloadable timezone, a policy the grid rejects, a position that
 	// cannot be computed.
 	ErrRotation = errors.New("schedulerender: rotation error")
 )
+
+// ErrHistoryMarkerMissing is re-exported, not redefined: a root with no
+// history horizon is one fact, and scheduleconfig - which owns ScheduleRoot -
+// owns the sentinel and its text. This alias exists so the classification
+// below and the read paths in this package keep reading in this package's
+// vocabulary.
+var ErrHistoryMarkerMissing = scheduleconfig.ErrHistoryMarkerMissing

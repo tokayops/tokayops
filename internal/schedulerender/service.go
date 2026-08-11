@@ -220,8 +220,8 @@ func onCallOfRoot(ctx context.Context, view scheduleconfig.ScheduleReadView,
 	root scheduleconfig.ScheduleRoot, at time.Time) (OnCall, *scheduleconfig.ScheduleRevision, error) {
 
 	out := OnCall{At: at}
-	if root.HistoryCompleteFrom == nil {
-		return OnCall{}, nil, fmt.Errorf("%w: schedule %s", ErrHistoryMarkerMissing, root.ID)
+	if err := scheduleconfig.RequireInitializedRoot(&root); err != nil {
+		return OnCall{}, nil, err
 	}
 	if at.Before(*root.HistoryCompleteFrom) {
 		return out, nil, nil

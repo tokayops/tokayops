@@ -210,7 +210,9 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.POST("/teams", a.CreateTeam, a.Require(rbac.ActionTeamCreate, ScopeGlobal()))
 	v1.GET("/teams/:id", a.GetTeam, a.Require(rbac.ActionTeamView, ScopeGlobal())) // or TeamScope, but View is public
 	v1.PUT("/teams/:id", a.UpdateTeam, a.Require(rbac.ActionTeamUpdate, ScopeFromResource("team", "id")))
-	v1.DELETE("/teams/:id", a.DeleteTeam, a.Require(rbac.ActionTeamDelete, ScopeGlobal()))
+	// requireScheduleStack because deleting a team is now a schedule-aware
+	// command: what retains a team is its schedule history.
+	v1.DELETE("/teams/:id", a.DeleteTeam, a.requireScheduleStack, a.Require(rbac.ActionTeamDelete, ScopeGlobal()))
 	v1.GET("/teams/:id/alert-groups", a.GetTeamAlertGroups, a.Require(rbac.ActionAlertView, ScopeGlobal())) // List is global/public
 	v1.GET("/teams/:id/incidents", a.GetTeamAlertGroups, a.Require(rbac.ActionAlertView, ScopeGlobal()))
 	v1.GET("/teams/:id/members", a.GetTeamMembers, a.Require(rbac.ActionTeamView, ScopeFromResource("team", "id")))
@@ -856,9 +858,10 @@ func (a *API) teamsWithSchedule(ctx context.Context, teams []*model.Team) (map[s
 			case err != nil:
 				return err
 			}
-			if root.HistoryCompleteFrom == nil {
-				log.Printf("ALERT schedule_config: team %s has a schedule row with no history horizon (%s); the upgrade reset was not run",
-					team.ID, root.ID)
+			// Quiet here, loud everywhere else - and the wording of "loud"
+			// comes from the one place that owns it, so the two cannot drift.
+			if err := scheduleconfig.RequireInitializedRoot(root); err != nil {
+				log.Printf("ALERT schedule_config: team %s: %v", team.ID, err)
 				continue
 			}
 			if root.DeletedAt != nil {
@@ -1092,24 +1095,16 @@ func (a *API) UpdateTeam(c echo.Context) error {
 // @Param id path string true "Team ID"
 // @Success 204
 // @Failure 404 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse
 // @Failure 500 {object} ErrorResponse
 // @Router /api/v1/teams/{id} [delete]
 func (a *API) DeleteTeam(c echo.Context) error {
-	id := c.Param("id")
-
-	// Check if team exists
-	_, err := a.store.GetTeamByID(id)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "team not found"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+	// Existence is answered inside the transaction, by the row lock, rather
+	// than by a read before it: a team can be deleted between the two, and
+	// then a 404 would come back as a 500 from the write that followed.
+	if err := a.scheduleConfig.DeleteTeam(c.Request().Context(), c.Param("id")); err != nil {
+		return a.mapScheduleError(c, err)
 	}
-
-	if err := a.store.DeleteTeam(id); err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
 	return c.NoContent(http.StatusNoContent)
 }
 

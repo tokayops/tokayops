@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -412,9 +411,8 @@ func (a *API) revisionRoot(ctx context.Context, view scheduleconfig.ScheduleRead
 	if err != nil {
 		return nil, err
 	}
-	if root.HistoryCompleteFrom == nil {
-		return nil, fmt.Errorf("%w: schedule %s has no history horizon; the upgrade reset was not run",
-			scheduleconfig.ErrInvariantViolation, root.ID)
+	if err := scheduleconfig.RequireInitializedRoot(root); err != nil {
+		return nil, err
 	}
 	return root, nil
 }

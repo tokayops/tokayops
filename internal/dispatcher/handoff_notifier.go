@@ -152,7 +152,12 @@ func (n *HandoffNotifier) Run(ctx context.Context) {
 // on duty" instead would be worse - the repair would then look like a shift
 // starting after a gap and DM a group whose duty never changed.
 func (n *HandoffNotifier) checkAll(ctx context.Context) bool {
+	// Observed around the call whether or not it succeeds: a tick that gets
+	// slower and then starts failing is the shape this is meant to show.
+	started := time.Now()
 	bulk, err := n.oncall.CurrentOnCallForAllNow(ctx)
+	metrics.ScheduleOnCallProjectionDuration.
+		WithLabelValues(metrics.ConsumerHandoffNotifier).Observe(time.Since(started).Seconds())
 	if err != nil {
 		log.Printf("[HandoffNotifier] Failed to project on-call state: %v", err)
 		return false
@@ -164,7 +169,8 @@ func (n *HandoffNotifier) checkAll(ctx context.Context) bool {
 		// on repair, into a notification nobody earned.
 		log.Printf("[HandoffNotifier] Schedule %s (team %s) could not be projected (%s): %v",
 			failure.ScheduleID, failure.TeamID, failure.Reason, failure.Err)
-		metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(string(failure.Reason)).Inc()
+		metrics.ScheduleOnCallProjectionFailuresTotal.
+			WithLabelValues(metrics.ConsumerHandoffNotifier, string(failure.Reason)).Inc()
 	}
 
 	if len(bulk.Schedules) == 0 {

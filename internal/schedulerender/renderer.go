@@ -92,10 +92,10 @@ func Render(in Input) (Result, error) {
 	// calendar with history_complete=false would answer a corrupt row exactly
 	// as it answers a schedule created yesterday, and the caller cannot tell
 	// those apart.
-	hcf := in.Root.HistoryCompleteFrom
-	if hcf == nil {
-		return Result{}, fmt.Errorf("%w: schedule %s", ErrHistoryMarkerMissing, in.Root.ID)
+	if err := scheduleconfig.RequireInitializedRoot(&in.Root); err != nil {
+		return Result{}, err
 	}
+	hcf := in.Root.HistoryCompleteFrom
 
 	// History before the first recorded revision is not a gap in the chain,
 	// it is the part of the past this schedule cannot speak about. Saying

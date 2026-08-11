@@ -54,6 +54,24 @@ var (
 	// person chose, corruption is not.
 	ErrSnapshotDecode = errors.New("scheduleconfig: snapshot could not be decoded")
 
+	// ErrTeamHasScheduleHistory means the team cannot be deleted because a
+	// schedule of that team has history, and history is not cascaded away.
+	//
+	// This one is terminal: unlike an integration, the caller cannot clear it
+	// and retry. Deleting the schedule does not help either - a soft-deleted
+	// schedule still owns its revisions, which is the whole point of them.
+	ErrTeamHasScheduleHistory = errors.New("scheduleconfig: team has schedule history")
+
+	// ErrTeamHasIntegrations means the team still owns a team-scoped
+	// integration, which holds it in place through a foreign key with no
+	// ON DELETE action.
+	//
+	// Unlike schedule history this is removable: the caller deletes the
+	// webhook and retries. That difference is why it is a separate error, and
+	// a separate code, rather than one "team is retained" with a list of
+	// reasons - the two answers are acted on differently.
+	ErrTeamHasIntegrations = errors.New("scheduleconfig: team still has integrations")
+
 	// ErrRevisionMetadataDecode means the audit metadata of a revision - its
 	// change summary - could not be decoded.
 	//
@@ -179,3 +197,15 @@ func (e *MemberOnCallError) Error() string {
 }
 
 func (e *MemberOnCallError) Unwrap() error { return ErrMemberOnCall }
+
+// TeamHasScheduleHistoryError names the schedule that retains the team, so the
+// answer says which row to look at rather than only that one exists.
+type TeamHasScheduleHistoryError struct {
+	ScheduleID string
+}
+
+func (e *TeamHasScheduleHistoryError) Error() string {
+	return fmt.Sprintf("scheduleconfig: team retains schedule %s and its history", e.ScheduleID)
+}
+
+func (e *TeamHasScheduleHistoryError) Unwrap() error { return ErrTeamHasScheduleHistory }

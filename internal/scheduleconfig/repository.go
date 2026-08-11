@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/rotation"
@@ -50,7 +51,63 @@ var (
 	// cannot be explained by concurrent legitimate use. It is a bug signal,
 	// not a condition callers can recover from.
 	ErrInvariantViolation = errors.New("scheduleconfig: invariant violation")
+
+	// ErrHistoryMarkerMissing means a schedule row carries no
+	// history_complete_from - see RootInitialized for what that implies and
+	// why every path has to decide about it.
+	//
+	// It wraps ErrInvariantViolation rather than standing beside it, so one
+	// error satisfies both questions asked of it: the API mapper classifies it
+	// as an invariant violation without a new row in its table, and the bulk
+	// projection still tells it apart from every other invariant violation
+	// when it labels a per-schedule failure.
+	ErrHistoryMarkerMissing = fmt.Errorf(
+		"%w: schedule has no history horizon; the upgrade reset was not run",
+		ErrInvariantViolation)
 )
+
+// RootInitialized reports whether a schedule row was written by the revision
+// model.
+//
+// CreateInitialSchedule writes the row, config_version 1 and
+// history_complete_from in one statement, and nothing ever clears the horizon
+// afterwards. So an empty horizon does not mean "a schedule with little
+// history" - it means a row from before the revision model, in a database
+// where the destructive upgrade reset was never run.
+//
+// This is the only place in non-test code that reads the field to ask that
+// question. It used to be five, in three shapes, with the error text written
+// out twice; the sixth path would not have found any of them. What each caller
+// does with a false answer still differs, and legitimately so:
+//
+//   - a command or a read of one schedule refuses (RequireInitializedRoot);
+//   - a list of teams skips the row and logs, because failing a whole page
+//     over one corrupt row is a blast radius nobody asked for;
+//   - the preview fills the horizon in, because it is describing a schedule
+//     that does not exist yet rather than checking one that does.
+//
+// The predicate is shared so those three answers stay three deliberate
+// answers to one question, instead of three copies of the question.
+func RootInitialized(root *ScheduleRoot) bool {
+	return root != nil && root.HistoryCompleteFrom != nil
+}
+
+// RequireInitializedRoot is the refusing form of RootInitialized, and the one
+// text of this error in the repository.
+//
+// It is an invariant violation rather than a class of its own: there is no
+// action the caller can take, and a dedicated error code would be a permanent
+// promise in the public contract about a state this binary cannot produce.
+// The operator-facing answer is the upgrade checklist, not an API code.
+func RequireInitializedRoot(root *ScheduleRoot) error {
+	if root == nil {
+		return fmt.Errorf("%w: nil schedule root", ErrInvariantViolation)
+	}
+	if !RootInitialized(root) {
+		return fmt.Errorf("%w (schedule %s)", ErrHistoryMarkerMissing, root.ID)
+	}
+	return nil
+}
 
 // ScheduleRoot is the aggregate identity and concurrency root of a schedule.
 // It carries no configuration: configuration lives only in revisions.
@@ -253,6 +310,27 @@ type ScheduleConfigTx interface {
 	// through Service.RemoveTeamMember, which holds the guard that stops a
 	// person being removed out from under a live assignment.
 	DeleteTeamMembership(ctx context.Context, teamID, userID string) error
+
+	// LockTeam takes the row lock on a team, and is the serialization point
+	// for deleting it: the lock conflicts with the one an insert takes on the
+	// parent row, so "create the first schedule" and "delete the team" cannot
+	// interleave into a raw constraint error.
+	//
+	// It sits between users and schedules in the global lock order
+	// (advisory -> users -> teams -> schedules). Nothing locked teams before,
+	// so the level was added without revisiting the commands above it.
+	//
+	// ErrTeamNotFound when no such team exists: existence is answered here,
+	// under the lock, rather than by a read before the transaction that
+	// nothing keeps true.
+	LockTeam(ctx context.Context, teamID string) error
+
+	// DeleteTeam removes the team and its memberships in this transaction.
+	//
+	// It refuses with ErrTeamHasIntegrations when a team-scoped integration
+	// still references the team. The schedule blocker is not its business:
+	// Service.DeleteTeam checks that first, because it is terminal.
+	DeleteTeam(ctx context.Context, teamID string) error
 }
 
 // NormalizeTimestamp truncates to the resolution the database stores, so a
