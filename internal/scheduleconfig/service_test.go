@@ -377,3 +377,39 @@ func TestFakeCurrentOverridesDoNotResurrectDeleted(t *testing.T) {
 		t.Fatalf("history holds %d revisions, want 3 (append-only)", got)
 	}
 }
+
+// A rolled-back transaction must put back everything it snapshotted, and the
+// snapshot is easy to under-copy: two maps were added to the fake state for
+// DeleteTeam and clone() did not know about them, so any rollback wiped every
+// team the test had registered. Nothing failed, because the tests that delete
+// teams do not roll back and the tests that roll back do not use teams - which
+// is exactly the kind of hole a fake grows quietly.
+func TestFakeRollbackRestoresTeamState(t *testing.T) {
+	repo := fakes.NewScheduleConfigRepo()
+	repo.AddTeams("devops")
+	repo.AddTeamIntegration("billing")
+
+	boom := errors.New("boom")
+	err := repo.WithinTx(context.Background(), func(tx scheduleconfig.ScheduleConfigTx) error {
+		if err := tx.DeleteTeam(context.Background(), "devops"); err != nil {
+			return err
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("WithinTx = %v, want the injected failure", err)
+	}
+
+	// Both maps have to survive: the one the transaction touched, and the one
+	// it never looked at.
+	if err := repo.WithinTx(context.Background(), func(tx scheduleconfig.ScheduleConfigTx) error {
+		return tx.LockTeam(context.Background(), "devops")
+	}); err != nil {
+		t.Errorf("the rolled-back delete stayed applied: %v", err)
+	}
+	if err := repo.WithinTx(context.Background(), func(tx scheduleconfig.ScheduleConfigTx) error {
+		return tx.DeleteTeam(context.Background(), "billing")
+	}); !errors.Is(err, scheduleconfig.ErrTeamHasIntegrations) {
+		t.Errorf("the untouched integration state was lost on rollback: %v", err)
+	}
+}

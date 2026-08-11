@@ -119,6 +119,12 @@ func (s fakeState) clone() fakeState {
 	for k, v := range s.knownUsers {
 		c.knownUsers[k] = v
 	}
+	for k, v := range s.knownTeams {
+		c.knownTeams[k] = v
+	}
+	for k, v := range s.teamIntegrations {
+		c.teamIntegrations[k] = v
+	}
 	return c
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/rotation"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
@@ -185,14 +186,18 @@ func TestDeleteTeamSeesAScheduleCommittedWhileItWaited(t *testing.T) {
 	s := setupTestDB(t)
 	seedTeam(t, s, "devops", "alice", "bob")
 
+	// Built on the test goroutine: revTestSnapshot calls t.Fatalf, and Fatal
+	// from a spawned goroutine ends that goroutine rather than the test.
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	snapshot := revTestSnapshot(t, start)
+
 	inserted := make(chan struct{})
 	commit := make(chan struct{})
 	created := make(chan error, 1)
 
 	go func() {
-		created <- s.ScheduleConfigRepository().WithinTx(context.Background(),
+		err := s.ScheduleConfigRepository().WithinTx(context.Background(),
 			func(tx scheduleconfig.ScheduleConfigTx) error {
-				start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
 				// This INSERT takes FOR KEY SHARE on the team row, which is
 				// what the delete will block on.
 				if err := tx.CreateInitialSchedule(context.Background(),
@@ -202,8 +207,8 @@ func TestDeleteTeamSeesAScheduleCommittedWhileItWaited(t *testing.T) {
 					},
 					&scheduleconfig.ScheduleRevision{
 						ID: "rev-1", ScheduleID: "sched-1", Version: 1,
-						Kind: scheduleconfig.RevisionActive,
-						Snapshot: revTestSnapshot(t, start), EffectiveFrom: start,
+						Kind:     scheduleconfig.RevisionActive,
+						Snapshot: snapshot, EffectiveFrom: start,
 					}); err != nil {
 					return err
 				}
@@ -211,6 +216,15 @@ func TestDeleteTeamSeesAScheduleCommittedWhileItWaited(t *testing.T) {
 				<-commit
 				return nil
 			})
+		// However this ended, the test must not wait on a signal that is never
+		// coming: a failed insert would otherwise hang here until the package
+		// timeout, and report nothing about why.
+		select {
+		case <-inserted:
+		default:
+			close(inserted)
+		}
+		created <- err
 	}()
 
 	<-inserted
@@ -320,5 +334,57 @@ func TestIntegrationWriteForADeletedTeamIsTyped(t *testing.T) {
 	moved.TeamID = &ghost
 	if err := s.UpdateIntegration(moved); !errors.Is(err, ErrIntegrationTeamNotFound) {
 		t.Fatalf("update error = %v, want ErrIntegrationTeamNotFound", err)
+	}
+}
+
+// The merge DoD asks that the audit trail answer this in one query: a save
+// that changes only metadata carries the phase rather than reanchoring it.
+//
+// It is a query rather than an assertion on the returned plan because that is
+// the promise - change_summary is stored next to every revision so someone can
+// ask the database later, without replaying the command that produced it.
+func TestChangeSummaryShowsMetadataSavesCarryThePhase(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops", "alice", "bob")
+
+	now := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	svc := newTestScheduleService(s, now)
+	if _, err := svc.CreateSchedule(context.Background(), "devops", revTestConfig(), "alice", nil); err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+
+	// Metadata only: same groups, same policy, different Slack usergroup.
+	metadata := revTestConfig()
+	metadata.SlackUsergroupID = "S-different"
+	later := newTestScheduleService(s, now.Add(37*time.Hour))
+	if _, err := later.Save(context.Background(), "devops", scheduleconfig.SaveCommand{
+		ExpectedVersion: 1, Desired: metadata, ActorID: "alice",
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	var action, selection string
+	var usergroupChanged, groupsChanged bool
+	if err := s.db.QueryRow(`
+		SELECT change_summary->>'l1_phase_action',
+		       change_summary->>'l1_group_selection',
+		       (change_summary->>'slack_usergroup_changed')::bool,
+		       (change_summary->>'l1_groups_changed')::bool
+		  FROM schedule_revisions
+		 WHERE schedule_id = (SELECT id FROM schedules WHERE team_id = 'devops')
+		 ORDER BY version DESC LIMIT 1`).
+		Scan(&action, &selection, &usergroupChanged, &groupsChanged); err != nil {
+		t.Fatalf("read change_summary: %v", err)
+	}
+
+	if action != rotation.PhaseActionCarry {
+		t.Errorf("l1_phase_action = %q, want carry - a metadata edit restarted the rotation", action)
+	}
+	if selection != rotation.SelectionPreserve {
+		t.Errorf("l1_group_selection = %q, want preserve", selection)
+	}
+	if !usergroupChanged || groupsChanged {
+		t.Errorf("summary must say the usergroup changed and the groups did not, got usergroup=%v groups=%v",
+			usergroupChanged, groupsChanged)
 	}
 }
