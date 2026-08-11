@@ -206,6 +206,13 @@ func (a *API) CreateIntegration(c echo.Context) error {
 		if errors.Is(err, store.ErrDuplicateIntegration) {
 			return c.JSON(http.StatusConflict, ErrorResponse{Error: "integration of this type already exists"})
 		}
+		// The team was validated above and deleted before this write landed.
+		// Deleting a team is a locked, deterministic command, so this side is
+		// the one that loses the race - and it says so as a 404 rather than
+		// handing the caller the name of a foreign key inside a 500.
+		if errors.Is(err, store.ErrIntegrationTeamNotFound) {
+			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "team not found"})
+		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 
@@ -306,6 +313,11 @@ func (a *API) UpdateIntegration(c echo.Context) error {
 	}
 
 	if err := a.store.UpdateIntegration(existing); err != nil {
+		// Same race as on create: moving an integration onto a team scope
+		// writes team_id, and the team can go away in between.
+		if errors.Is(err, store.ErrIntegrationTeamNotFound) {
+			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "team not found"})
+		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 

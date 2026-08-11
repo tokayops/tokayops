@@ -2,14 +2,15 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/lib/pq"
 
+	"github.com/tokayops/tokayops/internal/config"
+	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
@@ -116,11 +117,10 @@ func TestDeleteTeamWithScheduleHistoryIsTypedNotAConstraintError(t *testing.T) {
 // consequences: inserting a row that references a team takes FOR KEY SHARE on
 // the parent, and FOR UPDATE conflicts with it.
 //
-// Tested directly because the end-to-end race below cannot prove it - the
-// delete is two statements and a create is a whole pipeline, so the delete
-// wins every time on speed alone and the contended window never opens by
-// chance. Without this test the lock could be deleted and every other test
-// here would still pass.
+// Tested directly rather than through a concurrent create: the delete is two
+// statements against a whole create pipeline, so it wins on speed and the
+// contended window never opens by chance. Without this test the lock could be
+// removed and everything else here would still pass.
 func TestLockTeamBlocksConcurrentScheduleInsert(t *testing.T) {
 	s := setupTestDB(t)
 	seedTeam(t, s, "devops", "alice")
@@ -168,83 +168,157 @@ func TestLockTeamBlocksConcurrentScheduleInsert(t *testing.T) {
 	}
 }
 
-// Both interleavings of "create the first schedule" and "delete the team",
-// under real concurrency.
+// The half of S6-D10 that the lock alone does not give: after waiting for the
+// lock, the delete has to SEE the schedule that committed while it waited.
 //
-// What this pins is the outcome contract: exactly one wins, the loser gets a
-// typed error, and nothing answers with the text of a constraint. That the
-// lock is what buys it is the test above.
-func TestDeleteTeamRacesFirstSaveDeterministically(t *testing.T) {
+// That is READ COMMITTED, and it is the reason the root is read AFTER the
+// lock. Both halves are verified by mutation, and they fail differently:
+//
+//   - WithinTx on sql.LevelRepeatableRead: "could not serialize access due to
+//     concurrent update" - the snapshot predates the create;
+//   - reading the root before LockTeam: the raw schedule_revisions_schedule_id
+//     _fkey violation, which is the exact 500 this sprint exists to remove.
+//
+// Deterministic by construction, not by repetition: the create holds its
+// transaction open until the delete is provably blocked on the lock.
+func TestDeleteTeamSeesAScheduleCommittedWhileItWaited(t *testing.T) {
 	s := setupTestDB(t)
-	now := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
-	svc := newTestScheduleService(s, now)
+	seedTeam(t, s, "devops", "alice", "bob")
 
-	// Both goroutines released at once, on a fresh team each round.
-	//
-	// In practice the delete wins every round: it is two statements against a
-	// whole create pipeline. So this does NOT demonstrate the lock - removing
-	// LockTeam leaves it green, which is why the test above exists. What it
-	// does hold is the outcome contract under real concurrency, including that
-	// the losing create is answered in the contract's vocabulary rather than
-	// with a constraint name.
-	const rounds = 25
-	for i := 0; i < rounds; i++ {
-		teamID := fmt.Sprintf("devops-%d", i)
-		seedTeam(t, s, teamID, "alice", "bob")
+	inserted := make(chan struct{})
+	commit := make(chan struct{})
+	created := make(chan error, 1)
 
-		var wg sync.WaitGroup
-		var createErr, deleteErr error
-		start := make(chan struct{})
+	go func() {
+		created <- s.ScheduleConfigRepository().WithinTx(context.Background(),
+			func(tx scheduleconfig.ScheduleConfigTx) error {
+				start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+				// This INSERT takes FOR KEY SHARE on the team row, which is
+				// what the delete will block on.
+				if err := tx.CreateInitialSchedule(context.Background(),
+					&scheduleconfig.ScheduleRoot{
+						ID: "sched-1", TeamID: "devops",
+						ConfigVersion: 1, HistoryCompleteFrom: &start,
+					},
+					&scheduleconfig.ScheduleRevision{
+						ID: "rev-1", ScheduleID: "sched-1", Version: 1,
+						Kind: scheduleconfig.RevisionActive,
+						Snapshot: revTestSnapshot(t, start), EffectiveFrom: start,
+					}); err != nil {
+					return err
+				}
+				close(inserted)
+				<-commit
+				return nil
+			})
+	}()
 
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			<-start
-			deleteErr = svc.DeleteTeam(context.Background(), teamID)
-		}()
-		go func() {
-			defer wg.Done()
-			<-start
-			_, createErr = svc.CreateSchedule(context.Background(), teamID, revTestConfig(), "alice", nil)
-		}()
-		close(start)
-		wg.Wait()
+	<-inserted
 
-		// Exactly one of them wins, and the loser says so in the contract's
-		// own vocabulary.
-		switch {
-		case deleteErr == nil:
-			// Two typed answers, one per sub-interleaving, and both are
-			// legitimate readings of "the team is gone":
-			//
-			//   - the delete committed before the create read membership:
-			//     memberships went with the team, so validation refuses first
-			//     and says the users are not members;
-			//   - it committed after that read but before the insert: the
-			//     foreign key fires and the store maps it to ErrTeamNotFound.
-			//
-			// The second is why the foreign key mapping stays a backstop even
-			// though the lock is what makes the common case deterministic.
-			if !errors.Is(createErr, scheduleconfig.ErrUserNotTeamMember) &&
-				!errors.Is(createErr, scheduleconfig.ErrTeamNotFound) {
-				t.Fatalf("round %d: team deleted, so the create must lose with a typed error, got %v", i, createErr)
-			}
-		case createErr == nil:
-			var retained *scheduleconfig.TeamHasScheduleHistoryError
-			if !errors.As(deleteErr, &retained) {
-				t.Fatalf("round %d: schedule created, so the delete must lose with TeamHasScheduleHistoryError, got %v", i, deleteErr)
-			}
-		default:
-			t.Fatalf("round %d: both failed: create=%v delete=%v", i, createErr, deleteErr)
-		}
+	deleted := make(chan error, 1)
+	go func() {
+		deleted <- newTestScheduleService(s, time.Now().UTC()).
+			DeleteTeam(context.Background(), "devops")
+	}()
 
-		// Whatever the order, nothing leaked a driver error - that is the 500
-		// this whole story is about.
-		for _, err := range []error{createErr, deleteErr} {
-			var pqErr *pq.Error
-			if errors.As(err, &pqErr) {
-				t.Fatalf("round %d: a raw SQL error escaped: %v", i, pqErr)
-			}
-		}
+	// The delete must be waiting, not finished: if it answered here it either
+	// never took the lock or took it before the insert, and the interleaving
+	// under test never happened.
+	select {
+	case err := <-deleted:
+		close(commit)
+		t.Fatalf("the delete finished while the create still held the team row: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(commit)
+	if err := <-created; err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var retained *scheduleconfig.TeamHasScheduleHistoryError
+	if err := <-deleted; !errors.As(err, &retained) {
+		t.Fatalf("error = %v, want TeamHasScheduleHistoryError - the delete did not see the schedule it waited for", err)
+	}
+	if n := countRows(t, s, `SELECT COUNT(*) FROM teams WHERE id = 'devops'`); n != 1 {
+		t.Fatal("the team was deleted despite the refusal")
+	}
+}
+
+// The other order, without concurrency because it needs none: once the team is
+// gone, the create loses in the contract's vocabulary rather than on a
+// constraint. Two typed answers are possible - membership validation runs
+// before the insert and the memberships went with the team - and either is a
+// legitimate reading of "the team is gone".
+func TestCreateScheduleForATeamThatWasJustDeleted(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops", "alice", "bob")
+
+	svc := newTestScheduleService(s, time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC))
+	if err := svc.DeleteTeam(context.Background(), "devops"); err != nil {
+		t.Fatalf("DeleteTeam: %v", err)
+	}
+
+	_, err := svc.CreateSchedule(context.Background(), "devops", revTestConfig(), "alice", nil)
+	if !errors.Is(err, scheduleconfig.ErrUserNotTeamMember) &&
+		!errors.Is(err, scheduleconfig.ErrTeamNotFound) {
+		t.Fatalf("error = %v, want a typed refusal", err)
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		t.Fatalf("a raw SQL error escaped: %v", pqErr)
+	}
+}
+
+// The mirror image of the delete's own race: an integration write that loses
+// to a team deletion.
+//
+// The delete holds a row lock and answers deterministically, so this side is
+// always the loser - and the loser used to hand the caller the name of a
+// foreign key inside a 500. Only integrations_team_id_fkey is translated; any
+// other constraint on this table means something else.
+func TestIntegrationWriteForADeletedTeamIsTyped(t *testing.T) {
+	s := setupTestDB(t)
+
+	// Set here rather than relying on the package default: two other tests in
+	// this package take the key and `defer os.Unsetenv` it, so whether it is
+	// present by the time this runs depends on test order. t.Setenv restores
+	// the previous value instead of clearing it.
+	t.Setenv(config.EncryptionKeyEnv,
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+
+	scope := model.WebhookScopeTeam
+	ghost := "ghost-team"
+	err := s.CreateIntegration(&model.Integration{
+		ID: "int-orphan", Type: model.IntegrationTypeGenericWebhook,
+		Name: "orphan hook", Enabled: true, Scope: &scope, TeamID: &ghost,
+		Config: json.RawMessage(`{"url":"https://example.test/hook"}`),
+	})
+	if !errors.Is(err, ErrIntegrationTeamNotFound) {
+		t.Fatalf("create error = %v, want ErrIntegrationTeamNotFound", err)
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		t.Fatalf("a raw SQL error leaked through the contract: %v", pqErr)
+	}
+
+	// Update reaches the same foreign key, because moving an integration onto
+	// a team scope writes team_id too.
+	seedTeam(t, s, "devops")
+	live := "devops"
+	if err := s.CreateIntegration(&model.Integration{
+		ID: "int-live", Type: model.IntegrationTypeGenericWebhook,
+		Name: "live hook", Enabled: true, Scope: &scope, TeamID: &live,
+		Config: json.RawMessage(`{"url":"https://example.test/hook"}`),
+	}); err != nil {
+		t.Fatalf("CreateIntegration: %v", err)
+	}
+	moved, err := s.GetIntegrationByID("int-live")
+	if err != nil {
+		t.Fatalf("GetIntegrationByID: %v", err)
+	}
+	moved.TeamID = &ghost
+	if err := s.UpdateIntegration(moved); !errors.Is(err, ErrIntegrationTeamNotFound) {
+		t.Fatalf("update error = %v, want ErrIntegrationTeamNotFound", err)
 	}
 }

@@ -127,6 +127,11 @@ func TestScheduleRoutesRefuseWhenUnwired(t *testing.T) {
 		{http.MethodDelete, "/api/v1/schedules/s1/overrides/o1?expected_revision=1", nil},
 		{http.MethodDelete, "/api/v1/teams/devops/members/alex", nil},
 		{http.MethodDelete, "/api/v1/users/alex", nil},
+
+		// Deleting a team is on this list because what retains a team is its
+		// schedule history: the command needs the same stack, and answering
+		// 204 without it would delete a team whose blockers nobody looked at.
+		{http.MethodDelete, "/api/v1/teams/devops", nil},
 	}
 
 	for _, r := range routes {
