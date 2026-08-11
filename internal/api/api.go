@@ -832,9 +832,9 @@ type TeamListResponse struct {
 // the same statement as the row), so it means an upgrade whose destructive
 // schedule reset was skipped. Everywhere else that state is an invariant
 // violation, but a list of teams must stay answerable: failing the whole page
-// because one row is corrupt is the blast radius Sprint 6A spent its time
-// removing from the notifier tick. It is logged, and the schedule endpoints of
-// that one team say plainly what is wrong.
+// because one row is corrupt is the same blast radius that was taken out of the
+// notifier tick. It is logged, and the schedule endpoints of that one team say
+// plainly what is wrong.
 //
 // One snapshot for the whole page, not one per team: the list is a single
 // answer, and reading each team in its own transaction would let a save

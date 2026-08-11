@@ -25,8 +25,9 @@ type cacheEntry struct {
 // UsergroupSyncer synchronizes Slack usergroups with current on-call users.
 type UsergroupSyncer struct {
 	// Only identities are read from the store: the usergroup and its members
-	// come from the projection, which is the whole point of Sprint 6A. The
-	// narrow type is what says so without a comment having to.
+	// come from the projection, and reading either from anywhere else would be a
+	// second source of truth for them. The narrow type is what says so without a
+	// comment having to.
 	store        identityLookup
 	oncall       onCallLister
 	slackClient  *slack.Client

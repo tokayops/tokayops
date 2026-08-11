@@ -54,7 +54,7 @@ func TestBusinessCollector_ActiveAlertGroups(t *testing.T) {
 // The two on-call gauges are NOT asserted here, and that is a decision rather
 // than a gap. They are answers about the revision model, which the mock does
 // not implement - it would have to grow a second projection to do so, and two
-// implementations of "who is on duty" is the thing this epic removed. The mock
+// implementations of "who is on duty" is exactly what was removed. The mock
 // reports zero for both; a test over that would assert the double, not the
 // query.
 //

@@ -2460,9 +2460,9 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 
 	// Teams without on-call and teams with permanent on-call are reported as
 	// zero, deliberately. Both are answers about the revision model, which this
-	// mock does not implement (that was the Sprint 2 decision: one projection,
-	// not two), and computing them from something else here would be a second
-	// definition of "has a schedule" that could disagree with the real one.
+	// mock does not implement - deliberately, so that there is one projection
+	// rather than two - and computing them from something else here would be a
+	// second definition of "has a schedule" that could disagree with the real one.
 	//
 	// Their coverage is the integration test against the real query.
 
