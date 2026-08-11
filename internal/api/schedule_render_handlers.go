@@ -11,8 +11,8 @@ import (
 )
 
 // maxRenderRange bounds one render request. Without it a client can make the
-// renderer materialize years of daily slots for a single call; the legacy
-// handler had the same limit and clients already respect it.
+// renderer materialize years of daily slots for a single call. The limit is
+// unchanged from the endpoint this replaced, so clients already respect it.
 const maxRenderRange = 90 * 24 * time.Hour
 
 // RenderSchedule godoc
@@ -46,7 +46,7 @@ func (a *API) RenderSchedule(c echo.Context) error {
 	ctx := c.Request().Context()
 	var scheduleID string
 	err = a.scheduleRead.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
-		root, err := view.GetScheduleRootByTeam(ctx, c.Param("id"))
+		root, err := a.revisionRoot(ctx, view, c.Param("id"))
 		if err != nil {
 			return err
 		}
@@ -57,9 +57,6 @@ func (a *API) RenderSchedule(c echo.Context) error {
 		return a.mapScheduleError(c, err)
 	}
 
-	// A legacy row is answered rather than refused: it degrades honestly to an
-	// empty calendar with history_complete false, which is exactly what is
-	// true about it - the revision chain knows nothing of its rotation.
 	res, err := a.scheduleRenderer.RenderRange(ctx, scheduleID, from, until, nil)
 	if err != nil {
 		return a.mapScheduleError(c, err)

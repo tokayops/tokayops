@@ -91,8 +91,8 @@ func ScopeCurrentUser() ScopeResolver {
 //
 // There is deliberately no "schedule" kind. Scoping by schedule ID happens only
 // on the override routes, and those go through ScopeScheduleOverride, which
-// reads the revision contract; a resolver built on the legacy schedule reader
-// would refuse every schedule the revision model governs.
+// reads the revision contract - the only place a schedule's owning team can be
+// established.
 //
 // It assumes the read repository is wired, because requireScheduleStack runs
 // ahead of it on every route that uses it.
@@ -160,10 +160,9 @@ func ScopeFromResource(kind, paramName string) ScopeResolver {
 // ScopeScheduleOverride checks that the override exists AND belongs to the
 // named schedule (IDOR protection), then scopes to the owning team.
 //
-// It reads through the revision contract rather than the legacy schedule
-// reader. That reader now refuses any schedule governed by revisions, so
-// leaving it here would turn every override request into a 500 - and the
-// override tables it would be consulting are not the ones the commands write.
+// It reads through the revision contract, which is where both the schedule and
+// its overrides live. Checking ownership anywhere else would be checking tables
+// the commands do not write.
 func ScopeScheduleOverride(scheduleIDParam, overrideIDParam string) ScopeResolver {
 	return func(c echo.Context, api *API) (rbac.Scope, error) {
 		scheduleID := c.Param(scheduleIDParam)

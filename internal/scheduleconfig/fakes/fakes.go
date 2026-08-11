@@ -2,7 +2,7 @@
 // erasure unit-of-work interfaces for service unit tests.
 //
 // These fakes deliberately mirror only the narrow interfaces, not the full
-// persistence model: the legacy MockStore is never extended with revisions.
+// persistence model: MockStore is never extended with revisions.
 // SQL correctness is proven by integration tests against a real PostgreSQL.
 package fakes
 
@@ -343,9 +343,9 @@ func (r *ScheduleConfigRepo) RootCount() int {
 // SeedRoot inserts a schedule root directly, with whatever revision chain it
 // already has - usually none.
 //
-// No command can produce a root without a chain, which is the point: a legacy
-// row, a broken chain and a missing history horizon are all states the readers
-// have to answer for, and none of them is reachable through the command side.
+// No command can produce a root without a chain, which is the point: a broken
+// chain and a missing history horizon are both states the readers have to answer
+// for, and neither is reachable through the command side.
 func (r *ScheduleConfigRepo) SeedRoot(root scheduleconfig.ScheduleRoot) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -353,13 +353,13 @@ func (r *ScheduleConfigRepo) SeedRoot(root scheduleconfig.ScheduleRoot) {
 	r.state.teamIndex[root.TeamID] = root.ID
 }
 
-// SeedLegacyRoot inserts a schedule row from before the revision model: a root
-// at config_version 0 with no revision chain.
+// SeedRootWithoutHistory inserts a schedule row that no live path could have
+// written: no history horizon, no revision chain, config_version 0.
 //
-// It is what the upgrade leaves behind, and the commands have to refuse it
-// while the read paths have to report it as no schedule at all. Without a way
-// to build it here, neither would be testable.
-func (r *ScheduleConfigRepo) SeedLegacyRoot(scheduleID, teamID string) {
+// It is what an upgrade leaves behind when the destructive schedule reset is
+// skipped. Every path has to refuse it loudly, and without a way to build one
+// here that could not be tested at all.
+func (r *ScheduleConfigRepo) SeedRootWithoutHistory(scheduleID, teamID string) {
 	r.SeedRoot(scheduleconfig.ScheduleRoot{ID: scheduleID, TeamID: teamID})
 }
 

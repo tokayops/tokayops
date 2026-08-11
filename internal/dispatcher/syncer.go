@@ -10,7 +10,6 @@ import (
 
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/schedulerender"
-	"github.com/tokayops/tokayops/internal/store"
 	"github.com/slack-go/slack"
 )
 
@@ -25,7 +24,11 @@ type cacheEntry struct {
 
 // UsergroupSyncer synchronizes Slack usergroups with current on-call users.
 type UsergroupSyncer struct {
-	store        store.StoreInterface
+	// Only identities are read from the store: the usergroup and its members
+	// come from the projection, and reading either from anywhere else would be a
+	// second source of truth for them. The narrow type is what says so without a
+	// comment having to.
+	store        identityLookup
 	oncall       onCallLister
 	slackClient  *slack.Client
 	syncInterval time.Duration
@@ -39,7 +42,7 @@ type UsergroupSyncer struct {
 // Start/Stop are non-blocking - old syncer will stop asynchronously when its context is cancelled.
 // Uses generation-based cleanup to detect dead syncers and allow restart.
 type UsergroupSyncerManager struct {
-	store        store.StoreInterface
+	store        identityLookup
 	oncall       onCallLister
 	syncInterval time.Duration
 
@@ -50,7 +53,7 @@ type UsergroupSyncerManager struct {
 }
 
 // NewUsergroupSyncerManager creates a new manager for UsergroupSyncer.
-func NewUsergroupSyncerManager(st store.StoreInterface, oncall onCallLister, interval time.Duration) *UsergroupSyncerManager {
+func NewUsergroupSyncerManager(st identityLookup, oncall onCallLister, interval time.Duration) *UsergroupSyncerManager {
 	return &UsergroupSyncerManager{
 		store:        st,
 		oncall:       oncall,
@@ -121,7 +124,7 @@ func (m *UsergroupSyncerManager) IsRunning() bool {
 }
 
 // NewUsergroupSyncer creates a new usergroup syncer.
-func NewUsergroupSyncer(st store.StoreInterface, oncall onCallLister, slackToken string, interval time.Duration) *UsergroupSyncer {
+func NewUsergroupSyncer(st identityLookup, oncall onCallLister, slackToken string, interval time.Duration) *UsergroupSyncer {
 	return &UsergroupSyncer{
 		store:        st,
 		oncall:       oncall,

@@ -13,7 +13,6 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
-	"github.com/tokayops/tokayops/internal/store"
 	"github.com/google/uuid"
 )
 
@@ -29,15 +28,42 @@ type dmProviderLookup interface {
 // is on duty everywhere, right now, read from one database snapshot.
 //
 // It is declared here rather than taken as *schedulerender.Service because the
-// revision model is deliberately absent from the legacy MockStore. A narrow
+// revision model is deliberately absent from MockStore. A narrow
 // interface is what keeps these unit tests off PostgreSQL.
 type onCallLister interface {
 	CurrentOnCallForAllNow(ctx context.Context) (schedulerender.BulkOnCall, error)
 }
 
+// The store side of a tick, named by role rather than taken whole.
+//
+// The notifier used to hold a store.StoreInterface for these three methods,
+// which is a hundred-odd others it never calls - and its test double embedded
+// that interface, so nothing showed which three were real and a double that
+// implemented none of them still compiled.
+type teamDirectory interface {
+	GetAllTeams() ([]*model.Team, error)
+}
+
+type identityLookup interface {
+	GetIdentitiesForUsers(userIDs []string) (map[string][]*model.ExternalIdentity, error)
+}
+
+type jobCreator interface {
+	CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
+		steps []*model.JobStep) (id string, created bool, err error)
+}
+
+// notifierStore is the three roles together, so the constructor keeps taking
+// one argument and *store.Store still satisfies it structurally.
+type notifierStore interface {
+	teamDirectory
+	identityLookup
+	jobCreator
+}
+
 // HandoffNotifier detects on-call changes and creates notification jobs.
 type HandoffNotifier struct {
-	store         store.StoreInterface
+	store         notifierStore
 	oncall        onCallLister
 	providers     dmProviderLookup
 	checkInterval time.Duration
@@ -61,7 +87,7 @@ type HandoffNotifier struct {
 // NewHandoffNotifier creates a new HandoffNotifier. oncall is the schedule
 // projection; providers is the capability registry view used to filter linked
 // identities down to those served by a registered dm-capable provider.
-func NewHandoffNotifier(st store.StoreInterface, oncall onCallLister, providers dmProviderLookup, interval time.Duration) *HandoffNotifier {
+func NewHandoffNotifier(st notifierStore, oncall onCallLister, providers dmProviderLookup, interval time.Duration) *HandoffNotifier {
 	return &HandoffNotifier{
 		store:         st,
 		oncall:        oncall,

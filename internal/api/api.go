@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -65,9 +66,9 @@ type API struct {
 	telegram         TelegramAPI                                         // optional, nil = telegram interactivity disabled
 
 	// Schedule configuration is deliberately NOT reached through
-	// store.StoreInterface. The revision model is not mirrored into the legacy
-	// mock, and routing it through the same interface would be an invitation
-	// to read a schedule's rotation from the mutable columns again.
+	// store.StoreInterface. The revision model is not mirrored into MockStore,
+	// and routing it through the same interface would put the configuration back
+	// behind the door its own tables were taken out from.
 	scheduleConfig      *scheduleconfig.Service
 	scheduleRead        scheduleconfig.ScheduleReadRepository
 	scheduleRenderer    *schedulerender.Service
@@ -227,13 +228,6 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.PUT("/users/:id", a.UpdateUser, a.Require(rbac.ActionUserUpdate, ScopeGlobal()))
 	v1.PUT("/users/:id/password", a.UpdateUserPassword, a.Require(rbac.ActionUserPasswordUpdate, ScopeUserSelfOrAdmin("id")))
 	v1.DELETE("/users/:id", a.DeleteUser, a.requireUserEraser, a.Require(rbac.ActionUserDelete, ScopeGlobal()))
-
-	// Schedules
-	v1.GET("/teams/:id/schedule", a.GetTeamSchedule, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
-	v1.PUT("/teams/:id/schedule", a.UpsertTeamSchedule, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.PUT("/teams/:id/schedule/l1-groups", a.SetScheduleL1Groups, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.PUT("/teams/:id/schedule/l2-users", a.SetScheduleL2Users, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.GET("/teams/:id/oncall", a.GetTeamOnCall, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
 
 	// Schedule configuration (revision model).
 	//
@@ -828,16 +822,19 @@ type TeamListResponse struct {
 
 // teamsWithSchedule answers which of these teams have a live schedule.
 //
-// It reads the revision root rather than the legacy row. The legacy read now
-// refuses a revision-managed schedule outright (store.ErrScheduleSuperseded),
-// and the previous version of this loop discarded that error with `schedule,
-// _ :=`, so every configured team reported itself as unconfigured. The insured
-// failure became a silent wrong answer at exactly the point the insurance was
-// meant to make loud.
+// Absent and soft-deleted schedules are "not configured", and any OTHER
+// repository error fails the request. Swallowing errors is what produced an
+// earlier defect here - a discarded error made every configured team report
+// itself unconfigured - and it is not reproduced.
 //
-// So: absent and pre-revision schedules are "not configured", a soft-deleted
-// one is too, and any OTHER repository error fails the request. Swallowing
-// errors is what produced the defect; it is not reproduced here.
+// A root with no history horizon is the one place this file answers quietly.
+// It cannot be produced by any live path (the create flow writes the horizon in
+// the same statement as the row), so it means an upgrade whose destructive
+// schedule reset was skipped. Everywhere else that state is an invariant
+// violation, but a list of teams must stay answerable: failing the whole page
+// because one row is corrupt is the same blast radius that was taken out of the
+// notifier tick. It is logged, and the schedule endpoints of that one team say
+// plainly what is wrong.
 //
 // One snapshot for the whole page, not one per team: the list is a single
 // answer, and reading each team in its own transaction would let a save
@@ -859,7 +856,12 @@ func (a *API) teamsWithSchedule(ctx context.Context, teams []*model.Team) (map[s
 			case err != nil:
 				return err
 			}
-			if scheduleconfig.IsLegacyRoot(root) || root.DeletedAt != nil {
+			if root.HistoryCompleteFrom == nil {
+				log.Printf("ALERT schedule_config: team %s has a schedule row with no history horizon (%s); the upgrade reset was not run",
+					team.ID, root.ID)
+				continue
+			}
+			if root.DeletedAt != nil {
 				continue
 			}
 			out[team.ID] = struct{}{}

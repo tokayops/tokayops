@@ -15,10 +15,10 @@ import (
 	"github.com/tokayops/tokayops/internal/testutil"
 )
 
-// seedRevisionSchedule creates a schedule through the revision-model endpoint
-// and returns its config_version. The legacy store writer is deliberately not
-// used: a row it produces is refused by the new commands, which is the point
-// of the guard.
+// seedRevisionSchedule creates a schedule through the API and returns its
+// config_version. Going through the endpoint rather than writing rows is what
+// makes these fixtures the same thing a user would have: a schedule root and
+// its first revision, written together.
 func seedRevisionSchedule(t *testing.T, env *APIIntegrationEnv, teamID, actorID string, groups ...[]string) int64 {
 	t.Helper()
 	monday := 1
@@ -109,123 +109,6 @@ func TestSchedule_Overrides_Conflict(t *testing.T) {
 	}
 }
 
-func TestSchedule_Timezones_And_Updates(t *testing.T) {
-	env := setupAPITest(t)
-
-	// Setup Data
-	admin := testutil.SeedUser(t, env.S, "admin@example.com")
-	team := testutil.SeedTeam(t, env.S, "tz-team")
-	user1 := testutil.SeedUser(t, env.S, "u1-tz@example.com")
-	testutil.SeedTeamMember(t, env.S, team.ID, user1.ID, model.TeamMemberRoleMember)
-
-	// 1. Create Schedule with Specific Timezone via API
-	createReq := map[string]interface{}{
-		"team_id":           team.ID,
-		"timezone":          "Europe/Moscow",
-		"l1_rotation_type":  "weekly",
-		"l1_handoff_time":   "09:00",
-		"l1_handoff_day":    1, // Monday
-		"l1_rotation_start": time.Now().Format(time.RFC3339),
-		"l1_users":          []string{user1.ID},
-	}
-	jsonBody, _ := json.Marshal(createReq)
-	req := createAuthenticatedRequest(t, http.MethodPut, "/api/v1/teams/"+team.ID+"/schedule", jsonBody, admin.ID)
-	rec := httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
-		t.Fatalf("Expected 200 OK or 201 Created, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// 1.1 Set Groups for the Schedule (Required as Upsert doesn't handle groups - mimicking UI behavior)
-	groupsReq := map[string]interface{}{
-		"groups": [][]string{{user1.ID}},
-	}
-	groupsJson, _ := json.Marshal(groupsReq)
-	reqGroups := createAuthenticatedRequest(t, http.MethodPut, "/api/v1/teams/"+team.ID+"/schedule/l1-groups", groupsJson, admin.ID)
-	recGroups := httptest.NewRecorder()
-	env.Echo.ServeHTTP(recGroups, reqGroups)
-	if recGroups.Code != http.StatusOK {
-		t.Fatalf("Expected 200 OK for setting groups, got %d: %s", recGroups.Code, recGroups.Body.String())
-	}
-
-	// Verify DB
-	sched, err := env.S.GetScheduleByTeamID(team.ID)
-	if err != nil {
-		t.Fatalf("Failed to fetch schedule: %v", err)
-	}
-	if sched.Timezone != "Europe/Moscow" {
-		t.Errorf("Expected timezone Europe/Moscow, got %s", sched.Timezone)
-	}
-	// Verify L1 Users persistence via RotationEpochs
-	// We didn't seed users into the rotation_epochs table, and UpsertTeamSchedule might not be creating one.
-	// But GetScheduleByTeamID doesn't load epochs either.
-	// So we need to fetch epochs to see if any exist.
-	epochs, err := env.S.GetRotationEpochs(sched.ID, "l1", time.Now().Add(-24*time.Hour), time.Now().Add(24*time.Hour))
-	if err != nil {
-		t.Fatalf("Failed to fetch epochs: %v", err)
-	}
-	if len(epochs) == 0 {
-		t.Fatalf("Expected at least one rotation epoch after creation, got 0. L1Users might have been dropped.")
-	}
-	if len(epochs[0].Groups) == 0 || len(epochs[0].Groups[0]) == 0 || epochs[0].Groups[0][0] != user1.ID {
-		t.Errorf("Expected user %s in epoch groups, got %v", user1.ID, epochs[0].Groups)
-	}
-
-	// 2. Update Schedule (Change Timezone and Handoff) - PUT is a full replacement
-	// First fetch existing to keep other fields
-	sched, err = env.S.GetScheduleByTeamID(team.ID)
-	if err != nil {
-		t.Fatalf("Failed to fetch schedule for update: %v", err)
-	}
-
-	updateReq := map[string]interface{}{
-		"team_id":           team.ID,
-		"timezone":          "Asia/Tokyo", // Changed
-		"l1_rotation_type":  sched.L1RotationType,
-		"l1_handoff_time":   "18:00", // Changed
-		"l1_handoff_day":    sched.L1HandoffDay,
-		"l1_rotation_start": sched.L1RotationStart.Format(time.RFC3339),
-		"l1_users":          []string{user1.ID},
-	}
-	jsonBody, _ = json.Marshal(updateReq)
-	req = createAuthenticatedRequest(t, http.MethodPut, "/api/v1/teams/"+team.ID+"/schedule", jsonBody, admin.ID)
-	rec = httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 OK for update, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// 2.1 Set Groups for the Updated Schedule (Mimic UI)
-	groupsReqUpdate := map[string]interface{}{
-		"groups": [][]string{{user1.ID}},
-	}
-	groupsJsonUpdate, _ := json.Marshal(groupsReqUpdate)
-	reqGroupsUpdate := createAuthenticatedRequest(t, http.MethodPut, "/api/v1/teams/"+team.ID+"/schedule/l1-groups", groupsJsonUpdate, admin.ID)
-	recGroupsUpdate := httptest.NewRecorder()
-	env.Echo.ServeHTTP(recGroupsUpdate, reqGroupsUpdate)
-	if recGroupsUpdate.Code != http.StatusOK {
-		t.Fatalf("Expected 200 OK for setting groups update, got %d: %s", recGroupsUpdate.Code, recGroupsUpdate.Body.String())
-	}
-
-	// Verify Updates Persisted
-	updatedSched, err := env.S.GetScheduleByTeamID(team.ID)
-	if err != nil {
-		t.Fatalf("Failed to fetch updated schedule: %v", err)
-	}
-	if updatedSched.Timezone != "Asia/Tokyo" {
-		t.Errorf("Expected timezone Asia/Tokyo, got %s", updatedSched.Timezone)
-	}
-	if updatedSched.L1HandoffTime != "18:00" {
-		t.Errorf("Expected handoff 18:00, got %s", updatedSched.L1HandoffTime)
-	}
-	// Verify existing fields didn't break
-	if updatedSched.L1RotationType != model.RotationWeekly {
-		t.Errorf("Expected rotation type preserved as weekly, got %s", updatedSched.L1RotationType)
-	}
-}
-
 func TestSchedule_Delete(t *testing.T) {
 	env := setupAPITest(t)
 
@@ -282,167 +165,6 @@ func TestSchedule_Creation_Validation(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("Expected 404 for non-existent team, got %d", rec.Code)
-	}
-}
-
-// TestSchedule_SetL1Groups_Validation covers all validation rules of the
-// PUT /api/v1/teams/:id/schedule/l1-groups endpoint.
-func TestSchedule_SetL1Groups_Validation(t *testing.T) {
-	env := setupAPITest(t)
-
-	admin := testutil.SeedUser(t, env.S, "admin@example.com")
-	team := testutil.SeedTeam(t, env.S, "validation-team")
-	uA := testutil.SeedUser(t, env.S, "ua@example.com")
-	uB := testutil.SeedUser(t, env.S, "ub@example.com")
-	uOutsider := testutil.SeedUser(t, env.S, "outsider@example.com")
-	testutil.SeedTeamMember(t, env.S, team.ID, uA.ID, model.TeamMemberRoleMember)
-	testutil.SeedTeamMember(t, env.S, team.ID, uB.ID, model.TeamMemberRoleMember)
-	// uOutsider deliberately not added to team
-
-	// Schedule must exist (handler returns 404 if missing)
-	if err := env.S.CreateSchedule(&model.Schedule{
-		ID:              "sched-validation",
-		TeamID:          team.ID,
-		Timezone:        "UTC",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "09:00",
-		L1RotationStart: time.Now(),
-	}); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
-
-	put := func(t *testing.T, body map[string]interface{}) int {
-		t.Helper()
-		jsonBody, _ := json.Marshal(body)
-		req := createAuthenticatedRequest(t, http.MethodPut,
-			"/api/v1/teams/"+team.ID+"/schedule/l1-groups", jsonBody, admin.ID)
-		rec := httptest.NewRecorder()
-		env.Echo.ServeHTTP(rec, req)
-		return rec.Code
-	}
-
-	// 1. Empty group inside groups → 400
-	if code := put(t, map[string]interface{}{"groups": [][]string{{}}}); code != http.StatusBadRequest {
-		t.Errorf("Empty inner group: expected 400, got %d", code)
-	}
-
-	// 2. Duplicate user within a single group → 400
-	if code := put(t, map[string]interface{}{"groups": [][]string{{uA.ID, uA.ID}}}); code != http.StatusBadRequest {
-		t.Errorf("Duplicate user in group: expected 400, got %d", code)
-	}
-
-	// 3. User exists but is not a team member → 400
-	if code := put(t, map[string]interface{}{"groups": [][]string{{uOutsider.ID}}}); code != http.StatusBadRequest {
-		t.Errorf("Non-member user: expected 400, got %d", code)
-	}
-
-	// 4. User does not exist at all → 400
-	if code := put(t, map[string]interface{}{"groups": [][]string{{"u-nonexistent"}}}); code != http.StatusBadRequest {
-		t.Errorf("Nonexistent user: expected 400, got %d", code)
-	}
-
-	// 5. Valid groups → 200, epoch created with the groups
-	if code := put(t, map[string]interface{}{"groups": [][]string{{uA.ID, uB.ID}}}); code != http.StatusOK {
-		t.Errorf("Valid groups: expected 200, got %d", code)
-	}
-	epoch, err := env.S.GetCurrentEpoch("sched-validation", "l1")
-	if err != nil {
-		t.Fatalf("GetCurrentEpoch after valid set: %v", err)
-	}
-	if len(epoch.Groups) != 1 || len(epoch.Groups[0]) != 2 {
-		t.Errorf("Expected 1 group of 2 users, got %v", epoch.Groups)
-	}
-
-	// 6. Empty groups array → 200, current epoch closed, no new epoch
-	if code := put(t, map[string]interface{}{"groups": [][]string{}}); code != http.StatusOK {
-		t.Errorf("Empty groups (clear): expected 200, got %d", code)
-	}
-	if _, err := env.S.GetCurrentEpoch("sched-validation", "l1"); err == nil {
-		t.Errorf("Expected no current epoch after clear, but GetCurrentEpoch succeeded")
-	}
-
-	// 7. Same user in multiple groups (allowed, dedup is per-group only)
-	if code := put(t, map[string]interface{}{"groups": [][]string{{uA.ID}, {uA.ID, uB.ID}}}); code != http.StatusOK {
-		t.Errorf("User in multiple groups: expected 200, got %d", code)
-	}
-}
-
-// TestSchedule_GetTeamSchedule_ReturnsL1Groups verifies that the GET endpoint
-// returns the L1 rotation as a nested array of populated user objects.
-func TestSchedule_GetTeamSchedule_ReturnsL1Groups(t *testing.T) {
-	env := setupAPITest(t)
-
-	admin := testutil.SeedUser(t, env.S, "admin@example.com")
-	team := testutil.SeedTeam(t, env.S, "get-groups-team")
-	uA := testutil.SeedUser(t, env.S, "ga@example.com")
-	uB := testutil.SeedUser(t, env.S, "gb@example.com")
-	uC := testutil.SeedUser(t, env.S, "gc@example.com")
-	testutil.SeedTeamMember(t, env.S, team.ID, uA.ID, model.TeamMemberRoleMember)
-	testutil.SeedTeamMember(t, env.S, team.ID, uB.ID, model.TeamMemberRoleMember)
-	testutil.SeedTeamMember(t, env.S, team.ID, uC.ID, model.TeamMemberRoleMember)
-
-	if err := env.S.CreateSchedule(&model.Schedule{
-		ID:              "sched-get-groups",
-		TeamID:          team.ID,
-		Timezone:        "UTC",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "09:00",
-		L1RotationStart: time.Now(),
-	}); err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
-	}
-
-	// Set groups via API
-	groupsBody, _ := json.Marshal(map[string]interface{}{
-		"groups": [][]string{{uA.ID, uB.ID}, {uC.ID}},
-	})
-	req := createAuthenticatedRequest(t, http.MethodPut,
-		"/api/v1/teams/"+team.ID+"/schedule/l1-groups", groupsBody, admin.ID)
-	rec := httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("Set groups: expected 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// GET schedule
-	getReq := createAuthenticatedRequest(t, http.MethodGet, "/api/v1/teams/"+team.ID+"/schedule", nil, admin.ID)
-	getRec := httptest.NewRecorder()
-	env.Echo.ServeHTTP(getRec, getReq)
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("GET schedule: expected 200, got %d", getRec.Code)
-	}
-
-	// Parse with nested array of user objects
-	var resp struct {
-		L1Groups [][]struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"l1_groups"`
-	}
-	if err := json.Unmarshal(getRec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("Unmarshal: %v (body: %s)", err, getRec.Body.String())
-	}
-
-	if len(resp.L1Groups) != 2 {
-		t.Fatalf("Expected 2 groups in response, got %d", len(resp.L1Groups))
-	}
-	if len(resp.L1Groups[0]) != 2 {
-		t.Errorf("Group 0: expected 2 users, got %d", len(resp.L1Groups[0]))
-	}
-	if len(resp.L1Groups[1]) != 1 {
-		t.Errorf("Group 1: expected 1 user, got %d", len(resp.L1Groups[1]))
-	}
-	// Verify user IDs preserved in order
-	if resp.L1Groups[0][0].ID != uA.ID || resp.L1Groups[0][1].ID != uB.ID {
-		t.Errorf("Group 0 IDs: expected [%s, %s], got [%s, %s]",
-			uA.ID, uB.ID, resp.L1Groups[0][0].ID, resp.L1Groups[0][1].ID)
-	}
-	if resp.L1Groups[1][0].ID != uC.ID {
-		t.Errorf("Group 1 ID: expected %s, got %s", uC.ID, resp.L1Groups[1][0].ID)
-	}
-	// Names populated
-	if resp.L1Groups[0][0].Name == "" || resp.L1Groups[0][1].Name == "" || resp.L1Groups[1][0].Name == "" {
-		t.Errorf("Expected populated user names, got empty: %+v", resp.L1Groups)
 	}
 }
 
@@ -557,91 +279,82 @@ func renderRange(t *testing.T, env *APIIntegrationEnv, teamID, actorID string, f
 	return out
 }
 
+// The Slack usergroup travels in the configuration snapshot, so setting it and
+// clearing it has to survive a round trip through the editor's own endpoints.
+// The syncer reads it from there and from nowhere else, which is what makes an
+// unsaved usergroup a silently dead integration rather than a visible error.
 func TestSchedule_SlackUsergroupID_Persistence(t *testing.T) {
 	env := setupAPITest(t)
 
-	// Setup Data
 	admin := testutil.SeedUser(t, env.S, "admin@example.com")
 	team := testutil.SeedTeam(t, env.S, "usergroup-team")
 	user1 := testutil.SeedUser(t, env.S, "oncall@example.com")
 	testutil.SeedTeamMember(t, env.S, team.ID, user1.ID, model.TeamMemberRoleMember)
 
-	// 1. Create Schedule with slack_usergroup_id
-	createReq := map[string]interface{}{
-		"team_id":            team.ID,
-		"timezone":           "UTC",
-		"slack_usergroup_id": "S12345678",
-		"l1_rotation_type":   "daily",
-		"l1_handoff_time":    "11:00",
-		"l1_rotation_start":  time.Now().Format(time.RFC3339),
-	}
-	jsonBody, _ := json.Marshal(createReq)
-	req := createAuthenticatedRequest(t, http.MethodPut, "/api/v1/teams/"+team.ID+"/schedule", jsonBody, admin.ID)
-	rec := httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
-		t.Fatalf("Expected 200/201, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// 2. Verify via GET
-	getReq := createAuthenticatedRequest(t, http.MethodGet, "/api/v1/teams/"+team.ID+"/schedule", nil, admin.ID)
-	getRec := httptest.NewRecorder()
-	env.Echo.ServeHTTP(getRec, getReq)
-
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 for GET, got %d", getRec.Code)
-	}
-
-	var schedule model.Schedule
-	if err := json.Unmarshal(getRec.Body.Bytes(), &schedule); err != nil {
-		t.Fatalf("Failed to parse response: %v", err)
-	}
-
-	if schedule.SlackUsergroupID != "S12345678" {
-		t.Errorf("Expected slack_usergroup_id=S12345678, got %s", schedule.SlackUsergroupID)
-	}
-
-	// 3. Update to clear usergroup ID
-	updateReq := map[string]interface{}{
-		"team_id":            team.ID,
-		"timezone":           "UTC",
-		"slack_usergroup_id": "", // Clear
-		"l1_rotation_type":   "daily",
-		"l1_handoff_time":    "11:00",
-		"l1_rotation_start":  time.Now().Format(time.RFC3339),
-	}
-	jsonBody, _ = json.Marshal(updateReq)
-	req = createAuthenticatedRequest(t, http.MethodPut, "/api/v1/teams/"+team.ID+"/schedule", jsonBody, admin.ID)
-	rec = httptest.NewRecorder()
-	env.Echo.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 for update, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// 4. Verify cleared
-	getReq = createAuthenticatedRequest(t, http.MethodGet, "/api/v1/teams/"+team.ID+"/schedule", nil, admin.ID)
-	getRec = httptest.NewRecorder()
-	env.Echo.ServeHTTP(getRec, getReq)
-
-	var schedule2 model.Schedule // Use fresh variable to avoid stale data from omitempty
-	if err := json.Unmarshal(getRec.Body.Bytes(), &schedule2); err != nil {
-		t.Fatalf("Failed to parse response: %v", err)
-	}
-
-	if schedule2.SlackUsergroupID != "" {
-		t.Errorf("Expected slack_usergroup_id to be cleared, got %s", schedule2.SlackUsergroupID)
-	}
-
-	// 5. Verify GetSchedulesWithUsergroup excludes this schedule
-	schedules, err := env.S.GetSchedulesWithUsergroup()
-	if err != nil {
-		t.Fatalf("GetSchedulesWithUsergroup failed: %v", err)
-	}
-	for _, s := range schedules {
-		if s.ID == schedule2.ID {
-			t.Errorf("Schedule with empty usergroup should not be returned by GetSchedulesWithUsergroup")
+	monday := 1
+	put := func(version int64, usergroup string) api.PutScheduleConfigResponse {
+		t.Helper()
+		body, err := json.Marshal(api.PutScheduleConfigRequest{
+			ExpectedVersion: version,
+			ScheduleConfigDTO: api.ScheduleConfigDTO{
+				Timezone:         "UTC",
+				SlackUsergroupID: usergroup,
+				L1: api.ScheduleL1DTO{
+					Enabled: true, RotationType: "daily", HandoffTime: "11:00",
+					Groups: []api.ScheduleGroupDTO{{
+						ID:      "5f0a1e2c-3333-4a3b-8c4d-000000000001",
+						UserIDs: []string{user1.ID},
+					}},
+				},
+				L2: api.ScheduleL2DTO{
+					EscalationTimeoutMinutes: 5, RotationType: "weekly",
+					HandoffTime: "11:00", HandoffDay: &monday,
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal config: %v", err)
 		}
+		req := createAuthenticatedRequest(t, http.MethodPut,
+			"/api/v1/teams/"+team.ID+"/schedule/config", body, admin.ID)
+		rec := httptest.NewRecorder()
+		env.Echo.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("save config: want 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var out api.PutScheduleConfigResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode save: %v", err)
+		}
+		return out
+	}
+
+	get := func() api.ScheduleConfigResponse {
+		t.Helper()
+		req := createAuthenticatedRequest(t, http.MethodGet,
+			"/api/v1/teams/"+team.ID+"/schedule/config", nil, admin.ID)
+		rec := httptest.NewRecorder()
+		env.Echo.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET config: want 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var out api.ScheduleConfigResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode config: %v", err)
+		}
+		return out
+	}
+
+	created := put(0, "S12345678")
+	if got := get().Config.SlackUsergroupID; got != "S12345678" {
+		t.Errorf("slack_usergroup_id = %q, wanted it persisted", got)
+	}
+
+	// Clearing it is the case worth its own step: an empty string has to reach
+	// the snapshot as an empty string rather than be dropped as "unchanged",
+	// or a team could never stop syncing a usergroup.
+	put(created.Version, "")
+	if got := get().Config.SlackUsergroupID; got != "" {
+		t.Errorf("slack_usergroup_id = %q, want it cleared", got)
 	}
 }

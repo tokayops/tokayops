@@ -112,9 +112,6 @@ func TestScheduleOnCallAnswersNobodyRatherThanNotFound(t *testing.T) {
 		setup      func(t *testing.T, e *echo.Echo, env *scheduleTestEnv)
 	}{
 		{"no schedule at all", false, func(t *testing.T, e *echo.Echo, env *scheduleTestEnv) {}},
-		{"schedule from before the revision model", false, func(t *testing.T, e *echo.Echo, env *scheduleTestEnv) {
-			env.Config.SeedLegacyRoot("legacy-1", "devops")
-		}},
 		{"deleted schedule", true, func(t *testing.T, e *echo.Echo, env *scheduleTestEnv) {
 			created := createSchedule(t, e, []string{"denis"})
 			env.SetNow(time.Now().UTC().Add(time.Hour))

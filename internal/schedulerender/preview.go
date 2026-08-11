@@ -98,10 +98,10 @@ func (s *Service) preview(ctx context.Context, view scheduleconfig.ScheduleReadV
 	evaluatedAt := scheduleconfig.NormalizeTimestamp(s.now().UTC())
 	windowUntil := previewWindow(evaluatedAt, until)
 
-	// Load first, validate second, in that order because Save refuses a
-	// pre-revision schedule before it looks at membership. A preview that
-	// reported the membership problem where the save reports the legacy one
-	// would send the editor to fix the wrong thing.
+	// Load first, validate second, in that order because Save also refuses a
+	// schedule it cannot read before it looks at membership. A preview that
+	// reported a membership problem where the save reports damage would send
+	// the editor to fix the wrong thing.
 	base, err := loadPreviewBase(ctx, view, teamID, evaluatedAt, windowUntil)
 	if err != nil {
 		return nil, err
@@ -184,33 +184,32 @@ func loadPreviewBase(ctx context.Context, view scheduleconfig.ScheduleReadView, 
 	if err != nil {
 		return previewBase{}, err
 	}
-	if scheduleconfig.IsLegacyRoot(root) {
-		// The same refusal Save gives. Rendering a legacy schedule here would
-		// show a plan that Save then rejects.
-		return previewBase{}, scheduleconfig.ErrLegacySchedule
-	}
-
 	// An existing root reports its real version, deleted included: a recreate
 	// is a save against that version, and reporting 0 would make the first
 	// recreate fail optimistic concurrency every time.
 	base.scheduleID = root.ID
 	base.root = previewRoot(*root, evaluatedAt)
 
-	effective, err := view.GetEffectiveRevision(ctx, root.ID, evaluatedAt)
-	if err != nil && !errors.Is(err, scheduleconfig.ErrRevisionNotFound) {
+	// One read, two answers. The projection already loads the revision in force
+	// to work out who is on duty, and asking for it again to fill `current` was
+	// a second round trip for a row that was already in hand - and, worse, a
+	// second chance for the two to disagree about which revision "in force"
+	// meant.
+	onCall, effective, err := onCallOfRoot(ctx, view, *root, evaluatedAt)
+	if err != nil {
 		return previewBase{}, err
 	}
+	base.onCall = onCall
+	base.onCall.At = evaluatedAt
+
 	// A deleted period carries a copy of the last valid snapshot so the column
 	// stays decodable. It is not a configuration in force, so the planner is
-	// given nothing - exactly as the recreate branch of Save.
-	if err == nil && effective.Kind == scheduleconfig.RevisionActive {
+	// given nothing - exactly as the recreate branch of Save. A nil revision is
+	// the same story from the other side: the instant precedes this schedule's
+	// history, so there is nothing in force to plan against.
+	if effective != nil && effective.Kind == scheduleconfig.RevisionActive {
 		base.current = &effective.Snapshot
 	}
-
-	if base.onCall, err = onCallWithin(ctx, view, *root, evaluatedAt); err != nil {
-		return previewBase{}, err
-	}
-	base.onCall.At = evaluatedAt
 
 	if base.revisions, err = view.GetRevisionsInRange(ctx, root.ID, evaluatedAt, windowUntil); err != nil {
 		return previewBase{}, err

@@ -346,21 +346,22 @@ func TestListScheduleRootsReadsRevisionRows(t *testing.T) {
 	// A revision-managed schedule: no l1_rotation_start, no rotation type.
 	revision := createSchedule(t, s, "devops", start)
 
-	// A row from before the revision model, which is still reachable while
-	// legacy creates and the seed exist. It must be listed, not skipped: the
-	// projection decides what it means, the query only reports what is there.
+	// A row left behind by an upgrade whose schedule reset was skipped. There
+	// is no longer any Go that can write one - which is the point - so it goes
+	// in as SQL.
+	//
+	// It must be LISTED, not skipped. The query reports what is in the table;
+	// deciding that this row is damage is the projection's job, and a row the
+	// query hides is a row nobody can report.
 	if err := s.CreateTeam(&model.Team{ID: "legacy-team", Name: "legacy-team"}); err != nil {
 		t.Fatalf("CreateTeam: %v", err)
 	}
-	if err := s.CreateSchedule(&model.Schedule{
-		ID:              "sched-legacy",
-		TeamID:          "legacy-team",
-		Timezone:        "UTC",
-		L1RotationType:  model.RotationDaily,
-		L1HandoffTime:   "09:00",
-		L1RotationStart: start.Add(-24 * time.Hour),
-	}); err != nil {
-		t.Fatalf("CreateSchedule (legacy): %v", err)
+	if _, err := s.db.Exec(`
+		INSERT INTO schedules (id, team_id, timezone, l1_rotation_type, l1_handoff_time,
+		                       l1_rotation_start, created_at, updated_at)
+		VALUES ('sched-legacy', 'legacy-team', 'UTC', 'daily', '09:00', $1, NOW(), NOW())`,
+		start.Add(-24*time.Hour)); err != nil {
+		t.Fatalf("insert pre-revision row: %v", err)
 	}
 
 	// A soft-deleted revision schedule, which the contract includes.

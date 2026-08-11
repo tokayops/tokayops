@@ -25,11 +25,6 @@ var (
 	// needs it active. Recreating is a Save, not a retry of this command.
 	ErrScheduleDeleted = errors.New("scheduleconfig: schedule is deleted")
 
-	// ErrLegacySchedule means the schedule row predates the revision model:
-	// it has no tail revision and config_version 0. Revision commands refuse
-	// it rather than grafting a chain onto it.
-	ErrLegacySchedule = errors.New("scheduleconfig: schedule predates the revision model")
-
 	// ErrOverrideNotFound means no live override revision answers to the ID.
 	// A tombstoned override is not found either: it was deleted.
 	ErrOverrideNotFound = errors.New("scheduleconfig: override not found")

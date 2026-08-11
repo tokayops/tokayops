@@ -1,8 +1,8 @@
 // Package rotation is the pure domain core for schedule revisions: handoff
 // grid math, rotation position, and transition planning. It depends only on
-// internal/model and must never import store, API, or scheduler code. The
-// scheduler consumes this package starting with the historical renderer; the
-// legacy rotation math in internal/scheduler stays live until then.
+// internal/model and must never import store or API code. It is the only
+// rotation math in the product - internal/schedulerender projects revisions
+// through it, and every consumer reaches it that way.
 package rotation
 
 import (

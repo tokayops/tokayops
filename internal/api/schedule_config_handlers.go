@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -76,14 +77,9 @@ func (a *API) GetScheduleConfig(c echo.Context) error {
 
 	var out ScheduleConfigResponse
 	err := a.scheduleRead.WithinSnapshot(c.Request().Context(), func(view scheduleconfig.ScheduleReadView) error {
-		root, err := view.GetScheduleRootByTeam(c.Request().Context(), teamID)
+		root, err := a.revisionRoot(c.Request().Context(), view, teamID)
 		if err != nil {
 			return err
-		}
-		// A row from before the revision model has no configuration in this
-		// model, so it is not found here rather than half-answered.
-		if scheduleconfig.IsLegacyRoot(root) {
-			return scheduleconfig.ErrScheduleNotFound
 		}
 
 		// The tail is the highest version. For a deleted schedule that is the
@@ -335,7 +331,7 @@ func (a *API) GetScheduleRevision(c echo.Context) error {
 
 // GetScheduleOnCall godoc
 // @Summary Get who is on duty for a team right now
-// @Description The current-assignment projection, derived from the revision chain. A team with no schedule, a schedule from before the revision model and a deleted one all answer 200 with null layers: the question is who is on duty, and "nobody" is an answer.
+// @Description The current-assignment projection, derived from the revision chain. A team with no schedule and a team whose schedule is deleted both answer 200 with null layers: the question is who is on duty, and "nobody" is an answer. A schedule whose data cannot produce one - a broken revision chain, a missing history horizon - answers 500 rather than pretending nobody is on call.
 // @Tags schedules
 // @Produce json
 // @Param id path string true "Team ID"
@@ -347,15 +343,17 @@ func (a *API) GetScheduleOnCall(c echo.Context) error {
 
 	// One call, one snapshot. This is the most frequently read endpoint here,
 	// and fetching the root separately cost a second read-only transaction on
-	// every request; the renderer also owns the rules about absent,
-	// pre-revision and deleted schedules, which this handler used to keep its
-	// own copy of.
+	// every request; the renderer also owns the rules about absent and deleted
+	// schedules, which this handler used to keep its own copy of.
 	//
-	// A team with no schedule, or one from before the revision model, is
-	// answered rather than refused: this endpoint reports who is on duty, and
-	// "nobody" is a true answer, not a missing resource. A client forced to
-	// read 404 as "nobody" would swallow a real 404 from a mistyped team along
-	// with it.
+	// A team with no schedule, or one that deleted it, is answered rather than
+	// refused: this endpoint reports who is on duty, and "nobody" is a true
+	// answer, not a missing resource. A client forced to read 404 as "nobody"
+	// would swallow a real 404 from a mistyped team along with it.
+	//
+	// Damage is the opposite case and is not softened into "nobody": a schedule
+	// the projection cannot read would otherwise look exactly like one with an
+	// empty rotation, and nobody would be paged for it.
 	res, err := a.scheduleRenderer.CurrentTeamOnCallNow(ctx, c.Param("id"))
 	if err != nil {
 		return a.mapScheduleError(c, err)
@@ -400,16 +398,23 @@ func (a *API) ListScheduleOverrides(c echo.Context) error {
 	return c.JSON(http.StatusOK, out)
 }
 
-// revisionRoot resolves a team's schedule root for the read endpoints, giving
-// a legacy row the same answer as a missing one: in the revision model that
-// schedule does not exist.
+// revisionRoot resolves a team's schedule root for the read endpoints.
+//
+// It is also where those endpoints refuse a row with no history horizon. Such a
+// row cannot be created by this binary - the create flow writes the horizon in
+// the same statement as the row - so it means the destructive upgrade reset was
+// never run, and every answer built on it would be a guess about a schedule
+// whose configuration this model cannot see. It is reported as the invariant
+// violation it is, not as a missing schedule: a 404 here would tell an operator
+// the team has no schedule when in fact it has an unreadable one.
 func (a *API) revisionRoot(ctx context.Context, view scheduleconfig.ScheduleReadView, teamID string) (*scheduleconfig.ScheduleRoot, error) {
 	root, err := view.GetScheduleRootByTeam(ctx, teamID)
 	if err != nil {
 		return nil, err
 	}
-	if scheduleconfig.IsLegacyRoot(root) {
-		return nil, scheduleconfig.ErrScheduleNotFound
+	if root.HistoryCompleteFrom == nil {
+		return nil, fmt.Errorf("%w: schedule %s has no history horizon; the upgrade reset was not run",
+			scheduleconfig.ErrInvariantViolation, root.ID)
 	}
 	return root, nil
 }

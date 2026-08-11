@@ -12,7 +12,7 @@ import (
 // fakeProjection is an OnCallProjection a test seeds directly.
 //
 // The builder depends on this narrow interface rather than on the renderer for
-// one concrete reason: the revision model is deliberately absent from the legacy
+// one concrete reason: the revision model is deliberately absent from
 // MockStore, so seeding on-call state through the store is not possible and
 // these tests would otherwise need PostgreSQL.
 //
@@ -51,7 +51,7 @@ func buildFor(t *testing.T, b *EscalationJobBuilder, proj OnCallProjection, ag *
 
 	t.Helper()
 	ctx := context.Background()
-	return b.Build(ctx, ag, policyID, TeamOnCallRead(proj.CurrentTeamOnCallNow(ctx, ag.TeamID)))
+	return b.Build(ctx, ag, policyID, schedulerender.TeamOnCallRead(proj.CurrentTeamOnCallNow(ctx, ag.TeamID)))
 }
 
 var projectionBase = time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC)

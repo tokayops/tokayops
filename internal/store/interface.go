@@ -116,32 +116,6 @@ type StoreInterface interface {
 	AddTimelineEvent(e *model.TimelineEvent) error
 	GetTimelineEvents(alertGroupID string) ([]*model.TimelineEvent, error)
 
-	// Schedules (Phase 3)
-	CreateSchedule(s *model.Schedule) error
-	GetScheduleByTeamID(teamID string) (*model.Schedule, error)
-	GetScheduleByID(id string) (*model.Schedule, error)
-	GetAllSchedules() ([]*model.Schedule, error)
-	GetSchedulesWithUsergroup() ([]*model.Schedule, error)
-	UpdateSchedule(s *model.Schedule) error
-	DeleteSchedule(id string) error
-	SetScheduleUsers(scheduleID, layer string, userIDs []string) error
-	GetScheduleUsers(scheduleID, layer string) ([]*model.User, error)
-	SetScheduleGroups(scheduleID string, groups [][]string) error
-	GetScheduleGroups(scheduleID, layer string) ([][]*model.User, error)
-
-	// Schedule Overrides
-	CreateScheduleOverride(o *model.ScheduleOverride) error
-	GetScheduleOverrides(scheduleID string, from, until time.Time) ([]*model.ScheduleOverride, error)
-	OverrideBelongsToSchedule(overrideID, scheduleID string) (bool, error)
-	DeleteScheduleOverride(id string) error
-	UpdateScheduleOverride(o *model.ScheduleOverride) error
-
-	// Rotation Epochs (schedule history)
-	CreateRotationEpoch(epoch *model.RotationEpoch) error
-	CloseCurrentEpoch(scheduleID, layer string, endTime time.Time) error
-	GetRotationEpochs(scheduleID, layer string, from, until time.Time) ([]*model.RotationEpoch, error)
-	GetCurrentEpoch(scheduleID, layer string) (*model.RotationEpoch, error)
-
 	// API Tokens
 	CreateAPIToken(token *model.APIToken) error
 	GetAPITokenByID(id string) (*model.APIToken, error)

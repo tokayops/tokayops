@@ -14,7 +14,6 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 // counterValue reads a counter the way the API tests do, so the assertions can
@@ -31,8 +30,12 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 // mockNotifierStore implements the store methods HandoffNotifier still needs:
 // team names, linked identities and job creation. On-call state does not come
 // from here any more - it comes from the projection.
+//
+// It does NOT embed store.StoreInterface. While it did, the double compiled
+// whether or not it implemented the methods under test, and every unimplemented
+// call was a nil-pointer panic waiting rather than a compile error. Now the
+// three methods below are the whole contract, and dropping one stops the build.
 type mockNotifierStore struct {
-	store.StoreInterface
 	teams    []*model.Team
 	slackIDs map[string]string // userID -> slack external id ("" means not linked)
 	jobs     []*createdJob

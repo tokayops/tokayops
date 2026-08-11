@@ -11,7 +11,7 @@ import (
 
 // ScheduleReadRepository exposes the read side of schedule configuration.
 // Like the command repository it is deliberately not part of StoreInterface:
-// the revision model is not mirrored into the legacy mock.
+// the revision model is not mirrored into MockStore.
 func (s *Store) ScheduleReadRepository() scheduleconfig.ScheduleReadRepository {
 	return &scheduleReadRepo{db: s.db}
 }

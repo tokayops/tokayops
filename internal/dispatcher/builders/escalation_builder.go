@@ -17,7 +17,7 @@ import (
 // OnCallProjection is the slice of the schedule projection the builder needs.
 //
 // It is an interface declared here rather than *schedulerender.Service because
-// the revision model is deliberately absent from the legacy MockStore: without
+// the revision model is deliberately absent from MockStore: without
 // it, every builder unit test would have to run against PostgreSQL.
 type OnCallProjection interface {
 	// CurrentTeamOnCallNow answers who is on duty for a team and whether the
@@ -34,39 +34,6 @@ type EscalationJobBuilder struct {
 	OnCall OnCallProjection
 	Config *config.Config // for firehose channel config
 }
-
-// TeamOnCallResult is the caller's answer to "who is on duty for this team",
-// and it has three states rather than two: the team has a schedule, the team has
-// none, or the question could not be answered at all.
-//
-// The third state has to survive the journey. Collapsed into the second - a zero
-// TeamOnCall, as a bare value would be - a failed read looks like a team that
-// never configured a schedule, and the builder does the one thing it must not do
-// after a failed read: fall back to the schedule ID stored on the policy step.
-// That ID can name a schedule the team no longer owns, so a transient error
-// would page last quarter's rotation while the alert group, which knows the read
-// failed, records nothing at all.
-//
-// The zero value means "this team has no schedule". Carry a real read with
-// TeamOnCallRead, which cannot drop the error because it takes it.
-type TeamOnCallResult struct {
-	onCall schedulerender.TeamOnCall
-	err    error
-}
-
-// TeamOnCallRead wraps what a projection read returned, error included. It takes
-// the pair so it can be applied directly to the call:
-//
-//	builders.TeamOnCallRead(projection.CurrentTeamOnCallNow(ctx, teamID))
-func TeamOnCallRead(onCall schedulerender.TeamOnCall, err error) TeamOnCallResult {
-	return TeamOnCallResult{onCall: onCall, err: err}
-}
-
-// Err reports why the team's on-call state is unknown, if it is.
-func (r TeamOnCallResult) Err() error { return r.err }
-
-// OnCall is the projection that was read. It is only meaningful when Err is nil.
-func (r TeamOnCallResult) OnCall() schedulerender.TeamOnCall { return r.onCall }
 
 // scheduleResolution is one schedule's answer as this build saw it, outcome
 // included: a read that failed is an answer to remember too, or two steps naming
@@ -87,7 +54,7 @@ type scheduleResolution struct {
 // nor a transient failure landing between them may split the answer.
 type onCallResolver struct {
 	builder *EscalationJobBuilder
-	team    TeamOnCallResult
+	team    schedulerender.TeamOnCallResult
 
 	// teamUsers is the team's answer hydrated into people. Nil means "not
 	// worked out yet" - a pointer rather than a value plus a flag, so the
@@ -121,7 +88,7 @@ const firehoseProvider = "slack"
 // apart can straddle a handoff or a save, and then the people paged and the
 // people recorded are different people.
 func (b *EscalationJobBuilder) Build(ctx context.Context, ag *model.AlertGroup, policyID string,
-	teamOnCall TeamOnCallResult) (*model.Job, []*model.JobStage, []*model.JobStep, *model.EscalationPolicySnapshot, error) {
+	teamOnCall schedulerender.TeamOnCallResult) (*model.Job, []*model.JobStage, []*model.JobStep, *model.EscalationPolicySnapshot, error) {
 
 	onCall := &onCallResolver{builder: b, team: teamOnCall}
 

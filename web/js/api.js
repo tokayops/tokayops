@@ -584,10 +584,11 @@ const API = {
 
         /**
          * Who is on duty right now.
-         * A team without a schedule, a schedule from before the revision model
-         * and a deleted one all answer 200 with null layers: the question is
-         * who is on duty, and "nobody" is an answer. Use getConfig to tell
-         * "not configured" from "nobody on duty".
+         * A team without a schedule and a team whose schedule is deleted both
+         * answer 200 with null layers: the question is who is on duty, and
+         * "nobody" is an answer. Use getConfig to tell "not configured" from
+         * "nobody on duty". A schedule whose data cannot produce an answer
+         * answers 500 instead of claiming nobody is on call.
          * @param {string} teamId
          * @returns {Promise<{schedule_id, on_call}>}
          */

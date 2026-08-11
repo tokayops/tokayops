@@ -13,21 +13,42 @@ import (
 	"github.com/tokayops/tokayops/internal/store"
 )
 
+// onCallProjection is what the engine needs from the schedule projection.
+//
+// It is declared here rather than borrowed from the escalation builder because
+// this is the engine's dependency: taking the builder's interface would make
+// the engine's contract change whenever the builder's needs did, for no reason
+// beyond the two happening to want the same thing today.
+//
+// Both methods are named although the engine calls one. The other is what it
+// hands to the builder it constructs, and an interface that omitted it would
+// describe less than the engine actually requires of the value it is given.
+type onCallProjection interface {
+	CurrentTeamOnCallNow(ctx context.Context, teamID string) (schedulerender.TeamOnCall, error)
+	CurrentOnCallNow(ctx context.Context, scheduleID string) (schedulerender.OnCall, error)
+}
+
 type Engine struct {
-	store  store.StoreInterface
-	oncall builders.OnCallProjection
-	cfg    *config.Config
+	store      store.StoreInterface
+	oncall     onCallProjection
+	escBuilder *builders.EscalationJobBuilder
 }
 
 // NewEngine builds the alert engine. The on-call projection is shared with the
 // escalation builder rather than constructed here: the snapshot the engine
 // stores on an alert group and the users the builder escalates to must be the
 // same answer, and two projections would be two clocks.
-func NewEngine(s store.StoreInterface, oncall builders.OnCallProjection, cfg *config.Config) *Engine {
+//
+// The builder is built once, here, rather than per alert group. It holds no
+// state between builds - what one build remembers lives for that build - so a
+// shared instance is the same object the loop was allocating each time round.
+func NewEngine(s store.StoreInterface, oncall onCallProjection, cfg *config.Config) *Engine {
+	// cfg is not kept: the only thing the engine did with it was hand it to the
+	// builder, which now holds it.
 	return &Engine{
-		store:  s,
-		oncall: oncall,
-		cfg:    cfg,
+		store:      s,
+		oncall:     oncall,
+		escBuilder: builders.NewEscalationJobBuilder(s, oncall, cfg),
 	}
 }
 
@@ -72,14 +93,13 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		// the builder as "this team has no schedule": that is the one state that
 		// sends it looking for the schedule ID stored on the policy step, which
 		// may name a schedule this team no longer owns.
-		teamOnCall := builders.TeamOnCallRead(e.oncall.CurrentTeamOnCallNow(ctx, ag.TeamID))
+		teamOnCall := schedulerender.TeamOnCallRead(e.oncall.CurrentTeamOnCallNow(ctx, ag.TeamID))
 		if err := teamOnCall.Err(); err != nil {
 			log.Printf("AlertEngine: Failed to fetch oncall for %s: %v", ag.ID, err)
 		}
 
 		// Build unified job (includes firehose as step 0 if configured)
-		escBuilder := builders.NewEscalationJobBuilder(e.store, e.oncall, e.cfg)
-		job, stages, steps, snapshot, err := escBuilder.Build(ctx, ag, policyID, teamOnCall)
+		job, stages, steps, snapshot, err := e.escBuilder.Build(ctx, ag, policyID, teamOnCall)
 
 		if err != nil {
 			// Build failed — leave AG as "new" so it retries on next tick

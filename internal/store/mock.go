@@ -30,15 +30,12 @@ type MockStore struct {
 	teamMembers            map[string]map[string]model.TeamMemberRole // teamID -> userID -> role
 	timelineEvents         map[string][]*model.TimelineEvent          // alertGroupID -> events
 	apiTokens              map[string]*model.APIToken                 // tokenID -> token
-	scheduleOverrides      map[string]*model.ScheduleOverride         // overrideID -> override
-	schedules              map[string]*model.Schedule                 // scheduleID -> schedule
 	externalIdentities     map[string]*model.ExternalIdentity         // "userID|provider" -> identity
 	linkTokens             map[string]mockLinkToken                   // "userID|provider" -> link token
 	jobs                   map[string]*model.Job                      // jobID -> job
 	jobStages              map[string]*model.JobStage                 // stageID -> stage
 	jobSteps               map[string]*model.JobStep                  // stepID -> step
 	escalationPolicies     map[string]*model.EscalationPolicy         // policyID -> policy
-	rotationEpochs         map[string][]*model.RotationEpoch          // scheduleID -> epochs
 	integrations           map[string]*model.Integration              // integrationID -> integration
 	notificationDeliveries map[string]*model.NotificationDelivery     // deliveryID -> delivery
 	outboxEvents           map[string]*model.OutboxEvent              // eventID -> event
@@ -67,15 +64,12 @@ func NewMockStore() *MockStore {
 		timelineEvents: make(map[string][]*model.TimelineEvent),
 		apiTokens:      make(map[string]*model.APIToken),
 
-		scheduleOverrides:      make(map[string]*model.ScheduleOverride),
-		schedules:              make(map[string]*model.Schedule),
 		externalIdentities:     make(map[string]*model.ExternalIdentity),
 		linkTokens:             make(map[string]mockLinkToken),
 		jobs:                   make(map[string]*model.Job),
 		jobStages:              make(map[string]*model.JobStage),
 		jobSteps:               make(map[string]*model.JobStep),
 		escalationPolicies:     make(map[string]*model.EscalationPolicy),
-		rotationEpochs:         make(map[string][]*model.RotationEpoch),
 		integrations:           make(map[string]*model.Integration),
 		notificationDeliveries: make(map[string]*model.NotificationDelivery),
 		outboxEvents:           make(map[string]*model.OutboxEvent),
@@ -1412,316 +1406,12 @@ func (m *MockStore) copyAlertGroup(ag *model.AlertGroup) *model.AlertGroup {
 	return &agCopy
 }
 
-// ========================================
-// Schedule Mock Stubs (Phase 3)
-// ========================================
 
-func (m *MockStore) CreateSchedule(s *model.Schedule) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	sc := *s
-	m.schedules[s.ID] = &sc
-	return nil
-}
-
-func (m *MockStore) GetScheduleByTeamID(teamID string) (*model.Schedule, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, s := range m.schedules {
-		if s.TeamID == teamID {
-			sc := *s
-			return &sc, nil
-		}
-	}
-	return nil, sql.ErrNoRows
-}
-
-func (m *MockStore) GetScheduleByID(id string) (*model.Schedule, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if s, ok := m.schedules[id]; ok {
-		sc := *s
-		return &sc, nil
-	}
-	return nil, sql.ErrNoRows
-}
-
-func (m *MockStore) GetAllSchedules() ([]*model.Schedule, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []*model.Schedule
-	for _, s := range m.schedules {
-		sc := *s
-		result = append(result, &sc)
-	}
-	return result, nil
-}
-
-func (m *MockStore) GetSchedulesWithUsergroup() ([]*model.Schedule, error) {
-	return nil, nil // Not needed for RBAC tests
-}
-
-func (m *MockStore) UpdateSchedule(s *model.Schedule) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing, ok := m.schedules[s.ID]; ok {
-		// Update allowed fields
-		existing.L1RotationType = s.L1RotationType
-		existing.L1HandoffTime = s.L1HandoffTime
-		existing.L1HandoffDay = s.L1HandoffDay
-		existing.L1Groups = s.L1Groups
-		existing.L2Enabled = s.L2Enabled
-		existing.L2EscalationTimeout = s.L2EscalationTimeout
-		existing.L2RotationType = s.L2RotationType
-		existing.L2HandoffTime = s.L2HandoffTime
-		existing.L2HandoffDay = s.L2HandoffDay
-		existing.L2Users = s.L2Users
-		existing.UpdatedAt = time.Now()
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
-func (m *MockStore) DeleteSchedule(id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.schedules, id)
-	return nil
-}
-
-func (m *MockStore) SetScheduleUsers(scheduleID, layer string, userIDs []string) error {
-	// Wrap flat userIDs into singleton groups, matching real store semantics
-	groups := make([][]string, len(userIDs))
-	for i, id := range userIDs {
-		groups[i] = []string{id}
-	}
-	return m.setScheduleGroupsLocked(scheduleID, layer, groups)
-}
-
-func (m *MockStore) GetScheduleUsers(scheduleID, layer string) ([]*model.User, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	epoch := m.getCurrentEpochLocked(scheduleID, layer)
-	if epoch == nil {
-		return []*model.User{}, nil
-	}
-
-	var users []*model.User
-	for _, group := range epoch.Groups {
-		for _, uid := range group {
-			if u, ok := m.users[uid]; ok {
-				uCopy := *u
-				users = append(users, &uCopy)
-			}
-		}
-	}
-	return users, nil
-}
-
-func (m *MockStore) SetScheduleGroups(scheduleID string, groups [][]string) error {
-	return m.setScheduleGroupsLocked(scheduleID, "l1", groups)
-}
-
-func (m *MockStore) GetScheduleGroups(scheduleID, layer string) ([][]*model.User, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	epoch := m.getCurrentEpochLocked(scheduleID, layer)
-	if epoch == nil {
-		return [][]*model.User{}, nil
-	}
-
-	var result [][]*model.User
-	for _, group := range epoch.Groups {
-		var users []*model.User
-		for _, uid := range group {
-			if u, ok := m.users[uid]; ok {
-				uCopy := *u
-				users = append(users, &uCopy)
-			}
-		}
-		result = append(result, users)
-	}
-	return result, nil
-}
-
-// setScheduleGroupsLocked closes the current epoch and creates a new one,
-// matching the real store's transactional semantics.
-func (m *MockStore) setScheduleGroupsLocked(scheduleID, layer string, groups [][]string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.schedules[scheduleID]; !ok {
-		return sql.ErrNoRows
-	}
-
-	now := time.Now().UTC()
-
-	// Close current epoch for this schedule/layer
-	for _, ep := range m.rotationEpochs[scheduleID] {
-		if ep.Layer == layer && ep.EndTime == nil {
-			ep.EndTime = &now
-		}
-	}
-
-	// Create new epoch if groups is non-empty
-	if len(groups) > 0 {
-		epCopy := &model.RotationEpoch{
-			ID:         "epoch-" + now.Format("20060102150405.000"),
-			ScheduleID: scheduleID,
-			Layer:      layer,
-			Groups:     make([][]string, len(groups)),
-			StartTime:  now,
-			CreatedAt:  now,
-		}
-		for i, g := range groups {
-			epCopy.Groups[i] = make([]string, len(g))
-			copy(epCopy.Groups[i], g)
-		}
-		m.rotationEpochs[scheduleID] = append(m.rotationEpochs[scheduleID], epCopy)
-	}
-
-	return nil
-}
-
-// getCurrentEpochLocked returns the current open epoch for schedule/layer (caller holds at least RLock).
-func (m *MockStore) getCurrentEpochLocked(scheduleID, layer string) *model.RotationEpoch {
-	for _, ep := range m.rotationEpochs[scheduleID] {
-		if ep.Layer == layer && ep.EndTime == nil {
-			return ep
-		}
-	}
-	return nil
-}
-
-func (m *MockStore) CreateScheduleOverride(o *model.ScheduleOverride) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	overrideCopy := *o
-	m.scheduleOverrides[o.ID] = &overrideCopy
-	return nil
-}
-
-func (m *MockStore) GetScheduleOverrides(scheduleID string, from, until time.Time) ([]*model.ScheduleOverride, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []*model.ScheduleOverride
-	for _, o := range m.scheduleOverrides {
-		if o.ScheduleID == scheduleID && o.StartTime.Before(until) && o.EndTime.After(from) {
-			overrideCopy := *o
-			result = append(result, &overrideCopy)
-		}
-	}
-	return result, nil
-}
-
-func (m *MockStore) OverrideBelongsToSchedule(overrideID, scheduleID string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	o, exists := m.scheduleOverrides[overrideID]
-	if !exists {
-		return false, nil
-	}
-	return o.ScheduleID == scheduleID, nil
-}
-
-func (m *MockStore) DeleteScheduleOverride(id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.scheduleOverrides, id)
-	return nil
-}
-
-func (m *MockStore) UpdateScheduleOverride(o *model.ScheduleOverride) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing, ok := m.scheduleOverrides[o.ID]; ok {
-		existing.UserID = o.UserID
-		existing.StartTime = o.StartTime
-		existing.EndTime = o.EndTime
-		existing.Reason = o.Reason
-		return nil
-	}
-	return sql.ErrNoRows
-}
 
 // ========================================
 // Rotation Epochs (schedule history stubs)
 // ========================================
 
-func (m *MockStore) CreateRotationEpoch(epoch *model.RotationEpoch) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if epoch.ID == "" {
-		epoch.ID = "epoch-" + time.Now().String() // Simple ID generation
-	}
-
-	epCopy := *epoch
-	// Deep-copy groups
-	epCopy.Groups = make([][]string, len(epoch.Groups))
-	for i, g := range epoch.Groups {
-		epCopy.Groups[i] = make([]string, len(g))
-		copy(epCopy.Groups[i], g)
-	}
-
-	m.rotationEpochs[epoch.ScheduleID] = append(m.rotationEpochs[epoch.ScheduleID], &epCopy)
-	return nil
-}
-
-func (m *MockStore) CloseCurrentEpoch(scheduleID, layer string, endTime time.Time) error {
-	return nil // Not needed for this test
-}
-
-func (m *MockStore) GetRotationEpochs(scheduleID, layer string, from, until time.Time) ([]*model.RotationEpoch, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var result []*model.RotationEpoch
-	epochs, ok := m.rotationEpochs[scheduleID]
-	if !ok {
-		return []*model.RotationEpoch{}, nil
-	}
-
-	for _, ep := range epochs {
-		if ep.Layer == layer {
-			// Check overlap with [from, until]
-			// Epoch interval: [StartTime, EndTime)
-			// Query interval: [from, until)
-			// Overlap if: StartTime < until AND (EndTime is Zero OR EndTime > from)
-
-			// Handle open-ended epochs
-			if ep.StartTime.Before(until) {
-				if ep.EndTime == nil || ep.EndTime.After(from) {
-					epCopy := *ep
-					epCopy.Groups = make([][]string, len(ep.Groups))
-					for i, g := range ep.Groups {
-						epCopy.Groups[i] = make([]string, len(g))
-						copy(epCopy.Groups[i], g)
-					}
-					result = append(result, &epCopy)
-				}
-			}
-		}
-	}
-	return result, nil
-}
-
-func (m *MockStore) GetCurrentEpoch(scheduleID, layer string) (*model.RotationEpoch, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	ep := m.getCurrentEpochLocked(scheduleID, layer)
-	if ep == nil {
-		return nil, sql.ErrNoRows
-	}
-	epCopy := *ep
-	epCopy.Groups = make([][]string, len(ep.Groups))
-	for i, g := range ep.Groups {
-		epCopy.Groups[i] = make([]string, len(g))
-		copy(epCopy.Groups[i], g)
-	}
-	return &epCopy, nil
-}
 
 // ========================================
 // API Tokens
@@ -2768,38 +2458,13 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 		}
 	}
 
-	// Teams without on-call
-	for teamID := range m.teams {
-		hasOnCall := false
-		for _, sched := range m.schedules {
-			if sched.TeamID == teamID {
-				if epochs, ok := m.rotationEpochs[sched.ID]; ok {
-					for _, ep := range epochs {
-						if ep.Layer == "l1" && ep.EndTime == nil && len(ep.Groups) > 0 {
-							hasOnCall = true
-							break
-						}
-					}
-				}
-				break
-			}
-		}
-		if !hasOnCall {
-			snap.TeamsWithoutOnCall++
-		}
-	}
-
-	// Teams with permanent on-call (single user in L1)
-	for _, sched := range m.schedules {
-		if epochs, ok := m.rotationEpochs[sched.ID]; ok {
-			for _, ep := range epochs {
-				if ep.Layer == "l1" && ep.EndTime == nil && len(ep.Groups) == 1 {
-					snap.TeamsWithPermanentOnCall++
-					break
-				}
-			}
-		}
-	}
+	// Teams without on-call and teams with permanent on-call are reported as
+	// zero, deliberately. Both are answers about the revision model, which this
+	// mock does not implement - deliberately, so that there is one projection
+	// rather than two - and computing them from something else here would be a
+	// second definition of "has a schedule" that could disagree with the real one.
+	//
+	// Their coverage is the integration test against the real query.
 
 	// Teams without escalation policy
 	for _, team := range m.teams {

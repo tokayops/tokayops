@@ -166,3 +166,38 @@ func onCallOverrideRange(slots []layerSlot) (from, until time.Time, ok bool) {
 	}
 	return from, until, ok
 }
+
+// TeamOnCallResult is a caller's answer to "who is on duty for this team", and
+// it has three states rather than two: the team has a schedule, the team has
+// none, or the question could not be answered at all.
+//
+// The third state has to survive the journey. Collapsed into the second - a
+// zero TeamOnCall, as a bare value would be - a failed read looks like a team
+// that never configured a schedule, and a consumer that treats "no schedule" as
+// a reason to look elsewhere then acts on a state that was never observed.
+//
+// It lives beside TeamOnCall rather than with any one consumer: what it
+// describes is a read of this projection, and two consumers - the alert engine
+// and the escalation builder - pass it between them. Declaring it in either
+// would make the other depend on its neighbour for a word about schedules.
+//
+// The zero value means "this team has no schedule". Carry a real read with
+// TeamOnCallRead, which cannot drop the error because it takes it.
+type TeamOnCallResult struct {
+	onCall TeamOnCall
+	err    error
+}
+
+// TeamOnCallRead wraps what a projection read returned, error included. It
+// takes the pair so it can be applied directly to the call:
+//
+//	schedulerender.TeamOnCallRead(projection.CurrentTeamOnCallNow(ctx, teamID))
+func TeamOnCallRead(onCall TeamOnCall, err error) TeamOnCallResult {
+	return TeamOnCallResult{onCall: onCall, err: err}
+}
+
+// Err reports why the team's on-call state is unknown, if it is.
+func (r TeamOnCallResult) Err() error { return r.err }
+
+// OnCall is the projection that was read. It is only meaningful when Err is nil.
+func (r TeamOnCallResult) OnCall() TeamOnCall { return r.onCall }
