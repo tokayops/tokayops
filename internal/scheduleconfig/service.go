@@ -245,7 +245,7 @@ func (s *Service) lockForWrite(ctx context.Context, tx ScheduleConfigTx,
 	}
 	// Checked on the locked row rather than the one the caller resolved: this
 	// is the copy every other decision below is made from.
-	if err := requireInitializedRoot(locked); err != nil {
+	if err := RequireInitializedRoot(locked); err != nil {
 		return nil, err
 	}
 	if locked.ConfigVersion != expectedVersion {
@@ -635,7 +635,7 @@ func (s *Service) RemoveTeamMember(ctx context.Context, teamID, userID string) e
 		if err != nil {
 			return err
 		}
-		if err := requireInitializedRoot(locked); err != nil {
+		if err := RequireInitializedRoot(locked); err != nil {
 			return err
 		}
 		// A deleted schedule has nobody on duty, so it blocks nothing -
@@ -698,34 +698,6 @@ func snapshotNames(snap rotation.ScheduleRevisionSnapshot, userID string) bool {
 		}
 	}
 	return false
-}
-
-// requireInitializedRoot refuses a schedule row that no live path could have
-// written.
-//
-// CreateInitialSchedule writes the row, config_version 1 and
-// history_complete_from in one statement, and nothing ever clears the horizon
-// afterwards. So an empty horizon does not mean "a schedule with little
-// history" - it means a row from before the revision model, in a database
-// where the destructive upgrade reset was never run.
-//
-// The horizon is the discriminator rather than config_version because the read
-// side already tests exactly this field and already calls its absence damage
-// (schedulerender.ErrHistoryMarkerMissing). One fact, checked the same way on
-// both sides, instead of two that merely happen to agree.
-//
-// It is an invariant violation rather than a class of its own: there is no
-// action the caller can take, and a dedicated error code would be a permanent
-// promise in the public contract about a state this binary cannot produce.
-func requireInitializedRoot(root *ScheduleRoot) error {
-	if root == nil {
-		return fmt.Errorf("%w: nil schedule root", ErrInvariantViolation)
-	}
-	if root.HistoryCompleteFrom == nil {
-		return fmt.Errorf("%w: schedule %s has no history horizon; the upgrade reset was not run",
-			ErrInvariantViolation, root.ID)
-	}
-	return nil
 }
 
 // checkDeletionConsistency compares the two statements of the same fact: the

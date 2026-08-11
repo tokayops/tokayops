@@ -856,9 +856,10 @@ func (a *API) teamsWithSchedule(ctx context.Context, teams []*model.Team) (map[s
 			case err != nil:
 				return err
 			}
-			if root.HistoryCompleteFrom == nil {
-				log.Printf("ALERT schedule_config: team %s has a schedule row with no history horizon (%s); the upgrade reset was not run",
-					team.ID, root.ID)
+			// Quiet here, loud everywhere else - and the wording of "loud"
+			// comes from the one place that owns it, so the two cannot drift.
+			if err := scheduleconfig.RequireInitializedRoot(root); err != nil {
+				log.Printf("ALERT schedule_config: team %s: %v", team.ID, err)
 				continue
 			}
 			if root.DeletedAt != nil {

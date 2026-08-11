@@ -174,7 +174,7 @@ func (s *Service) lockForOverride(ctx context.Context, tx ScheduleConfigTx, sche
 	// An override command never reads the revision chain, so without this the
 	// one uninitialized row in the database would be the one place a write
 	// succeeded: an override revision appended to a schedule that has none.
-	if err := requireInitializedRoot(locked); err != nil {
+	if err := RequireInitializedRoot(locked); err != nil {
 		return nil, time.Time{}, err
 	}
 	// An inactive schedule has nobody on duty, so there is nobody to stand in

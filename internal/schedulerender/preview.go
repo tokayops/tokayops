@@ -269,7 +269,10 @@ func previewWindow(evaluatedAt time.Time, until *time.Time) time.Time {
 // reported as incomplete history.
 func previewRoot(root scheduleconfig.ScheduleRoot, evaluatedAt time.Time) scheduleconfig.ScheduleRoot {
 	root.DeletedAt = nil
-	if root.HistoryCompleteFrom == nil {
+	// The one caller of RootInitialized that fills the gap in instead of
+	// refusing: this root is hypothetical, so "no horizon" here means "no
+	// schedule yet", not the skipped-reset damage it means everywhere else.
+	if !scheduleconfig.RootInitialized(&root) {
 		at := evaluatedAt
 		root.HistoryCompleteFrom = &at
 	}
