@@ -1069,3 +1069,54 @@ func TestOverrideOfAnotherScheduleIsRefused(t *testing.T) {
 		t.Fatalf("got %d overrides, want the original still there", len(list.Overrides))
 	}
 }
+
+// A save that committed has succeeded, and the response must not depend on
+// anything that happens afterwards.
+//
+// It used to render the resulting duty in a second read AFTER the commit, so a
+// failure there answered 500 for a command that had already been applied - the
+// response lied about the outcome. The structural guarantee is that there is
+// no read to fail: the handler opens no read transaction once the command
+// returns.
+func TestSaveDoesNotReadAfterTheCommit(t *testing.T) {
+	_, s, e, env := setupScheduleAPI(t)
+	defer s.Close()
+
+	created := createSchedule(t, e, []string{"denis"})
+
+	// Only the save under test is counted.
+	env.Config.Calls = nil
+
+	rec := doJSON(t, e, http.MethodPut, "/api/v1/teams/devops/schedule/config",
+		configRequest(created.Version, []string{"denis", "alex"}), "denis")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The command itself runs in a write transaction; what must not appear is
+	// a read transaction opened after it.
+	for i, call := range env.Config.Calls {
+		if call != "WithinSnapshot" {
+			continue
+		}
+		committed := false
+		for _, earlier := range env.Config.Calls[:i] {
+			if earlier == "Commit" {
+				committed = true
+			}
+		}
+		if committed {
+			t.Fatalf("the handler read again after the commit: %v", env.Config.Calls)
+		}
+	}
+
+	// And the answer says what the save did, without describing the world.
+	var out PutScheduleConfigResponse
+	decodeJSON(t, rec, &out)
+	if out.RevisionID == "" || out.Version != created.Version+1 {
+		t.Fatalf("save answer = %+v, want the new revision and version", out)
+	}
+	if strings.Contains(rec.Body.String(), "on_call_after") {
+		t.Errorf("the save response still describes who is on duty: %s", rec.Body.String())
+	}
+}

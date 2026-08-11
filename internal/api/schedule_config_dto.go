@@ -154,18 +154,24 @@ type ScheduleConfigResponse struct {
 	Config        ScheduleConfigDTO `json:"config"`
 }
 
-// PutScheduleConfigResponse is the answer to a save.
+// PutScheduleConfigResponse says what the save did, and nothing about the world
+// after it.
 //
 // Every field is present even when nothing was written: a no-op still has a
 // version and a revision in force, and an editor that had to special-case the
 // no-op response would end up with two ways to read the same answer.
+//
+// It used to carry on_call_after, rendered by a second read AFTER the commit -
+// so a failure of that read answered 500 for a command that had already been
+// applied. The response lied about the outcome, which is worse than being
+// terse. Who is on duty now is a separate question, asked by a separate
+// request that is free to fail on its own.
 type PutScheduleConfigResponse struct {
-	Version     int64     `json:"version"`
-	RevisionID  string    `json:"revision_id"`
-	Noop        bool      `json:"noop"`
-	Created     bool      `json:"created"`
-	Recreated   bool      `json:"recreated"`
-	OnCallAfter OnCallDTO `json:"on_call_after"`
+	Version    int64  `json:"version"`
+	RevisionID string `json:"revision_id"`
+	Noop       bool   `json:"noop"`
+	Created    bool   `json:"created"`
+	Recreated  bool   `json:"recreated"`
 }
 
 // LayerOnCallDTO is who is on duty on one layer.

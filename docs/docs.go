@@ -3130,9 +3130,6 @@ const docTemplate = `{
                 "noop": {
                     "type": "boolean"
                 },
-                "on_call_after": {
-                    "$ref": "#/definitions/api.OnCallDTO"
-                },
                 "recreated": {
                     "type": "boolean"
                 },

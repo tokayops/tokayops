@@ -197,9 +197,13 @@ func TestScheduleOnCallSurfacesOverrideOverlap(t *testing.T) {
 	}
 }
 
-// The same warning has to reach the save and preview projections, which share
-// the converter. Testing only the new endpoint would let the other two rot.
-func TestSaveAndPreviewCarryOnCallWarnings(t *testing.T) {
+// The same warning has to reach the preview projection, which shares the
+// converter with the on-call endpoint above. Testing only one of them would
+// let the other rot.
+//
+// The save used to be the third consumer. It no longer projects anything: its
+// response says what it did, not what the world looks like afterwards.
+func TestPreviewCarriesOnCallWarnings(t *testing.T) {
 	_, s, e, env := setupScheduleAPI(t)
 	defer s.Close()
 
@@ -219,15 +223,12 @@ func TestSaveAndPreviewCarryOnCallWarnings(t *testing.T) {
 		t.Fatalf("preview on_call_before warnings = %+v, want override_overlap", preview.OnCallBefore.Warnings)
 	}
 
+	// The save still succeeds on the same data; it just answers about itself
+	// now, so there is nothing in its response to assert a warning on.
 	rec = doJSON(t, e, http.MethodPut, "/api/v1/teams/devops/schedule/config",
 		configRequest(created.Version, []string{"denis", "alex"}), "denis")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("save: want 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var saved PutScheduleConfigResponse
-	decodeJSON(t, rec, &saved)
-	if !hasWarning(saved.OnCallAfter.Warnings, string(schedulerender.WarnOverrideOverlap)) {
-		t.Fatalf("save on_call_after warnings = %+v, want override_overlap", saved.OnCallAfter.Warnings)
 	}
 }
 

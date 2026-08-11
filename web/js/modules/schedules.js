@@ -633,26 +633,6 @@ function validateConfig(config) {
 // Preview -> Confirm
 // ========================================
 
-/**
- * Whether two projections put the same people on duty.
- *
- * Mirrors what the server compares. Provenance is deliberately left out: every
- * save produces a new revision and a new assignment start, so comparing those
- * would report "this differs from the preview" for every save, including the
- * ones that changed nothing about who is on call.
- */
-function sameLayerDuty(x, y) {
-    if (!x || !y) return !x && !y;
-    if (x.source !== y.source) return false;
-    const left = [...(x.user_ids || [])].sort();
-    const right = [...(y.user_ids || [])].sort();
-    return left.length === right.length && left.every((id, i) => id === right[i]);
-}
-
-function sameDuty(a, b) {
-    return sameLayerDuty(a?.l1, b?.l1) && sameLayerDuty(a?.l2, b?.l2);
-}
-
 async function handleScheduleSubmit(e) {
     e.preventDefault();
 
@@ -775,32 +755,11 @@ async function showPreviewStep(teamId, config, preview, expectedVersion, reason)
                 showToast('Schedule saved', 'success');
             }
 
-            // The save recalculated under a lock. If that produced a different
-            // duty than the preview showed, say so: the person approved a
-            // specific outcome, and quietly delivering another one is how
-            // trust in the preview is lost.
-            if (!saved.noop && !sameDuty(preview.on_call_after, saved.on_call_after)) {
-                // Resolved from what was actually saved, not from the preview:
-                // if a concurrent override put someone new on duty, their name
-                // was never in the preview and reusing that map would announce
-                // the surprise as "Unknown user".
-                const savedNames = await resolveNames([
-                    ...(saved.on_call_after?.l1?.user_ids || []),
-                    ...(saved.on_call_after?.l2?.user_ids || []),
-                ]);
-                const changed = ['l1', 'l2']
-                    .filter(layer => !sameLayerDuty(preview.on_call_after?.[layer],
-                                                    saved.on_call_after?.[layer]))
-                    .map(layer => {
-                        const who = Components.onCallNames(
-                            saved.on_call_after?.[layer], savedNames) || 'nobody';
-                        return `${layer.toUpperCase()}: ${who}`;
-                    });
-                showToast(
-                    `Saved, but on-call differs from the preview - ${changed.join(', ')}.`,
-                    'warning');
-            }
-
+            // Nothing is compared with the preview. The save no longer
+            // reports who is on duty afterwards - it says what it did, and
+            // refreshOnCallUI below asks the separate question of who is on
+            // call now. The preview was always advisory; a warning that it
+            // "differed" only ever restated that.
             previewHost.remove();
             closeModal();
             await refreshOnCallUI(teamId);
