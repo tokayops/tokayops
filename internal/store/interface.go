@@ -66,7 +66,6 @@ type StoreInterface interface {
 	GetTeamByID(id string) (*model.Team, error)
 	GetAllTeams() ([]*model.Team, error)
 	UpdateTeam(t *model.Team) error
-	DeleteTeam(id string) error
 
 	// Users
 	CreateUser(u *model.User) error

@@ -28,6 +28,13 @@ const (
 	// other foreign key on the revision tables points at rows this package
 	// writes itself, so violating one is a bug.
 	scheduleTeamFKConstraint = "schedules_team_id_fkey"
+
+	// integrationTeamFKConstraint is the integrations -> teams foreign key,
+	// which has no ON DELETE action: a team-scoped webhook holds its team in
+	// place. Deleting the team is the only operation that can trip it, and
+	// what it means there is a refusal the caller can act on, not a bug -
+	// hence a typed error rather than an invariant violation.
+	integrationTeamFKConstraint = "integrations_team_id_fkey"
 )
 
 // scheduleRevisionColumns is the SELECT list every revision scan expects.
@@ -287,6 +294,46 @@ func (t *scheduleConfigTx) ActiveUserIDs(ctx context.Context, userIDs []string) 
 // A membership that is not there is not an error: the caller asked for the
 // person to end up outside the team, and they are. The guard that decides
 // whether the removal is allowed at all lives in the service, above this.
+// LockTeam takes the row lock that serializes team deletion against anything
+// that would give the team a new child row.
+//
+// FOR UPDATE conflicts with the FOR KEY SHARE that PostgreSQL takes on a
+// parent row when a child referencing it is inserted, which is what makes the
+// two orders of "create the first schedule" and "delete the team"
+// deterministic instead of a race for the constraint.
+func (t *scheduleConfigTx) LockTeam(ctx context.Context, teamID string) error {
+	var id string
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT id FROM teams WHERE id = $1 FOR UPDATE`, teamID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return scheduleconfig.ErrTeamNotFound
+	}
+	return err
+}
+
+// DeleteTeam removes the team and its memberships.
+//
+// Memberships go first and explicitly: team_members -> teams has no ON DELETE
+// action, so nothing would remove them on its own, and leaving them would
+// leave rows pointing at a team that no longer exists.
+//
+// The refusal this can still hit is a team-scoped integration, which
+// mapScheduleWriteError turns into ErrTeamHasIntegrations. It is left to the
+// constraint rather than checked first on purpose: a SELECT before the DELETE
+// would be a second statement of the same rule, and the window between the two
+// is exactly what the constraint has no window for.
+func (t *scheduleConfigTx) DeleteTeam(ctx context.Context, teamID string) error {
+	if _, err := t.tx.ExecContext(ctx,
+		`DELETE FROM team_members WHERE team_id = $1`, teamID); err != nil {
+		return mapScheduleWriteError(err)
+	}
+	if _, err := t.tx.ExecContext(ctx,
+		`DELETE FROM teams WHERE id = $1`, teamID); err != nil {
+		return mapScheduleWriteError(err)
+	}
+	return nil
+}
+
 func (t *scheduleConfigTx) DeleteTeamMembership(ctx context.Context, teamID, userID string) error {
 	_, err := t.tx.ExecContext(ctx,
 		`DELETE FROM team_members WHERE team_id = $1 AND user_id = $2`, teamID, userID)
@@ -391,6 +438,9 @@ func mapScheduleWriteError(err error) error {
 	case "foreign_key_violation":
 		if pqErr.Constraint == scheduleTeamFKConstraint {
 			return scheduleconfig.ErrTeamNotFound
+		}
+		if pqErr.Constraint == integrationTeamFKConstraint {
+			return scheduleconfig.ErrTeamHasIntegrations
 		}
 		return fmt.Errorf("%w: foreign key %q: %s", scheduleconfig.ErrInvariantViolation, pqErr.Constraint, pqErr.Message)
 	case "check_violation", "exclusion_violation", "not_null_violation":

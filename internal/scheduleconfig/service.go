@@ -655,6 +655,62 @@ func (s *Service) RemoveTeamMember(ctx context.Context, teamID, userID string) e
 	})
 }
 
+// DeleteTeam removes a team, or explains what retains it.
+//
+// It lives here, in a package about schedules, because the thing that retains
+// a team is schedule history and the transaction that has to establish that is
+// this one. The honest home would be a team service, which does not exist;
+// RemoveTeamMember is here for the same reason. If one is ever written, both
+// move together.
+//
+// The protocol, in this order:
+//
+//  1. lock the team row. Inserting a child row takes FOR KEY SHARE on the
+//     parent, and FOR UPDATE conflicts with it, so a concurrent "create the
+//     first schedule" or "add a team-scoped webhook" either finishes before
+//     this read or waits for this transaction to end. Both orders answer
+//     deterministically; neither reaches the constraint by surprise.
+//  2. read the schedule root AFTER the lock. READ COMMITTED is what makes
+//     that read see a schedule that committed while this transaction waited.
+//     Under REPEATABLE READ the snapshot would predate it, the row would be
+//     invisible, and the refusal would come back as a raw constraint error.
+//  3. refuse an uninitialized root before anything else can act on it. Such a
+//     row has no revisions, so nothing would stop the cascade from teams -
+//     this is the one path on which a skipped upgrade reset could destroy
+//     data silently.
+//  4. delete, and let the integrations foreign key answer for itself.
+//
+// The schedule check is a read rather than a constraint because its answer is
+// terminal: history cannot be removed, so there is no point reporting a
+// removable blocker alongside it. Soft-deleted counts - the revisions are
+// still there.
+func (s *Service) DeleteTeam(ctx context.Context, teamID string) error {
+	if teamID == "" {
+		return invalidField("team_id", "is required")
+	}
+	return s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
+		if err := tx.LockTeam(ctx, teamID); err != nil {
+			return err
+		}
+
+		root, err := tx.GetScheduleRootByTeam(ctx, teamID)
+		switch {
+		case errors.Is(err, ErrScheduleNotFound):
+			// Never had a schedule, or never will have had one: nothing to
+			// retain the team on this side.
+		case err != nil:
+			return err
+		default:
+			if err := RequireInitializedRoot(root); err != nil {
+				return err
+			}
+			return &TeamHasScheduleHistoryError{ScheduleID: root.ID}
+		}
+
+		return tx.DeleteTeam(ctx, teamID)
+	})
+}
+
 // holdsAssignment reports whether a user is currently assignable on a
 // schedule, from both sources: the groups of the active tail revision, and any
 // live override head aimed at them. An override can name someone who appears

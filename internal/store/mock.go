@@ -1115,7 +1115,15 @@ func (m *MockStore) UpdateTeam(t *model.Team) error {
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) DeleteTeam(id string) error {
+// DeleteTeamRow removes the team row and its memberships, and nothing else.
+//
+// It is not the old DeleteTeam under another name: that one was on
+// StoreInterface, which made it a second way into a destructive operation with
+// none of the guards. This one is deliberately off the interface and named
+// after what it is - the double's stand-in for the two DELETE statements that
+// run inside scheduleconfig's transaction, with the guards left where they
+// belong, above it.
+func (m *MockStore) DeleteTeamRow(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

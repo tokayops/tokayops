@@ -63,6 +63,13 @@ type fakeState struct {
 	// belong to the team whose schedule they edit, so "is a member" and "is a
 	// person" are different questions here as they are in the store.
 	knownUsers map[string]bool
+
+	// knownTeams and teamIntegrations exist only for DeleteTeam: the first is
+	// what LockTeam answers about, the second stands for the foreign key that
+	// a team-scoped integration holds on the team. Every other command reaches
+	// a team through a schedule, so neither is consulted anywhere else.
+	knownTeams       map[string]bool
+	teamIntegrations map[string]bool
 }
 
 func newState() fakeState {
@@ -75,6 +82,9 @@ func newState() fakeState {
 		members:    map[string][]string{},
 		erased:     map[string]bool{},
 		knownUsers: map[string]bool{},
+
+		knownTeams:       map[string]bool{},
+		teamIntegrations: map[string]bool{},
 	}
 }
 
@@ -388,6 +398,27 @@ func (r *ScheduleConfigRepo) SetTeamMembers(teamID string, userIDs ...string) {
 	for _, id := range userIDs {
 		r.state.knownUsers[id] = true
 	}
+}
+
+// AddTeams registers teams that exist. Only DeleteTeam asks - every other
+// command reaches a team through its schedule - so a test that does not delete
+// teams need not call this.
+func (r *ScheduleConfigRepo) AddTeams(teamIDs ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range teamIDs {
+		r.state.knownTeams[id] = true
+	}
+}
+
+// AddTeamIntegration stands in for a team-scoped integration row: in the store
+// it is a foreign key with no ON DELETE action, and here it is the fact that
+// makes DeleteTeam refuse.
+func (r *ScheduleConfigRepo) AddTeamIntegration(teamID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.knownTeams[teamID] = true
+	r.state.teamIntegrations[teamID] = true
 }
 
 // AddUsers registers people who exist without belonging to any team - a global
@@ -1075,6 +1106,30 @@ func (t *scheduleConfigTx) DeleteTeamMembership(ctx context.Context, teamID, use
 		}
 	}
 	t.repo.state.members[teamID] = out
+	return nil
+}
+
+func (t *scheduleConfigTx) LockTeam(ctx context.Context, teamID string) error {
+	if err := t.repo.record("LockTeam"); err != nil {
+		return err
+	}
+	if !t.repo.state.knownTeams[teamID] {
+		return scheduleconfig.ErrTeamNotFound
+	}
+	return nil
+}
+
+func (t *scheduleConfigTx) DeleteTeam(ctx context.Context, teamID string) error {
+	if err := t.repo.record("DeleteTeam"); err != nil {
+		return err
+	}
+	// The store learns this from the foreign key; the fake is told. Either way
+	// it is the delete that refuses, not a check before it.
+	if t.repo.state.teamIntegrations[teamID] {
+		return scheduleconfig.ErrTeamHasIntegrations
+	}
+	delete(t.repo.state.members, teamID)
+	delete(t.repo.state.knownTeams, teamID)
 	return nil
 }
 

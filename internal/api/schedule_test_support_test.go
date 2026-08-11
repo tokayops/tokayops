@@ -67,6 +67,51 @@ func (t *testScheduleTx) DeleteTeamMembership(ctx context.Context, teamID, userI
 	return t.store.RemoveTeamMember(teamID, userID)
 }
 
+// Teams live in the mock, so the two operations that ask about the team row
+// itself are answered from there rather than from the revision fake.
+func (t *testScheduleTx) LockTeam(ctx context.Context, teamID string) error {
+	if _, err := t.store.GetTeamByID(teamID); err != nil {
+		return scheduleconfig.ErrTeamNotFound
+	}
+	return nil
+}
+
+// DeleteTeam stands in for the store's two DELETE statements, not for the
+// guards around them: schedule history is decided above this line, and the
+// integrations refusal is the foreign key, mirrored here.
+func (t *testScheduleTx) DeleteTeam(ctx context.Context, teamID string) error {
+	if scoped, err := teamScopedIntegrations(t.store, teamID); err != nil {
+		return err
+	} else if scoped {
+		return scheduleconfig.ErrTeamHasIntegrations
+	}
+	members, err := t.store.GetTeamMembers(teamID)
+	if err != nil {
+		return err
+	}
+	for _, m := range members {
+		if err := t.store.RemoveTeamMember(teamID, m.ID); err != nil {
+			return err
+		}
+	}
+	return t.store.DeleteTeamRow(teamID)
+}
+
+// teamScopedIntegrations mirrors what the integrations -> teams foreign key
+// does in the real database: a team-scoped integration holds its team in place.
+func teamScopedIntegrations(s *store.MockStore, teamID string) (bool, error) {
+	integrations, err := s.GetAllIntegrations()
+	if err != nil {
+		return false, err
+	}
+	for _, i := range integrations {
+		if i.TeamID != nil && *i.TeamID == teamID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // activeTeamMemberIDs mirrors the store query: members of the team, minus the
 // ones that have been erased.
 func activeTeamMemberIDs(s *store.MockStore, teamID string) ([]string, error) {

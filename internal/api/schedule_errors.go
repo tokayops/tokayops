@@ -35,6 +35,13 @@ const (
 	CodeOverrideOverlap    = "override_overlap"
 	CodeUserNotTeamMember  = "user_not_team_member"
 	CodeMemberOnCall       = "member_on_call"
+
+	// Deleting a team is refused by two different things, and the codes are
+	// separate because the remedies are: history cannot be removed at all, an
+	// integration is removed by the caller.
+	CodeTeamHasScheduleHistory = "team_has_schedule_history"
+	CodeTeamHasIntegrations    = "team_has_integrations"
+
 	CodeValidationFailed   = "validation_failed"
 	CodeInvalidRequestBody = "invalid_request_body"
 	CodeInvalidParameter   = "invalid_parameter"
@@ -67,6 +74,12 @@ var scheduleErrorStatuses = []struct {
 		"this team already has a schedule"},
 	{scheduleconfig.ErrScheduleDeleted, http.StatusConflict, CodeScheduleDeleted, "schedule is deleted"},
 	{erasure.ErrLastAdmin, http.StatusConflict, CodeLastAdmin, "last active admin"},
+
+	// Two codes rather than one "team is retained", because the two are acted
+	// on differently: schedule history cannot be removed at all, a team-scoped
+	// integration is deleted by the caller who then retries.
+	{scheduleconfig.ErrTeamHasIntegrations, http.StatusConflict, CodeTeamHasIntegrations,
+		"team still has integrations"},
 
 	// 401, not 403: the caller was authorized when the request arrived and has
 	// been erased since. There is no permission they could be granted.
@@ -157,6 +170,17 @@ func scheduleErrorDetails(err error) (int, any, bool) {
 			"error":    "some users are not members of this team",
 			"code":     CodeUserNotTeamMember,
 			"user_ids": notMember.UserIDs,
+		}, true
+	}
+
+	// The refusal names the schedule, so an operator reading the response
+	// knows which row retains the team without going to look for it.
+	var scheduleHistory *scheduleconfig.TeamHasScheduleHistoryError
+	if errors.As(err, &scheduleHistory) {
+		return http.StatusConflict, map[string]any{
+			"error":       "team has schedule history and cannot be deleted",
+			"code":        CodeTeamHasScheduleHistory,
+			"schedule_id": scheduleHistory.ScheduleID,
 		}, true
 	}
 

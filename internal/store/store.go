@@ -2191,14 +2191,6 @@ func (s *Store) UpdateTeam(t *model.Team) error {
 	return err
 }
 
-func (s *Store) DeleteTeam(id string) error {
-	if _, err := s.db.Exec(`DELETE FROM team_members WHERE team_id = $1`, id); err != nil {
-		return err
-	}
-	_, err := s.db.Exec(`DELETE FROM teams WHERE id = $1`, id)
-	return err
-}
-
 func (s *Store) GetTeamMembershipsForUser(userID string) (map[string]model.TeamMemberRole, error) {
 	query := `SELECT team_id, role FROM team_members WHERE user_id = $1`
 	rows, err := s.db.Query(query, userID)

@@ -310,6 +310,27 @@ type ScheduleConfigTx interface {
 	// through Service.RemoveTeamMember, which holds the guard that stops a
 	// person being removed out from under a live assignment.
 	DeleteTeamMembership(ctx context.Context, teamID, userID string) error
+
+	// LockTeam takes the row lock on a team, and is the serialization point
+	// for deleting it: the lock conflicts with the one an insert takes on the
+	// parent row, so "create the first schedule" and "delete the team" cannot
+	// interleave into a raw constraint error.
+	//
+	// It sits between users and schedules in the global lock order
+	// (advisory -> users -> teams -> schedules). Nothing locked teams before,
+	// so the level was added without revisiting the commands above it.
+	//
+	// ErrTeamNotFound when no such team exists: existence is answered here,
+	// under the lock, rather than by a read before the transaction that
+	// nothing keeps true.
+	LockTeam(ctx context.Context, teamID string) error
+
+	// DeleteTeam removes the team and its memberships in this transaction.
+	//
+	// It refuses with ErrTeamHasIntegrations when a team-scoped integration
+	// still references the team. The schedule blocker is not its business:
+	// Service.DeleteTeam checks that first, because it is terminal.
+	DeleteTeam(ctx context.Context, teamID string) error
 }
 
 // NormalizeTimestamp truncates to the resolution the database stores, so a
