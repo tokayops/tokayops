@@ -348,7 +348,7 @@ func TestNotifierDamagedScheduleIsIsolated(t *testing.T) {
 	)
 
 	before := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
-		string(schedulerender.FailureSnapshotDecode)))
+		metrics.ConsumerHandoffNotifier, string(schedulerender.FailureSnapshotDecode)))
 
 	env.oncall.setBulk(schedulerender.BulkOnCall{
 		Schedules: []schedulerender.ScheduleOnCall{rotationDuty("sched-healthy", "g-b", "bob")},
@@ -370,7 +370,7 @@ func TestNotifierDamagedScheduleIsIsolated(t *testing.T) {
 		t.Fatalf("cache of the damaged schedule = %+v, want it untouched", cached)
 	}
 	after := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
-		string(schedulerender.FailureSnapshotDecode)))
+		metrics.ConsumerHandoffNotifier, string(schedulerender.FailureSnapshotDecode)))
 	if after-before != 1 {
 		t.Errorf("projection failure counter moved by %v, want 1", after-before)
 	}

@@ -185,7 +185,10 @@ func (s *UsergroupSyncer) Run(ctx context.Context) {
 // sync that "succeeded over 0 schedules" was the honest report of a filter on a
 // column nothing writes.
 func (s *UsergroupSyncer) SyncAll(ctx context.Context) error {
+	started := time.Now()
 	bulk, err := s.oncall.CurrentOnCallForAllNow(ctx)
+	metrics.ScheduleOnCallProjectionDuration.
+		WithLabelValues(metrics.ConsumerUsergroupSyncer).Observe(time.Since(started).Seconds())
 	if err != nil {
 		return err
 	}
@@ -196,7 +199,8 @@ func (s *UsergroupSyncer) SyncAll(ctx context.Context) error {
 		// whoever was on duty when the schedule was last readable.
 		log.Printf("[UsergroupSyncer] Schedule %s (team %s) could not be projected (%s): %v",
 			failure.ScheduleID, failure.TeamID, failure.Reason, failure.Err)
-		metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(string(failure.Reason)).Inc()
+		metrics.ScheduleOnCallProjectionFailuresTotal.
+			WithLabelValues(metrics.ConsumerUsergroupSyncer, string(failure.Reason)).Inc()
 	}
 
 	for _, sc := range bulk.Schedules {

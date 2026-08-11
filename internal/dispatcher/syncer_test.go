@@ -258,12 +258,12 @@ func TestSyncerDamagedScheduleDoesNotStopTheRest(t *testing.T) {
 	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
 
 	before := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
-		string(schedulerender.FailureRotation)))
+		metrics.ConsumerUsergroupSyncer, string(schedulerender.FailureRotation)))
 	if err := syncer.SyncAll(context.Background()); err != nil {
 		t.Fatalf("SyncAll: %v", err)
 	}
 	after := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
-		string(schedulerender.FailureRotation)))
+		metrics.ConsumerUsergroupSyncer, string(schedulerender.FailureRotation)))
 
 	got := stub.recorded()
 	if len(got) != 1 || got[0].usergroup != "S-OK" {
