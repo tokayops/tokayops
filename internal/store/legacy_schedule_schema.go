@@ -28,13 +28,13 @@ CREATE TABLE IF NOT EXISTS schedules (
 	id TEXT PRIMARY KEY,
 	team_id TEXT UNIQUE NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
 	timezone TEXT DEFAULT 'UTC',
-	
+
 	-- L1 Layer Config
 	l1_rotation_type TEXT NOT NULL DEFAULT 'weekly',
 	l1_handoff_time TIME NOT NULL DEFAULT '11:00',
 	l1_handoff_day INTEGER DEFAULT 1,
 	l1_rotation_start TIMESTAMPTZ NOT NULL,
-	
+
 	-- L2 Layer Config (optional)
 	l2_enabled BOOLEAN DEFAULT FALSE,
 	l2_escalation_timeout_min INTEGER DEFAULT 5,
@@ -42,10 +42,10 @@ CREATE TABLE IF NOT EXISTS schedules (
 	l2_handoff_time TIME DEFAULT '11:00',
 	l2_handoff_day INTEGER DEFAULT 1,
 	l2_rotation_start TIMESTAMPTZ,
-	
+
 	-- Slack usergroup sync (optional)
 	slack_usergroup_id TEXT,
-	
+
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );

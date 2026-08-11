@@ -89,11 +89,12 @@ func (s *Service) RenderRange(ctx context.Context, scheduleID string, from, unti
 // needed, and computing it directly keeps the hot path to a single position
 // calculation.
 //
-// A schedule that does not exist, predates the revision model, or was deleted
-// before `at` yields an empty projection rather than an error. A dispatcher
+// A schedule that does not exist, was deleted before `at`, or did not yet
+// exist at `at` yields an empty projection rather than an error. A dispatcher
 // asking who to page must be told "nobody", not handed a failure it has to
 // interpret. Damage is the exception and does surface: a schedule whose chain
-// is broken has no honest answer to give.
+// is broken, or which carries no history horizon at all, has no honest answer
+// to give.
 func (s *Service) CurrentOnCall(ctx context.Context, scheduleID string, at time.Time) (OnCall, error) {
 	// Normalized for the same reason the render range is: the query that
 	// picks the effective revision floors `at`, so a sub-microsecond instant
@@ -139,8 +140,9 @@ func (s *Service) CurrentOnCallNow(ctx context.Context, scheduleID string) (OnCa
 // duty, and a caller has to tell them apart to know whether to offer to
 // configure one.
 type TeamOnCall struct {
-	// ScheduleID is empty when the team has no schedule in this model,
-	// including a row left over from before it.
+	// ScheduleID is empty only when the team has no schedule at all. A
+	// schedule that exists but could not be projected does not reach here -
+	// that is an error, not an answer.
 	ScheduleID string
 	DeletedAt  *time.Time
 	OnCall     OnCall
@@ -154,10 +156,9 @@ type TeamOnCall struct {
 // request, the first to fetch a single row. One transaction answers both
 // halves.
 //
-// It also puts the rules about absent, pre-revision and deleted schedules in
-// one place. A caller that assembled the answer itself needed its own copy of
-// them, and two copies of "what a schedule that is not there looks like" is
-// how they drift.
+// It also puts the rules about absent and deleted schedules in one place. A
+// caller that assembled the answer itself needed its own copy of them, and two
+// copies of "what a schedule that is not there looks like" is how they drift.
 //
 // Consistency comes along for free: a delete landing between two separate
 // reads could have produced an answer describing no state that ever existed.

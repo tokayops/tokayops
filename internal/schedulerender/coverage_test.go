@@ -302,3 +302,56 @@ func TestRangeIsNormalizedToDatabaseResolution(t *testing.T) {
 		t.Fatal("a sub-resolution range was accepted")
 	}
 }
+
+// TestGapNamesTheRevisionItActuallyFollows: a gap's RelatedIDs must name the
+// revisions on either side of it, and the left one is whatever the coverage
+// ended at - not simply whichever revision was processed last.
+//
+// The two differ only on a damaged chain: a revision nested wholly inside what
+// an earlier one already covers extends nothing, so the coverage still ends at
+// the earlier revision. Naming the nested one would point an operator at a row
+// that does not touch the gap at all, which is a lie told exactly when the data
+// is already confusing.
+func TestGapNamesTheRevisionItActuallyFollows(t *testing.T) {
+	created := utc(2026, 5, 1, 11, 0)
+	until := utc(2026, 5, 9, 11, 0)
+
+	revs := chain(t,
+		revisionStep{at: created, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
+		revisionStep{at: utc(2026, 5, 3, 11, 0),
+			cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"), group(groupB, "bob"))},
+		revisionStep{at: utc(2026, 5, 7, 11, 0),
+			cfg: config("UTC", dailyPolicy("11:00"), group(groupB, "bob"))},
+	)
+
+	// outer covers [1st, 5th); nested sits inside it and ends earlier, so it
+	// leaves the coverage exactly where outer put it. after starts on the 7th,
+	// so the hole is [5th, 7th) - bounded on the left by outer.
+	outer, nested, after := revs[0], revs[1], revs[2]
+	outerEnd := utc(2026, 5, 5, 11, 0)
+	outer.EffectiveTo = &outerEnd
+	nestedStart, nestedEnd := utc(2026, 5, 2, 11, 0), utc(2026, 5, 3, 11, 0)
+	nested.EffectiveFrom, nested.EffectiveTo = nestedStart, &nestedEnd
+
+	res := renderOf(t, Input{
+		Root:      root(created),
+		Revisions: []scheduleconfig.ScheduleRevision{outer, nested, after},
+		From:      created,
+		Until:     until,
+	})
+
+	gaps := gapWarnings(res)
+	if len(gaps) != 1 {
+		t.Fatalf("got %d gap warnings, want 1: %+v", len(gaps), res.Warnings)
+	}
+	if !gaps[0].From.Equal(outerEnd) || !gaps[0].Until.Equal(after.EffectiveFrom) {
+		t.Fatalf("gap = %v..%v, want %v..%v",
+			gaps[0].From, gaps[0].Until, outerEnd, after.EffectiveFrom)
+	}
+	want := []string{outer.ID, after.ID}
+	if len(gaps[0].RelatedIDs) != 2 ||
+		gaps[0].RelatedIDs[0] != want[0] || gaps[0].RelatedIDs[1] != want[1] {
+		t.Fatalf("related_ids = %v, want %v (the nested revision %s does not bound this gap)",
+			gaps[0].RelatedIDs, want, nested.ID)
+	}
+}

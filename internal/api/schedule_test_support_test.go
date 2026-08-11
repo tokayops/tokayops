@@ -13,9 +13,9 @@ import (
 )
 
 // The API tests run the real handlers and the real services over two doubles:
-// MockStore for everything that predates the revision model, and
-// fakes.ScheduleConfigRepo for the revision model itself. The legacy mock is
-// deliberately NOT extended with revisions.
+// MockStore for everything outside the revision model - users, teams, alert
+// groups - and fakes.ScheduleConfigRepo for the revision model itself. The mock
+// is deliberately NOT extended with revisions.
 //
 // The two have to agree about one thing - who is in a team - because a handler
 // reads membership through the mock while a command validates it through the

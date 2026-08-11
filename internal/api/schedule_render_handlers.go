@@ -11,8 +11,8 @@ import (
 )
 
 // maxRenderRange bounds one render request. Without it a client can make the
-// renderer materialize years of daily slots for a single call; the legacy
-// handler had the same limit and clients already respect it.
+// renderer materialize years of daily slots for a single call. The limit is
+// unchanged from the endpoint this replaced, so clients already respect it.
 const maxRenderRange = 90 * 24 * time.Hour
 
 // RenderSchedule godoc

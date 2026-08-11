@@ -32,7 +32,6 @@ type Engine struct {
 	store      store.StoreInterface
 	oncall     onCallProjection
 	escBuilder *builders.EscalationJobBuilder
-	cfg        *config.Config
 }
 
 // NewEngine builds the alert engine. The on-call projection is shared with the
@@ -44,11 +43,12 @@ type Engine struct {
 // state between builds - what one build remembers lives for that build - so a
 // shared instance is the same object the loop was allocating each time round.
 func NewEngine(s store.StoreInterface, oncall onCallProjection, cfg *config.Config) *Engine {
+	// cfg is not kept: the only thing the engine did with it was hand it to the
+	// builder, which now holds it.
 	return &Engine{
 		store:      s,
 		oncall:     oncall,
 		escBuilder: builders.NewEscalationJobBuilder(s, oncall, cfg),
-		cfg:        cfg,
 	}
 }
 

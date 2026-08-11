@@ -104,7 +104,7 @@ func TestResolvePolicy(t *testing.T) {
 		DefaultPolicyID: "triage_policy",
 	})
 
-	e := &Engine{store: s, cfg: &config.Config{}}
+	e := &Engine{store: s}
 
 	tests := []struct {
 		name     string

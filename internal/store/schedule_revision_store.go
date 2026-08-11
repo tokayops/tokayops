@@ -54,7 +54,7 @@ type rowScanner interface {
 
 // ScheduleConfigRepository exposes the schedule configuration unit of work.
 // It is intentionally not part of StoreInterface: the revision model is not
-// mirrored into the legacy mock.
+// mirrored into MockStore.
 func (s *Store) ScheduleConfigRepository() scheduleconfig.ScheduleConfigRepository {
 	return &scheduleConfigRepo{db: s.db}
 }
@@ -98,8 +98,9 @@ type scheduleConfigTx struct {
 // insert is deliberately not reachable on its own: there is no code path that
 // can leave a schedule without a revision behind.
 //
-// Legacy mutable configuration columns are left to their defaults; the runtime
-// no longer reads them.
+// The pre-revision configuration columns are left to their defaults. They are
+// still in the table - dropping them is a separate cleanup - and nothing reads
+// them.
 func (t *scheduleConfigTx) CreateInitialSchedule(ctx context.Context, root *scheduleconfig.ScheduleRoot, initial *scheduleconfig.ScheduleRevision) error {
 	if err := scheduleconfig.PrepareInitialSchedule(root, initial); err != nil {
 		return err

@@ -224,11 +224,3 @@ func TestMigration_RotationEpochsFlatToGroups(t *testing.T) {
 		t.Errorf("Migration not idempotent — data changed after third InitDB: %v", stillNested)
 	}
 }
-
-// TestMigration_LegacyFlatRotationProducesSameOnCallAsNewSingleton proves end-to-end
-// that data inserted in the legacy flat format (["a","b","c"]) — after running InitDB
-// migration — produces IDENTICAL on-call results compared to a parallel schedule
-// that was set up via the new SetScheduleGroups API ([["a"],["b"],["c"]]).
-//
-// This is the strongest backward-compatibility guarantee: existing single-user
-// rotations behave identically to how they did before Epic 5.

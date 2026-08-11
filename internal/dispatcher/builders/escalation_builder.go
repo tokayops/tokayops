@@ -17,7 +17,7 @@ import (
 // OnCallProjection is the slice of the schedule projection the builder needs.
 //
 // It is an interface declared here rather than *schedulerender.Service because
-// the revision model is deliberately absent from the legacy MockStore: without
+// the revision model is deliberately absent from MockStore: without
 // it, every builder unit test would have to run against PostgreSQL.
 type OnCallProjection interface {
 	// CurrentTeamOnCallNow answers who is on duty for a team and whether the

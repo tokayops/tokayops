@@ -28,7 +28,7 @@ type dmProviderLookup interface {
 // is on duty everywhere, right now, read from one database snapshot.
 //
 // It is declared here rather than taken as *schedulerender.Service because the
-// revision model is deliberately absent from the legacy MockStore. A narrow
+// revision model is deliberately absent from MockStore. A narrow
 // interface is what keeps these unit tests off PostgreSQL.
 type onCallLister interface {
 	CurrentOnCallForAllNow(ctx context.Context) (schedulerender.BulkOnCall, error)

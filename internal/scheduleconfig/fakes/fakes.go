@@ -2,7 +2,7 @@
 // erasure unit-of-work interfaces for service unit tests.
 //
 // These fakes deliberately mirror only the narrow interfaces, not the full
-// persistence model: the legacy MockStore is never extended with revisions.
+// persistence model: MockStore is never extended with revisions.
 // SQL correctness is proven by integration tests against a real PostgreSQL.
 package fakes
 
@@ -343,9 +343,9 @@ func (r *ScheduleConfigRepo) RootCount() int {
 // SeedRoot inserts a schedule root directly, with whatever revision chain it
 // already has - usually none.
 //
-// No command can produce a root without a chain, which is the point: a legacy
-// row, a broken chain and a missing history horizon are all states the readers
-// have to answer for, and none of them is reachable through the command side.
+// No command can produce a root without a chain, which is the point: a broken
+// chain and a missing history horizon are both states the readers have to answer
+// for, and neither is reachable through the command side.
 func (r *ScheduleConfigRepo) SeedRoot(root scheduleconfig.ScheduleRoot) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

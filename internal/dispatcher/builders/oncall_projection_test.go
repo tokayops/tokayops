@@ -12,7 +12,7 @@ import (
 // fakeProjection is an OnCallProjection a test seeds directly.
 //
 // The builder depends on this narrow interface rather than on the renderer for
-// one concrete reason: the revision model is deliberately absent from the legacy
+// one concrete reason: the revision model is deliberately absent from
 // MockStore, so seeding on-call state through the store is not possible and
 // these tests would otherwise need PostgreSQL.
 //

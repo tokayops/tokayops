@@ -268,10 +268,17 @@ func (c *coverage) advance(revRange interval, rev scheduleconfig.ScheduleRevisio
 		revRange.Start = maxTime(revRange.Start, c.cursor)
 	}
 
+	// The cursor and the revision it ends at move together. A revision wholly
+	// inside what is already covered - corruption, but corruption the renderer
+	// has to survive - advances neither: it is not what the coverage now ends
+	// at, so naming it as one side of the next gap would point at a row that
+	// does not touch that gap. The assignments would still be right and only
+	// the diagnosis wrong, which is the kind of error nobody catches while
+	// reading a warning about damaged data.
 	if revRange.End.After(c.cursor) {
 		c.cursor = revRange.End
+		c.lastID = rev.ID
 	}
-	c.lastID = rev.ID
 	return revRange, warnings
 }
 

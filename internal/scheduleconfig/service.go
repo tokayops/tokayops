@@ -229,8 +229,9 @@ type writeTarget struct {
 }
 
 // lockForWrite is the preamble every write to an existing schedule shares:
-// refuse a pre-revision row, take the row lock, check the caller is not stale,
-// read the revision in force and check it agrees with the deleted projection.
+// take the row lock, refuse a row that carries no revision history, check the
+// caller is not stale, read the revision in force and check it agrees with the
+// deleted projection.
 //
 // Effective time is captured last, and that ordering is the point of the
 // function: the wait for the lock can be long, and an instant read before it

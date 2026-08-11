@@ -98,10 +98,10 @@ func (s *Service) preview(ctx context.Context, view scheduleconfig.ScheduleReadV
 	evaluatedAt := scheduleconfig.NormalizeTimestamp(s.now().UTC())
 	windowUntil := previewWindow(evaluatedAt, until)
 
-	// Load first, validate second, in that order because Save refuses a
-	// pre-revision schedule before it looks at membership. A preview that
-	// reported the membership problem where the save reports the legacy one
-	// would send the editor to fix the wrong thing.
+	// Load first, validate second, in that order because Save also refuses a
+	// schedule it cannot read before it looks at membership. A preview that
+	// reported a membership problem where the save reports damage would send
+	// the editor to fix the wrong thing.
 	base, err := loadPreviewBase(ctx, view, teamID, evaluatedAt, windowUntil)
 	if err != nil {
 		return nil, err

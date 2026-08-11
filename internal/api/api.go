@@ -66,9 +66,9 @@ type API struct {
 	telegram         TelegramAPI                                         // optional, nil = telegram interactivity disabled
 
 	// Schedule configuration is deliberately NOT reached through
-	// store.StoreInterface. The revision model is not mirrored into the legacy
-	// mock, and routing it through the same interface would be an invitation
-	// to read a schedule's rotation from the mutable columns again.
+	// store.StoreInterface. The revision model is not mirrored into MockStore,
+	// and routing it through the same interface would put the configuration back
+	// behind the door its own tables were taken out from.
 	scheduleConfig      *scheduleconfig.Service
 	scheduleRead        scheduleconfig.ScheduleReadRepository
 	scheduleRenderer    *schedulerender.Service

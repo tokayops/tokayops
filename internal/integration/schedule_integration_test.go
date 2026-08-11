@@ -15,10 +15,10 @@ import (
 	"github.com/tokayops/tokayops/internal/testutil"
 )
 
-// seedRevisionSchedule creates a schedule through the revision-model endpoint
-// and returns its config_version. The legacy store writer is deliberately not
-// used: a row it produces is refused by the new commands, which is the point
-// of the guard.
+// seedRevisionSchedule creates a schedule through the API and returns its
+// config_version. Going through the endpoint rather than writing rows is what
+// makes these fixtures the same thing a user would have: a schedule root and
+// its first revision, written together.
 func seedRevisionSchedule(t *testing.T, env *APIIntegrationEnv, teamID, actorID string, groups ...[]string) int64 {
 	t.Helper()
 	monday := 1

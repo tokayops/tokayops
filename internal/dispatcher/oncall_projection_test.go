@@ -12,7 +12,7 @@ import (
 //
 // The runtime consumers depend on this narrow interface rather than on the
 // renderer so that their unit tests need neither PostgreSQL nor revisions in
-// the legacy MockStore.
+// MockStore.
 //
 // It is guarded because the real thing is: a syncer manager can leave two
 // syncers alive at once, and each runs its own goroutine against this fake.

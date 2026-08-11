@@ -497,11 +497,10 @@ func (s *Store) InitDB() error {
 	// Schedule revision history: append-only configuration snapshots plus the
 	// aggregate-root columns that carry version and history completeness.
 	//
-	// Nothing in the runtime reads these tables yet; they are created here so
-	// the schema exists before the write path is switched over. All range
-	// constraints use tstzrange — the legacy no_overlapping_overrides
-	// constraint above uses naive tsrange over TIMESTAMPTZ columns and is not
-	// a template to follow.
+	// These are the live schedule tables: the configuration, its history and
+	// the columns the aggregate root carries. All range constraints use
+	// tstzrange - the pre-revision no_overlapping_overrides constraint uses
+	// naive tsrange over TIMESTAMPTZ columns and is not a template to follow.
 	revisionQuery := `
 	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS config_version BIGINT NOT NULL DEFAULT 0;
 	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS history_complete_from TIMESTAMPTZ;

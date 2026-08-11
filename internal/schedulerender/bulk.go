@@ -136,8 +136,10 @@ func (s *Service) CurrentOnCallForAll(ctx context.Context, at time.Time) (BulkOn
 				DeletedAt:  root.DeletedAt,
 				OnCall:     onCall,
 			}
-			// A legacy root and an instant before the horizon have no revision
-			// in force, so there is no snapshot to take these from.
+			// An instant before the schedule's history horizon has no revision
+			// in force, so there is no snapshot to take these from. Every other
+			// way of ending up without one is damage, and damage went to
+			// Failures rather than here.
 			if rev != nil {
 				sc.Timezone = rev.Snapshot.Timezone
 				sc.SlackUsergroupID = rev.Snapshot.SlackUsergroupID

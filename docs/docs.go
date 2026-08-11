@@ -1940,7 +1940,7 @@ const docTemplate = `{
         },
         "/api/v1/teams/{id}/schedule/on-call": {
             "get": {
-                "description": "The current-assignment projection, derived from the revision chain. A team with no schedule, a schedule from before the revision model and a deleted one all answer 200 with null layers: the question is who is on duty, and \"nobody\" is an answer.",
+                "description": "The current-assignment projection, derived from the revision chain. A team with no schedule and a team whose schedule is deleted both answer 200 with null layers: the question is who is on duty, and \"nobody\" is an answer. A schedule whose data cannot produce one - a broken revision chain, a missing history horizon - answers 500 rather than pretending nobody is on call.",
                 "produces": [
                     "application/json"
                 ],

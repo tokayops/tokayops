@@ -331,7 +331,7 @@ func (a *API) GetScheduleRevision(c echo.Context) error {
 
 // GetScheduleOnCall godoc
 // @Summary Get who is on duty for a team right now
-// @Description The current-assignment projection, derived from the revision chain. A team with no schedule, a schedule from before the revision model and a deleted one all answer 200 with null layers: the question is who is on duty, and "nobody" is an answer.
+// @Description The current-assignment projection, derived from the revision chain. A team with no schedule and a team whose schedule is deleted both answer 200 with null layers: the question is who is on duty, and "nobody" is an answer. A schedule whose data cannot produce one - a broken revision chain, a missing history horizon - answers 500 rather than pretending nobody is on call.
 // @Tags schedules
 // @Produce json
 // @Param id path string true "Team ID"
@@ -343,15 +343,17 @@ func (a *API) GetScheduleOnCall(c echo.Context) error {
 
 	// One call, one snapshot. This is the most frequently read endpoint here,
 	// and fetching the root separately cost a second read-only transaction on
-	// every request; the renderer also owns the rules about absent,
-	// pre-revision and deleted schedules, which this handler used to keep its
-	// own copy of.
+	// every request; the renderer also owns the rules about absent and deleted
+	// schedules, which this handler used to keep its own copy of.
 	//
-	// A team with no schedule, or one from before the revision model, is
-	// answered rather than refused: this endpoint reports who is on duty, and
-	// "nobody" is a true answer, not a missing resource. A client forced to
-	// read 404 as "nobody" would swallow a real 404 from a mistyped team along
-	// with it.
+	// A team with no schedule, or one that deleted it, is answered rather than
+	// refused: this endpoint reports who is on duty, and "nobody" is a true
+	// answer, not a missing resource. A client forced to read 404 as "nobody"
+	// would swallow a real 404 from a mistyped team along with it.
+	//
+	// Damage is the opposite case and is not softened into "nobody": a schedule
+	// the projection cannot read would otherwise look exactly like one with an
+	// empty rotation, and nobody would be paged for it.
 	res, err := a.scheduleRenderer.CurrentTeamOnCallNow(ctx, c.Param("id"))
 	if err != nil {
 		return a.mapScheduleError(c, err)
