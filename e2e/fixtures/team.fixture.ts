@@ -68,7 +68,7 @@ export class TeamFixtures {
 
 export type DeleteOutcome =
   | { result: 'deleted' }
-  | { result: 'retained'; reason: 'schedule-history' }
+  | { result: 'retained'; reason: 'schedule-history' | 'integrations' }
   | { result: 'failed'; detail: string };
 
 /**
@@ -80,16 +80,14 @@ export type DeleteOutcome =
  * a successful cleanup.
  *
  * `retained` is a real outcome, not a soft failure. A team that has ever had a
- * schedule cannot be deleted at all: `teams -> schedules` cascades,
- * `schedules -> schedule_revisions` restricts, and the restriction wins - by
- * design, since history must not be cascaded away. Soft-deleting the schedule
- * first does not help; the revisions remain. Recorded as TD10.
+ * schedule cannot be deleted at all: history must not be cascaded away, so the
+ * refusal is the design. Soft-deleting the schedule first does not help; the
+ * revisions remain. A team-scoped webhook retains its team too, and that one
+ * the caller could clear - the suite simply has no reason to.
  *
- * Sprint 6 will turn the driver error into an explicit 409, which makes the
- * answer legible but leaves the team exactly where it is. So these teams live
- * until the volume is destroyed, which `make e2e-test` does on every run. What
- * this fixture buys is that everything else really is removed, and that a new
- * kind of failure is not mistaken for the known one.
+ * So these teams live until the volume is destroyed, which `make e2e-test`
+ * does on every run. What this fixture buys is that everything else really is
+ * removed, and that a new kind of failure is not mistaken for the known one.
  */
 export async function deleteTeam(page: Page, teamId: string): Promise<DeleteOutcome> {
   const response = await page.request.delete(`/api/v1/teams/${teamId}`);
@@ -97,20 +95,16 @@ export async function deleteTeam(page: Page, teamId: string): Promise<DeleteOutc
 
   const body = await response.text();
 
-  // Two shapes, each recognised on its own terms.
+  // Recognised by machine code, never by text. A code exists precisely so that
+  // nobody parses prose for it, and matching loosely would also accept a 409
+  // that merely mentioned the name while meaning something else.
   //
-  // Today the refusal escapes as a driver error, so there is nothing to read
-  // but the constraint name - and it is only accepted with the 500 that
-  // carries it. Once Sprint 6 gives the refusal a machine code, it arrives as
-  // a 409 and is recognised by that code, not by finding the string somewhere
-  // in the response: a code exists precisely so that nobody parses text for
-  // it. Matching loosely would also accept a 409 that merely mentioned the
-  // name while meaning something else.
+  // The refusal used to arrive as a 500 carrying a constraint name, and this
+  // helper accepted that shape too while Sprint 6C was pending. It no longer
+  // does: a 500 here is now a defect, and accepting one would hide exactly the
+  // regression this branch was written for.
   //
-  // Any other 500, and any other 409, is a failure.
-  if (response.status() === 500 && body.includes('schedule_revisions_schedule_id_fkey')) {
-    return { result: 'retained', reason: 'schedule-history' };
-  }
+  // Any 500, and any 409 without one of these codes, is a failure.
   if (response.status() === 409) {
     let code: unknown;
     try {
@@ -120,6 +114,9 @@ export async function deleteTeam(page: Page, teamId: string): Promise<DeleteOutc
     }
     if (code === 'team_has_schedule_history') {
       return { result: 'retained', reason: 'schedule-history' };
+    }
+    if (code === 'team_has_integrations') {
+      return { result: 'retained', reason: 'integrations' };
     }
   }
 
