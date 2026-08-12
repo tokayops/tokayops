@@ -19,20 +19,17 @@ func mustPlan(t *testing.T, current *ScheduleRevisionSnapshot, desired ScheduleC
 	return plan
 }
 
-func assertLayer(t *testing.T, lt LayerTransition, action, selection string, expectedID string, preserves bool) {
+// assertLayer checks the classification a save records: the phase action and
+// the group selection, both of which go into change_summary.
+//
+// It used to also check ExpectedActiveGroupID and PreservesActiveGroup - two
+// fields that existed for the commit guard and were read by nothing else once
+// it was gone. Where a test cares which group ends up on duty, it asks the
+// snapshot (see activeAt) rather than the planner's opinion about it.
+func assertLayer(t *testing.T, lt LayerTransition, action, selection string) {
 	t.Helper()
 	if lt.PhaseAction != action || lt.GroupSelection != selection {
 		t.Fatalf("transition = %s+%s, want %s+%s", lt.PhaseAction, lt.GroupSelection, action, selection)
-	}
-	if expectedID == "" {
-		if lt.ExpectedActiveGroupID != nil {
-			t.Fatalf("expected active group = %v, want nil", *lt.ExpectedActiveGroupID)
-		}
-	} else if lt.ExpectedActiveGroupID == nil || *lt.ExpectedActiveGroupID != expectedID {
-		t.Fatalf("expected active group = %v, want %s", lt.ExpectedActiveGroupID, expectedID)
-	}
-	if lt.PreservesActiveGroup != preserves {
-		t.Fatalf("preserves = %v, want %v", lt.PreservesActiveGroup, preserves)
 	}
 }
 
@@ -78,7 +75,7 @@ func TestPlanTransition_ActiveMembershipChange(t *testing.T) {
 	if plan.Noop {
 		t.Fatalf("membership change is not a no-op")
 	}
-	assertLayer(t, plan.L1, PhaseActionCarry, SelectionPreserve, gid[1], true)
+	assertLayer(t, plan.L1, PhaseActionCarry, SelectionPreserve)
 
 	// Carry copies the phase pair verbatim: no recomputation.
 	if !plan.Snapshot.L1.PhaseAnchorSlotStart.Equal(*snap.L1.PhaseAnchorSlotStart) {
@@ -116,7 +113,7 @@ func TestPlanTransition_AddGroup_EveryActivePosition(t *testing.T) {
 		desired.L1.Groups = append(desired.L1.Groups, RotationGroup{ID: gid[3], Members: []string{"dana"}})
 
 		plan := mustPlan(t, &snap, desired, effAt)
-		assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve, gid[p], true)
+		assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve)
 		if *plan.Snapshot.L1.StartPosition != p {
 			t.Fatalf("active position %d: new start_position = %d", p, *plan.Snapshot.L1.StartPosition)
 		}
@@ -138,7 +135,7 @@ func TestPlanTransition_Reorder(t *testing.T) {
 		{ID: gid[0], Members: []string{"alice"}},
 	}
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve, gid[1], true)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve)
 	if id := activeAt(t, plan.Snapshot, effAt); id != gid[1] {
 		t.Fatalf("active after reorder = %s, want bob", id)
 	}
@@ -157,7 +154,7 @@ func TestPlanTransition_RemoveActive_CyclicSuccessor(t *testing.T) {
 		{ID: gid[2], Members: []string{"carol"}},
 	}
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionSuccessor, gid[2], false)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionSuccessor)
 	if id := activeAt(t, plan.Snapshot, effAt); id != gid[2] {
 		t.Fatalf("successor = %s, want carol", id)
 	}
@@ -171,7 +168,7 @@ func TestPlanTransition_RemoveActive_CyclicSuccessor(t *testing.T) {
 		{ID: gid[1], Members: []string{"bob"}},
 	}
 	plan = mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionSuccessor, gid[0], false)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionSuccessor)
 }
 
 func TestPlanTransition_FullReplacement_First(t *testing.T) {
@@ -182,7 +179,7 @@ func TestPlanTransition_FullReplacement_First(t *testing.T) {
 		{ID: gid[4], Members: []string{"erik"}},
 	}
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionFirst, gid[3], false)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionFirst)
 	if *plan.Snapshot.L1.StartPosition != 0 {
 		t.Fatalf("full replacement starts at position 0")
 	}
@@ -194,7 +191,7 @@ func TestPlanTransition_HandoffLater_11to18(t *testing.T) {
 	desired := ConfigurationFromSnapshot(snap)
 	desired.L1.Policy = dailyPolicy("18:00")
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve, gid[1], true)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve)
 	// B serves until 18:00 TODAY.
 	if !plan.Snapshot.L1.PhaseAnchorSlotStart.Equal(utc(2026, time.August, 3, 18, 0)) {
 		t.Fatalf("anchor = %v, want slot [03 18:00, 04 18:00)", plan.Snapshot.L1.PhaseAnchorSlotStart)
@@ -212,7 +209,7 @@ func TestPlanTransition_HandoffEarlier_11to14(t *testing.T) {
 	desired := ConfigurationFromSnapshot(snap)
 	desired.L1.Policy = dailyPolicy("14:00")
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve, gid[1], true)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve)
 	// Edit at 15:00 > 14:00, so B serves until 14:00 TOMORROW.
 	if id := activeAt(t, plan.Snapshot, utc(2026, time.August, 5, 13, 59)); id != gid[1] {
 		t.Fatalf("before tomorrow 14:00 = %s, want bob", id)
@@ -227,7 +224,7 @@ func TestPlanTransition_DailyToWeekly(t *testing.T) {
 	desired := ConfigurationFromSnapshot(snap)
 	desired.L1.Policy = weeklyPolicy("11:00", 1) // Monday
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve, gid[1], true)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve)
 	// B serves until next Monday 11:00.
 	if id := activeAt(t, plan.Snapshot, utc(2026, time.August, 10, 10, 59)); id != gid[1] {
 		t.Fatalf("until Monday = %s, want bob", id)
@@ -244,7 +241,7 @@ func TestPlanTransition_WeeklyToDaily(t *testing.T) {
 	desired := ConfigurationFromSnapshot(snap)
 	desired.L1.Policy = dailyPolicy("11:00")
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve, gid[0], true)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve)
 	if id := activeAt(t, plan.Snapshot, utc(2026, time.August, 5, 12, 0)); id != gid[1] {
 		t.Fatalf("next daily handoff = %s, want bob", id)
 	}
@@ -255,7 +252,7 @@ func TestPlanTransition_TimezoneChange(t *testing.T) {
 	desired := ConfigurationFromSnapshot(snap)
 	desired.Timezone = "Europe/Moscow"
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve, gid[1], true)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionPreserve)
 	// 11:00 Moscow = 08:00 UTC; B serves until the next Moscow boundary.
 	if !plan.Snapshot.L1.PhaseAnchorSlotStart.Equal(utc(2026, time.August, 4, 8, 0)) {
 		t.Fatalf("anchor = %v, want 2026-08-04T08:00:00Z", plan.Snapshot.L1.PhaseAnchorSlotStart)
@@ -283,7 +280,7 @@ func TestPlanTransition_TimezoneChangedAndActiveRemoved(t *testing.T) {
 		{ID: gid[2], Members: []string{"carol"}},
 	}
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionSuccessor, gid[2], false)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionSuccessor)
 }
 
 func l2Enabled(users ...string) LayerConfiguration {
@@ -309,7 +306,7 @@ func TestPlanTransition_L2DisableReenable(t *testing.T) {
 	desired := ConfigurationFromSnapshot(snap)
 	desired.L2.Enabled = false
 	plan := mustPlan(t, &snap, desired, effAt)
-	assertLayer(t, plan.L2, PhaseActionClear, SelectionNone, "", false)
+	assertLayer(t, plan.L2, PhaseActionClear, SelectionNone)
 	if plan.Snapshot.L2.PhaseAnchorSlotStart != nil || plan.Snapshot.L2.StartPosition != nil {
 		t.Fatalf("disabled layer must have a nil phase pair")
 	}
@@ -319,7 +316,7 @@ func TestPlanTransition_L2DisableReenable(t *testing.T) {
 	desired2 := ConfigurationFromSnapshot(disabled)
 	desired2.L2.Enabled = true
 	plan2 := mustPlan(t, &disabled, desired2, utc(2026, time.August, 6, 12, 0))
-	assertLayer(t, plan2.L2, PhaseActionReanchor, SelectionFirst, "xavier", false)
+	assertLayer(t, plan2.L2, PhaseActionReanchor, SelectionFirst)
 	if *plan2.Snapshot.L2.StartPosition != 0 {
 		t.Fatalf("re-enable starts at position 0")
 	}
@@ -340,7 +337,7 @@ func TestPlanTransition_ReenableUnchangedPolicy_NotCarry(t *testing.T) {
 	if plan.L2.PhaseAction == PhaseActionCarry {
 		t.Fatalf("re-enable classified as carry: would copy a nil phase pair")
 	}
-	assertLayer(t, plan.L2, PhaseActionReanchor, SelectionFirst, "xavier", false)
+	assertLayer(t, plan.L2, PhaseActionReanchor, SelectionFirst)
 	if plan.Snapshot.L2.PhaseAnchorSlotStart == nil || plan.Snapshot.L2.StartPosition == nil {
 		t.Fatalf("re-enabled layer must get a fresh phase pair")
 	}
@@ -355,7 +352,7 @@ func TestPlanTransition_EditExactlyAtHandoff(t *testing.T) {
 	desired.L1.Groups[1].Members = []string{"bob", "dave"}
 
 	plan := mustPlan(t, &snap, desired, boundary)
-	assertLayer(t, plan.L1, PhaseActionCarry, SelectionPreserve, gid[1], true)
+	assertLayer(t, plan.L1, PhaseActionCarry, SelectionPreserve)
 	if id := activeAt(t, plan.Snapshot, boundary); id != gid[1] {
 		t.Fatalf("at handoff instant active = %s, want bob", id)
 	}
@@ -371,8 +368,8 @@ func TestPlanTransition_InitialRevision(t *testing.T) {
 	if plan.Noop {
 		t.Fatalf("initial revision is never a no-op")
 	}
-	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionFirst, gid[0], false)
-	assertLayer(t, plan.L2, PhaseActionClear, SelectionNone, "", false)
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionFirst)
+	assertLayer(t, plan.L2, PhaseActionClear, SelectionNone)
 	if !plan.Snapshot.L1.PhaseAnchorSlotStart.Equal(utc(2026, time.August, 4, 11, 0)) {
 		t.Fatalf("initial anchor = %v", plan.Snapshot.L1.PhaseAnchorSlotStart)
 	}

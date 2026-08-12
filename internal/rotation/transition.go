@@ -31,15 +31,17 @@ type TransitionInput struct {
 	EffectiveAt time.Time
 }
 
-// LayerTransition describes one layer's classified transition. The commit
-// post-condition guard always checks ExpectedActiveGroupID; equality of the
-// old and new active group is additionally required only when
-// PreservesActiveGroup is true.
+// LayerTransition describes one layer's classified transition.
+//
+// It used to carry ExpectedActiveGroupID and PreservesActiveGroup as well, for
+// a commit-time guard to check the planner against itself. The guard is gone
+// (Sprint 6D), and with it the only reader outside tests: both fields were
+// still being computed on every save and looked at by nobody. What remains is
+// what the audit trail records - the phase action and the group selection go
+// into change_summary, where a person can ask later what a save decided.
 type LayerTransition struct {
-	PhaseAction           string
-	GroupSelection        string
-	ExpectedActiveGroupID *string // nil for clear/none
-	PreservesActiveGroup  bool    // true only for preserve
+	PhaseAction    string
+	GroupSelection string
 }
 
 // ChangeSummary is the diagnostic diff persisted next to a revision. It never
@@ -162,12 +164,9 @@ func planLayer(current *RotationLayerSnapshot, currentTZ string, desired LayerCo
 		anchor := ng.SlotContaining(effectiveAt).Start
 		newLayer.PhaseAnchorSlotStart = &anchor
 		newLayer.StartPosition = &position
-		id := desired.Groups[position].ID
 		return newLayer, LayerTransition{
-			PhaseAction:           PhaseActionReanchor,
-			GroupSelection:        selection,
-			ExpectedActiveGroupID: &id,
-			PreservesActiveGroup:  selection == SelectionPreserve,
+			PhaseAction:    PhaseActionReanchor,
+			GroupSelection: selection,
 		}, nil
 	}
 
@@ -198,12 +197,9 @@ func planLayer(current *RotationLayerSnapshot, currentTZ string, desired LayerCo
 		position := *current.StartPosition
 		newLayer.PhaseAnchorSlotStart = &anchor
 		newLayer.StartPosition = &position
-		id := oldActiveID
 		return newLayer, LayerTransition{
-			PhaseAction:           PhaseActionCarry,
-			GroupSelection:        SelectionPreserve,
-			ExpectedActiveGroupID: &id,
-			PreservesActiveGroup:  true,
+			PhaseAction:    PhaseActionCarry,
+			GroupSelection: SelectionPreserve,
 		}, nil
 	}
 

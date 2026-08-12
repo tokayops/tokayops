@@ -203,9 +203,6 @@ func TestPurity_InputsUnchanged(t *testing.T) {
 	plan.Snapshot.L1.Groups[1].Members[0] = "zzz"
 	*plan.Snapshot.L1.PhaseAnchorSlotStart = time.Time{}
 	*plan.Snapshot.L1.StartPosition = 99
-	if plan.L1.ExpectedActiveGroupID != nil {
-		*plan.L1.ExpectedActiveGroupID = "zzz"
-	}
 
 	snapAfter, _ := json.Marshal(snap)
 	desiredAfter, _ := json.Marshal(desired)
