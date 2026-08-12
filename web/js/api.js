@@ -365,7 +365,8 @@ const API = {
          * Get members of a team
          * @param {string} id - Team ID
          */
-        members: (id) => request(`/teams/${encodeURIComponent(id)}/members`),
+        members: (id, options = {}) => request(
+            `/teams/${encodeURIComponent(id)}/members`, options),
 
         /**
          * Add a member to a team
@@ -502,6 +503,12 @@ const API = {
     // whole, in one request: the old chain of three (schedule, then L1 groups,
     // then L2 users) could leave a schedule half-written if any link failed,
     // and there was no version to check it against.
+    //
+    // The reads take an options bag, which `request` flattens into the fetch
+    // config - so a caller can pass the `signal` of whatever it is reading on
+    // behalf of, and a modal that closes takes its unfinished reads with it.
+    // The writes deliberately do not: a change already on its way has already
+    // happened somewhere, and aborting it would only lose the answer.
     schedules: {
         /**
          * Read the configuration in force.
@@ -511,8 +518,9 @@ const API = {
          * @param {string} teamId
          * @returns {Promise<{schedule_id, version, revision_id, effective_from, deleted_at?, config}>}
          */
-        getConfig: (teamId) => request(`/teams/${encodeURIComponent(teamId)}/schedule/config`,
-            { silentStatuses: [404] }),
+        getConfig: (teamId, options = {}) => request(
+            `/teams/${encodeURIComponent(teamId)}/schedule/config`,
+            { silentStatuses: [404], ...options }),
 
         /**
          * Save the whole configuration.
@@ -544,11 +552,12 @@ const API = {
          * @param {Object} config - the same payload the save would carry
          * @param {Date} [until] - end of the previewed window
          */
-        preview: (teamId, config, until) => {
+        preview: (teamId, config, until, options = {}) => {
             const query = buildQuery({ until: until ? until.toISOString() : null });
             return request(`/teams/${encodeURIComponent(teamId)}/schedule/preview${query}`, {
                 method: 'POST',
                 body: JSON.stringify(config),
+                ...options,
             });
         },
 
@@ -574,12 +583,12 @@ const API = {
          * @param {Date} until
          * @returns {Promise<{from, until, history_complete, history_complete_from?, deleted_at?, entries, warnings}>}
          */
-        render: (teamId, from, until) => {
+        render: (teamId, from, until, options = {}) => {
             const query = buildQuery({
                 from: from.toISOString(),
                 until: until.toISOString(),
             });
-            return request(`/teams/${encodeURIComponent(teamId)}/schedule/render${query}`);
+            return request(`/teams/${encodeURIComponent(teamId)}/schedule/render${query}`, options);
         },
 
         /**
@@ -592,7 +601,8 @@ const API = {
          * @param {string} teamId
          * @returns {Promise<{schedule_id, on_call}>}
          */
-        currentOnCall: (teamId) => request(`/teams/${encodeURIComponent(teamId)}/schedule/on-call`),
+        currentOnCall: (teamId, options = {}) => request(
+            `/teams/${encodeURIComponent(teamId)}/schedule/on-call`, options),
 
         /**
          * The audit trail of configuration changes, newest first.
@@ -615,7 +625,8 @@ const API = {
          * @param {string} teamId
          * @returns {Promise<{overrides: Array}>}
          */
-        listOverrides: (teamId) => request(`/teams/${encodeURIComponent(teamId)}/schedule/overrides`),
+        listOverrides: (teamId, options = {}) => request(
+            `/teams/${encodeURIComponent(teamId)}/schedule/overrides`, options),
 
         /**
          * Record a stand-in.
