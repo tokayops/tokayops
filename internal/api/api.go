@@ -843,25 +843,34 @@ func (a *API) teamsWithSchedule(ctx context.Context, teams []*model.Team) (map[s
 		return out, nil
 	}
 
+	// One query for the whole page, not one per team: the list is bounded by
+	// the number of teams, and a read per row is how a page gets slower every
+	// time somebody adds a team.
+	wanted := make(map[string]struct{}, len(teams))
+	for _, team := range teams {
+		wanted[team.ID] = struct{}{}
+	}
+
 	err := a.scheduleRead.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
-		for _, team := range teams {
-			root, err := view.GetScheduleRootByTeam(ctx, team.ID)
-			switch {
-			case errors.Is(err, scheduleconfig.ErrScheduleNotFound):
+		roots, err := view.ListScheduleRoots(ctx)
+		if err != nil {
+			return err
+		}
+		for i := range roots {
+			root := &roots[i]
+			if _, asked := wanted[root.TeamID]; !asked {
 				continue
-			case err != nil:
-				return err
 			}
 			// Quiet here, loud everywhere else - and the wording of "loud"
 			// comes from the one place that owns it, so the two cannot drift.
 			if err := scheduleconfig.RequireInitializedRoot(root); err != nil {
-				log.Printf("ALERT schedule_config: team %s: %v", team.ID, err)
+				log.Printf("ALERT schedule_config: team %s: %v", root.TeamID, err)
 				continue
 			}
 			if root.DeletedAt != nil {
 				continue
 			}
-			out[team.ID] = struct{}{}
+			out[root.TeamID] = struct{}{}
 		}
 		return nil
 	})

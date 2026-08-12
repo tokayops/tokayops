@@ -1094,3 +1094,45 @@ func TestSaveDoesNotReadAfterTheCommit(t *testing.T) {
 		t.Errorf("the save response still describes who is on duty: %s", rec.Body.String())
 	}
 }
+
+// The team list reads the schedule side once, not once per team.
+//
+// It used to call GetScheduleRootByTeam in a loop, so the page got one query
+// slower every time somebody added a team - and the loop was invisible from
+// the outside, because the answer was identical.
+func TestListTeamsReadsSchedulesInOneQuery(t *testing.T) {
+	_, s, e, env := setupScheduleAPI(t)
+	defer s.Close()
+
+	createSchedule(t, e, []string{"denis"})
+	for _, id := range []string{"team-b", "team-c", "team-d"} {
+		if err := s.CreateTeam(&model.Team{ID: id, Name: id}); err != nil {
+			t.Fatalf("CreateTeam %s: %v", id, err)
+		}
+	}
+
+	env.Config.Calls = nil
+	rec := doJSON(t, e, http.MethodGet, "/api/v1/teams", nil, "denis")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list teams: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	perTeam := 0
+	for _, call := range env.Config.Calls {
+		if call == "GetScheduleRootByTeam" {
+			perTeam++
+		}
+	}
+	if perTeam != 0 {
+		t.Fatalf("the page made %d per-team schedule reads, want none: %v", perTeam, env.Config.Calls)
+	}
+
+	// And it still answers: the team with a schedule is reported configured.
+	var out TeamListResponse
+	decodeJSON(t, rec, &out)
+	for _, team := range out.Teams {
+		if team.ID == "devops" && !team.OnCallConfigured {
+			t.Fatal("the team with a schedule is not reported as configured")
+		}
+	}
+}
