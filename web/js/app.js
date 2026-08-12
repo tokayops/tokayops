@@ -26,7 +26,12 @@ import {
     bindTeamModalClose
 } from '/js/modules/teams.js';
 import { bindUsersEvents, showUsersView } from '/js/modules/users.js';
-import { bindScheduleEvents, loadOnCallOverviewRow, loadOnCallOverviewRows } from '/js/modules/schedules.js';
+import {
+    bindScheduleEvents,
+    loadOnCallOverviewRow,
+    loadOnCallOverviewRows,
+    onCallListHeader,
+} from '/js/modules/schedules.js';
 import { bindPoliciesEvents, showPoliciesView } from '/js/modules/policies.js';
 import { bindIntegrationsEvents, showIntegrationsView } from '/js/modules/integrations.js';
 
@@ -258,7 +263,7 @@ function handleHashRoute() {
                                 (a.name || a.id || '').localeCompare(b.name || b.id || '')
                             );
                             container.innerHTML = `
-                                ${Components.onCallListHeader()}
+                                ${onCallListHeader()}
                                 <div class="oncall-list-body">
                                     ${teams.map(team => `
                                         <div class="oncall-row-slot" data-team-id="${escapeHtml(team.id)}"></div>
