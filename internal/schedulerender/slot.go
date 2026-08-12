@@ -1,7 +1,9 @@
 package schedulerender
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/rotation"
@@ -42,9 +44,9 @@ type slotInput struct {
 // on duty until its own valid_to, so switching a layer off or emptying its
 // groups in the middle of one must not make it vanish; the interval the
 // override does not cover is then simply nobody's.
-func renderSlot(in slotInput) ([]Assignment, []Warning) {
+func renderSlot(in slotInput) ([]Assignment, []Warning, error) {
 	if in.Bound.empty() {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	covering := overridesForSlot(in.Overrides, in.Bound)
@@ -62,7 +64,19 @@ func renderSlot(in slotInput) ([]Assignment, []Warning) {
 
 		active := coveringAt(covering, span.Start)
 		if len(active) > 1 {
-			warnings = appendOverlapWarning(warnings, in.Layer, span, active)
+			// Refused rather than resolved by "the last one wins". The command
+			// side cannot create this pair, so finding it means the data was
+			// edited past the code - and picking a winner would put an
+			// arbitrary person on duty and say nothing.
+			ids := make([]string, 0, len(active))
+			for _, o := range active {
+				ids = append(ids, o.OverrideID)
+			}
+			sort.Strings(ids)
+			return nil, nil, fmt.Errorf("%w: layer %s over %s..%s, overrides %s",
+				scheduleconfig.ErrOverrideCollision, in.Layer,
+				span.Start.Format(time.RFC3339), span.End.Format(time.RFC3339),
+				strings.Join(ids, " and "))
 		}
 
 		switch {
@@ -100,7 +114,7 @@ func renderSlot(in slotInput) ([]Assignment, []Warning) {
 		// No base and no override: nobody is on duty for this span. The gap
 		// is left as a gap rather than filled with the surrounding group.
 	}
-	return out, warnings
+	return out, warnings, nil
 }
 
 // overridesForSlot keeps the overrides that reach the bound and sorts them by
@@ -202,30 +216,4 @@ func equalIDs(a, b []string) bool {
 		}
 	}
 	return true
-}
-
-// appendOverlapWarning records that several overrides claimed one instant,
-// coalescing it with the previous warning when it is the same set continuing.
-func appendOverlapWarning(out []Warning, layer string, span interval, active []scheduleconfig.OverrideRevision) []Warning {
-	ids := make([]string, 0, len(active))
-	for _, o := range active {
-		ids = append(ids, o.OverrideID)
-	}
-	sort.Strings(ids)
-
-	if n := len(out); n > 0 {
-		last := &out[n-1]
-		if last.Code == WarnOverrideOverlap && last.Layer == layer &&
-			last.Until.Equal(span.Start) && equalIDs(last.RelatedIDs, ids) {
-			last.Until = span.End
-			return out
-		}
-	}
-	return append(out, Warning{
-		Code:       WarnOverrideOverlap,
-		Layer:      layer,
-		From:       span.Start,
-		Until:      span.End,
-		RelatedIDs: ids,
-	})
 }

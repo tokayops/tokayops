@@ -1,7 +1,9 @@
 package schedulerender
 
 import (
+	"errors"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -297,60 +299,45 @@ func TestOverlappingOverridesResolveDeterministically(t *testing.T) {
 	first := override("ovr-first", LayerL1, "carol", utc(2026, 5, 1, 13, 0), utc(2026, 5, 1, 17, 0), start)
 	second := override("ovr-second", LayerL1, "dave", utc(2026, 5, 1, 15, 0), utc(2026, 5, 1, 19, 0), start.Add(time.Hour))
 
-	res := renderOf(t, Input{
+	err := renderRefuses(t, Input{
 		Root: root(start), Revisions: revs, Overrides: []scheduleconfig.OverrideRevision{first, second},
 		From: start, Until: utc(2026, 5, 2, 11, 0),
-	})
-
-	at := utc(2026, 5, 1, 16, 0)
-	found := assignmentAt(assignmentsOf(res, LayerL1), at)
-	if found == nil || found.OverrideID != "ovr-second" {
-		t.Fatalf("at %v the winner is %v, want the later recorded override", at, found)
-	}
-	if !hasWarning(res, WarnOverrideOverlap) {
-		t.Fatalf("warnings = %v, want override_overlap", warningCodes(res))
+	}, scheduleconfig.ErrOverrideCollision)
+	for _, id := range []string{"ovr-first", "ovr-second"} {
+		if !strings.Contains(err.Error(), id) {
+			t.Fatalf("error must name both overrides, got %v", err)
+		}
 	}
 }
 
-// TestOverlapResolutionIsPermutationInvariant: the answer must not depend on
-// the order the projection happened to return the overrides in.
-func TestOverlapResolutionIsPermutationInvariant(t *testing.T) {
+// The refusal must not depend on the order the projection happened to return
+// the overrides in.
+//
+// This used to assert the same about the RESOLUTION - which override won a
+// collision. Nothing wins one now, but the property still matters: a caller
+// who retries must not get a calendar once and an error the next time because
+// two rows came back swapped.
+func TestOverlapRefusalIsPermutationInvariant(t *testing.T) {
 	start := utc(2026, 5, 1, 11, 0)
 	revs := chain(t, revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))})
 
-	sets := [][]scheduleconfig.OverrideRevision{
-		{
-			override("ovr-a", LayerL1, "carol", utc(2026, 5, 1, 13, 0), utc(2026, 5, 1, 17, 0), start),
-			override("ovr-b", LayerL1, "dave", utc(2026, 5, 1, 15, 0), utc(2026, 5, 1, 19, 0), start.Add(time.Hour)),
-		},
-		{
-			override("ovr-a", LayerL1, "carol", utc(2026, 5, 1, 13, 0), utc(2026, 5, 1, 20, 0), start),
-			override("ovr-b", LayerL1, "dave", utc(2026, 5, 1, 15, 0), utc(2026, 5, 1, 19, 0), start.Add(time.Hour)),
-			// Same recorded_at as ovr-b: the tie must break on the ID, not on
-			// the position in the slice.
-			override("ovr-c", LayerL1, "erin", utc(2026, 5, 1, 16, 0), utc(2026, 5, 1, 18, 0), start.Add(time.Hour)),
-		},
+	set := []scheduleconfig.OverrideRevision{
+		override("ovr-a", LayerL1, "carol", utc(2026, 5, 1, 13, 0), utc(2026, 5, 1, 20, 0), start),
+		override("ovr-b", LayerL1, "dave", utc(2026, 5, 1, 15, 0), utc(2026, 5, 1, 19, 0), start.Add(time.Hour)),
+		override("ovr-c", LayerL1, "erin", utc(2026, 5, 1, 16, 0), utc(2026, 5, 1, 18, 0), start.Add(time.Hour)),
 	}
 
 	rng := rand.New(rand.NewSource(1))
-	for setIdx, set := range sets {
-		want := renderOf(t, Input{
-			Root: root(start), Revisions: revs, Overrides: set,
+	for attempt := 0; attempt < 20; attempt++ {
+		shuffled := append([]scheduleconfig.OverrideRevision(nil), set...)
+		rng.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+
+		_, err := Render(Input{
+			Root: root(start), Revisions: revs, Overrides: shuffled,
 			From: start, Until: utc(2026, 5, 2, 11, 0),
 		})
-		wantShifts := MergeAdjacent(want.Assignments)
-
-		for attempt := 0; attempt < 20; attempt++ {
-			shuffled := append([]scheduleconfig.OverrideRevision(nil), set...)
-			rng.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-
-			got := renderOf(t, Input{
-				Root: root(start), Revisions: revs, Overrides: shuffled,
-				From: start, Until: utc(2026, 5, 2, 11, 0),
-			})
-			if !sameShifts(MergeAdjacent(got.Assignments), wantShifts) {
-				t.Fatalf("set %d attempt %d: a different input order produced a different answer", setIdx, attempt)
-			}
+		if !errors.Is(err, scheduleconfig.ErrOverrideCollision) {
+			t.Fatalf("attempt %d: error = %v, want ErrOverrideCollision regardless of order", attempt, err)
 		}
 	}
 }

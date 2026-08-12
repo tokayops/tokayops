@@ -1,6 +1,7 @@
 package schedulerender
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -200,4 +201,18 @@ func hasWarning(res Result, code WarningCode) bool {
 		}
 	}
 	return false
+}
+
+// renderRefuses asserts that a render of damaged data fails with a specific
+// sentinel instead of returning a calendar drawn around the damage.
+func renderRefuses(t testing.TB, in Input, want error) error {
+	t.Helper()
+	res, err := Render(in)
+	if err == nil {
+		t.Fatalf("Render returned a calendar for damaged data: %+v", res)
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
+	}
+	return err
 }

@@ -213,10 +213,7 @@ func TestHistoryIncompleteBeforeCutover(t *testing.T) {
 	if !hasWarning(res, WarnHistoryIncomplete) {
 		t.Fatalf("warnings = %v, want history_incomplete", warningCodes(res))
 	}
-	// Missing history is not a broken chain.
-	if hasWarning(res, WarnRevisionGap) {
-		t.Fatal("the range before the first revision was reported as a gap")
-	}
+	// Missing history is not a broken chain - it renders, it does not refuse.
 	for _, a := range res.Assignments {
 		if a.AssignmentStart.Before(start) {
 			t.Fatalf("assignment at %v predates the first revision", a.AssignmentStart)
@@ -252,9 +249,8 @@ func TestDeletedPeriodIsHistoricNotAGap(t *testing.T) {
 
 	res := renderOf(t, Input{Root: root(start), Revisions: revs, From: start, Until: utc(2026, 5, 7, 11, 0)})
 
-	if hasWarning(res, WarnRevisionGap) {
-		t.Fatal("a normal delete/recreate cycle was reported as a broken chain")
-	}
+	// A normal delete/recreate cycle is covered by a deleted-kind revision, so
+	// the render succeeds; refusing here would break an ordinary workflow.
 	if !hasWarning(res, WarnScheduleInactive) {
 		t.Fatalf("warnings = %v, want schedule_inactive", warningCodes(res))
 	}
@@ -285,10 +281,8 @@ func TestRealGapIsStillDiagnosed(t *testing.T) {
 	// Excise the middle revision, leaving the hole a lost row would leave.
 	damaged := []scheduleconfig.ScheduleRevision{revs[0], revs[2]}
 
-	res := renderOf(t, Input{Root: root(start), Revisions: damaged, From: start, Until: utc(2026, 5, 7, 11, 0)})
-	if !hasWarning(res, WarnRevisionGap) {
-		t.Fatalf("warnings = %v, want revision_gap", warningCodes(res))
-	}
+	renderRefuses(t, Input{Root: root(start), Revisions: damaged, From: start, Until: utc(2026, 5, 7, 11, 0)},
+		ErrRevisionGap)
 }
 
 func TestRenderRejectsEmptyRange(t *testing.T) {

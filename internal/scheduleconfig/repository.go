@@ -51,6 +51,22 @@ var (
 	// not a condition callers can recover from.
 	ErrInvariantViolation = errors.New("scheduleconfig: invariant violation")
 
+	// ErrRevisionOverlap means two revisions of one schedule claim the same
+	// instant. The exclusion constraint forbids it, so it is damage rather
+	// than a state a caller can produce - and it is refused rather than
+	// resolved, because picking one of the two would put an arbitrary group
+	// on duty and tell nobody.
+	ErrRevisionOverlap = fmt.Errorf(
+		"%w: two revisions are in force at the same instant", ErrInvariantViolation)
+
+	// ErrOverrideCollision means two live overrides of one layer cover the
+	// same instant IN STORED DATA. It is not ErrOverrideOverlap: that one is
+	// the command side refusing to create such a pair, which is a caller
+	// error and a 409. Finding the pair already written is damage, and the
+	// two must not share a sentinel or the API would answer one as the other.
+	ErrOverrideCollision = fmt.Errorf(
+		"%w: two overrides of one layer cover the same instant", ErrInvariantViolation)
+
 	// ErrHistoryMarkerMissing means a schedule row carries no
 	// history_complete_from - see RootInitialized for what that implies and
 	// why every path has to decide about it.

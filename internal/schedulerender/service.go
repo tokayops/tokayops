@@ -265,7 +265,7 @@ func onCallOfRevision(ctx context.Context, view scheduleconfig.ScheduleReadView,
 	if err != nil {
 		return OnCall{}, err
 	}
-	return projectOnCall(rev, at, slots, overrides), nil
+	return projectOnCall(rev, at, slots, overrides)
 }
 
 // projectRevisionOnCall is the same projection against overrides the caller
@@ -278,5 +278,5 @@ func projectRevisionOnCall(rev scheduleconfig.ScheduleRevision, at time.Time,
 	if err != nil {
 		return OnCall{}, err
 	}
-	return projectOnCall(rev, at, slots, overrides), nil
+	return projectOnCall(rev, at, slots, overrides)
 }

@@ -102,11 +102,11 @@ func onCallSlots(rev scheduleconfig.ScheduleRevision, at time.Time) ([]layerSlot
 // other direction: after an override ends, the rotation resumes at the
 // override's valid_to, not at the start of the grid slot.
 func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []layerSlot,
-	overrides []scheduleconfig.OverrideRevision) OnCall {
+	overrides []scheduleconfig.OverrideRevision) (OnCall, error) {
 
 	out := OnCall{At: at}
 	for _, ls := range slots {
-		assignments, warnings := renderSlot(slotInput{
+		assignments, warnings, err := renderSlot(slotInput{
 			RevisionID: rev.ID,
 			Layer:      ls.layer,
 			Slot:       ls.slot,
@@ -114,6 +114,9 @@ func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []la
 			Base:       ls.base,
 			Overrides:  overridesOfLayer(overrides, ls.layer),
 		})
+		if err != nil {
+			return OnCall{}, err
+		}
 		out.Warnings = append(out.Warnings, warnings...)
 
 		found := assignmentAt(assignments, at)
@@ -138,7 +141,7 @@ func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []la
 			out.L2 = layerOnCall
 		}
 	}
-	return out
+	return out, nil
 }
 
 func assignmentAt(assignments []Assignment, at time.Time) *Assignment {

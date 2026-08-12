@@ -11,7 +11,6 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
-	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -165,9 +164,9 @@ func TestScheduleOnCallAnswersNobodyRatherThanNotFound(t *testing.T) {
 }
 
 // §13: "a collision is no less real for being seen through the current view
-// rather than the history". The projection carried the warning already; the
-// DTO used to drop it on the floor.
-func TestScheduleOnCallSurfacesOverrideOverlap(t *testing.T) {
+// rather than the history" - and the current view is what decides who gets
+// woken, so it is refused rather than reported next to an arbitrary winner.
+func TestScheduleOnCallRefusesOverrideCollision(t *testing.T) {
 	_, s, e, env := setupScheduleAPI(t)
 	defer s.Close()
 
@@ -177,33 +176,25 @@ func TestScheduleOnCallSurfacesOverrideOverlap(t *testing.T) {
 	scheduleID := scheduleIDOf(t, env, "devops")
 
 	// Written through the repository rather than the API: the command side
-	// refuses overlapping overrides, so the only way to reach the state the
-	// warning describes is to put it there. That is the point - the warning
-	// exists for data the guard did not catch.
+	// refuses to create this pair, so the only way to reach the state is to
+	// put it there. That is the point - it exists for data the guard did not
+	// catch.
 	seedOverlappingOverrides(t, env, scheduleID, now)
 
 	rec := doJSON(t, e, http.MethodGet, onCallPath, nil, "denis")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500 for damaged data, got %d: %s", rec.Code, rec.Body.String())
 	}
-	var out ScheduleOnCallResponse
-	decodeJSON(t, rec, &out)
-
-	if !hasWarning(out.OnCall.Warnings, string(schedulerender.WarnOverrideOverlap)) {
-		t.Fatalf("warnings = %+v, want override_overlap", out.OnCall.Warnings)
-	}
-	if out.OnCall.L1 == nil || out.OnCall.L1.Source != "override" {
-		t.Fatalf("an overlap still resolves to one assignment, got %+v", out.OnCall.L1)
+	var body map[string]any
+	decodeJSON(t, rec, &body)
+	if body["code"] != CodeInvariantViolation {
+		t.Fatalf("code = %v, want %s", body["code"], CodeInvariantViolation)
 	}
 }
 
-// The same warning has to reach the preview projection, which shares the
-// converter with the on-call endpoint above. Testing only one of them would
-// let the other rot.
-//
-// The save used to be the third consumer. It no longer projects anything: its
-// response says what it did, not what the world looks like afterwards.
-func TestPreviewCarriesOnCallWarnings(t *testing.T) {
+// The preview shares the overlay with the on-call endpoint above, so damaged
+// data has to stop it too. Testing only one of them would let the other rot.
+func TestPreviewRefusesOverrideCollision(t *testing.T) {
 	_, s, e, env := setupScheduleAPI(t)
 	defer s.Close()
 
@@ -212,19 +203,16 @@ func TestPreviewCarriesOnCallWarnings(t *testing.T) {
 	created := createSchedule(t, e, []string{"denis"})
 	seedOverlappingOverrides(t, env, scheduleIDOf(t, env, "devops"), now)
 
+	// The preview projects the same damaged data through the same overlay, so
+	// it refuses too rather than previewing a guess.
 	rec := doJSON(t, e, http.MethodPost, "/api/v1/teams/devops/schedule/preview",
 		configRequest(created.Version, []string{"denis", "alex"}), "denis")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("preview: want 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var preview SchedulePreviewResponse
-	decodeJSON(t, rec, &preview)
-	if !hasWarning(preview.OnCallBefore.Warnings, string(schedulerender.WarnOverrideOverlap)) {
-		t.Fatalf("preview on_call_before warnings = %+v, want override_overlap", preview.OnCallBefore.Warnings)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("preview over damaged data: want 500, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// The save still succeeds on the same data; it just answers about itself
-	// now, so there is nothing in its response to assert a warning on.
+	// The save is not a projection: it writes a revision and answers about
+	// itself, so damaged OVERRIDE data does not stop it.
 	rec = doJSON(t, e, http.MethodPut, "/api/v1/teams/devops/schedule/config",
 		configRequest(created.Version, []string{"denis", "alex"}), "denis")
 	if rec.Code != http.StatusOK {
