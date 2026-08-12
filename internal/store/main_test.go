@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tokayops/tokayops/internal/config"
 	_ "github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/config"
 )
 
 var testStore *Store
@@ -63,7 +63,6 @@ func setupTestDB(t *testing.T) *Store {
 		"integrations",
 		"schedule_revisions",
 		"schedule_override_revisions",
-		"schedule_events",
 		"migration_markers",
 		"schedule_overrides",
 		"schedule_users",

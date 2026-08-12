@@ -105,7 +105,6 @@ func seedBenchSchedule(b *testing.B, s *store.Store, config *scheduleconfig.Serv
 	}
 
 	policy := rotation.RotationPolicy{
-		SchemaVersion: rotation.PolicySchemaVersion,
 		Cadence:       model.RotationDaily,
 		HandoffTime:   "11:00",
 	}
@@ -122,8 +121,10 @@ func seedBenchSchedule(b *testing.B, s *store.Store, config *scheduleconfig.Serv
 		L2:                      rotation.LayerConfiguration{Enabled: false, Policy: policy},
 		L2EscalationTimeoutMins: 5,
 	}
-	if _, err := config.CreateSchedule(context.Background(), teamID, cfg, "", nil); err != nil {
-		b.Fatalf("CreateSchedule %s: %v", teamID, err)
+	if _, err := config.Save(context.Background(), teamID, scheduleconfig.SaveCommand{
+		Desired: cfg,
+	}); err != nil {
+		b.Fatalf("create schedule %s: %v", teamID, err)
 	}
 }
 

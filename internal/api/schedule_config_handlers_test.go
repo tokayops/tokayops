@@ -342,11 +342,11 @@ func TestRenderNewShapeWithHistoryIncomplete(t *testing.T) {
 		t.Fatal("render returned no entries")
 	}
 	for _, entry := range out.Entries {
-		if entry.SlotCount < 1 || len(entry.RevisionIDs) == 0 {
-			t.Fatalf("entry must carry slot_count and revision_ids, got %+v", entry)
-		}
-		if entry.GridSlotStart.IsZero() || entry.Start.IsZero() {
-			t.Fatalf("entry must carry both pairs of boundaries, got %+v", entry)
+		// A shift is a run of duty: who, from when, until when. Grid
+		// boundaries and provenance are not part of it - the calendar never
+		// read them, and one slot's boundaries live on the on-call DTO.
+		if entry.Start.IsZero() || entry.End.IsZero() || len(entry.UserIDs) == 0 {
+			t.Fatalf("entry must say who is on duty and when, got %+v", entry)
 		}
 	}
 }
@@ -819,32 +819,6 @@ func TestErrorMappingTable(t *testing.T) {
 	}
 }
 
-// The decode failure is the one the mapper is the sole observer of, so it is
-// also the one that has to be counted rather than only logged.
-func TestSnapshotDecodeIsCounted(t *testing.T) {
-	api, s, _, _ := setupScheduleAPI(t)
-	defer s.Close()
-
-	counter := &countingScheduleMetrics{}
-	api.SetScheduleMetrics(counter)
-
-	e := echo.New()
-	rec := httptest.NewRecorder()
-	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
-	_ = api.mapScheduleError(c, fmt.Errorf("%w: broken", scheduleconfig.ErrSnapshotDecode))
-
-	if counter.decodeErrors != 1 {
-		t.Fatalf("snapshot decode errors counted = %d, want 1", counter.decodeErrors)
-	}
-}
-
-type countingScheduleMetrics struct {
-	scheduleconfig.NopMetrics
-	decodeErrors int
-}
-
-func (m *countingScheduleMetrics) SnapshotDecodeError() { m.decodeErrors++ }
-
 func TestScheduleConfigRBACMatrix(t *testing.T) {
 	_, s, e, _ := setupScheduleAPI(t)
 	defer s.Close()
@@ -1067,5 +1041,98 @@ func TestOverrideOfAnotherScheduleIsRefused(t *testing.T) {
 	decodeJSON(t, rec, &list)
 	if len(list.Overrides) != 1 {
 		t.Fatalf("got %d overrides, want the original still there", len(list.Overrides))
+	}
+}
+
+// A save that committed has succeeded, and the response must not depend on
+// anything that happens afterwards.
+//
+// It used to render the resulting duty in a second read AFTER the commit, so a
+// failure there answered 500 for a command that had already been applied - the
+// response lied about the outcome. The structural guarantee is that there is
+// no read to fail: the handler opens no read transaction once the command
+// returns.
+func TestSaveDoesNotReadAfterTheCommit(t *testing.T) {
+	_, s, e, env := setupScheduleAPI(t)
+	defer s.Close()
+
+	created := createSchedule(t, e, []string{"denis"})
+
+	// Only the save under test is counted.
+	env.Config.Calls = nil
+
+	rec := doJSON(t, e, http.MethodPut, "/api/v1/teams/devops/schedule/config",
+		configRequest(created.Version, []string{"denis", "alex"}), "denis")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The command itself runs in a write transaction; what must not appear is
+	// a read transaction opened after it.
+	for i, call := range env.Config.Calls {
+		if call != "WithinSnapshot" {
+			continue
+		}
+		committed := false
+		for _, earlier := range env.Config.Calls[:i] {
+			if earlier == "Commit" {
+				committed = true
+			}
+		}
+		if committed {
+			t.Fatalf("the handler read again after the commit: %v", env.Config.Calls)
+		}
+	}
+
+	// And the answer says what the save did, without describing the world.
+	var out PutScheduleConfigResponse
+	decodeJSON(t, rec, &out)
+	if out.RevisionID == "" || out.Version != created.Version+1 {
+		t.Fatalf("save answer = %+v, want the new revision and version", out)
+	}
+	if strings.Contains(rec.Body.String(), "on_call_after") {
+		t.Errorf("the save response still describes who is on duty: %s", rec.Body.String())
+	}
+}
+
+// The team list reads the schedule side once, not once per team.
+//
+// It used to call GetScheduleRootByTeam in a loop, so the page got one query
+// slower every time somebody added a team - and the loop was invisible from
+// the outside, because the answer was identical.
+func TestListTeamsReadsSchedulesInOneQuery(t *testing.T) {
+	_, s, e, env := setupScheduleAPI(t)
+	defer s.Close()
+
+	createSchedule(t, e, []string{"denis"})
+	for _, id := range []string{"team-b", "team-c", "team-d"} {
+		if err := s.CreateTeam(&model.Team{ID: id, Name: id}); err != nil {
+			t.Fatalf("CreateTeam %s: %v", id, err)
+		}
+	}
+
+	env.Config.Calls = nil
+	rec := doJSON(t, e, http.MethodGet, "/api/v1/teams", nil, "denis")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list teams: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	perTeam := 0
+	for _, call := range env.Config.Calls {
+		if call == "GetScheduleRootByTeam" {
+			perTeam++
+		}
+	}
+	if perTeam != 0 {
+		t.Fatalf("the page made %d per-team schedule reads, want none: %v", perTeam, env.Config.Calls)
+	}
+
+	// And it still answers: the team with a schedule is reported configured.
+	var out TeamListResponse
+	decodeJSON(t, rec, &out)
+	for _, team := range out.Teams {
+		if team.ID == "devops" && !team.OnCallConfigured {
+			t.Fatal("the team with a schedule is not reported as configured")
+		}
 	}
 }

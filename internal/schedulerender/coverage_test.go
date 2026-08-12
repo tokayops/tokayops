@@ -2,6 +2,7 @@ package schedulerender
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,10 +14,6 @@ import (
 // these are the ends and the empty case, where there is no pair to compare
 // and a lost revision would otherwise come back as a silent empty stretch
 // with HistoryComplete=true.
-
-func gapWarnings(res Result) []Warning {
-	return warningsOfCode(res, WarnRevisionGap)
-}
 
 func warningsOfCode(res Result, code WarningCode) []Warning {
 	var out []Warning
@@ -42,17 +39,11 @@ func TestMissingFirstRevisionIsAGap(t *testing.T) {
 	// is gone.
 	damaged := revs[1:]
 
-	res := renderOf(t, Input{Root: root(created), Revisions: damaged, From: created, Until: until})
-
-	gaps := gapWarnings(res)
-	if len(gaps) != 1 {
-		t.Fatalf("got %d gap warnings, want 1 for the lost first revision: %+v", len(gaps), res.Warnings)
-	}
-	if !gaps[0].From.Equal(created) || !gaps[0].Until.Equal(lost) {
-		t.Fatalf("gap = %v..%v, want %v..%v", gaps[0].From, gaps[0].Until, created, lost)
-	}
-	if !res.HistoryComplete {
-		t.Fatal("the range starts exactly at history_complete_from; it is damaged, not incomplete")
+	err := renderRefuses(t, Input{Root: root(created), Revisions: damaged, From: created, Until: until},
+		ErrRevisionGap)
+	if !strings.Contains(err.Error(), created.Format(time.RFC3339)) ||
+		!strings.Contains(err.Error(), lost.Format(time.RFC3339)) {
+		t.Fatalf("error must name the uncovered stretch %v..%v, got %v", created, lost, err)
 	}
 }
 
@@ -70,14 +61,10 @@ func TestMissingTailRevisionIsAGap(t *testing.T) {
 	// so nothing covers the rest of the range.
 	damaged := revs[:1]
 
-	res := renderOf(t, Input{Root: root(created), Revisions: damaged, From: created, Until: until})
-
-	gaps := gapWarnings(res)
-	if len(gaps) != 1 {
-		t.Fatalf("got %d gap warnings, want 1 for the lost tail: %+v", len(gaps), res.Warnings)
-	}
-	if !gaps[0].From.Equal(closed) || !gaps[0].Until.Equal(until) {
-		t.Fatalf("gap = %v..%v, want %v..%v", gaps[0].From, gaps[0].Until, closed, until)
+	err := renderRefuses(t, Input{Root: root(created), Revisions: damaged, From: created, Until: until},
+		ErrRevisionGap)
+	if !strings.Contains(err.Error(), closed.Format(time.RFC3339)) {
+		t.Fatalf("error must name where coverage stopped (%v), got %v", closed, err)
 	}
 }
 
@@ -85,18 +72,8 @@ func TestEmptyChainWithKnownHistoryIsAGap(t *testing.T) {
 	created := utc(2026, 5, 1, 11, 0)
 	until := utc(2026, 5, 5, 11, 0)
 
-	res := renderOf(t, Input{Root: root(created), Revisions: nil, From: created, Until: until})
-
-	gaps := gapWarnings(res)
-	if len(gaps) != 1 {
-		t.Fatalf("got %d gap warnings, want 1 for the empty chain: %+v", len(gaps), res.Warnings)
-	}
-	if !gaps[0].From.Equal(created) || !gaps[0].Until.Equal(until) {
-		t.Fatalf("gap = %v..%v, want the whole range", gaps[0].From, gaps[0].Until)
-	}
-	if len(res.Assignments) != 0 {
-		t.Fatal("assignments rendered from an empty chain")
-	}
+	renderRefuses(t, Input{Root: root(created), Revisions: nil, From: created, Until: until},
+		ErrRevisionGap)
 }
 
 // TestMissingHistoryStartIsRefused: a root with no history horizon is refused
@@ -144,9 +121,6 @@ func TestQueryBeforeHistoryStartIsIncompleteNotAnError(t *testing.T) {
 	if res.HistoryComplete {
 		t.Fatal("history reported complete for a range starting before the horizon")
 	}
-	if got := gapWarnings(res); len(got) != 0 {
-		t.Fatalf("got %+v, want the stretch before the horizon reported as incomplete, not as a gap", got)
-	}
 	incomplete := warningsOfCode(res, WarnHistoryIncomplete)
 	if len(incomplete) != 1 {
 		t.Fatalf("got %d history_incomplete warnings, want 1: %+v", len(incomplete), res.Warnings)
@@ -173,19 +147,16 @@ func TestInnerGapIsReportedBetweenPresentRevisions(t *testing.T) {
 	closedEarly := second.Add(-24 * time.Hour)
 	damaged[0].EffectiveTo = &closedEarly
 
-	res := renderOf(t, Input{Root: root(created), Revisions: damaged, From: created, Until: until})
-	gaps := gapWarnings(res)
-	if len(gaps) != 1 {
-		t.Fatalf("got %d gap warnings, want the inner hole reported: %+v", len(gaps), res.Warnings)
-	}
-	if !gaps[0].From.Equal(closedEarly) || !gaps[0].Until.Equal(second) {
-		t.Fatalf("gap = %v..%v, want %v..%v", gaps[0].From, gaps[0].Until, closedEarly, second)
+	err := renderRefuses(t, Input{Root: root(created), Revisions: damaged, From: created, Until: until},
+		ErrRevisionGap)
+	if !strings.Contains(err.Error(), closedEarly.Format(time.RFC3339)) {
+		t.Fatalf("error must name the inner hole starting %v, got %v", closedEarly, err)
 	}
 }
 
-// TestGapWarningIsClippedToTheQueryRange: a hole outside what was asked about
-// is not the caller's problem.
-func TestGapWarningIsClippedToTheQueryRange(t *testing.T) {
+// TestGapOutsideTheQueryRangeIsNotRefused: a hole the caller did not ask about
+// is not the caller's problem - clipping still decides whether it is a gap.
+func TestGapOutsideTheQueryRangeIsNotRefused(t *testing.T) {
 	created := utc(2026, 5, 1, 11, 0)
 	closed := utc(2026, 5, 3, 11, 0)
 	resumed := utc(2026, 5, 9, 11, 0)
@@ -197,20 +168,25 @@ func TestGapWarningIsClippedToTheQueryRange(t *testing.T) {
 	)
 	damaged := []scheduleconfig.ScheduleRevision{revs[0], revs[2]} // the middle row is gone
 
+	// The query sits entirely inside the hole, so it is refused.
 	from, until := utc(2026, 5, 5, 0, 0), utc(2026, 5, 7, 0, 0)
-	res := renderOf(t, Input{Root: root(created), Revisions: damaged, From: from, Until: until})
+	renderRefuses(t, Input{Root: root(created), Revisions: damaged, From: from, Until: until},
+		ErrRevisionGap)
 
-	gaps := gapWarnings(res)
-	if len(gaps) != 1 {
-		t.Fatalf("got %d gap warnings, want 1: %+v", len(gaps), res.Warnings)
-	}
-	if !gaps[0].From.Equal(from) || !gaps[0].Until.Equal(until) {
-		t.Fatalf("gap = %v..%v, want it clipped to the query %v..%v", gaps[0].From, gaps[0].Until, from, until)
+	// A query that ends before the hole opens is answered normally: the same
+	// damaged chain, a different question.
+	early, earlyUntil := utc(2026, 5, 1, 12, 0), utc(2026, 5, 2, 12, 0)
+	if res := renderOf(t, Input{Root: root(created), Revisions: damaged, From: early, Until: earlyUntil}); len(res.Assignments) == 0 {
+		t.Fatal("a range covered by the surviving revision must still render")
 	}
 }
 
-// TestOverlappingRevisionsAreReportedAndResolved: the exclusion constraint
-// forbids this, so it is corruption - but the renderer stays total, keeps one
+// The exclusion constraint forbids this, so it is corruption. The renderer
+// used to resolve it in favour of the earlier revision and say so in a
+// warning; it now refuses, because "here is the calendar, one of these two
+// configurations produced it" is not an answer anyone can act on.
+//
+// The old comment continued: the renderer stays total, keeps one
 // assignment per layer per instant, and does not rewrite the answer already
 // given for the earlier revision.
 func TestOverlappingRevisionsAreReportedAndResolved(t *testing.T) {
@@ -226,42 +202,14 @@ func TestOverlappingRevisionsAreReportedAndResolved(t *testing.T) {
 	overlapEnd := second.Add(24 * time.Hour)
 	revs[0].EffectiveTo = &overlapEnd
 
-	res := renderOf(t, Input{Root: root(created), Revisions: revs, From: created, Until: until})
-
-	var overlaps []Warning
-	for _, w := range res.Warnings {
-		if w.Code == WarnRevisionOverlap {
-			overlaps = append(overlaps, w)
+	err := renderRefuses(t, Input{Root: root(created), Revisions: revs, From: created, Until: until},
+		scheduleconfig.ErrRevisionOverlap)
+	for _, id := range []string{revs[0].ID, revs[1].ID} {
+		if !strings.Contains(err.Error(), id) {
+			t.Fatalf("error must name both revisions, got %v", err)
 		}
 	}
-	if len(overlaps) != 1 {
-		t.Fatalf("got %d overlap warnings, want 1: %+v", len(overlaps), res.Warnings)
-	}
-	if !overlaps[0].From.Equal(second) || !overlaps[0].Until.Equal(overlapEnd) {
-		t.Fatalf("overlap = %v..%v, want %v..%v", overlaps[0].From, overlaps[0].Until, second, overlapEnd)
-	}
-	if len(overlaps[0].RelatedIDs) != 2 {
-		t.Fatalf("overlap names %v, want both revisions", overlaps[0].RelatedIDs)
-	}
 
-	// No instant is claimed twice on one layer.
-	l1 := assignmentsOf(res, LayerL1)
-	for i := 1; i < len(l1); i++ {
-		if l1[i].AssignmentStart.Before(l1[i-1].AssignmentEnd) {
-			t.Fatalf("assignments %v..%v and %v..%v overlap",
-				l1[i-1].AssignmentStart, l1[i-1].AssignmentEnd, l1[i].AssignmentStart, l1[i].AssignmentEnd)
-		}
-	}
-	// The disputed stretch stays with the earlier revision: history already
-	// answered for it.
-	inDispute := assignmentAt(l1, second.Add(time.Hour))
-	if inDispute == nil || inDispute.ScheduleRevisionID != revs[0].ID {
-		t.Fatalf("the disputed interval is served by %v, want the earlier revision", inDispute)
-	}
-	// An overlap is not also a hole.
-	if hasWarning(res, WarnRevisionGap) {
-		t.Fatalf("an overlap was also reported as a gap: %+v", res.Warnings)
-	}
 }
 
 // TestRangeIsNormalizedToDatabaseResolution: the queries that fetch revisions
@@ -333,25 +281,21 @@ func TestGapNamesTheRevisionItActuallyFollows(t *testing.T) {
 	nestedStart, nestedEnd := utc(2026, 5, 2, 11, 0), utc(2026, 5, 3, 11, 0)
 	nested.EffectiveFrom, nested.EffectiveTo = nestedStart, &nestedEnd
 
-	res := renderOf(t, Input{
+	err := renderRefuses(t, Input{
 		Root:      root(created),
 		Revisions: []scheduleconfig.ScheduleRevision{outer, nested, after},
 		From:      created,
 		Until:     until,
-	})
+	}, scheduleconfig.ErrRevisionOverlap)
 
-	gaps := gapWarnings(res)
-	if len(gaps) != 1 {
-		t.Fatalf("got %d gap warnings, want 1: %+v", len(gaps), res.Warnings)
-	}
-	if !gaps[0].From.Equal(outerEnd) || !gaps[0].Until.Equal(after.EffectiveFrom) {
-		t.Fatalf("gap = %v..%v, want %v..%v",
-			gaps[0].From, gaps[0].Until, outerEnd, after.EffectiveFrom)
-	}
-	want := []string{outer.ID, after.ID}
-	if len(gaps[0].RelatedIDs) != 2 ||
-		gaps[0].RelatedIDs[0] != want[0] || gaps[0].RelatedIDs[1] != want[1] {
-		t.Fatalf("related_ids = %v, want %v (the nested revision %s does not bound this gap)",
-			gaps[0].RelatedIDs, want, nested.ID)
+	// The nested revision is refused as an overlap before the gap after it is
+	// ever reached: it starts inside what the outer one already covers. Which
+	// of the two damages is reported first does not matter to a caller who
+	// gets neither a calendar nor a wrong one - but it does have to name the
+	// rows involved.
+	for _, id := range []string{outer.ID, nested.ID} {
+		if !strings.Contains(err.Error(), id) {
+			t.Fatalf("error must name the revisions in dispute, got %v", err)
+		}
 	}
 }

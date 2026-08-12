@@ -1,6 +1,7 @@
 package schedulerender
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -25,7 +26,6 @@ func utc(year int, month time.Month, day, hour, minute int) time.Time {
 
 func dailyPolicy(handoff string) rotation.RotationPolicy {
 	return rotation.RotationPolicy{
-		SchemaVersion: rotation.PolicySchemaVersion,
 		Cadence:       model.RotationDaily,
 		HandoffTime:   handoff,
 	}
@@ -33,7 +33,6 @@ func dailyPolicy(handoff string) rotation.RotationPolicy {
 
 func weeklyPolicy(handoff string, day int) rotation.RotationPolicy {
 	return rotation.RotationPolicy{
-		SchemaVersion: rotation.PolicySchemaVersion,
 		Cadence:       model.RotationWeekly,
 		HandoffTime:   handoff,
 		HandoffDay:    &day,
@@ -200,4 +199,18 @@ func hasWarning(res Result, code WarningCode) bool {
 		}
 	}
 	return false
+}
+
+// renderRefuses asserts that a render of damaged data fails with a specific
+// sentinel instead of returning a calendar drawn around the damage.
+func renderRefuses(t testing.TB, in Input, want error) error {
+	t.Helper()
+	res, err := Render(in)
+	if err == nil {
+		t.Fatalf("Render returned a calendar for damaged data: %+v", res)
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
+	}
+	return err
 }

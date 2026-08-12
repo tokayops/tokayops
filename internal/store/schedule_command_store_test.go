@@ -34,8 +34,8 @@ func cmdConfig(members ...string) rotation.ScheduleConfiguration {
 func seedCommandSchedule(t *testing.T, s *Store, at time.Time) string {
 	t.Helper()
 	seedTeam(t, s, "devops", "alice", "bob")
-	rev, err := newTestScheduleService(s, at).CreateSchedule(
-		context.Background(), "devops", cmdConfig("alice", "bob"), "alice", nil)
+	rev, err := createViaSave(context.Background(), newTestScheduleService(s, at),
+		"devops", cmdConfig("alice", "bob"), "alice", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -82,59 +82,6 @@ func TestSetScheduleDeletedRoundTrip(t *testing.T) {
 	})
 	if !errors.Is(err, scheduleconfig.ErrScheduleNotFound) {
 		t.Fatalf("error = %v, want ErrScheduleNotFound", err)
-	}
-}
-
-func TestMaxOverrideRecordedAt(t *testing.T) {
-	s := setupTestDB(t)
-	at := time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC)
-	scheduleID := seedCommandSchedule(t, s, at)
-	ctx := context.Background()
-
-	err := s.ScheduleConfigRepository().WithinTx(ctx, func(tx scheduleconfig.ScheduleConfigTx) error {
-		max, err := tx.MaxOverrideRecordedAt(ctx, scheduleID)
-		if err != nil {
-			return err
-		}
-		if max != nil {
-			return fmt.Errorf("max over an empty history = %v, want nil", *max)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("empty history: %v", err)
-	}
-
-	// Two logical overrides with different recorded times: the maximum is over
-	// the schedule, not over one override.
-	first := at.Add(time.Hour)
-	second := at.Add(2 * time.Hour)
-	err = s.ScheduleConfigRepository().WithinTx(ctx, func(tx scheduleconfig.ScheduleConfigTx) error {
-		for i, recordedAt := range []time.Time{second, first} {
-			if err := tx.InsertOverrideRevision(ctx, &scheduleconfig.OverrideRevision{
-				RevisionID: fmt.Sprintf("ovr-rev-%d", i),
-				OverrideID: fmt.Sprintf("ovr-%d", i),
-				ScheduleID: scheduleID,
-				Revision:   1,
-				UserID:     "alice",
-				ValidFrom:  at.Add(24 * time.Hour),
-				ValidTo:    at.Add(25 * time.Hour),
-				RecordedAt: recordedAt,
-			}); err != nil {
-				return err
-			}
-		}
-		max, err := tx.MaxOverrideRecordedAt(ctx, scheduleID)
-		if err != nil {
-			return err
-		}
-		if max == nil || !max.Equal(second) {
-			return fmt.Errorf("max = %v, want %v", max, second)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("MaxOverrideRecordedAt: %v", err)
 	}
 }
 
@@ -275,7 +222,7 @@ func TestOverrideHeadsIncludeTombstone(t *testing.T) {
 		}
 
 		// The projection still hides it.
-		projection, err := view.GetOverrideProjectionInRange(ctx, scheduleID, nil, nil, nil)
+		projection, err := view.GetOverrideProjectionInRange(ctx, scheduleID, nil, nil)
 		if err != nil {
 			return err
 		}
@@ -531,8 +478,8 @@ func TestConcurrentInitialCreateAndErasure(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		_, createErr = newTestScheduleService(s, time.Now().UTC()).CreateSchedule(
-			ctx, "devops", cmdConfig("alice", "bob"), "alice", nil)
+		_, createErr = createViaSave(ctx, newTestScheduleService(s, time.Now().UTC()),
+			"devops", cmdConfig("alice", "bob"), "alice", nil)
 	}()
 	go func() {
 		defer wg.Done()
@@ -555,8 +502,8 @@ func TestConcurrentSaveMembershipAndErasure(t *testing.T) {
 	seedTeam(t, s, "devops", "alice", "bob")
 	ctx := context.Background()
 
-	if _, err := newTestScheduleService(s, at).CreateSchedule(
-		ctx, "devops", cmdConfig("alice"), "alice", nil); err != nil {
+	if _, err := createViaSave(ctx, newTestScheduleService(s, at),
+		"devops", cmdConfig("alice"), "alice", nil); err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
 
@@ -594,8 +541,8 @@ func TestConcurrentCreateOverrideAndErasure(t *testing.T) {
 	seedTeam(t, s, "devops", "alice", "bob")
 	ctx := context.Background()
 
-	if _, err := newTestScheduleService(s, at).CreateSchedule(
-		ctx, "devops", cmdConfig("alice"), "alice", nil); err != nil {
+	if _, err := createViaSave(ctx, newTestScheduleService(s, at),
+		"devops", cmdConfig("alice"), "alice", nil); err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
 
@@ -692,8 +639,8 @@ func TestParallelCommandsNeverDeadlock(t *testing.T) {
 	seedTeam(t, s, "devops", "alice", "bob")
 	ctx := context.Background()
 
-	if _, err := newTestScheduleService(s, at).CreateSchedule(
-		ctx, "devops", cmdConfig("alice", "bob"), "alice", nil); err != nil {
+	if _, err := createViaSave(ctx, newTestScheduleService(s, at),
+		"devops", cmdConfig("alice", "bob"), "alice", nil); err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
 	for _, id := range []string{"root-a", "root-b"} {

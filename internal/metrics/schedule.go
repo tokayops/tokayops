@@ -1,55 +1,16 @@
 package metrics
 
-import (
-	"time"
+import "github.com/prometheus/client_golang/prometheus"
 
-	"github.com/prometheus/client_golang/prometheus"
-)
-
-// Tier 6 - Schedule configuration commands.
+// Tier 6 - the schedule runtime.
 //
-// These are registered here, next to every other metric, but they are reached
-// through a narrow interface that scheduleconfig declares. A direct import the
-// other way would close the loop scheduleconfig -> metrics -> store ->
-// scheduleconfig, since this package collects from the store and the store
-// implements the scheduleconfig contracts. Every method below takes standard
-// library types only, so nothing here has to import scheduleconfig either.
+// Command-side counters used to live here too, reached through an interface
+// scheduleconfig declared. They are gone: duration and conflicts are already
+// visible in the HTTP metrics every command arrives through, and a corrupt
+// snapshot is already visible to the runtime as a projection failure. What
+// remains is what happens WITHOUT a request - the notifier and the syncer -
+// which no HTTP metric can see.
 var (
-	ScheduleRevisionCreatedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "schedule_revision_created_total",
-		Help: "Schedule revisions committed, by what triggered them.",
-	}, []string{"trigger"})
-
-	ScheduleTransitionNoopTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "schedule_transition_noop_total",
-		Help: "Saves that found nothing to change and wrote nothing.",
-	})
-
-	ScheduleTransitionConflictTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "schedule_transition_conflict_total",
-		Help: "Saves rejected because the caller held a stale config version.",
-	})
-
-	ScheduleTransitionDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "schedule_transition_duration_seconds",
-		Help:    "Duration of one schedule configuration command, lock wait included.",
-		Buckets: prometheus.DefBuckets,
-	})
-
-	// A rising count here is data corruption, not load: a stored snapshot no
-	// longer decodes, and the affected schedule cannot be rendered at all.
-	ScheduleSnapshotDecodeErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "schedule_snapshot_decode_errors_total",
-		Help: "Stored schedule snapshots that could not be decoded.",
-	})
-
-	// This one should be flat at zero. Anything else means a committed
-	// revision would have produced a rotation the planner did not intend, and
-	// the transaction was rolled back to stop it.
-	SchedulePhaseGuardViolationsTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "schedule_phase_guard_violations_total",
-		Help: "Commit-time post-condition failures in the schedule transition guard.",
-	})
 
 	// ScheduleOnCallNotificationsTotal counts notification jobs actually
 	// created, not on-call changes detected. The two differ whenever more than
@@ -62,10 +23,10 @@ var (
 	}, []string{"kind"})
 
 	// ScheduleOnCallProjectionFailuresTotal counts schedules the runtime could
-	// not project. It is deliberately separate from
-	// schedule_snapshot_decode_errors_total: that one counts a save being
-	// refused, this one counts a schedule whose duty roster can no longer be
-	// read at all. The alerts they deserve are not the same.
+	// not project - a schedule whose duty roster can no longer be read at all.
+	// A corrupt stored snapshot arrives here as reason="snapshot_decode": the
+	// command side has no counter of its own, because a save that hits one
+	// answers over HTTP, where the failure is already recorded.
 	//
 	// The consumer label is what makes a rate readable. Two consumers observe
 	// the same schedules on different intervals, so without it one damaged
@@ -105,33 +66,7 @@ const (
 	ConsumerUsergroupSyncer = "usergroup_syncer"
 )
 
-// ScheduleMetrics is the Prometheus implementation of the metrics sink the
-// schedule configuration service and the API error mapper report through.
-type ScheduleMetrics struct{}
-
-func (ScheduleMetrics) RevisionCreated(trigger string) {
-	ScheduleRevisionCreatedTotal.WithLabelValues(trigger).Inc()
-}
-
-func (ScheduleMetrics) TransitionNoop() { ScheduleTransitionNoopTotal.Inc() }
-
-func (ScheduleMetrics) TransitionConflict() { ScheduleTransitionConflictTotal.Inc() }
-
-func (ScheduleMetrics) TransitionDuration(d time.Duration) {
-	ScheduleTransitionDuration.Observe(d.Seconds())
-}
-
-func (ScheduleMetrics) SnapshotDecodeError() { ScheduleSnapshotDecodeErrorsTotal.Inc() }
-
-func (ScheduleMetrics) GuardViolation() { SchedulePhaseGuardViolationsTotal.Inc() }
-
 func init() {
-	prometheus.MustRegister(ScheduleRevisionCreatedTotal)
-	prometheus.MustRegister(ScheduleTransitionNoopTotal)
-	prometheus.MustRegister(ScheduleTransitionConflictTotal)
-	prometheus.MustRegister(ScheduleTransitionDuration)
-	prometheus.MustRegister(ScheduleSnapshotDecodeErrorsTotal)
-	prometheus.MustRegister(SchedulePhaseGuardViolationsTotal)
 	prometheus.MustRegister(ScheduleOnCallNotificationsTotal)
 	prometheus.MustRegister(ScheduleOnCallProjectionFailuresTotal)
 	prometheus.MustRegister(ScheduleOnCallProjectionDuration)

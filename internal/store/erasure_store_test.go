@@ -76,7 +76,7 @@ func seedErasureFixture(t *testing.T, s *Store) (scheduleID string) {
 	}
 
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
-	rev, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil)
+	rev, err := createViaSave(context.Background(), newTestScheduleService(s, start), "devops", revTestConfig(), "", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}

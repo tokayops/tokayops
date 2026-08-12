@@ -76,26 +76,21 @@ const (
 	// never returned as if it were recorded.
 	WarnHistoryIncomplete WarningCode = "history_incomplete"
 
-	// WarnRevisionGap means the revision chain fails to cover a stretch it
-	// should have covered - between two revisions, before the first, or after
-	// the last. Since a deleted period is itself a revision, this only ever
-	// means data loss.
-	WarnRevisionGap WarningCode = "revision_gap"
-
-	// WarnRevisionOverlap means two revisions claim the same instant. The
-	// exclusion constraint forbids it, so this is corruption; the renderer
-	// resolves it in favour of the earlier revision and says so.
-	WarnRevisionOverlap WarningCode = "revision_overlap"
-
 	// WarnScheduleInactive marks the interval covered by a deleted-kind
 	// revision. It is an expected state, not damage.
 	WarnScheduleInactive WarningCode = "schedule_inactive"
-
-	// WarnOverrideOverlap means two overrides of one layer claimed the same
-	// instant. The renderer resolves it deterministically and says so rather
-	// than picking one silently.
-	WarnOverrideOverlap WarningCode = "override_overlap"
 )
+
+// Both remaining codes describe states a user produced on purpose: a range
+// that reaches before this schedule's history, and a period during which the
+// schedule was deleted.
+//
+// Three codes are gone - revision_gap, revision_overlap, override_overlap.
+// Each described damage the write paths cannot produce, and each came attached
+// to a calendar the renderer had drawn around the damage. A plausible answer
+// about who was on duty is worse than no answer: it is the same failure the
+// epic refused when it stopped reporting "nobody" for a schedule it could not
+// read. They are errors now.
 
 // Warning is structured because both the API and the tests consume it: a
 // message string would force either to parse prose.

@@ -3002,12 +3002,6 @@ const docTemplate = `{
                 },
                 "l2": {
                     "$ref": "#/definitions/api.LayerOnCallDTO"
-                },
-                "warnings": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/api.ScheduleWarningDTO"
-                    }
                 }
             }
         },
@@ -3129,9 +3123,6 @@ const docTemplate = `{
                 },
                 "noop": {
                     "type": "boolean"
-                },
-                "on_call_after": {
-                    "$ref": "#/definitions/api.OnCallDTO"
                 },
                 "recreated": {
                     "type": "boolean"
@@ -3510,12 +3501,6 @@ const docTemplate = `{
                 "end": {
                     "type": "string"
                 },
-                "grid_slot_end": {
-                    "type": "string"
-                },
-                "grid_slot_start": {
-                    "type": "string"
-                },
                 "group_id": {
                     "type": "string"
                 },
@@ -3523,21 +3508,11 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "override_id": {
+                    "description": "No grid boundaries, slot count or contributing revisions. A merged shift\nspans several slots, so those described nothing a caller could act on,\nand nothing read them. Where one slot's boundaries matter - the DM about\na handoff, the editor showing that an assignment started mid-shift -\nthey come from LayerOnCallDTO, which is about exactly one slot.",
                     "type": "string"
                 },
                 "override_revision_id": {
                     "type": "string"
-                },
-                "revision_ids": {
-                    "description": "RevisionIDs is provenance: which revisions contributed, in order.",
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "slot_count": {
-                    "description": "SlotCount is how many grid slots this shift spans.",
-                    "type": "integer"
                 },
                 "source": {
                     "type": "string"

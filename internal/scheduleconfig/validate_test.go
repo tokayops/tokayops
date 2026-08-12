@@ -24,7 +24,6 @@ func testSnapshot(t *testing.T) rotation.ScheduleRevisionSnapshot {
 	t.Helper()
 	monday := 1
 	weekly := rotation.RotationPolicy{
-		SchemaVersion: rotation.PolicySchemaVersion,
 		Cadence:       model.RotationWeekly,
 		HandoffTime:   "11:00",
 		HandoffDay:    &monday,
@@ -375,40 +374,5 @@ func TestPrepareOverrideRevisionDefaultsAndRejects(t *testing.T) {
 	}
 	if err := PrepareOverrideRevision(nil); !errors.Is(err, ErrInvariantViolation) {
 		t.Fatalf("nil override error = %v, want ErrInvariantViolation", err)
-	}
-}
-
-func TestPrepareScheduleEventDefaultsAndRejects(t *testing.T) {
-	event := &ScheduleEvent{ScheduleID: "sched-1", EventType: "schedule.changed"}
-	if err := PrepareScheduleEvent(event); err != nil {
-		t.Fatalf("PrepareScheduleEvent: %v", err)
-	}
-	if event.ID == "" {
-		t.Fatal("event id was not generated")
-	}
-	if string(event.Payload) != "{}" {
-		t.Fatalf("payload = %q, want the empty object default", event.Payload)
-	}
-	if event.RecordedAt.IsZero() {
-		t.Fatal("recorded_at was left zero")
-	}
-
-	tests := []struct {
-		name  string
-		event *ScheduleEvent
-	}{
-		{name: "nil", event: nil},
-		{name: "no schedule id", event: &ScheduleEvent{EventType: "schedule.changed"}},
-		{name: "no type", event: &ScheduleEvent{ScheduleID: "sched-1"}},
-		{name: "malformed payload", event: &ScheduleEvent{
-			ScheduleID: "sched-1", EventType: "schedule.changed", Payload: []byte(`{"broken"`),
-		}},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := PrepareScheduleEvent(tc.event); !errors.Is(err, ErrInvariantViolation) {
-				t.Fatalf("error = %v, want ErrInvariantViolation", err)
-			}
-		})
 	}
 }

@@ -62,16 +62,23 @@ type ScheduleReadView interface {
 	// GetEffectiveRevision returns the revision in force at `at`, which may
 	// be a deleted-kind revision. Callers must branch on Kind rather than
 	// assume a revision means an active schedule.
+	//
+	// Two revisions in force at one instant is ErrRevisionOverlap, never a
+	// choice between them. The exclusion constraint forbids the pair, so
+	// finding it means damage - and returning either one would put an
+	// arbitrary group on duty and tell nobody. This is part of the contract,
+	// not of one implementation: a double that resolved it silently would let
+	// the behaviour this refuses pass every unit test.
 	GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*ScheduleRevision, error)
 
 	// GetOverrideProjectionInRange returns the WINNING revision per
 	// override_id - not every revision of it - among those overlapping the
 	// range, ordered by valid_from then override_id.
 	//
-	// A nil bound means unbounded on that side. asOf nil means the current
-	// state; a value means the state as it was recorded at that system time,
-	// which is what lets history be replayed as it was known then.
-	GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]OverrideRevision, error)
+	// A nil bound means unbounded on that side. The projection is always the
+	// current one: what was known at an earlier system time is not a product
+	// capability, and the contract stopped promising it.
+	GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until *time.Time) ([]OverrideRevision, error)
 
 	// GetRevisionByID returns one revision of one schedule. The schedule ID is
 	// part of the lookup, not a convenience: a revision ID guessed from

@@ -2,6 +2,7 @@ package schedulerender
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -62,7 +63,7 @@ func TestServiceRenderRangeMatchesPureRender(t *testing.T) {
 	}
 	repo := seed(t, revs, overrides)
 
-	got, err := New(repo).RenderRange(context.Background(), testScheduleID, start, until, nil)
+	got, err := New(repo).RenderRange(context.Background(), testScheduleID, start, until)
 	if err != nil {
 		t.Fatalf("RenderRange: %v", err)
 	}
@@ -182,7 +183,7 @@ func TestSnapshotIsolatesConcurrentWrites(t *testing.T) {
 	ctx := context.Background()
 
 	err := repo.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
-		before, err := view.GetOverrideProjectionInRange(ctx, testScheduleID, nil, nil, nil)
+		before, err := view.GetOverrideProjectionInRange(ctx, testScheduleID, nil, nil)
 		if err != nil {
 			return err
 		}
@@ -199,7 +200,7 @@ func TestSnapshotIsolatesConcurrentWrites(t *testing.T) {
 			return err
 		}
 
-		after, err := view.GetOverrideProjectionInRange(ctx, testScheduleID, nil, nil, nil)
+		after, err := view.GetOverrideProjectionInRange(ctx, testScheduleID, nil, nil)
 		if err != nil {
 			return err
 		}
@@ -218,41 +219,29 @@ func TestSnapshotIsolatesConcurrentWrites(t *testing.T) {
 	}
 }
 
-// TestAsOfSelectsTheVersionKnownThen replays override state as it was
-// recorded, which is what makes a historical answer reproducible.
-func TestAsOfSelectsTheVersionKnownThen(t *testing.T) {
+// The projection is always the current one. Rendering "as of" an earlier
+// system time was a contract with no product behind it - the option existed in
+// Go and in this test, and nothing ever asked for it. Editing an override
+// therefore changes what a render shows; the history of the edit lives in the
+// override revisions, which is where it was always kept.
+func TestRenderShowsTheCurrentOverrideRevision(t *testing.T) {
 	start := utc(2026, 5, 1, 11, 0)
 	revs := chain(t, revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))})
 
-	firstRecorded := start
-	editRecorded := start.Add(2 * time.Hour)
-
-	first := override("ovr-1", LayerL1, "carol", utc(2026, 5, 1, 14, 0), utc(2026, 5, 1, 18, 0), firstRecorded)
+	first := override("ovr-1", LayerL1, "carol", utc(2026, 5, 1, 14, 0), utc(2026, 5, 1, 18, 0), start)
 	edited := first
 	edited.RevisionID = "ovr-1-r2"
 	edited.Revision = 2
 	edited.UserID = "dave"
-	edited.RecordedAt = editRecorded
+	edited.RecordedAt = start.Add(2 * time.Hour)
 
 	svc := New(seed(t, revs, []scheduleconfig.OverrideRevision{first, edited}))
-	ctx := context.Background()
-	until := utc(2026, 5, 2, 11, 0)
-
-	asOfBefore := firstRecorded.Add(time.Hour)
-	early, err := svc.RenderRange(ctx, testScheduleID, start, until, &asOfBefore)
-	if err != nil {
-		t.Fatalf("RenderRange: %v", err)
-	}
-	if got := overrideHolder(early); got != "carol" {
-		t.Fatalf("as-of before the edit the override is held by %q, want carol", got)
-	}
-
-	current, err := svc.RenderRange(ctx, testScheduleID, start, until, nil)
+	current, err := svc.RenderRange(context.Background(), testScheduleID, start, utc(2026, 5, 2, 11, 0))
 	if err != nil {
 		t.Fatalf("RenderRange: %v", err)
 	}
 	if got := overrideHolder(current); got != "dave" {
-		t.Fatalf("current override is held by %q, want dave", got)
+		t.Fatalf("override is held by %q, want dave - the winning revision", got)
 	}
 }
 
@@ -263,4 +252,54 @@ func overrideHolder(res Result) string {
 		}
 	}
 	return ""
+}
+
+// The refusal has to reach the runtime paths, not only the calendar.
+//
+// CurrentOnCall and the bulk projection read one instant through
+// GetEffectiveRevision. While that read picked one of two overlapping
+// revisions, the calendar refused and the notifier quietly woke whichever
+// group it got - the worse half of the same bug, because nothing said so.
+func TestCurrentOnCallRefusesOverlappingRevisions(t *testing.T) {
+	start := utc(2026, 5, 1, 11, 0)
+	second := utc(2026, 5, 3, 11, 0)
+	revs := chain(t,
+		revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
+		revisionStep{at: second, cfg: config("UTC", dailyPolicy("11:00"), group(groupB, "bob"))},
+	)
+	repo := seed(t, revs, nil)
+
+	// Written straight into the store: seed builds a well-formed chain, and
+	// the command side cannot produce this pair at all - which is the point.
+	extra := revs[1]
+	extra.ID = "rev-overlapping"
+	extra.Version = 99
+	extra.EffectiveFrom = second
+	closed := second.Add(24 * time.Hour)
+	extra.EffectiveTo = &closed
+	if err := repo.WithinTx(context.Background(), func(tx scheduleconfig.ScheduleConfigTx) error {
+		return tx.InsertRevision(context.Background(), &extra)
+	}); err != nil {
+		t.Fatalf("seed the overlapping revision: %v", err)
+	}
+
+	svc := New(repo)
+	at := second.Add(time.Hour)
+
+	if _, err := svc.CurrentOnCall(context.Background(), testScheduleID, at); !errors.Is(err, scheduleconfig.ErrRevisionOverlap) {
+		t.Fatalf("CurrentOnCall error = %v, want ErrRevisionOverlap", err)
+	}
+
+	// And the bulk projection isolates it as one damaged schedule rather than
+	// failing the tick or picking a group.
+	bulk, err := svc.CurrentOnCallForAll(context.Background(), at)
+	if err != nil {
+		t.Fatalf("CurrentOnCallForAll: %v", err)
+	}
+	if len(bulk.Failures) != 1 || bulk.Failures[0].Reason != FailureRevisionOverlap {
+		t.Fatalf("failures = %+v, want one revision_overlap", bulk.Failures)
+	}
+	if len(bulk.Schedules) != 0 {
+		t.Fatalf("a schedule that could not be projected was reported as projected: %+v", bulk.Schedules)
+	}
 }

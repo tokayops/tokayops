@@ -103,8 +103,7 @@ func (v *scheduleReadView) ListOverrideHeads(ctx context.Context, scheduleID str
 //
 // Three steps, and their order is load-bearing:
 //
-//  1. pick the latest revision per override_id, bounded by asOf when the
-//     caller asks for the state as it was known at a system time;
+//  1. pick the latest revision per override_id;
 //  2. only THEN drop tombstones - filtering `deleted` before the grouping
 //     would let the revision preceding a delete win the MAX and resurrect an
 //     override the user removed;
@@ -121,22 +120,21 @@ func (v *scheduleReadView) ListOverrideHeads(ctx context.Context, scheduleID str
 // required, not decorative: without them PostgreSQL cannot infer the type of
 // a nil parameter.
 func getOverrideProjection(ctx context.Context, q sqlQueryer, scheduleID string,
-	from, until, asOf *time.Time) ([]scheduleconfig.OverrideRevision, error) {
+	from, until *time.Time) ([]scheduleconfig.OverrideRevision, error) {
 	rows, err := q.QueryContext(ctx,
 		`SELECT `+overrideRevisionColumns+`
 		 FROM schedule_override_revisions o
 		 JOIN (SELECT override_id, MAX(revision) AS revision
 		       FROM schedule_override_revisions
 		       WHERE schedule_id = $1
-		         AND ($2::timestamptz IS NULL OR recorded_at <= $2)
 		       GROUP BY override_id) last
 		   ON last.override_id = o.override_id AND last.revision = o.revision
 		 WHERE o.schedule_id = $1
 		   AND NOT o.deleted
-		   AND ($3::timestamptz IS NULL OR o.valid_to > $3)
-		   AND ($4::timestamptz IS NULL OR o.valid_from < $4)
+		   AND ($2::timestamptz IS NULL OR o.valid_to > $2)
+		   AND ($3::timestamptz IS NULL OR o.valid_from < $3)
 		 ORDER BY o.valid_from, o.override_id`,
-		scheduleID, normalizeBound(asOf), normalizeBound(from), normalizeBound(until))
+		scheduleID, normalizeBound(from), normalizeBound(until))
 	if err != nil {
 		return nil, err
 	}

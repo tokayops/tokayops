@@ -1,7 +1,9 @@
 package schedulerender
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/rotation"
@@ -42,7 +44,7 @@ type slotInput struct {
 // on duty until its own valid_to, so switching a layer off or emptying its
 // groups in the middle of one must not make it vanish; the interval the
 // override does not cover is then simply nobody's.
-func renderSlot(in slotInput) ([]Assignment, []Warning) {
+func renderSlot(in slotInput) ([]Assignment, error) {
 	if in.Bound.empty() {
 		return nil, nil
 	}
@@ -50,10 +52,7 @@ func renderSlot(in slotInput) ([]Assignment, []Warning) {
 	covering := overridesForSlot(in.Overrides, in.Bound)
 	points := elementaryPoints(covering, in.Bound)
 
-	var (
-		out      []Assignment
-		warnings []Warning
-	)
+	var out []Assignment
 	for i := 0; i+1 < len(points); i++ {
 		span := interval{Start: points[i], End: points[i+1]}
 		if span.empty() {
@@ -62,7 +61,19 @@ func renderSlot(in slotInput) ([]Assignment, []Warning) {
 
 		active := coveringAt(covering, span.Start)
 		if len(active) > 1 {
-			warnings = appendOverlapWarning(warnings, in.Layer, span, active)
+			// Refused rather than resolved by "the last one wins". The command
+			// side cannot create this pair, so finding it means the data was
+			// edited past the code - and picking a winner would put an
+			// arbitrary person on duty and say nothing.
+			ids := make([]string, 0, len(active))
+			for _, o := range active {
+				ids = append(ids, o.OverrideID)
+			}
+			sort.Strings(ids)
+			return nil, fmt.Errorf("%w: layer %s over %s..%s, overrides %s",
+				scheduleconfig.ErrOverrideCollision, in.Layer,
+				span.Start.Format(time.RFC3339), span.End.Format(time.RFC3339),
+				strings.Join(ids, " and "))
 		}
 
 		switch {
@@ -100,19 +111,18 @@ func renderSlot(in slotInput) ([]Assignment, []Warning) {
 		// No base and no override: nobody is on duty for this span. The gap
 		// is left as a gap rather than filled with the surrounding group.
 	}
-	return out, warnings
+	return out, nil
 }
 
-// overridesForSlot keeps the overrides that reach the bound and sorts them by
-// priority ASCENDING, so that the last covering entry always wins. Their own
+// overridesForSlot keeps the overrides that reach the bound. Their own
 // validity intervals are left intact: the bound decides which pieces are
 // reported, not what an override covers.
 //
-// The sort is what makes the result independent of the order the caller
-// supplied: overlapping overrides must resolve the same way no matter how the
-// projection happened to return them. Priority is the later recorded_at, and
-// for two recorded in the same microsecond the greater override_id - an
-// arbitrary but total rule, which is what determinism requires.
+// The result is deliberately unordered. It used to be sorted by recorded_at so
+// that the last recorded override won a collision; nothing wins one now - two
+// live overrides on one layer are refused - and nothing downstream depends on
+// the order: elementaryPoints sorts its own boundaries, and the ids in the
+// refusal are sorted where the message is built.
 func overridesForSlot(overrides []scheduleconfig.OverrideRevision, bound interval) []scheduleconfig.OverrideRevision {
 	out := make([]scheduleconfig.OverrideRevision, 0, len(overrides))
 	for _, o := range overrides {
@@ -121,12 +131,6 @@ func overridesForSlot(overrides []scheduleconfig.OverrideRevision, bound interva
 		}
 		out = append(out, o)
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if !out[i].RecordedAt.Equal(out[j].RecordedAt) {
-			return out[i].RecordedAt.Before(out[j].RecordedAt)
-		}
-		return out[i].OverrideID < out[j].OverrideID
-	})
 	return out
 }
 
@@ -202,30 +206,4 @@ func equalIDs(a, b []string) bool {
 		}
 	}
 	return true
-}
-
-// appendOverlapWarning records that several overrides claimed one instant,
-// coalescing it with the previous warning when it is the same set continuing.
-func appendOverlapWarning(out []Warning, layer string, span interval, active []scheduleconfig.OverrideRevision) []Warning {
-	ids := make([]string, 0, len(active))
-	for _, o := range active {
-		ids = append(ids, o.OverrideID)
-	}
-	sort.Strings(ids)
-
-	if n := len(out); n > 0 {
-		last := &out[n-1]
-		if last.Code == WarnOverrideOverlap && last.Layer == layer &&
-			last.Until.Equal(span.Start) && equalIDs(last.RelatedIDs, ids) {
-			last.Until = span.End
-			return out
-		}
-	}
-	return append(out, Warning{
-		Code:       WarnOverrideOverlap,
-		Layer:      layer,
-		From:       span.Start,
-		Until:      span.End,
-		RelatedIDs: ids,
-	})
 }

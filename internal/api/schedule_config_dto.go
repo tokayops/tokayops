@@ -86,7 +86,6 @@ func (d ScheduleConfigDTO) toConfiguration() rotation.ScheduleConfiguration {
 		L1: rotation.LayerConfiguration{
 			Enabled: d.L1.Enabled,
 			Policy: rotation.RotationPolicy{
-				SchemaVersion: rotation.PolicySchemaVersion,
 				Cadence:       model.RotationType(d.L1.RotationType),
 				HandoffTime:   d.L1.HandoffTime,
 				HandoffDay:    d.L1.HandoffDay,
@@ -96,7 +95,6 @@ func (d ScheduleConfigDTO) toConfiguration() rotation.ScheduleConfiguration {
 		L2: rotation.LayerConfiguration{
 			Enabled: d.L2.Enabled,
 			Policy: rotation.RotationPolicy{
-				SchemaVersion: rotation.PolicySchemaVersion,
 				Cadence:       model.RotationType(d.L2.RotationType),
 				HandoffTime:   d.L2.HandoffTime,
 				HandoffDay:    d.L2.HandoffDay,
@@ -154,18 +152,24 @@ type ScheduleConfigResponse struct {
 	Config        ScheduleConfigDTO `json:"config"`
 }
 
-// PutScheduleConfigResponse is the answer to a save.
+// PutScheduleConfigResponse says what the save did, and nothing about the world
+// after it.
 //
 // Every field is present even when nothing was written: a no-op still has a
 // version and a revision in force, and an editor that had to special-case the
 // no-op response would end up with two ways to read the same answer.
+//
+// It used to carry on_call_after, rendered by a second read AFTER the commit -
+// so a failure of that read answered 500 for a command that had already been
+// applied. The response lied about the outcome, which is worse than being
+// terse. Who is on duty now is a separate question, asked by a separate
+// request that is free to fail on its own.
 type PutScheduleConfigResponse struct {
-	Version     int64     `json:"version"`
-	RevisionID  string    `json:"revision_id"`
-	Noop        bool      `json:"noop"`
-	Created     bool      `json:"created"`
-	Recreated   bool      `json:"recreated"`
-	OnCallAfter OnCallDTO `json:"on_call_after"`
+	Version    int64  `json:"version"`
+	RevisionID string `json:"revision_id"`
+	Noop       bool   `json:"noop"`
+	Created    bool   `json:"created"`
+	Recreated  bool   `json:"recreated"`
 }
 
 // LayerOnCallDTO is who is on duty on one layer.
@@ -191,26 +195,22 @@ type LayerOnCallDTO struct {
 // OnCallDTO is the current-assignment projection. A null layer means nobody is
 // on duty there.
 //
-// Warnings belong here rather than beside the projection: an override overlap
-// is no less real for being seen through the current view than through the
-// history, and a caller that got the projection without them would have to
-// re-render a range to find out that the answer is contested. Carrying them
-// inside the value means every path that returns a projection - the on-call
-// endpoint, the preview's before/after, the save's result - reports the same
-// thing without three chances to forget.
+// It carries no warnings. It used to carry one - an override collision seen
+// through the current view - and that is an error now: a projection of damaged
+// data is refused rather than returned with a note. The two warnings that
+// remain describe a RANGE (history_incomplete, schedule_inactive) and live on
+// the render response, which is what answers about ranges.
 type OnCallDTO struct {
-	At       time.Time            `json:"at"`
-	L1       *LayerOnCallDTO      `json:"l1"`
-	L2       *LayerOnCallDTO      `json:"l2"`
-	Warnings []ScheduleWarningDTO `json:"warnings"`
+	At time.Time       `json:"at"`
+	L1 *LayerOnCallDTO `json:"l1"`
+	L2 *LayerOnCallDTO `json:"l2"`
 }
 
 func onCallDTO(o schedulerender.OnCall) OnCallDTO {
 	return OnCallDTO{
 		At:       o.At,
-		L1:       layerOnCallDTO(o.L1),
-		L2:       layerOnCallDTO(o.L2),
-		Warnings: warningDTOs(o.Warnings),
+		L1: layerOnCallDTO(o.L1),
+		L2: layerOnCallDTO(o.L2),
 	}
 }
 
@@ -241,15 +241,11 @@ type ShiftDTO struct {
 	Start time.Time `json:"start"`
 	End   time.Time `json:"end"`
 
-	GridSlotStart time.Time `json:"grid_slot_start"`
-	GridSlotEnd   time.Time `json:"grid_slot_end"`
-
-	// SlotCount is how many grid slots this shift spans.
-	SlotCount int `json:"slot_count"`
-
-	// RevisionIDs is provenance: which revisions contributed, in order.
-	RevisionIDs []string `json:"revision_ids"`
-
+	// No grid boundaries, slot count or contributing revisions. A merged shift
+	// spans several slots, so those described nothing a caller could act on,
+	// and nothing read them. Where one slot's boundaries matter - the DM about
+	// a handoff, the editor showing that an assignment started mid-shift -
+	// they come from LayerOnCallDTO, which is about exactly one slot.
 	OverrideID         string `json:"override_id,omitempty"`
 	OverrideRevisionID string `json:"override_revision_id,omitempty"`
 }
@@ -264,10 +260,6 @@ func shiftDTOs(shifts []schedulerender.Shift) []ShiftDTO {
 			UserIDs:            s.UserIDs,
 			Start:              s.Start,
 			End:                s.End,
-			GridSlotStart:      s.GridSlotStart,
-			GridSlotEnd:        s.GridSlotEnd,
-			SlotCount:          s.SlotCount,
-			RevisionIDs:        s.RevisionIDs,
 			OverrideID:         s.OverrideID,
 			OverrideRevisionID: s.OverrideRevisionID,
 		}

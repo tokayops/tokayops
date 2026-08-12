@@ -9,7 +9,6 @@ package scheduleconfig
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -51,6 +50,22 @@ var (
 	// cannot be explained by concurrent legitimate use. It is a bug signal,
 	// not a condition callers can recover from.
 	ErrInvariantViolation = errors.New("scheduleconfig: invariant violation")
+
+	// ErrRevisionOverlap means two revisions of one schedule claim the same
+	// instant. The exclusion constraint forbids it, so it is damage rather
+	// than a state a caller can produce - and it is refused rather than
+	// resolved, because picking one of the two would put an arbitrary group
+	// on duty and tell nobody.
+	ErrRevisionOverlap = fmt.Errorf(
+		"%w: two revisions are in force at the same instant", ErrInvariantViolation)
+
+	// ErrOverrideCollision means two live overrides of one layer cover the
+	// same instant IN STORED DATA. It is not ErrOverrideOverlap: that one is
+	// the command side refusing to create such a pair, which is a caller
+	// error and a 409. Finding the pair already written is damage, and the
+	// two must not share a sentinel or the API would answer one as the other.
+	ErrOverrideCollision = fmt.Errorf(
+		"%w: two overrides of one layer cover the same instant", ErrInvariantViolation)
 
 	// ErrHistoryMarkerMissing means a schedule row carries no
 	// history_complete_from - see RootInitialized for what that implies and
@@ -182,23 +197,6 @@ const (
 	LayerL2 = "l2"
 )
 
-// ScheduleEvent is a domain event recorded in the same transaction as the
-// change it describes.
-type ScheduleEvent struct {
-	ID         string
-	ScheduleID string
-	EventType  string
-	Payload    json.RawMessage
-	RecordedAt time.Time
-}
-
-// EventScheduleConfigurationChanged is the one event type every configuration
-// command emits. Create, save, delete and recreate are the same fact -
-// "the configuration of this schedule is now different" - and a consumer that
-// cares which one it was reads the trigger. Four event types would force every
-// consumer to subscribe to all four to stay correct.
-const EventScheduleConfigurationChanged = "schedule.configuration_changed"
-
 // Triggers of EventScheduleConfigurationChanged.
 const (
 	TriggerCreated   = "created"
@@ -206,20 +204,6 @@ const (
 	TriggerDeleted   = "deleted"
 	TriggerRecreated = "recreated"
 )
-
-// ConfigurationChangedPayload is the body of EventScheduleConfigurationChanged.
-// It names the revisions on both sides of the change rather than carrying the
-// configuration: a consumer that needs the snapshot reads the revision, and an
-// event log is not the place to duplicate it.
-type ConfigurationChangedPayload struct {
-	Trigger       string    `json:"trigger"`
-	OldRevisionID *string   `json:"old_revision_id"`
-	NewRevisionID string    `json:"new_revision_id"`
-	OldVersion    int64     `json:"old_version"`
-	NewVersion    int64     `json:"new_version"`
-	EffectiveAt   time.Time `json:"effective_at"`
-	ActorID       *string   `json:"actor_id"`
-}
 
 // ScheduleConfigRepository hands out a unit of work. Everything a command does
 // happens inside one WithinTx call; an error returned from fn rolls the whole
@@ -262,23 +246,12 @@ type ScheduleConfigTx interface {
 	// AdvanceVersion is a compare-and-set on config_version.
 	AdvanceVersion(ctx context.Context, scheduleID string, expected int64, at time.Time) error
 
-	InsertScheduleEvent(ctx context.Context, event *ScheduleEvent) error
-
 	InsertOverrideRevision(ctx context.Context, rev *OverrideRevision) error
 
 	// SetScheduleDeleted moves the deleted-at projection. A value sets it
 	// (delete), nil clears it (recreate). The projection is derived from the
 	// revision chain, never the other way round: the chain is the history.
 	SetScheduleDeleted(ctx context.Context, scheduleID string, deletedAt *time.Time) error
-
-	// MaxOverrideRecordedAt is the newest recorded_at across ALL override
-	// revisions of a schedule, tombstones included; nil when there are none.
-	//
-	// It is a read rather than SQL inside the insert so that the monotonicity
-	// rule lives next to the clock the service injects. Expressed in SQL it
-	// would have to be restated in the fake, and the two statements of one
-	// rule would be free to drift.
-	MaxOverrideRecordedAt(ctx context.Context, scheduleID string) (*time.Time, error)
 
 	// LockUsers takes a shared row lock on the named users, in ID order, and
 	// is the serialization point against erasure - not a source of data. It is

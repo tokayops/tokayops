@@ -41,15 +41,7 @@ func New(repo scheduleconfig.ScheduleReadRepository, opts ...Option) *Service {
 
 // RenderRange answers who was on duty across [from, until).
 //
-// asOf selects the system time at which override state is read: nil means as
-// it stands now, a value replays the state as it was known then.
-//
-// The range is normalized to database resolution before anything is fetched.
-// Passing it raw would let the queries floor `until` while the renderer clips
-// with the nanosecond-precise value, and a revision overlapping the range by
-// less than a microsecond would be dropped by the query yet expected by the
-// renderer. Result.From/Until report the range that was actually answered.
-func (s *Service) RenderRange(ctx context.Context, scheduleID string, from, until time.Time, asOf *time.Time) (Result, error) {
+func (s *Service) RenderRange(ctx context.Context, scheduleID string, from, until time.Time) (Result, error) {
 	from = scheduleconfig.NormalizeTimestamp(from)
 	until = scheduleconfig.NormalizeTimestamp(until)
 
@@ -63,7 +55,7 @@ func (s *Service) RenderRange(ctx context.Context, scheduleID string, from, unti
 		if err != nil {
 			return err
 		}
-		overrides, err := view.GetOverrideProjectionInRange(ctx, scheduleID, &from, &until, asOf)
+		overrides, err := view.GetOverrideProjectionInRange(ctx, scheduleID, &from, &until)
 		if err != nil {
 			return err
 		}
@@ -261,11 +253,11 @@ func onCallOfRevision(ctx context.Context, view scheduleconfig.ScheduleReadView,
 	if !ok {
 		return OnCall{At: at}, nil
 	}
-	overrides, err := view.GetOverrideProjectionInRange(ctx, rev.ScheduleID, &from, &until, nil)
+	overrides, err := view.GetOverrideProjectionInRange(ctx, rev.ScheduleID, &from, &until)
 	if err != nil {
 		return OnCall{}, err
 	}
-	return projectOnCall(rev, at, slots, overrides), nil
+	return projectOnCall(rev, at, slots, overrides)
 }
 
 // projectRevisionOnCall is the same projection against overrides the caller
@@ -278,5 +270,5 @@ func projectRevisionOnCall(rev scheduleconfig.ScheduleRevision, at time.Time,
 	if err != nil {
 		return OnCall{}, err
 	}
-	return projectOnCall(rev, at, slots, overrides), nil
+	return projectOnCall(rev, at, slots, overrides)
 }

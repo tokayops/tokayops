@@ -8,7 +8,6 @@ package fakes
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -50,7 +49,6 @@ type fakeState struct {
 	teamIndex map[string]string
 	revisions map[string][]scheduleconfig.ScheduleRevision
 	overrides map[string][]scheduleconfig.OverrideRevision
-	events    map[string][]scheduleconfig.ScheduleEvent
 
 	// members is team id -> user ids and erased is the set of soft-deleted
 	// users. Membership is part of the state because it is part of the
@@ -78,7 +76,6 @@ func newState() fakeState {
 		teamIndex:  map[string]string{},
 		revisions:  map[string][]scheduleconfig.ScheduleRevision{},
 		overrides:  map[string][]scheduleconfig.OverrideRevision{},
-		events:     map[string][]scheduleconfig.ScheduleEvent{},
 		members:    map[string][]string{},
 		erased:     map[string]bool{},
 		knownUsers: map[string]bool{},
@@ -106,9 +103,6 @@ func (s fakeState) clone() fakeState {
 	}
 	for k, v := range s.overrides {
 		c.overrides[k] = cloneOverrides(v)
-	}
-	for k, v := range s.events {
-		c.events[k] = cloneEvents(v)
 	}
 	for k, v := range s.members {
 		c.members[k] = append([]string(nil), v...)
@@ -221,22 +215,6 @@ func cloneOverrides(revs []scheduleconfig.OverrideRevision) []scheduleconfig.Ove
 	return out
 }
 
-func cloneEvent(e scheduleconfig.ScheduleEvent) scheduleconfig.ScheduleEvent {
-	e.Payload = append(json.RawMessage(nil), e.Payload...)
-	return e
-}
-
-func cloneEvents(events []scheduleconfig.ScheduleEvent) []scheduleconfig.ScheduleEvent {
-	if events == nil {
-		return nil
-	}
-	out := make([]scheduleconfig.ScheduleEvent, len(events))
-	for i, e := range events {
-		out[i] = cloneEvent(e)
-	}
-	return out
-}
-
 // NewScheduleConfigRepo returns an empty repository.
 func NewScheduleConfigRepo() *ScheduleConfigRepo {
 	return &ScheduleConfigRepo{state: newState(), FailOn: map[string]error{}}
@@ -340,13 +318,6 @@ func (r *ScheduleConfigRepo) OverrideRevisions(scheduleID string) []scheduleconf
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return cloneOverrides(r.state.overrides[scheduleID])
-}
-
-// Events returns the schedule events recorded for a schedule.
-func (r *ScheduleConfigRepo) Events(scheduleID string) []scheduleconfig.ScheduleEvent {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return cloneEvents(r.state.events[scheduleID])
 }
 
 // RootCount reports how many schedule roots exist.
@@ -521,6 +492,7 @@ func (v *fakeReadView) GetEffectiveRevision(ctx context.Context, scheduleID stri
 	if err := v.scheduleFailure(scheduleID); err != nil {
 		return nil, err
 	}
+	var inForce []scheduleconfig.ScheduleRevision
 	for _, rev := range v.state().revisions[scheduleID] {
 		if rev.EffectiveFrom.After(at) {
 			continue
@@ -528,10 +500,23 @@ func (v *fakeReadView) GetEffectiveRevision(ctx context.Context, scheduleID stri
 		if rev.EffectiveTo != nil && !rev.EffectiveTo.After(at) {
 			continue
 		}
-		found := cloneRevision(rev)
-		return &found, nil
+		inForce = append(inForce, rev)
 	}
-	return nil, scheduleconfig.ErrRevisionNotFound
+	switch len(inForce) {
+	case 0:
+		return nil, scheduleconfig.ErrRevisionNotFound
+	case 1:
+		found := cloneRevision(inForce[0])
+		return &found, nil
+	default:
+		// The contract refuses the pair rather than choosing. Returning the
+		// first match here would make every unit test of the runtime
+		// projection pass while production refused - the fake would be the
+		// only place the old behaviour still lived.
+		return nil, fmt.Errorf("%w: schedule %s has revisions %s and %s both in force at %s",
+			scheduleconfig.ErrRevisionOverlap, scheduleID, inForce[0].ID, inForce[1].ID,
+			at.Format(time.RFC3339))
+	}
 }
 
 // GetRevisionsInRange applies the half-open overlap test in both directions
@@ -555,19 +540,16 @@ func (v *fakeReadView) GetRevisionsInRange(ctx context.Context, scheduleID strin
 }
 
 // GetOverrideProjectionInRange mirrors the SQL projection step for step:
-// pick the latest revision per override_id (bounded by asOf), only then drop
+// pick the latest revision per override_id, only then drop
 // tombstones, only then apply the validity range. Any other order either
 // resurrects a deleted override or picks a stale version whose interval
 // happened to overlap.
-func (v *fakeReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]scheduleconfig.OverrideRevision, error) {
+func (v *fakeReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until *time.Time) ([]scheduleconfig.OverrideRevision, error) {
 	if err := v.record("GetOverrideProjectionInRange"); err != nil {
 		return nil, err
 	}
 	latest := map[string]scheduleconfig.OverrideRevision{}
 	for _, rev := range v.state().overrides[scheduleID] {
-		if asOf != nil && rev.RecordedAt.After(*asOf) {
-			continue
-		}
 		if cur, ok := latest[rev.OverrideID]; !ok || rev.Revision > cur.Revision {
 			latest[rev.OverrideID] = rev
 		}
@@ -795,21 +777,6 @@ func (t *scheduleConfigTx) AdvanceVersion(ctx context.Context, scheduleID string
 	}
 	root.ConfigVersion++
 	t.repo.state.roots[scheduleID] = root
-	return nil
-}
-
-func (t *scheduleConfigTx) InsertScheduleEvent(ctx context.Context, event *scheduleconfig.ScheduleEvent) error {
-	if err := t.repo.record("InsertScheduleEvent"); err != nil {
-		return err
-	}
-	if err := scheduleconfig.PrepareScheduleEvent(event); err != nil {
-		return err
-	}
-	s := t.repo.state
-	if _, ok := s.roots[event.ScheduleID]; !ok {
-		return scheduleconfig.ErrScheduleNotFound
-	}
-	s.events[event.ScheduleID] = append(s.events[event.ScheduleID], cloneEvent(*event))
 	return nil
 }
 
@@ -1054,20 +1021,6 @@ func (t *scheduleConfigTx) SetScheduleDeleted(ctx context.Context, scheduleID st
 	root.DeletedAt = cloneTime(deletedAt)
 	t.repo.state.roots[scheduleID] = root
 	return nil
-}
-
-func (t *scheduleConfigTx) MaxOverrideRecordedAt(ctx context.Context, scheduleID string) (*time.Time, error) {
-	if err := t.repo.record("MaxOverrideRecordedAt"); err != nil {
-		return nil, err
-	}
-	var max *time.Time
-	for _, rev := range t.repo.state.overrides[scheduleID] {
-		if max == nil || rev.RecordedAt.After(*max) {
-			at := rev.RecordedAt
-			max = &at
-		}
-	}
-	return max, nil
 }
 
 // LockUsers records that it happened and what it was asked to lock; there is

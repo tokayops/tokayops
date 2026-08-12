@@ -523,7 +523,7 @@ const API = {
          * @param {Object} config - {timezone, slack_usergroup_id, l1, l2}
          * @param {number} expectedVersion
          * @param {string} [reason] - free text recorded with the revision
-         * @returns {Promise<{version, revision_id, noop, created, recreated, on_call_after}>}
+         * @returns {Promise<{version, revision_id, noop, created, recreated}>}
          */
         saveConfig: (teamId, config, expectedVersion, reason) => {
             return request(`/teams/${encodeURIComponent(teamId)}/schedule/config`, {

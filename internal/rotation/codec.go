@@ -256,14 +256,11 @@ func decodeLayerV1(raw json.RawMessage, what string) (RotationLayerSnapshot, err
 
 func decodePolicyV1(raw json.RawMessage, what string) (RotationPolicy, error) {
 	var zero RotationPolicy
-	m, err := strictObject(raw, what, []string{"schema_version", "cadence", "handoff_time", "handoff_day"})
+	m, err := strictObject(raw, what, []string{"cadence", "handoff_time", "handoff_day"})
 	if err != nil {
 		return zero, err
 	}
 	var p RotationPolicy
-	if p.SchemaVersion, err = fieldInt(m, what, "schema_version"); err != nil {
-		return zero, err
-	}
 	cadence, err := fieldString(m, what, "cadence")
 	if err != nil {
 		return zero, err

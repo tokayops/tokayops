@@ -38,14 +38,15 @@ type LayerOnCall struct {
 // OnCall is the current-assignment projection. A nil layer means nobody is on
 // duty there - the layer is off, has no groups, or the schedule did not exist
 // at that instant.
+//
+// It carries no warnings. The two that remain - history_incomplete and
+// schedule_inactive - are about a RANGE, and this type answers about one
+// instant: at that instant a schedule is either readable or it is not, and
+// unreadable is an error rather than a note attached to a guess.
 type OnCall struct {
 	At time.Time
 	L1 *LayerOnCall
 	L2 *LayerOnCall
-
-	// Warnings surface here too: an override overlap is no less wrong for
-	// being observed through the current view rather than the history.
-	Warnings []Warning
 }
 
 // layerSlot is the grid slot of one layer at the queried instant, already
@@ -102,11 +103,11 @@ func onCallSlots(rev scheduleconfig.ScheduleRevision, at time.Time) ([]layerSlot
 // other direction: after an override ends, the rotation resumes at the
 // override's valid_to, not at the start of the grid slot.
 func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []layerSlot,
-	overrides []scheduleconfig.OverrideRevision) OnCall {
+	overrides []scheduleconfig.OverrideRevision) (OnCall, error) {
 
 	out := OnCall{At: at}
 	for _, ls := range slots {
-		assignments, warnings := renderSlot(slotInput{
+		assignments, err := renderSlot(slotInput{
 			RevisionID: rev.ID,
 			Layer:      ls.layer,
 			Slot:       ls.slot,
@@ -114,7 +115,9 @@ func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []la
 			Base:       ls.base,
 			Overrides:  overridesOfLayer(overrides, ls.layer),
 		})
-		out.Warnings = append(out.Warnings, warnings...)
+		if err != nil {
+			return OnCall{}, err
+		}
 
 		found := assignmentAt(assignments, at)
 		if found == nil {
@@ -138,7 +141,7 @@ func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []la
 			out.L2 = layerOnCall
 		}
 	}
-	return out
+	return out, nil
 }
 
 func assignmentAt(assignments []Assignment, at time.Time) *Assignment {

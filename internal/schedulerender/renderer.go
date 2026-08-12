@@ -3,6 +3,7 @@ package schedulerender
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/rotation"
@@ -120,7 +121,10 @@ func Render(in Input) (Result, error) {
 
 	for _, rev := range revisions {
 		revRange := revisionInterval(rev)
-		revRange, res.Warnings = cov.advance(revRange, rev, res.Warnings)
+		revRange, advErr := cov.advance(revRange, rev)
+		if advErr != nil {
+			return Result{}, advErr
+		}
 
 		bound := revRange.intersect(queryRange)
 		if bound.empty() {
@@ -141,15 +145,16 @@ func Render(in Input) (Result, error) {
 		}
 
 		for _, layer := range []string{LayerL1, LayerL2} {
-			assignments, warnings, err := renderLayer(rev, layer, bound, in.Overrides)
+			assignments, err := renderLayer(rev, layer, bound, in.Overrides)
 			if err != nil {
 				return Result{}, err
 			}
 			res.Assignments = append(res.Assignments, assignments...)
-			res.Warnings = append(res.Warnings, warnings...)
 		}
 	}
-	res.Warnings = cov.finish(res.Warnings)
+	if err := cov.finish(); err != nil {
+		return Result{}, err
+	}
 
 	sort.SliceStable(res.Assignments, func(i, j int) bool {
 		if res.Assignments[i].Layer != res.Assignments[j].Layer {
@@ -167,21 +172,21 @@ func Render(in Input) (Result, error) {
 // that outlives the edit which disabled the layer, and an override names the
 // person on duty until its own valid_to whatever the rotation is doing.
 func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interval,
-	overrides []scheduleconfig.OverrideRevision) ([]Assignment, []Warning, error) {
+	overrides []scheduleconfig.OverrideRevision) ([]Assignment, error) {
 
 	state, err := resolveLayer(rev, layer)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	layerOverrides := overridesOfLayer(overrides, layer)
 	if !state.active && len(layerOverrides) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	slots := state.grid.SlotsOverlapping(bound.Start, bound.End)
 	if len(slots) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	// PositionAt walks the grid from the phase anchor, which can be years
@@ -193,14 +198,11 @@ func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interv
 	if state.active {
 		position, _, err = rotation.PositionAt(state.grid, state.snapshot, slots[0].Start)
 		if err != nil {
-			return nil, nil, layerError(rev, layer, err)
+			return nil, layerError(rev, layer, err)
 		}
 	}
 
-	var (
-		out      []Assignment
-		warnings []Warning
-	)
+	var out []Assignment
 	for _, slot := range slots {
 		in := slotInput{
 			RevisionID: rev.ID,
@@ -214,11 +216,13 @@ func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interv
 			position = state.nextPosition(position)
 		}
 
-		slotAssignments, slotWarnings := renderSlot(in)
+		slotAssignments, err := renderSlot(in)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, slotAssignments...)
-		warnings = append(warnings, slotWarnings...)
 	}
-	return out, warnings, nil
+	return out, nil
 }
 
 // coverage walks the revision chain and reports where it fails to tile the
@@ -251,19 +255,19 @@ type coverage struct {
 // break the assumption every consumer makes. The EARLIER revision keeps the
 // disputed interval: an answer already given about the past must not change
 // because a later row has a wrong boundary.
-func (c *coverage) advance(revRange interval, rev scheduleconfig.ScheduleRevision, warnings []Warning) (interval, []Warning) {
+func (c *coverage) advance(revRange interval, rev scheduleconfig.ScheduleRevision) (interval, error) {
 	switch {
 	case revRange.Start.After(c.cursor):
-		warnings = c.appendGap(warnings, c.cursor, revRange.Start, rev.ID)
+		if err := c.gap(c.cursor, revRange.Start, rev.ID); err != nil {
+			return interval{}, err
+		}
 	case revRange.Start.Before(c.cursor):
 		if overlap := (interval{Start: revRange.Start, End: minTime(c.cursor, revRange.End)}).
 			intersect(c.query); !overlap.empty() {
-			warnings = append(warnings, Warning{
-				Code:       WarnRevisionOverlap,
-				From:       overlap.Start,
-				Until:      overlap.End,
-				RelatedIDs: relatedIDs(c.lastID, rev.ID),
-			})
+			return interval{}, fmt.Errorf("%w: schedule %s, revisions %s over %s..%s",
+				scheduleconfig.ErrRevisionOverlap, rev.ScheduleID,
+				strings.Join(relatedIDs(c.lastID, rev.ID), " and "),
+				overlap.Start.Format(time.RFC3339), overlap.End.Format(time.RFC3339))
 		}
 		revRange.Start = maxTime(revRange.Start, c.cursor)
 	}
@@ -279,25 +283,28 @@ func (c *coverage) advance(revRange interval, rev scheduleconfig.ScheduleRevisio
 		c.cursor = revRange.End
 		c.lastID = rev.ID
 	}
-	return revRange, warnings
+	return revRange, nil
 }
 
-// finish reports the stretch after the last revision.
-func (c *coverage) finish(warnings []Warning) []Warning {
-	return c.appendGap(warnings, c.cursor, c.query.End, "")
+// finish refuses the stretch after the last revision, if there is one.
+func (c *coverage) finish() error {
+	return c.gap(c.cursor, c.query.End, "")
 }
 
-func (c *coverage) appendGap(warnings []Warning, from, until time.Time, nextID string) []Warning {
+// gap refuses a stretch the chain fails to cover.
+//
+// It used to be a warning attached to a rendered calendar. A chain with a hole
+// in it is damage the write paths cannot produce, and drawing the rest of the
+// calendar around the hole answers a question about the past with something
+// that merely looks like an answer.
+func (c *coverage) gap(from, until time.Time, nextID string) error {
 	gap := interval{Start: from, End: until}.intersect(c.query)
 	if gap.empty() {
-		return warnings
+		return nil
 	}
-	return append(warnings, Warning{
-		Code:       WarnRevisionGap,
-		From:       gap.Start,
-		Until:      gap.End,
-		RelatedIDs: relatedIDs(c.lastID, nextID),
-	})
+	return fmt.Errorf("%w: %s..%s, between revisions %s",
+		ErrRevisionGap, gap.Start.Format(time.RFC3339), gap.End.Format(time.RFC3339),
+		strings.Join(relatedIDs(c.lastID, nextID), " and "))
 }
 
 // relatedIDs names the revisions on either side of a break, dropping the ends

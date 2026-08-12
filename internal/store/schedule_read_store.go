@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
@@ -83,14 +84,46 @@ func (v *scheduleReadView) ListScheduleRoots(ctx context.Context) ([]schedulecon
 // GetEffectiveRevision returns the revision whose half-open interval contains
 // `at`. The lower bound is part of the predicate on purpose: without it a
 // future revision would answer a query about the past.
+//
+// Two matching rows are refused rather than resolved. The exclusion constraint
+// forbids them, so this can only happen to a database somebody edited by hand
+// or restored badly - and then picking one of the two would mean the notifier
+// waking an arbitrary group and nobody ever learning. The row limit is 2
+// because the answer is the same whether there are two or two hundred.
 func (v *scheduleReadView) GetEffectiveRevision(ctx context.Context, scheduleID string, at time.Time) (*scheduleconfig.ScheduleRevision, error) {
-	return scanScheduleRevisionRow(v.q.QueryRowContext(ctx,
+	rows, err := v.q.QueryContext(ctx,
 		`SELECT `+scheduleRevisionColumns+`
 		 FROM schedule_revisions
 		 WHERE schedule_id = $1
 		   AND effective_from <= $2
-		   AND (effective_to IS NULL OR effective_to > $2)`,
-		scheduleID, scheduleconfig.NormalizeTimestamp(at)))
+		   AND (effective_to IS NULL OR effective_to > $2)
+		 LIMIT 2`,
+		scheduleID, scheduleconfig.NormalizeTimestamp(at))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return nil, scheduleconfig.ErrRevisionNotFound
+	}
+	first, err := scanScheduleRevision(rows)
+	if err != nil {
+		return nil, err
+	}
+	if rows.Next() {
+		second, err := scanScheduleRevision(rows)
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: schedule %s has revisions %s and %s both in force at %s",
+			scheduleconfig.ErrRevisionOverlap, scheduleID, first.ID, second.ID,
+			at.Format(time.RFC3339))
+	}
+	return first, rows.Err()
 }
 
 // GetRevisionsInRange returns every revision overlapping [from, until).
@@ -124,8 +157,8 @@ func (v *scheduleReadView) GetRevisionsInRange(ctx context.Context, scheduleID s
 	return out, rows.Err()
 }
 
-func (v *scheduleReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]scheduleconfig.OverrideRevision, error) {
-	return getOverrideProjection(ctx, v.q, scheduleID, from, until, asOf)
+func (v *scheduleReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until *time.Time) ([]scheduleconfig.OverrideRevision, error) {
+	return getOverrideProjection(ctx, v.q, scheduleID, from, until)
 }
 
 // GetRevisionByID scopes the lookup by schedule as well as by revision. A

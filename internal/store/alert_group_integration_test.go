@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 func TestAlertGroupLifecycle(t *testing.T) {

@@ -1,6 +1,7 @@
 package schedulerender
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -16,7 +17,11 @@ func onCallAt(t *testing.T, rev scheduleconfig.ScheduleRevision, at time.Time,
 	if err != nil {
 		t.Fatalf("onCallSlots at %v: %v", at, err)
 	}
-	return projectOnCall(rev, at, slots, overrides)
+	out, err := projectOnCall(rev, at, slots, overrides)
+	if err != nil {
+		t.Fatalf("projectOnCall at %v: %v", at, err)
+	}
+	return out
 }
 
 // TestOnCallBoundariesAroundOverride is the reason the projection shares its
@@ -141,9 +146,11 @@ func TestOnCallOnDisabledLayerWithOverride(t *testing.T) {
 	}
 }
 
-// TestOnCallSurfacesOverlapWarning: a collision is no less wrong for being
-// seen through the current view.
-func TestOnCallSurfacesOverlapWarning(t *testing.T) {
+// TestOnCallRefusesOverlappingOverrides: a collision is no less wrong for
+// being seen through the current view - and the current view is the one that
+// decides who gets woken, so answering with either of the two is worse here
+// than anywhere else.
+func TestOnCallRefusesOverlappingOverrides(t *testing.T) {
 	start := utc(2026, 5, 1, 11, 0)
 	revs := chain(t, revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))})
 
@@ -152,12 +159,13 @@ func TestOnCallSurfacesOverlapWarning(t *testing.T) {
 		override("ovr-b", LayerL1, "dave", utc(2026, 5, 1, 15, 0), utc(2026, 5, 1, 19, 0), start.Add(time.Hour)),
 	}
 
-	got := onCallAt(t, revs[0], utc(2026, 5, 1, 16, 0), overrides)
-	if len(got.Warnings) == 0 || got.Warnings[0].Code != WarnOverrideOverlap {
-		t.Fatalf("warnings = %v, want override_overlap", got.Warnings)
+	slots, err := onCallSlots(revs[0], utc(2026, 5, 1, 16, 0))
+	if err != nil {
+		t.Fatalf("onCallSlots: %v", err)
 	}
-	if got.L1 == nil || got.L1.OverrideID != "ovr-b" {
-		t.Fatalf("winner = %v, want the later recorded override", got.L1)
+	_, err = projectOnCall(revs[0], utc(2026, 5, 1, 16, 0), slots, overrides)
+	if !errors.Is(err, scheduleconfig.ErrOverrideCollision) {
+		t.Fatalf("error = %v, want ErrOverrideCollision", err)
 	}
 }
 

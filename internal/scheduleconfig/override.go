@@ -183,40 +183,15 @@ func (s *Service) lockForOverride(ctx context.Context, tx ScheduleConfigTx, sche
 	if locked.DeletedAt != nil {
 		return nil, time.Time{}, ErrScheduleDeleted
 	}
-	recordedAt, err := s.nextOverrideRecordedAt(ctx, tx, scheduleID, s.now().UTC())
-	if err != nil {
-		return nil, time.Time{}, err
-	}
-	return locked, recordedAt, nil
+	// Plain wall clock, normalized to what the database stores. The value is
+	// audit only: which revision of an override is its head is decided by the
+	// chain, not by comparing recorded_at. It used to be forced monotonic
+	// against a MAX(recorded_at) query on every command - one extra round trip
+	// per override write - so that as-of reads could resolve a head by time.
+	// As-of reads are gone.
+	return locked, NormalizeTimestamp(s.now().UTC()), nil
 }
 
-// nextOverrideRecordedAt is the monotonicity rule for override system time:
-//
-//	max(now, max(recorded_at of every override revision) + 1 resolution unit)
-//
-// It is the same shape as NextEffectiveAt and for the same reason. As-of
-// queries resolve an override by recorded_at, so two revisions sharing an
-// instant - a clock stepping back, or two commands inside one microsecond -
-// would make "what did we know then" ambiguous.
-//
-// It is computed here rather than inside the insert statement so that it sits
-// next to the injected clock and can be tested with the clock wound backwards.
-func (s *Service) nextOverrideRecordedAt(ctx context.Context, tx ScheduleConfigTx,
-	scheduleID string, now time.Time) (time.Time, error) {
-
-	candidate := NormalizeTimestamp(now)
-	max, err := tx.MaxOverrideRecordedAt(ctx, scheduleID)
-	if err != nil {
-		return time.Time{}, err
-	}
-	if max != nil {
-		floor := NormalizeTimestamp(*max).Add(TimestampResolution)
-		if candidate.Before(floor) {
-			candidate = floor
-		}
-	}
-	return candidate, nil
-}
 
 // liveOverrideHead resolves the override an update or a delete names and
 // checks the caller is not working from a stale version.
@@ -278,7 +253,7 @@ func (s *Service) validateOverrideTarget(ctx context.Context, view ScheduleReadV
 func (s *Service) checkOverrideOverlap(ctx context.Context, view ScheduleReadView,
 	rev *OverrideRevision, excludeOverrideID string) error {
 
-	existing, err := view.GetOverrideProjectionInRange(ctx, rev.ScheduleID, &rev.ValidFrom, &rev.ValidTo, nil)
+	existing, err := view.GetOverrideProjectionInRange(ctx, rev.ScheduleID, &rev.ValidFrom, &rev.ValidTo)
 	if err != nil {
 		return err
 	}

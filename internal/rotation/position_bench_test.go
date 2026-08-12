@@ -25,7 +25,7 @@ func BenchmarkPositionAt(b *testing.B) {
 		name   string
 		policy RotationPolicy
 	}{
-		{"daily", RotationPolicy{SchemaVersion: PolicySchemaVersion, Cadence: model.RotationDaily, HandoffTime: "11:00"}},
+		{"daily", RotationPolicy{Cadence: model.RotationDaily, HandoffTime: "11:00"}},
 		{"weekly", weeklyBenchPolicy()},
 	}
 	ages := []struct {
@@ -70,7 +70,6 @@ func BenchmarkPositionAt(b *testing.B) {
 func weeklyBenchPolicy() RotationPolicy {
 	monday := 1
 	return RotationPolicy{
-		SchemaVersion: PolicySchemaVersion,
 		Cadence:       model.RotationWeekly,
 		HandoffTime:   "11:00",
 		HandoffDay:    &monday,

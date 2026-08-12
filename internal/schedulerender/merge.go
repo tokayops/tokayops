@@ -4,12 +4,15 @@ import "time"
 
 // Shift is a run of adjacent assignments presented as one natural shift.
 //
-// It is a distinct type from Assignment on purpose. A merged run spans
-// several grid slots, so its grid boundaries no longer describe a single
-// handoff interval; giving it the same shape as an atomic assignment would
-// invite a caller to read them as one. SlotCount says how many slots are
-// underneath, and the current on-call projection never goes through this path
-// at all - it finds its own slot.
+// It is a distinct type from Assignment on purpose: a merged run spans several
+// grid slots, so its grid boundaries would no longer describe a single handoff
+// interval, and giving it the same shape as an atomic assignment would invite
+// a caller to read them as one.
+//
+// So it does not carry them. It used to expose GridSlotStart/End, SlotCount
+// and RevisionIDs - provenance that reached the calendar DTO and was read by
+// nobody. Where grid boundaries do matter, they come from LayerOnCall, which
+// describes ONE slot and is what the notifier and the editor read.
 type Shift struct {
 	Layer   string
 	Source  string
@@ -18,20 +21,6 @@ type Shift struct {
 
 	Start time.Time
 	End   time.Time
-
-	// GridSlotStart and GridSlotEnd are the first and last slot boundaries of
-	// the run, not one slot.
-	GridSlotStart time.Time
-	GridSlotEnd   time.Time
-
-	// SlotCount counts DISTINCT grid slots, not the assignments merged: a
-	// metadata-only save splits one slot into two assignments without adding
-	// a slot.
-	SlotCount int
-
-	// RevisionIDs are the revisions that contributed, in order, without
-	// repeats.
-	RevisionIDs []string
 
 	OverrideID         string
 	OverrideRevisionID string
@@ -68,8 +57,7 @@ func MergeAdjacent(assignments []Assignment) []Shift {
 // expose: which grid slot the last assignment came from, so that repeated
 // pieces of one slot do not inflate SlotCount.
 type shiftBuilder struct {
-	shift         Shift
-	lastSlotStart time.Time
+	shift Shift
 }
 
 func newShiftBuilder(a Assignment) *shiftBuilder {
@@ -81,14 +69,9 @@ func newShiftBuilder(a Assignment) *shiftBuilder {
 			UserIDs:            append([]string(nil), a.UserIDs...),
 			Start:              a.AssignmentStart,
 			End:                a.AssignmentEnd,
-			GridSlotStart:      a.GridSlotStart,
-			GridSlotEnd:        a.GridSlotEnd,
-			SlotCount:          1,
-			RevisionIDs:        []string{a.ScheduleRevisionID},
 			OverrideID:         a.OverrideID,
 			OverrideRevisionID: a.OverrideRevisionID,
 		},
-		lastSlotStart: a.GridSlotStart,
 	}
 }
 
@@ -108,23 +91,6 @@ func (b *shiftBuilder) canExtend(a Assignment) bool {
 
 func (b *shiftBuilder) extend(a Assignment) {
 	b.shift.End = a.AssignmentEnd
-	if !a.GridSlotStart.Equal(b.lastSlotStart) {
-		b.shift.SlotCount++
-		b.lastSlotStart = a.GridSlotStart
-	}
-	if a.GridSlotEnd.After(b.shift.GridSlotEnd) {
-		b.shift.GridSlotEnd = a.GridSlotEnd
-	}
-	b.shift.RevisionIDs = appendDistinct(b.shift.RevisionIDs, a.ScheduleRevisionID)
-}
-
-func appendDistinct(ids []string, id string) []string {
-	for _, existing := range ids {
-		if existing == id {
-			return ids
-		}
-	}
-	return append(ids, id)
 }
 
 // sameShift compares two shifts by what they mean rather than by where they
@@ -148,10 +114,7 @@ func sameShift(a, b Shift) bool {
 		a.OverrideRevisionID == b.OverrideRevisionID &&
 		equalIDs(a.UserIDs, b.UserIDs) &&
 		a.Start.Equal(b.Start) &&
-		a.End.Equal(b.End) &&
-		a.GridSlotStart.Equal(b.GridSlotStart) &&
-		a.GridSlotEnd.Equal(b.GridSlotEnd) &&
-		a.SlotCount == b.SlotCount
+		a.End.Equal(b.End)
 }
 
 // sameShifts is sameShift over two sequences.

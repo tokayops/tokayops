@@ -218,7 +218,7 @@ func loadPreviewBase(ctx context.Context, view scheduleconfig.ScheduleReadView, 
 	// them: a window without them would promise the rotation is on duty during
 	// a stand-in someone already arranged.
 	if base.overrides, err = view.GetOverrideProjectionInRange(ctx, root.ID,
-		&evaluatedAt, &windowUntil, nil); err != nil {
+		&evaluatedAt, &windowUntil); err != nil {
 		return previewBase{}, err
 	}
 	return base, nil

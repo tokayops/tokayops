@@ -48,6 +48,13 @@ const (
 	// supposed to cover.
 	FailureRevisionGap ProjectionFailureReason = "revision_gap"
 
+	// FailureRevisionOverlap - two revisions are in force at one instant.
+	FailureRevisionOverlap ProjectionFailureReason = "revision_overlap"
+
+	// FailureOverrideCollision - two live overrides of one layer cover one
+	// instant in stored data.
+	FailureOverrideCollision ProjectionFailureReason = "override_collision"
+
 	// FailureHistoryMarkerMissing - a revision-managed root has no history
 	// horizon.
 	FailureHistoryMarkerMissing ProjectionFailureReason = "history_complete_missing"
@@ -167,6 +174,14 @@ func failureReason(err error) (ProjectionFailureReason, bool) {
 		return FailureRevisionMetadata, true
 	case errors.Is(err, ErrRevisionGap):
 		return FailureRevisionGap, true
+	// Both are damage to ONE schedule, so they belong here rather than failing
+	// the tick: without these two cases a corrupt row would take the whole
+	// projection down with it, which is the defect the bulk contract exists
+	// to prevent.
+	case errors.Is(err, scheduleconfig.ErrRevisionOverlap):
+		return FailureRevisionOverlap, true
+	case errors.Is(err, scheduleconfig.ErrOverrideCollision):
+		return FailureOverrideCollision, true
 	case errors.Is(err, ErrHistoryMarkerMissing):
 		return FailureHistoryMarkerMissing, true
 	case errors.Is(err, ErrRotation):

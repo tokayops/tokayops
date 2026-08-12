@@ -1308,7 +1308,6 @@ const Components = {
                         <span class="on-call-l2-name">${escapeHtml(Components.onCallNames(l2, names))}</span>
                     </div>
                 ` : ''}
-                ${Components.scheduleWarnings(onCall?.warnings)}
                 <div class="on-call-actions">
                     ${Permissions.can('manage_schedule', { teamId: teamId }) ? `
                     <button class="btn btn-sm btn-secondary edit-schedule-btn" data-team-id="${escapeAttr(teamId)}">
@@ -1568,32 +1567,15 @@ const Components = {
                             : 'Part of this range predates the recorded history and is not shown.',
                     });
                     break;
-                case 'revision_gap':
-                    banners.push({
-                        level: 'warning',
-                        icon: 'alert-triangle',
-                        text: `No configuration is recorded for ${when(warning.from)} to ${when(warning.until)}. Nobody is shown on duty there, and that is a hole in the record rather than a quiet period.`,
-                    });
-                    break;
-                case 'revision_overlap':
-                    banners.push({
-                        level: 'warning',
-                        icon: 'alert-triangle',
-                        text: 'Two configurations claim the same period. The earlier one is shown; this needs looking into.',
-                    });
-                    break;
+                // revision_gap, revision_overlap and override_collision are
+                // not warnings any more: the server refuses to render damaged
+                // data rather than drawing a calendar around it, so they
+                // arrive as an error, not as a banner over a plausible answer.
                 case 'schedule_inactive':
                     banners.push({
                         level: 'info',
                         icon: 'pause-circle',
                         text: `The schedule was not active from ${when(warning.from)} to ${when(warning.until)}.`,
-                    });
-                    break;
-                case 'override_overlap':
-                    banners.push({
-                        level: 'warning',
-                        icon: 'users',
-                        text: 'Overrides overlap. One of them is in force; the others are being ignored.',
                     });
                     break;
                 default:

@@ -148,18 +148,11 @@ func (a *API) PutScheduleConfig(c echo.Context) error {
 		Created:    res.Created,
 		Recreated:  res.Recreated,
 	}
-	// Rendered AFTER the commit and at the new revision's effective instant,
-	// not at "now": a handoff can fall between the commit and this line, and
-	// answering with the group that took over would misreport what the save
-	// did. The chain is immutable, so this read is deterministic - only a
-	// concurrent override can change it, which is honest.
-	if a.scheduleRenderer != nil {
-		onCall, err := a.scheduleRenderer.CurrentOnCall(ctx, res.Revision.ScheduleID, res.EffectiveAt)
-		if err != nil {
-			return a.mapScheduleError(c, err)
-		}
-		out.OnCallAfter = onCallDTO(onCall)
-	}
+	// Nothing is read back here. A save that committed has succeeded, and a
+	// second read after the commit could only fail - which used to answer 500
+	// for a command that had already been applied. Who is on duty now is a
+	// different question, asked by a different request that is allowed to fail
+	// on its own.
 	return c.JSON(http.StatusOK, out)
 }
 

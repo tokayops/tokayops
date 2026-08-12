@@ -21,9 +21,6 @@ func TestMergeProducesNaturalShifts(t *testing.T) {
 		t.Fatalf("got %d shifts over three weeks, want 3", len(shifts))
 	}
 	for i, s := range shifts {
-		if s.SlotCount != 1 {
-			t.Fatalf("shift %d covers %d slots, want 1", i, s.SlotCount)
-		}
 		if s.End.Sub(s.Start) != 7*24*time.Hour {
 			t.Fatalf("shift %d lasts %v, want a week", i, s.End.Sub(s.Start))
 		}
@@ -33,25 +30,24 @@ func TestMergeProducesNaturalShifts(t *testing.T) {
 	}
 }
 
-// TestMergeCountsDistinctSlots: a group serving two slots in a row merges
-// into one shift spanning two slots, and SlotCount says two.
-func TestMergeCountsDistinctSlots(t *testing.T) {
+// A group serving several slots in a row is one continuous shift, spanning
+// them all. How many slots are underneath is not part of the answer: a shift
+// is a run of duty, and the grid that produced it is a separate question with
+// a separate type.
+func TestMergeJoinsConsecutiveSlotsIntoOneRun(t *testing.T) {
 	start := utc(2026, 5, 1, 11, 0)
 	// A single group serves every slot, so the whole range is one shift.
 	revs := chain(t, revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))})
 
-	res := renderOf(t, Input{Root: root(start), Revisions: revs, From: start, Until: utc(2026, 5, 4, 11, 0)})
+	until := utc(2026, 5, 4, 11, 0)
+	res := renderOf(t, Input{Root: root(start), Revisions: revs, From: start, Until: until})
 	shifts := MergeAdjacent(assignmentsOf(res, LayerL1))
 
 	if len(shifts) != 1 {
 		t.Fatalf("got %d shifts, want 1 continuous run", len(shifts))
 	}
-	if shifts[0].SlotCount != 3 {
-		t.Fatalf("SlotCount = %d, want 3 daily slots", shifts[0].SlotCount)
-	}
-	if !shifts[0].GridSlotStart.Equal(start) || !shifts[0].GridSlotEnd.Equal(utc(2026, 5, 4, 11, 0)) {
-		t.Fatalf("grid span = %v..%v, want first and last slot boundary",
-			shifts[0].GridSlotStart, shifts[0].GridSlotEnd)
+	if !shifts[0].Start.Equal(start) || !shifts[0].End.Equal(until) {
+		t.Fatalf("run = %v..%v, want the whole range", shifts[0].Start, shifts[0].End)
 	}
 }
 
@@ -210,18 +206,6 @@ func TestMetadataOnlySaveMidSlotSplitsAtomicAssignments(t *testing.T) {
 	}
 
 	shifts := MergeAdjacent(assignmentsOf(saved, LayerL1))
-	var spanning int
-	for _, s := range shifts {
-		if len(s.RevisionIDs) > 1 {
-			spanning++
-			if s.SlotCount != 1 {
-				t.Fatalf("the split shift covers %d slots, want 1", s.SlotCount)
-			}
-		}
-	}
-	if spanning != 1 {
-		t.Fatalf("%d shifts record both revisions, want exactly the one the save fell in", spanning)
-	}
 	if !sameShifts(shifts, MergeAdjacent(assignmentsOf(unchanged, LayerL1))) {
 		t.Fatal("the split survived the merge")
 	}
