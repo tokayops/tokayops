@@ -8,19 +8,20 @@ import (
 )
 
 // goldenSnapshotJSON is the frozen persistence contract for schema version 1.
-// Changing it after merge requires a schema_version bump.
+// Changing it after merge requires a snapshot schema_version bump - the
+// top-level one; the policy no longer carries a version of its own.
 const goldenSnapshotJSON = `{"schema_version":1,"timezone":"Europe/Moscow","slack_usergroup_id":"S0123",` +
-	`"l1":{"enabled":true,"policy":{"schema_version":1,"cadence":"daily","handoff_time":"11:00","handoff_day":null},` +
+	`"l1":{"enabled":true,"policy":{"cadence":"daily","handoff_time":"11:00","handoff_day":null},` +
 	`"groups":[{"id":"0c8f8f5e-4bda-4a44-9b8e-7f4a1f6de111","members":["alice"]},` +
 	`{"id":"1d9f8f5e-4bda-4a44-9b8e-7f4a1f6de222","members":["bob","dave"]}],` +
 	`"phase_anchor_slot_start":"2026-08-07T08:00:00Z","start_position":1},` +
-	`"l2":{"enabled":false,"policy":{"schema_version":1,"cadence":"weekly","handoff_time":"11:00","handoff_day":1},` +
+	`"l2":{"enabled":false,"policy":{"cadence":"weekly","handoff_time":"11:00","handoff_day":1},` +
 	`"groups":[],"phase_anchor_slot_start":null,"start_position":null},` +
 	`"l2_escalation_timeout_mins":5}`
 
 func goldenSnapshot() ScheduleRevisionSnapshot {
 	return ScheduleRevisionSnapshot{
-		SchemaVersion:    1,
+		SchemaVersion:    SnapshotSchemaVersion,
 		Timezone:         "Europe/Moscow",
 		SlackUsergroupID: "S0123",
 		L1: RotationLayerSnapshot{
@@ -66,10 +67,10 @@ func TestSnapshotCodec_RoundTripByteStable(t *testing.T) {
 
 // Second golden: both layers active, weekly policies, non-UTC timezone.
 const goldenSnapshot2JSON = `{"schema_version":1,"timezone":"America/New_York","slack_usergroup_id":"",` +
-	`"l1":{"enabled":true,"policy":{"schema_version":1,"cadence":"weekly","handoff_time":"09:00","handoff_day":0},` +
+	`"l1":{"enabled":true,"policy":{"cadence":"weekly","handoff_time":"09:00","handoff_day":0},` +
 	`"groups":[{"id":"2e0f8f5e-4bda-4a44-9b8e-7f4a1f6de333","members":["carol","erik"]}],` +
 	`"phase_anchor_slot_start":"2026-08-02T13:00:00Z","start_position":0},` +
-	`"l2":{"enabled":true,"policy":{"schema_version":1,"cadence":"weekly","handoff_time":"09:00","handoff_day":0},` +
+	`"l2":{"enabled":true,"policy":{"cadence":"weekly","handoff_time":"09:00","handoff_day":0},` +
 	`"groups":[{"id":"xavier","members":["xavier"]},{"id":"yulia","members":["yulia"]}],` +
 	`"phase_anchor_slot_start":"2026-08-02T13:00:00Z","start_position":1},` +
 	`"l2_escalation_timeout_mins":30}`
@@ -77,7 +78,7 @@ const goldenSnapshot2JSON = `{"schema_version":1,"timezone":"America/New_York","
 func TestSnapshotCodec_RoundTripByteStable_ActiveL2(t *testing.T) {
 	// Sun 2026-08-02 09:00 America/New_York (EDT, UTC-4) = 13:00Z.
 	snap := ScheduleRevisionSnapshot{
-		SchemaVersion: 1,
+		SchemaVersion: SnapshotSchemaVersion,
 		Timezone:      "America/New_York",
 		L1: RotationLayerSnapshot{
 			Enabled: true,

@@ -12,14 +12,10 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// PolicySchemaVersion is the only supported RotationPolicy schema version.
-const PolicySchemaVersion = 1
-
 // RotationPolicy is the immutable per-layer rotation policy stored inside a
 // schedule revision snapshot. Timezone deliberately lives on the snapshot
 // top-level, not here: both layers of one revision share a single timezone.
 type RotationPolicy struct {
-	SchemaVersion int                `json:"schema_version"`
 	Cadence       model.RotationType `json:"cadence"`      // daily | weekly
 	HandoffTime   string             `json:"handoff_time"` // local, canonical "HH:MM"
 	HandoffDay    *int               `json:"handoff_day"`  // weekly: 0..6, 0=Sunday; daily: nil
@@ -49,9 +45,6 @@ func ParseHandoffTime(s string) (hour, minute int, err error) {
 // Validate checks the policy in its canonical form: daily policies carry a
 // nil handoff day (normalization converts before validation).
 func (p RotationPolicy) Validate() error {
-	if p.SchemaVersion != PolicySchemaVersion {
-		return fmt.Errorf("rotation: unsupported policy schema_version %d", p.SchemaVersion)
-	}
 	if _, _, err := ParseHandoffTime(p.HandoffTime); err != nil {
 		return err
 	}
@@ -84,7 +77,7 @@ func (p RotationPolicy) clone() RotationPolicy {
 
 // equalPolicy compares policies semantically on their canonical forms.
 func equalPolicy(a, b RotationPolicy) bool {
-	if a.SchemaVersion != b.SchemaVersion || a.Cadence != b.Cadence || a.HandoffTime != b.HandoffTime {
+	if a.Cadence != b.Cadence || a.HandoffTime != b.HandoffTime {
 		return false
 	}
 	switch {

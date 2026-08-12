@@ -213,23 +213,6 @@ func (t *scheduleConfigTx) SetScheduleDeleted(ctx context.Context, scheduleID st
 	return requireOneRow(res, scheduleconfig.ErrScheduleNotFound)
 }
 
-// MaxOverrideRecordedAt is the newest recorded_at across every override
-// revision of a schedule, tombstones included. Nil means the schedule has no
-// override history at all.
-func (t *scheduleConfigTx) MaxOverrideRecordedAt(ctx context.Context, scheduleID string) (*time.Time, error) {
-	var max sql.NullTime
-	err := t.tx.QueryRowContext(ctx,
-		`SELECT MAX(recorded_at) FROM schedule_override_revisions WHERE schedule_id = $1`,
-		scheduleID).Scan(&max)
-	if err != nil {
-		return nil, err
-	}
-	if !max.Valid {
-		return nil, nil
-	}
-	v := scheduleconfig.NormalizeTimestamp(max.Time)
-	return &v, nil
-}
 
 // LockUsers takes a shared row lock on the named users, in ID order.
 //

@@ -21,7 +21,6 @@ const (
 func validConfig() rotation.ScheduleConfiguration {
 	monday := 1
 	weekly := rotation.RotationPolicy{
-		SchemaVersion: rotation.PolicySchemaVersion,
 		Cadence:       model.RotationWeekly,
 		HandoffTime:   "11:00",
 		HandoffDay:    &monday,
@@ -70,7 +69,7 @@ func TestCreateScheduleWritesRootAndFirstRevisionTogether(t *testing.T) {
 	now := time.Date(2026, 5, 4, 8, 30, 0, 123456789, time.UTC)
 	svc, repo := newService(t, now)
 
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
+	rev, err := createViaSave(context.Background(), svc, "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -109,15 +108,28 @@ func TestCreateScheduleWritesRootAndFirstRevisionTogether(t *testing.T) {
 	}
 }
 
-func TestCreateScheduleSecondCreateForSameTeamConflicts(t *testing.T) {
+// A second create attempt is a version conflict, not "already exists".
+//
+// Service.CreateSchedule used to answer ErrScheduleExists here, which is what
+// a programmatic caller wanted. It is gone, and Save is the only entrance: a
+// caller that says expected_version 0 about a team that already has a
+// schedule is holding a stale form, and the conflict carries the current
+// version so the editor can reload. ErrScheduleExists still exists for what
+// only it can mean - two creates racing for the same team, decided by the
+// unique constraint.
+func TestSecondCreateForSameTeamIsAVersionConflict(t *testing.T) {
 	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
 
-	if _, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil); err != nil {
+	if _, err := createViaSave(context.Background(), svc, "devops", validConfig(), "actor", nil); err != nil {
 		t.Fatalf("first CreateSchedule: %v", err)
 	}
-	_, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
-	if !errors.Is(err, scheduleconfig.ErrScheduleExists) {
-		t.Fatalf("second CreateSchedule error = %v, want ErrScheduleExists", err)
+	_, err := createViaSave(context.Background(), svc, "devops", validConfig(), "actor", nil)
+	var conflict *scheduleconfig.VersionConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("second create error = %v, want a version conflict", err)
+	}
+	if conflict.Current != 1 {
+		t.Fatalf("conflict reports current version %d, want 1", conflict.Current)
 	}
 	if got := repo.RootCount(); got != 1 {
 		t.Fatalf("got %d schedule roots, want 1", got)
@@ -134,7 +146,7 @@ func TestCreateScheduleRollsBackEveryStep(t *testing.T) {
 			svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
 			repo.FailOn[step] = boom
 
-			rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
+			rev, err := createViaSave(context.Background(), svc, "devops", validConfig(), "actor", nil)
 			if !errors.Is(err, boom) {
 				t.Fatalf("error = %v, want injected failure", err)
 			}
@@ -171,7 +183,7 @@ func TestCreateScheduleRejectsInvalidInputBeforeWriting(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
-			if _, err := svc.CreateSchedule(context.Background(), tc.teamID, tc.config, "actor", nil); err == nil {
+			if _, err := createViaSave(context.Background(), svc, tc.teamID, tc.config, "actor", nil); err == nil {
 				t.Fatal("expected an error")
 			}
 			if got := repo.RootCount(); got != 0 {
@@ -203,7 +215,7 @@ func TestCreateScheduleRejectsWhatTheDatabaseWouldReject(t *testing.T) {
 		return ""
 	}))
 
-	_, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
+	_, err := createViaSave(context.Background(), svc, "devops", validConfig(), "actor", nil)
 	if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
 		t.Fatalf("error = %v, want ErrInvariantViolation", err)
 	}
@@ -224,7 +236,7 @@ func TestCreateScheduleReturnsCanonicalSnapshot(t *testing.T) {
 
 	// The configuration leaves L2 disabled with no groups, which is exactly
 	// the nil slice persistence turns into [].
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
+	rev, err := createViaSave(context.Background(), svc, "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -259,7 +271,7 @@ func TestCreateScheduleReturnsCanonicalSnapshot(t *testing.T) {
 func TestFakeStoresSnapshotsByValue(t *testing.T) {
 	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
 
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
+	rev, err := createViaSave(context.Background(), svc, "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -305,7 +317,7 @@ func TestFakeStoresSnapshotsByValue(t *testing.T) {
 
 func TestFakeRollbackRestoresDeepState(t *testing.T) {
 	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
+	rev, err := createViaSave(context.Background(), svc, "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -331,7 +343,7 @@ func TestFakeRollbackRestoresDeepState(t *testing.T) {
 // revision that preceded a delete.
 func TestFakeCurrentOverridesDoNotResurrectDeleted(t *testing.T) {
 	svc, repo := newService(t, time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC))
-	rev, err := svc.CreateSchedule(context.Background(), "devops", validConfig(), "actor", nil)
+	rev, err := createViaSave(context.Background(), svc, "devops", validConfig(), "actor", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -364,7 +376,7 @@ func TestFakeCurrentOverridesDoNotResurrectDeleted(t *testing.T) {
 	var current []scheduleconfig.OverrideRevision
 	err = repo.WithinTx(context.Background(), func(tx scheduleconfig.ScheduleConfigTx) error {
 		var err error
-		current, err = tx.GetOverrideProjectionInRange(context.Background(), scheduleID, nil, nil, nil)
+		current, err = tx.GetOverrideProjectionInRange(context.Background(), scheduleID, nil, nil)
 		return err
 	})
 	if err != nil {
@@ -412,4 +424,19 @@ func TestFakeRollbackRestoresTeamState(t *testing.T) {
 	}); !errors.Is(err, scheduleconfig.ErrTeamHasIntegrations) {
 		t.Errorf("the untouched integration state was lost on rollback: %v", err)
 	}
+}
+
+// createViaSave is how production creates a schedule: Save with
+// expected_version 0. Service.CreateSchedule used to be a second entrance to
+// the same code - called by nothing but tests - and is gone.
+func createViaSave(ctx context.Context, svc *scheduleconfig.Service, teamID string,
+	cfg rotation.ScheduleConfiguration, actorID string, reason *string) (*scheduleconfig.ScheduleRevision, error) {
+
+	res, err := svc.Save(ctx, teamID, scheduleconfig.SaveCommand{
+		Desired: cfg, ActorID: actorID, Reason: reason,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.Revision, nil
 }

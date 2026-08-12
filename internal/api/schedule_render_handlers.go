@@ -57,7 +57,7 @@ func (a *API) RenderSchedule(c echo.Context) error {
 		return a.mapScheduleError(c, err)
 	}
 
-	res, err := a.scheduleRenderer.RenderRange(ctx, scheduleID, from, until, nil)
+	res, err := a.scheduleRenderer.RenderRange(ctx, scheduleID, from, until)
 	if err != nil {
 		return a.mapScheduleError(c, err)
 	}

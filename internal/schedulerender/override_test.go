@@ -183,8 +183,13 @@ func TestOverrideCrossesRevisionBoundary(t *testing.T) {
 	if len(shifts) != 1 {
 		t.Fatalf("merged into %d shifts, want 1", len(shifts))
 	}
-	if len(shifts[0].RevisionIDs) != 2 {
-		t.Fatalf("merged shift records %v, want both revisions", shifts[0].RevisionIDs)
+	// Which revisions contributed is no longer part of a shift: the point is
+	// that the override reads as one unbroken stretch of duty across the edit,
+	// and the atomic pieces above already proved it spans two revisions.
+	if !shifts[0].Start.Equal(pieces[0].AssignmentStart) ||
+		!shifts[0].End.Equal(pieces[len(pieces)-1].AssignmentEnd) {
+		t.Fatalf("merged shift = %v..%v, want the whole override",
+			shifts[0].Start, shifts[0].End)
 	}
 }
 

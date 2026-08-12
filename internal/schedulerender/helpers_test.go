@@ -26,7 +26,6 @@ func utc(year int, month time.Month, day, hour, minute int) time.Time {
 
 func dailyPolicy(handoff string) rotation.RotationPolicy {
 	return rotation.RotationPolicy{
-		SchemaVersion: rotation.PolicySchemaVersion,
 		Cadence:       model.RotationDaily,
 		HandoffTime:   handoff,
 	}
@@ -34,7 +33,6 @@ func dailyPolicy(handoff string) rotation.RotationPolicy {
 
 func weeklyPolicy(handoff string, day int) rotation.RotationPolicy {
 	return rotation.RotationPolicy{
-		SchemaVersion: rotation.PolicySchemaVersion,
 		Cadence:       model.RotationWeekly,
 		HandoffTime:   handoff,
 		HandoffDay:    &day,

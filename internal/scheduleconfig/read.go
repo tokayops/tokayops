@@ -68,10 +68,12 @@ type ScheduleReadView interface {
 	// override_id - not every revision of it - among those overlapping the
 	// range, ordered by valid_from then override_id.
 	//
-	// A nil bound means unbounded on that side. asOf nil means the current
+	// A nil bound means unbounded on that side. The projection is always the
+	// current one: what was known at an earlier system time is not a product
+	// capability, and the contract stopped promising it.
 	// state; a value means the state as it was recorded at that system time,
 	// which is what lets history be replayed as it was known then.
-	GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]OverrideRevision, error)
+	GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until *time.Time) ([]OverrideRevision, error)
 
 	// GetRevisionByID returns one revision of one schedule. The schedule ID is
 	// part of the lookup, not a convenience: a revision ID guessed from

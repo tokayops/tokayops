@@ -109,7 +109,7 @@ func TestLegacyScheduleResetIsNotRepeatable(t *testing.T) {
 	}
 
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
-	rev, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil)
+	rev, err := createViaSave(context.Background(), newTestScheduleService(s, start), "devops", revTestConfig(), "", nil)
 	if err != nil {
 		t.Fatalf("recreate schedule: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestLegacyScheduleResetRefusesWhenRevisionsExistWithoutMarker(t *testing.T)
 
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
 	seedTeam(t, s, "devops", "alice", "bob")
-	if _, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil); err != nil {
+	if _, err := createViaSave(context.Background(), newTestScheduleService(s, start), "devops", revTestConfig(), "", nil); err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
 

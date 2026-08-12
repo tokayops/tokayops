@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/engine"
@@ -22,7 +23,6 @@ import (
 	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/tokayops/tokayops/internal/testutil"
-	"github.com/labstack/echo/v4"
 )
 
 type IntegrationTestEnv struct {
@@ -64,7 +64,7 @@ func pipelineSchedule(t *testing.T, env *IntegrationTestEnv, teamID string,
 			t.Fatalf("AddTeamMember %s: %v", id, err)
 		}
 	}
-	rev, err := env.Schedules.CreateSchedule(context.Background(), teamID, cfg, "", nil)
+	rev, err := env.createViaSave(context.Background(), Schedules, teamID, cfg, "", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -75,7 +75,6 @@ func pipelineSchedule(t *testing.T, env *IntegrationTestEnv, teamID string,
 // group configured here is the one on duty for the rest of the test.
 func pipelineConfig(l1Groups []rotation.RotationGroup, l2User string) rotation.ScheduleConfiguration {
 	policy := rotation.RotationPolicy{
-		SchemaVersion: rotation.PolicySchemaVersion,
 		Cadence:       model.RotationDaily,
 		HandoffTime:   "00:00",
 	}

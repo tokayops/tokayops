@@ -342,11 +342,11 @@ func TestRenderNewShapeWithHistoryIncomplete(t *testing.T) {
 		t.Fatal("render returned no entries")
 	}
 	for _, entry := range out.Entries {
-		if entry.SlotCount < 1 || len(entry.RevisionIDs) == 0 {
-			t.Fatalf("entry must carry slot_count and revision_ids, got %+v", entry)
-		}
-		if entry.GridSlotStart.IsZero() || entry.Start.IsZero() {
-			t.Fatalf("entry must carry both pairs of boundaries, got %+v", entry)
+		// A shift is a run of duty: who, from when, until when. Grid
+		// boundaries and provenance are not part of it - the calendar never
+		// read them, and one slot's boundaries live on the on-call DTO.
+		if entry.Start.IsZero() || entry.End.IsZero() || len(entry.UserIDs) == 0 {
+			t.Fatalf("entry must say who is on duty and when, got %+v", entry)
 		}
 	}
 }

@@ -22,11 +22,11 @@ func intp(i int) *int { return &i }
 func timep(t time.Time) *time.Time { return &t }
 
 func dailyPolicy(hhmm string) RotationPolicy {
-	return RotationPolicy{SchemaVersion: 1, Cadence: model.RotationDaily, HandoffTime: hhmm}
+	return RotationPolicy{Cadence: model.RotationDaily, HandoffTime: hhmm}
 }
 
 func weeklyPolicy(hhmm string, day int) RotationPolicy {
-	return RotationPolicy{SchemaVersion: 1, Cadence: model.RotationWeekly, HandoffTime: hhmm, HandoffDay: intp(day)}
+	return RotationPolicy{Cadence: model.RotationWeekly, HandoffTime: hhmm, HandoffDay: intp(day)}
 }
 
 func mustGrid(t *testing.T, tz string, p RotationPolicy) Grid {
@@ -56,7 +56,7 @@ func inZone(t *testing.T, tz string, y int, m time.Month, d, hh, mm int) time.Ti
 // L2 disabled. Active group at 2026-08-04 12:00 UTC is gid[1] (bob).
 func baseSnapshot() ScheduleRevisionSnapshot {
 	return ScheduleRevisionSnapshot{
-		SchemaVersion:    1,
+		SchemaVersion:    SnapshotSchemaVersion,
 		Timezone:         "UTC",
 		SlackUsergroupID: "S0123",
 		L1: RotationLayerSnapshot{

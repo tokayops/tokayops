@@ -86,7 +86,6 @@ func (d ScheduleConfigDTO) toConfiguration() rotation.ScheduleConfiguration {
 		L1: rotation.LayerConfiguration{
 			Enabled: d.L1.Enabled,
 			Policy: rotation.RotationPolicy{
-				SchemaVersion: rotation.PolicySchemaVersion,
 				Cadence:       model.RotationType(d.L1.RotationType),
 				HandoffTime:   d.L1.HandoffTime,
 				HandoffDay:    d.L1.HandoffDay,
@@ -96,7 +95,6 @@ func (d ScheduleConfigDTO) toConfiguration() rotation.ScheduleConfiguration {
 		L2: rotation.LayerConfiguration{
 			Enabled: d.L2.Enabled,
 			Policy: rotation.RotationPolicy{
-				SchemaVersion: rotation.PolicySchemaVersion,
 				Cadence:       model.RotationType(d.L2.RotationType),
 				HandoffTime:   d.L2.HandoffTime,
 				HandoffDay:    d.L2.HandoffDay,
@@ -247,15 +245,11 @@ type ShiftDTO struct {
 	Start time.Time `json:"start"`
 	End   time.Time `json:"end"`
 
-	GridSlotStart time.Time `json:"grid_slot_start"`
-	GridSlotEnd   time.Time `json:"grid_slot_end"`
-
-	// SlotCount is how many grid slots this shift spans.
-	SlotCount int `json:"slot_count"`
-
-	// RevisionIDs is provenance: which revisions contributed, in order.
-	RevisionIDs []string `json:"revision_ids"`
-
+	// No grid boundaries, slot count or contributing revisions. A merged shift
+	// spans several slots, so those described nothing a caller could act on,
+	// and nothing read them. Where one slot's boundaries matter - the DM about
+	// a handoff, the editor showing that an assignment started mid-shift -
+	// they come from LayerOnCallDTO, which is about exactly one slot.
 	OverrideID         string `json:"override_id,omitempty"`
 	OverrideRevisionID string `json:"override_revision_id,omitempty"`
 }
@@ -270,10 +264,6 @@ func shiftDTOs(shifts []schedulerender.Shift) []ShiftDTO {
 			UserIDs:            s.UserIDs,
 			Start:              s.Start,
 			End:                s.End,
-			GridSlotStart:      s.GridSlotStart,
-			GridSlotEnd:        s.GridSlotEnd,
-			SlotCount:          s.SlotCount,
-			RevisionIDs:        s.RevisionIDs,
 			OverrideID:         s.OverrideID,
 			OverrideRevisionID: s.OverrideRevisionID,
 		}

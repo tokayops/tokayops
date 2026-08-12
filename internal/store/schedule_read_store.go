@@ -157,8 +157,8 @@ func (v *scheduleReadView) GetRevisionsInRange(ctx context.Context, scheduleID s
 	return out, rows.Err()
 }
 
-func (v *scheduleReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]scheduleconfig.OverrideRevision, error) {
-	return getOverrideProjection(ctx, v.q, scheduleID, from, until, asOf)
+func (v *scheduleReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until *time.Time) ([]scheduleconfig.OverrideRevision, error) {
+	return getOverrideProjection(ctx, v.q, scheduleID, from, until)
 }
 
 // GetRevisionByID scopes the lookup by schedule as well as by revision. A

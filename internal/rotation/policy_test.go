@@ -56,14 +56,12 @@ func TestRotationPolicyValidate(t *testing.T) {
 		{name: "daily ok", p: dailyPolicy("11:00")},
 		{name: "weekly ok", p: weeklyPolicy("11:00", 0)},
 		{name: "weekly saturday", p: weeklyPolicy("23:59", 6)},
-		{name: "bad schema version", p: RotationPolicy{SchemaVersion: 2, Cadence: model.RotationDaily, HandoffTime: "11:00"}, wantErr: true},
-		{name: "zero schema version", p: RotationPolicy{Cadence: model.RotationDaily, HandoffTime: "11:00"}, wantErr: true},
-		{name: "daily with handoff day", p: RotationPolicy{SchemaVersion: 1, Cadence: model.RotationDaily, HandoffTime: "11:00", HandoffDay: intp(1)}, wantErr: true},
-		{name: "weekly without day", p: RotationPolicy{SchemaVersion: 1, Cadence: model.RotationWeekly, HandoffTime: "11:00"}, wantErr: true},
+		{name: "daily with handoff day", p: RotationPolicy{Cadence: model.RotationDaily, HandoffTime: "11:00", HandoffDay: intp(1)}, wantErr: true},
+		{name: "weekly without day", p: RotationPolicy{Cadence: model.RotationWeekly, HandoffTime: "11:00"}, wantErr: true},
 		{name: "weekly day too big", p: weeklyPolicy("11:00", 7), wantErr: true},
 		{name: "weekly day negative", p: weeklyPolicy("11:00", -1), wantErr: true},
 		{name: "bad handoff time", p: dailyPolicy("9:00"), wantErr: true},
-		{name: "unknown cadence", p: RotationPolicy{SchemaVersion: 1, Cadence: "monthly", HandoffTime: "11:00"}, wantErr: true},
+		{name: "unknown cadence", p: RotationPolicy{Cadence: "monthly", HandoffTime: "11:00"}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

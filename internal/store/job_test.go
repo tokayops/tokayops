@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/testutil"
-	"github.com/google/uuid"
 )
 
 func TestUpdateJobStepIfOwned_Persistence(t *testing.T) {

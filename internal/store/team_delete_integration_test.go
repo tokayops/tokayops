@@ -96,7 +96,7 @@ func TestDeleteTeamWithScheduleHistoryIsTypedNotAConstraintError(t *testing.T) {
 
 	now := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
 	svc := newTestScheduleService(s, now)
-	if _, err := svc.CreateSchedule(context.Background(), "devops", revTestConfig(), "alice", nil); err != nil {
+	if _, err := createViaSave(context.Background(), svc, "devops", revTestConfig(), "alice", nil); err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
 
@@ -273,7 +273,7 @@ func TestCreateScheduleForATeamThatWasJustDeleted(t *testing.T) {
 		t.Fatalf("DeleteTeam: %v", err)
 	}
 
-	_, err := svc.CreateSchedule(context.Background(), "devops", revTestConfig(), "alice", nil)
+	_, err := createViaSave(context.Background(), svc, "devops", revTestConfig(), "alice", nil)
 	if !errors.Is(err, scheduleconfig.ErrUserNotTeamMember) &&
 		!errors.Is(err, scheduleconfig.ErrTeamNotFound) {
 		t.Fatalf("error = %v, want a typed refusal", err)
@@ -349,7 +349,7 @@ func TestChangeSummaryShowsMetadataSavesCarryThePhase(t *testing.T) {
 
 	now := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
 	svc := newTestScheduleService(s, now)
-	if _, err := svc.CreateSchedule(context.Background(), "devops", revTestConfig(), "alice", nil); err != nil {
+	if _, err := createViaSave(context.Background(), svc, "devops", revTestConfig(), "alice", nil); err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
 

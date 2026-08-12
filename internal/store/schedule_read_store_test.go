@@ -139,12 +139,12 @@ func TestOverrideProjectionAsOf(t *testing.T) {
 	insert(1, "alice", early, early.Add(4*time.Hour), recordedV1, false)
 	insert(2, "bob", late, late.Add(4*time.Hour), recordedV2, false)
 
-	project := func(from, until, asOf *time.Time) []scheduleconfig.OverrideRevision {
+	project := func(from, until *time.Time) []scheduleconfig.OverrideRevision {
 		t.Helper()
 		var out []scheduleconfig.OverrideRevision
 		err := withSnapshot(t, s, func(view scheduleconfig.ScheduleReadView) error {
 			var err error
-			out, err = view.GetOverrideProjectionInRange(context.Background(), rev.ScheduleID, from, until, asOf)
+			out, err = view.GetOverrideProjectionInRange(context.Background(), rev.ScheduleID, from, until)
 			return err
 		})
 		if err != nil {
@@ -153,39 +153,30 @@ func TestOverrideProjectionAsOf(t *testing.T) {
 		return out
 	}
 
-	// Unbounded and current: only the latest version exists.
-	if got := project(nil, nil, nil); len(got) != 1 || got[0].UserID != "bob" {
+	// Unbounded: only the latest version exists. The projection is always the
+	// current one - reading it "as of" an earlier system time was a contract
+	// with no product behind it and is gone.
+	if got := project(nil, nil); len(got) != 1 || got[0].UserID != "bob" {
 		t.Fatalf("current projection = %+v, want only v2", got)
-	}
-
-	// As of a moment between the two writes, v1 is the state of the world.
-	asOf := recordedV1.Add(30 * time.Minute)
-	if got := project(nil, nil, &asOf); len(got) != 1 || got[0].UserID != "alice" {
-		t.Fatalf("as-of projection = %+v, want v1", got)
 	}
 
 	// The early window no longer holds the override: the winning revision v2
 	// moved away from it. Returning v1 here would mean the range filter ran
 	// before the winner was chosen.
 	earlyEnd := early.Add(4 * time.Hour)
-	if got := project(&early, &earlyEnd, nil); len(got) != 0 {
+	if got := project(&early, &earlyEnd); len(got) != 0 {
 		t.Fatalf("early window projection = %+v, want nothing", got)
 	}
 	lateEnd := late.Add(4 * time.Hour)
-	if got := project(&late, &lateEnd, nil); len(got) != 1 || got[0].UserID != "bob" {
+	if got := project(&late, &lateEnd); len(got) != 1 || got[0].UserID != "bob" {
 		t.Fatalf("late window projection = %+v, want v2", got)
 	}
 
-	// A tombstone still wins the grouping and removes the override, and an
-	// as-of before it still sees the live version.
+	// A tombstone still wins the grouping and removes the override.
 	recordedV3 := start.Add(3 * time.Hour)
 	insert(3, "bob", late, late.Add(4*time.Hour), recordedV3, true)
-	if got := project(nil, nil, nil); len(got) != 0 {
+	if got := project(nil, nil); len(got) != 0 {
 		t.Fatalf("after the tombstone got %+v, want nothing", got)
-	}
-	beforeDelete := recordedV2.Add(30 * time.Minute)
-	if got := project(nil, nil, &beforeDelete); len(got) != 1 || got[0].UserID != "bob" {
-		t.Fatalf("as-of before the delete = %+v, want v2", got)
 	}
 }
 

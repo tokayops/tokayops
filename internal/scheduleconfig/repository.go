@@ -253,15 +253,6 @@ type ScheduleConfigTx interface {
 	// revision chain, never the other way round: the chain is the history.
 	SetScheduleDeleted(ctx context.Context, scheduleID string, deletedAt *time.Time) error
 
-	// MaxOverrideRecordedAt is the newest recorded_at across ALL override
-	// revisions of a schedule, tombstones included; nil when there are none.
-	//
-	// It is a read rather than SQL inside the insert so that the monotonicity
-	// rule lives next to the clock the service injects. Expressed in SQL it
-	// would have to be restated in the fake, and the two statements of one
-	// rule would be free to drift.
-	MaxOverrideRecordedAt(ctx context.Context, scheduleID string) (*time.Time, error)
-
 	// LockUsers takes a shared row lock on the named users, in ID order, and
 	// is the serialization point against erasure - not a source of data. It is
 	// taken BEFORE the schedule lock by every command, because erasure locks

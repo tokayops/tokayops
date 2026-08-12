@@ -337,55 +337,6 @@ func (s *Service) appendRevision(ctx context.Context, tx ScheduleConfigTx, targe
 		target.root.ConfigVersion, target.effectiveAt, actorID), nil
 }
 
-// CreateSchedule creates a schedule and its first revision in one transaction.
-//
-// It is the programmatic entry point - tests and tooling - while the editor
-// reaches the same code through Save. Both end in initialize, so there is
-// exactly one definition of what a freshly created schedule is.
-//
-// It does NOT delegate to Save. A caller that asks to create says nothing
-// about versions, so "the team already has a schedule" is the answer it needs;
-// Save reports the same fact as a version conflict carrying the current
-// version, which is what an editor holding a stale form needs. Deriving one
-// from the other would mean reading a version number back out of an error to
-// guess which situation it described.
-//
-// A concurrent create for the same team yields ErrScheduleExists too, from the
-// unique constraint on team_id.
-func (s *Service) CreateSchedule(ctx context.Context, teamID string,
-	config rotation.ScheduleConfiguration, actorID string, reason *string) (*ScheduleRevision, error) {
-
-	if teamID == "" {
-		return nil, invalidField("team_id", "is required")
-	}
-	desired, err := NormalizeConfiguration(config)
-	if err != nil {
-		return nil, err
-	}
-
-	var created *SaveResult
-	err = s.runCommand(ctx, func(tx ScheduleConfigTx) error {
-		if err := tx.LockUsers(ctx, commandUserIDs(actorID, ConfigurationUserIDs(desired)...)); err != nil {
-			return err
-		}
-		if err := requireActiveActor(ctx, tx, actorID); err != nil {
-			return err
-		}
-		switch _, err := tx.GetScheduleRootByTeam(ctx, teamID); {
-		case err == nil:
-			return ErrScheduleExists
-		case !errors.Is(err, ErrScheduleNotFound):
-			return err
-		}
-		created, err = s.initialize(ctx, tx, teamID, desired, actorID, reason)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	s.logCommit(created.commit)
-	return created.Revision, nil
-}
 
 // initialize writes the root, revision 1 and the creation event.
 func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID string,
@@ -534,10 +485,7 @@ func (s *Service) tombstoneLiveOverrides(ctx context.Context, tx ScheduleConfigT
 	if len(heads) == 0 {
 		return nil
 	}
-	recordedAt, err := s.nextOverrideRecordedAt(ctx, tx, scheduleID, at)
-	if err != nil {
-		return err
-	}
+	recordedAt := NormalizeTimestamp(at)
 	for _, head := range heads {
 		tombstone := head
 		tombstone.RevisionID = s.newID()

@@ -127,7 +127,7 @@ func mustCreateSchedule(t *testing.T, svc *scheduleconfig.Service, teamID string
 	cfg rotation.ScheduleConfiguration) *scheduleconfig.ScheduleRevision {
 
 	t.Helper()
-	res, err := svc.CreateSchedule(context.Background(), teamID, cfg, "", nil)
+	res, err := createViaSave(context.Background(), svc, teamID, cfg, "", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule %s: %v", teamID, err)
 	}

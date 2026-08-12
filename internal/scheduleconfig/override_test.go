@@ -110,27 +110,19 @@ func TestOverrideExpectedRevisionConflict(t *testing.T) {
 	}
 }
 
-// Two revisions of one override sharing an instant would make an as-of query
-// ambiguous, so recorded time is strictly increasing per schedule even when
-// the clock is not.
-func TestOverrideRecordedAtMonotonic(t *testing.T) {
+// recorded_at is audit only, and normalized to what the database stores.
+//
+// It used to be forced monotonic against a MAX(recorded_at) query on every
+// override command, so that as-of reads could resolve a head by time. As-of
+// reads are gone, the head is decided by the revision chain, and the query
+// went with them - one round trip less per write.
+func TestOverrideRecordedAtIsAtDatabaseResolution(t *testing.T) {
 	f := overrideFixture(t)
 	from := f.clock.at.Add(24 * time.Hour)
 
-	first := f.createOverride(t, "bob", from, from.Add(time.Hour))
-
-	// The clock steps backwards between the two commands.
-	f.clock.at = f.clock.at.Add(-time.Hour)
-	second := f.createOverride(t, "carol", from.Add(2*time.Hour), from.Add(3*time.Hour))
-
-	if !second.RecordedAt.After(first.RecordedAt) {
-		t.Fatalf("recorded_at %v does not follow %v", second.RecordedAt, first.RecordedAt)
-	}
-	if got := second.RecordedAt.Sub(first.RecordedAt); got != scheduleconfig.TimestampResolution {
-		t.Fatalf("recorded_at advanced by %v, want exactly one resolution unit", got)
-	}
-	if second.RecordedAt.Truncate(scheduleconfig.TimestampResolution) != second.RecordedAt {
-		t.Fatalf("recorded_at %v is not at database resolution", second.RecordedAt)
+	rev := f.createOverride(t, "bob", from, from.Add(time.Hour))
+	if rev.RecordedAt.Truncate(scheduleconfig.TimestampResolution) != rev.RecordedAt {
+		t.Fatalf("recorded_at %v is not at database resolution", rev.RecordedAt)
 	}
 }
 

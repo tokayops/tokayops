@@ -83,7 +83,7 @@ func randL1Groups(r *rand.Rand, iter int) []RotationGroup {
 func randActiveSnapshot(t *testing.T, r *rand.Rand, iter int) ScheduleRevisionSnapshot {
 	t.Helper()
 	s := ScheduleRevisionSnapshot{
-		SchemaVersion:           1,
+		SchemaVersion:           SnapshotSchemaVersion,
 		Timezone:                randTimezone(r),
 		SlackUsergroupID:        "S0123",
 		L2EscalationTimeoutMins: 1 + r.IntN(1440),
@@ -409,7 +409,7 @@ func TestProp_WeeklyBoundaryWeekday(t *testing.T) {
 	for iter := 0; iter < 200; iter++ {
 		day := r.IntN(7)
 		tz := randTimezone(r)
-		policy := RotationPolicy{SchemaVersion: 1, Cadence: model.RotationWeekly,
+		policy := RotationPolicy{Cadence: model.RotationWeekly,
 			HandoffTime: "11:00", HandoffDay: &day}
 		g, err := NewGrid(tz, policy)
 		if err != nil {

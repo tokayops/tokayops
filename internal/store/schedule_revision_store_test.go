@@ -23,7 +23,6 @@ const (
 func revTestConfig() rotation.ScheduleConfiguration {
 	monday := 1
 	weekly := rotation.RotationPolicy{
-		SchemaVersion: rotation.PolicySchemaVersion,
 		Cadence:       model.RotationWeekly,
 		HandoffTime:   "11:00",
 		HandoffDay:    &monday,
@@ -104,7 +103,7 @@ func TestCreateScheduleIsAtomic(t *testing.T) {
 	seedTeam(t, s, "devops", "alice", "bob")
 
 	now := time.Date(2026, 5, 4, 8, 30, 0, 123456789, time.UTC)
-	rev, err := newTestScheduleService(s, now).CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil)
+	rev, err := createViaSave(context.Background(), newTestScheduleService(s, now), "devops", revTestConfig(), "", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -196,7 +195,7 @@ func TestCreateScheduleRollsBackOnInjectedFailure(t *testing.T) {
 			repo := &failingRepo{inner: s.ScheduleConfigRepository(), failAt: failAt, err: boom}
 			svc := scheduleconfig.NewService(repo)
 
-			if _, err := svc.CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil); !errors.Is(err, boom) {
+			if _, err := createViaSave(context.Background(), svc, "devops", revTestConfig(), "", nil); !errors.Is(err, boom) {
 				t.Fatalf("error = %v, want injected failure", err)
 			}
 			if n := countRows(t, s, `SELECT COUNT(*) FROM schedules`); n != 0 {
@@ -220,7 +219,7 @@ func TestCreateScheduleConcurrentSameTeam(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = svc.CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil)
+			_, errs[i] = createViaSave(context.Background(), svc, "devops", revTestConfig(), "", nil)
 		}(i)
 	}
 	wg.Wait()
@@ -256,7 +255,7 @@ func TestCreateScheduleStoresCanonicalSnapshot(t *testing.T) {
 	// revTestConfig leaves L2 disabled with no groups: the planner emits a nil
 	// slice there, which is exactly what storage turns into [].
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
-	rev, err := newTestScheduleService(s, start).CreateSchedule(context.Background(), "devops", revTestConfig(), "", nil)
+	rev, err := createViaSave(context.Background(), newTestScheduleService(s, start), "devops", revTestConfig(), "", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -340,8 +339,8 @@ func TestCreateScheduleForUnknownTeam(t *testing.T) {
 	}
 
 	// And through the service, the more specific refusal.
-	if _, err := newTestScheduleService(s, start).CreateSchedule(
-		context.Background(), "ghost-team", revTestConfig(), "", nil); !errors.Is(err, scheduleconfig.ErrUserNotTeamMember) {
+	if _, err := createViaSave(context.Background(), newTestScheduleService(s, start),
+		"ghost-team", revTestConfig(), "", nil); !errors.Is(err, scheduleconfig.ErrUserNotTeamMember) {
 		t.Fatalf("service error = %v, want a membership rejection", err)
 	}
 }
@@ -354,7 +353,7 @@ func TestCreateScheduleForUnknownTeam(t *testing.T) {
 func createSchedule(t *testing.T, s *Store, teamID string, at time.Time) *scheduleconfig.ScheduleRevision {
 	t.Helper()
 	seedTeam(t, s, teamID, "alice", "bob")
-	rev, err := newTestScheduleService(s, at).CreateSchedule(context.Background(), teamID, revTestConfig(), "", nil)
+	rev, err := createViaSave(context.Background(), newTestScheduleService(s, at), teamID, revTestConfig(), "", nil)
 	if err != nil {
 		t.Fatalf("CreateSchedule: %v", err)
 	}
@@ -403,7 +402,6 @@ func appendRevision(t *testing.T, s *Store, prev *scheduleconfig.ScheduleRevisio
 	}
 	return next
 }
-
 
 func TestRevisionKindRoundTrip(t *testing.T) {
 	s := setupTestDB(t)
@@ -946,7 +944,7 @@ func currentOverrides(t *testing.T, s *Store, scheduleID string) []scheduleconfi
 	var out []scheduleconfig.OverrideRevision
 	err := withTx(t, s, func(tx scheduleconfig.ScheduleConfigTx) error {
 		var err error
-		out, err = tx.GetOverrideProjectionInRange(context.Background(), scheduleID, nil, nil, nil)
+		out, err = tx.GetOverrideProjectionInRange(context.Background(), scheduleID, nil, nil)
 		return err
 	})
 	if err != nil {
@@ -975,4 +973,19 @@ func TestInitDBIsIdempotent(t *testing.T) {
 	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_revisions WHERE schedule_id = $1`, rev.ScheduleID); n != 1 {
 		t.Fatalf("got %d revisions after re-running InitDB, want 1", n)
 	}
+}
+
+// createViaSave is how production creates a schedule: Save with
+// expected_version 0. Service.CreateSchedule used to be a second entrance to
+// the same code - called by nothing but tests - and is gone.
+func createViaSave(ctx context.Context, svc *scheduleconfig.Service, teamID string,
+	cfg rotation.ScheduleConfiguration, actorID string, reason *string) (*scheduleconfig.ScheduleRevision, error) {
+
+	res, err := svc.Save(ctx, teamID, scheduleconfig.SaveCommand{
+		Desired: cfg, ActorID: actorID, Reason: reason,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.Revision, nil
 }

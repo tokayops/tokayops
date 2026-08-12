@@ -531,15 +531,12 @@ func (v *fakeReadView) GetRevisionsInRange(ctx context.Context, scheduleID strin
 // tombstones, only then apply the validity range. Any other order either
 // resurrects a deleted override or picks a stale version whose interval
 // happened to overlap.
-func (v *fakeReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until, asOf *time.Time) ([]scheduleconfig.OverrideRevision, error) {
+func (v *fakeReadView) GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until *time.Time) ([]scheduleconfig.OverrideRevision, error) {
 	if err := v.record("GetOverrideProjectionInRange"); err != nil {
 		return nil, err
 	}
 	latest := map[string]scheduleconfig.OverrideRevision{}
 	for _, rev := range v.state().overrides[scheduleID] {
-		if asOf != nil && rev.RecordedAt.After(*asOf) {
-			continue
-		}
 		if cur, ok := latest[rev.OverrideID]; !ok || rev.Revision > cur.Revision {
 			latest[rev.OverrideID] = rev
 		}
@@ -1014,19 +1011,6 @@ func (t *scheduleConfigTx) SetScheduleDeleted(ctx context.Context, scheduleID st
 	return nil
 }
 
-func (t *scheduleConfigTx) MaxOverrideRecordedAt(ctx context.Context, scheduleID string) (*time.Time, error) {
-	if err := t.repo.record("MaxOverrideRecordedAt"); err != nil {
-		return nil, err
-	}
-	var max *time.Time
-	for _, rev := range t.repo.state.overrides[scheduleID] {
-		if max == nil || rev.RecordedAt.After(*max) {
-			at := rev.RecordedAt
-			max = &at
-		}
-	}
-	return max, nil
-}
 
 // LockUsers records that it happened and what it was asked to lock; there is
 // nothing to lock in a single-threaded fake. What a test can check is the

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tokayops/tokayops/internal/config"
 	_ "github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/config"
 )
 
 var testStore *Store
