@@ -44,18 +44,15 @@ type slotInput struct {
 // on duty until its own valid_to, so switching a layer off or emptying its
 // groups in the middle of one must not make it vanish; the interval the
 // override does not cover is then simply nobody's.
-func renderSlot(in slotInput) ([]Assignment, []Warning, error) {
+func renderSlot(in slotInput) ([]Assignment, error) {
 	if in.Bound.empty() {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	covering := overridesForSlot(in.Overrides, in.Bound)
 	points := elementaryPoints(covering, in.Bound)
 
-	var (
-		out      []Assignment
-		warnings []Warning
-	)
+	var out []Assignment
 	for i := 0; i+1 < len(points); i++ {
 		span := interval{Start: points[i], End: points[i+1]}
 		if span.empty() {
@@ -73,7 +70,7 @@ func renderSlot(in slotInput) ([]Assignment, []Warning, error) {
 				ids = append(ids, o.OverrideID)
 			}
 			sort.Strings(ids)
-			return nil, nil, fmt.Errorf("%w: layer %s over %s..%s, overrides %s",
+			return nil, fmt.Errorf("%w: layer %s over %s..%s, overrides %s",
 				scheduleconfig.ErrOverrideCollision, in.Layer,
 				span.Start.Format(time.RFC3339), span.End.Format(time.RFC3339),
 				strings.Join(ids, " and "))
@@ -114,13 +111,12 @@ func renderSlot(in slotInput) ([]Assignment, []Warning, error) {
 		// No base and no override: nobody is on duty for this span. The gap
 		// is left as a gap rather than filled with the surrounding group.
 	}
-	return out, warnings, nil
+	return out, nil
 }
 
-// overridesForSlot keeps the overrides that reach the bound and sorts them by
-// priority ASCENDING, so that the last covering entry always wins. Their own
-// validity intervals are left intact: the bound decides which pieces are
-// reported, not what an override covers.
+// overridesForSlot keeps the overrides that reach the bound, in a stable
+// order. Their own validity intervals are left intact: the bound decides which
+// pieces are reported, not what an override covers.
 //
 // The sort is what makes the result independent of the order the caller
 // supplied: overlapping overrides must resolve the same way no matter how the
@@ -135,12 +131,11 @@ func overridesForSlot(overrides []scheduleconfig.OverrideRevision, bound interva
 		}
 		out = append(out, o)
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if !out[i].RecordedAt.Equal(out[j].RecordedAt) {
-			return out[i].RecordedAt.Before(out[j].RecordedAt)
-		}
-		return out[i].OverrideID < out[j].OverrideID
-	})
+	// Sorted by id alone. It used to be recorded_at first, so that the last
+	// recorded override won a collision; nothing wins one now, and the only
+	// remaining requirement is a stable order so the elementary points and any
+	// error message come out the same on every run.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].OverrideID < out[j].OverrideID })
 	return out
 }
 

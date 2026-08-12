@@ -28,10 +28,10 @@ var (
 	}, []string{"kind"})
 
 	// ScheduleOnCallProjectionFailuresTotal counts schedules the runtime could
-	// not project. It is deliberately separate from
-	// schedule_snapshot_decode_errors_total: that one counts a save being
-	// refused, this one counts a schedule whose duty roster can no longer be
-	// read at all. The alerts they deserve are not the same.
+	// not project - a schedule whose duty roster can no longer be read at all.
+	// A corrupt stored snapshot arrives here as reason="snapshot_decode": the
+	// command side has no counter of its own, because a save that hits one
+	// answers over HTTP, where the failure is already recorded.
 	//
 	// The consumer label is what makes a rate readable. Two consumers observe
 	// the same schedules on different intervals, so without it one damaged

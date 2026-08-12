@@ -148,16 +148,6 @@ func (s *Service) runCommand(ctx context.Context, fn func(ScheduleConfigTx) erro
 	return s.repo.WithinTx(ctx, fn)
 }
 
-func triggerOf(res *SaveResult) string {
-	switch {
-	case res.Created:
-		return TriggerCreated
-	case res.Recreated:
-		return TriggerRecreated
-	default:
-		return TriggerSaved
-	}
-}
 
 func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	desired rotation.ScheduleConfiguration, cmd SaveCommand) (*SaveResult, error) {

@@ -42,11 +42,12 @@ type OnCall struct {
 	At time.Time
 	L1 *LayerOnCall
 	L2 *LayerOnCall
-
-	// Warnings surface here too: an override overlap is no less wrong for
-	// being observed through the current view rather than the history.
-	Warnings []Warning
 }
+
+// It carries no warnings. The two that remain - history_incomplete and
+// schedule_inactive - are about a RANGE, and this type answers about one
+// instant: at that instant a schedule is either readable or it is not, and
+// unreadable is an error now rather than a note attached to a guess.
 
 // layerSlot is the grid slot of one layer at the queried instant, already
 // clipped to the revision.
@@ -106,7 +107,7 @@ func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []la
 
 	out := OnCall{At: at}
 	for _, ls := range slots {
-		assignments, warnings, err := renderSlot(slotInput{
+		assignments, err := renderSlot(slotInput{
 			RevisionID: rev.ID,
 			Layer:      ls.layer,
 			Slot:       ls.slot,
@@ -117,7 +118,6 @@ func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []la
 		if err != nil {
 			return OnCall{}, err
 		}
-		out.Warnings = append(out.Warnings, warnings...)
 
 		found := assignmentAt(assignments, at)
 		if found == nil {

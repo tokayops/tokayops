@@ -3002,12 +3002,6 @@ const docTemplate = `{
                 },
                 "l2": {
                     "$ref": "#/definitions/api.LayerOnCallDTO"
-                },
-                "warnings": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/api.ScheduleWarningDTO"
-                    }
                 }
             }
         },

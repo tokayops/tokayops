@@ -1308,7 +1308,6 @@ const Components = {
                         <span class="on-call-l2-name">${escapeHtml(Components.onCallNames(l2, names))}</span>
                     </div>
                 ` : ''}
-                ${Components.scheduleWarnings(onCall?.warnings)}
                 <div class="on-call-actions">
                     ${Permissions.can('manage_schedule', { teamId: teamId }) ? `
                     <button class="btn btn-sm btn-secondary edit-schedule-btn" data-team-id="${escapeAttr(teamId)}">

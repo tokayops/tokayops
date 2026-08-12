@@ -215,7 +215,6 @@ func cloneOverrides(revs []scheduleconfig.OverrideRevision) []scheduleconfig.Ove
 	return out
 }
 
-
 // NewScheduleConfigRepo returns an empty repository.
 func NewScheduleConfigRepo() *ScheduleConfigRepo {
 	return &ScheduleConfigRepo{state: newState(), FailOn: map[string]error{}}
@@ -493,6 +492,7 @@ func (v *fakeReadView) GetEffectiveRevision(ctx context.Context, scheduleID stri
 	if err := v.scheduleFailure(scheduleID); err != nil {
 		return nil, err
 	}
+	var inForce []scheduleconfig.ScheduleRevision
 	for _, rev := range v.state().revisions[scheduleID] {
 		if rev.EffectiveFrom.After(at) {
 			continue
@@ -500,10 +500,23 @@ func (v *fakeReadView) GetEffectiveRevision(ctx context.Context, scheduleID stri
 		if rev.EffectiveTo != nil && !rev.EffectiveTo.After(at) {
 			continue
 		}
-		found := cloneRevision(rev)
-		return &found, nil
+		inForce = append(inForce, rev)
 	}
-	return nil, scheduleconfig.ErrRevisionNotFound
+	switch len(inForce) {
+	case 0:
+		return nil, scheduleconfig.ErrRevisionNotFound
+	case 1:
+		found := cloneRevision(inForce[0])
+		return &found, nil
+	default:
+		// The contract refuses the pair rather than choosing. Returning the
+		// first match here would make every unit test of the runtime
+		// projection pass while production refused - the fake would be the
+		// only place the old behaviour still lived.
+		return nil, fmt.Errorf("%w: schedule %s has revisions %s and %s both in force at %s",
+			scheduleconfig.ErrRevisionOverlap, scheduleID, inForce[0].ID, inForce[1].ID,
+			at.Format(time.RFC3339))
+	}
 }
 
 // GetRevisionsInRange applies the half-open overlap test in both directions
@@ -527,7 +540,7 @@ func (v *fakeReadView) GetRevisionsInRange(ctx context.Context, scheduleID strin
 }
 
 // GetOverrideProjectionInRange mirrors the SQL projection step for step:
-// pick the latest revision per override_id (bounded by asOf), only then drop
+// pick the latest revision per override_id, only then drop
 // tombstones, only then apply the validity range. Any other order either
 // resurrects a deleted override or picks a stale version whose interval
 // happened to overlap.
@@ -766,7 +779,6 @@ func (t *scheduleConfigTx) AdvanceVersion(ctx context.Context, scheduleID string
 	t.repo.state.roots[scheduleID] = root
 	return nil
 }
-
 
 func (t *scheduleConfigTx) InsertOverrideRevision(ctx context.Context, rev *scheduleconfig.OverrideRevision) error {
 	if err := t.repo.record("InsertOverrideRevision"); err != nil {
@@ -1010,7 +1022,6 @@ func (t *scheduleConfigTx) SetScheduleDeleted(ctx context.Context, scheduleID st
 	t.repo.state.roots[scheduleID] = root
 	return nil
 }
-
 
 // LockUsers records that it happened and what it was asked to lock; there is
 // nothing to lock in a single-threaded fake. What a test can check is the

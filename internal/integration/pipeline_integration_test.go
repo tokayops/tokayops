@@ -64,11 +64,14 @@ func pipelineSchedule(t *testing.T, env *IntegrationTestEnv, teamID string,
 			t.Fatalf("AddTeamMember %s: %v", id, err)
 		}
 	}
-	rev, err := env.createViaSave(context.Background(), Schedules, teamID, cfg, "", nil)
+	// How production creates a schedule: Save with expected_version 0.
+	res, err := env.Schedules.Save(context.Background(), teamID, scheduleconfig.SaveCommand{
+		Desired: cfg,
+	})
 	if err != nil {
-		t.Fatalf("CreateSchedule: %v", err)
+		t.Fatalf("create schedule: %v", err)
 	}
-	return rev.ScheduleID
+	return res.Revision.ScheduleID
 }
 
 // pipelineConfig is a daily rotation that hands over at midnight UTC, so the

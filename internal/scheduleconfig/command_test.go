@@ -183,7 +183,7 @@ func TestNoopCommitsWithoutWrites(t *testing.T) {
 	}
 	for _, call := range f.calls()[before:] {
 		switch call {
-		case "CloseRevision", "InsertRevision", "AdvanceVersion", "InsertScheduleEvent", "SetScheduleDeleted":
+		case "CloseRevision", "InsertRevision", "AdvanceVersion", "SetScheduleDeleted":
 			t.Fatalf("no-op performed a write: %s", call)
 		}
 	}

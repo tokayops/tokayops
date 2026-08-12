@@ -145,12 +145,11 @@ func Render(in Input) (Result, error) {
 		}
 
 		for _, layer := range []string{LayerL1, LayerL2} {
-			assignments, warnings, err := renderLayer(rev, layer, bound, in.Overrides)
+			assignments, err := renderLayer(rev, layer, bound, in.Overrides)
 			if err != nil {
 				return Result{}, err
 			}
 			res.Assignments = append(res.Assignments, assignments...)
-			res.Warnings = append(res.Warnings, warnings...)
 		}
 	}
 	if err := cov.finish(); err != nil {
@@ -173,21 +172,21 @@ func Render(in Input) (Result, error) {
 // that outlives the edit which disabled the layer, and an override names the
 // person on duty until its own valid_to whatever the rotation is doing.
 func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interval,
-	overrides []scheduleconfig.OverrideRevision) ([]Assignment, []Warning, error) {
+	overrides []scheduleconfig.OverrideRevision) ([]Assignment, error) {
 
 	state, err := resolveLayer(rev, layer)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	layerOverrides := overridesOfLayer(overrides, layer)
 	if !state.active && len(layerOverrides) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	slots := state.grid.SlotsOverlapping(bound.Start, bound.End)
 	if len(slots) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	// PositionAt walks the grid from the phase anchor, which can be years
@@ -199,14 +198,11 @@ func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interv
 	if state.active {
 		position, _, err = rotation.PositionAt(state.grid, state.snapshot, slots[0].Start)
 		if err != nil {
-			return nil, nil, layerError(rev, layer, err)
+			return nil, layerError(rev, layer, err)
 		}
 	}
 
-	var (
-		out      []Assignment
-		warnings []Warning
-	)
+	var out []Assignment
 	for _, slot := range slots {
 		in := slotInput{
 			RevisionID: rev.ID,
@@ -220,14 +216,13 @@ func renderLayer(rev scheduleconfig.ScheduleRevision, layer string, bound interv
 			position = state.nextPosition(position)
 		}
 
-		slotAssignments, slotWarnings, err := renderSlot(in)
+		slotAssignments, err := renderSlot(in)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		out = append(out, slotAssignments...)
-		warnings = append(warnings, slotWarnings...)
 	}
-	return out, warnings, nil
+	return out, nil
 }
 
 // coverage walks the revision chain and reports where it fails to tile the

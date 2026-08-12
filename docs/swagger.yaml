@@ -202,10 +202,6 @@ definitions:
         $ref: '#/definitions/api.LayerOnCallDTO'
       l2:
         $ref: '#/definitions/api.LayerOnCallDTO'
-      warnings:
-        items:
-          $ref: '#/definitions/api.ScheduleWarningDTO'
-        type: array
     type: object
   api.PolicyRequest:
     properties:

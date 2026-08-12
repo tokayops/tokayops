@@ -58,9 +58,6 @@ func TestScheduleOnCallReportsBothBoundaryPairs(t *testing.T) {
 	if l1.Source != "rotation" {
 		t.Fatalf("source = %q, want rotation", l1.Source)
 	}
-	if out.OnCall.Warnings == nil {
-		t.Fatal("warnings must be an empty array, not null: a client should not branch on the difference")
-	}
 }
 
 // An edit in the middle of a shift is the case §13 exists for: the handoff
@@ -155,9 +152,6 @@ func TestScheduleOnCallAnswersNobodyRatherThanNotFound(t *testing.T) {
 			}
 			if out.OnCall.At.IsZero() {
 				t.Fatal("at must be set even when nobody is on duty")
-			}
-			if len(out.OnCall.Warnings) != 0 {
-				t.Fatalf("warnings = %v, want none", out.OnCall.Warnings)
 			}
 		})
 	}

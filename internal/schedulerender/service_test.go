@@ -2,6 +2,7 @@ package schedulerender
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -251,4 +252,54 @@ func overrideHolder(res Result) string {
 		}
 	}
 	return ""
+}
+
+// The refusal has to reach the runtime paths, not only the calendar.
+//
+// CurrentOnCall and the bulk projection read one instant through
+// GetEffectiveRevision. While that read picked one of two overlapping
+// revisions, the calendar refused and the notifier quietly woke whichever
+// group it got - the worse half of the same bug, because nothing said so.
+func TestCurrentOnCallRefusesOverlappingRevisions(t *testing.T) {
+	start := utc(2026, 5, 1, 11, 0)
+	second := utc(2026, 5, 3, 11, 0)
+	revs := chain(t,
+		revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
+		revisionStep{at: second, cfg: config("UTC", dailyPolicy("11:00"), group(groupB, "bob"))},
+	)
+	repo := seed(t, revs, nil)
+
+	// Written straight into the store: seed builds a well-formed chain, and
+	// the command side cannot produce this pair at all - which is the point.
+	extra := revs[1]
+	extra.ID = "rev-overlapping"
+	extra.Version = 99
+	extra.EffectiveFrom = second
+	closed := second.Add(24 * time.Hour)
+	extra.EffectiveTo = &closed
+	if err := repo.WithinTx(context.Background(), func(tx scheduleconfig.ScheduleConfigTx) error {
+		return tx.InsertRevision(context.Background(), &extra)
+	}); err != nil {
+		t.Fatalf("seed the overlapping revision: %v", err)
+	}
+
+	svc := New(repo)
+	at := second.Add(time.Hour)
+
+	if _, err := svc.CurrentOnCall(context.Background(), testScheduleID, at); !errors.Is(err, scheduleconfig.ErrRevisionOverlap) {
+		t.Fatalf("CurrentOnCall error = %v, want ErrRevisionOverlap", err)
+	}
+
+	// And the bulk projection isolates it as one damaged schedule rather than
+	// failing the tick or picking a group.
+	bulk, err := svc.CurrentOnCallForAll(context.Background(), at)
+	if err != nil {
+		t.Fatalf("CurrentOnCallForAll: %v", err)
+	}
+	if len(bulk.Failures) != 1 || bulk.Failures[0].Reason != FailureRevisionOverlap {
+		t.Fatalf("failures = %+v, want one revision_overlap", bulk.Failures)
+	}
+	if len(bulk.Schedules) != 0 {
+		t.Fatalf("a schedule that could not be projected was reported as projected: %+v", bulk.Schedules)
+	}
 }

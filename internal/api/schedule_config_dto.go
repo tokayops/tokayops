@@ -195,26 +195,22 @@ type LayerOnCallDTO struct {
 // OnCallDTO is the current-assignment projection. A null layer means nobody is
 // on duty there.
 //
-// Warnings belong here rather than beside the projection: an override overlap
-// is no less real for being seen through the current view than through the
-// history, and a caller that got the projection without them would have to
-// re-render a range to find out that the answer is contested. Carrying them
-// inside the value means every path that returns a projection - the on-call
-// endpoint, the preview's before/after, the save's result - reports the same
-// thing without three chances to forget.
+// It carries no warnings. It used to carry one - an override collision seen
+// through the current view - and that is an error now: a projection of damaged
+// data is refused rather than returned with a note. The two warnings that
+// remain describe a RANGE (history_incomplete, schedule_inactive) and live on
+// the render response, which is what answers about ranges.
 type OnCallDTO struct {
-	At       time.Time            `json:"at"`
-	L1       *LayerOnCallDTO      `json:"l1"`
-	L2       *LayerOnCallDTO      `json:"l2"`
-	Warnings []ScheduleWarningDTO `json:"warnings"`
+	At time.Time       `json:"at"`
+	L1 *LayerOnCallDTO `json:"l1"`
+	L2 *LayerOnCallDTO `json:"l2"`
 }
 
 func onCallDTO(o schedulerender.OnCall) OnCallDTO {
 	return OnCallDTO{
 		At:       o.At,
-		L1:       layerOnCallDTO(o.L1),
-		L2:       layerOnCallDTO(o.L2),
-		Warnings: warningDTOs(o.Warnings),
+		L1: layerOnCallDTO(o.L1),
+		L2: layerOnCallDTO(o.L2),
 	}
 }
 
