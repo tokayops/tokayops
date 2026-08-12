@@ -174,10 +174,12 @@ export async function joinNames(ids) {
  * absent here.
  *
  * @param {string} teamId
+ * @param {Object} [options] - passed to the request; carry a `signal` to have
+ *        the lookup abandoned along with whatever asked for it
  * @returns {Promise<Array<{id, name}>>} in the order the team lists them
  */
-export async function assignableMembers(teamId) {
-    const response = await API.teams.members(teamId);
+export async function assignableMembers(teamId, options = {}) {
+    const response = await API.teams.members(teamId, options);
     return (response?.users || []).map(member => ({ id: member.id, name: member.name }));
 }
 
