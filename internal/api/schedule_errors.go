@@ -216,7 +216,6 @@ func (a *API) mapScheduleFault(c echo.Context, err error) error {
 	// rotation is a valid state someone chose, so a caller cannot tell the two
 	// apart. It is logged loudly and counted.
 	case errors.Is(err, scheduleconfig.ErrSnapshotDecode):
-		a.scheduleMetrics().SnapshotDecodeError()
 		log.Printf("ALERT schedule_config: stored snapshot could not be decoded: %v", err)
 		return c.JSON(http.StatusInternalServerError,
 			ErrorResponse{Error: "stored schedule data is corrupt", Code: CodeSnapshotCorrupt})
@@ -254,12 +253,4 @@ func onCallConflictBody(schedules []map[string]string) map[string]any {
 		"code":      CodeMemberOnCall,
 		"schedules": schedules,
 	}
-}
-
-// scheduleMetrics is the metrics sink, never nil: an unwired API still runs.
-func (a *API) scheduleMetrics() scheduleconfig.Metrics {
-	if a.scheduleMetricsSink == nil {
-		return scheduleconfig.NopMetrics{}
-	}
-	return a.scheduleMetricsSink
 }

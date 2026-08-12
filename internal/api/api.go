@@ -73,7 +73,6 @@ type API struct {
 	scheduleRead        scheduleconfig.ScheduleReadRepository
 	scheduleRenderer    *schedulerender.Service
 	userEraser          *erasure.Service
-	scheduleMetricsSink scheduleconfig.Metrics
 }
 
 // NewAPI creates a new API instance. Pass nil for oidc if not using OIDC.
@@ -120,11 +119,6 @@ func (a *API) SetUserEraser(svc *erasure.Service) {
 	a.userEraser = svc
 }
 
-// SetScheduleMetrics gives the error mapper somewhere to report the failures
-// it is the only observer of, such as an undecodable snapshot.
-func (a *API) SetScheduleMetrics(m scheduleconfig.Metrics) {
-	a.scheduleMetricsSink = m
-}
 
 // SetCardRenderer enables instant Slack card replacement on Ack/Resolve button clicks.
 func (a *API) SetCardRenderer(r SlackCardRenderer) {

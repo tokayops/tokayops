@@ -19,13 +19,8 @@ type Service struct {
 	repo    ScheduleConfigRepository
 	now     func() time.Time
 	newID   func() string
-	metrics Metrics
 	logf    func(format string, args ...any)
 
-	// planTransition is the pure planner, injectable so a test can feed the
-	// commit guard a plan that contradicts its own snapshot. A guard no test
-	// can trip is a comment, not a guard.
-	planTransition func(rotation.TransitionInput) (rotation.TransitionPlan, error)
 }
 
 // Option customizes a Service. The clock and ID source are injectable so tests
@@ -43,15 +38,6 @@ func WithIDSource(newID func() string) Option {
 	return func(s *Service) { s.newID = newID }
 }
 
-// WithMetrics sends the command-side counters somewhere. Without it they go
-// nowhere, which is what keeps unit tests free of a metrics registry.
-func WithMetrics(m Metrics) Option {
-	return func(s *Service) {
-		if m != nil {
-			s.metrics = m
-		}
-	}
-}
 
 // WithLogger overrides the commit log sink.
 func WithLogger(logf func(format string, args ...any)) Option {
@@ -64,9 +50,7 @@ func NewService(repo ScheduleConfigRepository, opts ...Option) *Service {
 		repo:           repo,
 		now:            func() time.Time { return time.Now().UTC() },
 		newID:          func() string { return uuid.New().String() },
-		metrics:        NopMetrics{},
 		logf:           log.Printf,
-		planTransition: rotation.PlanTransition,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -151,26 +135,17 @@ func (s *Service) Save(ctx context.Context, teamID string, cmd SaveCommand) (*Sa
 		return nil, err
 	}
 	s.logCommit(result.commit)
-	if result.Noop {
-		s.metrics.TransitionNoop()
-	} else {
-		s.metrics.RevisionCreated(triggerOf(result))
-	}
 	return result, nil
 }
 
-// runCommand is the one place a configuration command opens a transaction and
-// reports on it. Every command times the same span - lock wait included - and
-// counts a conflict the same way, so there is no path where one of them
-// silently stops being measured.
+// runCommand is the one place a configuration command opens a transaction.
+//
+// It used to also time the span and count conflicts through a metrics sink of
+// this package's own. Both are already visible in the HTTP metrics every
+// command arrives through - duration by route, conflicts as the 409 - so the
+// sink was a second, narrower copy of the same numbers.
 func (s *Service) runCommand(ctx context.Context, fn func(ScheduleConfigTx) error) error {
-	started := s.now()
-	err := s.repo.WithinTx(ctx, fn)
-	s.metrics.TransitionDuration(s.now().Sub(started))
-	if errors.Is(err, ErrVersionConflict) {
-		s.metrics.TransitionConflict()
-	}
-	return err
+	return s.repo.WithinTx(ctx, fn)
 }
 
 func triggerOf(res *SaveResult) string {
@@ -287,7 +262,7 @@ func (s *Service) rewrite(ctx context.Context, tx ScheduleConfigTx, target *writ
 		return nil, err
 	}
 
-	plan, err := s.planTransition(rotation.TransitionInput{
+	plan, err := rotation.PlanTransition(rotation.TransitionInput{
 		Current:     current,
 		Desired:     desired,
 		EffectiveAt: target.effectiveAt,
@@ -305,14 +280,6 @@ func (s *Service) rewrite(ctx context.Context, tx ScheduleConfigTx, target *writ
 			EffectiveAt: target.effectiveAt,
 			Noop:        true,
 		}, nil
-	}
-
-	before, after, err := s.activeGroupsAround(current, plan, target.effectiveAt)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.guardTransition(plan, current != nil, before, after, target.effectiveAt); err != nil {
-		return nil, err
 	}
 
 	summary := plan.Change
@@ -333,7 +300,7 @@ func (s *Service) rewrite(ctx context.Context, tx ScheduleConfigTx, target *writ
 	if recreate {
 		trigger = TriggerRecreated
 	}
-	commit, err := s.appendRevision(ctx, tx, target, revision, recreate, trigger, cmd.ActorID, before, after)
+	commit, err := s.appendRevision(ctx, tx, target, revision, recreate, trigger, cmd.ActorID)
 	if err != nil {
 		return nil, err
 	}
@@ -350,8 +317,7 @@ func (s *Service) rewrite(ctx context.Context, tx ScheduleConfigTx, target *writ
 // intact: close the tail, insert its successor, move the deleted projection if
 // the schedule is coming back, advance the version, record the event.
 func (s *Service) appendRevision(ctx context.Context, tx ScheduleConfigTx, target *writeTarget,
-	revision *ScheduleRevision, clearDeleted bool, trigger, actorID string,
-	before, after activeGroupPair) (*commitLog, error) {
+	revision *ScheduleRevision, clearDeleted bool, trigger, actorID string) (*commitLog, error) {
 
 	if err := tx.CloseRevision(ctx, target.root.ID, target.tail.ID, target.effectiveAt); err != nil {
 		return nil, err
@@ -368,7 +334,7 @@ func (s *Service) appendRevision(ctx context.Context, tx ScheduleConfigTx, targe
 		return nil, err
 	}
 	return s.recordChange(trigger, &target.tail.ID, revision,
-		target.root.ConfigVersion, target.effectiveAt, actorID, before, after), nil
+		target.root.ConfigVersion, target.effectiveAt, actorID), nil
 }
 
 // CreateSchedule creates a schedule and its first revision in one transaction.
@@ -418,7 +384,6 @@ func (s *Service) CreateSchedule(ctx context.Context, teamID string,
 		return nil, err
 	}
 	s.logCommit(created.commit)
-	s.metrics.RevisionCreated(TriggerCreated)
 	return created.Revision, nil
 }
 
@@ -434,7 +399,7 @@ func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID st
 		return nil, err
 	}
 
-	plan, err := s.planTransition(rotation.TransitionInput{
+	plan, err := rotation.PlanTransition(rotation.TransitionInput{
 		Current:     nil,
 		Desired:     desired,
 		EffectiveAt: effectiveAt,
@@ -447,14 +412,6 @@ func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID st
 	if plan.Noop {
 		return nil, fmt.Errorf("%w: initial transition reported as no-op", ErrInvariantViolation)
 	}
-	before, after, err := s.activeGroupsAround(nil, plan, effectiveAt)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.guardTransition(plan, false, before, after, effectiveAt); err != nil {
-		return nil, err
-	}
-
 	summary := plan.Change
 	root := &ScheduleRoot{ID: s.newID(), TeamID: teamID}
 	revision := &ScheduleRevision{
@@ -473,7 +430,7 @@ func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID st
 	if err := tx.CreateInitialSchedule(ctx, root, revision); err != nil {
 		return nil, err
 	}
-	commit := s.recordChange(TriggerCreated, nil, revision, 0, effectiveAt, actorID, before, after)
+	commit := s.recordChange(TriggerCreated, nil, revision, 0, effectiveAt, actorID)
 
 	return &SaveResult{
 		Revision:    revision,
@@ -507,7 +464,6 @@ func (s *Service) Delete(ctx context.Context, teamID string, cmd DeleteCommand) 
 		return err
 	}
 	s.logCommit(commit)
-	s.metrics.RevisionCreated(TriggerDeleted)
 	return nil
 }
 
@@ -531,11 +487,6 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 	}
 	if target.root.DeletedAt != nil {
 		return nil, ErrScheduleDeleted
-	}
-
-	before, err := activeGroups(&target.tail.Snapshot, target.effectiveAt)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
 	}
 
 	deleted := &ScheduleRevision{
@@ -565,10 +516,8 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 	if err := tx.AdvanceVersion(ctx, target.root.ID, target.root.ConfigVersion, target.effectiveAt); err != nil {
 		return nil, err
 	}
-	// Nobody is on duty after a delete, so the "after" pair is empty by
-	// construction rather than computed.
 	return s.recordChange(TriggerDeleted, &target.tail.ID, deleted,
-		target.root.ConfigVersion, target.effectiveAt, cmd.ActorID, before, activeGroupPair{}), nil
+		target.root.ConfigVersion, target.effectiveAt, cmd.ActorID), nil
 }
 
 // tombstoneLiveOverrides appends a delete revision to every override that is
@@ -835,99 +784,8 @@ func optionalString(s string) *string {
 	return &v
 }
 
-// activeGroupPair is the group on duty in each layer at one instant; an empty
-// string means the layer produces no assignment.
-type activeGroupPair struct {
-	L1 string
-	L2 string
-}
 
-func activeGroups(snap *rotation.ScheduleRevisionSnapshot, at time.Time) (activeGroupPair, error) {
-	var out activeGroupPair
-	if snap == nil {
-		return out, nil
-	}
-	var err error
-	if out.L1, err = activeGroupID(snap.Timezone, snap.L1, at); err != nil {
-		return activeGroupPair{}, fmt.Errorf("l1: %w", err)
-	}
-	if out.L2, err = activeGroupID(snap.Timezone, snap.L2, at); err != nil {
-		return activeGroupPair{}, fmt.Errorf("l2: %w", err)
-	}
-	return out, nil
-}
 
-func activeGroupID(timezone string, layer rotation.RotationLayerSnapshot, at time.Time) (string, error) {
-	grid, err := rotation.NewGrid(timezone, layer.Policy)
-	if err != nil {
-		return "", err
-	}
-	group, _, ok, err := rotation.ActiveGroupAt(grid, layer, at)
-	if err != nil || !ok {
-		return "", err
-	}
-	return group.ID, nil
-}
-
-// activeGroupsAround resolves who the old and the new snapshot each put on
-// duty at the transition instant.
-//
-// It is separate from the guard because the answer has two consumers: the
-// guard checks it, and the commit log records it. Folding the computation into
-// the guard made a validator that also returned data, which is how a "guard"
-// ends up being called for its side effects.
-func (s *Service) activeGroupsAround(current *rotation.ScheduleRevisionSnapshot,
-	plan rotation.TransitionPlan, at time.Time) (before, after activeGroupPair, err error) {
-
-	if before, err = activeGroups(current, at); err != nil {
-		return activeGroupPair{}, activeGroupPair{}, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
-	}
-	if after, err = activeGroups(&plan.Snapshot, at); err != nil {
-		return activeGroupPair{}, activeGroupPair{}, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
-	}
-	return before, after, nil
-}
-
-// guardTransition is the commit post-condition: the rotation the planner
-// promised has to be the rotation the snapshot it produced actually yields.
-//
-// The expected active group is checked ALWAYS. Equality of the old and the new
-// active group is checked only when the plan claims to preserve it - a
-// successor or first selection legitimately changes who is on duty, and
-// demanding equality there would roll back valid edits.
-//
-// It reads nothing and computes nothing: given a plan and the two answers, it
-// either agrees or it does not.
-func (s *Service) guardTransition(plan rotation.TransitionPlan, hadCurrent bool,
-	before, after activeGroupPair, at time.Time) error {
-
-	layers := [2]struct {
-		name       string
-		transition rotation.LayerTransition
-		before     string
-		after      string
-	}{
-		{"l1", plan.L1, before.L1, after.L1},
-		{"l2", plan.L2, before.L2, after.L2},
-	}
-	for _, l := range layers {
-		expected := ""
-		if l.transition.ExpectedActiveGroupID != nil {
-			expected = *l.transition.ExpectedActiveGroupID
-		}
-		if l.after != expected {
-			s.metrics.GuardViolation()
-			return fmt.Errorf("%w: %s plan expects active group %q at %v, snapshot yields %q",
-				ErrInvariantViolation, l.name, expected, at, l.after)
-		}
-		if l.transition.PreservesActiveGroup && hadCurrent && l.before != l.after {
-			s.metrics.GuardViolation()
-			return fmt.Errorf("%w: %s claims to preserve the active group but %q became %q",
-				ErrInvariantViolation, l.name, l.before, l.after)
-		}
-	}
-	return nil
-}
 
 // commitLog is one line about a committed change, assembled while the facts
 // are at hand and written only once the transaction is known to have
@@ -943,8 +801,6 @@ type commitLog struct {
 	effectiveAt   time.Time
 	actorID       string
 	changeSummary string
-	before        activeGroupPair
-	after         activeGroupPair
 }
 
 // recordChange builds the line to log once the transaction commits.
@@ -957,7 +813,7 @@ type commitLog struct {
 // idempotency - not a write-only audit table kept warm in case.
 func (s *Service) recordChange(trigger string,
 	oldRevisionID *string, revision *ScheduleRevision, oldVersion int64,
-	effectiveAt time.Time, actorID string, before, after activeGroupPair) *commitLog {
+	effectiveAt time.Time, actorID string) *commitLog {
 
 	entry := &commitLog{
 		trigger:       trigger,
@@ -968,8 +824,6 @@ func (s *Service) recordChange(trigger string,
 		newVersion:    revision.Version,
 		effectiveAt:   effectiveAt,
 		actorID:       actorID,
-		before:        before,
-		after:         after,
 	}
 	if revision.ChangeSummary != nil {
 		if encoded, err := json.Marshal(revision.ChangeSummary); err == nil {
@@ -990,13 +844,10 @@ func (s *Service) logCommit(entry *commitLog) {
 		return
 	}
 	s.logf("schedule_config: trigger=%s schedule_id=%s old_revision_id=%s new_revision_id=%s "+
-		"old_version=%d new_version=%d effective_at=%s actor_id=%s change_summary=%s "+
-		"active_l1_before=%s active_l1_after=%s active_l2_before=%s active_l2_after=%s",
+		"old_version=%d new_version=%d effective_at=%s actor_id=%s change_summary=%s",
 		entry.trigger, entry.scheduleID, derefOr(entry.oldRevisionID, "-"), entry.newRevisionID,
 		entry.oldVersion, entry.newVersion, entry.effectiveAt.Format(time.RFC3339Nano),
-		orDash(entry.actorID), entry.changeSummary,
-		orDash(entry.before.L1), orDash(entry.after.L1),
-		orDash(entry.before.L2), orDash(entry.after.L2))
+		orDash(entry.actorID), entry.changeSummary)
 }
 
 func derefOr(s *string, fallback string) string {

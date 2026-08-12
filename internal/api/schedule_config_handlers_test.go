@@ -819,32 +819,6 @@ func TestErrorMappingTable(t *testing.T) {
 	}
 }
 
-// The decode failure is the one the mapper is the sole observer of, so it is
-// also the one that has to be counted rather than only logged.
-func TestSnapshotDecodeIsCounted(t *testing.T) {
-	api, s, _, _ := setupScheduleAPI(t)
-	defer s.Close()
-
-	counter := &countingScheduleMetrics{}
-	api.SetScheduleMetrics(counter)
-
-	e := echo.New()
-	rec := httptest.NewRecorder()
-	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
-	_ = api.mapScheduleError(c, fmt.Errorf("%w: broken", scheduleconfig.ErrSnapshotDecode))
-
-	if counter.decodeErrors != 1 {
-		t.Fatalf("snapshot decode errors counted = %d, want 1", counter.decodeErrors)
-	}
-}
-
-type countingScheduleMetrics struct {
-	scheduleconfig.NopMetrics
-	decodeErrors int
-}
-
-func (m *countingScheduleMetrics) SnapshotDecodeError() { m.decodeErrors++ }
-
 func TestScheduleConfigRBACMatrix(t *testing.T) {
 	_, s, e, _ := setupScheduleAPI(t)
 	defer s.Close()

@@ -337,13 +337,10 @@ func main() {
 	// side and the renderer are built from the store's narrow repositories
 	// rather than from StoreInterface: the revision model is deliberately not
 	// part of that interface.
-	scheduleMetrics := metrics.ScheduleMetrics{}
-	scheduleConfigService := scheduleconfig.NewService(st.ScheduleConfigRepository(),
-		scheduleconfig.WithMetrics(scheduleMetrics))
+	scheduleConfigService := scheduleconfig.NewService(st.ScheduleConfigRepository())
 	apiService.SetScheduleConfigService(scheduleConfigService)
 	apiService.SetScheduleReadRepository(st.ScheduleReadRepository())
 	apiService.SetScheduleRenderer(scheduleRenderer)
-	apiService.SetScheduleMetrics(scheduleMetrics)
 	apiService.SetUserEraser(erasure.NewService(st.ErasureRepository()))
 	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle (Epic 8 Sprint 3)
 	// Register the Telegram webhook at boot so TOKAY_SELF_URL + restart suffices (no

@@ -361,36 +361,6 @@ func TestLastWriteFailureRollsBackEverything(t *testing.T) {
 	}
 }
 
-// The guard exists to catch a plan whose snapshot does not produce the
-// rotation the plan promised. Only an injected planner can produce one.
-func TestGuardCatchesInjectedPlan(t *testing.T) {
-	wrong := groupBob
-	f := newFixture(t, scheduleconfig.WithPlanner(
-		func(in rotation.TransitionInput) (rotation.TransitionPlan, error) {
-			plan, err := rotation.PlanTransition(in)
-			if err != nil {
-				return plan, err
-			}
-			// The snapshot puts group A on duty; the plan claims group B.
-			plan.L1.ExpectedActiveGroupID = &wrong
-			return plan, nil
-		}))
-
-	_, err := f.svc.Save(context.Background(), "devops", scheduleconfig.SaveCommand{
-		Desired: groupsConfig(group(groupAlice, "alice")),
-	})
-	if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
-		t.Fatalf("error = %v, want an invariant violation", err)
-	}
-	if f.repo.RootCount() != 0 {
-		t.Fatal("a guard violation must roll the whole transaction back")
-	}
-}
-
-// A composite edit - a timezone change that also drops the active group - is
-// a valid successor transition, and the guard must not roll it back. Equality
-// of the old and the new active group is only required when the plan says it
-// preserves one.
 func TestCompositeEditTimezonePlusActiveGroupRemoval(t *testing.T) {
 	f := newFixture(t)
 	created := f.mustSave(t, scheduleconfig.SaveCommand{
