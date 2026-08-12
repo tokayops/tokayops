@@ -71,7 +71,6 @@ func TruncateTables(t testing.TB, s *store.Store) {
 		"integrations",
 		"schedule_revisions",
 		"schedule_override_revisions",
-		"schedule_events",
 		"migration_markers",
 		"schedule_overrides",
 		"schedule_users",

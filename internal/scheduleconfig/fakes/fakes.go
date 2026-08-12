@@ -8,7 +8,6 @@ package fakes
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -50,7 +49,6 @@ type fakeState struct {
 	teamIndex map[string]string
 	revisions map[string][]scheduleconfig.ScheduleRevision
 	overrides map[string][]scheduleconfig.OverrideRevision
-	events    map[string][]scheduleconfig.ScheduleEvent
 
 	// members is team id -> user ids and erased is the set of soft-deleted
 	// users. Membership is part of the state because it is part of the
@@ -78,7 +76,6 @@ func newState() fakeState {
 		teamIndex:  map[string]string{},
 		revisions:  map[string][]scheduleconfig.ScheduleRevision{},
 		overrides:  map[string][]scheduleconfig.OverrideRevision{},
-		events:     map[string][]scheduleconfig.ScheduleEvent{},
 		members:    map[string][]string{},
 		erased:     map[string]bool{},
 		knownUsers: map[string]bool{},
@@ -106,9 +103,6 @@ func (s fakeState) clone() fakeState {
 	}
 	for k, v := range s.overrides {
 		c.overrides[k] = cloneOverrides(v)
-	}
-	for k, v := range s.events {
-		c.events[k] = cloneEvents(v)
 	}
 	for k, v := range s.members {
 		c.members[k] = append([]string(nil), v...)
@@ -221,21 +215,6 @@ func cloneOverrides(revs []scheduleconfig.OverrideRevision) []scheduleconfig.Ove
 	return out
 }
 
-func cloneEvent(e scheduleconfig.ScheduleEvent) scheduleconfig.ScheduleEvent {
-	e.Payload = append(json.RawMessage(nil), e.Payload...)
-	return e
-}
-
-func cloneEvents(events []scheduleconfig.ScheduleEvent) []scheduleconfig.ScheduleEvent {
-	if events == nil {
-		return nil
-	}
-	out := make([]scheduleconfig.ScheduleEvent, len(events))
-	for i, e := range events {
-		out[i] = cloneEvent(e)
-	}
-	return out
-}
 
 // NewScheduleConfigRepo returns an empty repository.
 func NewScheduleConfigRepo() *ScheduleConfigRepo {
@@ -340,13 +319,6 @@ func (r *ScheduleConfigRepo) OverrideRevisions(scheduleID string) []scheduleconf
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return cloneOverrides(r.state.overrides[scheduleID])
-}
-
-// Events returns the schedule events recorded for a schedule.
-func (r *ScheduleConfigRepo) Events(scheduleID string) []scheduleconfig.ScheduleEvent {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return cloneEvents(r.state.events[scheduleID])
 }
 
 // RootCount reports how many schedule roots exist.
@@ -798,20 +770,6 @@ func (t *scheduleConfigTx) AdvanceVersion(ctx context.Context, scheduleID string
 	return nil
 }
 
-func (t *scheduleConfigTx) InsertScheduleEvent(ctx context.Context, event *scheduleconfig.ScheduleEvent) error {
-	if err := t.repo.record("InsertScheduleEvent"); err != nil {
-		return err
-	}
-	if err := scheduleconfig.PrepareScheduleEvent(event); err != nil {
-		return err
-	}
-	s := t.repo.state
-	if _, ok := s.roots[event.ScheduleID]; !ok {
-		return scheduleconfig.ErrScheduleNotFound
-	}
-	s.events[event.ScheduleID] = append(s.events[event.ScheduleID], cloneEvent(*event))
-	return nil
-}
 
 func (t *scheduleConfigTx) InsertOverrideRevision(ctx context.Context, rev *scheduleconfig.OverrideRevision) error {
 	if err := t.repo.record("InsertOverrideRevision"); err != nil {

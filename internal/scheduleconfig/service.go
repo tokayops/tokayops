@@ -367,8 +367,8 @@ func (s *Service) appendRevision(ctx context.Context, tx ScheduleConfigTx, targe
 	if err := tx.AdvanceVersion(ctx, target.root.ID, target.root.ConfigVersion, target.effectiveAt); err != nil {
 		return nil, err
 	}
-	return s.recordChange(ctx, tx, trigger, &target.tail.ID, revision,
-		target.root.ConfigVersion, target.effectiveAt, actorID, before, after)
+	return s.recordChange(trigger, &target.tail.ID, revision,
+		target.root.ConfigVersion, target.effectiveAt, actorID, before, after), nil
 }
 
 // CreateSchedule creates a schedule and its first revision in one transaction.
@@ -473,10 +473,7 @@ func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID st
 	if err := tx.CreateInitialSchedule(ctx, root, revision); err != nil {
 		return nil, err
 	}
-	commit, err := s.recordChange(ctx, tx, TriggerCreated, nil, revision, 0, effectiveAt, actorID, before, after)
-	if err != nil {
-		return nil, err
-	}
+	commit := s.recordChange(TriggerCreated, nil, revision, 0, effectiveAt, actorID, before, after)
 
 	return &SaveResult{
 		Revision:    revision,
@@ -570,8 +567,8 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 	}
 	// Nobody is on duty after a delete, so the "after" pair is empty by
 	// construction rather than computed.
-	return s.recordChange(ctx, tx, TriggerDeleted, &target.tail.ID, deleted,
-		target.root.ConfigVersion, target.effectiveAt, cmd.ActorID, before, activeGroupPair{})
+	return s.recordChange(TriggerDeleted, &target.tail.ID, deleted,
+		target.root.ConfigVersion, target.effectiveAt, cmd.ActorID, before, activeGroupPair{}), nil
 }
 
 // tombstoneLiveOverrides appends a delete revision to every override that is
@@ -950,32 +947,17 @@ type commitLog struct {
 	after         activeGroupPair
 }
 
-// recordChange writes the domain event in the same transaction as the revision
-// it describes, and returns the line to log after the commit.
-func (s *Service) recordChange(ctx context.Context, tx ScheduleConfigTx, trigger string,
+// recordChange builds the line to log once the transaction commits.
+//
+// It used to also write a schedule_events row in the same transaction. That
+// table had no readers: the revision it described already carries the version,
+// the actor, the reason, the effective time, the snapshot and the change
+// summary, and the event's payload only named ids derivable from the chain.
+// A real consumer would need an outbox with a cursor, delivery and
+// idempotency - not a write-only audit table kept warm in case.
+func (s *Service) recordChange(trigger string,
 	oldRevisionID *string, revision *ScheduleRevision, oldVersion int64,
-	effectiveAt time.Time, actorID string, before, after activeGroupPair) (*commitLog, error) {
-
-	payload, err := json.Marshal(ConfigurationChangedPayload{
-		Trigger:       trigger,
-		OldRevisionID: oldRevisionID,
-		NewRevisionID: revision.ID,
-		OldVersion:    oldVersion,
-		NewVersion:    revision.Version,
-		EffectiveAt:   effectiveAt,
-		ActorID:       optionalString(actorID),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
-	}
-	if err := tx.InsertScheduleEvent(ctx, &ScheduleEvent{
-		ScheduleID: revision.ScheduleID,
-		EventType:  EventScheduleConfigurationChanged,
-		Payload:    payload,
-		RecordedAt: effectiveAt,
-	}); err != nil {
-		return nil, err
-	}
+	effectiveAt time.Time, actorID string, before, after activeGroupPair) *commitLog {
 
 	entry := &commitLog{
 		trigger:       trigger,
@@ -994,7 +976,7 @@ func (s *Service) recordChange(ctx context.Context, tx ScheduleConfigTx, trigger
 			entry.changeSummary = string(encoded)
 		}
 	}
-	return entry, nil
+	return entry
 }
 
 // logCommit writes one line per committed change.

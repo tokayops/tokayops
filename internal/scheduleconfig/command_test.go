@@ -141,54 +141,28 @@ func TestSaveCreatesOneRevisionAtomically(t *testing.T) {
 	if root.ConfigVersion != 2 || saved.Version != 2 {
 		t.Fatalf("config version = %d (result %d), want 2", root.ConfigVersion, saved.Version)
 	}
-
-	events := f.repo.Events(scheduleID)
-	if len(events) != 2 {
-		t.Fatalf("got %d events, want one per revision", len(events))
-	}
-	var payload scheduleconfig.ConfigurationChangedPayload
-	if err := json.Unmarshal(events[1].Payload, &payload); err != nil {
-		t.Fatalf("decode event payload: %v", err)
-	}
-	if payload.Trigger != scheduleconfig.TriggerSaved {
-		t.Fatalf("trigger = %q, want %q", payload.Trigger, scheduleconfig.TriggerSaved)
-	}
-	if payload.OldRevisionID == nil || *payload.OldRevisionID != revisions[0].ID {
-		t.Fatalf("old_revision_id = %v, want %s", payload.OldRevisionID, revisions[0].ID)
-	}
-	if payload.NewRevisionID != revisions[1].ID || payload.NewVersion != 2 || payload.OldVersion != 1 {
-		t.Fatalf("event payload does not describe the transition: %+v", payload)
-	}
-	if payload.ActorID == nil || *payload.ActorID != "bob" {
-		t.Fatalf("actor_id = %v, want bob", payload.ActorID)
-	}
 }
 
-func TestCreateWritesEventWithNullOldRevision(t *testing.T) {
+// A create has no revision before its first one, and the chain says so by
+// having exactly one revision whose version is 1. This used to be asserted
+// through the event payload's null old_revision_id; the chain states the same
+// fact and is the thing consumers actually read.
+func TestCreateLeavesExactlyOneRevisionAtVersionOne(t *testing.T) {
 	f := newFixture(t)
 	created := f.mustSave(t, scheduleconfig.SaveCommand{
 		Desired: groupsConfig(group(groupAlice, "alice")),
 		ActorID: "alice",
 	})
 
-	events := f.repo.Events(created.Revision.ScheduleID)
-	if len(events) != 1 {
-		t.Fatalf("got %d events, want 1", len(events))
+	revisions := f.repo.Revisions(created.Revision.ScheduleID)
+	if len(revisions) != 1 {
+		t.Fatalf("got %d revisions after a create, want 1", len(revisions))
 	}
-	var payload scheduleconfig.ConfigurationChangedPayload
-	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
-		t.Fatalf("decode event payload: %v", err)
+	if revisions[0].Version != 1 {
+		t.Fatalf("first revision version = %d, want 1", revisions[0].Version)
 	}
-	if payload.Trigger != scheduleconfig.TriggerCreated {
-		t.Fatalf("trigger = %q, want %q", payload.Trigger, scheduleconfig.TriggerCreated)
-	}
-	// There is no revision before the first one, and saying so with a null is
-	// what lets a consumer tell a create from an edit without a second field.
-	if payload.OldRevisionID != nil {
-		t.Fatalf("old_revision_id = %v, want null on a create", *payload.OldRevisionID)
-	}
-	if payload.OldVersion != 0 {
-		t.Fatalf("old_version = %d, want 0", payload.OldVersion)
+	if revisions[0].EffectiveTo != nil {
+		t.Fatal("the first revision must be the open-ended tail")
 	}
 }
 
@@ -360,12 +334,15 @@ func TestInsertFailureRollsBackClose(t *testing.T) {
 
 // The revision, the version and the event are one fact. A failure to record
 // the event must not leave a committed change nobody was told about.
-func TestEventFailureRollsBackEverything(t *testing.T) {
+func TestLastWriteFailureRollsBackEverything(t *testing.T) {
 	f := newFixture(t)
 	created := f.mustSave(t, scheduleconfig.SaveCommand{Desired: groupsConfig(group(groupAlice, "alice"))})
 
 	boom := errors.New("injected failure")
-	f.repo.FailOn["InsertScheduleEvent"] = boom
+	// The last write of the transaction. It used to be InsertScheduleEvent;
+	// with the event gone, AdvanceVersion is what commits last, and failing
+	// there still has to take the revision back with it.
+	f.repo.FailOn["AdvanceVersion"] = boom
 	f.clock.advance(time.Hour)
 
 	_, err := f.svc.Save(context.Background(), "devops", scheduleconfig.SaveCommand{
@@ -778,13 +755,10 @@ func TestDeleteInsertsDeletedRevision(t *testing.T) {
 		t.Fatalf("config version = %d, want 2", root.ConfigVersion)
 	}
 
-	events := f.repo.Events(scheduleID)
-	var payload scheduleconfig.ConfigurationChangedPayload
-	if err := json.Unmarshal(events[len(events)-1].Payload, &payload); err != nil {
-		t.Fatalf("decode event: %v", err)
-	}
-	if payload.Trigger != scheduleconfig.TriggerDeleted {
-		t.Fatalf("trigger = %q, want %q", payload.Trigger, scheduleconfig.TriggerDeleted)
+	// That this was a delete is stated by the revision kind, not by an event
+	// alongside it.
+	if deleted.Kind != scheduleconfig.RevisionDeleted {
+		t.Fatalf("tail kind = %q, want %q", deleted.Kind, scheduleconfig.RevisionDeleted)
 	}
 }
 

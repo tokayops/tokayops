@@ -9,7 +9,6 @@ package scheduleconfig
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -182,23 +181,6 @@ const (
 	LayerL2 = "l2"
 )
 
-// ScheduleEvent is a domain event recorded in the same transaction as the
-// change it describes.
-type ScheduleEvent struct {
-	ID         string
-	ScheduleID string
-	EventType  string
-	Payload    json.RawMessage
-	RecordedAt time.Time
-}
-
-// EventScheduleConfigurationChanged is the one event type every configuration
-// command emits. Create, save, delete and recreate are the same fact -
-// "the configuration of this schedule is now different" - and a consumer that
-// cares which one it was reads the trigger. Four event types would force every
-// consumer to subscribe to all four to stay correct.
-const EventScheduleConfigurationChanged = "schedule.configuration_changed"
-
 // Triggers of EventScheduleConfigurationChanged.
 const (
 	TriggerCreated   = "created"
@@ -206,20 +188,6 @@ const (
 	TriggerDeleted   = "deleted"
 	TriggerRecreated = "recreated"
 )
-
-// ConfigurationChangedPayload is the body of EventScheduleConfigurationChanged.
-// It names the revisions on both sides of the change rather than carrying the
-// configuration: a consumer that needs the snapshot reads the revision, and an
-// event log is not the place to duplicate it.
-type ConfigurationChangedPayload struct {
-	Trigger       string    `json:"trigger"`
-	OldRevisionID *string   `json:"old_revision_id"`
-	NewRevisionID string    `json:"new_revision_id"`
-	OldVersion    int64     `json:"old_version"`
-	NewVersion    int64     `json:"new_version"`
-	EffectiveAt   time.Time `json:"effective_at"`
-	ActorID       *string   `json:"actor_id"`
-}
 
 // ScheduleConfigRepository hands out a unit of work. Everything a command does
 // happens inside one WithinTx call; an error returned from fn rolls the whole
@@ -261,8 +229,6 @@ type ScheduleConfigTx interface {
 
 	// AdvanceVersion is a compare-and-set on config_version.
 	AdvanceVersion(ctx context.Context, scheduleID string, expected int64, at time.Time) error
-
-	InsertScheduleEvent(ctx context.Context, event *ScheduleEvent) error
 
 	InsertOverrideRevision(ctx context.Context, rev *OverrideRevision) error
 

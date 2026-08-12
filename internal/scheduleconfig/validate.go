@@ -2,7 +2,6 @@ package scheduleconfig
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -223,36 +222,5 @@ func PrepareOverrideRevision(rev *OverrideRevision) error {
 			ErrInvariantViolation, rev.ValidFrom, rev.ValidTo)
 	}
 	rev.RecordedAt = normalizeRecordedAt(rev.RecordedAt)
-	return nil
-}
-
-// PrepareScheduleEvent fills in the identifier, the empty payload and the
-// recorded time, then checks the rest.
-//
-// A nil event is an error, not a no-op: an event that has to accompany a
-// configuration change would otherwise let a failure to assemble it commit as
-// a change with no audit trail.
-func PrepareScheduleEvent(event *ScheduleEvent) error {
-	if event == nil {
-		return fmt.Errorf("%w: nil schedule event", ErrInvariantViolation)
-	}
-	if event.ScheduleID == "" {
-		return fmt.Errorf("%w: schedule event needs a schedule id", ErrInvariantViolation)
-	}
-	if event.EventType == "" {
-		return fmt.Errorf("%w: schedule event needs a type", ErrInvariantViolation)
-	}
-	if event.ID == "" {
-		event.ID = uuid.New().String()
-	}
-	if len(event.Payload) == 0 {
-		event.Payload = json.RawMessage("{}")
-	}
-	// Checked here so a malformed payload reads as a contract violation rather
-	// than as a raw database JSON parse error.
-	if !json.Valid(event.Payload) {
-		return fmt.Errorf("%w: schedule event payload is not valid JSON", ErrInvariantViolation)
-	}
-	event.RecordedAt = normalizeRecordedAt(event.RecordedAt)
 	return nil
 }

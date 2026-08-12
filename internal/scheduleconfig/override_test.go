@@ -190,8 +190,10 @@ func TestOverrideDoesNotAdvanceVersionOrEmitEvent(t *testing.T) {
 	if root.ConfigVersion != 1 {
 		t.Fatalf("config version = %d, want it unchanged at 1", root.ConfigVersion)
 	}
-	if got := len(f.repo.Events(scheduleID)); got != 1 {
-		t.Fatalf("got %d events, want only the one from the create", got)
+	// An override command touches override revisions only: the schedule's own
+	// revision chain must not gain anything.
+	if got := len(f.repo.Revisions(scheduleID)); got != 1 {
+		t.Fatalf("got %d schedule revisions, want only the one from the create", got)
 	}
 }
 

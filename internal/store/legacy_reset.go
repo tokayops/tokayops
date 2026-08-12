@@ -81,7 +81,7 @@ func RunLegacyScheduleReset(db *sql.DB) (*ResetResult, error) {
 
 	// Any of these tables holding rows means the new write path has already
 	// been used against this database.
-	for _, table := range []string{"schedule_revisions", "schedule_override_revisions", "schedule_events"} {
+	for _, table := range []string{"schedule_revisions", "schedule_override_revisions"} {
 		var populated bool
 		// nosemgrep: string-formatted-query - table names are hardcoded, not user input
 		if err := tx.QueryRow(fmt.Sprintf(`SELECT EXISTS(SELECT 1 FROM %s)`, table)).Scan(&populated); err != nil {

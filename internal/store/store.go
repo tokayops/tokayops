@@ -594,19 +594,6 @@ func (s *Store) InitDB() error {
 	CREATE INDEX IF NOT EXISTS idx_schedule_override_revisions_range
 		ON schedule_override_revisions(schedule_id, valid_from);
 
-	-- Schedule domain events, written in the same transaction as the revision
-	-- they describe. Delivery columns are intentionally absent: consumers are
-	-- internal, event_outbox stays bound to alert_groups.
-	CREATE TABLE IF NOT EXISTS schedule_events (
-		id          TEXT PRIMARY KEY,
-		schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE RESTRICT,
-		event_type  TEXT NOT NULL,
-		payload     JSONB NOT NULL DEFAULT '{}',
-		recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_schedule_events_schedule
-		ON schedule_events(schedule_id, recorded_at);
-
 	-- Markers for one-shot operational migrations that must never run twice.
 	CREATE TABLE IF NOT EXISTS migration_markers (
 		name       TEXT PRIMARY KEY,

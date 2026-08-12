@@ -63,7 +63,6 @@ func setupTestDB(t *testing.T) *Store {
 		"integrations",
 		"schedule_revisions",
 		"schedule_override_revisions",
-		"schedule_events",
 		"migration_markers",
 		"schedule_overrides",
 		"schedule_users",
