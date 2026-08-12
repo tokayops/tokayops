@@ -38,16 +38,16 @@ type LayerOnCall struct {
 // OnCall is the current-assignment projection. A nil layer means nobody is on
 // duty there - the layer is off, has no groups, or the schedule did not exist
 // at that instant.
+//
+// It carries no warnings. The two that remain - history_incomplete and
+// schedule_inactive - are about a RANGE, and this type answers about one
+// instant: at that instant a schedule is either readable or it is not, and
+// unreadable is an error rather than a note attached to a guess.
 type OnCall struct {
 	At time.Time
 	L1 *LayerOnCall
 	L2 *LayerOnCall
 }
-
-// It carries no warnings. The two that remain - history_incomplete and
-// schedule_inactive - are about a RANGE, and this type answers about one
-// instant: at that instant a schedule is either readable or it is not, and
-// unreadable is an error now rather than a note attached to a guess.
 
 // layerSlot is the grid slot of one layer at the queried instant, already
 // clipped to the revision.

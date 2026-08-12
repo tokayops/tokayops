@@ -78,8 +78,6 @@ type ScheduleReadView interface {
 	// A nil bound means unbounded on that side. The projection is always the
 	// current one: what was known at an earlier system time is not a product
 	// capability, and the contract stopped promising it.
-	// state; a value means the state as it was recorded at that system time,
-	// which is what lets history be replayed as it was known then.
 	GetOverrideProjectionInRange(ctx context.Context, scheduleID string, from, until *time.Time) ([]OverrideRevision, error)
 
 	// GetRevisionByID returns one revision of one schedule. The schedule ID is

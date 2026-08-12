@@ -12,11 +12,6 @@ import "github.com/prometheus/client_golang/prometheus"
 // which no HTTP metric can see.
 var (
 
-
-
-
-
-
 	// ScheduleOnCallNotificationsTotal counts notification jobs actually
 	// created, not on-call changes detected. The two differ whenever more than
 	// one instance is running: both observe the same handoff, the dedup key

@@ -114,15 +114,15 @@ func renderSlot(in slotInput) ([]Assignment, error) {
 	return out, nil
 }
 
-// overridesForSlot keeps the overrides that reach the bound, in a stable
-// order. Their own validity intervals are left intact: the bound decides which
-// pieces are reported, not what an override covers.
+// overridesForSlot keeps the overrides that reach the bound. Their own
+// validity intervals are left intact: the bound decides which pieces are
+// reported, not what an override covers.
 //
-// The sort is what makes the result independent of the order the caller
-// supplied: overlapping overrides must resolve the same way no matter how the
-// projection happened to return them. Priority is the later recorded_at, and
-// for two recorded in the same microsecond the greater override_id - an
-// arbitrary but total rule, which is what determinism requires.
+// The result is deliberately unordered. It used to be sorted by recorded_at so
+// that the last recorded override won a collision; nothing wins one now - two
+// live overrides on one layer are refused - and nothing downstream depends on
+// the order: elementaryPoints sorts its own boundaries, and the ids in the
+// refusal are sorted where the message is built.
 func overridesForSlot(overrides []scheduleconfig.OverrideRevision, bound interval) []scheduleconfig.OverrideRevision {
 	out := make([]scheduleconfig.OverrideRevision, 0, len(overrides))
 	for _, o := range overrides {
@@ -131,11 +131,6 @@ func overridesForSlot(overrides []scheduleconfig.OverrideRevision, bound interva
 		}
 		out = append(out, o)
 	}
-	// Sorted by id alone. It used to be recorded_at first, so that the last
-	// recorded override won a collision; nothing wins one now, and the only
-	// remaining requirement is a stable order so the elementary points and any
-	// error message come out the same on every run.
-	sort.SliceStable(out, func(i, j int) bool { return out[i].OverrideID < out[j].OverrideID })
 	return out
 }
 
