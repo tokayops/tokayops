@@ -20,7 +20,7 @@ import { showToast, escapeHtml, openModal } from '/js/core/utils.js';
 import { beginModalSession, modalShell } from '/js/core/modal-session.js';
 import { initTimezonePicker } from '/js/core/timezone-picker.js';
 import { resolveNames, assignableMembers } from '/js/core/users-directory.js';
-import { reportOverrideError } from '/js/modules/schedule-shared.js';
+import { reportOverrideError } from '/js/modules/schedule-errors.js';
 import { overrideModal, overridesList } from '/js/modules/schedule-components.js';
 import { resolveLocalTime, gapMessage, instantToLocalInput } from '/js/core/zoned-time.js';
 
@@ -66,12 +66,20 @@ export async function openOverrideModal(teamId, options = {}) {
         },
     });
 
-    /** Leave the modal the way this open is supposed to be left. */
+    /**
+     * Leave the modal the way this open is supposed to be left.
+     *
+     * `closeModal` rather than `close` then `closeModal`: closing the session
+     * first would give up the screen, and the shell is only closed by the
+     * session that still owns it.
+     */
     function leave() {
+        if (!options.returnTo) {
+            session.closeModal();
+            return undefined;
+        }
         session.close();
-        if (options.returnTo) return options.returnTo();
-        session.closeModal();
-        return undefined;
+        return options.returnTo();
     }
 
     try {
@@ -120,6 +128,11 @@ export async function openOverrideModal(teamId, options = {}) {
         if (session.closed) return null;
         console.error('Failed to open override modal:', error);
         showToast('Failed to load overrides: ' + error.message, 'error');
+        // Nothing was drawn, so there is nothing here to keep a session for.
+        // Opened from the calendar, that means going back to it: the calendar
+        // this replaced is on screen but its session ended when this one
+        // began, so what is showing is a picture with no listeners behind it.
+        await leave();
         return null;
     }
 }
@@ -432,12 +445,25 @@ async function handleSubmit(e, session, state, options, leave) {
             showToast('Override created', 'success');
         }
 
-        resetForm(state);
-        await Promise.all([leave(), options.onChanged?.(teamId)]);
+        // A change that lands after this modal was replaced is still worth
+        // reporting and still worth redrawing the widgets for. What it must
+        // not do is reset a form or navigate away from somebody else's modal.
+        let leaving;
+        if (!session.closed) {
+            resetForm(state);
+            leaving = leave();
+        }
+        await Promise.all([leaving, options.onChanged?.(teamId)]);
     } catch (error) {
         console.error('Failed to save override:', error);
         await reportOverrideError(error, {
+            // The refusal is reported either way - that happens above, and it
+            // is true wherever the user is. Recovering the form is not: this
+            // one reaches for the title and the footer by shape, and by now
+            // they may belong to a modal that is in the middle of its own
+            // edit. The whole recovery goes, not just the part that redraws.
             onStale: async () => {
+                if (session.closed) return;
                 resetForm(state);
                 await refreshList(session, state);
             },

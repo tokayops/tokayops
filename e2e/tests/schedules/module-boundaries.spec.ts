@@ -31,6 +31,7 @@ const FEATURE_MODULES = [
   'schedule-calendar.js',
 ];
 const SHARED_MODULE = 'schedule-shared.js';
+const ERRORS_MODULE = 'schedule-errors.js';
 const COMPONENTS_MODULE = 'schedule-components.js';
 
 type Edge = { spec: string; kind: 'import' | 'export' | 'dynamic' };
@@ -101,12 +102,36 @@ const callsOn = (object: string, method: string) => (node: ts.Node) =>
   && ts.isIdentifier(node.expression.expression)
   && node.expression.expression.text === object;
 
-/** Bindings declared beside the module rather than inside a call. */
-function moduleLevelMutables(file: string): string[] {
+/** Everything declared beside the module rather than inside a call. */
+function moduleLevelVariables(file: string): string[] {
   return parse(file).statements
     .filter(ts.isVariableStatement)
-    .filter(statement => (statement.declarationList.flags & ts.NodeFlags.Const) === 0)
     .flatMap(statement => statement.declarationList.declarations.map(d => d.name.getText()));
+}
+
+/**
+ * Module-level bindings that can still be changed.
+ *
+ * `const` is not the question - `const state = {}` is as much state as
+ * `let state`, and it was one of the ten this split was about. What counts is
+ * whether the value can be written to, so the only module-level binding a
+ * shared module may hold is a frozen one.
+ */
+function unfrozenModuleLevelVariables(file: string): string[] {
+  return parse(file).statements
+    .filter(ts.isVariableStatement)
+    .flatMap(statement => statement.declarationList.declarations
+      .filter(declaration => {
+        if ((statement.declarationList.flags & ts.NodeFlags.Const) === 0) return true;
+        const value = declaration.initializer;
+        if (!value) return true;
+        // A frozen literal, or a primitive that cannot be mutated at all.
+        if (ts.isStringLiteral(value) || ts.isNumericLiteral(value)) return false;
+        return !(ts.isCallExpression(value)
+          && ts.isPropertyAccessExpression(value.expression)
+          && value.expression.name.text === 'freeze');
+      })
+      .map(declaration => declaration.name.getText()));
 }
 
 test.describe('schedule module boundaries', () => {
@@ -145,12 +170,26 @@ test.describe('schedule module boundaries', () => {
   test('the shared module holds values, not the feature', () => {
     const file = path.join(MODULES, SHARED_MODULE);
 
-    expect(targets(edgesOf(file), [...FEATURE_MODULES, ROOT_MODULE, COMPONENTS_MODULE]),
-      'shared code that imports the feature is the feature').toEqual([]);
+    // It says of itself that it is values and transformations, so it imports
+    // nothing at all: not the feature, and not the toast either. What the UI
+    // says when something fails is an opinion about the screen, and it lives
+    // next door in schedule-errors.js.
+    expect(edgesOf(file).map(edge => edge.spec),
+      'a shared module with dependencies is a shared module with opinions').toEqual([]);
     expect(count(file, readsGlobal('API')),
       'a request here would make this the place flows reassemble').toBe(0);
-    expect(moduleLevelMutables(file),
+    expect(unfrozenModuleLevelVariables(file),
       'state beside a shared module outlives every screen that reads it').toEqual([]);
+  });
+
+  test('the errors module explains, and leaves recovery to its caller', () => {
+    const file = path.join(MODULES, ERRORS_MODULE);
+
+    expect(targets(edgesOf(file), [...FEATURE_MODULES, ROOT_MODULE, COMPONENTS_MODULE]),
+      'the module that names failures must not know which screens have them').toEqual([]);
+    expect(count(file, readsGlobal('API')),
+      'it says what went wrong; retrying is the caller\'s business').toBe(0);
+    expect(moduleLevelVariables(file), 'it remembers nothing between failures').toEqual([]);
   });
 
   test('the root wires, and does nothing else', () => {
@@ -164,7 +203,10 @@ test.describe('schedule module boundaries', () => {
     expect(count(file, assignsInnerHtml), 'the root writes no markup').toBe(0);
     expect(count(file, callsOn('document', 'addEventListener')),
       'one listener, for the life of the page').toBe(1);
-    expect(moduleLevelMutables(file), 'the root remembers nothing between calls').toEqual([]);
+    // Not "no `let`": `const current = {}` would be the same module-level
+    // state under a keyword that only promises the binding will not be
+    // reassigned. The root holds no module-level binding of any kind.
+    expect(moduleLevelVariables(file), 'the root remembers nothing between calls').toEqual([]);
 
     const componentEdges = targets(edges, [COMPONENTS_MODULE]);
     expect(componentEdges.map(edge => edge.kind),

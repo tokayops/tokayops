@@ -18,6 +18,7 @@
  *   schedule-calendar.js    the calendar and the menu on an override
  *   schedule-components.js  the markup all of them render
  *   schedule-shared.js      values and transformations they agree on
+ *   schedule-errors.js      what they say when the server refuses something
  */
 
 import {

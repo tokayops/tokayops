@@ -20,7 +20,7 @@ import { showToast, escapeHtml, openModal } from '/js/core/utils.js';
 import { beginModalSession, modalShell } from '/js/core/modal-session.js';
 import { initTimezonePicker } from '/js/core/timezone-picker.js';
 import { resolveNames, assignableMembers, invalidateNames } from '/js/core/users-directory.js';
-import { onScheduleError } from '/js/modules/schedule-shared.js';
+import { onScheduleError } from '/js/modules/schedule-errors.js';
 import { scheduleConfigModal, schedulePreview } from '/js/modules/schedule-components.js';
 
 /**
@@ -97,6 +97,10 @@ async function renderEditor(session, teamId, options) {
         // over whatever is on screen now.
         if (session.closed) return;
         console.error('Failed to open schedule modal:', error);
+        // The editor never appeared, so this session has nothing to own. Left
+        // open, its dismissal listeners would answer for whatever is on
+        // screen until the next modal replaced them.
+        session.closeModal();
         await onScheduleError(error);
     }
 }
@@ -524,8 +528,14 @@ async function showPreviewStep(session, { teamId, config, preview, expectedVersi
             // the refresh below asks the separate question of who is on
             // call now. The preview was always advisory; a warning that it
             // "differed" only ever restated that.
-            previewHost.remove();
-            session.closeModal();
+            //
+            // What the save did is said either way; the screen is only
+            // touched while this is still the screen. A save that lands
+            // after its modal was replaced has nothing here to close.
+            if (!session.closed) {
+                previewHost.remove();
+                session.closeModal();
+            }
             await options.onChanged?.(teamId);
         } catch (error) {
             console.error('Failed to save schedule:', error);
@@ -546,6 +556,10 @@ async function showPreviewStep(session, { teamId, config, preview, expectedVersi
 function handleSaveError(error, session, teamId, options) {
     const reopen = (message) => {
         showToast(message, 'error');
+        // Reopening replaces whatever is on screen with this team's editor,
+        // which is right while this editor is on screen and wrong once
+        // something else is. The refusal is still reported.
+        if (session.closed) return;
         session.closeModal();
         openScheduleEditor(teamId, options);
     };
@@ -581,13 +595,14 @@ async function handleScheduleDelete(session, teamId, options) {
             document.getElementById('schedule-form')?.dataset.expectedVersion, 10) || 0;
         await API.schedules.deleteSchedule(teamId, version);
         showToast('Schedule deleted', 'success');
-        session.closeModal();
+        if (!session.closed) session.closeModal();
         await options.onChanged?.(teamId);
     } catch (error) {
         console.error('Failed to delete schedule:', error);
         await onScheduleError(error, {
             schedule_version_conflict: () => {
                 showToast('Someone else changed this schedule. Reopening it.', 'error');
+                if (session.closed) return;
                 session.closeModal();
                 openScheduleEditor(teamId, options);
             },

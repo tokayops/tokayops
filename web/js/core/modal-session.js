@@ -75,9 +75,20 @@ export function beginModalSession({ onDismiss } = {}) {
             if (active === session) active = null;
             controller.abort();
         },
+        /**
+         * End the session and, if it is still the one on screen, close the
+         * shell with it.
+         *
+         * The ownership check is the whole point. A write is not aborted when
+         * its modal closes - it has already changed something - so the code
+         * that resumes afterwards still holds this session and will try to
+         * close "its" modal. By then the shell belongs to whatever opened
+         * next, and closing it would close somebody else's work.
+         */
         closeModal() {
+            const onScreen = active === session;
             session.close();
-            closeModalById(OVERLAY_ID);
+            if (onScreen) closeModalById(OVERLAY_ID);
         },
     };
 

@@ -17,6 +17,20 @@ import { test, expect, Page } from '@playwright/test';
 
 const HARNESS = '/__schedule-session-harness';
 
+/**
+ * The modules are served by the app, so they are imported through variables.
+ * A literal specifier would send the type-checker looking for files that are
+ * not part of this project, and it would be right: they are not.
+ */
+const MODULES = {
+  utils: '/js/core/utils.js',
+  permissions: '/js/modules/permissions.js',
+  schedules: '/js/modules/schedules.js',
+  session: '/js/core/modal-session.js',
+};
+
+type Listener = { type: string; aborted: boolean };
+
 const HARNESS_HTML = `<!doctype html><title>harness</title>
 <div id="toast-container"></div>
 <div id="modal-overlay" class="modal-overlay">
@@ -44,14 +58,21 @@ async function boot(page: Page) {
     route.fulfill({ contentType: 'text/html', body: HARNESS_HTML }));
   await page.goto(HARNESS);
 
-  await page.evaluate(async () => {
+  await page.evaluate(async (modules: typeof MODULES) => {
     const w = window as any;
 
     const harness: any = {
       listeners: [] as any[],
-      calls: { created: 0, updated: 0, deleted: 0, overrideSignals: [] as any[] },
+      calls: { created: 0, updated: 0, deleted: 0, saved: 0, overrideSignals: [] as any[] },
       holdOverrides: false,
       releaseOverrides: null as any,
+      // Writes are never aborted when a modal closes, so they are the ones
+      // that can come back to a screen that has moved on.
+      holdWrites: false,
+      releaseWrite: null as any,
+      failSave: false,
+      failUpdate: false,
+      failMembers: false,
       overrides: [{
         override_id: 'ovr-1',
         revision: 3,
@@ -70,7 +91,10 @@ async function boot(page: Page) {
 
     w.API = {
       teams: {
-        members: async () => ({ users: [{ id: 'u1', name: 'Ann' }, { id: 'u2', name: 'Ben' }] }),
+        members: async () => {
+          if (harness.failMembers) throw new Error('members unavailable');
+          return { users: [{ id: 'u1', name: 'Ann' }, { id: 'u2', name: 'Ben' }] };
+        },
       },
       users: {
         resolve: async (ids: string[]) => ({ users: ids.map(id => ({ id, name: `User ${id}` })) }),
@@ -108,15 +132,53 @@ async function boot(page: Page) {
           }],
           warnings: [],
         }),
-        createOverride: async () => { harness.calls.created += 1; return {}; },
-        updateOverride: async () => { harness.calls.updated += 1; return {}; },
+        preview: async () => ({
+          base_version: 1,
+          on_call_changed: false,
+          on_call_before: { l1: { user_ids: ['u1'] } },
+          on_call_after: { l1: { user_ids: ['u1'] } },
+          entries: [],
+          warnings: [],
+          evaluated_at: new Date().toISOString(),
+        }),
+        saveConfig: async () => {
+          harness.calls.saved += 1;
+          if (harness.holdWrites) {
+            await new Promise(resolve => { harness.releaseWrite = resolve; });
+          }
+          if (harness.failSave) {
+            throw Object.assign(new Error('someone else saved it'), {
+              status: 409, code: 'schedule_version_conflict', body: {},
+            });
+          }
+          return { noop: false };
+        },
+        createOverride: async () => {
+          harness.calls.created += 1;
+          if (harness.holdWrites) {
+            await new Promise(resolve => { harness.releaseWrite = resolve; });
+          }
+          return {};
+        },
+        updateOverride: async () => {
+          harness.calls.updated += 1;
+          if (harness.holdWrites) {
+            await new Promise(resolve => { harness.releaseWrite = resolve; });
+          }
+          if (harness.failUpdate) {
+            throw Object.assign(new Error('someone else changed it'), {
+              status: 409, code: 'override_revision_conflict', body: {},
+            });
+          }
+          return {};
+        },
         deleteOverride: async () => { harness.calls.deleted += 1; return {}; },
       },
     };
 
-    const utils = await import('/js/core/utils.js');
+    const utils = await import(modules.utils);
     utils.initElements();
-    const permissions = await import('/js/modules/permissions.js');
+    const permissions = await import(modules.permissions);
     permissions.Permissions.init({ id: 'u1', name: 'Ann', role: 'admin', teams: {} });
 
     const original = EventTarget.prototype.addEventListener;
@@ -130,7 +192,7 @@ async function boot(page: Page) {
       return original.call(this, type, handler, options);
     };
 
-    const schedules = await import('/js/modules/schedules.js');
+    const schedules = await import(modules.schedules);
     schedules.bindScheduleEvents();
     harness.mark = harness.listeners.length;
 
@@ -140,11 +202,11 @@ async function boot(page: Page) {
         <button class="view-schedule-btn" data-team-id="team-1">View</button>
         <button class="edit-schedule-btn" data-team-id="team-1">Configure</button>
       </div>`;
-  });
+  }, MODULES);
 }
 
 /** What the schedule modules registered while a modal was open, and its fate. */
-async function sessionListeners(page: Page) {
+async function sessionListeners(page: Page): Promise<{ session: Listener[]; page: Listener[] }> {
   return page.evaluate(() => {
     const harness = (window as any).__h;
     const owned = (entry: any) => entry.from.includes('/js/modules/schedule-')
@@ -166,14 +228,34 @@ async function openOverrideModal(page: Page) {
   await page.locator('#override-form').waitFor({ state: 'attached' });
 }
 
+async function openEditor(page: Page) {
+  await page.locator('.edit-schedule-btn').click();
+  await page.locator('#schedule-form').waitFor({ state: 'attached' });
+}
+
+/** Hold the next write open, and hand back the release. */
+async function holdWrites(page: Page) {
+  await page.evaluate(() => { (window as any).__h.holdWrites = true; });
+  return async () => {
+    await page.waitForFunction(() => (window as any).__h.releaseWrite !== null);
+    await page.evaluate(() => (window as any).__h.releaseWrite());
+    await page.waitForTimeout(100);
+  };
+}
+
+async function waitForToast(page: Page) {
+  await page.waitForFunction(() =>
+    document.querySelectorAll('#toast-container .toast').length > 0);
+}
+
 test.describe('modal session', () => {
   test.beforeEach(async ({ page }) => {
     await boot(page);
   });
 
   test('close() is idempotent, and aborts once', async ({ page }) => {
-    const result = await page.evaluate(async () => {
-      const { beginModalSession } = await import('/js/core/modal-session.js');
+    const result = await page.evaluate(async (module: string) => {
+      const { beginModalSession } = await import(module);
       const session = beginModalSession();
 
       let aborts = 0;
@@ -184,7 +266,7 @@ test.describe('modal session', () => {
       session.closeModal();
 
       return { aborts, closed: session.closed };
-    });
+    }, MODULES.session);
 
     // Four ways out of a modal run into each other: cancel closes and then
     // Escape arrives, or the X is clicked twice. The second one through has to
@@ -194,15 +276,39 @@ test.describe('modal session', () => {
   });
 
   test('a new modal starts a session the old one cannot reach', async ({ page }) => {
-    const result = await page.evaluate(async () => {
-      const { beginModalSession } = await import('/js/core/modal-session.js');
+    const result = await page.evaluate(async (module: string) => {
+      const { beginModalSession } = await import(module);
       const first = beginModalSession();
       const second = beginModalSession();
       return { first: first.closed, second: second.closed };
-    });
+    }, MODULES.session);
 
     expect(result.first, 'opening a modal ends the one it replaced').toBe(true);
     expect(result.second).toBe(false);
+  });
+
+  test('a session that is no longer on screen cannot close the shell', async ({ page }) => {
+    const result = await page.evaluate(async (module: string) => {
+      const { beginModalSession } = await import(module);
+      const overlay = document.getElementById('modal-overlay')!;
+
+      const first = beginModalSession();
+      overlay.classList.add('active');
+      // Whatever opened next took the screen, and with it the right to close
+      // it. `first` is what a write still holds when it finishes late.
+      const second = beginModalSession();
+      overlay.classList.add('active');
+
+      first.closeModal();
+      const afterStale = overlay.classList.contains('active');
+      second.closeModal();
+
+      return { afterStale, afterOwner: overlay.classList.contains('active') };
+    }, MODULES.session);
+
+    expect(result.afterStale,
+      'a modal nobody is looking at closed the one they are').toBe(true);
+    expect(result.afterOwner, 'and the session on screen still closes it').toBe(false);
   });
 
   for (const exit of ['cancel', 'close button', 'overlay', 'Escape'] as const) {
@@ -298,6 +404,133 @@ test.describe('modal session', () => {
     expect(aborted[0],
       'the signal reached the request, so a real fetch would have been cancelled').toBe(true);
   });
+
+  test('a save that lands after its modal was replaced leaves the new one alone',
+    async ({ page }) => {
+      await openEditor(page);
+      const release = await holdWrites(page);
+
+      await page.locator('#schedule-form-submit').click();
+      await page.locator('#preview-confirm').waitFor({ state: 'attached' });
+      await page.locator('#preview-confirm').click();
+
+      // The editor is dismissed while its save is still in flight, and an
+      // override modal takes the screen.
+      await page.locator('#modal-close').click();
+      await openOverrideModal(page);
+
+      await release();
+
+      // The save is not cancelled - it had already changed something - but the
+      // modal it belonged to is gone, and closing "its" modal now would close
+      // this one.
+      await expect(page.locator('#modal-overlay'),
+        'the save closed the modal that replaced it').toHaveClass(/active/);
+      await expect(page.locator('#override-form')).toBeAttached();
+    });
+
+  test('a refused save does not reopen its editor over the modal that replaced it',
+    async ({ page }) => {
+      await openEditor(page);
+      await page.evaluate(() => { (window as any).__h.failSave = true; });
+      const release = await holdWrites(page);
+
+      await page.locator('#schedule-form-submit').click();
+      await page.locator('#preview-confirm').waitFor({ state: 'attached' });
+      await page.locator('#preview-confirm').click();
+
+      await page.locator('#modal-close').click();
+      await openOverrideModal(page);
+
+      await release();
+
+      // A version conflict reopens the editor, which is right while the editor
+      // is on screen and is somebody else's modal once it is not.
+      await expect(page.locator('#schedule-form'),
+        'the refusal reopened an editor over the override modal').toHaveCount(0);
+      await expect(page.locator('#override-form')).toBeAttached();
+    });
+
+  test('an override created after its modal was replaced leaves the new one alone',
+    async ({ page }) => {
+      await openOverrideModal(page);
+      await page.locator('#override-user').selectOption('u2');
+      const release = await holdWrites(page);
+
+      await page.locator('#modal-footer button[type="submit"]').click();
+      await page.locator('#modal-close').click();
+      await openEditor(page);
+
+      await release();
+
+      await expect(page.locator('#modal-overlay')).toHaveClass(/active/);
+      await expect(page.locator('#schedule-form')).toBeAttached();
+      // resetForm() reaches for the footer by shape, not by ownership, so a
+      // create finishing late used to relabel whatever button was there.
+      await expect(page.locator('#modal-footer button[type="submit"]'),
+        'the finished create rewrote the new modal\'s footer').toHaveText(/Review changes/);
+    });
+
+  test('a refused update does not recover the form of the modal that replaced it',
+    async ({ page }) => {
+      const submit = page.locator('#modal-footer button[type="submit"]');
+
+      await openOverrideModal(page);
+      await page.locator('.edit-override-btn').first().click();
+      await expect(submit).toHaveText('Save Changes');
+
+      await page.evaluate(() => { (window as any).__h.failUpdate = true; });
+      const release = await holdWrites(page);
+      await submit.click();
+
+      // A is dismissed mid-write; B opens and is editing an override of its
+      // own by the time A's refusal arrives.
+      await page.locator('#modal-close').click();
+      await openOverrideModal(page);
+      await page.locator('.edit-override-btn').first().click();
+      await expect(submit).toHaveText('Save Changes');
+
+      await release();
+
+      // Recovering A's form here would put B's form back to "create" while
+      // B's session went on editing - the screen and the session disagreeing
+      // about what the next submit does.
+      await expect(submit,
+        'the refusal reset the form of a modal that was editing').toHaveText('Save Changes');
+      await expect(page.locator('.override-form-title')).toContainText('Edit Override');
+    });
+
+  test('a modal that could not load leaves no listeners behind', async ({ page }) => {
+    await page.evaluate(() => { (window as any).__h.failMembers = true; });
+    await page.locator('.create-override-btn').click();
+    await waitForToast(page);
+
+    const listeners = await sessionListeners(page);
+    expect(listeners.session.filter(l => !l.aborted),
+      'a modal that never appeared still owns the keyboard').toEqual([]);
+    expect(listeners.page.filter(l => l.aborted),
+      'and it took the dispatcher with it').toEqual([]);
+  });
+
+  test('an override that fails to load from the calendar hands the calendar back',
+    async ({ page }) => {
+      await page.locator('.view-schedule-btn').click();
+      await page.locator('.calendar-list').waitFor({ state: 'attached' });
+      await page.locator('.calendar-entry.layer-override').first().click();
+      await expect(page.locator('.override-context-menu.active')).toBeAttached();
+
+      await page.evaluate(() => { (window as any).__h.failMembers = true; });
+      await page.locator('.override-context-menu-item[data-action="edit"]').click();
+      await waitForToast(page);
+
+      // The calendar was already on screen when the override modal took over,
+      // so failing to load leaves a picture with nothing behind it unless the
+      // way out is the ordinary one.
+      await page.locator('.calendar-list').waitFor({ state: 'attached' });
+      await page.locator('.calendar-entry.layer-override').first().click();
+      await expect(page.locator('.override-context-menu.active'),
+        'the calendar came back dead').toBeAttached();
+    });
 
   test('a reopened modal does not remember what the last one was editing', async ({ page }) => {
     await openOverrideModal(page);
