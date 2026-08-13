@@ -19,7 +19,7 @@ func TestParseHandoffTime(t *testing.T) {
 		{in: "24:00", wantErr: true},
 		{in: "25:00", wantErr: true},
 		{in: "11:60", wantErr: true},
-		{in: "9:00", wantErr: true},  // missing leading zero is not canonical
+		{in: "9:00", wantErr: true}, // missing leading zero is not canonical
 		{in: "09:5", wantErr: true},
 		{in: "011:00", wantErr: true},
 		{in: "11.00", wantErr: true},

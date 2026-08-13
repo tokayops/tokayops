@@ -16,7 +16,7 @@
  * finish into another one's modal.
  */
 
-import { showToast, escapeHtml, openModal } from '/js/core/utils.js';
+import { showToast, escapeHtml, escapeAttr, openModal } from '/js/core/utils.js';
 import { beginModalSession, modalShell } from '/js/core/modal-session.js';
 import { initTimezonePicker } from '/js/core/timezone-picker.js';
 import { resolveNames, assignableMembers, invalidateNames } from '/js/core/users-directory.js';
@@ -215,7 +215,7 @@ function initGroupsEditor(session, editorId, addGroupBtnId, members) {
     const buildOptions = () => {
         const opts = ['<option value="">+ Add user</option>'];
         for (const u of members) {
-            opts.push(`<option value="${escapeHtml(u.id)}">${escapeHtml(u.name)}</option>`);
+            opts.push(`<option value="${escapeAttr(u.id)}">${escapeHtml(u.name)}</option>`);
         }
         return opts.join('');
     };

@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // ProviderCapabilitiesLookup is the read-only view of the dispatcher's

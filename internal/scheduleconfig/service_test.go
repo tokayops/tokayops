@@ -21,9 +21,9 @@ const (
 func validConfig() rotation.ScheduleConfiguration {
 	monday := 1
 	weekly := rotation.RotationPolicy{
-		Cadence:       model.RotationWeekly,
-		HandoffTime:   "11:00",
-		HandoffDay:    &monday,
+		Cadence:     model.RotationWeekly,
+		HandoffTime: "11:00",
+		HandoffDay:  &monday,
 	}
 	return rotation.ScheduleConfiguration{
 		Timezone:         "Europe/Amsterdam",

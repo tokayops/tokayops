@@ -65,18 +65,18 @@ const (
 
 // Job represents a background execution unit (e.g., escalation workflow)
 type Job struct {
-	ID          string          `json:"id" db:"id"`
-	Type        string          `json:"type" db:"type"`
-	Status      JobStatus       `json:"status" db:"status"`
-	Payload     json.RawMessage `json:"payload" db:"payload"`
+	ID           string          `json:"id" db:"id"`
+	Type         string          `json:"type" db:"type"`
+	Status       JobStatus       `json:"status" db:"status"`
+	Payload      json.RawMessage `json:"payload" db:"payload"`
 	DedupKey     *string         `json:"dedup_key" db:"dedup_key"`
 	AlertGroupID *string         `json:"alert_group_id" db:"alert_group_id"`
-	CurrentStage int            `json:"current_stage" db:"current_stage"`
-	Error       *string         `json:"error" db:"error"`
-	CreatedAt   time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time       `json:"updated_at" db:"updated_at"`
-	FinishedAt  *time.Time      `json:"finished_at" db:"finished_at"`
-	CanceledAt  *time.Time      `json:"canceled_at" db:"canceled_at"`
+	CurrentStage int             `json:"current_stage" db:"current_stage"`
+	Error        *string         `json:"error" db:"error"`
+	CreatedAt    time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at" db:"updated_at"`
+	FinishedAt   *time.Time      `json:"finished_at" db:"finished_at"`
+	CanceledAt   *time.Time      `json:"canceled_at" db:"canceled_at"`
 }
 
 // JobStep represents a single execution step within a job

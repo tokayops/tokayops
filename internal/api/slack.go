@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/store"
 	"github.com/labstack/echo/v4"
+	"github.com/tokayops/tokayops/internal/store"
 )
 
 // slackOTPTTL is how long an issued Slack OTP code stays valid (mirrors the pre-Sprint-3 5-min window).

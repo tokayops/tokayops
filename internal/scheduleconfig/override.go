@@ -186,7 +186,6 @@ func (s *Service) lockForOverride(ctx context.Context, tx ScheduleConfigTx, sche
 	return locked, NormalizeTimestamp(s.now().UTC()), nil
 }
 
-
 // liveOverrideHead resolves the override an update or a delete names and
 // checks the caller is not working from a stale version.
 //

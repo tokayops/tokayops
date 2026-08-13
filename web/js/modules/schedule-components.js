@@ -270,7 +270,7 @@ export function onCallOverviewRow(onCall, team, ctx = {}) {
     }
 
     return `
-        <div class="oncall-row" data-team-id="${escapeHtml(teamId)}"
+        <div class="oncall-row" data-team-id="${escapeAttr(teamId)}"
              data-schedule-id="${escapeAttr(scheduleId)}"
              data-schedule-state="${scheduleState(ctx)}">
             <div class="oncall-cell oncall-cell-primary">

@@ -16,11 +16,10 @@ import (
 // Service is the only application entry point for schedule configuration
 // commands. HTTP handlers bind and map errors; they never touch a repository.
 type Service struct {
-	repo    ScheduleConfigRepository
-	now     func() time.Time
-	newID   func() string
-	logf    func(format string, args ...any)
-
+	repo  ScheduleConfigRepository
+	now   func() time.Time
+	newID func() string
+	logf  func(format string, args ...any)
 }
 
 // Option customizes a Service. The clock and ID source are injectable so tests
@@ -38,7 +37,6 @@ func WithIDSource(newID func() string) Option {
 	return func(s *Service) { s.newID = newID }
 }
 
-
 // WithLogger overrides the commit log sink.
 func WithLogger(logf func(format string, args ...any)) Option {
 	return func(s *Service) { s.logf = logf }
@@ -47,10 +45,10 @@ func WithLogger(logf func(format string, args ...any)) Option {
 // NewService builds a Service over a repository.
 func NewService(repo ScheduleConfigRepository, opts ...Option) *Service {
 	s := &Service{
-		repo:           repo,
-		now:            func() time.Time { return time.Now().UTC() },
-		newID:          func() string { return uuid.New().String() },
-		logf:           log.Printf,
+		repo:  repo,
+		now:   func() time.Time { return time.Now().UTC() },
+		newID: func() string { return uuid.New().String() },
+		logf:  log.Printf,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -147,7 +145,6 @@ func (s *Service) Save(ctx context.Context, teamID string, cmd SaveCommand) (*Sa
 func (s *Service) runCommand(ctx context.Context, fn func(ScheduleConfigTx) error) error {
 	return s.repo.WithinTx(ctx, fn)
 }
-
 
 func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	desired rotation.ScheduleConfiguration, cmd SaveCommand) (*SaveResult, error) {
@@ -322,13 +319,27 @@ func (s *Service) appendRevision(ctx context.Context, tx ScheduleConfigTx, targe
 		target.root.ConfigVersion, target.effectiveAt, actorID), nil
 }
 
-
 // initialize writes the root, revision 1 and the creation event.
 func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	desired rotation.ScheduleConfiguration, actorID string, reason *string) (*SaveResult, error) {
 
-	// No schedule row exists yet, so there is nothing to lock and no tail
-	// revision to stay ahead of: effective time is simply now.
+	// The team row is the serialization point, and it is taken BEFORE
+	// membership is read.
+	//
+	// There is no schedule row to lock yet - that is the whole shape of this
+	// branch - but that does not mean there is nothing to lock. Without this,
+	// RemoveTeamMember's own no-schedule branch (which deletes a membership and
+	// takes no schedule lock either, because there is none) can commit between
+	// the read below and this transaction's commit, leaving a schedule whose
+	// rotation names somebody the team no longer contains.
+	//
+	// Lock order across this package is team -> schedule, the same order
+	// DeleteTeam and RemoveTeamMember take, so no pair of them can deadlock.
+	if err := tx.LockTeam(ctx, teamID); err != nil {
+		return nil, err
+	}
+
+	// No tail revision to stay ahead of: effective time is simply now.
 	effectiveAt := NormalizeTimestamp(s.now().UTC())
 
 	if err := ValidateMembership(ctx, tx, teamID, ConfigurationUserIDs(desired)); err != nil {
@@ -495,13 +506,28 @@ func (s *Service) tombstoneLiveOverrides(ctx context.Context, tx ScheduleConfigT
 // without someone deciding it does - and would be inconsistent here.
 //
 // The check is team-scoped, unlike erasure's global sweep, and it serializes
-// against Save on the schedule row lock. That is why Save re-reads membership
-// after taking that lock.
+// against Save on the schedule row lock, and - when the team has no schedule
+// yet - on the team row lock. That is why Save re-reads membership after taking
+// a lock, and why both of these paths take the team row before anything else:
+// the schedule lock cannot serialize a schedule that does not exist.
 func (s *Service) RemoveTeamMember(ctx context.Context, teamID, userID string) error {
 	if teamID == "" || userID == "" {
 		return invalidField("team_id", "and user_id are required")
 	}
 	return s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
+		// Taken first, and for both branches. The branch below that finds no
+		// schedule used to take no lock at all, which made it the half of a
+		// race the schedule lock could not cover: a concurrent first Save has
+		// no schedule row to be blocked by either, so nothing serialized the
+		// two and the save could commit a rotation naming a member this
+		// transaction had already removed.
+		//
+		// Lock order is team -> schedule here and everywhere else in this
+		// package.
+		if err := tx.LockTeam(ctx, teamID); err != nil {
+			return err
+		}
+
 		root, err := tx.GetScheduleRootByTeam(ctx, teamID)
 		if errors.Is(err, ErrScheduleNotFound) {
 			// No schedule means no assignment to protect.
@@ -712,9 +738,6 @@ func optionalString(s string) *string {
 	v := s
 	return &v
 }
-
-
-
 
 // commitLog is one line about a committed change, assembled while the facts
 // are at hand and written only once the transaction is known to have

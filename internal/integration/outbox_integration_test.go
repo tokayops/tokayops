@@ -18,10 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbox"
 	"github.com/tokayops/tokayops/internal/testutil"
-	"github.com/google/uuid"
 )
 
 // testEncryptionKey is a 32-byte hex key used for integration tests.

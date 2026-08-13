@@ -7,11 +7,11 @@ import (
 	"log"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/google/uuid"
 )
 
 // OnCallProjection is the slice of the schedule projection the builder needs.

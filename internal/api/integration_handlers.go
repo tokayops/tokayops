@@ -11,13 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/integrations"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbox"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/google/uuid"
-	"github.com/labstack/echo/v4"
 )
 
 // IntegrationCache interface for reloading cache after CRUD

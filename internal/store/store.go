@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // activeUserCTE is the head of every statement that creates something owned by
@@ -581,7 +581,7 @@ func (s *Store) InitDB() error {
 		IF NOT EXISTS (
 			SELECT 1 FROM pg_constraint
 			WHERE conname = 'no_overlapping_schedule_revisions'
-			  AND conrelid = to_regclass('public.schedule_revisions')
+			  AND conrelid = to_regclass('schedule_revisions')
 			  AND contype = 'x'
 		) THEN
 			ALTER TABLE schedule_revisions ADD CONSTRAINT no_overlapping_schedule_revisions
@@ -2614,16 +2614,13 @@ func nullIfEmpty(s string) interface{} {
 	return s
 }
 
-
 // ========================================
 // Schedule Overrides
 // ========================================
 
-
 // ========================================
 // Rotation Epochs
 // ========================================
-
 
 // ========================================
 // API Tokens CRUD

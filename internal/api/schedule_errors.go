@@ -21,20 +21,20 @@ import (
 // editor and forgetting to emit the code is a compile error here, not a
 // silent default in the browser.
 const (
-	CodeScheduleNotFound   = "schedule_not_found"
-	CodeRevisionNotFound   = "revision_not_found"
-	CodeOverrideNotFound   = "override_not_found"
-	CodeTeamNotFound       = "team_not_found"
-	CodeUserNotFound       = "user_not_found"
-	CodeScheduleExists     = "schedule_exists"
-	CodeScheduleDeleted    = "schedule_deleted"
-	CodeLastAdmin          = "last_admin"
-	CodeActorNotActive     = "actor_not_active"
-	CodeVersionConflict    = "schedule_version_conflict"
-	CodeRevisionConflict   = "override_revision_conflict"
-	CodeOverrideOverlap    = "override_overlap"
-	CodeUserNotTeamMember  = "user_not_team_member"
-	CodeMemberOnCall       = "member_on_call"
+	CodeScheduleNotFound  = "schedule_not_found"
+	CodeRevisionNotFound  = "revision_not_found"
+	CodeOverrideNotFound  = "override_not_found"
+	CodeTeamNotFound      = "team_not_found"
+	CodeUserNotFound      = "user_not_found"
+	CodeScheduleExists    = "schedule_exists"
+	CodeScheduleDeleted   = "schedule_deleted"
+	CodeLastAdmin         = "last_admin"
+	CodeActorNotActive    = "actor_not_active"
+	CodeVersionConflict   = "schedule_version_conflict"
+	CodeRevisionConflict  = "override_revision_conflict"
+	CodeOverrideOverlap   = "override_overlap"
+	CodeUserNotTeamMember = "user_not_team_member"
+	CodeMemberOnCall      = "member_on_call"
 
 	// Deleting a team is refused by two different things, and the codes are
 	// separate because the remedies are: history cannot be removed at all, an

@@ -105,8 +105,8 @@ func seedBenchSchedule(b *testing.B, s *store.Store, config *scheduleconfig.Serv
 	}
 
 	policy := rotation.RotationPolicy{
-		Cadence:       model.RotationDaily,
-		HandoffTime:   "11:00",
+		Cadence:     model.RotationDaily,
+		HandoffTime: "11:00",
 	}
 	cfg := rotation.ScheduleConfiguration{
 		Timezone: "Europe/Berlin",

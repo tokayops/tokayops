@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/testutil"
-	"github.com/google/uuid"
 )
 
 // TestMigration_Idempotent proves that InitDB can be called repeatedly:

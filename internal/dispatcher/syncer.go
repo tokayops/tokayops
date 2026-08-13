@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/schedulerender"
-	"github.com/slack-go/slack"
 )
 
 // cacheTTL defines how long a cache entry is valid before forcing a refresh.

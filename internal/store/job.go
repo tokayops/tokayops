@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // createJobWithDedupTx inserts a job and its steps within the given transaction.

@@ -395,3 +395,143 @@ func TestChangeSummaryShowsMetadataSavesCarryThePhase(t *testing.T) {
 			usergroupChanged, groupsChanged)
 	}
 }
+
+// waitForLockWaiter blocks until some other session in this database is waiting
+// on a lock, and fails if none ever does.
+//
+// It replaces a sleep, and the difference is which direction the test can be
+// wrong in. A sleep says "by now the goroutine has surely blocked"; if the
+// scheduler disagrees - a loaded CI runner, a cold connection pool - the
+// goroutine runs AFTER the lock is released, the interleaving under test never
+// happens, and the test passes on a build that has the defect. Waiting for the
+// waiter to appear turns that silent pass into a failure with a reason.
+func waitForLockWaiter(t *testing.T, s *Store, why string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting int
+		if err := s.db.QueryRow(`
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+			  AND pid <> pg_backend_pid()`).Scan(&waiting); err != nil {
+			t.Fatalf("read pg_stat_activity: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("nothing ever blocked on a lock: %s", why)
+}
+
+// TestFirstSaveReadsMembershipUnderTheTeamLock is the create-branch half of the
+// serialization, and it asserts an OUTCOME rather than a wait.
+//
+// Waiting proves nothing here. Without the team lock the first Save still
+// blocks - CreateInitialSchedule inserts a child row, which takes FOR KEY SHARE
+// on the team - but it blocks at the INSERT, after it has already read
+// membership. So a test that only measured "does it block" passed with the lock
+// and without it, which is a test that lies.
+//
+// What distinguishes the two is what the Save does with a membership that
+// changed while it waited: under the team lock it has not read membership yet,
+// so it refuses; without it, it read bob before waiting and commits a rotation
+// naming somebody the team no longer contains.
+func TestFirstSaveReadsMembershipUnderTheTeamLock(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops", "alice", "bob")
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+
+	locked := make(chan struct{})
+	saved := make(chan error, 1)
+
+	go func() {
+		<-locked
+		_, err := createViaSave(context.Background(),
+			newTestScheduleService(s, start), "devops", revTestConfig(), "", nil)
+		saved <- err
+	}()
+
+	err := s.ScheduleConfigRepository().WithinTx(context.Background(),
+		func(tx scheduleconfig.ScheduleConfigTx) error {
+			if err := tx.LockTeam(context.Background(), "devops"); err != nil {
+				return err
+			}
+			close(locked)
+			// Not a sleep: wait until the save has actually blocked. Under the
+			// team lock it blocks before reading membership; without it, it
+			// blocks at the INSERT, which is after - and that is the whole
+			// distinction this test exists to make, so proceeding before it
+			// has blocked at all would test neither case.
+			waitForLockWaiter(t, s, "the first save never blocked, so it read membership without holding anything")
+			return tx.DeleteTeamMembership(context.Background(), "devops", "bob")
+		})
+	if err != nil {
+		t.Fatalf("WithinTx: %v", err)
+	}
+
+	saveErr := <-saved
+	if !errors.Is(saveErr, scheduleconfig.ErrUserNotTeamMember) {
+		var inRotation bool
+		if qErr := s.GetDB().QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM schedule_revisions r
+				JOIN schedules sc ON sc.id = r.schedule_id AND sc.team_id = 'devops'
+				WHERE r.snapshot::text LIKE '%bob%')`).Scan(&inRotation); qErr != nil {
+			t.Fatalf("inspect the stored snapshot: %v", qErr)
+		}
+		if inRotation {
+			t.Fatalf("the save committed a rotation naming a removed member (save error: %v); "+
+				"it read membership before taking the team lock", saveErr)
+		}
+		t.Fatalf("save error = %v, want ErrUserNotTeamMember", saveErr)
+	}
+}
+
+// TestMemberRemovalWaitsOnTheTeamRow covers the no-schedule branch of
+// RemoveTeamMember, which took no lock at all: with no schedule row there was
+// nothing for it to be blocked by, and nothing for a concurrent first Save to
+// be blocked by either.
+func TestMemberRemovalWaitsOnTheTeamRow(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops", "alice", "bob")
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+
+	locked := make(chan struct{})
+	done := make(chan time.Time, 1)
+
+	go func() {
+		<-locked
+		if err := newTestScheduleService(s, start).
+			RemoveTeamMember(context.Background(), "devops", "bob"); err != nil {
+			t.Errorf("RemoveTeamMember: %v", err)
+		}
+		done <- time.Now()
+	}()
+
+	var releasedAt time.Time
+	err := s.ScheduleConfigRepository().WithinTx(context.Background(),
+		func(tx scheduleconfig.ScheduleConfigTx) error {
+			if err := tx.LockTeam(context.Background(), "devops"); err != nil {
+				return err
+			}
+			close(locked)
+			// The assertion IS this wait. A removal that takes no team lock
+			// never blocks, so the waiter never appears and this fails with a
+			// reason, instead of the timing comparison below quietly passing
+			// because the goroutine started late.
+			waitForLockWaiter(t, s, "the removal never blocked on the team row")
+			releasedAt = time.Now()
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("WithinTx: %v", err)
+	}
+
+	if finishedAt := <-done; finishedAt.Before(releasedAt) {
+		t.Fatalf("the removal completed while the team row was held (%v before release): "+
+			"it is not serialized on the team, so a concurrent first save can slip past it",
+			releasedAt.Sub(finishedAt))
+	}
+}

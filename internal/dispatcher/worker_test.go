@@ -1339,32 +1339,32 @@ func TestDeliveryCreatedAfterAck_ShouldBeUpdated(t *testing.T) {
 // or no deliveries to update), not on transient failures.
 func TestProcessAcknowledgedAlertGroups_OnlyMarkProcessedOnSuccess(t *testing.T) {
 	testCases := []struct {
-		name               string
-		hasDelivery        bool
-		jobCreationFails   bool
+		name                string
+		hasDelivery         bool
+		jobCreationFails    bool
 		shouldMarkProcessed bool
-		description        string
+		description         string
 	}{
 		{
-			name:               "no_deliveries",
-			hasDelivery:        false,
-			jobCreationFails:   false,
+			name:                "no_deliveries",
+			hasDelivery:         false,
+			jobCreationFails:    false,
 			shouldMarkProcessed: true,
-			description:        "No deliveries = nothing to update, mark as processed",
+			description:         "No deliveries = nothing to update, mark as processed",
 		},
 		{
-			name:               "job_created_successfully",
-			hasDelivery:        true,
-			jobCreationFails:   false,
+			name:                "job_created_successfully",
+			hasDelivery:         true,
+			jobCreationFails:    false,
 			shouldMarkProcessed: true,
-			description:        "Job created successfully, mark as processed",
+			description:         "Job created successfully, mark as processed",
 		},
 		{
-			name:               "job_creation_transient_failure",
-			hasDelivery:        true,
-			jobCreationFails:   true,
+			name:                "job_creation_transient_failure",
+			hasDelivery:         true,
+			jobCreationFails:    true,
 			shouldMarkProcessed: false,
-			description:        "Transient failure should NOT mark as processed (allow retry)",
+			description:         "Transient failure should NOT mark as processed (allow retry)",
 		},
 	}
 

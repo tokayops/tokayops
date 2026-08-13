@@ -24,9 +24,9 @@ var previewNow = time.Date(2026, 5, 4, 8, 30, 0, 0, time.UTC)
 func previewConfig(groups ...rotation.RotationGroup) rotation.ScheduleConfiguration {
 	monday := 1
 	weekly := rotation.RotationPolicy{
-		Cadence:       model.RotationWeekly,
-		HandoffTime:   "11:00",
-		HandoffDay:    &monday,
+		Cadence:     model.RotationWeekly,
+		HandoffTime: "11:00",
+		HandoffDay:  &monday,
 	}
 	return rotation.ScheduleConfiguration{
 		Timezone: "UTC",

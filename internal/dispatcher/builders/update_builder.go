@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/google/uuid"
 )
 
 // ErrNoUpdatableDeliveries indicates no deliveries need updating (not a failure)
@@ -64,14 +64,14 @@ func (b *UpdateJobBuilder) BuildWithDedup(ag *model.AlertGroup, dedupPrefix stri
 	now := time.Now()
 
 	job := &model.Job{
-		ID:          jobID,
-		Type:        "update",
-		Status:      model.JobStatusPending,
-		DedupKey:    &dedupKey,
+		ID:           jobID,
+		Type:         "update",
+		Status:       model.JobStatusPending,
+		DedupKey:     &dedupKey,
 		CurrentStage: 0,
-		Payload:     json.RawMessage("{}"),
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		Payload:      json.RawMessage("{}"),
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 
 	var steps []*model.JobStep

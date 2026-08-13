@@ -16,9 +16,9 @@ import (
 // schedule revision snapshot. Timezone deliberately lives on the snapshot
 // top-level, not here: both layers of one revision share a single timezone.
 type RotationPolicy struct {
-	Cadence       model.RotationType `json:"cadence"`      // daily | weekly
-	HandoffTime   string             `json:"handoff_time"` // local, canonical "HH:MM"
-	HandoffDay    *int               `json:"handoff_day"`  // weekly: 0..6, 0=Sunday; daily: nil
+	Cadence     model.RotationType `json:"cadence"`      // daily | weekly
+	HandoffTime string             `json:"handoff_time"` // local, canonical "HH:MM"
+	HandoffDay  *int               `json:"handoff_day"`  // weekly: 0..6, 0=Sunday; daily: nil
 }
 
 // ParseHandoffTime parses a canonical "HH:MM" local handoff time. Unlike the

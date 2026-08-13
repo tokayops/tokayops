@@ -151,6 +151,60 @@ test.describe('zoned-time', () => {
     expect(new Date(result.to!).getTime()).toBeGreaterThan(new Date(result.from!).getTime());
   });
 
+  /**
+   * The fold is what an edit form cannot infer from its own inputs.
+   *
+   * Both instants below render to the identical local string "02:30", so a
+   * form filled from either one and saved back unchanged has to be told which
+   * pass it came from. Assuming the earlier one - which is the right default
+   * for a value nobody has chosen yet - moves an override anchored to the
+   * second pass an hour into the past, silently, on a save that changed
+   * nothing.
+   */
+  test('tells the two passes of a repeated local hour apart', async ({ page }) => {
+    const result = await page.evaluate(async (module: string) => {
+      const mod = await import(module);
+      const tz = 'Europe/Berlin';
+      const first = '2026-10-25T00:30:00Z';
+      const second = '2026-10-25T01:30:00Z';
+      return {
+        firstLocal: mod.instantToLocalInput(first, tz),
+        secondLocal: mod.instantToLocalInput(second, tz),
+        firstFold: mod.foldOf(first, tz),
+        secondFold: mod.foldOf(second, tz),
+        plainFold: mod.foldOf('2026-07-01T10:00:00Z', tz),
+        // The API takes RFC3339, so a stored override can carry seconds. The
+        // candidates this is compared against are built from a minute-precision
+        // local string, so an exact timestamp comparison called every such
+        // instant 'later' and moved it an hour on the next save.
+        firstWithSeconds: mod.foldOf('2026-10-25T00:30:30Z', tz),
+        secondWithSeconds: mod.foldOf('2026-10-25T01:30:30Z', tz),
+        // And below the second. PostgreSQL stores microseconds, so a stored
+        // override round-trips through the API with a fractional part; the
+        // offset comparison has to be immune to it too.
+        firstWithMillis: mod.foldOf('2026-10-25T00:30:30.123Z', tz),
+        secondWithMillis: mod.foldOf('2026-10-25T01:30:30.123Z', tz),
+        lastMomentOfTheFirstPass: mod.foldOf('2026-10-25T00:59:59.999Z', tz),
+      };
+    }, MODULE);
+
+    // The premise: the two instants are indistinguishable in the input.
+    expect(result.firstLocal).toBe('2026-10-25T02:30');
+    expect(result.secondLocal).toBe('2026-10-25T02:30');
+
+    expect(result.firstFold).toBe('earlier');
+    expect(result.secondFold).toBe('later');
+    // An unambiguous instant answers with the default, so filling a form from
+    // one is unaffected.
+    expect(result.plainFold).toBe('earlier');
+
+    expect(result.firstWithSeconds).toBe('earlier');
+    expect(result.secondWithSeconds).toBe('later');
+    expect(result.firstWithMillis).toBe('earlier');
+    expect(result.secondWithMillis).toBe('later');
+    expect(result.lastMomentOfTheFirstPass).toBe('earlier');
+  });
+
   test('round-trips an instant back to a local input value', async ({ page }) => {
     const value = await page.evaluate(async (module: string) => {
       const mod = await import(module);

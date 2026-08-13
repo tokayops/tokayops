@@ -7,9 +7,9 @@ import (
 	"log"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/google/uuid"
 )
 
 // Seed populates the database with initial data

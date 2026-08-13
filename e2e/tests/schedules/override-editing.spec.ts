@@ -562,3 +562,66 @@ test.describe('Calendar Override Data Attributes', () => {
     await schedulesPage.closeCalendarView();
   });
 });
+
+/**
+ * Deleting from the calendar is two reads before the delete, and the second
+ * one used to be outside the guard.
+ *
+ * The calendar knows an override's id and nothing else - not its revision, not
+ * which schedule it belongs to - so removal reads the override head and then
+ * the schedule config. Wrapping only the first left the second to reject out
+ * of a click handler: no error UI, an unhandled rejection, and a user with no
+ * idea whether anything happened.
+ */
+test.describe('Override removal: the second read fails', () => {
+  let env: TestEnv;
+
+  test.beforeEach(async ({ page, schedulesPage }) => {
+    env = await seedTestEnv(page, 'cfgfail');
+    const { start, end } = futureOverrideWindow();
+    await createOverrideViaAPI(page, env.teamId, 'e2e-bob', start, end, 'Second read fails');
+    await schedulesPage.gotoOnCall();
+  });
+
+  test.afterEach(async ({ page }) => {
+    await deleteTeam(page, env.teamId);
+  });
+
+  test('reports the failure instead of throwing, and sends no delete', async ({
+    page,
+    schedulesPage,
+  }) => {
+    const pageErrors: string[] = [];
+    page.on('pageerror', e => pageErrors.push(e.message));
+
+    await schedulesPage.openCalendarView(env.teamId);
+    await expect(schedulesPage.calendarOverrideEntries.first()).toBeVisible({ timeout: 5000 });
+
+    // The head read succeeds; the config read - the one the calendar path
+    // needs because it carries no schedule id - does not.
+    await page.route(`**/api/v1/teams/${env.teamId}/schedule/config`, route =>
+      route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"boom"}' }));
+
+    const deleteRequests: string[] = [];
+    page.on('request', req => {
+      if (req.method() === 'DELETE' && req.url().includes('/overrides/')) {
+        deleteRequests.push(req.url());
+      }
+    });
+    // The confirm would come after both reads; it must never be reached.
+    page.on('dialog', d => d.accept());
+
+    await schedulesPage.clickCalendarOverride(0);
+    await schedulesPage.expectContextMenuVisible();
+    await schedulesPage.contextMenuDelete.click();
+
+    await expect(page.locator('#toast-container')).toContainText(
+      /could not reach the server/i,
+      { timeout: 5000 },
+    );
+
+    expect(deleteRequests, 'nothing may be deleted when the preflight failed').toHaveLength(0);
+    expect(pageErrors, 'the failure must be handled, not thrown out of the click handler')
+      .toHaveLength(0);
+  });
+});

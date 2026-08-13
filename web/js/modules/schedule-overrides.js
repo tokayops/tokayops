@@ -22,7 +22,7 @@ import { initTimezonePicker } from '/js/core/timezone-picker.js';
 import { resolveNames, assignableMembers } from '/js/core/users-directory.js';
 import { reportOverrideError } from '/js/modules/schedule-errors.js';
 import { overrideModal, overridesList } from '/js/modules/schedule-components.js';
-import { resolveLocalTime, gapMessage, instantToLocalInput } from '/js/core/zoned-time.js';
+import { resolveLocalTime, gapMessage, instantToLocalInput, foldOf } from '/js/core/zoned-time.js';
 
 /**
  * Open the override manager for a team.
@@ -138,10 +138,19 @@ export async function openOverrideModal(teamId, options = {}) {
 }
 
 async function loadOverrideState(teamId, signal) {
+    // Only a 404 on the config is an answer: this team has no schedule, and
+    // an empty form is the honest way to say so. Every other failure - 403,
+    // 500, a dropped connection - means we do not KNOW, and turning that into
+    // "no schedule, no overrides" makes existing overrides vanish from the
+    // screen and opens a form with no schedule_id behind it. Those propagate
+    // to the caller, which already has an error path.
     const [members, config, overrideList] = await Promise.all([
         assignableMembers(teamId, { signal }),
-        API.schedules.getConfig(teamId, { signal }).catch(() => null),
-        API.schedules.listOverrides(teamId, { signal }).catch(() => ({ overrides: [] })),
+        API.schedules.getConfig(teamId, { signal }).catch(e => {
+            if (e?.status === 404) return null;
+            throw e;
+        }),
+        API.schedules.listOverrides(teamId, { signal }),
     ]);
 
     const overrides = overrideList?.overrides || [];
@@ -226,7 +235,16 @@ function bindOverrideEvents(session, state, options, leave) {
  * @param {string} scheduleId - which schedule it belongs to
  */
 function populateEditForm(state, head, scheduleId) {
-    state.fold = { start: 'earlier', end: 'later' };
+    // Derived, not assumed. The create form defaults to earlier/later because
+    // nobody has chosen yet; here both instants already exist, and taking the
+    // default would move an override anchored to the second pass of a repeated
+    // local hour back by an hour the moment someone opens this form and saves
+    // it unchanged.
+    const foldZone = state.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+    state.fold = {
+        start: foldOf(head.valid_from, foldZone),
+        end: foldOf(head.valid_to, foldZone),
+    };
     state.editing = {
         overrideId: head.override_id,
         revision: head.revision !== undefined && head.revision !== null
@@ -274,8 +292,17 @@ async function refreshList(session, state) {
     const contentWrapper = body?.querySelector('.override-modal-content');
     if (!contentWrapper) return;
 
-    const overrideList = await API.schedules.listOverrides(state.teamId, { signal: session.signal })
-        .catch(() => ({ overrides: [] }));
+    let overrideList;
+    try {
+        overrideList = await API.schedules.listOverrides(state.teamId, { signal: session.signal });
+    } catch (e) {
+        if (session.closed) return;
+        // The list on screen was correct a moment ago. Replacing it with an
+        // empty one because a refresh failed turns a transient error into
+        // "your overrides are gone".
+        showToast('Could not refresh overrides: ' + (e?.message || 'request failed'), 'error');
+        return;
+    }
     if (session.closed) return;
     const overrides = overrideList?.overrides || [];
     const names = await resolveNames(overrides.map(o => o.user_id));
@@ -489,17 +516,35 @@ export async function removeOverride(target, { onStale } = {}) {
     const { teamId, overrideId } = target;
 
     if (!Number.isInteger(revision) || !scheduleId) {
-        const head = await currentOverrideHead(teamId, overrideId);
+        // The whole preflight under one guard, not just its first read.
+        //
+        // Reaching here from the calendar means neither the revision nor the
+        // schedule id was carried, so this is two requests, and the second one
+        // fails the same ways as the first. Guarding only the first left the
+        // second to reject out of an event handler, where nothing catches it:
+        // no error UI, and an unhandled rejection in the console.
+        let head;
+        try {
+            head = await currentOverrideHead(teamId, overrideId);
+            if (head && !scheduleId) {
+                // Same rule as loadOverrideState: only a 404 means "no schedule".
+                const config = await API.schedules.getConfig(teamId).catch(e => {
+                    if (e?.status === 404) return null;
+                    throw e;
+                });
+                scheduleId = config?.schedule_id || '';
+            }
+        } catch (error) {
+            console.error('Failed to read the override before removing it:', error);
+            showToast('Could not reach the server: ' + (error?.message || 'request failed'), 'error');
+            return false;
+        }
         if (!head) {
             showToast('This override no longer exists.', 'error');
             await onStale?.();
             return false;
         }
         revision = head.revision;
-        if (!scheduleId) {
-            const config = await API.schedules.getConfig(teamId).catch(() => null);
-            scheduleId = config?.schedule_id || '';
-        }
     }
 
     if (!confirm('Remove this override?')) return false;
@@ -547,8 +592,13 @@ export async function removeOverrideFromWidget(button, { onRemoved } = {}) {
  *
  * A removal has to name the revision it is removing, and the list of override
  * heads is the only place that number comes from.
+ *
+ * The read is allowed to fail, and a failure is NOT an answer: swallowing it
+ * into an empty list made "the server did not respond" and "somebody already
+ * removed this" the same sentence on screen, and only one of those means the
+ * user should stop trying.
  */
 async function currentOverrideHead(teamId, overrideId) {
-    const list = await API.schedules.listOverrides(teamId).catch(() => ({ overrides: [] }));
+    const list = await API.schedules.listOverrides(teamId);
     return (list?.overrides || []).find(o => o.override_id === overrideId) || null;
 }

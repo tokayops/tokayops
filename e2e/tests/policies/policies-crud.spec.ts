@@ -544,3 +544,57 @@ test.describe('Policies - Scope Filtering', () => {
     await expect(policiesPage.policiesGrid).toBeVisible();
   });
 });
+
+/**
+ * Switching teams while the schedule read fails must not leave the previous
+ * team's schedule behind the placeholder.
+ *
+ * The editor keeps the current schedule id in module state and rebuilds the
+ * step's option from it. A read that fails is not an answer, so the option
+ * cannot say "no schedule configured" - but it must not keep the id it had
+ * either: that offers "Team Schedule (B)" with team A's schedule behind it,
+ * and saving the policy binds the step to another team's schedule.
+ */
+test.describe('Policy editor: unreadable schedule', () => {
+  test('does not carry the previous team\'s schedule when the read fails', async ({ policiesPage, page }) => {
+    await policiesPage.goto();
+    await policiesPage.waitForPoliciesLoad();
+
+    await policiesPage.openCreatePolicyModal();
+
+    const teamOptions = await policiesPage.policyTeamSelect
+      .locator('option')
+      .evaluateAll((opts: HTMLOptionElement[]) =>
+        opts.map(o => o.value).filter(v => v && v !== 'all'));
+    test.skip(teamOptions.length < 2, 'needs two teams to switch between');
+    const [teamA, teamB] = teamOptions;
+
+    // Team A reads fine and has a schedule; team B cannot be read at all.
+    // Both are stubbed so the test does not depend on what the seed left.
+    await page.route(`**/api/v1/teams/${teamA}/schedule/config`, route =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ schedule_id: 'sched-of-team-a', config_version: 1 }),
+      }));
+    await page.route(`**/api/v1/teams/${teamB}/schedule/config`, route =>
+      route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"boom"}' }));
+
+    await policiesPage.addStep();
+    const targetType = page.locator('.target-type-select').first();
+    await targetType.selectOption('schedule');
+
+    await policiesPage.policyTeamSelect.selectOption(teamA);
+    // The value is set as a property on the <option>, which toHaveValue does
+    // not read - that matcher is for form controls.
+    const placeholder = page.locator('.target-id-input option[data-schedule-placeholder]').first();
+    const placeholderValue = () => placeholder.evaluate((o: HTMLOptionElement) => o.value);
+    await expect.poll(placeholderValue).toBe('sched-of-team-a');
+
+    await policiesPage.policyTeamSelect.selectOption(teamB);
+
+    // The one thing that must never happen: team A's schedule offered under
+    // team B. Empty is the honest answer here - we do not know.
+    await expect.poll(placeholderValue).toBe('');
+  });
+});

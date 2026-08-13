@@ -53,8 +53,8 @@ func TestStartupGate(t *testing.T) {
 		if !strings.Contains(out, "migrate reset-schedules") {
 			t.Errorf("the refusal does not name the skipped step:\n%s", out)
 		}
-		if !strings.Contains(out, "epic10-upgrade-checklist") {
-			t.Errorf("the refusal does not point at the checklist:\n%s", out)
+		if !strings.Contains(out, "upgrade documentation") {
+			t.Errorf("the refusal does not point at the upgrade documentation:\n%s", out)
 		}
 	})
 

@@ -3,11 +3,11 @@ package metrics_test
 import (
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 )
 
 func TestBusinessCollector_ActiveAlertGroups(t *testing.T) {
@@ -60,7 +60,6 @@ func TestBusinessCollector_ActiveAlertGroups(t *testing.T) {
 //
 // They are covered against a real database in
 // store.TestGetMetricsSnapshotOnCallGauges.
-
 
 func TestBusinessCollector_TeamsWithoutPolicy(t *testing.T) {
 	s := store.NewMockStore()

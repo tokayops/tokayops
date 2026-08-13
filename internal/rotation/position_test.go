@@ -31,7 +31,7 @@ func TestPositionAt_Daily(t *testing.T) {
 		{"two slots later", 0, utc(2026, time.August, 5, 12, 0), 2},
 		{"two slots later, position 1", 1, utc(2026, time.August, 5, 12, 0), 0},
 		{"wrap around", 0, utc(2026, time.August, 6, 12, 0), 0},
-		{"negative elapsed", 0, utc(2026, time.August, 1, 12, 0), 1},  // -2 slots -> floorMod(-2,3)=1
+		{"negative elapsed", 0, utc(2026, time.August, 1, 12, 0), 1}, // -2 slots -> floorMod(-2,3)=1
 		{"negative elapsed pos 2", 2, utc(2026, time.August, 1, 12, 0), 0},
 	}
 	for _, tt := range tests {

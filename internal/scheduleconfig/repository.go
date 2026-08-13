@@ -66,7 +66,6 @@ var (
 	// two must not share a sentinel or the API would answer one as the other.
 	ErrOverrideCollision = fmt.Errorf(
 		"%w: two overrides of one layer cover the same instant", ErrInvariantViolation)
-
 )
 
 // ScheduleRoot is the aggregate identity and concurrency root of a schedule.

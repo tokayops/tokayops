@@ -403,14 +403,14 @@ func TestPlanTransition_ClassificationPartition(t *testing.T) {
 	const (
 		desDisabled desKind = iota
 		desEmpty
-		desMetadataOnly    // layers untouched (slack changes)
-		desMembershipEdit  // members change, IDs unchanged
-		desPolicyChanged   // handoff time changed
-		desTZChanged       // timezone changed
-		desAddGroup        // ordered ID list extended
-		desRemoveActive    // active removed, others survive
-		desReplaceAll      // no old ID survives
-		desTZAndRemove     // composite: tz + active removed
+		desMetadataOnly   // layers untouched (slack changes)
+		desMembershipEdit // members change, IDs unchanged
+		desPolicyChanged  // handoff time changed
+		desTZChanged      // timezone changed
+		desAddGroup       // ordered ID list extended
+		desRemoveActive   // active removed, others survive
+		desReplaceAll     // no old ID survives
+		desTZAndRemove    // composite: tz + active removed
 	)
 	curKinds := []curKind{curNil, curDisabled, curEmpty, curActive}
 	desKinds := []desKind{desDisabled, desEmpty, desMetadataOnly, desMembershipEdit,

@@ -17,7 +17,7 @@ import (
 var ErrCutoverSchemaIncomplete = errors.New(
 	"store: the schedule schema still has its pre-revision shape; " +
 		"run `tokayops migrate reset-schedules` before starting the server " +
-		"(see epic10-upgrade-checklist.md)")
+		"(see the upgrade documentation for this release)")
 
 // RequireCutoverSchema refuses to let the server start against a database that
 // has not been through the schedule cutover.
@@ -35,13 +35,21 @@ func (s *Store) RequireCutoverSchema() error {
 	return requireCutoverSchema(s.db)
 }
 
+// Every lookup below resolves through search_path rather than naming a schema.
+//
+// Nothing else in this package qualifies one: the DDL creates unqualified
+// tables and every query reads them unqualified, so the schema an installation
+// puts them in is whatever its search_path says. A check that insisted on
+// `public` would be the only opinionated thing in the codebase, and it would
+// express that opinion by refusing to start - the loudest failure available -
+// on a database every other line of code is perfectly happy with.
 func requireCutoverSchema(db *sql.DB) error {
 	var problems []string
 
 	for _, table := range legacyScheduleTables {
 		var present bool
 		if err := db.QueryRow(
-			`SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&present); err != nil {
+			`SELECT to_regclass($1) IS NOT NULL`, table).Scan(&present); err != nil {
 			return err
 		}
 		if present {
@@ -76,14 +84,15 @@ func requireCutoverSchema(db *sql.DB) error {
 		}
 	}
 
-	var nullable sql.NullString
+	var notNull sql.NullBool
 	if err := db.QueryRow(`
-		SELECT is_nullable FROM information_schema.columns
-		WHERE table_schema = 'public' AND table_name = 'schedules'
-		  AND column_name = 'history_complete_from'`).Scan(&nullable); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		SELECT attnotnull FROM pg_attribute
+		WHERE attrelid = to_regclass('schedules')
+		  AND attname = 'history_complete_from'
+		  AND attnum > 0 AND NOT attisdropped`).Scan(&notNull); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if nullable.Valid && nullable.String != "NO" {
+	if notNull.Valid && !notNull.Bool {
 		problems = append(problems, "schedules.history_complete_from is still nullable")
 	}
 
@@ -107,6 +116,7 @@ func requireCutoverSchema(db *sql.DB) error {
 // What it must not do is disappear silently. The DDL that creates it swallows a
 // missing extension with a RAISE NOTICE, which no operator sees; a database
 // without the constraint should be a fact somebody can read in the log.
+//
 // The lookup names the table and the kind, not just the constraint name.
 // Constraint names are unique per table, not per database, so a same-named
 // constraint on anything else would answer this question - and it would answer
@@ -119,18 +129,24 @@ func (s *Store) RevisionOverlapConstraintPresent() (bool, error) {
 		SELECT EXISTS(
 			SELECT 1 FROM pg_constraint
 			WHERE conname = $1
-			  AND conrelid = to_regclass('public.schedule_revisions')
+			  AND conrelid = to_regclass('schedule_revisions')
 			  AND contype = 'x')`,
 		"no_overlapping_schedule_revisions").Scan(&present)
 	return present, err
 }
 
+// scheduleColumnExists asks pg_attribute rather than information_schema: the
+// former is addressed by relation oid, which to_regclass resolves through
+// search_path, while the latter is addressed by schema name and would have to
+// be told which one. `NOT attisdropped` matters too - a dropped column keeps
+// its slot forever, and information_schema hides that while pg_attribute does
+// not.
 func scheduleColumnExists(db *sql.DB, column string) (bool, error) {
 	var exists bool
 	err := db.QueryRow(`
 		SELECT EXISTS(
-			SELECT 1 FROM information_schema.columns
-			WHERE table_schema = 'public' AND table_name = 'schedules'
-			  AND column_name = $1)`, column).Scan(&exists)
+			SELECT 1 FROM pg_attribute
+			WHERE attrelid = to_regclass('schedules')
+			  AND attname = $1 AND attnum > 0 AND NOT attisdropped)`, column).Scan(&exists)
 	return exists, err
 }

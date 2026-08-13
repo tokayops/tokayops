@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -711,6 +713,12 @@ func TestParallelCommandsNeverDeadlock(t *testing.T) {
 // wiped by erasure or listed here as a deliberate survivor. A new column that
 // nobody classified fails this test, which is the whole point - erasure
 // completeness cannot be maintained by memory.
+//
+// The column names below are the criterion, so a name that matches nothing is
+// worse than useless: it reads as coverage. This scan used to ask for
+// `acked_by`, which exists nowhere, while the real column - `acknowledged_by`
+// - was not asked for at all and therefore never classified. A completeness
+// check with a hole of exactly the kind it exists to catch.
 func TestErasureCoversEveryUserDataSource(t *testing.T) {
 	s := setupTestDB(t)
 	seedTeam(t, s, "devops", "alice", "bob")
@@ -738,12 +746,8 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		"schedule_revisions.created_by":           true,
 		"schedule_override_revisions.user_id":     true,
 		"schedule_override_revisions.recorded_by": true,
-		"alert_groups.acked_by":                   true,
+		"alert_groups.acknowledged_by":            true,
 		"alert_groups.resolved_by":                true,
-		"alert_groups.assigned_to":                true,
-		"notification_deliveries.user_id":         true,
-		"job_steps.user_id":                       true,
-		"escalation_steps.target_user_id":         true,
 		"timeline_events.actor":                   true,
 	}
 
@@ -754,10 +758,8 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		  AND (column_name = 'user_id'
 		       OR column_name = 'created_by'
 		       OR column_name = 'recorded_by'
-		       OR column_name = 'acked_by'
+		       OR column_name = 'acknowledged_by'
 		       OR column_name = 'resolved_by'
-		       OR column_name = 'assigned_to'
-		       OR column_name = 'target_user_id'
 		       OR (table_name = 'users' AND column_name IN
 		           ('id', 'email', 'name', 'role', 'password_hash', 'auth_provider', 'deleted_at')))
 		ORDER BY table_name, column_name`)
@@ -767,12 +769,14 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 	defer rows.Close()
 
 	var unclassified []string
+	seen := map[string]bool{}
 	for rows.Next() {
 		var table, column string
 		if err := rows.Scan(&table, &column); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
 		key := table + "." + column
+		seen[key] = true
 		if !erased[key] && !byDesign[key] {
 			unclassified = append(unclassified, key)
 		}
@@ -783,6 +787,33 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 	if len(unclassified) > 0 {
 		t.Fatalf("columns referring to a user that nobody classified as erased or kept by design: %v",
 			unclassified)
+	}
+
+	// The classification is checked in both directions, because a name that
+	// matches no column reads as coverage and is not. Two such entries lived
+	// here for a while - `alert_groups.acked_by` and `alert_groups.assigned_to`
+	// - while the real column, `acknowledged_by`, was never even scanned.
+	//
+	// Only classifications of a SCANNED column name are checked: `reason` and
+	// `change_reason` are classified deliberately and are outside this query's
+	// filter, so their absence from `seen` means nothing.
+	scannedNames := map[string]bool{
+		"user_id": true, "created_by": true, "recorded_by": true,
+		"acknowledged_by": true, "resolved_by": true,
+	}
+	var phantom []string
+	for _, set := range []map[string]bool{erased, byDesign} {
+		for key := range set {
+			column := key[strings.LastIndex(key, ".")+1:]
+			if scannedNames[column] && !seen[key] {
+				phantom = append(phantom, key)
+			}
+		}
+	}
+	if len(phantom) > 0 {
+		sort.Strings(phantom)
+		t.Fatalf("classified columns that do not exist in the schema, so they cover nothing: %v",
+			phantom)
 	}
 
 	// And an end-to-end erasure with data in each reachable source.

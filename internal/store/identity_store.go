@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // ErrExternalIdentityAlreadyLinked means the (provider, external_id) is already

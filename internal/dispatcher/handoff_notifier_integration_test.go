@@ -93,8 +93,8 @@ func setupHandoffEnv(t *testing.T) *handoffEnv {
 // later is a different group.
 func dailyConfig(groups ...rotation.RotationGroup) rotation.ScheduleConfiguration {
 	policy := rotation.RotationPolicy{
-		Cadence:       model.RotationDaily,
-		HandoffTime:   "12:00",
+		Cadence:     model.RotationDaily,
+		HandoffTime: "12:00",
 	}
 	return rotation.ScheduleConfiguration{
 		Timezone: "UTC",

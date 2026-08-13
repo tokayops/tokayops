@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 var (

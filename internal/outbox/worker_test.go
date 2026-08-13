@@ -42,12 +42,12 @@ func newTestEvent(teamID string) *model.OutboxEvent {
 	wid := testWorkerID
 	future := time.Now().Add(5 * time.Minute)
 	return &model.OutboxEvent{
-		ID:         "evt-1",
-		EventType:  model.OutboxEventFiring,
-		TeamID:     teamID,
-		Payload:    payload,
-		Status:     model.OutboxEventStatusProcessing,
-		LockedBy:   &wid,
+		ID:          "evt-1",
+		EventType:   model.OutboxEventFiring,
+		TeamID:      teamID,
+		Payload:     payload,
+		Status:      model.OutboxEventStatusProcessing,
+		LockedBy:    &wid,
 		LockedUntil: &future,
 	}
 }
