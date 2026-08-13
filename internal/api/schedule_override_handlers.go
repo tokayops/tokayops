@@ -84,29 +84,36 @@ func (a *API) UpdateScheduleOverride(c echo.Context) error {
 }
 
 // DeleteScheduleOverride godoc
-// @Summary Delete an override
-// @Description Appends a tombstone. The override history is kept and stays replayable as of any past instant.
+// @Summary Cancel an override
+// @Description Ends the override from this moment. An override that has not started is removed; one that is in force keeps the hours it has already covered and loses the rest; one that has already ended is refused, because cancelling it would rewrite who was on duty. History is append-only either way.
 // @Tags schedules
 // @Produce json
 // @Param schedule_id path string true "Schedule ID"
 // @Param id path string true "Override ID"
 // @Param expected_revision query int true "Revision the caller loaded"
+// @Param reason query string false "Why it is being cancelled"
 // @Success 204
 // @Failure 400 {object} ErrorResponse
 // @Failure 404 {object} ErrorResponse
 // @Failure 409 {object} ErrorResponse
+// @Failure 422 {object} ErrorResponse
 // @Router /api/v1/schedules/{schedule_id}/overrides/{id} [delete]
 func (a *API) DeleteScheduleOverride(c echo.Context) error {
 	// Query rather than body: a DELETE body is not carried reliably by every
 	// client and proxy, and losing it here would silently skip the conflict
-	// check the parameter exists to perform.
+	// check the parameter exists to perform. The reason rides along for the
+	// same reason.
 	expected, err := strconv.ParseInt(c.QueryParam("expected_revision"), 10, 64)
 	if err != nil {
 		return badRequest(c, CodeInvalidParameter, "expected_revision query parameter is required")
 	}
+	var reason *string
+	if raw := c.QueryParam("reason"); raw != "" {
+		reason = &raw
+	}
 
-	if err := a.scheduleConfig.DeleteOverride(c.Request().Context(),
-		c.Param("schedule_id"), c.Param("id"), expected, actorID(c)); err != nil {
+	if err := a.scheduleConfig.CancelOverride(c.Request().Context(),
+		c.Param("schedule_id"), c.Param("id"), expected, actorID(c), reason); err != nil {
 		return a.mapScheduleError(c, err)
 	}
 	return c.NoContent(http.StatusNoContent)

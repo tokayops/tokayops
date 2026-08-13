@@ -1313,14 +1313,14 @@ const docTemplate = `{
                 }
             },
             "delete": {
-                "description": "Appends a tombstone. The override history is kept and stays replayable as of any past instant.",
+                "description": "Ends the override from this moment. An override that has not started is removed; one that is in force keeps the hours it has already covered and loses the rest; one that has already ended is refused, because cancelling it would rewrite who was on duty. History is append-only either way.",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "schedules"
                 ],
-                "summary": "Delete an override",
+                "summary": "Cancel an override",
                 "parameters": [
                     {
                         "type": "string",
@@ -1342,6 +1342,12 @@ const docTemplate = `{
                         "name": "expected_revision",
                         "in": "query",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Why it is being cancelled",
+                        "name": "reason",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -1362,6 +1368,12 @@ const docTemplate = `{
                     },
                     "409": {
                         "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
                         "schema": {
                             "$ref": "#/definitions/api.ErrorResponse"
                         }

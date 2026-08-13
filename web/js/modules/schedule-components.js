@@ -63,7 +63,7 @@ export function onCallWidget(onCall, ctx = {}) {
                             <button class="delete-override-btn"
                                     data-schedule-id="${escapeAttr(scheduleId)}"
                                     data-override-id="${escapeAttr(l1.override_id || '')}"
-                                    title="Remove override">
+                                    title="End override now">
                                 <i data-lucide="x"></i>
                             </button>
                             ` : ''}
@@ -291,7 +291,7 @@ export function onCallOverviewRow(onCall, team, ctx = {}) {
             <div class="oncall-cell" data-label="Status">
                 <span class="badge badge-status oncall-status-badge ${statusClass}">
                     ${statusLabel}
-                    ${isOverride && canDeleteOverride ? `<button class="delete-override-btn" data-schedule-id="${escapeAttr(scheduleId)}" data-override-id="${escapeAttr(l1.override_id || '')}" title="Remove override"><i data-lucide="x"></i></button>` : ''}
+                    ${isOverride && canDeleteOverride ? `<button class="delete-override-btn" data-schedule-id="${escapeAttr(scheduleId)}" data-override-id="${escapeAttr(l1.override_id || '')}" title="End override now"><i data-lucide="x"></i></button>` : ''}
                 </span>
             </div>
             <div class="oncall-cell oncall-cell-actions">

@@ -64,8 +64,8 @@ func TestOverrideRevisionLifecycle(t *testing.T) {
 		t.Fatalf("update produced %+v, want revision 2 of the same override", updated)
 	}
 
-	if err := f.svc.DeleteOverride(context.Background(), scheduleID, created.OverrideID, 2, "alice"); err != nil {
-		t.Fatalf("DeleteOverride: %v", err)
+	if err := f.svc.CancelOverride(context.Background(), scheduleID, created.OverrideID, 2, "alice", nil); err != nil {
+		t.Fatalf("CancelOverride: %v", err)
 	}
 
 	history := f.repo.OverrideRevisions(scheduleID)
@@ -189,8 +189,13 @@ func TestOverrideDoesNotAdvanceVersionOrEmitEvent(t *testing.T) {
 	}
 }
 
-// A retroactive correction is a legitimate record: the table is append-only
-// and an as-of query still shows what was known at any earlier moment.
+// Recording a stand-in that already happened is allowed, and is not in tension
+// with refusing to cancel one that already happened.
+//
+// The two are opposites: entering "bob covered yesterday, we forgot" ADDS a
+// fact, and the revision that carries it says when it was recorded. Cancelling
+// a shift that was served would remove one. The append-only table keeps both
+// readable; only one of them changes what the calendar says happened.
 func TestOverridePastValidFromAllowed(t *testing.T) {
 	f := overrideFixture(t)
 	past := f.clock.at.Add(-48 * time.Hour)
@@ -224,7 +229,7 @@ func TestOverrideCommandsRefuseDeletedSchedule(t *testing.T) {
 	); !errors.Is(err, scheduleconfig.ErrScheduleDeleted) {
 		t.Fatalf("update on a deleted schedule: %v, want ErrScheduleDeleted", err)
 	}
-	if err := f.svc.DeleteOverride(context.Background(), scheduleID, created.OverrideID, 1, "alice"); !errors.Is(err, scheduleconfig.ErrScheduleDeleted) {
+	if err := f.svc.CancelOverride(context.Background(), scheduleID, created.OverrideID, 1, "alice", nil); !errors.Is(err, scheduleconfig.ErrScheduleDeleted) {
 		t.Fatalf("delete on a deleted schedule: %v, want ErrScheduleDeleted", err)
 	}
 }
@@ -241,5 +246,260 @@ func TestOverrideTargetMustBeTeamMember(t *testing.T) {
 	var notMember *scheduleconfig.UserNotTeamMemberError
 	if !errors.As(err, &notMember) {
 		t.Fatalf("error = %v, want a membership rejection", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Temporal semantics: the future can be cancelled, the past cannot be un-lived
+// ---------------------------------------------------------------------------
+
+// liveHead is the override's current head, or nil when it is tombstoned.
+func (f *commandFixture) liveHead(t *testing.T, scheduleID, overrideID string) *scheduleconfig.OverrideRevision {
+	t.Helper()
+	var head *scheduleconfig.OverrideRevision
+	for _, rev := range f.repo.OverrideRevisions(scheduleID) {
+		if rev.OverrideID != overrideID {
+			continue
+		}
+		r := rev
+		if head == nil || r.Revision > head.Revision {
+			head = &r
+		}
+	}
+	if head != nil && head.Deleted {
+		return nil
+	}
+	return head
+}
+
+// TestCancelOverrideBeforeItStartsRemovesIt: nothing was served, so there is
+// nothing to keep. This is the one case where a tombstone is still right.
+func TestCancelOverrideBeforeItStartsRemovesIt(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+	from := f.clock.at.Add(24 * time.Hour)
+	created := f.createOverride(t, "bob", from, from.Add(2*time.Hour))
+
+	if err := f.svc.CancelOverride(context.Background(), scheduleID, created.OverrideID, 1, "alice", nil); err != nil {
+		t.Fatalf("CancelOverride: %v", err)
+	}
+	if head := f.liveHead(t, scheduleID, created.OverrideID); head != nil {
+		t.Fatalf("an override that never started is still live: %+v", head)
+	}
+}
+
+// TestCancelOverrideInForceKeepsTheHoursAlreadyServed is the whole point of
+// the change: the stand-in covered from 08:00, and cancelling at 10:00 must not
+// make yesterday's calendar say somebody else was on duty at 09:00.
+func TestCancelOverrideInForceKeepsTheHoursAlreadyServed(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+
+	from := f.clock.at.Add(-time.Hour)
+	to := f.clock.at.Add(3 * time.Hour)
+	created := f.createOverride(t, "bob", from, to)
+
+	f.clock.advance(30 * time.Minute)
+	cancelledAt := f.clock.at
+	reason := "back early"
+	if err := f.svc.CancelOverride(context.Background(), scheduleID, created.OverrideID, 1,
+		"alice", &reason); err != nil {
+		t.Fatalf("CancelOverride: %v", err)
+	}
+
+	head := f.liveHead(t, scheduleID, created.OverrideID)
+	if head == nil {
+		t.Fatal("the override was removed instead of being ended")
+	}
+	if !head.ValidFrom.Equal(scheduleconfig.NormalizeTimestamp(from)) {
+		t.Errorf("valid_from = %v, want the untouched %v", head.ValidFrom, from)
+	}
+	if !head.ValidTo.Equal(scheduleconfig.NormalizeTimestamp(cancelledAt)) {
+		t.Errorf("valid_to = %v, want the moment of the cancel %v", head.ValidTo, cancelledAt)
+	}
+	if head.UserID != "bob" {
+		t.Errorf("user = %q, want the person who actually covered", head.UserID)
+	}
+	// The reason is the canceller's, not the creator's, and both are readable:
+	// the earlier revision still carries whatever it carried.
+	if head.Reason == nil || *head.Reason != reason {
+		t.Errorf("reason = %v, want the canceller's own", head.Reason)
+	}
+}
+
+// TestCancelOverrideThatHasEndedIsRefused: 204 would tell the caller they
+// removed a shift, when what they did was rewrite who was on duty.
+func TestCancelOverrideThatHasEndedIsRefused(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+
+	from := f.clock.at.Add(-3 * time.Hour)
+	to := f.clock.at.Add(-time.Hour)
+	created := f.createOverride(t, "bob", from, to)
+
+	err := f.svc.CancelOverride(context.Background(), scheduleID, created.OverrideID, 1, "alice", nil)
+	var ended *scheduleconfig.OverrideAlreadyEndedError
+	if !errors.As(err, &ended) {
+		t.Fatalf("error = %v, want OverrideAlreadyEndedError", err)
+	}
+	if len(f.repo.OverrideRevisions(scheduleID)) != 1 {
+		t.Fatal("the refusal wrote a revision")
+	}
+}
+
+// TestCancelExactlyAtTheStartRemovesIt: the boundary is <=, not <, and not out
+// of taste - truncating to valid_to == valid_from would violate the CHECK on
+// the table, and it means the same thing anyway: nobody stood in for anybody.
+func TestCancelExactlyAtTheStartRemovesIt(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+
+	from := f.clock.at.Add(time.Hour)
+	created := f.createOverride(t, "bob", from, from.Add(2*time.Hour))
+
+	f.clock.advance(time.Hour) // now == valid_from
+	if err := f.svc.CancelOverride(context.Background(), scheduleID, created.OverrideID, 1, "alice", nil); err != nil {
+		t.Fatalf("CancelOverride: %v", err)
+	}
+	if head := f.liveHead(t, scheduleID, created.OverrideID); head != nil {
+		t.Fatalf("cancelling at the exact start left it live: %+v", head)
+	}
+}
+
+// TestUpdateOverrideInForceSplitsIt: revision N+1 wins the whole projection, so
+// replacing an override that is running would rewrite the hours already served.
+// The served part is closed where it stops, and the change becomes its own
+// override from now.
+func TestUpdateOverrideInForceSplitsIt(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+
+	from := f.clock.at.Add(-time.Hour)
+	to := f.clock.at.Add(3 * time.Hour)
+	created := f.createOverride(t, "bob", from, to)
+
+	f.clock.advance(time.Hour)
+	splitAt := f.clock.at
+	updated, err := f.svc.UpdateOverride(context.Background(), scheduleID, created.OverrideID, 1,
+		scheduleconfig.OverrideCommand{
+			UserID: "carol", ValidFrom: from, ValidTo: to, ActorID: "alice",
+		})
+	if err != nil {
+		t.Fatalf("UpdateOverride: %v", err)
+	}
+
+	if updated.OverrideID == created.OverrideID {
+		t.Fatal("the change kept the same override id, so it replaced the served hours")
+	}
+	if updated.Revision != 1 {
+		t.Errorf("the new override starts at revision %d, want 1", updated.Revision)
+	}
+	if !updated.ValidFrom.Equal(splitAt) || !updated.ValidTo.Equal(scheduleconfig.NormalizeTimestamp(to)) {
+		t.Errorf("new override = %v..%v, want %v..%v", updated.ValidFrom, updated.ValidTo, splitAt, to)
+	}
+	if updated.UserID != "carol" {
+		t.Errorf("new override is held by %q, want carol", updated.UserID)
+	}
+
+	old := f.liveHead(t, scheduleID, created.OverrideID)
+	if old == nil {
+		t.Fatal("the served part was removed")
+	}
+	if old.UserID != "bob" {
+		t.Errorf("the served part is held by %q, want the person who served it", old.UserID)
+	}
+	if !old.ValidTo.Equal(splitAt) {
+		t.Errorf("the served part ends at %v, want the split %v", old.ValidTo, splitAt)
+	}
+	// Half-open, so the two do not overlap and the existing non-overlap check
+	// passes without an exception for them.
+	if old.ValidTo.After(updated.ValidFrom) {
+		t.Error("the two halves overlap")
+	}
+}
+
+// A future override has served nothing, so one revision may replace another -
+// including moving it into the past, which records a fact rather than erasing
+// one.
+func TestUpdateOverrideBeforeItStartsReplacesIt(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+
+	from := f.clock.at.Add(24 * time.Hour)
+	created := f.createOverride(t, "bob", from, from.Add(2*time.Hour))
+
+	updated, err := f.svc.UpdateOverride(context.Background(), scheduleID, created.OverrideID, 1,
+		scheduleconfig.OverrideCommand{
+			UserID: "carol", ValidFrom: from, ValidTo: from.Add(4 * time.Hour), ActorID: "alice",
+		})
+	if err != nil {
+		t.Fatalf("UpdateOverride: %v", err)
+	}
+	if updated.OverrideID != created.OverrideID || updated.Revision != 2 {
+		t.Fatalf("update produced %+v, want revision 2 of the same override", updated)
+	}
+}
+
+// TestUpdateOverrideThatHasEndedIsRefused: same rule as cancel, same reason.
+func TestUpdateOverrideThatHasEndedIsRefused(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+
+	from := f.clock.at.Add(-3 * time.Hour)
+	created := f.createOverride(t, "bob", from, f.clock.at.Add(-time.Hour))
+
+	_, err := f.svc.UpdateOverride(context.Background(), scheduleID, created.OverrideID, 1,
+		scheduleconfig.OverrideCommand{
+			UserID: "carol", ValidFrom: from, ValidTo: f.clock.at.Add(time.Hour), ActorID: "alice",
+		})
+	if !errors.Is(err, scheduleconfig.ErrOverrideAlreadyEnded) {
+		t.Fatalf("error = %v, want ErrOverrideAlreadyEnded", err)
+	}
+}
+
+// TestUpdateOverrideInForceIgnoresASubmittedValidFrom: the hours already served
+// are not editable, so the new segment starts now whatever the caller sent.
+func TestUpdateOverrideInForceIgnoresASubmittedValidFrom(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+
+	from := f.clock.at.Add(-time.Hour)
+	to := f.clock.at.Add(3 * time.Hour)
+	created := f.createOverride(t, "bob", from, to)
+
+	f.clock.advance(time.Hour)
+	splitAt := f.clock.at
+	updated, err := f.svc.UpdateOverride(context.Background(), scheduleID, created.OverrideID, 1,
+		scheduleconfig.OverrideCommand{
+			// Two hours earlier than the split, i.e. into hours bob served.
+			UserID: "carol", ValidFrom: f.clock.at.Add(-2 * time.Hour), ValidTo: to, ActorID: "alice",
+		})
+	if err != nil {
+		t.Fatalf("UpdateOverride: %v", err)
+	}
+	if !updated.ValidFrom.Equal(splitAt) {
+		t.Fatalf("new override starts at %v, want the split %v - the served hours are not editable",
+			updated.ValidFrom, splitAt)
+	}
+}
+
+// TestUpdateOverrideInForceRefusesToEndInThePast: shortening to now is what
+// cancel does; shortening below it would erase duty somebody served.
+func TestUpdateOverrideInForceRefusesToEndInThePast(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+
+	from := f.clock.at.Add(-time.Hour)
+	created := f.createOverride(t, "bob", from, f.clock.at.Add(3*time.Hour))
+
+	f.clock.advance(time.Hour)
+	for _, validTo := range []time.Time{f.clock.at, f.clock.at.Add(-30 * time.Minute)} {
+		_, err := f.svc.UpdateOverride(context.Background(), scheduleID, created.OverrideID, 1,
+			scheduleconfig.OverrideCommand{
+				UserID: "carol", ValidFrom: from, ValidTo: validTo, ActorID: "alice",
+			})
+		if !errors.Is(err, scheduleconfig.ErrOverrideEndsInThePast) {
+			t.Fatalf("valid_to %v: error = %v, want ErrOverrideEndsInThePast", validTo, err)
+		}
 	}
 }

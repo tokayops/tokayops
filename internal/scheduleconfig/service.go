@@ -454,7 +454,7 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 	if err := tx.InsertRevision(ctx, deleted); err != nil {
 		return nil, err
 	}
-	if err := s.tombstoneLiveOverrides(ctx, tx, target.root.ID, target.effectiveAt, cmd.ActorID); err != nil {
+	if err := s.endLiveOverrides(ctx, tx, target.root.ID, target.effectiveAt, cmd.ActorID); err != nil {
 		return nil, err
 	}
 	if err := tx.SetScheduleDeleted(ctx, target.root.ID, &target.effectiveAt); err != nil {
@@ -467,11 +467,11 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 		target.root.ConfigVersion, target.effectiveAt, cmd.ActorID), nil
 }
 
-// tombstoneLiveOverrides appends a delete revision to every override that is
-// still alive. They share one recordedAt: the monotonicity rule applies to a
-// command, not to each row it writes, and the next override command will still
-// land above all of them.
-func (s *Service) tombstoneLiveOverrides(ctx context.Context, tx ScheduleConfigTx,
+// endLiveOverrides ends every override the schedule still has, by the same
+// rule a cancel follows. They share one recordedAt: the monotonicity rule
+// applies to a command, not to each row it writes, and the next override
+// command will still land above all of them.
+func (s *Service) endLiveOverrides(ctx context.Context, tx ScheduleConfigTx,
 	scheduleID string, at time.Time, actorID string) error {
 
 	heads, err := tx.ListOverrideHeads(ctx, scheduleID, false)
@@ -483,13 +483,28 @@ func (s *Service) tombstoneLiveOverrides(ctx context.Context, tx ScheduleConfigT
 	}
 	recordedAt := NormalizeTimestamp(at)
 	for _, head := range heads {
-		tombstone := head
-		tombstone.RevisionID = s.newID()
-		tombstone.Revision = head.Revision + 1
-		tombstone.Deleted = true
-		tombstone.RecordedAt = recordedAt
-		tombstone.RecordedBy = optionalString(actorID)
-		if err := tx.InsertOverrideRevision(ctx, &tombstone); err != nil {
+		next := head
+		next.RevisionID = s.newID()
+		next.Revision = head.Revision + 1
+		next.RecordedAt = recordedAt
+		next.RecordedBy = optionalString(actorID)
+		// The schedule is going away, and so is every override on it - but by
+		// the same rule a cancel follows: an override that has already covered
+		// some hours keeps them, and only the rest goes. Tombstoning all of
+		// them would take the served ones out of the projection and rewrite
+		// who was on duty before the schedule was deleted.
+		//
+		// Already-ended overrides need nothing: they are outside the deletion
+		// instant and the projection already answers them correctly.
+		switch {
+		case !recordedAt.After(head.ValidFrom):
+			next.Deleted = true
+		case recordedAt.Before(head.ValidTo):
+			next.ValidTo = recordedAt
+		default:
+			continue
+		}
+		if err := tx.InsertOverrideRevision(ctx, &next); err != nil {
 			return err
 		}
 	}

@@ -890,3 +890,39 @@ func TestRemoveTeamMemberGuard(t *testing.T) {
 		}
 	})
 }
+
+// Deleting a schedule ends its overrides by the same rule a cancel follows.
+//
+// Tombstoning all of them - which is what this used to do - took the served
+// ones out of the projection, so deleting a schedule today changed who the
+// calendar said was on duty last week. An override that has already started
+// keeps its hours and loses the rest.
+func TestDeleteScheduleEndsOverridesWithoutErasingServedHours(t *testing.T) {
+	f := newFixture(t)
+	created := f.mustSave(t, scheduleconfig.SaveCommand{
+		Desired: groupsConfig(group(groupAlice, "alice"), group(groupBob, "bob")),
+		ActorID: "alice",
+	})
+	scheduleID := created.Revision.ScheduleID
+
+	running := f.createOverride(t, "bob", f.clock.at.Add(-time.Hour), f.clock.at.Add(3*time.Hour))
+	future := f.createOverride(t, "bob", f.clock.at.Add(48*time.Hour), f.clock.at.Add(50*time.Hour))
+
+	f.clock.advance(time.Hour)
+	deletedAt := f.clock.at
+	if err := f.svc.Delete(context.Background(), "devops", scheduleconfig.DeleteCommand{
+		ExpectedVersion: 1, ActorID: "alice",
+	}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if head := f.liveHead(t, scheduleID, running.OverrideID); head == nil {
+		t.Fatal("the override that was in force was erased instead of ended")
+	} else if !head.ValidTo.Equal(deletedAt) {
+		t.Errorf("the running override ends at %v, want the deletion instant %v", head.ValidTo, deletedAt)
+	}
+
+	if head := f.liveHead(t, scheduleID, future.OverrideID); head != nil {
+		t.Fatalf("an override that never started survived the delete: %+v", head)
+	}
+}

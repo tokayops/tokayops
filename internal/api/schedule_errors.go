@@ -36,6 +36,13 @@ const (
 	CodeUserNotTeamMember = "user_not_team_member"
 	CodeMemberOnCall      = "member_on_call"
 
+	// Two codes, because the two refusals are about different halves of the
+	// same rule and a caller acts on them differently: an override that has
+	// ended cannot be touched at all, while an update that would end one in
+	// the past should be reissued as a cancel.
+	CodeOverrideAlreadyEnded  = "override_already_ended"
+	CodeOverrideEndsInThePast = "override_ends_in_the_past"
+
 	// Deleting a team is refused by two different things, and the codes are
 	// separate because the remedies are: history cannot be removed at all, an
 	// integration is removed by the caller.
@@ -73,6 +80,14 @@ var scheduleErrorStatuses = []struct {
 	{scheduleconfig.ErrScheduleExists, http.StatusConflict, CodeScheduleExists,
 		"this team already has a schedule"},
 	{scheduleconfig.ErrScheduleDeleted, http.StatusConflict, CodeScheduleDeleted, "schedule is deleted"},
+
+	// 422 rather than 409: a conflict invites a retry after re-reading, and
+	// re-reading changes nothing here. The override is over; no revision the
+	// caller could load would make cancelling it meaningful.
+	{scheduleconfig.ErrOverrideAlreadyEnded, http.StatusUnprocessableEntity,
+		CodeOverrideAlreadyEnded, "override has already ended"},
+	{scheduleconfig.ErrOverrideEndsInThePast, http.StatusUnprocessableEntity,
+		CodeOverrideEndsInThePast, "an update cannot end an override in the past"},
 	{erasure.ErrLastAdmin, http.StatusConflict, CodeLastAdmin, "last active admin"},
 
 	// Two codes rather than one "team is retained", because the two are acted

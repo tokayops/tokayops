@@ -525,13 +525,15 @@ func TestHandoffNotifierThreeGroupsNoRepeatWithinOneShift(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierEditedOverrideIsNotDeduped is the end-to-end form of the
-// case AssignmentStart cannot carry.
+// TestHandoffNotifierEditedOverrideIsNotDeduped: the same person coming back
+// onto duty must page again, even while the first job is still pending.
 //
-// Editing an override leaves its valid_from alone, so the same person coming
-// back onto the same override yields the same composition, the same kind AND the
-// same instant. Only the override revision differs, and the second job must
-// still be created while the first is pending.
+// Editing an override that is IN FORCE splits it - the served part is closed
+// where it stops and the change becomes a new override starting now - so U_C's
+// two arrivals differ by override id and by valid_from as well as by revision.
+// They used to differ by revision alone, which is what made this case worth an
+// end-to-end test; it is worth keeping because the dedup key still has to tell
+// them apart, and the assertion is unchanged either way.
 func TestHandoffNotifierEditedOverrideIsNotDeduped(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(group(handoffGroupA, "U_A")))
@@ -553,10 +555,12 @@ func TestHandoffNotifierEditedOverrideIsNotDeduped(t *testing.T) {
 	// U_C -> U_B -> U_C, all inside the one override interval. The first and
 	// third edits are the same event twice over: same holder, same override,
 	// same valid_from, same kind.
-	revision := override.Revision
+	// Each edit lands on whatever the previous one produced: an in-force edit
+	// returns the NEW override, so both the id and the revision move.
+	overrideID, revision := override.OverrideID, override.Revision
 	for i, user := range []string{"U_C", "U_B", "U_C"} {
 		env.now = env.now.Add(time.Hour)
-		updated, err := env.config.UpdateOverride(context.Background(), env.schedID, override.OverrideID,
+		updated, err := env.config.UpdateOverride(context.Background(), env.schedID, overrideID,
 			revision, scheduleconfig.OverrideCommand{
 				UserID:    user,
 				ValidFrom: from,
@@ -566,7 +570,7 @@ func TestHandoffNotifierEditedOverrideIsNotDeduped(t *testing.T) {
 		if err != nil {
 			t.Fatalf("UpdateOverride %d: %v", i, err)
 		}
-		revision = updated.Revision
+		overrideID, revision = updated.OverrideID, updated.Revision
 		env.tick(time.Minute)
 	}
 

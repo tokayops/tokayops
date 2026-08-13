@@ -28,10 +28,13 @@ type LayerOnCall struct {
 	// OverrideRevisionID identifies the VERSION of the override in force, and
 	// is set only for SourceOverride.
 	//
-	// It is what tells two arrivals of the same stand-in apart. Editing an
-	// override does not move its valid_from, so neither the composition nor
-	// AssignmentStart changes when the person on it is swapped and swapped
-	// back - only the revision does.
+	// It is part of what tells two arrivals of the same stand-in apart. It used
+	// to be the whole of it: editing an override left its valid_from alone, so
+	// swapping the person on it and swapping them back changed neither the
+	// composition nor AssignmentStart. Editing an override that is in force
+	// now splits it, so those two arrivals differ by override id and start
+	// instant as well - and this still moves, which keeps the case covered for
+	// edits that do not split.
 	OverrideRevisionID string
 }
 

@@ -193,7 +193,7 @@ function getOrCreateContextMenu(view) {
         </button>
         <button type="button" class="override-context-menu-item danger" data-action="delete">
             <i data-lucide="trash-2"></i>
-            Delete
+            End now
         </button>
     `;
     document.body.appendChild(menu);

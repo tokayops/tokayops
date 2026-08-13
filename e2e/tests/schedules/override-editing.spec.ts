@@ -247,8 +247,10 @@ test.describe('Calendar Override Context Menu', () => {
     const deleteRes = await deletePromise;
     expect(deleteRes.status()).toBe(204);
 
-    // Toast should confirm deletion
-    await schedulesPage.expectToastVisible('removed');
+    // "ended", not "removed": this one never started, so it is gone entirely -
+    // but the wording is shared with an override that keeps the hours it
+    // covered, and promising removal there would be untrue.
+    await schedulesPage.expectToastVisible('ended');
 
     // Override should disappear from the calendar
     await expect(schedulesPage.calendarOverrideEntries).toHaveCount(0, { timeout: 5000 });
@@ -357,7 +359,7 @@ test.describe('Override Edit from Modal List', () => {
     const deleteRes = await deletePromise;
     expect(deleteRes.status()).toBe(204);
 
-    await schedulesPage.expectToastVisible('removed');
+    await schedulesPage.expectToastVisible('ended');
 
     // Override list should have one fewer item
     await expect(schedulesPage.overrideItems).toHaveCount(countBefore - 1, { timeout: 5000 });

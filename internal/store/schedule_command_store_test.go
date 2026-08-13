@@ -17,6 +17,7 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rotation"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
 // cmdConfig is a valid configuration over the named members, one group each.
@@ -1138,5 +1139,81 @@ func TestGetAllUsersExcludesErased(t *testing.T) {
 	// Still resolvable one by one, which is what history needs.
 	if _, err := s.GetUserByID("bob"); err != nil {
 		t.Fatalf("history can no longer resolve the erased id: %v", err)
+	}
+}
+
+// TestCancelledOverrideKeepsItsPastInTheRender is the end-to-end form of the
+// rule, through the real store and the real renderer.
+//
+// The command side truncates rather than tombstones, and the renderer reads the
+// current projection - which is exactly why the two have to be checked
+// together. Truncation is only worth anything if the projection then answers a
+// past range with the person who actually covered it.
+func TestCancelledOverrideKeepsItsPastInTheRender(t *testing.T) {
+	s := setupTestDB(t)
+	seedTeam(t, s, "devops", "alice", "bob")
+	ctx := context.Background()
+
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	if _, err := createViaSave(ctx, newTestScheduleService(s, start), "devops", revTestConfig(), "", nil); err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+	var scheduleID string
+	if err := withSnapshot(t, s, func(view scheduleconfig.ScheduleReadView) error {
+		root, err := view.GetScheduleRootByTeam(ctx, "devops")
+		if err != nil {
+			return err
+		}
+		scheduleID = root.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("read the root: %v", err)
+	}
+
+	// bob stands in from 10:00 to 16:00, and the clock is at 10:00 when it is
+	// created so the override is in force.
+	from := start.Add(2 * time.Hour)
+	to := start.Add(8 * time.Hour)
+	svcAtStart := newTestScheduleService(s, from)
+	created, err := svcAtStart.CreateOverride(ctx, "devops", scheduleconfig.OverrideCommand{
+		UserID: "bob", ValidFrom: from, ValidTo: to, ActorID: "alice",
+	})
+	if err != nil {
+		t.Fatalf("CreateOverride: %v", err)
+	}
+
+	// Two hours in, somebody cancels it.
+	cancelledAt := from.Add(2 * time.Hour)
+	if err := newTestScheduleService(s, cancelledAt).
+		CancelOverride(ctx, scheduleID, created.OverrideID, 1, "alice", nil); err != nil {
+		t.Fatalf("CancelOverride: %v", err)
+	}
+
+	renderer := schedulerender.New(s.ScheduleReadRepository())
+	res, err := renderer.RenderRange(ctx, scheduleID, from, to)
+	if err != nil {
+		t.Fatalf("RenderRange: %v", err)
+	}
+
+	var overrideEnd time.Time
+	var sawOverride bool
+	for _, a := range res.Assignments {
+		if a.Source != schedulerender.SourceOverride {
+			continue
+		}
+		sawOverride = true
+		if a.AssignmentEnd.After(overrideEnd) {
+			overrideEnd = a.AssignmentEnd
+		}
+		if len(a.UserIDs) != 1 || a.UserIDs[0] != "bob" {
+			t.Fatalf("the hours bob covered are attributed to %v", a.UserIDs)
+		}
+	}
+	if !sawOverride {
+		t.Fatal("the cancelled override vanished from the range it had already covered")
+	}
+	if !overrideEnd.Equal(cancelledAt) {
+		t.Errorf("the override runs until %v in the render, want the cancel instant %v",
+			overrideEnd, cancelledAt)
 	}
 }

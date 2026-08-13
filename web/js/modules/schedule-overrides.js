@@ -547,11 +547,14 @@ export async function removeOverride(target, { onStale } = {}) {
         revision = head.revision;
     }
 
-    if (!confirm('Remove this override?')) return false;
+    // "End", not "remove": an override that has already started keeps the
+    // hours it covered, and the calendar will still show them. Saying "remove"
+    // would promise something the server deliberately does not do.
+    if (!confirm('End this override now? Any hours already covered are kept.')) return false;
 
     try {
         await API.schedules.deleteOverride(scheduleId, overrideId, revision);
-        showToast('Override removed', 'success');
+        showToast('Override ended', 'success');
         return true;
     } catch (error) {
         console.error('Failed to delete override:', error);
