@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -73,60 +75,95 @@ CREATE TABLE IF NOT EXISTS rotation_epochs (
 );
 `
 
-// makeSchemaLegacy puts the database back into its pre-revision shape and
-// registers the cleanup that takes it out again.
+// newThrowawayDB gives the caller a database of its own, created empty.
 //
-// The cleanup is not hygiene. The three tables it creates are no longer in any
-// truncate list - they do not exist on a normal test database - so nothing else
-// would remove them, and InitDB does not drop columns. A fixture that left them
-// behind would make every later assertion about "the final schema shape" depend
-// on the order the tests happen to run in.
-//
-// It restores in the order the restoration requires: rows first, because a
-// pre-revision row has no horizon and SET NOT NULL would refuse it; then the
-// schema; then the constraint. And it finishes by asking RequireCutoverSchema
-// whether it succeeded, so an incomplete restore fails THIS test rather than a
-// later one that did nothing wrong.
-func makeSchemaLegacy(t *testing.T, s *Store) {
+// Two different needs land here. Tests that assert what a database looks like
+// when InitDB runs on it for the FIRST time cannot use the shared one, where
+// TestMain has already run InitDB (main_test.go) and any neighbour may have
+// reshaped it since - "fresh" there is a fiction. And tests that reshape the
+// schema must not do it to a database anything else will use afterwards.
+func newThrowawayDB(t *testing.T) *Store {
 	t.Helper()
 
-	t.Cleanup(func() { restoreCutoverSchema(t, s) })
-
-	if _, err := s.db.Exec(legacyScheduleFixtureDDL); err != nil {
-		t.Fatalf("build the pre-revision schema: %v", err)
+	dsn := os.Getenv("TEST_DB_DSN")
+	if dsn == "" {
+		t.Skip("TEST_DB_DSN not set")
 	}
+	admin, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open the admin connection: %v", err)
+	}
+	defer admin.Close()
+
+	// One database per test. The name carries a common prefix so a leftover
+	// from a killed run is recognizable as test scaffolding.
+	name := fmt.Sprintf("tokay_tmp_%x", time.Now().UnixNano())
+	// nosemgrep: string-formatted-query - the name is generated here, not user input
+	if _, err := admin.Exec(`DROP DATABASE IF EXISTS ` + name); err != nil {
+		t.Fatalf("drop a stale %s: %v", name, err)
+	}
+	// nosemgrep: string-formatted-query - the name is generated here, not user input
+	if _, err := admin.Exec(`CREATE DATABASE ` + name); err != nil {
+		t.Skipf("cannot create a throwaway database (%v); "+
+			"TEST_DB_DSN must name a user allowed to CREATE DATABASE", err)
+	}
+
+	s, err := NewStore(replaceDBName(t, dsn, name))
+	if err != nil {
+		t.Fatalf("connect to %s: %v", name, err)
+	}
+	t.Cleanup(func() {
+		s.Close()
+		dropper, err := sql.Open("postgres", dsn)
+		if err != nil {
+			t.Errorf("reopen to drop %s: %v", name, err)
+			return
+		}
+		defer dropper.Close()
+		// nosemgrep: string-formatted-query - the name is generated here, not user input
+		if _, err := dropper.Exec(`DROP DATABASE IF EXISTS ` + name + ` WITH (FORCE)`); err != nil {
+			t.Errorf("drop %s: %v", name, err)
+		}
+	})
+	return s
 }
 
-func restoreCutoverSchema(t *testing.T, s *Store) {
+func replaceDBName(t *testing.T, dsn, name string) string {
 	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse TEST_DB_DSN: %v", err)
+	}
+	u.Path = "/" + name
+	return u.String()
+}
 
-	// A test may have failed before the reset ran, or after it: either the
-	// legacy shape is still there or it is long gone. Both are expected, so
-	// every statement below tolerates its subject being absent.
-	if _, err := s.db.Exec(`DELETE FROM schedules WHERE history_complete_from IS NULL`); err != nil {
-		t.Fatalf("clear pre-revision rows: %v", err)
+// newLegacyDB gives the caller a throwaway database already in its
+// pre-revision shape: schema created by the real InitDB, then reshaped.
+//
+// It has to be a database of its own, and not because of test order. Building
+// the legacy shape means ADD COLUMN, and taking it down means DROP COLUMN -
+// and PostgreSQL keeps a dropped column's slot forever, counting it against the
+// 1600-column limit of the table. On a shared database that is not a mess to
+// clean up afterwards, it is damage that accumulates across runs until
+// `schedules` can no longer take a column at all. A borrowed database cannot be
+// given back; a throwaway one is dropped with the slots still in it.
+func newLegacyDB(t *testing.T) *Store {
+	t.Helper()
+	s := newThrowawayDB(t)
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("InitDB: %v", err)
 	}
-	for _, table := range legacyScheduleTables {
-		// nosemgrep: string-formatted-query - table names are hardcoded, not user input
-		if _, err := s.db.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS %s`, table)); err != nil {
-			t.Fatalf("drop %s: %v", table, err)
-		}
-	}
-	for _, column := range legacyScheduleColumns {
-		// nosemgrep: string-formatted-query - column names are hardcoded, not user input
-		if _, err := s.db.Exec(fmt.Sprintf(
-			`ALTER TABLE schedules DROP COLUMN IF EXISTS %s`, column)); err != nil {
-			t.Fatalf("drop schedules.%s: %v", column, err)
-		}
-	}
-	if _, err := s.db.Exec(
-		`ALTER TABLE schedules ALTER COLUMN history_complete_from SET NOT NULL`); err != nil {
-		t.Fatalf("restore NOT NULL on the history horizon: %v", err)
-	}
-	// The self-check. Without it a half-restored schema is a green test here
-	// and a baffling failure somewhere else.
-	if err := s.RequireCutoverSchema(); err != nil {
-		t.Fatalf("the fixture did not restore the schema it borrowed: %v", err)
+	makeSchemaLegacy(t, s)
+	return s
+}
+
+// makeSchemaLegacy reshapes a database into its pre-revision form. Only ever
+// called on a throwaway one - see newLegacyDB.
+func makeSchemaLegacy(t *testing.T, s *Store) {
+	t.Helper()
+	if _, err := s.db.Exec(legacyScheduleFixtureDDL); err != nil {
+		t.Fatalf("build the pre-revision schema: %v", err)
 	}
 }
 

@@ -2,79 +2,11 @@ package store
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
-	"net/url"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
-
-// newCutoverDB gives the caller a database of its own, created empty.
-//
-// The shared test database cannot answer the question this file asks. Two of
-// the assertions below are about what a database looks like when InitDB runs on
-// it for the FIRST time, and on the shared one TestMain has already run InitDB
-// (main_test.go) and any neighbouring test may have reshaped it since. "Fresh"
-// there is a fiction, and a test that believes it would be pinning the order
-// the package happens to run in.
-func newCutoverDB(t *testing.T) *Store {
-	t.Helper()
-
-	dsn := os.Getenv("TEST_DB_DSN")
-	if dsn == "" {
-		t.Skip("TEST_DB_DSN not set")
-	}
-	admin, err := sql.Open("postgres", dsn)
-	if err != nil {
-		t.Fatalf("open the admin connection: %v", err)
-	}
-	defer admin.Close()
-
-	// One database per test, named after it: a leftover from a killed run is
-	// then traceable to the test that made it rather than anonymous.
-	name := "cutover_" + fmt.Sprintf("%x", time.Now().UnixNano())
-	// nosemgrep: string-formatted-query - the name is generated here, not user input
-	if _, err := admin.Exec(`DROP DATABASE IF EXISTS ` + name); err != nil {
-		t.Fatalf("drop a stale %s: %v", name, err)
-	}
-	// nosemgrep: string-formatted-query - the name is generated here, not user input
-	if _, err := admin.Exec(`CREATE DATABASE ` + name); err != nil {
-		t.Skipf("cannot create a database for the cutover test (%v); "+
-			"TEST_DB_DSN must name a user allowed to CREATE DATABASE", err)
-	}
-
-	s, err := NewStore(replaceDBName(t, dsn, name))
-	if err != nil {
-		t.Fatalf("connect to %s: %v", name, err)
-	}
-	t.Cleanup(func() {
-		s.Close()
-		dropper, err := sql.Open("postgres", dsn)
-		if err != nil {
-			t.Errorf("reopen to drop %s: %v", name, err)
-			return
-		}
-		defer dropper.Close()
-		// nosemgrep: string-formatted-query - the name is generated here, not user input
-		if _, err := dropper.Exec(`DROP DATABASE IF EXISTS ` + name + ` WITH (FORCE)`); err != nil {
-			t.Errorf("drop %s: %v", name, err)
-		}
-	})
-	return s
-}
-
-func replaceDBName(t *testing.T, dsn, name string) string {
-	t.Helper()
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatalf("parse TEST_DB_DSN: %v", err)
-	}
-	u.Path = "/" + name
-	return u.String()
-}
 
 // TestCutoverSequence is the one test that matters here, and it is end to end
 // because what has to hold is the SEQUENCE, not its steps.
@@ -84,14 +16,14 @@ func replaceDBName(t *testing.T, dsn, name string) string {
 // repair it, and the gate must then pass - in that order, on the same database,
 // with the schedules still writable afterwards.
 func TestCutoverSequence(t *testing.T) {
-	s := newCutoverDB(t)
+	s := newThrowawayDB(t)
 
 	// 1. A database from before the revision model. InitDB has to run on it
 	//    first, because that is what the binary does before anything else.
 	if err := s.InitDB(); err != nil {
 		t.Fatalf("InitDB on an empty database: %v", err)
 	}
-	makeLegacyShapeWithoutCleanup(t, s)
+	makeSchemaLegacy(t, s)
 	seedLegacySchedule(t, s, "devops", "sched-legacy", "alice")
 
 	// 2. InitDB again, as the upgraded binary runs it. It must not fail, and
@@ -160,21 +92,12 @@ func TestCutoverSequence(t *testing.T) {
 	}
 }
 
-// makeLegacyShapeWithoutCleanup is makeSchemaLegacy without the restore: this
-// database is thrown away whole, so restoring it would be work done for nobody.
-func makeLegacyShapeWithoutCleanup(t *testing.T, s *Store) {
-	t.Helper()
-	if _, err := s.db.Exec(legacyScheduleFixtureDDL); err != nil {
-		t.Fatalf("build the pre-revision schema: %v", err)
-	}
-}
-
 // TestFreshDatabaseReachesTheFinalShape: a new installation needs no reset, so
 // the gate must let it start. The reset is for upgrades and is not meaningful
 // here - which is why the refusal is worded about the legacy shape and not
 // about a missing marker.
 func TestFreshDatabaseReachesTheFinalShape(t *testing.T) {
-	s := newCutoverDB(t)
+	s := newThrowawayDB(t)
 	if err := s.InitDB(); err != nil {
 		t.Fatalf("InitDB: %v", err)
 	}
@@ -212,11 +135,11 @@ func TestFreshDatabaseReachesTheFinalShape(t *testing.T) {
 // history_complete_from IS NULL` - returns zero here and would wave this
 // database through with its pre-revision schema fully intact.
 func TestEmptyLegacyDatabaseIsRefused(t *testing.T) {
-	s := newCutoverDB(t)
+	s := newThrowawayDB(t)
 	if err := s.InitDB(); err != nil {
 		t.Fatalf("InitDB: %v", err)
 	}
-	makeLegacyShapeWithoutCleanup(t, s)
+	makeSchemaLegacy(t, s)
 
 	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules WHERE history_complete_from IS NULL`); n != 0 {
 		t.Fatalf("the fixture must be empty for this test to mean anything, got %d rows", n)
@@ -229,7 +152,7 @@ func TestEmptyLegacyDatabaseIsRefused(t *testing.T) {
 // missing extension with a NOTICE, so losing the extension would remove the
 // non-overlap invariant silently, and only on fresh databases.
 func TestFreshDatabaseHasTheRevisionExclusionConstraint(t *testing.T) {
-	s := newCutoverDB(t)
+	s := newThrowawayDB(t)
 	if err := s.InitDB(); err != nil {
 		t.Fatalf("InitDB: %v", err)
 	}
@@ -240,13 +163,14 @@ func TestFreshDatabaseHasTheRevisionExclusionConstraint(t *testing.T) {
 		t.Fatalf("check for btree_gist: %v", err)
 	}
 	if !available {
+		// Skipped rather than failed on purpose: the constraint is defence in
+		// depth and an installation without the extension is supported. That
+		// contract is what RevisionOverlapConstraintPresent reports at startup.
 		t.Skip("btree_gist is not installed in this PostgreSQL; the constraint is skipped by design")
 	}
 
-	var present bool
-	if err := s.db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_schedule_revisions')`).
-		Scan(&present); err != nil {
+	present, err := s.RevisionOverlapConstraintPresent()
+	if err != nil {
 		t.Fatalf("check for the constraint: %v", err)
 	}
 	if !present {
@@ -254,18 +178,15 @@ func TestFreshDatabaseHasTheRevisionExclusionConstraint(t *testing.T) {
 	}
 }
 
-// TestLegacyFixtureBuildsARealLegacyShape guards the fixture itself, on the
-// SHARED database it borrows.
+// TestLegacyFixtureBuildsARealLegacyShape guards the fixture itself.
 //
-// Its other half - that the borrowing is given back - is asserted by the
-// cleanup, which ends in RequireCutoverSchema and therefore fails the test that
-// borrowed rather than some later test that did nothing wrong. What is left to
-// check here is that the shape is genuinely the pre-revision one, and not
-// merely something the gate happens to dislike: a fixture that refused for the
-// wrong reason would make the cutover sequence prove nothing.
+// The cutover sequence proves nothing if what it upgrades is not actually a
+// pre-revision database - a fixture the gate refused for some other reason
+// would look exactly as convincing. So the shape is checked directly: the
+// tables, the mutable columns, and a schedule row with no history horizon,
+// which nothing in this binary can write.
 func TestLegacyFixtureBuildsARealLegacyShape(t *testing.T) {
-	s := setupTestDB(t)
-	makeSchemaLegacy(t, s)
+	s := newLegacyDB(t)
 	seedLegacySchedule(t, s, "devops", "sched-fixture", "alice")
 
 	for _, table := range []string{"rotation_epochs", "schedule_users", "schedule_overrides"} {
@@ -285,4 +206,33 @@ func TestLegacyFixtureBuildsARealLegacyShape(t *testing.T) {
 		t.Fatalf("got %d pre-revision rows, want exactly the one the fixture wrote", n)
 	}
 	requireLegacyShapeRefused(t, s.RequireCutoverSchema())
+}
+
+// TestRevisionOverlapConstraintLookupIsTableQualified: constraint names are
+// unique per table, so a same-named constraint elsewhere must not answer for
+// this one - and it would answer "present", hiding exactly the absence the
+// startup warning exists to report.
+func TestRevisionOverlapConstraintLookupIsTableQualified(t *testing.T) {
+	s := newThrowawayDB(t)
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+
+	// Drop the real one, then put a decoy of the same name on another table.
+	if _, err := s.db.Exec(
+		`ALTER TABLE schedule_revisions DROP CONSTRAINT IF EXISTS no_overlapping_schedule_revisions`); err != nil {
+		t.Fatalf("drop the real constraint: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`ALTER TABLE teams ADD CONSTRAINT no_overlapping_schedule_revisions CHECK (id <> '')`); err != nil {
+		t.Fatalf("add the decoy: %v", err)
+	}
+
+	present, err := s.RevisionOverlapConstraintPresent()
+	if err != nil {
+		t.Fatalf("RevisionOverlapConstraintPresent: %v", err)
+	}
+	if present {
+		t.Fatal("a constraint of the same name on another table was reported as this one")
+	}
 }

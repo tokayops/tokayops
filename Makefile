@@ -66,10 +66,17 @@ test-db-status:
 test-integration:
 	@./scripts/run_integration_tests.sh --failures
 
-# Integration tests in randomized order. Inside the runner so the database it
-# starts is still up: see the --shuffle comment in the script.
+# Order independence of the store package, which is where the schema-mutating
+# cutover tests live. Inside the runner so the database it starts is still up:
+# see the --shuffle comment in the script.
+#
+# Scoped to ./internal/store/... deliberately. The tree as a whole has never
+# been order-independent - `-shuffle=on` over ./internal/... fails on `epic10`
+# too, in api, dispatcher and integration - and fixing that is a separate piece
+# of work, recorded in tokay-docs. Widening this target before then would give
+# it a red baseline and make it useless for the thing it was added to check.
 test-integration-shuffle:
-	@./scripts/run_integration_tests.sh --shuffle --failures
+	@./scripts/run_integration_tests.sh --shuffle --pkg ./internal/store/... --failures
 
 # Quick summary of integration tests
 test-integration-quick:

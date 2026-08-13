@@ -26,15 +26,18 @@ const legacyScheduleDropMarker = "legacy_schedule_physical_drop"
 // two operators starting the reset at once serialize instead of racing.
 const legacyScheduleResetLockKey int64 = 1953980275
 
-// legacyResetLockTimeout bounds the wait for the locks the physical phase
-// needs.
+// legacyResetLockTimeout bounds every lock this transaction waits for.
 //
-// The phase is DDL: DROP TABLE, DROP COLUMN and SET NOT NULL all take ACCESS
-// EXCLUSIVE. The upgrade checklist requires every instance to be stopped, so on
-// a real cutover nothing contends. When something does, waiting is the worst
-// available answer: a cutover window is finite, and in CI an unbounded wait
-// burns the whole job timeout and reports nothing about why. Failing names the
-// blocker instead.
+// The physical phase is DDL: DROP TABLE, DROP COLUMN and SET NOT NULL all take
+// ACCESS EXCLUSIVE. The upgrade checklist requires every instance to be
+// stopped, so on a real cutover nothing contends. When something does, waiting
+// is the worst available answer: a cutover window is finite, and in CI an
+// unbounded wait burns the whole job timeout and reports nothing about why.
+// Failing names the blocker instead.
+//
+// It is set before the advisory lock rather than after, and the advisory lock
+// is taken with the try form: the two together are what leave no unbounded wait
+// in the transaction.
 const legacyResetLockTimeout = "15s"
 
 // legacyScheduleTables are the pre-revision tables the cleanup removes.
@@ -81,6 +84,11 @@ var ErrLegacyResetUnexpectedState = errors.New("store: schedule reset marker mis
 // reach the schedules it is about.
 var ErrLegacyResetRootWithoutHorizon = errors.New("store: schedule has no history horizon and cannot be tightened")
 
+// ErrLegacyResetInProgress means another process holds the reset lock. Re-run
+// once it has finished; the marker makes the second run a no-op.
+var ErrLegacyResetInProgress = errors.New(
+	"store: another schedule reset is already running against this database")
+
 // ResetResult reports what the reset did.
 //
 // The outcomes are kept distinct rather than inferred from the count, because
@@ -123,7 +131,7 @@ func (s *Store) ResetLegacySchedules() (*ResetResult, error) {
 //
 // The transaction is:
 //
-//  1. take a global advisory lock and bound the wait for every other one;
+//  1. bound every lock wait, then take the global advisory lock or refuse;
 //  2. physical marker present -> no-op;
 //  3. reset marker absent (a database from before the epic) -> refuse if
 //     revision data exists, otherwise DELETE FROM schedules and record it;
@@ -148,12 +156,24 @@ func RunLegacyScheduleReset(db *sql.DB) (*ResetResult, error) {
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after a successful commit is a no-op
 
-	// Held until the transaction ends; no explicit unlock to forget.
-	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, legacyScheduleResetLockKey); err != nil {
-		return nil, err
-	}
+	// lock_timeout goes first, before anything can wait: set after the advisory
+	// lock it would not bound the one wait that has no other bound.
 	if _, err := tx.Exec(`SET LOCAL lock_timeout = '` + legacyResetLockTimeout + `'`); err != nil {
 		return nil, err
+	}
+
+	// Try, not wait. Held until the transaction ends, so there is no unlock to
+	// forget - and a second operator gets a sentence naming the situation
+	// instead of a wait that ends in `canceling statement due to lock timeout`,
+	// which says nothing about who is holding it or what to do. Re-running
+	// after the first finishes is a no-op by then.
+	var acquired bool
+	if err := tx.QueryRow(
+		`SELECT pg_try_advisory_xact_lock($1)`, legacyScheduleResetLockKey).Scan(&acquired); err != nil {
+		return nil, err
+	}
+	if !acquired {
+		return nil, ErrLegacyResetInProgress
 	}
 
 	dropped, err := markerExists(tx, legacyScheduleDropMarker)

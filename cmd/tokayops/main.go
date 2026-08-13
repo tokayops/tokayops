@@ -266,6 +266,20 @@ func main() {
 		log.Fatalf("Refusing to start: %v", err)
 	}
 
+	// Defence in depth, reported rather than enforced - see
+	// RevisionOverlapConstraintPresent for why this warns instead of refusing.
+	// The DDL swallows a missing btree_gist with a NOTICE nobody reads, so
+	// without this line an installation cannot tell it is running without the
+	// constraint.
+	if present, err := st.RevisionOverlapConstraintPresent(); err != nil {
+		log.Fatalf("Failed to inspect the schedule schema: %v", err)
+	} else if !present {
+		log.Println("WARN: the schedule_revisions non-overlap constraint is absent " +
+			"(btree_gist unavailable when the schema was created). Overlapping revisions are still " +
+			"prevented by the write path's row lock; the database-level backstop is not in place. " +
+			"Install the btree_gist extension and restart to add it.")
+	}
+
 	// 3. Init Components
 
 	// Schedule projection. It is constructed here, before its first consumer,

@@ -333,7 +333,13 @@ type ScheduleRenderResponse struct {
 	// there is no absence to express. It is a value rather than a pointer for
 	// that reason - and `omitempty` would not have expressed the absence
 	// anyway, since it does nothing on a struct.
-	HistoryCompleteFrom time.Time `json:"history_complete_from"`
+	//
+	// `validate:"required"` is here for the generated contract, not for
+	// runtime validation: this is a response type and nothing validates it on
+	// the way out. Without the tag swagger keeps describing the field as
+	// optional and every generated client keeps a pointer for a value that
+	// cannot be absent.
+	HistoryCompleteFrom time.Time `json:"history_complete_from" validate:"required"`
 
 	DeletedAt *time.Time           `json:"deleted_at,omitempty"`
 	Entries   []ShiftDTO           `json:"entries"`

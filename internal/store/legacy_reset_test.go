@@ -16,8 +16,7 @@ func markerCount(t *testing.T, s *Store, name string) int {
 }
 
 func TestLegacyScheduleResetCascades(t *testing.T) {
-	s := setupTestDB(t)
-	makeSchemaLegacy(t, s)
+	s := newLegacyDB(t)
 	seedLegacySchedule(t, s, "devops", "sched-devops", "alice")
 	seedLegacySchedule(t, s, "platform", "sched-platform", "bob")
 
@@ -45,12 +44,17 @@ func TestLegacyScheduleResetCascades(t *testing.T) {
 			t.Errorf("%s survived the cleanup", table)
 		}
 	}
-	// Teams and users are not schedule data and must survive.
-	if n := countRows(t, s, `SELECT COUNT(*) FROM teams`); n != 2 {
-		t.Fatalf("got %d teams, want 2", n)
+	// Teams and users are not schedule data and must survive. Named rather
+	// than counted: InitDB creates a `triage` team of its own, and a global
+	// count would be asserting that the database is otherwise empty, which is
+	// not what this test is about.
+	if n := countRows(t, s,
+		`SELECT COUNT(*) FROM teams WHERE id IN ('devops', 'platform')`); n != 2 {
+		t.Fatalf("got %d of the two seeded teams, want both", n)
 	}
-	if n := countRows(t, s, `SELECT COUNT(*) FROM users`); n != 2 {
-		t.Fatalf("got %d users, want 2", n)
+	if n := countRows(t, s,
+		`SELECT COUNT(*) FROM users WHERE id IN ('alice', 'bob')`); n != 2 {
+		t.Fatalf("got %d of the two seeded users, want both", n)
 	}
 	if markerCount(t, s, legacyScheduleResetMarker) != 1 {
 		t.Error("the reset marker was not written")
@@ -63,8 +67,7 @@ func TestLegacyScheduleResetCascades(t *testing.T) {
 // The marker is what makes a second run harmless: without it, a rerun after
 // the operator has recreated schedules would delete them.
 func TestLegacyScheduleResetIsNotRepeatable(t *testing.T) {
-	s := setupTestDB(t)
-	makeSchemaLegacy(t, s)
+	s := newLegacyDB(t)
 	seedLegacySchedule(t, s, "devops", "sched-devops", "alice")
 
 	if _, err := s.ResetLegacySchedules(); err != nil {
@@ -122,8 +125,7 @@ func TestLegacyScheduleResetIsNotRepeatable(t *testing.T) {
 // them - which is what the pre-cutover code path would do without its marker
 // short-circuit - is the catastrophe this test exists to prevent.
 func TestLegacyScheduleResetCleansUpADatabaseThatAlreadyRanTheReset(t *testing.T) {
-	s := setupTestDB(t)
-	makeSchemaLegacy(t, s)
+	s := newLegacyDB(t)
 
 	// The state an earlier upgrade left: the reset marker is there, the legacy
 	// schema is not gone, and the schedules are the new ones.
@@ -173,8 +175,7 @@ func TestLegacyScheduleResetCleansUpADatabaseThatAlreadyRanTheReset(t *testing.T
 // still has no horizon. SET NOT NULL would refuse it with a bare DDL error
 // naming a column, which tells the one person who can fix it nothing.
 func TestLegacyScheduleResetRefusesARootWithoutHorizonByName(t *testing.T) {
-	s := setupTestDB(t)
-	makeSchemaLegacy(t, s)
+	s := newLegacyDB(t)
 
 	if _, err := s.db.Exec(
 		`INSERT INTO migration_markers (name) VALUES ($1)`, legacyScheduleResetMarker); err != nil {
@@ -204,8 +205,7 @@ func TestLegacyScheduleResetRefusesARootWithoutHorizonByName(t *testing.T) {
 // Revision data without the marker means someone already used the new write
 // path against this database. Deleting then would destroy live schedules.
 func TestLegacyScheduleResetRefusesWhenRevisionsExistWithoutMarker(t *testing.T) {
-	s := setupTestDB(t)
-	makeSchemaLegacy(t, s)
+	s := newLegacyDB(t)
 	seedLegacySchedule(t, s, "platform", "sched-platform", "bob")
 
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
@@ -238,7 +238,10 @@ func TestLegacyScheduleResetRefusesWhenRevisionsExistWithoutMarker(t *testing.T)
 // A database that never carried the legacy schema at all still records both
 // markers, so a second run is the no-op it is everywhere else.
 func TestLegacyScheduleResetOnFreshDatabase(t *testing.T) {
-	s := setupTestDB(t)
+	s := newThrowawayDB(t)
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
 
 	res, err := s.ResetLegacySchedules()
 	if err != nil {
@@ -258,5 +261,49 @@ func TestLegacyScheduleResetOnFreshDatabase(t *testing.T) {
 	}
 	if err := s.RequireCutoverSchema(); err != nil {
 		t.Fatalf("a fresh database is not in the final shape: %v", err)
+	}
+}
+
+// TestLegacyScheduleResetRefusesWhenAnotherRunHoldsTheLock: the advisory lock
+// is taken with the try form, so a second operator is told what is happening
+// rather than waiting for a timeout that names nothing.
+//
+// It also pins the ordering that makes this true. lock_timeout is set BEFORE
+// the lock is taken; set after, it would bound every wait in the transaction
+// except the one that has no other bound.
+func TestLegacyScheduleResetRefusesWhenAnotherRunHoldsTheLock(t *testing.T) {
+	s := newThrowawayDB(t)
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+
+	holder, err := s.db.Begin()
+	if err != nil {
+		t.Fatalf("begin the holding transaction: %v", err)
+	}
+	defer holder.Rollback() //nolint:errcheck // the test is done with it either way
+	if _, err := holder.Exec(
+		`SELECT pg_advisory_xact_lock($1)`, legacyScheduleResetLockKey); err != nil {
+		t.Fatalf("hold the advisory lock: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ResetLegacySchedules()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrLegacyResetInProgress) {
+			t.Fatalf("error = %v, want ErrLegacyResetInProgress", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reset waited on the advisory lock instead of refusing; " +
+			"lock_timeout does not bound a lock that was already taken")
+	}
+
+	if markerCount(t, s, legacyScheduleDropMarker) != 0 {
+		t.Error("the refused run recorded a marker")
 	}
 }

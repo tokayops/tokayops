@@ -574,8 +574,16 @@ func (s *Store) InitDB() error {
 	-- Defence in depth only: non-overlap is guaranteed by the schedule row
 	-- lock and a single transaction (an empty history has no revision row to
 	-- lock). Skipped when btree_gist is unavailable.
+	-- Qualified by table and kind, like the startup check that reports on it:
+	-- constraint names are unique per table, so a same-named constraint on
+	-- another table would make this skip creating the real one.
 	DO $$ BEGIN
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_schedule_revisions') THEN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conname = 'no_overlapping_schedule_revisions'
+			  AND conrelid = to_regclass('public.schedule_revisions')
+			  AND contype = 'x'
+		) THEN
 			ALTER TABLE schedule_revisions ADD CONSTRAINT no_overlapping_schedule_revisions
 				EXCLUDE USING gist (schedule_id WITH =, tstzrange(effective_from, effective_to, '[)') WITH &&);
 		END IF;
