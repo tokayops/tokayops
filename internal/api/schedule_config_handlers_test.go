@@ -271,19 +271,6 @@ func TestGetConfigStates(t *testing.T) {
 		}
 	})
 
-	// A row with no history horizon is refused, not reported as missing. It is
-	// covered across every endpoint by TestRootWithoutHistoryIsRefusedEverywhere.
-	t.Run("RootWithoutHistoryIsAnInvariantViolation", func(t *testing.T) {
-		_, s, e, env := setupScheduleAPI(t)
-		defer s.Close()
-		env.Config.SeedRootWithoutHistory("legacy-1", "devops")
-
-		rec := doJSON(t, e, http.MethodGet, "/api/v1/teams/devops/schedule/config", nil, "denis")
-		if rec.Code != http.StatusInternalServerError {
-			t.Fatalf("want 500, got %d: %s", rec.Code, rec.Body.String())
-		}
-	})
-
 	// A deleted schedule answers 200 with deleted_at and the last valid
 	// configuration, so the editor can prefill a recreate without a second
 	// request. A 410 with no body would have forced exactly that request.
@@ -885,63 +872,6 @@ func scheduleIDOf(t *testing.T, env *scheduleTestEnv, teamID string) string {
 	return root.ID
 }
 
-// TestRootWithoutHistoryIsRefusedEverywhere is the endpoint-by-endpoint form of
-// the rule, and it is a table rather than a handful of spot checks because the
-// two endpoints that were missing from an earlier draft of this work are
-// exactly the two that answered wrongly: /render loaded the root itself and
-// degraded to a 200 with history_complete=false, and /on-call reached the
-// renderer's sentinel, which had no HTTP mapping and came back as a generic
-// internal error.
-//
-// The fixture cannot be built through the API - after the legacy write path was
-// removed there is no way to create such a row in Go - which is itself part of
-// what is being asserted.
-//
-// Not in this table: GET /teams, the one deliberate exception, covered by
-// TestListTeamsReportsRootWithoutHistoryAsUnconfigured.
-func TestRootWithoutHistoryIsRefusedEverywhere(t *testing.T) {
-	from := time.Date(2026, 5, 6, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
-	until := time.Date(2026, 5, 13, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
-
-	cases := []struct {
-		name   string
-		method string
-		url    string
-		body   any
-	}{
-		{"config", http.MethodGet, "/api/v1/teams/devops/schedule/config", nil},
-		{"revisions", http.MethodGet, "/api/v1/teams/devops/schedule/revisions", nil},
-		{"overrides", http.MethodGet, "/api/v1/teams/devops/schedule/overrides", nil},
-		{"render", http.MethodGet, "/api/v1/teams/devops/schedule/render?from=" + from + "&until=" + until, nil},
-		{"on-call", http.MethodGet, "/api/v1/teams/devops/schedule/on-call", nil},
-		{"preview", http.MethodPost, "/api/v1/teams/devops/schedule/preview",
-			configRequest(0, []string{"denis"})},
-		{"save", http.MethodPut, "/api/v1/teams/devops/schedule/config",
-			configRequest(0, []string{"denis"})},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, s, e, env := setupScheduleAPI(t)
-			defer s.Close()
-			env.Config.SeedRootWithoutHistory("legacy-1", "devops")
-
-			rec := doJSON(t, e, tc.method, tc.url, tc.body, "denis")
-			if rec.Code != http.StatusInternalServerError {
-				t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
-			}
-			var body map[string]any
-			decodeJSON(t, rec, &body)
-			// The point is the code, not the status. A generic internal_error
-			// here would mean this half of the surface still needs prose to be
-			// understood, which is the defect the machine codes exist to close.
-			if body["code"] != CodeInvariantViolation {
-				t.Fatalf("code = %v, want %q: %s", body["code"], CodeInvariantViolation, rec.Body.String())
-			}
-		})
-	}
-}
-
 // TestOverrideOfAnotherScheduleIsRefused: the override routes are keyed by
 // schedule ID and override ID, so naming someone else's override through a
 // schedule of your own must not reach it.
@@ -991,7 +921,7 @@ func TestOverrideOfAnotherScheduleIsRefused(t *testing.T) {
 	// request is the override-belongs-to-schedule check itself.
 	other := "schedule-elsewhere"
 	env.Config.SeedRoot(scheduleconfig.ScheduleRoot{
-		ID: other, TeamID: "other-team", ConfigVersion: 1, HistoryCompleteFrom: &validFrom,
+		ID: other, TeamID: "other-team", ConfigVersion: 1, HistoryCompleteFrom: validFrom,
 	})
 	if other == root.ID {
 		t.Fatal("the fixture needs two distinct schedules")

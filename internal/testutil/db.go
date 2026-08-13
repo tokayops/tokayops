@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	_ "github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	_ "github.com/lib/pq"
 )
 
 // BindIdentity binds an external identity (provider + external ID) to a user via
@@ -72,9 +72,6 @@ func TruncateTables(t testing.TB, s *store.Store) {
 		"schedule_revisions",
 		"schedule_override_revisions",
 		"migration_markers",
-		"schedule_overrides",
-		"schedule_users",
-		"rotation_epochs",
 		"link_tokens",
 		"external_identities",
 		"schedules",

@@ -8,6 +8,7 @@
 #   ./scripts/run_integration_tests.sh --pkg PKG    - Run tests in specific package
 #   ./scripts/run_integration_tests.sh --summary    - Show only pass/fail summary
 #   ./scripts/run_integration_tests.sh --failures   - Show only failures (default for CI)
+#   ./scripts/run_integration_tests.sh --shuffle    - Randomize test order (see below)
 #
 # Examples:
 #   ./scripts/run_integration_tests.sh --run TestPipeline
@@ -20,9 +21,12 @@ set -e
 # Defaults
 AUTO_DB=true
 RUN_PATTERN=""
-PACKAGE="./internal/..."
+# ./cmd/... too: the schedule cutover startup gate can only be tested by
+# running the binary, so its test lives beside main.
+PACKAGE="./internal/... ./cmd/..."
 OUTPUT_MODE="full"  # full, summary, failures
 VERBOSE="-v"
+SHUFFLE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -46,6 +50,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --failures)
             OUTPUT_MODE="failures"
+            shift
+            ;;
+        # Order independence has to be checked from in here, not afterwards.
+        # The trap below tears the database down when this script exits, so a
+        # `go test -shuffle=on` run from the shell that just called `make
+        # test-integration` has no TEST_DB_DSN - setupTestDB skips every
+        # integration test and the run reports `ok` having asserted nothing.
+        --shuffle)
+            SHUFFLE=true
             shift
             ;;
         --quiet|-q)
@@ -83,6 +96,10 @@ fi
 
 # Build test command
 TEST_CMD="go test -p 1 -tags=integration $VERBOSE"
+if $SHUFFLE; then
+    # -count=1 with it: a cached result was produced in some other order.
+    TEST_CMD="$TEST_CMD -shuffle=on -count=1"
+fi
 if [ -n "$RUN_PATTERN" ]; then
     TEST_CMD="$TEST_CMD -run $RUN_PATTERN"
 fi

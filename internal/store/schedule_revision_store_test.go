@@ -23,9 +23,9 @@ const (
 func revTestConfig() rotation.ScheduleConfiguration {
 	monday := 1
 	weekly := rotation.RotationPolicy{
-		Cadence:       model.RotationWeekly,
-		HandoffTime:   "11:00",
-		HandoffDay:    &monday,
+		Cadence:     model.RotationWeekly,
+		HandoffTime: "11:00",
+		HandoffDay:  &monday,
 	}
 	return rotation.ScheduleConfiguration{
 		Timezone:         "Europe/Amsterdam",
@@ -112,11 +112,10 @@ func TestCreateScheduleIsAtomic(t *testing.T) {
 		teamID        string
 		configVersion int64
 		historyFrom   time.Time
-		rotationStart *time.Time
 	)
 	err = s.db.QueryRow(
-		`SELECT team_id, config_version, history_complete_from, l1_rotation_start FROM schedules WHERE id = $1`,
-		rev.ScheduleID).Scan(&teamID, &configVersion, &historyFrom, &rotationStart)
+		`SELECT team_id, config_version, history_complete_from FROM schedules WHERE id = $1`,
+		rev.ScheduleID).Scan(&teamID, &configVersion, &historyFrom)
 	if err != nil {
 		t.Fatalf("read schedule root: %v", err)
 	}
@@ -128,10 +127,6 @@ func TestCreateScheduleIsAtomic(t *testing.T) {
 	}
 	if !historyFrom.Equal(rev.EffectiveFrom) {
 		t.Fatalf("history_complete_from = %v, want %v", historyFrom, rev.EffectiveFrom)
-	}
-	// The legacy NOT NULL was dropped precisely so the root insert can skip it.
-	if rotationStart != nil {
-		t.Fatalf("legacy l1_rotation_start was written: %v", *rotationStart)
 	}
 	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_revisions WHERE schedule_id = $1`, rev.ScheduleID); n != 1 {
 		t.Fatalf("got %d revisions, want 1", n)
@@ -224,12 +219,20 @@ func TestCreateScheduleConcurrentSameTeam(t *testing.T) {
 	}
 	wg.Wait()
 
+	// The loser can lose in either of two legitimate ways, and which one it
+	// gets is a matter of nanoseconds: it either reaches the UNIQUE(team_id)
+	// constraint (ErrScheduleExists) or reads the root the winner has just
+	// committed and finds its expected_version 0 stale (ErrVersionConflict).
+	// Both are correct answers to "create a schedule that already exists"; what
+	// must never happen is two successes, or a loss reported as something the
+	// caller cannot interpret.
 	var succeeded, conflicted int
 	for _, err := range errs {
 		switch {
 		case err == nil:
 			succeeded++
-		case errors.Is(err, scheduleconfig.ErrScheduleExists):
+		case errors.Is(err, scheduleconfig.ErrScheduleExists),
+			errors.Is(err, scheduleconfig.ErrVersionConflict):
 			conflicted++
 		default:
 			t.Fatalf("unexpected error: %v", err)
@@ -684,7 +687,7 @@ func TestLockSchedule(t *testing.T) {
 	if root.TeamID != "devops" || root.ConfigVersion != 1 {
 		t.Fatalf("root = %+v, want team devops at version 1", root)
 	}
-	if root.HistoryCompleteFrom == nil || !root.HistoryCompleteFrom.Equal(rev.EffectiveFrom) {
+	if !root.HistoryCompleteFrom.Equal(rev.EffectiveFrom) {
 		t.Fatalf("history_complete_from = %v, want %v", root.HistoryCompleteFrom, rev.EffectiveFrom)
 	}
 	if root.DeletedAt != nil {

@@ -3390,6 +3390,9 @@ const docTemplate = `{
         },
         "api.ScheduleRenderResponse": {
             "type": "object",
+            "required": [
+                "history_complete_from"
+            ],
             "properties": {
                 "deleted_at": {
                     "type": "string"
@@ -3408,6 +3411,7 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "history_complete_from": {
+                    "description": "HistoryCompleteFrom is always present: every schedule has a horizon, so\nthere is no absence to express. It is a value rather than a pointer for\nthat reason - and ` + "`" + `omitempty` + "`" + ` would not have expressed the absence\nanyway, since it does nothing on a struct.\n\n` + "`" + `validate:\"required\"` + "`" + ` is here for the generated contract, not for\nruntime validation: this is a response type and nothing validates it on\nthe way out. Without the tag swagger keeps describing the field as\noptional and every generated client keeps a pointer for a value that\ncannot be absent.",
                     "type": "string"
                 },
                 "until": {

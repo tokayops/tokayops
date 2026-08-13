@@ -166,13 +166,14 @@ func (s *Service) preview(ctx context.Context, view scheduleconfig.ScheduleReadV
 //
 // The root it returns is the one the renderer should see, not the one on disk:
 // deleted_at is cleared because the save being previewed brings the schedule
-// back, and a missing history horizon is set to the moment of evaluation so a
-// hypothetical is not reported as incomplete history.
+// back. A team with no schedule at all gets a hypothetical root whose horizon
+// is the moment of evaluation, so a preview of something that does not exist
+// yet is not reported as incomplete history.
 func loadPreviewBase(ctx context.Context, view scheduleconfig.ScheduleReadView, teamID string,
 	evaluatedAt, windowUntil time.Time) (previewBase, error) {
 
 	base := previewBase{
-		root:   scheduleconfig.ScheduleRoot{TeamID: teamID, HistoryCompleteFrom: &evaluatedAt},
+		root:   scheduleconfig.ScheduleRoot{TeamID: teamID, HistoryCompleteFrom: evaluatedAt},
 		onCall: OnCall{At: evaluatedAt},
 	}
 
@@ -188,7 +189,7 @@ func loadPreviewBase(ctx context.Context, view scheduleconfig.ScheduleReadView, 
 	// is a save against that version, and reporting 0 would make the first
 	// recreate fail optimistic concurrency every time.
 	base.scheduleID = root.ID
-	base.root = previewRoot(*root, evaluatedAt)
+	base.root = previewRoot(*root)
 
 	// One read, two answers. The projection already loads the revision in force
 	// to work out who is on duty, and asking for it again to fill `current` was
@@ -264,18 +265,15 @@ func previewWindow(evaluatedAt time.Time, until *time.Time) time.Time {
 }
 
 // previewRoot presents the root as the hypothetical world would have it: not
-// deleted, since the save being previewed recreates it, and with a known
-// history horizon so a preview of a schedule that does not exist yet is not
+// deleted, since the save being previewed recreates it.
+//
+// The horizon needs no adjusting. An existing root always carries one, and the
+// team that has no schedule at all never reaches here - loadPreviewBase answers
+// that case with a hypothetical root of its own, whose horizon is the moment of
+// evaluation, so a preview of a schedule that does not exist yet is not
 // reported as incomplete history.
-func previewRoot(root scheduleconfig.ScheduleRoot, evaluatedAt time.Time) scheduleconfig.ScheduleRoot {
+func previewRoot(root scheduleconfig.ScheduleRoot) scheduleconfig.ScheduleRoot {
 	root.DeletedAt = nil
-	// The one caller of RootInitialized that fills the gap in instead of
-	// refusing: this root is hypothetical, so "no horizon" here means "no
-	// schedule yet", not the skipped-reset damage it means everywhere else.
-	if !scheduleconfig.RootInitialized(&root) {
-		at := evaluatedAt
-		root.HistoryCompleteFrom = &at
-	}
 	return root
 }
 

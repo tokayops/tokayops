@@ -67,14 +67,11 @@ func TestScheduleErrorsCarryMachineCodes(t *testing.T) {
 			&scheduleconfig.ValidationError{Field: "timezone", Msg: reason},
 			http.StatusBadRequest, CodeValidationFailed},
 
-		// The renderer's damage sentinels are part of the same contract. They
-		// used to fall through to the generic internal error, which meant half
-		// the schedule surface answered with a machine code and the other half
-		// with prose - and the half without one was the half a caller is least
-		// able to guess about.
-		{"schedule has no history horizon",
-			fmt.Errorf("wrapped: %w", schedulerender.ErrHistoryMarkerMissing),
-			http.StatusInternalServerError, CodeInvariantViolation},
+		// The renderer's damage sentinel is part of the same contract. It used
+		// to fall through to the generic internal error, which meant half the
+		// schedule surface answered with a machine code and the other half with
+		// prose - and the half without one was the half a caller is least able
+		// to guess about.
 		{"revision chain has a hole",
 			fmt.Errorf("wrapped: %w", schedulerender.ErrRevisionGap),
 			http.StatusInternalServerError, CodeInvariantViolation},

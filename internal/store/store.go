@@ -486,27 +486,48 @@ func (s *Store) InitDB() error {
 		return err
 	}
 
-	// Pre-revision schedule schema. It is kept - the tables are not dropped -
-	// but it lives in a file of its own so that "the runtime does not touch
-	// legacy" is a question a grep can answer. Inside a multi-line CREATE TABLE
-	// there is nothing on the line of a column to tell it apart from live code.
-	if err := s.initLegacyScheduleSchema(); err != nil {
-		return err
-	}
-
-	// Schedule revision history: append-only configuration snapshots plus the
-	// aggregate-root columns that carry version and history completeness.
+	// Schedule revision history: the aggregate root, its append-only
+	// configuration snapshots, and the override history beside them.
 	//
-	// These are the live schedule tables: the configuration, its history and
-	// the columns the aggregate root carries. All range constraints use
-	// tstzrange - the pre-revision no_overlapping_overrides constraint uses
-	// naive tsrange over TIMESTAMPTZ columns and is not a template to follow.
+	// The root is created in its final shape, with the history horizon NOT NULL:
+	// a row without one could only come from before the revision model, and the
+	// destructive upgrade removes those rather than carrying them forward.
+	//
+	// The three ALTERs below are the upgrade path and only the upgrade path. On
+	// a database created by this statement they are no-ops; on one that predates
+	// the revision model they add the columns NULLABLE and tighten nothing. That
+	// asymmetry is deliberate and load-bearing: InitDB runs before the `migrate`
+	// subcommand (cmd/tokayops/main.go), so a SET NOT NULL here would refuse to
+	// start the very binary whose reset repairs the situation. The tightening
+	// lives in that reset; RequireCutoverSchema refuses to serve until it ran.
+	//
+	// All range constraints use tstzrange over TIMESTAMPTZ columns.
 	revisionQuery := `
+	CREATE TABLE IF NOT EXISTS schedules (
+		id                    TEXT PRIMARY KEY,
+		team_id               TEXT UNIQUE NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+		config_version        BIGINT NOT NULL DEFAULT 0,
+		history_complete_from TIMESTAMPTZ NOT NULL,
+		deleted_at            TIMESTAMPTZ,
+		created_at            TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+		updated_at            TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+	);
+
 	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS config_version BIGINT NOT NULL DEFAULT 0;
 	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS history_complete_from TIMESTAMPTZ;
 	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 	ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+	-- Required by the schedule_revisions exclusion constraint below. It used to
+	-- be created by the pre-revision schema; that file is gone, and without this
+	-- line the constraint would silently not be created on a fresh database -
+	-- the constraint swallows a missing extension with a NOTICE.
+	DO $$ BEGIN
+		CREATE EXTENSION IF NOT EXISTS btree_gist;
+	EXCEPTION WHEN insufficient_privilege THEN
+		RAISE NOTICE 'btree_gist extension not created (needs superuser)';
+	END $$;
 
 	-- ON DELETE RESTRICT: a schedule with history is never physically deleted
 	-- (soft delete via schedules.deleted_at), so cascading the history away
@@ -553,8 +574,16 @@ func (s *Store) InitDB() error {
 	-- Defence in depth only: non-overlap is guaranteed by the schedule row
 	-- lock and a single transaction (an empty history has no revision row to
 	-- lock). Skipped when btree_gist is unavailable.
+	-- Qualified by table and kind, like the startup check that reports on it:
+	-- constraint names are unique per table, so a same-named constraint on
+	-- another table would make this skip creating the real one.
 	DO $$ BEGIN
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_schedule_revisions') THEN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conname = 'no_overlapping_schedule_revisions'
+			  AND conrelid = to_regclass('public.schedule_revisions')
+			  AND contype = 'x'
+		) THEN
 			ALTER TABLE schedule_revisions ADD CONSTRAINT no_overlapping_schedule_revisions
 				EXCLUDE USING gist (schedule_id WITH =, tstzrange(effective_from, effective_to, '[)') WITH &&);
 		END IF;

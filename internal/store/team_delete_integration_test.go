@@ -48,27 +48,33 @@ func TestDeleteTeamRefusesTeamScopedIntegrationWithTypedError(t *testing.T) {
 	}
 }
 
-// The reason the schedule blocker is a read and not a constraint: with the
-// cascade from teams, an uninitialized row has no revisions to protect it, so
-// the constraint would never fire and the row would vanish.
-func TestDeleteTeamRefusesUninitializedScheduleRatherThanCascadingIt(t *testing.T) {
+// The reason the schedule blocker is a read and not a constraint: a root with
+// no revision chain has nothing for ON DELETE RESTRICT to defend, so the
+// cascade from teams would take it silently.
+//
+// history_complete_from NOT NULL does not close this. It rules out the
+// pre-revision row, not the general case - the INSERT below writes a horizon
+// and no chain, and Postgres is happy with it. What makes the delete safe is
+// that it refuses on the EXISTENCE of a root without asking what is in it, and
+// this test fails if that is ever narrowed to some property of the row.
+func TestDeleteTeamRefusesAChainlessScheduleRatherThanCascadingIt(t *testing.T) {
 	s := setupTestDB(t)
 	seedTeam(t, s, "devops", "alice")
 
-	// The shape a skipped upgrade reset leaves behind: a schedule row with no
-	// history horizon and no revision chain.
 	if _, err := s.db.Exec(
-		`INSERT INTO schedules (id, team_id, config_version) VALUES ($1, $2, 0)`,
-		"legacy-1", "devops"); err != nil {
-		t.Fatalf("seed pre-revision schedule: %v", err)
+		`INSERT INTO schedules (id, team_id, config_version, history_complete_from)
+		 VALUES ($1, $2, 1, NOW())`,
+		"chainless-1", "devops"); err != nil {
+		t.Fatalf("seed a chainless schedule: %v", err)
 	}
 
 	err := newTestScheduleService(s, time.Now().UTC()).DeleteTeam(context.Background(), "devops")
-	if !errors.Is(err, scheduleconfig.ErrInvariantViolation) {
-		t.Fatalf("error = %v, want ErrInvariantViolation", err)
+	var blocked *scheduleconfig.TeamHasScheduleHistoryError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("error = %v, want TeamHasScheduleHistoryError", err)
 	}
-	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules WHERE id = 'legacy-1'`); n != 1 {
-		t.Fatal("the pre-revision schedule was destroyed by the cascade - silently, which is the whole defect")
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules WHERE id = 'chainless-1'`); n != 1 {
+		t.Fatal("the schedule was destroyed by the cascade - silently, which is the whole defect")
 	}
 	if n := countRows(t, s, `SELECT COUNT(*) FROM teams WHERE id = 'devops'`); n != 1 {
 		t.Fatal("the team was deleted despite the refusal")
@@ -135,7 +141,8 @@ func TestLockTeamBlocksConcurrentScheduleInsert(t *testing.T) {
 		// A bare INSERT, not the service: what is under test is the lock the
 		// foreign key takes on the parent row, with nothing else in the way.
 		_, err := s.db.Exec(
-			`INSERT INTO schedules (id, team_id, config_version) VALUES ($1, $2, 0)`,
+			`INSERT INTO schedules (id, team_id, config_version, history_complete_from)
+			 VALUES ($1, $2, 0, NOW())`,
 			"sched-race", "devops")
 		if err != nil {
 			t.Errorf("insert: %v", err)
@@ -203,7 +210,7 @@ func TestDeleteTeamSeesAScheduleCommittedWhileItWaited(t *testing.T) {
 				if err := tx.CreateInitialSchedule(context.Background(),
 					&scheduleconfig.ScheduleRoot{
 						ID: "sched-1", TeamID: "devops",
-						ConfigVersion: 1, HistoryCompleteFrom: &start,
+						ConfigVersion: 1, HistoryCompleteFrom: start,
 					},
 					&scheduleconfig.ScheduleRevision{
 						ID: "rev-1", ScheduleID: "sched-1", Version: 1,

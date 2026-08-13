@@ -251,17 +251,17 @@ func scanScheduleRootRow(row *sql.Row) (*scheduleconfig.ScheduleRoot, error) {
 	return root, err
 }
 
+// scanScheduleRoot reads the horizon straight into the struct: the column is
+// NOT NULL after the cutover, so a NULL here is not a state to represent but a
+// scan error, and reporting it as one is correct.
 func scanScheduleRoot(row rowScanner) (*scheduleconfig.ScheduleRoot, error) {
 	var (
-		root                 scheduleconfig.ScheduleRoot
-		historyFrom, deleted sql.NullTime
+		root    scheduleconfig.ScheduleRoot
+		deleted sql.NullTime
 	)
-	if err := row.Scan(&root.ID, &root.TeamID, &root.ConfigVersion, &historyFrom, &deleted); err != nil {
+	if err := row.Scan(&root.ID, &root.TeamID, &root.ConfigVersion,
+		&root.HistoryCompleteFrom, &deleted); err != nil {
 		return nil, err
-	}
-	if historyFrom.Valid {
-		v := historyFrom.Time
-		root.HistoryCompleteFrom = &v
 	}
 	if deleted.Valid {
 		v := deleted.Time

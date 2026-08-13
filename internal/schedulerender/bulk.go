@@ -55,10 +55,6 @@ const (
 	// instant in stored data.
 	FailureOverrideCollision ProjectionFailureReason = "override_collision"
 
-	// FailureHistoryMarkerMissing - a revision-managed root has no history
-	// horizon.
-	FailureHistoryMarkerMissing ProjectionFailureReason = "history_complete_missing"
-
 	// FailureRotation - the rotation math refused the stored configuration.
 	FailureRotation ProjectionFailureReason = "rotation_error"
 )
@@ -182,8 +178,6 @@ func failureReason(err error) (ProjectionFailureReason, bool) {
 		return FailureRevisionOverlap, true
 	case errors.Is(err, scheduleconfig.ErrOverrideCollision):
 		return FailureOverrideCollision, true
-	case errors.Is(err, ErrHistoryMarkerMissing):
-		return FailureHistoryMarkerMissing, true
 	case errors.Is(err, ErrRotation):
 		return FailureRotation, true
 	default:

@@ -731,16 +731,13 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		"schedule_revisions.change_reason":   true,
 	}
 	// Columns that survive by design: immutable identity references that
-	// history is joined on, plus legacy tables the cutover removes.
+	// history is joined on.
 	byDesign := map[string]bool{
 		"users.id":                                true,
 		"users.role":                              true,
 		"schedule_revisions.created_by":           true,
 		"schedule_override_revisions.user_id":     true,
 		"schedule_override_revisions.recorded_by": true,
-		"schedule_overrides.user_id":              true,
-		"schedule_overrides.created_by":           true,
-		"schedule_users.user_id":                  true,
 		"alert_groups.acked_by":                   true,
 		"alert_groups.resolved_by":                true,
 		"alert_groups.assigned_to":                true,

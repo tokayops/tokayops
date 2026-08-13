@@ -208,11 +208,6 @@ func (s *Service) lockForWrite(ctx context.Context, tx ScheduleConfigTx,
 	if err != nil {
 		return nil, err
 	}
-	// Checked on the locked row rather than the one the caller resolved: this
-	// is the copy every other decision below is made from.
-	if err := RequireInitializedRoot(locked); err != nil {
-		return nil, err
-	}
 	if locked.ConfigVersion != expectedVersion {
 		return nil, &VersionConflictError{Expected: expectedVersion, Current: locked.ConfigVersion}
 	}
@@ -519,9 +514,6 @@ func (s *Service) RemoveTeamMember(ctx context.Context, teamID, userID string) e
 		if err != nil {
 			return err
 		}
-		if err := RequireInitializedRoot(locked); err != nil {
-			return err
-		}
 		// A deleted schedule has nobody on duty, so it blocks nothing -
 		// otherwise a team could never clean up after deleting its schedule.
 		if locked.DeletedAt == nil {
@@ -558,16 +550,18 @@ func (s *Service) RemoveTeamMember(ctx context.Context, teamID, userID string) e
 //     that read see a schedule that committed while this transaction waited.
 //     Under REPEATABLE READ the snapshot would predate it, the row would be
 //     invisible, and the refusal would come back as a raw constraint error.
-//  3. refuse an uninitialized root before anything else can act on it. Such a
-//     row has no revisions, so nothing would stop the cascade from teams -
-//     this is the one path on which a skipped upgrade reset could destroy
-//     data silently.
-//  4. delete, and let the integrations foreign key answer for itself.
+//  3. delete, and let the integrations foreign key answer for itself.
 //
 // The schedule check is a read rather than a constraint because its answer is
 // terminal: history cannot be removed, so there is no point reporting a
 // removable blocker alongside it. Soft-deleted counts - the revisions are
 // still there.
+//
+// Step 2 refuses on the EXISTENCE of a root, never on what the root contains.
+// That is what makes it safe on its own: the ON DELETE RESTRICT from
+// schedule_revisions defends a schedule that has a chain, but nothing proves a
+// root has one, so a check that only refused "initialized" roots would be
+// narrower than the cascade it guards against.
 func (s *Service) DeleteTeam(ctx context.Context, teamID string) error {
 	if teamID == "" {
 		return invalidField("team_id", "is required")
@@ -585,9 +579,6 @@ func (s *Service) DeleteTeam(ctx context.Context, teamID string) error {
 		case err != nil:
 			return err
 		default:
-			if err := RequireInitializedRoot(root); err != nil {
-				return err
-			}
 			return &TeamHasScheduleHistoryError{ScheduleID: root.ID}
 		}
 

@@ -175,9 +175,8 @@ func PrepareInitialSchedule(root *ScheduleRoot, revision *ScheduleRevision) erro
 			ErrInvariantViolation, RevisionActive, revision.Kind)
 	}
 
-	from := revision.EffectiveFrom
 	root.ConfigVersion = 1
-	root.HistoryCompleteFrom = &from
+	root.HistoryCompleteFrom = revision.EffectiveFrom
 	root.DeletedAt = nil
 	return nil
 }

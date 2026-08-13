@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -155,72 +154,4 @@ func TestMigration_EscalationStepsStepTypeToProviderKind(t *testing.T) {
 	}
 	assertStep(dmID, "slack", "dm")
 	assertStep(chID, "slack", "channel")
-}
-
-// TestMigration_RotationEpochsFlatToGroups verifies that the InitDB migration
-// converts the legacy flat user_ids JSON ["a","b","c"] into nested singleton
-// groups [["a"],["b"],["c"]], and that re-running InitDB is idempotent (the
-// json_typeof guard prevents double-wrapping).
-func TestMigration_RotationEpochsFlatToGroups(t *testing.T) {
-	s := testutil.SetupDB(t)
-
-	// Setup: team + schedule (foreign key requirement for rotation_epochs)
-	team := testutil.SeedTeam(t, s, "team-mig-rotation")
-	scheduleID := uuid.New().String()
-	if _, err := s.GetDB().Exec(`
-		INSERT INTO schedules (id, team_id, timezone, l1_rotation_type, l1_handoff_time, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, created_at, updated_at)
-		VALUES ($1, $2, 'UTC', 'daily', '09:00', NOW(), false, 5, NOW(), NOW())
-	`, scheduleID, team.ID); err != nil {
-		t.Fatalf("Insert schedule: %v", err)
-	}
-
-	// Insert raw legacy format: flat array of strings
-	epochID := uuid.New().String()
-	if _, err := s.GetDB().Exec(`
-		INSERT INTO rotation_epochs (id, schedule_id, layer, user_ids, start_time, end_time, created_at)
-		VALUES ($1, $2, 'l1', '["alice","bob","carol"]', NOW(), NULL, NOW())
-	`, epochID, scheduleID); err != nil {
-		t.Fatalf("Insert legacy epoch: %v", err)
-	}
-
-	// Run InitDB again — migration should convert flat → nested
-	if err := s.InitDB(); err != nil {
-		t.Fatalf("InitDB (migration): %v", err)
-	}
-
-	// Verify raw JSON in DB is now nested
-	var rawJSON string
-	if err := s.GetDB().QueryRow(`SELECT user_ids FROM rotation_epochs WHERE id = $1`, epochID).Scan(&rawJSON); err != nil {
-		t.Fatalf("Read user_ids: %v", err)
-	}
-
-	var migrated [][]string
-	if err := json.Unmarshal([]byte(rawJSON), &migrated); err != nil {
-		t.Fatalf("Migrated JSON is not nested array: %v (raw: %s)", err, rawJSON)
-	}
-
-	expected := [][]string{{"alice"}, {"bob"}, {"carol"}}
-	if len(migrated) != len(expected) {
-		t.Fatalf("Expected %d groups, got %d (raw: %s)", len(expected), len(migrated), rawJSON)
-	}
-	for i, g := range expected {
-		if len(migrated[i]) != 1 || migrated[i][0] != g[0] {
-			t.Errorf("Group %d: expected %v, got %v", i, g, migrated[i])
-		}
-	}
-
-	// Idempotency: third InitDB call must NOT re-wrap (json_typeof = 'string' guard)
-	if err := s.InitDB(); err != nil {
-		t.Fatalf("Third InitDB: %v", err)
-	}
-	if err := s.GetDB().QueryRow(`SELECT user_ids FROM rotation_epochs WHERE id = $1`, epochID).Scan(&rawJSON); err != nil {
-		t.Fatalf("Read user_ids after third InitDB: %v", err)
-	}
-	var stillNested [][]string
-	if err := json.Unmarshal([]byte(rawJSON), &stillNested); err != nil {
-		t.Fatalf("After third InitDB, JSON is not nested: %v (raw: %s)", err, rawJSON)
-	}
-	if len(stillNested) != 3 || len(stillNested[0]) != 1 || stillNested[0][0] != "alice" {
-		t.Errorf("Migration not idempotent — data changed after third InitDB: %v", stillNested)
-	}
 }

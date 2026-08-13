@@ -1,6 +1,7 @@
 .PHONY: run build test clean swagger up down seed user \
        test-db-start test-db-stop test-db-status \
        test-integration test-integration-quick test-integration-run \
+       test-integration-shuffle \
        test-pipeline test-dispatcher \
        e2e-install e2e-test e2e-test-ui e2e-test-headed e2e-up e2e-down \
        e2e-wait e2e-seed \
@@ -65,6 +66,18 @@ test-db-status:
 test-integration:
 	@./scripts/run_integration_tests.sh --failures
 
+# Order independence of the store package, which is where the schema-mutating
+# cutover tests live. Inside the runner so the database it starts is still up:
+# see the --shuffle comment in the script.
+#
+# Scoped to ./internal/store/... deliberately. The tree as a whole has never
+# been order-independent - `-shuffle=on` over ./internal/... fails on `epic10`
+# too, in api, dispatcher and integration - and fixing that is a separate piece
+# of work, recorded in tokay-docs. Widening this target before then would give
+# it a red baseline and make it useless for the thing it was added to check.
+test-integration-shuffle:
+	@./scripts/run_integration_tests.sh --shuffle --pkg ./internal/store/... --failures
+
 # Quick summary of integration tests
 test-integration-quick:
 	@./scripts/run_integration_tests.sh --summary
@@ -93,10 +106,19 @@ e2e-install:
 # so running this twice against a surviving database would re-seed the legacy
 # schedules and have nothing left to remove them. Starting clean is also what
 # e2e-test already assumed: it tears the stack down after every run.
+#
+# The database comes up alone, the CLI runs against it, and only then does the
+# application start. That order is the production cutover procedure, and the
+# reason to reproduce it is that `migrate reset-schedules` is no longer only
+# DML: it drops the pre-revision tables and tightens a column, taking ACCESS
+# EXCLUSIVE locks. The upgrade checklist requires every instance to be stopped
+# for exactly that reason, and the only automated rehearsal of the cutover we
+# have should not be rehearsing something the checklist forbids.
 e2e-up: e2e-down
-	docker compose -f docker-compose.e2e.yml up -d --build
-	$(MAKE) e2e-wait
+	docker compose -f docker-compose.e2e.yml up -d --wait e2e_db
 	$(MAKE) e2e-seed
+	docker compose -f docker-compose.e2e.yml up -d --build tokay_app
+	$(MAKE) e2e-wait
 
 # e2e-wait blocks until the app answers, and gives up instead of hanging: an
 # unbounded wait is invisible locally (you see it and interrupt it) but in CI it
@@ -132,12 +154,16 @@ e2e-wait:
 # the real schema and leaves the marker a database has after an upgrade, which is
 # the state the suite is supposed to run against.
 #
+# These run as one-shot containers rather than `exec` into a running app,
+# because the application is deliberately not running yet - see e2e-up. Each
+# creates its own container from the same image and exits.
+#
 # Schedules for the tests are created through the API by the Playwright setup
 # project.
 e2e-seed:
-	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops user create admin@example.com 'Admin123!' 'Test Admin' || true
-	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops seed || true
-	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops migrate reset-schedules
+	docker compose -f docker-compose.e2e.yml run --rm --build tokay_cli user create admin@example.com 'Admin123!' 'Test Admin' || true
+	docker compose -f docker-compose.e2e.yml run --rm tokay_cli seed || true
+	docker compose -f docker-compose.e2e.yml run --rm tokay_cli migrate reset-schedules
 
 e2e-down:
 	docker compose -f docker-compose.e2e.yml down -v --remove-orphans

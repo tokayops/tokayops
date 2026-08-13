@@ -220,19 +220,17 @@ func (a *API) mapScheduleFault(c echo.Context, err error) error {
 		return c.JSON(http.StatusInternalServerError,
 			ErrorResponse{Error: "stored schedule data is corrupt", Code: CodeSnapshotCorrupt})
 
-	// The renderer's damage sentinels answer here too. Both describe a row that
-	// no live write path could have produced - a chain with a hole in it, or a
-	// schedule with no history horizon - so they are the same class of answer
-	// as the command side's invariant violation, and leaving them to the
-	// default below would have given half the schedule contract a machine code
-	// and the other half a prose fallback.
+	// The renderer's damage sentinel answers here too. It describes a row that
+	// no live write path could have produced - a chain with a hole in it - so
+	// it is the same class of answer as the command side's invariant violation,
+	// and leaving it to the default below would have given half the schedule
+	// contract a machine code and the other half a prose fallback.
 	//
-	// Their other consumer is untouched: the bulk projection still classifies
-	// the same sentinels into per-schedule failure reasons. That is what having
+	// Its other consumer is untouched: the bulk projection still classifies the
+	// same sentinels into per-schedule failure reasons. That is what having
 	// sentinels instead of error text buys.
 	case errors.Is(err, scheduleconfig.ErrInvariantViolation),
 		errors.Is(err, scheduleconfig.ErrRevisionMismatch),
-		errors.Is(err, schedulerender.ErrHistoryMarkerMissing),
 		errors.Is(err, schedulerender.ErrRevisionGap):
 		log.Printf("ALERT schedule_config: invariant violation: %v", err)
 		return c.JSON(http.StatusInternalServerError,

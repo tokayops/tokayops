@@ -86,18 +86,18 @@ func (d ScheduleConfigDTO) toConfiguration() rotation.ScheduleConfiguration {
 		L1: rotation.LayerConfiguration{
 			Enabled: d.L1.Enabled,
 			Policy: rotation.RotationPolicy{
-				Cadence:       model.RotationType(d.L1.RotationType),
-				HandoffTime:   d.L1.HandoffTime,
-				HandoffDay:    d.L1.HandoffDay,
+				Cadence:     model.RotationType(d.L1.RotationType),
+				HandoffTime: d.L1.HandoffTime,
+				HandoffDay:  d.L1.HandoffDay,
 			},
 			Groups: groups,
 		},
 		L2: rotation.LayerConfiguration{
 			Enabled: d.L2.Enabled,
 			Policy: rotation.RotationPolicy{
-				Cadence:       model.RotationType(d.L2.RotationType),
-				HandoffTime:   d.L2.HandoffTime,
-				HandoffDay:    d.L2.HandoffDay,
+				Cadence:     model.RotationType(d.L2.RotationType),
+				HandoffTime: d.L2.HandoffTime,
+				HandoffDay:  d.L2.HandoffDay,
 			},
 			// The server owns L2 group identity: it is the user ID itself.
 			Groups: rotation.L2GroupsFromUserIDs(d.L2.UserIDs),
@@ -208,7 +208,7 @@ type OnCallDTO struct {
 
 func onCallDTO(o schedulerender.OnCall) OnCallDTO {
 	return OnCallDTO{
-		At:       o.At,
+		At: o.At,
 		L1: layerOnCallDTO(o.L1),
 		L2: layerOnCallDTO(o.L2),
 	}
@@ -327,8 +327,19 @@ type ScheduleRenderResponse struct {
 	// HistoryComplete is false when part of the range precedes the point from
 	// which this schedule's history is exact. Inferred history is never
 	// returned as if it had been recorded.
-	HistoryComplete     bool       `json:"history_complete"`
-	HistoryCompleteFrom *time.Time `json:"history_complete_from,omitempty"`
+	HistoryComplete bool `json:"history_complete"`
+
+	// HistoryCompleteFrom is always present: every schedule has a horizon, so
+	// there is no absence to express. It is a value rather than a pointer for
+	// that reason - and `omitempty` would not have expressed the absence
+	// anyway, since it does nothing on a struct.
+	//
+	// `validate:"required"` is here for the generated contract, not for
+	// runtime validation: this is a response type and nothing validates it on
+	// the way out. Without the tag swagger keeps describing the field as
+	// optional and every generated client keeps a pointer for a value that
+	// cannot be absent.
+	HistoryCompleteFrom time.Time `json:"history_complete_from" validate:"required"`
 
 	DeletedAt *time.Time           `json:"deleted_at,omitempty"`
 	Entries   []ShiftDTO           `json:"entries"`
