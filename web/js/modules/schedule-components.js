@@ -354,9 +354,8 @@ export function scheduleWarnings(warnings, extra = {}) {
                 banners.push({
                     level: 'info',
                     icon: 'history',
-                    text: extra.historyCompleteFrom
-                        ? `Exact history starts ${when(extra.historyCompleteFrom)}. Earlier shifts were never recorded and are not shown.`
-                        : 'Part of this range predates the recorded history and is not shown.',
+                    text: `Exact history starts ${when(extra.historyCompleteFrom)}. `
+                        + 'Earlier shifts were never recorded and are not shown.',
                 });
                 break;
             // revision_gap, revision_overlap and override_collision are

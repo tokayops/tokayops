@@ -254,6 +254,18 @@ func main() {
 
 	// Normal Server Startup
 
+	// The schedule cutover has to have happened before anything serves.
+	//
+	// Deliberately here and not right after the `migrate` branch above: between
+	// the two sit `seed`, `user create`, `team create` and
+	// `migrate-slack-identities` - the tools an operator may well need on a
+	// database in the middle of a cutover window. None of them touches
+	// schedules, and gating them would turn one skipped step into a locked
+	// toolbox.
+	if err := st.RequireCutoverSchema(); err != nil {
+		log.Fatalf("Refusing to start: %v", err)
+	}
+
 	// 3. Init Components
 
 	// Schedule projection. It is constructed here, before its first consumer,
@@ -502,12 +514,22 @@ func runMigrate(st *store.Store, args []string) {
 		if err != nil {
 			log.Fatalf("Schedule reset failed: %v", err)
 		}
-		if res.AlreadyApplied {
-			log.Println("Schedule reset already applied - nothing to do.")
-			return
+		// Three outcomes, three sentences. A database that had already been
+		// reset by an earlier release gets the physical cleanup and deletes
+		// nothing; saying "0 schedule(s) deleted" there would be true and
+		// thoroughly misleading in the one moment the output is read closely,
+		// because it reads as "there was nothing here" rather than "the live
+		// schedules were deliberately left alone".
+		switch {
+		case res.AlreadyApplied:
+			log.Println("Schedule cutover already complete - nothing to do.")
+		case res.RowsAlreadyReset:
+			log.Println("Legacy schedule schema removed and the history horizon tightened. " +
+				"The rows had already been reset by an earlier upgrade and were left untouched.")
+		default:
+			log.Printf("Schedule reset complete: %d schedule(s) deleted, legacy schema removed. "+
+				"Recreate schedules with the new binary running.", res.SchedulesDeleted)
 		}
-		log.Printf("Schedule reset complete: %d schedule(s) deleted. "+
-			"Recreate schedules with the new binary running.", res.SchedulesDeleted)
 	default:
 		log.Fatalf("Unknown migrate command: %s", subCmd)
 	}

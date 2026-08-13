@@ -391,23 +391,8 @@ func (a *API) ListScheduleOverrides(c echo.Context) error {
 }
 
 // revisionRoot resolves a team's schedule root for the read endpoints.
-//
-// It is also where those endpoints refuse a row with no history horizon. Such a
-// row cannot be created by this binary - the create flow writes the horizon in
-// the same statement as the row - so it means the destructive upgrade reset was
-// never run, and every answer built on it would be a guess about a schedule
-// whose configuration this model cannot see. It is reported as the invariant
-// violation it is, not as a missing schedule: a 404 here would tell an operator
-// the team has no schedule when in fact it has an unreadable one.
 func (a *API) revisionRoot(ctx context.Context, view scheduleconfig.ScheduleReadView, teamID string) (*scheduleconfig.ScheduleRoot, error) {
-	root, err := view.GetScheduleRootByTeam(ctx, teamID)
-	if err != nil {
-		return nil, err
-	}
-	if err := scheduleconfig.RequireInitializedRoot(root); err != nil {
-		return nil, err
-	}
-	return root, nil
+	return view.GetScheduleRootByTeam(ctx, teamID)
 }
 
 func revisionLimit(raw string) (int, error) {

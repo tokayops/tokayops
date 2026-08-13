@@ -1,7 +1,6 @@
 package schedulerender
 
 import (
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -74,31 +73,6 @@ func TestEmptyChainWithKnownHistoryIsAGap(t *testing.T) {
 
 	renderRefuses(t, Input{Root: root(created), Revisions: nil, From: created, Until: until},
 		ErrRevisionGap)
-}
-
-// TestMissingHistoryStartIsRefused: a root with no history horizon is refused
-// outright rather than rendered as an honest-looking empty calendar.
-//
-// This replaces TestUnknownHistoryStartDoesNotCryGap, which asserted the
-// opposite and was right to: while pre-revision rows existed, an unknown
-// horizon was a reachable state and claiming coverage over it would have cried
-// damage on real schedules. The create flow now writes the horizon in the same
-// statement as the row, so the state is unreachable, and answering it with a
-// 200 would give a corrupt row the same reply as a schedule created yesterday.
-func TestMissingHistoryStartIsRefused(t *testing.T) {
-	created := utc(2026, 5, 1, 11, 0)
-	until := utc(2026, 5, 5, 11, 0)
-
-	revs := chain(t,
-		revisionStep{at: created, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))},
-	)
-	unknown := root(created)
-	unknown.HistoryCompleteFrom = nil
-
-	_, err := Render(Input{Root: unknown, Revisions: revs, From: created, Until: until})
-	if !errors.Is(err, ErrHistoryMarkerMissing) {
-		t.Fatalf("error = %v, want ErrHistoryMarkerMissing", err)
-	}
 }
 
 // TestQueryBeforeHistoryStartIsIncompleteNotAnError: the other half of the

@@ -3,55 +3,21 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// seedLegacySchedule writes a schedule in the pre-upgrade shape, with a row in
-// every table that hangs off it by cascade.
-func seedLegacySchedule(t *testing.T, s *Store, teamID, scheduleID, userID string) {
+func markerCount(t *testing.T, s *Store, name string) int {
 	t.Helper()
-	// No members: this fixture writes a pre-upgrade row directly, so there is
-	// no save pipeline here to validate membership for.
-	seedTeam(t, s, teamID)
-	if err := s.CreateUser(&model.User{ID: userID, Email: userID + "@example.com", Name: userID}); err != nil {
-		t.Fatalf("CreateUser %s: %v", userID, err)
-	}
-
-	start := time.Date(2026, 1, 5, 11, 0, 0, 0, time.UTC)
-	if _, err := s.db.Exec(
-		`INSERT INTO schedules (id, team_id, timezone, l1_rotation_start) VALUES ($1, $2, 'UTC', $3)`,
-		scheduleID, teamID, start); err != nil {
-		t.Fatalf("insert legacy schedule: %v", err)
-	}
-	if _, err := s.db.Exec(
-		`INSERT INTO schedule_users (schedule_id, layer, user_id, position) VALUES ($1, 'l1', $2, 0)`,
-		scheduleID, userID); err != nil {
-		t.Fatalf("insert legacy schedule user: %v", err)
-	}
-	if _, err := s.db.Exec(
-		`INSERT INTO schedule_overrides (id, schedule_id, user_id, start_time, end_time, created_by)
-		 VALUES ($1, $2, $3, $4, $5, $3)`,
-		"legacy-ovr-"+scheduleID, scheduleID, userID, start.Add(24*time.Hour), start.Add(30*time.Hour)); err != nil {
-		t.Fatalf("insert legacy override: %v", err)
-	}
-	if _, err := s.db.Exec(
-		`INSERT INTO rotation_epochs (id, schedule_id, layer, user_ids, start_time)
-		 VALUES ($1, $2, 'l1', $3, $4)`,
-		"legacy-epoch-"+scheduleID, scheduleID, `[["`+userID+`"]]`, start); err != nil {
-		t.Fatalf("insert legacy epoch: %v", err)
-	}
-}
-
-func markerCount(t *testing.T, s *Store) int {
-	t.Helper()
-	return countRows(t, s, `SELECT COUNT(*) FROM migration_markers WHERE name = $1`, legacyScheduleResetMarker)
+	return countRows(t, s, `SELECT COUNT(*) FROM migration_markers WHERE name = $1`, name)
 }
 
 func TestLegacyScheduleResetCascades(t *testing.T) {
 	s := setupTestDB(t)
+	makeSchemaLegacy(t, s)
 	seedLegacySchedule(t, s, "devops", "sched-devops", "alice")
 	seedLegacySchedule(t, s, "platform", "sched-platform", "bob")
 
@@ -65,11 +31,18 @@ func TestLegacyScheduleResetCascades(t *testing.T) {
 	if res.SchedulesDeleted != 2 {
 		t.Fatalf("deleted %d schedules, want 2", res.SchedulesDeleted)
 	}
+	if !res.PhysicalCleanup || res.RowsAlreadyReset {
+		t.Fatalf("result = %+v, want a cleanup that deleted the rows itself", res)
+	}
 
-	for _, table := range []string{"schedules", "schedule_users", "schedule_overrides", "rotation_epochs"} {
-		// nosemgrep: string-formatted-query - table names are hardcoded, not user input
-		if n := countRows(t, s, `SELECT COUNT(*) FROM `+table); n != 0 {
-			t.Fatalf("%s still holds %d row(s)", table, n)
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules`); n != 0 {
+		t.Fatalf("schedules still holds %d row(s)", n)
+	}
+	// The dependent rows went with them, and so did the tables: the cascade is
+	// no longer the only thing that had to happen here.
+	for _, table := range legacyScheduleTables {
+		if legacyTableExists(t, s.db, table) {
+			t.Errorf("%s survived the cleanup", table)
 		}
 	}
 	// Teams and users are not schedule data and must survive.
@@ -79,8 +52,11 @@ func TestLegacyScheduleResetCascades(t *testing.T) {
 	if n := countRows(t, s, `SELECT COUNT(*) FROM users`); n != 2 {
 		t.Fatalf("got %d users, want 2", n)
 	}
-	if markerCount(t, s) != 1 {
-		t.Fatal("marker was not written")
+	if markerCount(t, s, legacyScheduleResetMarker) != 1 {
+		t.Error("the reset marker was not written")
+	}
+	if markerCount(t, s, legacyScheduleDropMarker) != 1 {
+		t.Error("the drop marker was not written")
 	}
 }
 
@@ -88,6 +64,7 @@ func TestLegacyScheduleResetCascades(t *testing.T) {
 // the operator has recreated schedules would delete them.
 func TestLegacyScheduleResetIsNotRepeatable(t *testing.T) {
 	s := setupTestDB(t)
+	makeSchemaLegacy(t, s)
 	seedLegacySchedule(t, s, "devops", "sched-devops", "alice")
 
 	if _, err := s.ResetLegacySchedules(); err != nil {
@@ -121,8 +98,8 @@ func TestLegacyScheduleResetIsNotRepeatable(t *testing.T) {
 	if !res.AlreadyApplied {
 		t.Fatal("second run did not report AlreadyApplied")
 	}
-	if res.SchedulesDeleted != 0 {
-		t.Fatalf("second run deleted %d schedules", res.SchedulesDeleted)
+	if res.SchedulesDeleted != 0 || res.PhysicalCleanup {
+		t.Fatalf("second run did work: %+v", res)
 	}
 	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules WHERE id = $1`, rev.ScheduleID); n != 1 {
 		t.Fatal("the recreated schedule was deleted by a repeat run")
@@ -130,8 +107,97 @@ func TestLegacyScheduleResetIsNotRepeatable(t *testing.T) {
 	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_revisions`); n != 1 {
 		t.Fatalf("got %d revisions after a repeat run, want 1", n)
 	}
-	if markerCount(t, s) != 1 {
-		t.Fatal("marker was duplicated")
+	if markerCount(t, s, legacyScheduleDropMarker) != 1 {
+		t.Fatal("the drop marker was duplicated")
+	}
+}
+
+// TestLegacyScheduleResetCleansUpADatabaseThatAlreadyRanTheReset is the branch
+// that did not exist before the physical cutover, and the one where getting it
+// wrong is worst.
+//
+// Such a database has the reset marker but still carries the legacy tables: it
+// upgraded before this release. It needs the cleanup, and the schedules in it
+// are the recreated, revision-managed ones the whole epic exists for. Deleting
+// them - which is what the pre-cutover code path would do without its marker
+// short-circuit - is the catastrophe this test exists to prevent.
+func TestLegacyScheduleResetCleansUpADatabaseThatAlreadyRanTheReset(t *testing.T) {
+	s := setupTestDB(t)
+	makeSchemaLegacy(t, s)
+
+	// The state an earlier upgrade left: the reset marker is there, the legacy
+	// schema is not gone, and the schedules are the new ones.
+	if _, err := s.db.Exec(
+		`INSERT INTO migration_markers (name) VALUES ($1)`, legacyScheduleResetMarker); err != nil {
+		t.Fatalf("seed the old marker: %v", err)
+	}
+	seedTeam(t, s, "devops", "alice", "bob")
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	rev, err := createViaSave(context.Background(), newTestScheduleService(s, start), "devops", revTestConfig(), "", nil)
+	if err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+
+	res, err := s.ResetLegacySchedules()
+	if err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	if res.AlreadyApplied {
+		t.Fatal("a database that never had the physical cleanup reported AlreadyApplied")
+	}
+	if res.SchedulesDeleted != 0 {
+		t.Fatalf("the cleanup deleted %d schedule(s); it must touch no data here", res.SchedulesDeleted)
+	}
+	if !res.PhysicalCleanup || !res.RowsAlreadyReset {
+		t.Fatalf("result = %+v, want a cleanup that reports it touched no data", res)
+	}
+
+	// The live schedule and its history are exactly where they were.
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedules WHERE id = $1`, rev.ScheduleID); n != 1 {
+		t.Fatal("the cleanup destroyed a live revision-managed schedule")
+	}
+	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_revisions WHERE schedule_id = $1`, rev.ScheduleID); n != 1 {
+		t.Fatal("the cleanup destroyed the revision history")
+	}
+	for _, table := range legacyScheduleTables {
+		if legacyTableExists(t, s.db, table) {
+			t.Errorf("%s survived the cleanup", table)
+		}
+	}
+	if err := s.RequireCutoverSchema(); err != nil {
+		t.Fatalf("the schema is not final after the cleanup: %v", err)
+	}
+}
+
+// The intermediate state: the rows were reset, but something in the database
+// still has no horizon. SET NOT NULL would refuse it with a bare DDL error
+// naming a column, which tells the one person who can fix it nothing.
+func TestLegacyScheduleResetRefusesARootWithoutHorizonByName(t *testing.T) {
+	s := setupTestDB(t)
+	makeSchemaLegacy(t, s)
+
+	if _, err := s.db.Exec(
+		`INSERT INTO migration_markers (name) VALUES ($1)`, legacyScheduleResetMarker); err != nil {
+		t.Fatalf("seed the old marker: %v", err)
+	}
+	seedLegacySchedule(t, s, "devops", "sched-stranded", "alice")
+
+	res, err := s.ResetLegacySchedules()
+	if !errors.Is(err, ErrLegacyResetRootWithoutHorizon) {
+		t.Fatalf("error = %v, want ErrLegacyResetRootWithoutHorizon", err)
+	}
+	if res != nil {
+		t.Fatalf("result returned alongside the error: %+v", res)
+	}
+	if !strings.Contains(err.Error(), "sched-stranded") {
+		t.Fatalf("the refusal must name the schedule that blocks it: %v", err)
+	}
+	// Refused means refused: nothing was dropped on the way to finding out.
+	if !legacyTableExists(t, s.db, "rotation_epochs") {
+		t.Error("the cleanup ran despite the refusal")
+	}
+	if markerCount(t, s, legacyScheduleDropMarker) != 0 {
+		t.Error("the drop marker was written despite the refusal")
 	}
 }
 
@@ -139,6 +205,7 @@ func TestLegacyScheduleResetIsNotRepeatable(t *testing.T) {
 // path against this database. Deleting then would destroy live schedules.
 func TestLegacyScheduleResetRefusesWhenRevisionsExistWithoutMarker(t *testing.T) {
 	s := setupTestDB(t)
+	makeSchemaLegacy(t, s)
 	seedLegacySchedule(t, s, "platform", "sched-platform", "bob")
 
 	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
@@ -160,22 +227,36 @@ func TestLegacyScheduleResetRefusesWhenRevisionsExistWithoutMarker(t *testing.T)
 	if n := countRows(t, s, `SELECT COUNT(*) FROM schedule_revisions`); n != 1 {
 		t.Fatalf("got %d revisions, want 1", n)
 	}
-	if markerCount(t, s) != 0 {
-		t.Fatal("marker was written despite the refusal")
+	if markerCount(t, s, legacyScheduleResetMarker) != 0 {
+		t.Error("the reset marker was written despite the refusal")
+	}
+	if markerCount(t, s, legacyScheduleDropMarker) != 0 {
+		t.Error("the drop marker was written despite the refusal")
 	}
 }
 
-func TestLegacyScheduleResetOnEmptyDatabase(t *testing.T) {
+// A database that never carried the legacy schema at all still records both
+// markers, so a second run is the no-op it is everywhere else.
+func TestLegacyScheduleResetOnFreshDatabase(t *testing.T) {
 	s := setupTestDB(t)
 
 	res, err := s.ResetLegacySchedules()
 	if err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	if res.SchedulesDeleted != 0 || res.AlreadyApplied {
-		t.Fatalf("result = %+v, want a no-op first run", res)
+	// Not RowsAlreadyReset: nothing had been reset here, there was simply
+	// nothing to reset. The two share a count and the CLI says different
+	// things about them.
+	if res.SchedulesDeleted != 0 || res.AlreadyApplied || !res.PhysicalCleanup || res.RowsAlreadyReset {
+		t.Fatalf("result = %+v, want a no-op first run that records the cleanup", res)
 	}
-	if markerCount(t, s) != 1 {
-		t.Fatal("marker was not written")
+	if markerCount(t, s, legacyScheduleResetMarker) != 1 {
+		t.Error("the reset marker was not written")
+	}
+	if markerCount(t, s, legacyScheduleDropMarker) != 1 {
+		t.Error("the drop marker was not written")
+	}
+	if err := s.RequireCutoverSchema(); err != nil {
+		t.Fatalf("a fresh database is not in the final shape: %v", err)
 	}
 }

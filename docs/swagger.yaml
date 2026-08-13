@@ -475,6 +475,11 @@ definitions:
           returned as if it had been recorded.
         type: boolean
       history_complete_from:
+        description: |-
+          HistoryCompleteFrom is always present: every schedule has a horizon, so
+          there is no absence to express. It is a value rather than a pointer for
+          that reason - and `omitempty` would not have expressed the absence
+          anyway, since it does nothing on a struct.
         type: string
       until:
         type: string

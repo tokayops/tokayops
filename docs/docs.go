@@ -3408,6 +3408,7 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "history_complete_from": {
+                    "description": "HistoryCompleteFrom is always present: every schedule has a horizon, so\nthere is no absence to express. It is a value rather than a pointer for\nthat reason - and ` + "`" + `omitempty` + "`" + ` would not have expressed the absence\nanyway, since it does nothing on a struct.",
                     "type": "string"
                 },
                 "until": {

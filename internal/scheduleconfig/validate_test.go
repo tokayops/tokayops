@@ -261,13 +261,8 @@ func TestPrepareInitialSchedule(t *testing.T) {
 	if root.ConfigVersion != 1 {
 		t.Fatalf("config version = %d, want 1", root.ConfigVersion)
 	}
-	if root.HistoryCompleteFrom == nil || !root.HistoryCompleteFrom.Equal(rev.EffectiveFrom) {
+	if !root.HistoryCompleteFrom.Equal(rev.EffectiveFrom) {
 		t.Fatalf("history_complete_from = %v, want %v", root.HistoryCompleteFrom, rev.EffectiveFrom)
-	}
-	// The derived pointer must not alias the revision's own field.
-	*root.HistoryCompleteFrom = time.Unix(0, 0).UTC()
-	if rev.EffectiveFrom.Equal(time.Unix(0, 0).UTC()) {
-		t.Fatal("history_complete_from aliases the revision's effective_from")
 	}
 }
 

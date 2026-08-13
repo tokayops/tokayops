@@ -147,7 +147,6 @@ func cloneInt(i *int) *int {
 }
 
 func cloneRoot(r scheduleconfig.ScheduleRoot) scheduleconfig.ScheduleRoot {
-	r.HistoryCompleteFrom = cloneTime(r.HistoryCompleteFrom)
 	r.DeletedAt = cloneTime(r.DeletedAt)
 	return r
 }
@@ -331,23 +330,13 @@ func (r *ScheduleConfigRepo) RootCount() int {
 // already has - usually none.
 //
 // No command can produce a root without a chain, which is the point: a broken
-// chain and a missing history horizon are both states the readers have to answer
-// for, and neither is reachable through the command side.
+// chain is a state the readers have to answer for, and it is not reachable
+// through the command side.
 func (r *ScheduleConfigRepo) SeedRoot(root scheduleconfig.ScheduleRoot) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.state.roots[root.ID] = cloneRoot(root)
 	r.state.teamIndex[root.TeamID] = root.ID
-}
-
-// SeedRootWithoutHistory inserts a schedule row that no live path could have
-// written: no history horizon, no revision chain, config_version 0.
-//
-// It is what an upgrade leaves behind when the destructive schedule reset is
-// skipped. Every path has to refuse it loudly, and without a way to build one
-// here that could not be tested at all.
-func (r *ScheduleConfigRepo) SeedRootWithoutHistory(scheduleID, teamID string) {
-	r.SeedRoot(scheduleconfig.ScheduleRoot{ID: scheduleID, TeamID: teamID})
 }
 
 // FailScheduleRead makes the revision read of one schedule fail with err,

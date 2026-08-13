@@ -34,9 +34,10 @@ type Result struct {
 	Assignments []Assignment
 
 	// HistoryComplete is false when part of the range precedes the point from
-	// which this schedule's history is exact.
+	// which this schedule's history is exact. HistoryCompleteFrom is always
+	// known: a successful render has read a root, and every root carries one.
 	HistoryComplete     bool
-	HistoryCompleteFrom *time.Time
+	HistoryCompleteFrom time.Time
 
 	// DeletedAt is the current soft-delete stamp of the schedule, if any.
 	DeletedAt *time.Time
@@ -84,29 +85,17 @@ func Render(in Input) (Result, error) {
 		return revisions[i].Version < revisions[j].Version
 	})
 
-	// No horizon at all is damage, not a schedule with little history. The
-	// create flow writes it in the same statement as the row, and nothing
-	// clears it afterwards, so an empty value means a row written past the
-	// code - the same conclusion the projection reaches (onCallOfRoot).
-	//
-	// This is deliberately not folded into the check below. Rendering an empty
-	// calendar with history_complete=false would answer a corrupt row exactly
-	// as it answers a schedule created yesterday, and the caller cannot tell
-	// those apart.
-	if err := scheduleconfig.RequireInitializedRoot(&in.Root); err != nil {
-		return Result{}, err
-	}
 	hcf := in.Root.HistoryCompleteFrom
 
 	// History before the first recorded revision is not a gap in the chain,
 	// it is the part of the past this schedule cannot speak about. Saying
 	// "gap" there would cry damage on every schedule younger than the query.
-	if from.Before(*hcf) {
+	if from.Before(hcf) {
 		res.HistoryComplete = false
 		res.Warnings = append(res.Warnings, Warning{
 			Code:  WarnHistoryIncomplete,
 			From:  from,
-			Until: minTime(until, *hcf),
+			Until: minTime(until, hcf),
 		})
 	}
 
@@ -117,7 +106,7 @@ func Render(in Input) (Result, error) {
 	//
 	// It starts at the point from which this schedule's history is supposed to
 	// be exact, which is always known here.
-	cov := coverage{query: queryRange, cursor: maxTime(from, *hcf)}
+	cov := coverage{query: queryRange, cursor: maxTime(from, hcf)}
 
 	for _, rev := range revisions {
 		revRange := revisionInterval(rev)

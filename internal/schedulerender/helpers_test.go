@@ -140,12 +140,11 @@ func revisionID(i int) string {
 }
 
 func root(historyFrom time.Time) scheduleconfig.ScheduleRoot {
-	from := historyFrom
 	return scheduleconfig.ScheduleRoot{
 		ID:                  testScheduleID,
 		TeamID:              "devops",
 		ConfigVersion:       1,
-		HistoryCompleteFrom: &from,
+		HistoryCompleteFrom: historyFrom,
 	}
 }
 

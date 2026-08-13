@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
 // Deleting a team used to answer 500 with the text of a Postgres constraint
@@ -162,29 +163,36 @@ func TestDeleteTeamAnswersAboutTheTerminalBlockerFirst(t *testing.T) {
 	}
 }
 
-// The one path on which a skipped upgrade reset could destroy data silently: a
-// schedule row with no history horizon owns no revisions, so no RESTRICT stops
-// the cascade from teams, and the row would go without a word.
-func TestDeleteTeamRefusesUninitializedScheduleAndKeepsIt(t *testing.T) {
+// TestDeleteTeamRefusesOnTheExistenceOfARootNotItsContents pins the reason the
+// delete is safe, which is narrower than it is tempting to state.
+//
+// A root with no revision chain owns nothing for ON DELETE RESTRICT to defend,
+// so the cascade from teams would take it without a word. Nothing rules such a
+// root out either: history_complete_from NOT NULL closes the pre-revision row,
+// not the general case - raw SQL can still write a root with a horizon and no
+// chain. What makes the delete safe is that it refuses as soon as a root
+// EXISTS, without asking what is in it, and this test is the thing that fails
+// if that check is ever narrowed to some property of the row.
+func TestDeleteTeamRefusesOnTheExistenceOfARootNotItsContents(t *testing.T) {
 	_, s, e, env := setupScheduleAPI(t)
 	defer s.Close()
 
-	env.Config.SeedRootWithoutHistory("legacy-1", "devops")
+	env.Config.SeedRoot(scheduleconfig.ScheduleRoot{
+		ID: "chainless-1", TeamID: "devops", ConfigVersion: 1,
+		HistoryCompleteFrom: time.Now().UTC(),
+	})
 
 	rec := doJSON(t, e, http.MethodDelete, "/api/v1/teams/devops", nil, "denis")
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500, got %d: %s", rec.Code, rec.Body.String())
-	}
 	var body map[string]any
 	decodeJSON(t, rec, &body)
-	if body["code"] != CodeInvariantViolation {
-		t.Errorf("code = %v, want %s", body["code"], CodeInvariantViolation)
+	if rec.Code != http.StatusConflict || body["code"] != CodeTeamHasScheduleHistory {
+		t.Fatalf("want 409 %s, got %d %v", CodeTeamHasScheduleHistory, rec.Code, body["code"])
 	}
 	if _, err := s.GetTeamByID("devops"); err != nil {
 		t.Error("the team was deleted despite the refusal")
 	}
 	if _, ok := env.Config.RootByTeam("devops"); !ok {
-		t.Error("the uninitialized schedule row was destroyed; that is the defect this test exists for")
+		t.Error("the schedule row was destroyed; that is the defect this test exists for")
 	}
 }
 

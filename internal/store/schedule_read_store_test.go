@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
@@ -337,24 +336,6 @@ func TestListScheduleRootsReadsRevisionRows(t *testing.T) {
 	// A revision-managed schedule: no l1_rotation_start, no rotation type.
 	revision := createSchedule(t, s, "devops", start)
 
-	// A row left behind by an upgrade whose schedule reset was skipped. There
-	// is no longer any Go that can write one - which is the point - so it goes
-	// in as SQL.
-	//
-	// It must be LISTED, not skipped. The query reports what is in the table;
-	// deciding that this row is damage is the projection's job, and a row the
-	// query hides is a row nobody can report.
-	if err := s.CreateTeam(&model.Team{ID: "legacy-team", Name: "legacy-team"}); err != nil {
-		t.Fatalf("CreateTeam: %v", err)
-	}
-	if _, err := s.db.Exec(`
-		INSERT INTO schedules (id, team_id, timezone, l1_rotation_type, l1_handoff_time,
-		                       l1_rotation_start, created_at, updated_at)
-		VALUES ('sched-legacy', 'legacy-team', 'UTC', 'daily', '09:00', $1, NOW(), NOW())`,
-		start.Add(-24*time.Hour)); err != nil {
-		t.Fatalf("insert pre-revision row: %v", err)
-	}
-
 	// A soft-deleted revision schedule, which the contract includes.
 	deleted := createSchedule(t, s, "platform", start)
 	deletedAt := start.Add(24 * time.Hour)
@@ -372,8 +353,8 @@ func TestListScheduleRootsReadsRevisionRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListScheduleRoots: %v", err)
 	}
-	if len(roots) != 3 {
-		t.Fatalf("listed %d roots, want all three: %+v", len(roots), roots)
+	if len(roots) != 2 {
+		t.Fatalf("listed %d roots, want both: %+v", len(roots), roots)
 	}
 
 	byID := map[string]scheduleconfig.ScheduleRoot{}
@@ -393,19 +374,11 @@ func TestListScheduleRootsReadsRevisionRows(t *testing.T) {
 	if live.ConfigVersion != 1 {
 		t.Errorf("config_version = %d, want 1", live.ConfigVersion)
 	}
-	if live.HistoryCompleteFrom == nil || !live.HistoryCompleteFrom.Equal(start) {
+	if !live.HistoryCompleteFrom.Equal(start) {
 		t.Errorf("history_complete_from = %v, want %v", live.HistoryCompleteFrom, start)
 	}
 	if live.DeletedAt != nil {
 		t.Errorf("deleted_at = %v for a live schedule", live.DeletedAt)
-	}
-
-	legacy, ok := byID["sched-legacy"]
-	if !ok {
-		t.Fatalf("the legacy schedule is missing: %v", ids)
-	}
-	if legacy.ConfigVersion != 0 || legacy.HistoryCompleteFrom != nil {
-		t.Errorf("legacy root = %+v, want config_version 0 and no history horizon", legacy)
 	}
 
 	gone, ok := byID[deleted.ScheduleID]

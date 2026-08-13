@@ -100,7 +100,7 @@ func TestCreateScheduleWritesRootAndFirstRevisionTogether(t *testing.T) {
 	if root.ConfigVersion != 1 {
 		t.Fatalf("config version = %d, want 1", root.ConfigVersion)
 	}
-	if root.HistoryCompleteFrom == nil || !root.HistoryCompleteFrom.Equal(rev.EffectiveFrom) {
+	if !root.HistoryCompleteFrom.Equal(rev.EffectiveFrom) {
 		t.Fatalf("history_complete_from = %v, want %v", root.HistoryCompleteFrom, rev.EffectiveFrom)
 	}
 	if got := repo.Revisions(root.ID); len(got) != 1 {

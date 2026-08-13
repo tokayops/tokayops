@@ -173,19 +173,6 @@ func TestPreviewValidationMatchesSave(t *testing.T) {
 			t.Fatalf("error = %v, want a validation rejection", err)
 		}
 	})
-
-	// A root with no history horizon is damage, not a schedule the preview can
-	// reason about: showing a plan for it would show a plan Save then refuses.
-	t.Run("root without history", func(t *testing.T) {
-		f := newPreviewFixture(t)
-		f.repo.SeedRootWithoutHistory("legacy-1", "devops")
-
-		_, err := f.svc.Preview(context.Background(), "devops",
-			previewConfig(pvGroup(pvGroupA, "alice")), nil)
-		if !errors.Is(err, schedulerender.ErrHistoryMarkerMissing) {
-			t.Fatalf("error = %v, want ErrHistoryMarkerMissing", err)
-		}
-	})
 }
 
 func TestPreviewOnAbsentSchedule(t *testing.T) {

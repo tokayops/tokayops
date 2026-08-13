@@ -53,31 +53,6 @@ func TestListTeamsTreatsDeletedScheduleAsUnconfigured(t *testing.T) {
 	}
 }
 
-// The team list is the ONE place a row with no history horizon gets a quiet
-// answer, and that is deliberate rather than an oversight left over from the
-// pre-revision era.
-//
-// Every schedule endpoint refuses such a row as an invariant violation
-// (TestRootWithoutHistoryIsRefusedEverywhere). Doing that here would fail the
-// whole page because one team's row is corrupt - the same blast radius that was
-// taken out of the notifier tick, and a list of teams is not where an operator
-// should discover a skipped migration. It is logged instead, and the team is
-// reported as unconfigured.
-func TestListTeamsReportsRootWithoutHistoryAsUnconfigured(t *testing.T) {
-	_, s, e, env := setupScheduleAPI(t)
-	defer s.Close()
-
-	env.Config.SeedRootWithoutHistory("legacy-1", "devops")
-
-	teams := configuredTeams(t, e)
-	if teams["devops"] {
-		t.Fatal("an uninitialized schedule must not report on_call_configured")
-	}
-	if len(teams) == 0 {
-		t.Fatal("the page must still answer; one corrupt row cannot take out the team list")
-	}
-}
-
 // The defect was a swallowed error. A repository failure now fails the
 // request: answering 200 with every team marked unconfigured is a wrong
 // answer that looks like a fact.

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -859,12 +858,6 @@ func (a *API) teamsWithSchedule(ctx context.Context, teams []*model.Team) (map[s
 		for i := range roots {
 			root := &roots[i]
 			if _, asked := wanted[root.TeamID]; !asked {
-				continue
-			}
-			// Quiet here, loud everywhere else - and the wording of "loud"
-			// comes from the one place that owns it, so the two cannot drift.
-			if err := scheduleconfig.RequireInitializedRoot(root); err != nil {
-				log.Printf("ALERT schedule_config: team %s: %v", root.TeamID, err)
 				continue
 			}
 			if root.DeletedAt != nil {

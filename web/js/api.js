@@ -581,7 +581,7 @@ const API = {
          * @param {string} teamId
          * @param {Date} from
          * @param {Date} until
-         * @returns {Promise<{from, until, history_complete, history_complete_from?, deleted_at?, entries, warnings}>}
+         * @returns {Promise<{from, until, history_complete, history_complete_from, deleted_at?, entries, warnings}>}
          */
         render: (teamId, from, until, options = {}) => {
             const query = buildQuery({

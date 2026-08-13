@@ -1,3 +1,21 @@
+# The application environment, shared by the server and the one-shot CLI
+# container below. One definition so the two cannot drift: a CLI pointed at a
+# different database than the app is a failure that looks like a bug in the
+# code under test.
+x-app-env: &app-env
+  DB_HOST: e2e_db
+  DB_PORT: "5432"
+  DB_USER: e2e_user
+  DB_PASSWORD: e2e_password
+  DB_NAME: tokay_e2e
+  DB_SSLMODE: disable
+  CONFIG_FILE: /app/tokay.yaml
+  JWT_SECRET: e2e-test-secret-key-12345
+  ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  APP_ENV: development
+  TOKAY_WEBHOOK_ALLOW_HTTP: "true"
+  TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS: "127.0.0.0/8"
+
 services:
   e2e_db:
     image: postgres:17-alpine
@@ -28,19 +46,7 @@ services:
     depends_on:
       e2e_db:
         condition: service_healthy
-    environment:
-      DB_HOST: e2e_db
-      DB_PORT: "5432"
-      DB_USER: e2e_user
-      DB_PASSWORD: e2e_password
-      DB_NAME: tokay_e2e
-      DB_SSLMODE: disable
-      CONFIG_FILE: /app/tokay.yaml
-      JWT_SECRET: e2e-test-secret-key-12345
-      ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-      APP_ENV: development
-      TOKAY_WEBHOOK_ALLOW_HTTP: "true"
-      TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS: "127.0.0.0/8"
+    environment: *app-env
     ports:
       - "8081:8080"
     volumes:
@@ -50,6 +56,31 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # The maintenance CLI, run one command at a time with `docker compose run`.
+  #
+  # It exists so the destructive schedule reset can run with the application
+  # stopped, which is what the upgrade checklist requires of an operator. The
+  # reset drops the pre-revision tables and tightens a column; doing that
+  # against a live application would be rehearsing a procedure nobody is
+  # supposed to follow.
+  #
+  # Behind a profile so it never starts with `up`: it is a command, not a
+  # service, and a container that exits immediately would look like a crash.
+  tokay_cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["cli"]
+    networks:
+      - tokay_e2e_net
+    depends_on:
+      e2e_db:
+        condition: service_healthy
+    environment: *app-env
+    volumes:
+      - ./tokay.yaml:/app/tokay.yaml:ro
+    entrypoint: ["/app/tokayops"]
 
 networks:
   tokay_e2e_net:

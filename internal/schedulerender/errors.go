@@ -1,10 +1,6 @@
 package schedulerender
 
-import (
-	"errors"
-
-	"github.com/tokayops/tokayops/internal/scheduleconfig"
-)
+import "errors"
 
 // Failures a read path can hit in the data of one schedule.
 //
@@ -24,10 +20,3 @@ var (
 	// cannot be computed.
 	ErrRotation = errors.New("schedulerender: rotation error")
 )
-
-// ErrHistoryMarkerMissing is re-exported, not redefined: a root with no
-// history horizon is one fact, and scheduleconfig - which owns ScheduleRoot -
-// owns the sentinel and its text. This alias exists so the classification
-// below and the read paths in this package keep reading in this package's
-// vocabulary.
-var ErrHistoryMarkerMissing = scheduleconfig.ErrHistoryMarkerMissing
