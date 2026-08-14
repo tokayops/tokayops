@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
 )
 
 func setupDeliveryTestEnv(t *testing.T) (*store.MockStore, *echo.Echo, string, string, string) {

@@ -8,13 +8,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+	"github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/google/uuid"
-	"github.com/labstack/echo/v4"
-	"github.com/lib/pq"
 )
 
 type AMPayload struct {
@@ -328,7 +328,6 @@ func buildMergeTimelineEvents(alertGroupID string, incomingAlerts []model.Alert,
 	}
 	return events
 }
-
 
 func mergeAlerts(existing, incoming []model.Alert) []model.Alert {
 	state := make(map[string]model.Alert)

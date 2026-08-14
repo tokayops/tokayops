@@ -1,8 +1,10 @@
 .PHONY: run build test clean swagger up down seed user \
        test-db-start test-db-stop test-db-status \
        test-integration test-integration-quick test-integration-run \
+       test-integration-shuffle \
        test-pipeline test-dispatcher \
        e2e-install e2e-test e2e-test-ui e2e-test-headed e2e-up e2e-down \
+       e2e-wait e2e-seed \
        webhook-receiver webhook-receiver-build
 
 # Pin swag version for reproducible builds
@@ -64,6 +66,18 @@ test-db-status:
 test-integration:
 	@./scripts/run_integration_tests.sh --failures
 
+# Order independence of the store package, which is where the schema-mutating
+# cutover tests live. Inside the runner so the database it starts is still up:
+# see the --shuffle comment in the script.
+#
+# Scoped to ./internal/store/... deliberately. The tree as a whole has never
+# been order-independent - `-shuffle=on` over ./internal/... fails on `epic10`
+# too, in api, dispatcher and integration - and fixing that is a separate piece
+# of work, recorded in tokay-docs. Widening this target before then would give
+# it a red baseline and make it useless for the thing it was added to check.
+test-integration-shuffle:
+	@./scripts/run_integration_tests.sh --shuffle --pkg ./internal/store/... --failures
+
 # Quick summary of integration tests
 test-integration-quick:
 	@./scripts/run_integration_tests.sh --summary
@@ -87,13 +101,69 @@ test-dispatcher:
 e2e-install:
 	cd e2e && npm install && npx playwright install chromium firefox
 
-e2e-up:
-	docker compose -f docker-compose.e2e.yml up -d --build
+# Always from a fresh volume. The environment is built by seeding and then
+# resetting, and the reset records a marker that makes it a no-op afterwards -
+# so running this twice against a surviving database would re-seed the legacy
+# schedules and have nothing left to remove them. Starting clean is also what
+# e2e-test already assumed: it tears the stack down after every run.
+#
+# The database comes up alone, the CLI runs against it, and only then does the
+# application start. That order is the production cutover procedure, and the
+# reason to reproduce it is that `migrate reset-schedules` is no longer only
+# DML: it drops the pre-revision tables and tightens a column, taking ACCESS
+# EXCLUSIVE locks. The upgrade checklist requires every instance to be stopped
+# for exactly that reason, and the only automated rehearsal of the cutover we
+# have should not be rehearsing something the checklist forbids.
+e2e-up: e2e-down
+	docker compose -f docker-compose.e2e.yml up -d --wait e2e_db
+	$(MAKE) e2e-seed
+	docker compose -f docker-compose.e2e.yml up -d --build tokay_app
+	$(MAKE) e2e-wait
+
+# e2e-wait blocks until the app answers, and gives up instead of hanging: an
+# unbounded wait is invisible locally (you see it and interrupt it) but in CI it
+# burns the whole job timeout and reports nothing about why the app never came
+# up. On timeout the app log is the first thing anyone would ask for.
+e2e-wait:
 	@echo "Waiting for application to be ready..."
-	@while ! curl -s http://localhost:8081/swagger/index.html > /dev/null 2>&1; do sleep 2; done
-	@echo "Application is ready!"
-	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops user create admin@example.com 'Admin123!' 'Test Admin' || true
-	docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops seed || true
+	@for attempt in $$(seq 1 60); do \
+		if curl -s http://localhost:8081/swagger/index.html > /dev/null 2>&1; then \
+			echo "Application is ready!"; \
+			exit 0; \
+		fi; \
+		echo "Waiting for app... (attempt $$attempt/60)"; \
+		sleep 2; \
+	done; \
+	echo "Application failed to start"; \
+	docker compose -f docker-compose.e2e.yml logs tokay_app; \
+	exit 1
+
+# e2e-seed is the data half of the environment: the admin the suite logs in as,
+# the seeded teams, and the destructive reset.
+#
+# It is a target of its own so that CI calls it instead of keeping a copy of
+# these three commands. It used to keep one, and when Epic 10 Sprint 5.5 added
+# the reset below, the workflow's copy never got it - so `env.spec.ts` failed on
+# every branch in CI while every local run was green. One definition of the
+# environment, called from both places, is the only thing that stops that
+# happening again.
+#
+# The reset no longer has anything to delete - `seed` stopped writing schedules
+# when the legacy write path was removed - and it stays anyway, without `|| true`,
+# so a failure fails the environment. On every run it puts the real CLI against
+# the real schema and leaves the marker a database has after an upgrade, which is
+# the state the suite is supposed to run against.
+#
+# These run as one-shot containers rather than `exec` into a running app,
+# because the application is deliberately not running yet - see e2e-up. Each
+# creates its own container from the same image and exits.
+#
+# Schedules for the tests are created through the API by the Playwright setup
+# project.
+e2e-seed:
+	docker compose -f docker-compose.e2e.yml run --rm --build tokay_cli user create admin@example.com 'Admin123!' 'Test Admin' || true
+	docker compose -f docker-compose.e2e.yml run --rm tokay_cli seed || true
+	docker compose -f docker-compose.e2e.yml run --rm tokay_cli migrate reset-schedules
 
 e2e-down:
 	docker compose -f docker-compose.e2e.yml down -v --remove-orphans

@@ -10,12 +10,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/api"
 	"github.com/tokayops/tokayops/internal/auth"
+	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/tokayops/tokayops/internal/testutil"
-	"github.com/labstack/echo/v4"
 )
 
 type APIIntegrationEnv struct {
@@ -29,6 +32,7 @@ func setupAPITest(t *testing.T) *APIIntegrationEnv {
 
 	// We pass nil for OIDC provider, Slack messenger, and IntegrationCache for now
 	a := api.NewAPI(s, nil, nil, nil, "", nil)
+	wireScheduleServices(a, s)
 	e := echo.New()
 	a.RegisterRoutes(e)
 
@@ -37,6 +41,16 @@ func setupAPITest(t *testing.T) *APIIntegrationEnv {
 		API:  a,
 		Echo: e,
 	}
+}
+
+// wireScheduleServices gives the API the same schedule and erasure services
+// main builds. They are separate setters because the revision model is
+// deliberately not part of store.StoreInterface, so NewAPI cannot reach them.
+func wireScheduleServices(a *api.API, s *store.Store) {
+	a.SetScheduleConfigService(scheduleconfig.NewService(s.ScheduleConfigRepository()))
+	a.SetScheduleReadRepository(s.ScheduleReadRepository())
+	a.SetScheduleRenderer(schedulerender.New(s.ScheduleReadRepository()))
+	a.SetUserEraser(erasure.NewService(s.ErasureRepository()))
 }
 
 func createAuthenticatedRequest(t *testing.T, method, path string, body []byte, userID string) *http.Request {

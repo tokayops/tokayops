@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // createJobWithDedupTx inserts a job and its steps within the given transaction.
@@ -97,19 +97,20 @@ func (s *Store) createJobWithDedupTx(tx *sql.Tx, job *model.Job, stages []*model
 }
 
 // CreateJobWithDedup creates a job and its steps atomically.
-// If a job with the same dedup_key exists and is active, it returns existing job ID (idempotent).
-func (s *Store) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, error) {
+// If a job with the same dedup_key exists and is active, it returns that job's
+// ID (idempotent) with created false.
+func (s *Store) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer tx.Rollback()
 
-	jobID, _, err := s.createJobWithDedupTx(tx, job, stages, steps)
+	jobID, created, err := s.createJobWithDedupTx(tx, job, stages, steps)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return jobID, tx.Commit()
+	return jobID, created, tx.Commit()
 }
 
 // EnsureEscalationJob atomically transitions an AG from new/processing → processing

@@ -47,7 +47,7 @@ func (a *API) RequestTelegramLink(c echo.Context) error {
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
 	}
-	if _, err := a.store.GetUserByID(userID); err != nil {
+	if _, err := a.store.GetActiveUserByID(userID); err != nil {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 	}
 	if a.telegram == nil {

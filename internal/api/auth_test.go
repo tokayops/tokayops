@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
+	"github.com/stretchr/testify/assert"
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestAuth(t *testing.T) {

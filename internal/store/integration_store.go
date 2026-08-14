@@ -8,15 +8,28 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/lib/pq"
+
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/integrations"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/google/uuid"
 )
 
 var (
 	ErrIntegrationNotFound  = errors.New("integration not found")
 	ErrDuplicateIntegration = errors.New("integration of this type already exists")
+
+	// ErrIntegrationTeamNotFound means a team-scoped integration named a team
+	// that does not exist by the time the row is written.
+	//
+	// The caller usually validated the team a moment earlier, so this is the
+	// narrow race: the team was deleted between that check and this write.
+	// Deleting a team takes a row lock precisely so its own outcome is
+	// deterministic, which means the write on the other side is the one that
+	// loses - and it has to lose in the vocabulary of the contract rather than
+	// with the name of a foreign key.
+	ErrIntegrationTeamNotFound = errors.New("integration team not found")
 )
 
 // CreateIntegration creates a new integration with encrypted config
@@ -51,6 +64,9 @@ func (s *Store) CreateIntegration(i *model.Integration) error {
 		if isUniqueViolation(err) {
 			return ErrDuplicateIntegration
 		}
+		if isIntegrationTeamFKViolation(err) {
+			return ErrIntegrationTeamNotFound
+		}
 		return err
 	}
 	return nil
@@ -78,6 +94,11 @@ func (s *Store) UpdateIntegration(i *model.Integration) error {
 	query := `UPDATE integrations SET name = $1, enabled = $2, scope = $3, team_id = $4, config = $5, updated_at = $6 WHERE id = $7`
 	result, err := s.db.Exec(query, i.Name, i.Enabled, scopeToNullString(i.Scope), stringPtrToNullString(i.TeamID), encryptedConfig, i.UpdatedAt, i.ID)
 	if err != nil {
+		// Same race as on create, reachable the same way: moving an existing
+		// integration onto a team scope writes team_id too.
+		if isIntegrationTeamFKViolation(err) {
+			return ErrIntegrationTeamNotFound
+		}
 		return err
 	}
 
@@ -334,6 +355,18 @@ func mergeSecrets(integrationType model.IntegrationType, existingConfig, newConf
 }
 
 // isUniqueViolation checks if error is a unique constraint violation
+// isIntegrationTeamFKViolation recognises the integrations -> teams foreign
+// key, and only it. Matching on the constraint name rather than on the error
+// class is deliberate: every other foreign key reachable from this table means
+// something else, and laundering all of them into "team not found" would tell
+// the caller to go fix a team that was never the problem.
+func isIntegrationTeamFKViolation(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) &&
+		pqErr.Code.Name() == "foreign_key_violation" &&
+		pqErr.Constraint == integrationTeamFKConstraint
+}
+
 func isUniqueViolation(err error) bool {
 	// PostgreSQL error code for unique violation is 23505
 	return err != nil && (err.Error() == "pq: duplicate key value violates unique constraint \"idx_integrations_type_outbound\"" ||

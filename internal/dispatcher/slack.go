@@ -9,9 +9,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/slackcard"
-	"github.com/slack-go/slack"
 )
 
 // ErrSlackUserNotFound means the email has no matching Slack account.

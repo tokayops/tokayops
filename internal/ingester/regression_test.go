@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
+	"github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
-	"github.com/lib/pq"
 )
 
 // errLookupStore wraps MockStore but returns a DB error from GetActiveAlertGroup.

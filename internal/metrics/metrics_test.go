@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 func TestAllMetricsRegistered(t *testing.T) {

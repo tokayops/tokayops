@@ -3,7 +3,6 @@ package store
 import (
 	"encoding/hex"
 	"encoding/json"
-	"os"
 	"testing"
 
 	"github.com/tokayops/tokayops/internal/config"
@@ -20,8 +19,12 @@ func TestIntegrationStore(t *testing.T) {
 	for i := range key {
 		key[i] = byte(i)
 	}
-	os.Setenv(config.EncryptionKeyEnv, hex.EncodeToString(key))
-	defer os.Unsetenv(config.EncryptionKeyEnv)
+	// t.Setenv, not os.Setenv + defer os.Unsetenv: the latter does not restore
+	// the previous value, it deletes the variable. TestMain sets a default key
+	// for the whole package, so unsetting it here left every later test that
+	// needs one failing - invisibly in declaration order, and reproducibly
+	// under -shuffle.
+	t.Setenv(config.EncryptionKeyEnv, hex.EncodeToString(key))
 
 	t.Run("CRUD slack integration", func(t *testing.T) {
 		s := setupTestDB(t)

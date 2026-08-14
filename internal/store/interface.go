@@ -66,11 +66,18 @@ type StoreInterface interface {
 	GetTeamByID(id string) (*model.Team, error)
 	GetAllTeams() ([]*model.Team, error)
 	UpdateTeam(t *model.Team) error
-	DeleteTeam(id string) error
 
 	// Users
 	CreateUser(u *model.User) error
+
+	// GetUserByID is the DISPLAY read: it returns erased users too, so history
+	// that names an ID still resolves to "Deleted user". Authentication and
+	// commands must use GetActiveUserByID instead.
 	GetUserByID(id string) (*model.User, error)
+
+	// GetActiveUserByID excludes erased users and answers ErrUserNotFound for
+	// them, which is what makes a soft delete terminal.
+	GetActiveUserByID(id string) (*model.User, error)
 	GetUsersByIDs(ids []string) ([]*model.User, error)
 	GetUserByEmail(email string) (*model.User, error)
 	GetAllUsers() ([]*model.User, error)
@@ -108,32 +115,6 @@ type StoreInterface interface {
 	AddTimelineEvent(e *model.TimelineEvent) error
 	GetTimelineEvents(alertGroupID string) ([]*model.TimelineEvent, error)
 
-	// Schedules (Phase 3)
-	CreateSchedule(s *model.Schedule) error
-	GetScheduleByTeamID(teamID string) (*model.Schedule, error)
-	GetScheduleByID(id string) (*model.Schedule, error)
-	GetAllSchedules() ([]*model.Schedule, error)
-	GetSchedulesWithUsergroup() ([]*model.Schedule, error)
-	UpdateSchedule(s *model.Schedule) error
-	DeleteSchedule(id string) error
-	SetScheduleUsers(scheduleID, layer string, userIDs []string) error
-	GetScheduleUsers(scheduleID, layer string) ([]*model.User, error)
-	SetScheduleGroups(scheduleID string, groups [][]string) error
-	GetScheduleGroups(scheduleID, layer string) ([][]*model.User, error)
-
-	// Schedule Overrides
-	CreateScheduleOverride(o *model.ScheduleOverride) error
-	GetScheduleOverrides(scheduleID string, from, until time.Time) ([]*model.ScheduleOverride, error)
-	OverrideBelongsToSchedule(overrideID, scheduleID string) (bool, error)
-	DeleteScheduleOverride(id string) error
-	UpdateScheduleOverride(o *model.ScheduleOverride) error
-
-	// Rotation Epochs (schedule history)
-	CreateRotationEpoch(epoch *model.RotationEpoch) error
-	CloseCurrentEpoch(scheduleID, layer string, endTime time.Time) error
-	GetRotationEpochs(scheduleID, layer string, from, until time.Time) ([]*model.RotationEpoch, error)
-	GetCurrentEpoch(scheduleID, layer string) (*model.RotationEpoch, error)
-
 	// API Tokens
 	CreateAPIToken(token *model.APIToken) error
 	GetAPITokenByID(id string) (*model.APIToken, error)
@@ -143,7 +124,13 @@ type StoreInterface interface {
 	DeleteAPIToken(id string) error
 
 	// Jobs (Phase 2)
-	CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, error)
+	//
+	// CreateJobWithDedup reports whether the job was inserted: false means an
+	// active job already held the dedup key and its ID came back instead. A
+	// caller that counts notifications actually sent needs that answer, and
+	// comparing the returned ID against the proposed one would be inferring it
+	// from a string match when the insert already knows.
+	CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (id string, created bool, err error)
 	EnsureEscalationJob(agID string, job *model.Job, stages []*model.JobStage, steps []*model.JobStep, snapshot *model.EscalationPolicySnapshot) (bool, error)
 	GetJobByID(id string) (*model.Job, error)
 	GetJobByDedupKey(dedupKey string) (*model.Job, error)

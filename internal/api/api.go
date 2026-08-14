@@ -3,21 +3,25 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/dispatcher"
+	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rbac"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/slackcard"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/google/uuid"
-	"github.com/labstack/echo/v4"
 )
 
 // SlackMessenger defines the interface for Slack operations needed by the API layer.
@@ -59,6 +63,15 @@ type API struct {
 	selfURL          string                                              // TokayOps base URL for manifest generation
 	providerCaps     ProviderCapabilitiesLookup                          // capability registry view (read-only)
 	telegram         TelegramAPI                                         // optional, nil = telegram interactivity disabled
+
+	// Schedule configuration is deliberately NOT reached through
+	// store.StoreInterface. The revision model is not mirrored into MockStore,
+	// and routing it through the same interface would put the configuration back
+	// behind the door its own tables were taken out from.
+	scheduleConfig   *scheduleconfig.Service
+	scheduleRead     scheduleconfig.ScheduleReadRepository
+	scheduleRenderer *schedulerender.Service
+	userEraser       *erasure.Service
 }
 
 // NewAPI creates a new API instance. Pass nil for oidc if not using OIDC.
@@ -79,6 +92,30 @@ func NewAPI(s store.StoreInterface, oidc *auth.OIDCProvider, slack SlackMessenge
 	}
 	api.respondEphemeral = postResponseURL
 	return api
+}
+
+// SetScheduleConfigService wires the schedule command side: save, delete,
+// override commands and the team-member guard.
+func (a *API) SetScheduleConfigService(svc *scheduleconfig.Service) {
+	a.scheduleConfig = svc
+}
+
+// SetScheduleReadRepository wires the read side the config, revision and
+// override endpoints answer from.
+func (a *API) SetScheduleReadRepository(repo scheduleconfig.ScheduleReadRepository) {
+	a.scheduleRead = repo
+}
+
+// SetScheduleRenderer wires the historical renderer, the on-call projection
+// and the preview.
+func (a *API) SetScheduleRenderer(svc *schedulerender.Service) {
+	a.scheduleRenderer = svc
+}
+
+// SetUserEraser wires the user erasure command. Without it DeleteUser has no
+// safe implementation and refuses rather than falling back to a hard delete.
+func (a *API) SetUserEraser(svc *erasure.Service) {
+	a.userEraser = svc
 }
 
 // SetCardRenderer enables instant Slack card replacement on Ack/Resolve button clicks.
@@ -165,32 +202,45 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.POST("/teams", a.CreateTeam, a.Require(rbac.ActionTeamCreate, ScopeGlobal()))
 	v1.GET("/teams/:id", a.GetTeam, a.Require(rbac.ActionTeamView, ScopeGlobal())) // or TeamScope, but View is public
 	v1.PUT("/teams/:id", a.UpdateTeam, a.Require(rbac.ActionTeamUpdate, ScopeFromResource("team", "id")))
-	v1.DELETE("/teams/:id", a.DeleteTeam, a.Require(rbac.ActionTeamDelete, ScopeGlobal()))
+	// requireScheduleStack because deleting a team is now a schedule-aware
+	// command: what retains a team is its schedule history.
+	v1.DELETE("/teams/:id", a.DeleteTeam, a.requireScheduleStack, a.Require(rbac.ActionTeamDelete, ScopeGlobal()))
 	v1.GET("/teams/:id/alert-groups", a.GetTeamAlertGroups, a.Require(rbac.ActionAlertView, ScopeGlobal())) // List is global/public
 	v1.GET("/teams/:id/incidents", a.GetTeamAlertGroups, a.Require(rbac.ActionAlertView, ScopeGlobal()))
 	v1.GET("/teams/:id/members", a.GetTeamMembers, a.Require(rbac.ActionTeamView, ScopeFromResource("team", "id")))
 	v1.POST("/teams/:id/members", a.AddTeamMember, a.Require(rbac.ActionTeamMemberAdd, ScopeFromResource("team", "id")))
-	v1.DELETE("/teams/:id/members/:user_id", a.RemoveTeamMember, a.Require(rbac.ActionTeamMemberRemove, ScopeFromResource("team", "id")))
+	v1.DELETE("/teams/:id/members/:user_id", a.RemoveTeamMember, a.requireScheduleStack, a.Require(rbac.ActionTeamMemberRemove, ScopeFromResource("team", "id")))
 
 	// Users
 	v1.GET("/users", a.ListUsers, a.Require(rbac.ActionUserList, ScopeGlobal()))
 	v1.GET("/users/:id", a.GetUser, a.Require(rbac.ActionUserView, ScopeGlobal()))
+	// Display read for historical data: it answers for erased users, which
+	// GET /users/:id deliberately does not. Same permission as viewing a user,
+	// and it returns strictly less.
+	v1.POST("/users/resolve", a.ResolveUsers, a.Require(rbac.ActionUserView, ScopeGlobal()))
 	v1.POST("/users", a.CreateUser, a.Require(rbac.ActionUserCreate, ScopeGlobal()))
 	v1.PUT("/users/:id", a.UpdateUser, a.Require(rbac.ActionUserUpdate, ScopeGlobal()))
 	v1.PUT("/users/:id/password", a.UpdateUserPassword, a.Require(rbac.ActionUserPasswordUpdate, ScopeUserSelfOrAdmin("id")))
-	v1.DELETE("/users/:id", a.DeleteUser, a.Require(rbac.ActionUserDelete, ScopeGlobal()))
+	v1.DELETE("/users/:id", a.DeleteUser, a.requireUserEraser, a.Require(rbac.ActionUserDelete, ScopeGlobal()))
 
-	// Schedules
-	v1.GET("/teams/:id/schedule", a.GetTeamSchedule, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
-	v1.PUT("/teams/:id/schedule", a.UpsertTeamSchedule, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.DELETE("/teams/:id/schedule", a.DeleteTeamSchedule, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.PUT("/teams/:id/schedule/l1-groups", a.SetScheduleL1Groups, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.PUT("/teams/:id/schedule/l2-users", a.SetScheduleL2Users, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
-	v1.GET("/teams/:id/oncall", a.GetTeamOnCall, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
-	v1.GET("/teams/:id/schedule/render", a.RenderSchedule, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
-	v1.POST("/teams/:id/schedule/overrides", a.CreateScheduleOverride, a.Require(rbac.ActionOverrideCreate, ScopeFromResource("team", "id")))
-	v1.PUT("/schedules/:schedule_id/overrides/:id", a.UpdateScheduleOverride, a.Require(rbac.ActionOverrideUpdate, ScopeScheduleOverride("schedule_id", "id")))
-	v1.DELETE("/schedules/:schedule_id/overrides/:id", a.DeleteScheduleOverride, a.Require(rbac.ActionOverrideDelete, ScopeScheduleOverride("schedule_id", "id")))
+	// Schedule configuration (revision model).
+	//
+	// preview and the revision endpoints require schedule.edit rather than
+	// schedule.view: a preview takes the same payload as a save and is a
+	// write-intent tool, and revisions carry created_by and change_reason.
+	// Loosening a permission later is easy; tightening one is not.
+	v1.GET("/teams/:id/schedule/config", a.GetScheduleConfig, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
+	v1.PUT("/teams/:id/schedule/config", a.PutScheduleConfig, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.POST("/teams/:id/schedule/preview", a.PostSchedulePreview, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.DELETE("/teams/:id/schedule", a.DeleteTeamSchedule, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/revisions", a.ListScheduleRevisions, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/revisions/:revision_id", a.GetScheduleRevision, a.requireScheduleStack, a.Require(rbac.ActionScheduleEdit, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/render", a.RenderSchedule, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/on-call", a.GetScheduleOnCall, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
+	v1.GET("/teams/:id/schedule/overrides", a.ListScheduleOverrides, a.requireScheduleStack, a.Require(rbac.ActionScheduleView, ScopeFromResource("team", "id")))
+	v1.POST("/teams/:id/schedule/overrides", a.CreateScheduleOverride, a.requireScheduleStack, a.Require(rbac.ActionOverrideCreate, ScopeFromResource("team", "id")))
+	v1.PUT("/schedules/:schedule_id/overrides/:id", a.UpdateScheduleOverride, a.requireScheduleStack, a.Require(rbac.ActionOverrideUpdate, ScopeScheduleOverride("schedule_id", "id")))
+	v1.DELETE("/schedules/:schedule_id/overrides/:id", a.DeleteScheduleOverride, a.requireScheduleStack, a.Require(rbac.ActionOverrideDelete, ScopeScheduleOverride("schedule_id", "id")))
 
 	// API Tokens
 	// These usually belong to user. Assuming self-management for now.
@@ -284,8 +334,17 @@ type TeamMemberListResponse struct {
 }
 
 // ErrorResponse represents an error response.
+//
+// Code is the machine-readable half. A status alone is not a contract: the
+// schedule editor answers 409 in six different senses, and each one needs a
+// different reaction from the client - reload the form, reload the override
+// list, show the conflicting intervals, switch to recreate. A client that had
+// to tell them apart by parsing the message would break on the first
+// rewording. Codes are defined in schedule_errors.go; the field is omitempty
+// so responses that predate it are unchanged on the wire.
 type ErrorResponse struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
 
 // ManualAlertGroupRequest represents a request to create a manual alert group.
@@ -498,6 +557,8 @@ func (a *API) CreateManualAlertGroup(c echo.Context) error {
 
 	actor := "user"
 	if userID, ok := c.Get("user_id").(string); ok && userID != "" {
+		// Display read on purpose: this names the actor in a timeline entry,
+		// and an erased actor still has to render as something.
 		if user, err := a.store.GetUserByID(userID); err == nil && user != nil {
 			if user.Name != "" {
 				actor = user.Name
@@ -597,6 +658,7 @@ func (a *API) resolveRESTActor(c echo.Context) alertgroup.Actor {
 	userID, _ := c.Get("user_id").(string)
 	actor := alertgroup.Actor{Name: "user"}
 	if userID != "" {
+		// Display read on purpose, as above: this is an audit label.
 		if user, err := a.store.GetUserByID(userID); err == nil && user != nil {
 			actor.Email = user.Email
 			if user.Name != "" {
@@ -752,6 +814,64 @@ type TeamListResponse struct {
 	Total int               `json:"total"`
 }
 
+// teamsWithSchedule answers which of these teams have a live schedule.
+//
+// Absent and soft-deleted schedules are "not configured", and any OTHER
+// repository error fails the request. Swallowing errors is what produced an
+// earlier defect here - a discarded error made every configured team report
+// itself unconfigured - and it is not reproduced.
+//
+// A root with no history horizon is the one place this file answers quietly.
+// It cannot be produced by any live path (the create flow writes the horizon in
+// the same statement as the row), so it means an upgrade whose destructive
+// schedule reset was skipped. Everywhere else that state is an invariant
+// violation, but a list of teams must stay answerable: failing the whole page
+// because one row is corrupt is the same blast radius that was taken out of the
+// notifier tick. It is logged, and the schedule endpoints of that one team say
+// plainly what is wrong.
+//
+// One snapshot for the whole page, not one per team: the list is a single
+// answer, and reading each team in its own transaction would let a save
+// between two of them show a state no instant ever had.
+func (a *API) teamsWithSchedule(ctx context.Context, teams []*model.Team) (map[string]struct{}, error) {
+	out := make(map[string]struct{}, len(teams))
+	// The schedule stack is optional wiring; without it there is nothing to
+	// report and an empty set is the honest answer.
+	if a.scheduleRead == nil {
+		return out, nil
+	}
+
+	// One query for the whole page, not one per team: the list is bounded by
+	// the number of teams, and a read per row is how a page gets slower every
+	// time somebody adds a team.
+	wanted := make(map[string]struct{}, len(teams))
+	for _, team := range teams {
+		wanted[team.ID] = struct{}{}
+	}
+
+	err := a.scheduleRead.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
+		roots, err := view.ListScheduleRoots(ctx)
+		if err != nil {
+			return err
+		}
+		for i := range roots {
+			root := &roots[i]
+			if _, asked := wanted[root.TeamID]; !asked {
+				continue
+			}
+			if root.DeletedAt != nil {
+				continue
+			}
+			out[root.TeamID] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ListTeams godoc
 // @Summary List teams
 // @Description Get all teams with configuration status
@@ -771,6 +891,11 @@ func (a *API) ListTeams(c echo.Context) error {
 		teams = []*model.Team{}
 	}
 
+	configured, err := a.teamsWithSchedule(c.Request().Context(), teams)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error(), Code: CodeInternal})
+	}
+
 	// Enrich teams with configuration status
 	enrichedTeams := make([]*TeamWithConfig, len(teams))
 	for i, team := range teams {
@@ -781,9 +906,7 @@ func (a *API) ListTeams(c echo.Context) error {
 			memberCount = len(members)
 		}
 
-		// Check if on-call schedule is configured
-		schedule, _ := a.store.GetScheduleByTeamID(team.ID)
-		onCallConfigured := schedule != nil
+		_, onCallConfigured := configured[team.ID]
 
 		enrichedTeams[i] = &TeamWithConfig{
 			Team:             team,
@@ -967,24 +1090,16 @@ func (a *API) UpdateTeam(c echo.Context) error {
 // @Param id path string true "Team ID"
 // @Success 204
 // @Failure 404 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse
 // @Failure 500 {object} ErrorResponse
 // @Router /api/v1/teams/{id} [delete]
 func (a *API) DeleteTeam(c echo.Context) error {
-	id := c.Param("id")
-
-	// Check if team exists
-	_, err := a.store.GetTeamByID(id)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "team not found"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+	// Existence is answered inside the transaction, by the row lock, rather
+	// than by a read before it: a team can be deleted between the two, and
+	// then a 404 would come back as a 500 from the write that followed.
+	if err := a.scheduleConfig.DeleteTeam(c.Request().Context(), c.Param("id")); err != nil {
+		return a.mapScheduleError(c, err)
 	}
-
-	if err := a.store.DeleteTeam(id); err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -1201,9 +1316,12 @@ func (a *API) ListUsers(c echo.Context) error {
 func (a *API) GetUser(c echo.Context) error {
 	id := c.Param("id")
 
-	user, err := a.store.GetUserByID(id)
+	// The active read: an erased user is gone as far as the admin API is
+	// concerned. Their row survives only so history that names the ID still
+	// resolves, and that hydration goes through the batch read, not here.
+	user, err := a.store.GetActiveUserByID(id)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, store.ErrUserNotFound) || errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
@@ -1283,7 +1401,7 @@ func (a *API) CreateUser(c echo.Context) error {
 	}
 
 	// Reload to get CreatedAt
-	created, _ := a.store.GetUserByID(userID)
+	created, _ := a.store.GetActiveUserByID(userID)
 	if created != nil {
 		user = created
 	}
@@ -1315,9 +1433,9 @@ func (a *API) UpdateUser(c echo.Context) error {
 	id := c.Param("id")
 
 	// Verify user exists
-	user, err := a.store.GetUserByID(id)
+	user, err := a.store.GetActiveUserByID(id)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, store.ErrUserNotFound) || errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
@@ -1341,10 +1459,14 @@ func (a *API) UpdateUser(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid role"})
 		}
 
-		// Enforce safety check (e.g. Last Admin) via SetUserRole
+		// Role changes go through SetUserRole and nowhere else: it is what
+		// serializes the last-admin invariant against erasure.
 		if err := a.store.SetUserRole(user.ID, model.UserRole(req.Role)); err != nil {
-			if err.Error() == "cannot demote the last admin" {
-				return c.JSON(http.StatusConflict, ErrorResponse{Error: err.Error()})
+			switch {
+			case errors.Is(err, store.ErrLastAdmin):
+				return c.JSON(http.StatusConflict, ErrorResponse{Error: "cannot demote the last admin"})
+			case errors.Is(err, store.ErrUserNotFound):
+				return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 			}
 			return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 		}
@@ -1352,6 +1474,9 @@ func (a *API) UpdateUser(c echo.Context) error {
 	}
 
 	if err := a.store.UpdateUser(user); err != nil {
+		if errors.Is(err, store.ErrUserNotFound) {
+			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
+		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 
@@ -1378,9 +1503,9 @@ func (a *API) UpdateUserPassword(c echo.Context) error {
 	id := c.Param("id")
 
 	// Verify user exists first
-	user, err := a.store.GetUserByID(id)
+	user, err := a.store.GetActiveUserByID(id)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, store.ErrUserNotFound) || errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
@@ -1405,6 +1530,9 @@ func (a *API) UpdateUserPassword(c echo.Context) error {
 	}
 
 	if err := a.store.UpdateUserPassword(id, hash); err != nil {
+		if errors.Is(err, store.ErrUserNotFound) {
+			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
+		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 
@@ -1423,21 +1551,11 @@ func (a *API) UpdateUserPassword(c echo.Context) error {
 // @Failure 500 {object} ErrorResponse
 // @Router /api/v1/users/{id} [delete]
 func (a *API) DeleteUser(c echo.Context) error {
-	id := c.Param("id")
-
-	// Verify user exists
-	_, err := a.store.GetUserByID(id)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+	// Erasure is the only entry point; the route's middleware has already
+	// refused the request if it was not wired.
+	if err := a.userEraser.Erase(c.Request().Context(), c.Param("id")); err != nil {
+		return a.mapScheduleError(c, err)
 	}
-
-	if err := a.store.DeleteUser(id); err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -1495,15 +1613,21 @@ func (a *API) AddTeamMember(c echo.Context) error {
 	}
 
 	// Verify user exists
-	_, err = a.store.GetUserByID(req.UserID)
+	_, err = a.store.GetActiveUserByID(req.UserID)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, store.ErrUserNotFound) || errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 
 	if err := a.store.AddTeamMember(teamID, req.UserID, role); err != nil {
+		// An erased user is not found here even though the row survives for
+		// history: granting them a membership would put an erased identity
+		// back into circulation.
+		if errors.Is(err, store.ErrUserNotFound) {
+			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
+		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 
@@ -1539,8 +1663,12 @@ func (a *API) RemoveTeamMember(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 
-	if err := a.store.RemoveTeamMember(teamID, targetUserID); err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+	// Through the service, which refuses while the member holds a current
+	// assignment: a membership is what makes a rotation entry resolvable, so
+	// removing one out from under a live assignment leaves the schedule
+	// pointing at a non-member.
+	if err := a.scheduleConfig.RemoveTeamMember(c.Request().Context(), teamID, targetUserID); err != nil {
+		return a.mapScheduleError(c, err)
 	}
 
 	return c.NoContent(http.StatusNoContent)

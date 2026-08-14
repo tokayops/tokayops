@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/integrations"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/google/uuid"
 )
 
 // MockStore is an in-memory implementation of StoreInterface for testing.
@@ -26,18 +26,16 @@ type MockStore struct {
 	incidentSeq            int
 	teams                  map[string]*model.Team
 	users                  map[string]*model.User
+	erasedUsers            map[string]bool
 	teamMembers            map[string]map[string]model.TeamMemberRole // teamID -> userID -> role
 	timelineEvents         map[string][]*model.TimelineEvent          // alertGroupID -> events
 	apiTokens              map[string]*model.APIToken                 // tokenID -> token
-	scheduleOverrides      map[string]*model.ScheduleOverride         // overrideID -> override
-	schedules              map[string]*model.Schedule                 // scheduleID -> schedule
 	externalIdentities     map[string]*model.ExternalIdentity         // "userID|provider" -> identity
 	linkTokens             map[string]mockLinkToken                   // "userID|provider" -> link token
 	jobs                   map[string]*model.Job                      // jobID -> job
 	jobStages              map[string]*model.JobStage                 // stageID -> stage
 	jobSteps               map[string]*model.JobStep                  // stepID -> step
 	escalationPolicies     map[string]*model.EscalationPolicy         // policyID -> policy
-	rotationEpochs         map[string][]*model.RotationEpoch          // scheduleID -> epochs
 	integrations           map[string]*model.Integration              // integrationID -> integration
 	notificationDeliveries map[string]*model.NotificationDelivery     // deliveryID -> delivery
 	outboxEvents           map[string]*model.OutboxEvent              // eventID -> event
@@ -66,15 +64,12 @@ func NewMockStore() *MockStore {
 		timelineEvents: make(map[string][]*model.TimelineEvent),
 		apiTokens:      make(map[string]*model.APIToken),
 
-		scheduleOverrides:      make(map[string]*model.ScheduleOverride),
-		schedules:              make(map[string]*model.Schedule),
 		externalIdentities:     make(map[string]*model.ExternalIdentity),
 		linkTokens:             make(map[string]mockLinkToken),
 		jobs:                   make(map[string]*model.Job),
 		jobStages:              make(map[string]*model.JobStage),
 		jobSteps:               make(map[string]*model.JobStep),
 		escalationPolicies:     make(map[string]*model.EscalationPolicy),
-		rotationEpochs:         make(map[string][]*model.RotationEpoch),
 		integrations:           make(map[string]*model.Integration),
 		notificationDeliveries: make(map[string]*model.NotificationDelivery),
 		outboxEvents:           make(map[string]*model.OutboxEvent),
@@ -1120,7 +1115,15 @@ func (m *MockStore) UpdateTeam(t *model.Team) error {
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) DeleteTeam(id string) error {
+// DeleteTeamRow removes the team row and its memberships, and nothing else.
+//
+// It is not the old DeleteTeam under another name: that one was on
+// StoreInterface, which made it a second way into a destructive operation with
+// none of the guards. This one is deliberately off the interface and named
+// after what it is - the double's stand-in for the two DELETE statements that
+// run inside scheduleconfig's transaction, with the guards left where they
+// belong, above it.
+func (m *MockStore) DeleteTeamRow(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1159,6 +1162,35 @@ func (m *MockStore) GetUserByID(id string) (*model.User, error) {
 	return nil, sql.ErrNoRows
 }
 
+// GetActiveUserByID mirrors the store: an erased user is not found.
+func (m *MockStore) GetActiveUserByID(id string) (*model.User, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.GetUserByIDError != nil {
+		return nil, m.GetUserByIDError
+	}
+	if m.erasedUsers[id] {
+		return nil, ErrUserNotFound
+	}
+	if u, ok := m.users[id]; ok {
+		userCopy := *u
+		return &userCopy, nil
+	}
+	return nil, ErrUserNotFound
+}
+
+// EraseUser marks a mock user as soft-deleted: GetUserByID keeps returning
+// them for history, GetActiveUserByID stops.
+func (m *MockStore) EraseUser(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.erasedUsers == nil {
+		m.erasedUsers = map[string]bool{}
+	}
+	m.erasedUsers[id] = true
+}
+
 func (m *MockStore) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1186,51 +1218,70 @@ func (m *MockStore) GetUserByEmail(email string) (*model.User, error) {
 	return nil, sql.ErrNoRows
 }
 
+// GetAllUsers excludes erased users, like the store: the operator's user list
+// is a list of people who exist, not a log of who ever did.
 func (m *MockStore) GetAllUsers() ([]*model.User, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var result []*model.User
-	for _, u := range m.users {
+	for id, u := range m.users {
+		if m.erasedUsers[id] {
+			continue
+		}
 		userCopy := *u
 		result = append(result, &userCopy)
 	}
 	return result, nil
 }
 
+// AnonymizeUser strips the identifying fields, mirroring the erasure
+// primitive. id and role survive: the ID is what history joins on.
+func (m *MockStore) AnonymizeUser(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if u, ok := m.users[id]; ok {
+		u.Name = AnonymizedUserName
+		u.Email = ""
+		u.PasswordHash = ""
+		u.AuthProvider = ""
+	}
+}
+
 func (m *MockStore) UpdateUser(u *model.User) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if existing, ok := m.users[u.ID]; ok {
+	// Profile fields only, as in the store: role changes go through SetUserRole,
+	// which is the one place the last-admin invariant is serialized.
+	if existing, ok := m.users[u.ID]; ok && !m.erasedUsers[u.ID] {
 		existing.Email = u.Email
 		existing.Name = u.Name
-		existing.Role = u.Role
 		return nil
 	}
-	return sql.ErrNoRows
+	return ErrUserNotFound
 }
 
 func (m *MockStore) UpdateUserPassword(id, hash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if u, ok := m.users[id]; ok {
+	if u, ok := m.users[id]; ok && !m.erasedUsers[id] {
 		u.PasswordHash = hash
 		return nil
 	}
-	return sql.ErrNoRows
+	return ErrUserNotFound
 }
 
 func (m *MockStore) UpdateUserAuthProvider(id, provider string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if u, ok := m.users[id]; ok {
+	if u, ok := m.users[id]; ok && !m.erasedUsers[id] {
 		u.AuthProvider = provider
 		return nil
 	}
-	return sql.ErrNoRows
+	return ErrUserNotFound
 }
 
 func (m *MockStore) DeleteUser(id string) error {
@@ -1256,8 +1307,8 @@ func (m *MockStore) AddTeamMember(teamID, userID string, role model.TeamMemberRo
 	if _, ok := m.teams[teamID]; !ok {
 		return sql.ErrNoRows
 	}
-	if _, ok := m.users[userID]; !ok {
-		return sql.ErrNoRows
+	if _, ok := m.users[userID]; !ok || m.erasedUsers[userID] {
+		return ErrUserNotFound
 	}
 
 	if m.teamMembers[teamID] == nil {
@@ -1278,7 +1329,7 @@ func (m *MockStore) GetTeamMembers(teamID string) ([]*model.TeamMemberDetail, er
 
 	var result []*model.TeamMemberDetail
 	for userID, role := range members {
-		if u, ok := m.users[userID]; ok {
+		if u, ok := m.users[userID]; ok && !m.erasedUsers[userID] {
 			tm := &model.TeamMemberDetail{
 				User:     *u,
 				TeamRole: role,
@@ -1364,324 +1415,34 @@ func (m *MockStore) copyAlertGroup(ag *model.AlertGroup) *model.AlertGroup {
 }
 
 // ========================================
-// Schedule Mock Stubs (Phase 3)
-// ========================================
-
-func (m *MockStore) CreateSchedule(s *model.Schedule) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	sc := *s
-	m.schedules[s.ID] = &sc
-	return nil
-}
-
-func (m *MockStore) GetScheduleByTeamID(teamID string) (*model.Schedule, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, s := range m.schedules {
-		if s.TeamID == teamID {
-			sc := *s
-			return &sc, nil
-		}
-	}
-	return nil, sql.ErrNoRows
-}
-
-func (m *MockStore) GetScheduleByID(id string) (*model.Schedule, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if s, ok := m.schedules[id]; ok {
-		sc := *s
-		return &sc, nil
-	}
-	return nil, sql.ErrNoRows
-}
-
-func (m *MockStore) GetAllSchedules() ([]*model.Schedule, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []*model.Schedule
-	for _, s := range m.schedules {
-		sc := *s
-		result = append(result, &sc)
-	}
-	return result, nil
-}
-
-func (m *MockStore) GetSchedulesWithUsergroup() ([]*model.Schedule, error) {
-	return nil, nil // Not needed for RBAC tests
-}
-
-func (m *MockStore) UpdateSchedule(s *model.Schedule) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing, ok := m.schedules[s.ID]; ok {
-		// Update allowed fields
-		existing.L1RotationType = s.L1RotationType
-		existing.L1HandoffTime = s.L1HandoffTime
-		existing.L1HandoffDay = s.L1HandoffDay
-		existing.L1Groups = s.L1Groups
-		existing.L2Enabled = s.L2Enabled
-		existing.L2EscalationTimeout = s.L2EscalationTimeout
-		existing.L2RotationType = s.L2RotationType
-		existing.L2HandoffTime = s.L2HandoffTime
-		existing.L2HandoffDay = s.L2HandoffDay
-		existing.L2Users = s.L2Users
-		existing.UpdatedAt = time.Now()
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
-func (m *MockStore) DeleteSchedule(id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.schedules, id)
-	return nil
-}
-
-func (m *MockStore) SetScheduleUsers(scheduleID, layer string, userIDs []string) error {
-	// Wrap flat userIDs into singleton groups, matching real store semantics
-	groups := make([][]string, len(userIDs))
-	for i, id := range userIDs {
-		groups[i] = []string{id}
-	}
-	return m.setScheduleGroupsLocked(scheduleID, layer, groups)
-}
-
-func (m *MockStore) GetScheduleUsers(scheduleID, layer string) ([]*model.User, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	epoch := m.getCurrentEpochLocked(scheduleID, layer)
-	if epoch == nil {
-		return []*model.User{}, nil
-	}
-
-	var users []*model.User
-	for _, group := range epoch.Groups {
-		for _, uid := range group {
-			if u, ok := m.users[uid]; ok {
-				uCopy := *u
-				users = append(users, &uCopy)
-			}
-		}
-	}
-	return users, nil
-}
-
-func (m *MockStore) SetScheduleGroups(scheduleID string, groups [][]string) error {
-	return m.setScheduleGroupsLocked(scheduleID, "l1", groups)
-}
-
-func (m *MockStore) GetScheduleGroups(scheduleID, layer string) ([][]*model.User, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	epoch := m.getCurrentEpochLocked(scheduleID, layer)
-	if epoch == nil {
-		return [][]*model.User{}, nil
-	}
-
-	var result [][]*model.User
-	for _, group := range epoch.Groups {
-		var users []*model.User
-		for _, uid := range group {
-			if u, ok := m.users[uid]; ok {
-				uCopy := *u
-				users = append(users, &uCopy)
-			}
-		}
-		result = append(result, users)
-	}
-	return result, nil
-}
-
-// setScheduleGroupsLocked closes the current epoch and creates a new one,
-// matching the real store's transactional semantics.
-func (m *MockStore) setScheduleGroupsLocked(scheduleID, layer string, groups [][]string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.schedules[scheduleID]; !ok {
-		return sql.ErrNoRows
-	}
-
-	now := time.Now().UTC()
-
-	// Close current epoch for this schedule/layer
-	for _, ep := range m.rotationEpochs[scheduleID] {
-		if ep.Layer == layer && ep.EndTime == nil {
-			ep.EndTime = &now
-		}
-	}
-
-	// Create new epoch if groups is non-empty
-	if len(groups) > 0 {
-		epCopy := &model.RotationEpoch{
-			ID:         "epoch-" + now.Format("20060102150405.000"),
-			ScheduleID: scheduleID,
-			Layer:      layer,
-			Groups:     make([][]string, len(groups)),
-			StartTime:  now,
-			CreatedAt:  now,
-		}
-		for i, g := range groups {
-			epCopy.Groups[i] = make([]string, len(g))
-			copy(epCopy.Groups[i], g)
-		}
-		m.rotationEpochs[scheduleID] = append(m.rotationEpochs[scheduleID], epCopy)
-	}
-
-	return nil
-}
-
-// getCurrentEpochLocked returns the current open epoch for schedule/layer (caller holds at least RLock).
-func (m *MockStore) getCurrentEpochLocked(scheduleID, layer string) *model.RotationEpoch {
-	for _, ep := range m.rotationEpochs[scheduleID] {
-		if ep.Layer == layer && ep.EndTime == nil {
-			return ep
-		}
-	}
-	return nil
-}
-
-func (m *MockStore) CreateScheduleOverride(o *model.ScheduleOverride) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	overrideCopy := *o
-	m.scheduleOverrides[o.ID] = &overrideCopy
-	return nil
-}
-
-func (m *MockStore) GetScheduleOverrides(scheduleID string, from, until time.Time) ([]*model.ScheduleOverride, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []*model.ScheduleOverride
-	for _, o := range m.scheduleOverrides {
-		if o.ScheduleID == scheduleID && o.StartTime.Before(until) && o.EndTime.After(from) {
-			overrideCopy := *o
-			result = append(result, &overrideCopy)
-		}
-	}
-	return result, nil
-}
-
-func (m *MockStore) OverrideBelongsToSchedule(overrideID, scheduleID string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	o, exists := m.scheduleOverrides[overrideID]
-	if !exists {
-		return false, nil
-	}
-	return o.ScheduleID == scheduleID, nil
-}
-
-func (m *MockStore) DeleteScheduleOverride(id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.scheduleOverrides, id)
-	return nil
-}
-
-func (m *MockStore) UpdateScheduleOverride(o *model.ScheduleOverride) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing, ok := m.scheduleOverrides[o.ID]; ok {
-		existing.UserID = o.UserID
-		existing.StartTime = o.StartTime
-		existing.EndTime = o.EndTime
-		existing.Reason = o.Reason
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
-// ========================================
 // Rotation Epochs (schedule history stubs)
 // ========================================
-
-func (m *MockStore) CreateRotationEpoch(epoch *model.RotationEpoch) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if epoch.ID == "" {
-		epoch.ID = "epoch-" + time.Now().String() // Simple ID generation
-	}
-
-	epCopy := *epoch
-	// Deep-copy groups
-	epCopy.Groups = make([][]string, len(epoch.Groups))
-	for i, g := range epoch.Groups {
-		epCopy.Groups[i] = make([]string, len(g))
-		copy(epCopy.Groups[i], g)
-	}
-
-	m.rotationEpochs[epoch.ScheduleID] = append(m.rotationEpochs[epoch.ScheduleID], &epCopy)
-	return nil
-}
-
-func (m *MockStore) CloseCurrentEpoch(scheduleID, layer string, endTime time.Time) error {
-	return nil // Not needed for this test
-}
-
-func (m *MockStore) GetRotationEpochs(scheduleID, layer string, from, until time.Time) ([]*model.RotationEpoch, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var result []*model.RotationEpoch
-	epochs, ok := m.rotationEpochs[scheduleID]
-	if !ok {
-		return []*model.RotationEpoch{}, nil
-	}
-
-	for _, ep := range epochs {
-		if ep.Layer == layer {
-			// Check overlap with [from, until]
-			// Epoch interval: [StartTime, EndTime)
-			// Query interval: [from, until)
-			// Overlap if: StartTime < until AND (EndTime is Zero OR EndTime > from)
-
-			// Handle open-ended epochs
-			if ep.StartTime.Before(until) {
-				if ep.EndTime == nil || ep.EndTime.After(from) {
-					epCopy := *ep
-					epCopy.Groups = make([][]string, len(ep.Groups))
-					for i, g := range ep.Groups {
-						epCopy.Groups[i] = make([]string, len(g))
-						copy(epCopy.Groups[i], g)
-					}
-					result = append(result, &epCopy)
-				}
-			}
-		}
-	}
-	return result, nil
-}
-
-func (m *MockStore) GetCurrentEpoch(scheduleID, layer string) (*model.RotationEpoch, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	ep := m.getCurrentEpochLocked(scheduleID, layer)
-	if ep == nil {
-		return nil, sql.ErrNoRows
-	}
-	epCopy := *ep
-	epCopy.Groups = make([][]string, len(ep.Groups))
-	for i, g := range ep.Groups {
-		epCopy.Groups[i] = make([]string, len(g))
-		copy(epCopy.Groups[i], g)
-	}
-	return &epCopy, nil
-}
 
 // ========================================
 // API Tokens
 // ========================================
 
+// activeUser mirrors the lifecycle rule the store enforces in SQL: nothing
+// owned by a user may be created for, or resolved to, someone who has been
+// erased. The mock has to agree, or API tests keep passing against states
+// production has made impossible.
+//
+// Callers hold the lock.
+func (m *MockStore) activeUser(userID string) bool {
+	if m.erasedUsers[userID] {
+		return false
+	}
+	_, ok := m.users[userID]
+	return ok
+}
+
 func (m *MockStore) CreateAPIToken(token *model.APIToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if !m.activeUser(token.UserID) {
+		return ErrUserNotFound
+	}
 	if token.CreatedAt.IsZero() {
 		token.CreatedAt = time.Now()
 	}
@@ -1695,7 +1456,7 @@ func (m *MockStore) GetAPITokenByHash(hash string) (*model.APIToken, error) {
 	defer m.mu.RUnlock()
 
 	for _, t := range m.apiTokens {
-		if t.TokenHash == hash {
+		if t.TokenHash == hash && m.activeUser(t.UserID) {
 			tokenCopy := *t
 			return &tokenCopy, nil
 		}
@@ -1759,6 +1520,9 @@ func (m *MockStore) BindExternalIdentity(ei *model.ExternalIdentity) error {
 }
 
 func (m *MockStore) bindIdentityLocked(ei *model.ExternalIdentity) error {
+	if !m.activeUser(ei.UserID) {
+		return ErrUserNotFound
+	}
 	// (provider, external_id) must be globally unique across users
 	for _, other := range m.externalIdentities {
 		if other.Provider == ei.Provider && other.ExternalID == ei.ExternalID && other.UserID != ei.UserID {
@@ -1790,6 +1554,10 @@ func (m *MockStore) BindExternalIdentityIfAbsent(userID, provider, externalID, d
 	if _, ok := m.externalIdentities[userID+"|"+provider]; ok {
 		return false, nil
 	}
+	// An erased user is the same answer as a conflict here: nothing changed.
+	if !m.activeUser(userID) {
+		return false, nil
+	}
 	ei := &model.ExternalIdentity{
 		UserID: userID, Provider: provider, ExternalID: externalID, DisplayName: displayName,
 	}
@@ -1813,11 +1581,9 @@ func (m *MockStore) GetUserByExternalID(provider, externalID string) (*model.Use
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, ei := range m.externalIdentities {
-		if ei.Provider == provider && ei.ExternalID == externalID {
-			if u, ok := m.users[ei.UserID]; ok {
-				copy := *u
-				return &copy, nil
-			}
+		if ei.Provider == provider && ei.ExternalID == externalID && m.activeUser(ei.UserID) {
+			copy := *m.users[ei.UserID]
+			return &copy, nil
 		}
 	}
 	return nil, sql.ErrNoRows
@@ -1866,6 +1632,9 @@ func (m *MockStore) IssueLinkToken(userID, provider, externalID, token string, e
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.activeUser(userID) {
+		return ErrUserNotFound
+	}
 	hash := mockHashToken(token)
 	// (provider, token_hash) global uniqueness — collisions retry at the caller.
 	for k, lt := range m.linkTokens {
@@ -1883,6 +1652,9 @@ func (m *MockStore) IssueLinkToken(userID, provider, externalID, token string, e
 func (m *MockStore) ConfirmIdentityLink(userID, provider, token string) (*model.ExternalIdentity, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.activeUser(userID) {
+		return nil, ErrUserNotFound
+	}
 	key := userID + "|" + provider
 	lt, ok := m.linkTokens[key]
 	if !ok {
@@ -1937,6 +1709,9 @@ func (m *MockStore) ConsumeLinkToken(provider, token, externalID, chatID, displa
 	if !ok {
 		return nil, ErrLinkTokenInvalid
 	}
+	if !m.activeUser(found.UserID) {
+		return nil, ErrUserNotFound
+	}
 	if time.Now().After(found.ExpiresAt) {
 		delete(m.linkTokens, key)
 		return nil, ErrLinkTokenExpired
@@ -1985,21 +1760,23 @@ func (m *MockStore) SetUserRole(userID string, role model.UserRole) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	user, ok := m.users[userID]
-	if !ok {
-		return sql.ErrNoRows
+	// Role is part of the lifecycle, like everything else a user owns: an
+	// erased user has no role to change, and does not count as one of the
+	// administrators the system is required to keep.
+	if !m.activeUser(userID) {
+		return ErrUserNotFound
 	}
+	user := m.users[userID]
 
-	// If demoting from admin, check we're not removing the last admin
 	if user.Role == model.UserRoleAdmin && role != model.UserRoleAdmin {
 		adminCount := 0
-		for _, u := range m.users {
-			if u.Role == model.UserRoleAdmin {
+		for id, u := range m.users {
+			if u.Role == model.UserRoleAdmin && m.activeUser(id) {
 				adminCount++
 			}
 		}
 		if adminCount <= 1 {
-			return sql.ErrNoRows // simulates "cannot demote last admin"
+			return ErrLastAdmin
 		}
 	}
 
@@ -2008,13 +1785,15 @@ func (m *MockStore) SetUserRole(userID string, role model.UserRole) error {
 }
 
 // CountAdmins returns the number of users with admin role.
+// CountAdmins counts ACTIVE admins. An erased one is not an administrator the
+// system can fall back on.
 func (m *MockStore) CountAdmins() (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	count := 0
-	for _, u := range m.users {
-		if u.Role == model.UserRoleAdmin {
+	for id, u := range m.users {
+		if u.Role == model.UserRoleAdmin && m.activeUser(id) {
 			count++
 		}
 	}
@@ -2023,7 +1802,7 @@ func (m *MockStore) CountAdmins() (int, error) {
 
 // Jobs Mocks (Phase 2)
 // NOTE: We add a map to store jobs for testing
-func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, error) {
+func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// Initialize maps if needed (hack for existing tests)
@@ -2042,8 +1821,8 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 		for _, existing := range m.jobs {
 			if existing.DedupKey != nil && *existing.DedupKey == *job.DedupKey {
 				if existing.Status == model.JobStatusPending || existing.Status == model.JobStatusRunning {
-					// Dedup: return existing job ID
-					return existing.ID, nil
+					// Dedup: return existing job ID, nothing was created
+					return existing.ID, false, nil
 				}
 			}
 		}
@@ -2060,7 +1839,7 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 		stepCopy := *step
 		m.jobSteps[step.ID] = &stepCopy
 	}
-	return job.ID, nil
+	return job.ID, true, nil
 }
 
 // EnsureEscalationJob atomically transitions an AG from new/processing → processing
@@ -2684,38 +2463,13 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 		}
 	}
 
-	// Teams without on-call
-	for teamID := range m.teams {
-		hasOnCall := false
-		for _, sched := range m.schedules {
-			if sched.TeamID == teamID {
-				if epochs, ok := m.rotationEpochs[sched.ID]; ok {
-					for _, ep := range epochs {
-						if ep.Layer == "l1" && ep.EndTime == nil && len(ep.Groups) > 0 {
-							hasOnCall = true
-							break
-						}
-					}
-				}
-				break
-			}
-		}
-		if !hasOnCall {
-			snap.TeamsWithoutOnCall++
-		}
-	}
-
-	// Teams with permanent on-call (single user in L1)
-	for _, sched := range m.schedules {
-		if epochs, ok := m.rotationEpochs[sched.ID]; ok {
-			for _, ep := range epochs {
-				if ep.Layer == "l1" && ep.EndTime == nil && len(ep.Groups) == 1 {
-					snap.TeamsWithPermanentOnCall++
-					break
-				}
-			}
-		}
-	}
+	// Teams without on-call and teams with permanent on-call are reported as
+	// zero, deliberately. Both are answers about the revision model, which this
+	// mock does not implement - deliberately, so that there is one projection
+	// rather than two - and computing them from something else here would be a
+	// second definition of "has a schedule" that could disagree with the real one.
+	//
+	// Their coverage is the integration test against the real query.
 
 	// Teams without escalation policy
 	for _, team := range m.teams {

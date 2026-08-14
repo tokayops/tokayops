@@ -2,21 +2,24 @@ package dispatcher
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/slack-go/slack"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/store"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
-// mockSyncerStore implements the store interface methods required by syncer
+// mockSyncerStore serves the one store read the syncer still makes: the Slack
+// identities of the people the projection put on duty.
 type mockSyncerStore struct {
-	store.StoreInterface
-	schedules []*model.Schedule
-	epochs    []*model.RotationEpoch
-	overrides []*model.ScheduleOverride
-	users     map[string]*model.User
-	slackIDs  map[string]string // userID -> slack external id (empty = not linked → skipped)
+	slackIDs map[string]string // userID -> slack external id ("" = not linked → skipped)
 }
 
 func (m *mockSyncerStore) GetIdentitiesForUsers(userIDs []string) (map[string][]*model.ExternalIdentity, error) {
@@ -31,138 +34,334 @@ func (m *mockSyncerStore) GetIdentitiesForUsers(userIDs []string) (map[string][]
 	return out, nil
 }
 
-func (m *mockSyncerStore) GetSchedulesWithUsergroup() ([]*model.Schedule, error) {
-	return m.schedules, nil
+// slackStub is a Slack API double recording every usergroups.users.update it is
+// asked to perform. The syncer talks to a real slack.Client, so the seam is the
+// HTTP endpoint rather than an interface.
+type slackStub struct {
+	mu      sync.Mutex
+	updates []slackUpdate
+	fail    bool
+
+	server *httptest.Server
 }
 
-func (m *mockSyncerStore) GetRotationEpochs(scheduleID, layer string, from, until time.Time) ([]*model.RotationEpoch, error) {
-	return m.epochs, nil
+type slackUpdate struct {
+	usergroup string
+	users     string
 }
 
-func (m *mockSyncerStore) GetScheduleOverrides(scheduleID string, from, until time.Time) ([]*model.ScheduleOverride, error) {
-	return m.overrides, nil
+func newSlackStub(t *testing.T) *slackStub {
+	t.Helper()
+	stub := &slackStub{}
+	stub.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		stub.mu.Lock()
+		stub.updates = append(stub.updates, slackUpdate{
+			usergroup: r.FormValue("usergroup"),
+			users:     r.FormValue("users"),
+		})
+		failing := stub.fail
+		stub.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if failing {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "ratelimited"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":        true,
+			"usergroup": map[string]any{"id": r.FormValue("usergroup")},
+		})
+	}))
+	t.Cleanup(stub.server.Close)
+	return stub
 }
 
-func (m *mockSyncerStore) GetUsersByIDs(ids []string) ([]*model.User, error) {
-	var result []*model.User
-	for _, id := range ids {
-		if u, ok := m.users[id]; ok {
-			result = append(result, u)
+func (s *slackStub) recorded() []slackUpdate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]slackUpdate(nil), s.updates...)
+}
+
+func (s *slackStub) setFail(fail bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fail = fail
+}
+
+func newTestSyncer(t *testing.T, stub *slackStub, oncall onCallLister, slackIDs map[string]string) *UsergroupSyncer {
+	t.Helper()
+	return &UsergroupSyncer{
+		store:        &mockSyncerStore{slackIDs: slackIDs},
+		oncall:       oncall,
+		slackClient:  slack.New("test-token", slack.OptionAPIURL(stub.server.URL+"/")),
+		syncInterval: time.Minute,
+		cache:        make(map[string]cacheEntry),
+	}
+}
+
+// usergroupDuty is a schedule with a usergroup configured in its snapshot.
+func usergroupDuty(scheduleID, usergroup, groupID string, users ...string) schedulerender.ScheduleOnCall {
+	return duty(dutySpec{
+		scheduleID: scheduleID,
+		usergroup:  usergroup,
+		source:     schedulerender.SourceRotation,
+		groupID:    groupID,
+		users:      users,
+	})
+}
+
+// TestSyncerSyncsUsergroupFromSnapshot is the closing of the second defect: the
+// usergroup is read from the configuration in force. The old filter looked at a
+// mutable column nothing on the revision path writes, so the sync ran happily
+// over zero schedules.
+func TestSyncerSyncsUsergroupFromSnapshot(t *testing.T) {
+	stub := newSlackStub(t)
+	oncall := &fakeOnCall{}
+	oncall.set(usergroupDuty("sched-1", "S12345", "g-a", "alice", "bob"))
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice", "bob"))
+
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+
+	got := stub.recorded()
+	if len(got) != 1 {
+		t.Fatalf("%d Slack updates, want 1: %+v", len(got), got)
+	}
+	if got[0].usergroup != "S12345" {
+		t.Errorf("usergroup = %q, want the one from the snapshot", got[0].usergroup)
+	}
+	if got[0].users != "U-ALICE,U-BOB" {
+		t.Errorf("members = %q, want both on-call users sorted", got[0].users)
+	}
+}
+
+// TestSyncerSkipsSchedulesWithoutUsergroup: the filter is in Go, over the
+// projection, because the projection is the only place the usergroup is stated.
+func TestSyncerSkipsSchedulesWithoutUsergroup(t *testing.T) {
+	stub := newSlackStub(t)
+	oncall := &fakeOnCall{}
+	oncall.set(
+		rotationDuty("sched-none", "g-a", "alice"),
+		usergroupDuty("sched-1", "S12345", "g-a", "alice"),
+	)
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
+
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	got := stub.recorded()
+	if len(got) != 1 || got[0].usergroup != "S12345" {
+		t.Fatalf("Slack updates = %+v, want only the schedule with a usergroup", got)
+	}
+}
+
+// TestSyncerAppliesOverrideComposition: the projection already overlaid the
+// override, so the group holds the stand-in with no override branch here.
+func TestSyncerAppliesOverrideComposition(t *testing.T) {
+	stub := newSlackStub(t)
+	oncall := &fakeOnCall{}
+	standIn := duty(dutySpec{
+		scheduleID: "sched-1", usergroup: "S12345",
+		source: schedulerender.SourceOverride, groupID: "ovr-1", users: []string{"carol"},
+	})
+	oncall.set(standIn)
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice", "carol"))
+
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	got := stub.recorded()
+	if len(got) != 1 || got[0].users != "U-CAROL" {
+		t.Fatalf("Slack updates = %+v, want the override holder", got)
+	}
+}
+
+// TestSyncerIgnoresDeletedSchedules: deleting a schedule has never emptied its
+// usergroup, and this is not where that changes. The projection reports the
+// deleted row because the notifier needs it; the syncer drops it in one line.
+func TestSyncerIgnoresDeletedSchedules(t *testing.T) {
+	stub := newSlackStub(t)
+	deletedAt := dutyBase.Add(time.Hour)
+	oncall := &fakeOnCall{}
+	oncall.set(duty(dutySpec{scheduleID: "sched-1", usergroup: "S12345", deletedAt: &deletedAt}))
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
+
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	if got := stub.recorded(); len(got) != 0 {
+		t.Fatalf("Slack was called for a deleted schedule: %+v", got)
+	}
+}
+
+// TestSyncerSkipsWhenNobodyIsOnCall: an empty group is not synced as an empty
+// membership - between shifts the group keeps whoever it had.
+func TestSyncerSkipsWhenNobodyIsOnCall(t *testing.T) {
+	stub := newSlackStub(t)
+	oncall := &fakeOnCall{}
+	oncall.set(duty(dutySpec{scheduleID: "sched-1", usergroup: "S12345"}))
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
+
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	if got := stub.recorded(); len(got) != 0 {
+		t.Fatalf("Slack was called with nobody on duty: %+v", got)
+	}
+}
+
+// TestSyncerSkipsUsersWithoutSlackIdentity: someone with no Slack identity
+// cannot be a member of a Slack group, and the rest of the group still syncs.
+func TestSyncerSkipsUsersWithoutSlackIdentity(t *testing.T) {
+	stub := newSlackStub(t)
+	oncall := &fakeOnCall{}
+	oncall.set(usergroupDuty("sched-1", "S12345", "g-a", "alice", "bob"))
+	syncer := newTestSyncer(t, stub, oncall, map[string]string{"alice": "U-ALICE"})
+
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	got := stub.recorded()
+	if len(got) != 1 || got[0].users != "U-ALICE" {
+		t.Fatalf("Slack updates = %+v, want alice alone", got)
+	}
+
+	// Nobody linked at all: the group is left as it stands rather than emptied.
+	stub2 := newSlackStub(t)
+	syncer2 := newTestSyncer(t, stub2, oncall, map[string]string{})
+	if err := syncer2.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	if got := stub2.recorded(); len(got) != 0 {
+		t.Fatalf("Slack was called with no linked users: %+v", got)
+	}
+}
+
+// TestSyncerDamagedScheduleDoesNotStopTheRest: a schedule that could not be
+// projected is logged and counted; its usergroup is left alone, because a group
+// cannot be synced to a membership nobody could read.
+func TestSyncerDamagedScheduleDoesNotStopTheRest(t *testing.T) {
+	stub := newSlackStub(t)
+	oncall := &fakeOnCall{}
+	oncall.setBulk(schedulerender.BulkOnCall{
+		Schedules: []schedulerender.ScheduleOnCall{usergroupDuty("sched-ok", "S-OK", "g-a", "alice")},
+		Failures: []schedulerender.ProjectionFailure{{
+			ScheduleID: "sched-broken", TeamID: "team-1",
+			Reason: schedulerender.FailureRotation, Err: errors.New("unknown time zone"),
+		}},
+	})
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
+
+	before := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
+		metrics.ConsumerUsergroupSyncer, string(schedulerender.FailureRotation)))
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	after := counterValue(t, metrics.ScheduleOnCallProjectionFailuresTotal.WithLabelValues(
+		metrics.ConsumerUsergroupSyncer, string(schedulerender.FailureRotation)))
+
+	got := stub.recorded()
+	if len(got) != 1 || got[0].usergroup != "S-OK" {
+		t.Fatalf("Slack updates = %+v, want the healthy schedule synced", got)
+	}
+	if after-before != 1 {
+		t.Errorf("projection failure counter moved by %v, want 1", after-before)
+	}
+}
+
+// TestSyncerOneSlackFailureDoesNotStopTheLoop: the sync is a loop over
+// independent schedules and stays one.
+func TestSyncerOneSlackFailureDoesNotStopTheLoop(t *testing.T) {
+	stub := newSlackStub(t)
+	stub.setFail(true)
+	oncall := &fakeOnCall{}
+	oncall.set(
+		usergroupDuty("sched-1", "S-1", "g-a", "alice"),
+		usergroupDuty("sched-2", "S-2", "g-a", "alice"),
+	)
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
+
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll should not fail because one schedule did: %v", err)
+	}
+	if got := stub.recorded(); len(got) != 2 {
+		t.Fatalf("%d Slack calls, want both schedules attempted: %+v", len(got), got)
+	}
+}
+
+// TestSyncerCachesUnchangedMembership: an unchanged group is not written again.
+// A failed write is not cached either, or the retry would never happen.
+func TestSyncerCachesUnchangedMembership(t *testing.T) {
+	stub := newSlackStub(t)
+	oncall := &fakeOnCall{}
+	oncall.set(usergroupDuty("sched-1", "S12345", "g-a", "alice"))
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice", "bob"))
+
+	for i := 0; i < 3; i++ {
+		if err := syncer.SyncAll(context.Background()); err != nil {
+			t.Fatalf("SyncAll: %v", err)
 		}
 	}
-	return result, nil
-}
-
-func TestUsergroupSyncer_SyncAll_SkipsEmpty(t *testing.T) {
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{}, // No schedules with usergroup
+	if got := stub.recorded(); len(got) != 1 {
+		t.Fatalf("%d Slack calls for an unchanged membership, want 1: %+v", len(got), got)
 	}
 
-	syncer := &UsergroupSyncer{
-		store:        mockStore,
-		slackClient:  nil, // Not used when schedules is empty
-		syncInterval: time.Minute,
+	// A change goes through the cache.
+	oncall.set(usergroupDuty("sched-1", "S12345", "g-b", "bob"))
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
 	}
-
-	ctx := context.Background()
-	err := syncer.SyncAll(ctx)
-	if err != nil {
-		t.Errorf("SyncAll with no schedules should not error, got: %v", err)
+	got := stub.recorded()
+	if len(got) != 2 || got[1].users != "U-BOB" {
+		t.Fatalf("Slack updates = %+v, want the changed membership written", got)
 	}
 }
 
-func TestUsergroupSyncer_SyncSchedule_NoL1User(t *testing.T) {
-	// Schedule with usergroup but no L1 users configured
-	schedule := &model.Schedule{
-		ID:               "sched-1",
-		TeamID:           "team-1",
-		Timezone:         "UTC",
-		SlackUsergroupID: "S12345678",
-		L1RotationType:   model.RotationDaily,
-		L1HandoffTime:    "11:00",
-		L1RotationStart:  time.Now(),
-	}
+// TestSyncerFailedWriteIsNotCached: the cache records what Slack accepted, so a
+// rejected write must be retried on the next tick.
+func TestSyncerFailedWriteIsNotCached(t *testing.T) {
+	stub := newSlackStub(t)
+	stub.setFail(true)
+	oncall := &fakeOnCall{}
+	oncall.set(usergroupDuty("sched-1", "S12345", "g-a", "alice"))
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
 
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{schedule},
-		epochs:    []*model.RotationEpoch{}, // No epochs = no users
-		overrides: nil,
-		users:     make(map[string]*model.User),
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
 	}
-
-	syncer := &UsergroupSyncer{
-		store:        mockStore,
-		slackClient:  nil, // API call shouldn't happen
-		syncInterval: time.Minute,
+	stub.setFail(false)
+	if err := syncer.SyncAll(context.Background()); err != nil {
+		t.Fatalf("SyncAll: %v", err)
 	}
-
-	ctx := context.Background()
-	err := syncer.SyncSchedule(ctx, schedule)
-	if err != nil {
-		t.Errorf("SyncSchedule with no L1 epochs should skip without error, got: %v", err)
+	if got := stub.recorded(); len(got) != 2 {
+		t.Fatalf("%d Slack calls, want the rejected write retried: %+v", len(got), got)
 	}
 }
 
-func TestUsergroupSyncer_SyncSchedule_NoSlackUserID(t *testing.T) {
-	// L1 user exists but has no SlackUserID
-	user := &model.User{
-		ID:    "user-1",
-		Name:  "Test User",
-		Email: "test@example.com",
-	}
+// TestSyncerCallFailureIsReported: nothing was read, so the caller is told
+// rather than being handed a silent no-op over zero schedules - the shape of the
+// defect this replaces.
+func TestSyncerCallFailureIsReported(t *testing.T) {
+	stub := newSlackStub(t)
+	oncall := &fakeOnCall{}
+	oncall.fail(errors.New("could not begin transaction"))
+	syncer := newTestSyncer(t, stub, oncall, slackIDsFor("alice"))
 
-	schedule := &model.Schedule{
-		ID:               "sched-1",
-		TeamID:           "team-1",
-		Timezone:         "UTC",
-		SlackUsergroupID: "S12345678",
-		L1RotationType:   model.RotationDaily,
-		L1HandoffTime:    "11:00",
-		L1RotationStart:  time.Now(),
+	if err := syncer.SyncAll(context.Background()); err == nil {
+		t.Fatal("SyncAll reported success although it read nothing")
 	}
-
-	epoch := &model.RotationEpoch{
-		ID:         "epoch-1",
-		ScheduleID: "sched-1",
-		Layer:      "l1",
-		Groups:     [][]string{{"user-1"}},
-		StartTime:  time.Now().Add(-24 * time.Hour),
+	if got := stub.recorded(); len(got) != 0 {
+		t.Fatalf("Slack was called after a read failure: %+v", got)
 	}
-
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{schedule},
-		epochs:    []*model.RotationEpoch{epoch},
-		overrides: nil,
-		users:     map[string]*model.User{"user-1": user},
-	}
-
-	syncer := &UsergroupSyncer{
-		store:        mockStore,
-		slackClient:  nil, // API call shouldn't happen due to missing SlackUserID
-		syncInterval: time.Minute,
-	}
-
-	ctx := context.Background()
-	err := syncer.SyncSchedule(ctx, schedule)
-	if err != nil {
-		t.Errorf("SyncSchedule with user missing SlackUserID should skip without error, got: %v", err)
-	}
-}
-
-func TestUsergroupSyncer_SyncSchedule_WithValidUser_SkipsWhenNoClient(t *testing.T) {
-	// Note: Testing the full path to Slack API call requires a mock Slack client.
-	// Since slack.Client doesn't have an interface, we'd need to refactor syncer to use one.
-	// For now, we only test the edge cases that return early before the API call.
-	// The integration test with a real DB will cover the full flow when TEST_DB_DSN is set.
-	t.Skip("Full Slack API test requires mock client refactoring - covered by integration tests")
 }
 
 func TestUsergroupSyncerManager_StartWithSameToken_NoRestart(t *testing.T) {
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{},
-	}
-
-	manager := NewUsergroupSyncerManager(mockStore, 100*time.Millisecond)
+	manager := NewUsergroupSyncerManager(&mockSyncerStore{}, &fakeOnCall{}, 100*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -191,11 +390,7 @@ func TestUsergroupSyncerManager_StartWithSameToken_NoRestart(t *testing.T) {
 }
 
 func TestUsergroupSyncerManager_StartWithDifferentToken_Restarts(t *testing.T) {
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{},
-	}
-
-	manager := NewUsergroupSyncerManager(mockStore, 100*time.Millisecond)
+	manager := NewUsergroupSyncerManager(&mockSyncerStore{}, &fakeOnCall{}, 100*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -223,11 +418,7 @@ func TestUsergroupSyncerManager_StartWithDifferentToken_Restarts(t *testing.T) {
 }
 
 func TestUsergroupSyncerManager_StartWithEmptyToken_Stops(t *testing.T) {
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{},
-	}
-
-	manager := NewUsergroupSyncerManager(mockStore, 100*time.Millisecond)
+	manager := NewUsergroupSyncerManager(&mockSyncerStore{}, &fakeOnCall{}, 100*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -245,11 +436,7 @@ func TestUsergroupSyncerManager_StartWithEmptyToken_Stops(t *testing.T) {
 }
 
 func TestUsergroupSyncerManager_StopIsNonBlocking(t *testing.T) {
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{},
-	}
-
-	manager := NewUsergroupSyncerManager(mockStore, 100*time.Millisecond)
+	manager := NewUsergroupSyncerManager(&mockSyncerStore{}, &fakeOnCall{}, 100*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -276,11 +463,7 @@ func TestUsergroupSyncerManager_StopIsNonBlocking(t *testing.T) {
 }
 
 func TestUsergroupSyncerManager_DeadSyncerRecovery(t *testing.T) {
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{},
-	}
-
-	manager := NewUsergroupSyncerManager(mockStore, 50*time.Millisecond)
+	manager := NewUsergroupSyncerManager(&mockSyncerStore{}, &fakeOnCall{}, 50*time.Millisecond)
 
 	// Create a cancellable context to simulate external cancellation
 	syncerCtx, syncerCancel := context.WithCancel(context.Background())
@@ -312,11 +495,7 @@ func TestUsergroupSyncerManager_DeadSyncerRecovery(t *testing.T) {
 }
 
 func TestUsergroupSyncerManager_GenerationPreventsRace(t *testing.T) {
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{},
-	}
-
-	manager := NewUsergroupSyncerManager(mockStore, 50*time.Millisecond)
+	manager := NewUsergroupSyncerManager(&mockSyncerStore{}, &fakeOnCall{}, 50*time.Millisecond)
 	ctx1, cancel1 := context.WithCancel(context.Background())
 
 	// Start with token1, gen=1
@@ -360,67 +539,26 @@ func TestUsergroupSyncerManager_GenerationPreventsRace(t *testing.T) {
 	}
 }
 
-func TestUsergroupSyncer_SyncSchedule_OverrideTakesPrecedence(t *testing.T) {
-	// Override user should take precedence over regular rotation
-	regularUser := &model.User{
-		ID:    "user-1",
-		Name:  "Regular User",
-		Email: "regular@example.com",
-	}
-	overrideUser := &model.User{
-		ID:    "user-2",
-		Name:  "Override User",
-		Email: "override@example.com",
-	}
+// TestSyncerRunSurvivesAnEmptyProjection: a fresh installation has no schedules
+// and the loop has to be fine with that.
+func TestSyncerRunSurvivesAnEmptyProjection(t *testing.T) {
+	stub := newSlackStub(t)
+	syncer := newTestSyncer(t, stub, &fakeOnCall{}, nil)
 
-	schedule := &model.Schedule{
-		ID:               "sched-1",
-		TeamID:           "team-1",
-		Timezone:         "UTC",
-		SlackUsergroupID: "S12345678",
-		L1RotationType:   model.RotationDaily,
-		L1HandoffTime:    "11:00",
-		L1RotationStart:  time.Now().Add(-7 * 24 * time.Hour),
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		syncer.Run(ctx)
+		close(done)
+	}()
+	cancel()
 
-	now := time.Now()
-	epoch := &model.RotationEpoch{
-		ID:         "epoch-1",
-		ScheduleID: "sched-1",
-		Layer:      "l1",
-		Groups:     [][]string{{"user-1"}},
-		StartTime:  time.Now().Add(-7 * 24 * time.Hour),
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop when its context was cancelled")
 	}
-
-	// Override covering current time
-	override := &model.ScheduleOverride{
-		ID:         "override-1",
-		ScheduleID: "sched-1",
-		UserID:     "user-2",
-		StartTime:  now.Add(-1 * time.Hour),
-		EndTime:    now.Add(1 * time.Hour),
-	}
-
-	mockStore := &mockSyncerStore{
-		schedules: []*model.Schedule{schedule},
-		epochs:    []*model.RotationEpoch{epoch},
-		overrides: []*model.ScheduleOverride{override},
-		users: map[string]*model.User{
-			"user-1": regularUser,
-			"user-2": overrideUser,
-		},
-	}
-
-	syncer := &UsergroupSyncer{
-		store:        mockStore,
-		slackClient:  nil,
-		syncInterval: time.Minute,
-	}
-
-	ctx := context.Background()
-	err := syncer.SyncSchedule(ctx, schedule)
-	// Should skip because override user has no SlackUserID
-	if err != nil {
-		t.Errorf("Expected skip for override user without SlackUserID, got error: %v", err)
+	if got := stub.recorded(); len(got) != 0 {
+		t.Fatalf("Slack was called with no schedules: %+v", got)
 	}
 }

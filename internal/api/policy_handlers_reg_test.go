@@ -7,9 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
 )
 
 // TestCreatePolicy_EmptySteps_ShouldFail validates that creating a policy

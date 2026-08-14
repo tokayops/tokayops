@@ -3,8 +3,8 @@ package metrics
 import (
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // Tier 1 — HTTP

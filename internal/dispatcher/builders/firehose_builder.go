@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/google/uuid"
 )
 
 // FirehoseJobBuilder creates standalone firehose notification jobs.

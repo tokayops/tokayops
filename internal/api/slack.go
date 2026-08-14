@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/store"
 	"github.com/labstack/echo/v4"
+	"github.com/tokayops/tokayops/internal/store"
 )
 
 // slackOTPTTL is how long an issued Slack OTP code stays valid (mirrors the pre-Sprint-3 5-min window).
@@ -56,7 +56,7 @@ func (a *API) RequestSlackCode(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
 	}
 
-	if _, err := a.store.GetUserByID(userID); err != nil {
+	if _, err := a.store.GetActiveUserByID(userID); err != nil {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 	}
 
@@ -129,7 +129,7 @@ func (a *API) ConfirmSlackCode(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
 	}
 
-	user, err := a.store.GetUserByID(userID)
+	user, err := a.store.GetActiveUserByID(userID)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 	}

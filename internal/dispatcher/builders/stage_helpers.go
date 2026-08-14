@@ -3,8 +3,8 @@ package builders
 import (
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // WrapStepsInStages creates one stage per step (sequential execution model).

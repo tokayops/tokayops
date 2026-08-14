@@ -8,12 +8,12 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/api"
 	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/tokayops/tokayops/internal/testutil"
-	"github.com/labstack/echo/v4"
 )
 
 // setupPolicyAPITest builds the API with a REAL provider capability registry
@@ -36,6 +36,7 @@ func setupPolicyAPITest(t *testing.T) *APIIntegrationEnv {
 	})
 
 	a := api.NewAPI(s, nil, nil, nil, "", api.NewProviderCapsAdapter(reg))
+	wireScheduleServices(a, s)
 	e := echo.New()
 	a.RegisterRoutes(e)
 	return &APIIntegrationEnv{S: s, API: a, Echo: e}

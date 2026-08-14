@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
 )
 
 func TestIngester_PartialUpdate_KeepsStatusAndFlagsSlackUpdate(t *testing.T) {

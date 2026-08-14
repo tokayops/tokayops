@@ -209,29 +209,81 @@ export async function openPolicyEditor(policyId = null) {
 }
 
 /**
- * Load schedule ID for a team
+ * Load the schedule a team's escalation steps can target.
+ *
+ * A deleted schedule keeps its ID: recreating one goes through the same
+ * record, so a step pointing at it starts working again the moment it comes
+ * back. Clearing the target here would quietly break policies that a recreate
+ * would have healed, and nobody would connect the two events.
  */
 async function loadTeamSchedule(teamId) {
-    try {
-        const schedule = await API.schedules.get(teamId);
-        State.currentScheduleId = schedule?.id || null;
+    let scheduleId = null;
+    let label = null;
 
-        // Update any existing schedule selectors
-        document.querySelectorAll('.target-id-input option[data-schedule-placeholder]').forEach(opt => {
-            opt.value = State.currentScheduleId || '';
-            if (!State.currentScheduleId) {
-                opt.textContent = 'No schedule configured for this team';
-                opt.parentElement.disabled = true;
-            } else {
-                const team = State.teams.find(t => t.id === teamId);
-                opt.textContent = `Team Schedule (${team?.name || 'Unknown'})`;
-                opt.parentElement.disabled = false;
-            }
-        });
+    try {
+        const config = await API.schedules.getConfig(teamId);
+        scheduleId = config?.schedule_id || null;
+        if (config?.deleted_at) {
+            label = 'Schedule inactive (deleted)';
+        }
     } catch (e) {
-        console.warn('Failed to load schedule for team', teamId, e);
-        State.currentScheduleId = null;
+        // Three outcomes, not two, and the third has to be visible.
+        //
+        // A 404 is an ANSWER: this team has no schedule. Anything else means
+        // we do not know - and neither of the other two behaviours is safe
+        // there. Rewriting the option to empty says "no schedule configured",
+        // which is a claim we cannot make and which loses the binding a step
+        // already has. Leaving the option alone is worse: it still carries the
+        // PREVIOUS team's schedule id, so switching teams while the read fails
+        // offers "Team Schedule (B)" with team A's id behind it, and saving
+        // binds the step to another team's schedule.
+        //
+        // So a failed read says so, and leaves nothing selectable behind it.
+        if (e?.status !== 404) {
+            console.warn('Failed to load schedule for team', teamId, e);
+            State.currentScheduleId = null;
+            markScheduleUnreadable();
+            return 'failed';
+        }
+        scheduleId = null;
     }
+
+    State.currentScheduleId = scheduleId;
+
+    document.querySelectorAll('.target-id-input option[data-schedule-placeholder]').forEach(opt => {
+        opt.value = scheduleId || '';
+        if (!scheduleId) {
+            opt.textContent = 'No schedule configured for this team';
+            opt.parentElement.disabled = true;
+            return;
+        }
+        if (label) {
+            // Still selectable in the sense that an existing step keeps
+            // pointing at it, but not offered as a new choice.
+            opt.textContent = label;
+            opt.parentElement.disabled = true;
+            return;
+        }
+        const team = State.teams.find(t => t.id === teamId);
+        opt.textContent = `Team Schedule (${team?.name || 'Unknown'})`;
+        opt.parentElement.disabled = false;
+    });
+}
+
+/**
+ * Leave nothing selectable behind an unreadable schedule.
+ *
+ * The option keeps its place so the row does not jump, but it carries no
+ * value: a step cannot be bound to a schedule this editor could not read, and
+ * the text says which of the two "no schedule" situations this is.
+ */
+function markScheduleUnreadable() {
+    document.querySelectorAll('.target-id-input option[data-schedule-placeholder]').forEach(opt => {
+        opt.value = '';
+        opt.textContent = 'Could not load this team\'s schedule - try again';
+        opt.parentElement.disabled = true;
+    });
+    showToast('Could not load the schedule for this team. Reopen the policy to try again.', 'error');
 }
 
 /**
@@ -274,7 +326,12 @@ function reindexSteps() {
 async function handleTeamChange(e) {
     const teamId = e.target.value;
     if (teamId) {
-        await loadTeamSchedule(teamId);
+        // A failed read has already said so and emptied the placeholder.
+        // Redrawing the selectors on top of that would rebuild them from
+        // State.currentScheduleId, which is now null, and replace an honest
+        // "could not load" with "no schedule configured" - a claim about the
+        // team rather than about the request.
+        if (await loadTeamSchedule(teamId) === 'failed') return;
     } else {
         State.currentScheduleId = null;
     }

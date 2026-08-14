@@ -48,7 +48,6 @@ export const State = {
     editingPolicy: null,
     alertGroupsRaw: [],
     paginationMeta: null,
-    onCallByTeam: {},
     integrations: [],
     editingIntegration: null,
 };

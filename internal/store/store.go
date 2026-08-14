@@ -9,11 +9,68 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/model"
 )
+
+// activeUserCTE is the head of every statement that creates something owned by
+// a user: a token, an identity, a link, a membership.
+//
+// It does two jobs in one statement, and both are needed. The predicate makes
+// "this user is alive" and "the row is inserted" atomic, so there is no window
+// between checking and writing. The FOR SHARE makes erasure - which takes FOR
+// UPDATE on the same row - wait for this transaction, so its sweep of the
+// child tables runs after the insert rather than before it and misses nothing.
+//
+// Without the lock the predicate alone is not enough: an insert that was still
+// uncommitted when erasure deleted the table would survive it.
+//
+// THE USER ID IS ALWAYS $1. That is the whole convention, and it is why this
+// is a constant concatenated onto a query rather than a format string: a
+// placeholder index chosen per call site is a silent coupling to the argument
+// order, and getting it wrong locks the wrong person while every test that
+// uses one user still passes.
+const activeUserCTE = `WITH active AS (
+	SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR SHARE
+)`
+
+// lockActiveUserTx is activeUserCTE for a transaction that writes more than
+// one statement: take the shared lock on the user first, and only then touch
+// the rows that belong to them.
+//
+// Order matters as much as the lock. Erasure locks the user and then deletes
+// the child rows; a transaction that locked a child row first and reached for
+// the user second would be the other half of an AB-BA deadlock.
+func lockActiveUserTx(tx *sql.Tx, userID string) error {
+	var id string
+	err := tx.QueryRow(
+		`SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR SHARE`, userID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrUserNotFound
+	}
+	return err
+}
+
+// ErrUserNotFound means no user matched, or the one that did has been erased.
+// The two are the same answer on purpose: a command must not be able to tell
+// "this person never existed" from "this person was deleted".
+var ErrUserNotFound = errors.New("store: user not found")
+
+// ErrLastAdmin means the change would leave the system with no active
+// administrator. It is a sentinel because the API has to answer 409 for it,
+// and the alternative - matching on the message text - is a contract nobody
+// can see and the mock could never reproduce.
+//
+// erasure declares a sentinel of the same name for the same invariant seen
+// from its side. The duplication is deliberate and is the second instance of
+// this trade in the codebase, after UserOnCallError and MemberOnCallError: the
+// erasure package knows nothing about the store, and one shared sentinel would
+// buy a line of code at the price of an import that means nothing. If a third
+// instance appears, that is the signal to give these invariants a home of
+// their own rather than to keep paying.
+var ErrLastAdmin = errors.New("store: cannot demote the last admin")
 
 type Store struct {
 	db *sql.DB
@@ -429,111 +486,150 @@ func (s *Store) InitDB() error {
 		return err
 	}
 
-	// Phase 3: Schedule tables
-	scheduleQuery := `
-	-- Schedules table (1:1 with teams)
+	// Schedule revision history: the aggregate root, its append-only
+	// configuration snapshots, and the override history beside them.
+	//
+	// The root is created in its final shape, with the history horizon NOT NULL:
+	// a row without one could only come from before the revision model, and the
+	// destructive upgrade removes those rather than carrying them forward.
+	//
+	// The three ALTERs below are the upgrade path and only the upgrade path. On
+	// a database created by this statement they are no-ops; on one that predates
+	// the revision model they add the columns NULLABLE and tighten nothing. That
+	// asymmetry is deliberate and load-bearing: InitDB runs before the `migrate`
+	// subcommand (cmd/tokayops/main.go), so a SET NOT NULL here would refuse to
+	// start the very binary whose reset repairs the situation. The tightening
+	// lives in that reset; RequireCutoverSchema refuses to serve until it ran.
+	//
+	// All range constraints use tstzrange over TIMESTAMPTZ columns.
+	revisionQuery := `
 	CREATE TABLE IF NOT EXISTS schedules (
-		id TEXT PRIMARY KEY,
-		team_id TEXT UNIQUE NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-		timezone TEXT DEFAULT 'UTC',
-		
-		-- L1 Layer Config
-		l1_rotation_type TEXT NOT NULL DEFAULT 'weekly',
-		l1_handoff_time TIME NOT NULL DEFAULT '11:00',
-		l1_handoff_day INTEGER DEFAULT 1,
-		l1_rotation_start TIMESTAMPTZ NOT NULL,
-		
-		-- L2 Layer Config (optional)
-		l2_enabled BOOLEAN DEFAULT FALSE,
-		l2_escalation_timeout_min INTEGER DEFAULT 5,
-		l2_rotation_type TEXT DEFAULT 'weekly',
-		l2_handoff_time TIME DEFAULT '11:00',
-		l2_handoff_day INTEGER DEFAULT 1,
-		l2_rotation_start TIMESTAMPTZ,
-		
-		-- Slack usergroup sync (optional)
-		slack_usergroup_id TEXT,
-		
-		created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-		updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+		id                    TEXT PRIMARY KEY,
+		team_id               TEXT UNIQUE NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+		config_version        BIGINT NOT NULL DEFAULT 0,
+		history_complete_from TIMESTAMPTZ NOT NULL,
+		deleted_at            TIMESTAMPTZ,
+		created_at            TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+		updated_at            TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 	);
 
-	-- Schedule users (ordered rotation)
-	CREATE TABLE IF NOT EXISTS schedule_users (
-		schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
-		layer TEXT NOT NULL,
-		user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		position INTEGER NOT NULL,
-		PRIMARY KEY (schedule_id, layer, user_id)
-	);
-	CREATE INDEX IF NOT EXISTS idx_schedule_users_layer ON schedule_users(schedule_id, layer, position);
+	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS config_version BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS history_complete_from TIMESTAMPTZ;
+	ALTER TABLE schedules ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
-	-- Schedule overrides (minute precision)
-	CREATE TABLE IF NOT EXISTS schedule_overrides (
-		id TEXT PRIMARY KEY,
-		schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
-		user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		start_time TIMESTAMPTZ NOT NULL,
-		end_time TIMESTAMPTZ NOT NULL,
-		reason TEXT,
-		created_by TEXT REFERENCES users(id),
-		created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-		CHECK (end_time > start_time)
-	);
-	CREATE INDEX IF NOT EXISTS idx_overrides_range ON schedule_overrides(schedule_id, start_time, end_time);
-	
-	-- Prevent overlapping overrides (requires btree_gist extension)
+	ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+	-- Required by the schedule_revisions exclusion constraint below. It used to
+	-- be created by the pre-revision schema; that file is gone, and without this
+	-- line the constraint would silently not be created on a fresh database -
+	-- the constraint swallows a missing extension with a NOTICE.
 	DO $$ BEGIN
 		CREATE EXTENSION IF NOT EXISTS btree_gist;
 	EXCEPTION WHEN insufficient_privilege THEN
-		-- Extension creation may fail in restricted environments
 		RAISE NOTICE 'btree_gist extension not created (needs superuser)';
 	END $$;
-	DO $$ BEGIN
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_overrides') THEN
-			ALTER TABLE schedule_overrides ADD CONSTRAINT no_overlapping_overrides
-				EXCLUDE USING gist (schedule_id WITH =, tsrange(start_time, end_time) WITH &&);
-		END IF;
-	EXCEPTION WHEN undefined_function THEN
-		-- Constraint creation may fail if btree_gist extension isn't available
-		RAISE NOTICE 'Exclusion constraint not created (btree_gist not available)';
-	END $$;
 
-	-- Rotation epochs (history of rotation order changes)
-	CREATE TABLE IF NOT EXISTS rotation_epochs (
-		id TEXT PRIMARY KEY,
-		schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
-		layer TEXT NOT NULL, -- 'l1' or 'l2'
-		user_ids TEXT NOT NULL, -- JSON array of user IDs in rotation order
-		start_time TIMESTAMPTZ NOT NULL,
-		end_time TIMESTAMPTZ, -- NULL = current epoch
-		created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+	-- ON DELETE RESTRICT: a schedule with history is never physically deleted
+	-- (soft delete via schedules.deleted_at), so cascading the history away
+	-- must be impossible at the schema level too.
+	--
+	-- kind makes the interval in which a schedule was deleted a record of its
+	-- own rather than a hole. Recreating a schedule clears deleted_at, so a
+	-- hole is all that would remain of a normal delete/recreate cycle and a
+	-- reader could not tell it from a lost revision.
+	CREATE TABLE IF NOT EXISTS schedule_revisions (
+		id             TEXT PRIMARY KEY,
+		schedule_id    TEXT NOT NULL REFERENCES schedules(id) ON DELETE RESTRICT,
+		version        BIGINT NOT NULL,
+		kind           TEXT NOT NULL DEFAULT 'active',
+		snapshot       JSONB NOT NULL,
+		effective_from TIMESTAMPTZ NOT NULL,
+		effective_to   TIMESTAMPTZ,
+		recorded_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		created_by     TEXT,
+		change_reason  TEXT,
+		change_summary JSONB,
+
+		UNIQUE (schedule_id, version),
+		CONSTRAINT schedule_revisions_version_positive CHECK (version >= 1),
+		CONSTRAINT schedule_revisions_kind_known CHECK (kind IN ('active', 'deleted')),
+		CHECK (effective_to IS NULL OR effective_to > effective_from)
 	);
-	CREATE INDEX IF NOT EXISTS idx_rotation_epochs_schedule ON rotation_epochs(schedule_id, layer, start_time);
-	-- Ensure only one open epoch per schedule/layer (P1-1 fix)
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_rotation_epochs_one_open ON rotation_epochs(schedule_id, layer) WHERE end_time IS NULL;
-
-	-- Migration: convert flat user_ids ["a","b","c"] to groups [["a"],["b"],["c"]]
+	ALTER TABLE schedule_revisions ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'active';
 	DO $$ BEGIN
-		UPDATE rotation_epochs
-		SET user_ids = (
-			SELECT json_agg(json_build_array(elem))::text
-			FROM json_array_elements_text(user_ids::json) AS elem
-		)
-		WHERE user_ids IS NOT NULL
-		  AND user_ids != '[]'
-		  AND user_ids::json->0 IS NOT NULL
-		  AND json_typeof(user_ids::json->0) = 'string';
-	END $$;
-
-	-- Migration: add slack_usergroup_id if not exists
-	DO $$ BEGIN
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='schedules' AND column_name='slack_usergroup_id') THEN
-			ALTER TABLE schedules ADD COLUMN slack_usergroup_id TEXT;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'schedule_revisions_version_positive') THEN
+			ALTER TABLE schedule_revisions ADD CONSTRAINT schedule_revisions_version_positive CHECK (version >= 1);
+		END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'schedule_revisions_kind_known') THEN
+			ALTER TABLE schedule_revisions ADD CONSTRAINT schedule_revisions_kind_known
+				CHECK (kind IN ('active', 'deleted'));
 		END IF;
 	END $$;
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_revisions_one_tail
+		ON schedule_revisions(schedule_id)
+		WHERE effective_to IS NULL;
+	CREATE INDEX IF NOT EXISTS idx_schedule_revisions_range
+		ON schedule_revisions(schedule_id, effective_from);
+
+	-- Defence in depth only: non-overlap is guaranteed by the schedule row
+	-- lock and a single transaction (an empty history has no revision row to
+	-- lock). Skipped when btree_gist is unavailable.
+	-- Qualified by table and kind, like the startup check that reports on it:
+	-- constraint names are unique per table, so a same-named constraint on
+	-- another table would make this skip creating the real one.
+	DO $$ BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conname = 'no_overlapping_schedule_revisions'
+			  AND conrelid = to_regclass('schedule_revisions')
+			  AND contype = 'x'
+		) THEN
+			ALTER TABLE schedule_revisions ADD CONSTRAINT no_overlapping_schedule_revisions
+				EXCLUDE USING gist (schedule_id WITH =, tstzrange(effective_from, effective_to, '[)') WITH &&);
+		END IF;
+	EXCEPTION WHEN undefined_function OR undefined_object THEN
+		RAISE NOTICE 'schedule_revisions exclusion constraint not created (btree_gist not available)';
+	END $$;
+
+	-- Append-only override history. Deliberately without an exclusion
+	-- constraint: overlap is a property of the CURRENT projection (latest
+	-- revision per override_id, tombstones excluded), which no per-row
+	-- constraint can express. The service validates it under the schedule
+	-- lock. user_id/recorded_by carry no FK so history survives user deletion.
+	CREATE TABLE IF NOT EXISTS schedule_override_revisions (
+		revision_id TEXT PRIMARY KEY,
+		override_id TEXT NOT NULL,
+		schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE RESTRICT,
+		revision    BIGINT NOT NULL,
+		layer       TEXT NOT NULL DEFAULT 'l1' CHECK (layer IN ('l1', 'l2')),
+		user_id     TEXT NOT NULL,
+		valid_from  TIMESTAMPTZ NOT NULL,
+		valid_to    TIMESTAMPTZ NOT NULL,
+		reason      TEXT,
+		deleted     BOOLEAN NOT NULL DEFAULT FALSE,
+		recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		recorded_by TEXT,
+
+		UNIQUE (override_id, revision),
+		CONSTRAINT schedule_override_revisions_revision_positive CHECK (revision >= 1),
+		CHECK (valid_to > valid_from)
+	);
+	DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'schedule_override_revisions_revision_positive') THEN
+			ALTER TABLE schedule_override_revisions
+				ADD CONSTRAINT schedule_override_revisions_revision_positive CHECK (revision >= 1);
+		END IF;
+	END $$;
+	CREATE INDEX IF NOT EXISTS idx_schedule_override_revisions_range
+		ON schedule_override_revisions(schedule_id, valid_from);
+
+	-- Markers for one-shot operational migrations that must never run twice.
+	CREATE TABLE IF NOT EXISTS migration_markers (
+		name       TEXT PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
 	`
-	if _, err := s.db.Exec(scheduleQuery); err != nil {
+	if _, err := s.db.Exec(revisionQuery); err != nil {
 		return err
 	}
 
@@ -2111,14 +2207,6 @@ func (s *Store) UpdateTeam(t *model.Team) error {
 	return err
 }
 
-func (s *Store) DeleteTeam(id string) error {
-	if _, err := s.db.Exec(`DELETE FROM team_members WHERE team_id = $1`, id); err != nil {
-		return err
-	}
-	_, err := s.db.Exec(`DELETE FROM teams WHERE id = $1`, id)
-	return err
-}
-
 func (s *Store) GetTeamMembershipsForUser(userID string) (map[string]model.TeamMemberRole, error) {
 	query := `SELECT team_id, role FROM team_members WHERE user_id = $1`
 	rows, err := s.db.Query(query, userID)
@@ -2162,22 +2250,55 @@ func (s *Store) CreateUser(u *model.User) error {
 	return err
 }
 
+// GetUserByID reads a user INCLUDING an erased one.
+//
+// It is the display read, and it exists so history stays legible: a revision
+// or an override that names an erased ID has to resolve to something, and
+// "Deleted user" is what anonymization left behind. Command paths and
+// authentication must not use it - they use GetActiveUserByID, or an erased
+// person keeps a working session and can be written back into the system.
 func (s *Store) GetUserByID(id string) (*model.User, error) {
 	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at FROM users WHERE id = $1`
-	row := s.db.QueryRow(query, id)
+	return scanUser(s.db.QueryRow(query, id))
+}
 
+// GetActiveUserByID reads a user that has not been erased.
+//
+// Soft delete has to be terminal, and this is the read that makes it so:
+// authentication and every command go through here, so an erased user's
+// session stops working on their next request and no command can act on them.
+func (s *Store) GetActiveUserByID(id string) (*model.User, error) {
+	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at
+			  FROM users WHERE id = $1 AND deleted_at IS NULL`
+	u, err := scanUser(s.db.QueryRow(query, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
+	return u, err
+}
+
+func scanUser(row *sql.Row) (*model.User, error) {
 	var u model.User
-	var role, passwordHash, authProvider sql.NullString
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
+	var email, role, passwordHash, authProvider sql.NullString
+	err := row.Scan(&u.ID, &email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
+	u.Email = email.String
 	u.Role = model.UserRole(role.String)
 	u.PasswordHash = passwordHash.String
 	u.AuthProvider = authProvider.String
 	return &u, nil
 }
 
+// GetUsersByIDs is a DISPLAY read and deliberately does NOT filter erased
+// users, unlike GetAllUsers directly above it.
+//
+// This is what hydrates names onto rendered history, and history names people
+// who have since been erased: dropping them here would leave a shift with an
+// ID and no name at all, which is worse than "Deleted user". The rule is by
+// purpose, not by table - "align these two" is a change that silently breaks
+// the calendar.
 func (s *Store) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	if len(ids) == 0 {
 		return []*model.User{}, nil
@@ -2192,10 +2313,11 @@ func (s *Store) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	var users []*model.User
 	for rows.Next() {
 		var u model.User
-		var role, passwordHash, authProvider sql.NullString
-		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
+		var email, role, passwordHash, authProvider sql.NullString
+		if err := rows.Scan(&u.ID, &email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
 			return nil, err
 		}
+		u.Email = email.String
 		u.Role = model.UserRole(role.String)
 		u.PasswordHash = passwordHash.String
 		u.AuthProvider = authProvider.String
@@ -2204,8 +2326,12 @@ func (s *Store) GetUsersByIDs(ids []string) ([]*model.User, error) {
 	return users, nil
 }
 
+// GetAllUsers lists the people who exist. An erased user is a tombstone kept
+// so history resolves, not a member of the directory - and the mock has always
+// said so, which meant unit tests and production disagreed.
 func (s *Store) GetAllUsers() ([]*model.User, error) {
-	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at FROM users ORDER BY name`
+	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at
+			  FROM users WHERE deleted_at IS NULL ORDER BY name`
 	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
@@ -2215,10 +2341,11 @@ func (s *Store) GetAllUsers() ([]*model.User, error) {
 	var users []*model.User
 	for rows.Next() {
 		var u model.User
-		var role, passwordHash, authProvider sql.NullString
-		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
+		var email, role, passwordHash, authProvider sql.NullString
+		if err := rows.Scan(&u.ID, &email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt); err != nil {
 			return nil, err
 		}
+		u.Email = email.String
 		u.Role = model.UserRole(role.String)
 		u.PasswordHash = passwordHash.String
 		u.AuthProvider = authProvider.String
@@ -2227,11 +2354,18 @@ func (s *Store) GetAllUsers() ([]*model.User, error) {
 	return users, nil
 }
 
+// AddTeamMember grants a membership, and only to a user who has not been
+// erased: a bare INSERT would hand an erased identity a live grant back.
 func (s *Store) AddTeamMember(teamID, userID string, role model.TeamMemberRole) error {
-	query := `INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)
-			  ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`
-	_, err := s.db.Exec(query, teamID, userID, role)
-	return err
+	query := activeUserCTE + `
+		INSERT INTO team_members (team_id, user_id, role)
+		SELECT $2, active.id, $3 FROM active
+		ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`
+	res, err := s.db.Exec(query, userID, teamID, role)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 func (s *Store) GetTeamMembers(teamID string) ([]*model.TeamMemberDetail, error) {
@@ -2248,10 +2382,12 @@ func (s *Store) GetTeamMembers(teamID string) ([]*model.TeamMemberDetail, error)
 	var members []*model.TeamMemberDetail
 	for rows.Next() {
 		var tm model.TeamMemberDetail
+		var email sql.NullString
 		var role string
-		if err := rows.Scan(&tm.ID, &tm.Email, &tm.Name, &tm.CreatedAt, &role); err != nil {
+		if err := rows.Scan(&tm.ID, &email, &tm.Name, &tm.CreatedAt, &role); err != nil {
 			return nil, err
 		}
+		tm.Email = email.String
 		tm.TeamRole = model.TeamMemberRole(role)
 		members = append(members, &tm)
 	}
@@ -2264,40 +2400,76 @@ func (s *Store) RemoveTeamMember(teamID, userID string) error {
 	return err
 }
 
+// GetUserByEmail looks a user up by address. An anonymized user has a NULL
+// email, so this returns sql.ErrNoRows for their former address - it can never
+// resurface an erased identity.
 func (s *Store) GetUserByEmail(email string) (*model.User, error) {
 	query := `SELECT id, email, name, role, password_hash, auth_provider, created_at FROM users WHERE email = $1`
 	row := s.db.QueryRow(query, email)
 
 	var u model.User
-	var role, passwordHash, authProvider sql.NullString
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
+	var storedEmail, role, passwordHash, authProvider sql.NullString
+	err := row.Scan(&u.ID, &storedEmail, &u.Name, &role, &passwordHash, &authProvider, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
+	u.Email = storedEmail.String
 	u.Role = model.UserRole(role.String)
 	u.PasswordHash = passwordHash.String
 	u.AuthProvider = authProvider.String
 	return &u, nil
 }
 
+// The three user mutations below all carry `deleted_at IS NULL` and check that
+// they affected a row.
+//
+// Without the filter each of them silently refills an erased row - name and
+// email, a password hash, a federated identity - and the erasure that was
+// supposed to be terminal becomes a stage a later request can undo. Without
+// the row count, an update that matched nothing reports success, which reads
+// as "the change was applied" to every caller.
+
+// UpdateUser writes profile fields only. role is deliberately NOT among them.
+//
+// Role is an invariant, not a field: the system must keep one active
+// administrator, and SetUserRole is what serializes that check against
+// erasure. A profile update that also carried role could undo a promotion it
+// never saw - read B as a user, let someone promote B and erase the last other
+// admin, then write B back as a user and leave nobody in charge.
 func (s *Store) UpdateUser(u *model.User) error {
-	query := `UPDATE users SET email = $1, name = $2, role = $3 WHERE id = $4`
-	_, err := s.db.Exec(query, u.Email, u.Name, u.Role, u.ID)
-	return err
+	query := `UPDATE users SET email = $1, name = $2 WHERE id = $3 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, u.Email, u.Name, u.ID)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 func (s *Store) UpdateUserPassword(id, hash string) error {
-	query := `UPDATE users SET password_hash = $1 WHERE id = $2`
-	_, err := s.db.Exec(query, hash, id)
-	return err
+	query := `UPDATE users SET password_hash = $1 WHERE id = $2 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, hash, id)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 func (s *Store) UpdateUserAuthProvider(id, provider string) error {
-	query := `UPDATE users SET auth_provider = $1 WHERE id = $2`
-	_, err := s.db.Exec(query, provider, id)
-	return err
+	query := `UPDATE users SET auth_provider = $1 WHERE id = $2 AND deleted_at IS NULL`
+	res, err := s.db.Exec(query, provider, id)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
+// DeleteUser physically removes a user.
+//
+// Deprecated: user deletion goes through erasure.Service, which soft-deletes
+// and anonymizes so the history that names the ID stays explainable, and which
+// refuses to erase someone who still holds an assignment. This remains only
+// for the tooling that has not moved yet and is removed with the rest of the
+// legacy schedule path.
 func (s *Store) DeleteUser(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM team_members WHERE user_id = $1`, id); err != nil {
 		return err
@@ -2322,7 +2494,17 @@ func (s *Store) GetUserTeamRole(userID, teamID string) (model.TeamMemberRole, er
 	return model.TeamMemberRole(role), nil
 }
 
-// SetUserRole updates a user's global role with transaction protection for last admin.
+// SetUserRole updates a user's global role, refusing to demote the last
+// administrator the system has left.
+//
+// It takes the admin-lifecycle advisory lock first, the same one erasure
+// takes, because these two commands change the same quantity from different
+// directions: without a shared mutex, erasing one of two admins and demoting
+// the other can both observe "there are two" and both commit.
+//
+// The count is of ACTIVE admins. Counting erased ones as living was the older
+// bug: after the first erasure the guard believed there were still two, and
+// the last real administrator could be demoted.
 func (s *Store) SetUserRole(userID string, role model.UserRole) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -2330,45 +2512,43 @@ func (s *Store) SetUserRole(userID string, role model.UserRole) error {
 	}
 	defer tx.Rollback()
 
-	// Get current role of target user
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, adminLifecycleLockKey); err != nil {
+		return err
+	}
+
 	var currentRole string
-	err = tx.QueryRow(`SELECT role FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&currentRole)
+	err = tx.QueryRow(`SELECT role FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, userID).Scan(&currentRole)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrUserNotFound
+	}
 	if err != nil {
 		return err
 	}
 
-	// If demoting from admin, lock ALL admin users and count them
 	if currentRole == string(model.UserRoleAdmin) && role != model.UserRoleAdmin {
-		// Lock all admin users to prevent parallel demotions
-		rows, err := tx.Query(`SELECT id FROM users WHERE role = 'admin' FOR UPDATE`)
-		if err != nil {
+		var adminCount int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL`).
+			Scan(&adminCount); err != nil {
 			return err
 		}
-		adminCount := 0
-		for rows.Next() {
-			var id string
-			rows.Scan(&id)
-			adminCount++
-		}
-		rows.Close()
-
 		if adminCount <= 1 {
-			return fmt.Errorf("cannot demote the last admin")
+			return ErrLastAdmin
 		}
 	}
 
-	_, err = tx.Exec(`UPDATE users SET role = $1 WHERE id = $2`, role, userID)
-	if err != nil {
+	if _, err = tx.Exec(`UPDATE users SET role = $1 WHERE id = $2 AND deleted_at IS NULL`, role, userID); err != nil {
 		return err
 	}
 
 	return tx.Commit()
 }
 
-// CountAdmins returns the number of users with admin role.
+// CountAdmins returns the number of ACTIVE users with the admin role. An
+// erased admin is not an administrator the system can fall back on.
 func (s *Store) CountAdmins() (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&count)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL`).Scan(&count)
 	return count, err
 }
 
@@ -2421,118 +2601,6 @@ func (s *Store) GetTimelineEvents(alertGroupID string) ([]*model.TimelineEvent, 
 	return events, nil
 }
 
-// ========================================
-// Schedule CRUD (Phase 3)
-// ========================================
-
-func (s *Store) CreateSchedule(sch *model.Schedule) error {
-	if sch.CreatedAt.IsZero() {
-		sch.CreatedAt = time.Now()
-	}
-	sch.UpdatedAt = sch.CreatedAt
-
-	var l2RotationType interface{} = sch.L2RotationType
-	if sch.L2RotationType == "" {
-		l2RotationType = nil
-	}
-	var l2HandoffTime interface{} = sch.L2HandoffTime
-	if sch.L2HandoffTime == "" {
-		l2HandoffTime = nil
-	}
-
-	query := `INSERT INTO schedules (id, team_id, timezone, l1_rotation_type, l1_handoff_time, l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, l2_handoff_time, l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`
-	_, err := s.db.Exec(query, sch.ID, sch.TeamID, sch.Timezone, sch.L1RotationType, sch.L1HandoffTime, sch.L1HandoffDay, sch.L1RotationStart, sch.L2Enabled, sch.L2EscalationTimeout, l2RotationType, l2HandoffTime, sch.L2HandoffDay, sch.L2RotationStart, nullIfEmpty(sch.SlackUsergroupID), sch.CreatedAt, sch.UpdatedAt)
-	return err
-}
-
-func (s *Store) GetScheduleByTeamID(teamID string) (*model.Schedule, error) {
-	query := `SELECT id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at
-			  FROM schedules WHERE team_id = $1`
-	return s.scanSchedule(s.db.QueryRow(query, teamID))
-}
-
-func (s *Store) GetScheduleByID(id string) (*model.Schedule, error) {
-	query := `SELECT id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at
-			  FROM schedules WHERE id = $1`
-	return s.scanSchedule(s.db.QueryRow(query, id))
-}
-
-func (s *Store) scanSchedule(row *sql.Row) (*model.Schedule, error) {
-	var sch model.Schedule
-	var l1HandoffDay, l2HandoffDay sql.NullInt64
-	var l2RotationType, l2HandoffTime, slackUsergroupID sql.NullString
-	var l2RotationStart sql.NullTime
-
-	err := row.Scan(&sch.ID, &sch.TeamID, &sch.Timezone, &sch.L1RotationType, &sch.L1HandoffTime, &l1HandoffDay, &sch.L1RotationStart, &sch.L2Enabled, &sch.L2EscalationTimeout, &l2RotationType, &l2HandoffTime, &l2HandoffDay, &l2RotationStart, &slackUsergroupID, &sch.CreatedAt, &sch.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-
-	if l1HandoffDay.Valid {
-		d := int(l1HandoffDay.Int64)
-		sch.L1HandoffDay = &d
-	}
-	if l2HandoffDay.Valid {
-		d := int(l2HandoffDay.Int64)
-		sch.L2HandoffDay = &d
-	}
-	sch.L2RotationType = model.RotationType(l2RotationType.String)
-	sch.L2HandoffTime = l2HandoffTime.String
-	if l2RotationStart.Valid {
-		sch.L2RotationStart = &l2RotationStart.Time
-	}
-	sch.SlackUsergroupID = slackUsergroupID.String
-
-	return &sch, nil
-}
-
-func (s *Store) UpdateSchedule(sch *model.Schedule) error {
-	sch.UpdatedAt = time.Now()
-	query := `UPDATE schedules SET timezone = $1, l1_rotation_type = $2, l1_handoff_time = $3, l1_handoff_day = $4, l1_rotation_start = $5, l2_enabled = $6, l2_escalation_timeout_min = $7, l2_rotation_type = $8, l2_handoff_time = $9, l2_handoff_day = $10, l2_rotation_start = $11, slack_usergroup_id = $12, updated_at = $13 WHERE id = $14`
-	_, err := s.db.Exec(query, sch.Timezone, sch.L1RotationType, sch.L1HandoffTime, sch.L1HandoffDay, sch.L1RotationStart, sch.L2Enabled, sch.L2EscalationTimeout, sch.L2RotationType, sch.L2HandoffTime, sch.L2HandoffDay, sch.L2RotationStart, nullIfEmpty(sch.SlackUsergroupID), sch.UpdatedAt, sch.ID)
-	return err
-}
-
-func (s *Store) DeleteSchedule(id string) error {
-	_, err := s.db.Exec(`DELETE FROM schedules WHERE id = $1`, id)
-	return err
-}
-
-func (s *Store) SetScheduleUsers(scheduleID, layer string, userIDs []string) error {
-	// Use transaction for atomic epoch transition
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	now := time.Now().UTC()
-
-	// Close current epoch if exists (with error checking)
-	closeQuery := `UPDATE rotation_epochs SET end_time = $1 WHERE schedule_id = $2 AND layer = $3 AND end_time IS NULL`
-	if _, err := tx.Exec(closeQuery, now, scheduleID, layer); err != nil {
-		return err
-	}
-
-	// Create new epoch with the new user order (wrap each user as a singleton group)
-	if len(userIDs) > 0 {
-		groups := make([][]string, len(userIDs))
-		for i, id := range userIDs {
-			groups[i] = []string{id}
-		}
-		groupsJSON, _ := json.Marshal(groups)
-		insertQuery := `INSERT INTO rotation_epochs (id, schedule_id, layer, user_ids, start_time, end_time, created_at)
-					    VALUES ($1, $2, $3, $4, $5, $6, $7)`
-		_, err := tx.Exec(insertQuery, generateUUID(), scheduleID, layer, string(groupsJSON), now, nil, now)
-		if err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
-}
-
 // generateUUID creates a new UUID using google/uuid
 func generateUUID() string {
 	return uuid.New().String()
@@ -2546,298 +2614,32 @@ func nullIfEmpty(s string) interface{} {
 	return s
 }
 
-// GetAllSchedules returns all schedules.
-func (s *Store) GetAllSchedules() ([]*model.Schedule, error) {
-	return s.querySchedules(`SELECT id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at
-			  FROM schedules`)
-}
-
-// GetSchedulesWithUsergroup returns all schedules that have slack_usergroup_id configured
-func (s *Store) GetSchedulesWithUsergroup() ([]*model.Schedule, error) {
-	return s.querySchedules(`SELECT id, team_id, timezone, l1_rotation_type, to_char(l1_handoff_time, 'HH24:MI'), l1_handoff_day, l1_rotation_start, l2_enabled, l2_escalation_timeout_min, l2_rotation_type, to_char(l2_handoff_time, 'HH24:MI'), l2_handoff_day, l2_rotation_start, slack_usergroup_id, created_at, updated_at
-			  FROM schedules WHERE slack_usergroup_id IS NOT NULL AND slack_usergroup_id != ''`)
-}
-
-func (s *Store) querySchedules(query string) ([]*model.Schedule, error) {
-	rows, err := s.db.Query(query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var schedules []*model.Schedule
-	for rows.Next() {
-		var sch model.Schedule
-		var l1HandoffDay, l2HandoffDay sql.NullInt64
-		var l2RotationType, l2HandoffTime, slackUsergroupID sql.NullString
-		var l2RotationStart sql.NullTime
-
-		if err := rows.Scan(&sch.ID, &sch.TeamID, &sch.Timezone, &sch.L1RotationType, &sch.L1HandoffTime, &l1HandoffDay, &sch.L1RotationStart, &sch.L2Enabled, &sch.L2EscalationTimeout, &l2RotationType, &l2HandoffTime, &l2HandoffDay, &l2RotationStart, &slackUsergroupID, &sch.CreatedAt, &sch.UpdatedAt); err != nil {
-			return nil, err
-		}
-
-		if l1HandoffDay.Valid {
-			d := int(l1HandoffDay.Int64)
-			sch.L1HandoffDay = &d
-		}
-		if l2HandoffDay.Valid {
-			d := int(l2HandoffDay.Int64)
-			sch.L2HandoffDay = &d
-		}
-		sch.L2RotationType = model.RotationType(l2RotationType.String)
-		sch.L2HandoffTime = l2HandoffTime.String
-		if l2RotationStart.Valid {
-			sch.L2RotationStart = &l2RotationStart.Time
-		}
-		sch.SlackUsergroupID = slackUsergroupID.String
-
-		schedules = append(schedules, &sch)
-	}
-	return schedules, nil
-}
-
-func (s *Store) GetScheduleUsers(scheduleID, layer string) ([]*model.User, error) {
-	// Get current epoch for this schedule/layer
-	epoch, err := s.GetCurrentEpoch(scheduleID, layer)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return []*model.User{}, nil // No epoch = no users
-		}
-		return nil, err
-	}
-
-	// Flatten groups to flat user list (for L2 which is always single-user groups)
-	var users []*model.User
-	for _, group := range epoch.Groups {
-		for _, userID := range group {
-			u, err := s.GetUserByID(userID)
-			if err != nil {
-				return nil, fmt.Errorf("user %s not found in rotation: %w", userID, err)
-			}
-			users = append(users, u)
-		}
-	}
-	return users, nil
-}
-
-func (s *Store) SetScheduleGroups(scheduleID string, groups [][]string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	now := time.Now().UTC()
-
-	closeQuery := `UPDATE rotation_epochs SET end_time = $1 WHERE schedule_id = $2 AND layer = $3 AND end_time IS NULL`
-	if _, err := tx.Exec(closeQuery, now, scheduleID, "l1"); err != nil {
-		return err
-	}
-
-	if len(groups) > 0 {
-		groupsJSON, _ := json.Marshal(groups)
-		insertQuery := `INSERT INTO rotation_epochs (id, schedule_id, layer, user_ids, start_time, end_time, created_at)
-					    VALUES ($1, $2, $3, $4, $5, $6, $7)`
-		_, err := tx.Exec(insertQuery, generateUUID(), scheduleID, "l1", string(groupsJSON), now, nil, now)
-		if err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
-}
-
-func (s *Store) GetScheduleGroups(scheduleID, layer string) ([][]*model.User, error) {
-	epoch, err := s.GetCurrentEpoch(scheduleID, layer)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return [][]*model.User{}, nil
-		}
-		return nil, err
-	}
-
-	var result [][]*model.User
-	for _, group := range epoch.Groups {
-		var users []*model.User
-		for _, userID := range group {
-			u, err := s.GetUserByID(userID)
-			if err != nil {
-				return nil, fmt.Errorf("user %s not found in rotation: %w", userID, err)
-			}
-			users = append(users, u)
-		}
-		result = append(result, users)
-	}
-	return result, nil
-}
-
 // ========================================
 // Schedule Overrides
 // ========================================
-
-func (s *Store) CreateScheduleOverride(o *model.ScheduleOverride) error {
-	if o.CreatedAt.IsZero() {
-		o.CreatedAt = time.Now()
-	}
-	query := `INSERT INTO schedule_overrides (id, schedule_id, user_id, start_time, end_time, reason, created_by, created_at)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
-	_, err := s.db.Exec(query, o.ID, o.ScheduleID, o.UserID, o.StartTime, o.EndTime, o.Reason, o.CreatedBy, o.CreatedAt)
-	return err
-}
-
-func (s *Store) GetScheduleOverrides(scheduleID string, from, until time.Time) ([]*model.ScheduleOverride, error) {
-	query := `SELECT o.id, o.schedule_id, o.user_id, o.start_time, o.end_time, o.reason, o.created_by, o.created_at,
-			         u.id, u.email, u.name
-			  FROM schedule_overrides o
-			  JOIN users u ON o.user_id = u.id
-			  WHERE o.schedule_id = $1 AND o.start_time < $2 AND o.end_time > $3
-			  ORDER BY o.start_time`
-	rows, err := s.db.Query(query, scheduleID, until, from)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var overrides []*model.ScheduleOverride
-	for rows.Next() {
-		var o model.ScheduleOverride
-		var reason, createdBy sql.NullString
-		var u model.User
-
-		if err := rows.Scan(&o.ID, &o.ScheduleID, &o.UserID, &o.StartTime, &o.EndTime, &reason, &createdBy, &o.CreatedAt,
-			&u.ID, &u.Email, &u.Name); err != nil {
-			return nil, err
-		}
-		o.Reason = reason.String
-		o.CreatedBy = createdBy.String
-		o.User = &u
-		overrides = append(overrides, &o)
-	}
-	return overrides, nil
-}
-
-// OverrideBelongsToSchedule checks if an override belongs to a schedule
-func (s *Store) OverrideBelongsToSchedule(overrideID, scheduleID string) (bool, error) {
-	var exists bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schedule_overrides WHERE id = $1 AND schedule_id = $2)`, overrideID, scheduleID).Scan(&exists)
-	if err != nil {
-		return false, err
-	}
-	return exists, nil
-}
-
-func (s *Store) DeleteScheduleOverride(id string) error {
-	_, err := s.db.Exec(`DELETE FROM schedule_overrides WHERE id = $1`, id)
-	return err
-}
-
-func (s *Store) UpdateScheduleOverride(o *model.ScheduleOverride) error {
-	query := `UPDATE schedule_overrides SET user_id = $1, start_time = $2, end_time = $3, reason = $4
-			  WHERE id = $5`
-	res, err := s.db.Exec(query, o.UserID, o.StartTime, o.EndTime, o.Reason, o.ID)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
 
 // ========================================
 // Rotation Epochs
 // ========================================
 
-// CreateRotationEpoch creates a new rotation epoch
-func (s *Store) CreateRotationEpoch(epoch *model.RotationEpoch) error {
-	if epoch.CreatedAt.IsZero() {
-		epoch.CreatedAt = time.Now()
-	}
-	groupsJSON, _ := json.Marshal(epoch.Groups)
-	query := `INSERT INTO rotation_epochs (id, schedule_id, layer, user_ids, start_time, end_time, created_at)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7)`
-	_, err := s.db.Exec(query, epoch.ID, epoch.ScheduleID, epoch.Layer, string(groupsJSON), epoch.StartTime, epoch.EndTime, epoch.CreatedAt)
-	return err
-}
-
-// CloseCurrentEpoch closes the current epoch for a schedule/layer by setting end_time
-func (s *Store) CloseCurrentEpoch(scheduleID, layer string, endTime time.Time) error {
-	query := `UPDATE rotation_epochs SET end_time = $1 WHERE schedule_id = $2 AND layer = $3 AND end_time IS NULL`
-	_, err := s.db.Exec(query, endTime, scheduleID, layer)
-	return err
-}
-
-// GetRotationEpochs returns epochs that overlap with the given time range
-func (s *Store) GetRotationEpochs(scheduleID, layer string, from, until time.Time) ([]*model.RotationEpoch, error) {
-	query := `SELECT id, schedule_id, layer, user_ids, start_time, end_time, created_at
-			  FROM rotation_epochs
-			  WHERE schedule_id = $1 AND layer = $2
-			    AND start_time < $3
-			    AND (end_time IS NULL OR end_time > $4)
-			  ORDER BY start_time`
-	rows, err := s.db.Query(query, scheduleID, layer, until, from)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var epochs []*model.RotationEpoch
-	for rows.Next() {
-		var e model.RotationEpoch
-		var userIDsJSON string
-		var endTime sql.NullTime
-
-		if err := rows.Scan(&e.ID, &e.ScheduleID, &e.Layer, &userIDsJSON, &e.StartTime, &endTime, &e.CreatedAt); err != nil {
-			return nil, err
-		}
-
-		_ = json.Unmarshal([]byte(userIDsJSON), &e.Groups)
-		if endTime.Valid {
-			e.EndTime = &endTime.Time
-		}
-		epochs = append(epochs, &e)
-	}
-	return epochs, nil
-}
-
-// GetCurrentEpoch returns the current (open) epoch for a schedule/layer
-func (s *Store) GetCurrentEpoch(scheduleID, layer string) (*model.RotationEpoch, error) {
-	query := `SELECT id, schedule_id, layer, user_ids, start_time, end_time, created_at
-			  FROM rotation_epochs
-			  WHERE schedule_id = $1 AND layer = $2 AND end_time IS NULL
-			  ORDER BY start_time DESC LIMIT 1`
-	row := s.db.QueryRow(query, scheduleID, layer)
-
-	var e model.RotationEpoch
-	var userIDsJSON string
-	var endTime sql.NullTime
-
-	err := row.Scan(&e.ID, &e.ScheduleID, &e.Layer, &userIDsJSON, &e.StartTime, &endTime, &e.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-
-	_ = json.Unmarshal([]byte(userIDsJSON), &e.Groups)
-	if endTime.Valid {
-		e.EndTime = &endTime.Time
-	}
-	return &e, nil
-}
-
 // ========================================
 // API Tokens CRUD
 // ========================================
 
-// CreateAPIToken creates a new API token
+// CreateAPIToken issues a token, and only to a user who has not been erased.
+// A credential is the last thing an erased identity should get back.
 func (s *Store) CreateAPIToken(token *model.APIToken) error {
 	if token.CreatedAt.IsZero() {
 		token.CreatedAt = time.Now()
 	}
-	query := `INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, created_at) 
-			  VALUES ($1, $2, $3, $4, $5, $6)`
-	_, err := s.db.Exec(query, token.ID, token.UserID, token.Name, token.TokenHash, token.ExpiresAt, token.CreatedAt)
-	return err
+	query := activeUserCTE + `
+		INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, created_at)
+		SELECT $2, active.id, $3, $4, $5, $6 FROM active`
+	res, err := s.db.Exec(query, token.UserID, token.ID, token.Name, token.TokenHash, token.ExpiresAt, token.CreatedAt)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 // GetAPITokenByHash retrieves an API token by its hash
@@ -2864,9 +2666,18 @@ func (s *Store) GetAPITokenByID(id string) (*model.APIToken, error) {
 	return &token, nil
 }
 
+// GetAPITokenByHash resolves a bearer token, and a token belonging to an
+// erased user does not resolve.
+//
+// The join is what makes soft delete terminal on this path. The cookie path
+// checks the user; without this, a token that outlived its owner by a race
+// would keep authenticating one, and Bearer requests never look at users at
+// all.
 func (s *Store) GetAPITokenByHash(hash string) (*model.APIToken, error) {
-	query := `SELECT id, user_id, name, token_hash, expires_at, last_used_at, created_at 
-			  FROM api_tokens WHERE token_hash = $1`
+	query := `SELECT t.id, t.user_id, t.name, t.token_hash, t.expires_at, t.last_used_at, t.created_at
+			  FROM api_tokens t
+			  JOIN users u ON u.id = t.user_id AND u.deleted_at IS NULL
+			  WHERE t.token_hash = $1`
 	row := s.db.QueryRow(query, hash)
 
 	var token model.APIToken
@@ -3186,23 +2997,44 @@ func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 		return nil, err
 	}
 
-	// 2. Teams without on-call (no schedule, no open L1 epoch, or empty L1 rotation)
+	// 2. Teams without on-call: no schedule, or one whose configuration in force
+	// puts nobody on duty.
+	//
+	// The state is read from the revision in force (the open-ended tail), which
+	// is the only place the configuration lives. Two predicates are not
+	// obvious and are both deliberate: deleted_at excludes soft-deleted
+	// schedules, which the pre-revision version of this query could not have,
+	// and l1.enabled is checked because a disabled layer keeps its groups in the
+	// snapshot - only the phase pair is cleared - so groups alone would report a
+	// switched-off rotation as covered.
 	err = s.db.QueryRow(`
-		SELECT COUNT(*) FROM teams t
-		LEFT JOIN schedules s ON t.id = s.team_id
-		LEFT JOIN rotation_epochs re ON s.id = re.schedule_id AND re.layer = 'l1' AND re.end_time IS NULL
-			AND json_array_length(re.user_ids::json) > 0
-		WHERE s.id IS NULL OR re.id IS NULL`).Scan(&snap.TeamsWithoutOnCall)
+		SELECT COUNT(*) FROM teams t WHERE NOT EXISTS (
+			SELECT 1 FROM schedules s
+			JOIN schedule_revisions r ON r.schedule_id = s.id AND r.effective_to IS NULL
+			WHERE s.team_id = t.id AND s.deleted_at IS NULL AND r.kind = 'active'
+			  AND (r.snapshot->'l1'->>'enabled')::boolean
+			  AND jsonb_array_length(r.snapshot->'l1'->'groups') > 0)`).Scan(&snap.TeamsWithoutOnCall)
 	if err != nil {
 		return nil, fmt.Errorf("teams without oncall query: %w", err)
 	}
 
-	// 3. Teams with permanent on-call (single user in L1 rotation)
+	// 3. Teams with permanent on-call: exactly one person carries L1, forever.
+	//
+	// "Exactly one person", not "exactly one group". The two were the same thing
+	// when user_ids was a flat list of users, and the query said so; the
+	// migration that turned that column into a list of GROUPS silently redefined
+	// the same length check, and a single group of several people has counted as
+	// a permanent on-call ever since - though those people are all paged
+	// together and nobody is alone. This restores what the metric has always
+	// claimed to measure (see its HELP text): bus factor one.
 	err = s.db.QueryRow(`
-		SELECT COUNT(*) FROM rotation_epochs re
-		JOIN schedules s ON re.schedule_id = s.id
-		WHERE re.layer = 'l1' AND re.end_time IS NULL
-		AND json_array_length(re.user_ids::json) = 1`).Scan(&snap.TeamsWithPermanentOnCall)
+		SELECT COUNT(*) FROM schedules s
+		JOIN schedule_revisions r ON r.schedule_id = s.id AND r.effective_to IS NULL
+		WHERE s.deleted_at IS NULL AND r.kind = 'active'
+		  AND (r.snapshot->'l1'->>'enabled')::boolean
+		  AND jsonb_array_length(r.snapshot->'l1'->'groups') = 1
+		  AND jsonb_array_length(r.snapshot->'l1'->'groups'->0->'members') = 1`).
+		Scan(&snap.TeamsWithPermanentOnCall)
 	if err != nil {
 		return nil, fmt.Errorf("teams with permanent oncall query: %w", err)
 	}

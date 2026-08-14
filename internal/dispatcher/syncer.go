@@ -8,10 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/scheduler"
-	"github.com/tokayops/tokayops/internal/store"
 	"github.com/slack-go/slack"
+	"github.com/tokayops/tokayops/internal/metrics"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
 // cacheTTL defines how long a cache entry is valid before forcing a refresh.
@@ -25,7 +24,12 @@ type cacheEntry struct {
 
 // UsergroupSyncer synchronizes Slack usergroups with current on-call users.
 type UsergroupSyncer struct {
-	store        store.StoreInterface
+	// Only identities are read from the store: the usergroup and its members
+	// come from the projection, and reading either from anywhere else would be a
+	// second source of truth for them. The narrow type is what says so without a
+	// comment having to.
+	store        identityLookup
+	oncall       onCallLister
 	slackClient  *slack.Client
 	syncInterval time.Duration
 
@@ -38,7 +42,8 @@ type UsergroupSyncer struct {
 // Start/Stop are non-blocking - old syncer will stop asynchronously when its context is cancelled.
 // Uses generation-based cleanup to detect dead syncers and allow restart.
 type UsergroupSyncerManager struct {
-	store        store.StoreInterface
+	store        identityLookup
+	oncall       onCallLister
 	syncInterval time.Duration
 
 	mu           sync.Mutex
@@ -48,9 +53,10 @@ type UsergroupSyncerManager struct {
 }
 
 // NewUsergroupSyncerManager creates a new manager for UsergroupSyncer.
-func NewUsergroupSyncerManager(st store.StoreInterface, interval time.Duration) *UsergroupSyncerManager {
+func NewUsergroupSyncerManager(st identityLookup, oncall onCallLister, interval time.Duration) *UsergroupSyncerManager {
 	return &UsergroupSyncerManager{
 		store:        st,
+		oncall:       oncall,
 		syncInterval: interval,
 	}
 }
@@ -83,7 +89,7 @@ func (m *UsergroupSyncerManager) Start(ctx context.Context, slackToken string) {
 
 	syncerCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
-	syncer := NewUsergroupSyncer(m.store, slackToken, m.syncInterval)
+	syncer := NewUsergroupSyncer(m.store, m.oncall, slackToken, m.syncInterval)
 
 	gen := m.generation
 	go func() {
@@ -118,9 +124,10 @@ func (m *UsergroupSyncerManager) IsRunning() bool {
 }
 
 // NewUsergroupSyncer creates a new usergroup syncer.
-func NewUsergroupSyncer(st store.StoreInterface, slackToken string, interval time.Duration) *UsergroupSyncer {
+func NewUsergroupSyncer(st identityLookup, oncall onCallLister, slackToken string, interval time.Duration) *UsergroupSyncer {
 	return &UsergroupSyncer{
 		store:        st,
+		oncall:       oncall,
 		slackClient:  slack.New(slackToken),
 		syncInterval: interval,
 		cache:        make(map[string]cacheEntry),
@@ -170,78 +177,62 @@ func (s *UsergroupSyncer) Run(ctx context.Context) {
 	}
 }
 
-// SyncAll syncs all schedules that have a usergroup configured.
+// SyncAll syncs every schedule that has a usergroup configured.
+//
+// The usergroup comes from the snapshot of the revision in force, not from a
+// column on the schedule row: the editor writes it into the configuration, and
+// the row's copy is not maintained on the revision path at all - which is how a
+// sync that "succeeded over 0 schedules" was the honest report of a filter on a
+// column nothing writes.
 func (s *UsergroupSyncer) SyncAll(ctx context.Context) error {
-	schedules, err := s.store.GetSchedulesWithUsergroup()
+	started := time.Now()
+	bulk, err := s.oncall.CurrentOnCallForAllNow(ctx)
+	metrics.ScheduleOnCallProjectionDuration.
+		WithLabelValues(metrics.ConsumerUsergroupSyncer).Observe(time.Since(started).Seconds())
 	if err != nil {
 		return err
 	}
 
-	for _, schedule := range schedules {
-		if err := s.SyncSchedule(ctx, schedule); err != nil {
-			log.Printf("[UsergroupSyncer] Failed to sync schedule %s: %v", schedule.ID, err)
+	for _, failure := range bulk.Failures {
+		// A group cannot be synced to a membership that could not be read.
+		// Leaving the group as it stands is the conservative end: it holds
+		// whoever was on duty when the schedule was last readable.
+		log.Printf("[UsergroupSyncer] Schedule %s (team %s) could not be projected (%s): %v",
+			failure.ScheduleID, failure.TeamID, failure.Reason, failure.Err)
+		metrics.ScheduleOnCallProjectionFailuresTotal.
+			WithLabelValues(metrics.ConsumerUsergroupSyncer, string(failure.Reason)).Inc()
+	}
+
+	for _, sc := range bulk.Schedules {
+		// Deleting a schedule has never emptied its usergroup, and this is not
+		// where that changes. To the syncer a deleted schedule is simply
+		// nothing to sync; to the handoff notifier the same row is an event,
+		// which is why the projection reports it and each consumer decides.
+		if sc.DeletedAt != nil || sc.SlackUsergroupID == "" {
+			continue
+		}
+		if err := s.SyncSchedule(ctx, sc); err != nil {
+			log.Printf("[UsergroupSyncer] Failed to sync schedule %s: %v", sc.ScheduleID, err)
 		}
 	}
 	return nil
 }
 
-// SyncSchedule syncs a single schedule's usergroup with the current on-call user.
-func (s *UsergroupSyncer) SyncSchedule(ctx context.Context, schedule *model.Schedule) error {
-	now := time.Now().UTC()
-
-	l1Epochs, err := s.store.GetRotationEpochs(schedule.ID, "l1", now, now.Add(32*24*time.Hour))
-	if err != nil {
-		return err
+// SyncSchedule syncs one schedule's usergroup with its current on-call group.
+func (s *UsergroupSyncer) SyncSchedule(ctx context.Context, sc schedulerender.ScheduleOnCall) error {
+	if sc.SlackUsergroupID == "" {
+		return nil
 	}
-	if len(l1Epochs) == 0 {
-		log.Printf("[UsergroupSyncer] No L1 epochs for schedule %s (team %s), skipping", schedule.ID, schedule.TeamID)
+	if sc.OnCall.L1 == nil || len(sc.OnCall.L1.UserIDs) == 0 {
+		log.Printf("[UsergroupSyncer] Nobody on call for schedule %s, skipping", sc.ScheduleID)
 		return nil
 	}
 
-	overrides, err := s.store.GetScheduleOverrides(schedule.ID, now, now.Add(32*24*time.Hour))
-	if err != nil {
-		return err
-	}
-
-	// Build user map
-	userIDs := make(map[string]bool)
-	for _, epoch := range l1Epochs {
-		for _, group := range epoch.Groups {
-			for _, uid := range group {
-				userIDs[uid] = true
-			}
-		}
-	}
-	for _, o := range overrides {
-		userIDs[o.UserID] = true
-	}
-
-	uniqueIDs := make([]string, 0, len(userIDs))
-	for id := range userIDs {
-		uniqueIDs = append(uniqueIDs, id)
-	}
-
-	fetchedUsers, err := s.store.GetUsersByIDs(uniqueIDs)
-	if err != nil {
-		return err
-	}
-	users := make(map[string]*model.User)
-	for _, u := range fetchedUsers {
-		users[u.ID] = u
-	}
-
-	result := scheduler.GetCurrentOnCall(schedule, l1Epochs, nil, overrides, users, now)
-
-	if len(result.L1Users) == 0 {
-		log.Printf("[UsergroupSyncer] No L1 users for schedule %s, skipping", schedule.ID)
-		return nil
-	}
+	// The projection has already overlaid any active override, so this is who
+	// is really on duty - there is no override branch to take here.
+	l1UserIDs := sc.OnCall.L1.UserIDs
 
 	// Batch-fetch Slack external identities for the L1 group; users without one are skipped.
-	l1UserIDs := make([]string, 0, len(result.L1Users))
-	for _, u := range result.L1Users {
-		l1UserIDs = append(l1UserIDs, u.ID)
-	}
 	identities, err := s.store.GetIdentitiesForUsers(l1UserIDs)
 	if err != nil {
 		return err
@@ -257,18 +248,17 @@ func (s *UsergroupSyncer) SyncSchedule(ctx context.Context, schedule *model.Sche
 	}
 
 	var slackIDs []string
-	for _, u := range result.L1Users {
-		ext := slackByUser[u.ID]
+	for _, uid := range l1UserIDs {
+		ext := slackByUser[uid]
 		if ext == "" {
-			log.Printf("[UsergroupSyncer] WARN: L1 user %s (%s) has no slack identity, skipping",
-				u.Name, u.Email)
+			log.Printf("[UsergroupSyncer] WARN: L1 user %s has no slack identity, skipping", uid)
 			continue
 		}
 		slackIDs = append(slackIDs, ext)
 	}
 	if len(slackIDs) == 0 {
 		log.Printf("[UsergroupSyncer] No L1 users with slack identity for schedule %s, cannot sync usergroup %s",
-			schedule.ID, schedule.SlackUsergroupID)
+			sc.ScheduleID, sc.SlackUsergroupID)
 		return nil
 	}
 
@@ -276,22 +266,22 @@ func (s *UsergroupSyncer) SyncSchedule(ctx context.Context, schedule *model.Sche
 	joinedIDs := strings.Join(slackIDs, ",")
 
 	// Check cache - skip if unchanged and not expired
-	if cached, ok := s.getCache(schedule.SlackUsergroupID); ok {
+	if cached, ok := s.getCache(sc.SlackUsergroupID); ok {
 		if cached.slackIDs == joinedIDs && time.Since(cached.updatedAt) < cacheTTL {
 			return nil
 		}
 	}
 
 	// Update Slack usergroup with all on-call users
-	_, err = s.slackClient.UpdateUserGroupMembersContext(ctx, schedule.SlackUsergroupID, joinedIDs)
+	_, err = s.slackClient.UpdateUserGroupMembersContext(ctx, sc.SlackUsergroupID, joinedIDs)
 	if err != nil {
-		log.Printf("[UsergroupSyncer] Failed to update usergroup %s: %v", schedule.SlackUsergroupID, err)
+		log.Printf("[UsergroupSyncer] Failed to update usergroup %s: %v", sc.SlackUsergroupID, err)
 		return err
 	}
 
-	s.setCache(schedule.SlackUsergroupID, joinedIDs)
+	s.setCache(sc.SlackUsergroupID, joinedIDs)
 	log.Printf("[UsergroupSyncer] Updated usergroup %s with users %s",
-		schedule.SlackUsergroupID, joinedIDs)
+		sc.SlackUsergroupID, joinedIDs)
 
 	return nil
 }

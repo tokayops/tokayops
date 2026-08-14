@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
 )
 
 // seedDefaultTeams creates the teams commonly used by ingester tests in the mock store.
@@ -689,8 +689,8 @@ func TestResolveCreatesOutboxEvent(t *testing.T) {
 	ag := &model.AlertGroup{
 		ID: "ag-outbox-resolve", DedupKey: "outbox-resolve-group",
 		Status: model.AlertGroupStatusTriggered, TeamID: "devops", TeamNameSnapshot: "DevOps",
-		Severity: "critical",
-		Alerts:   []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
+		Severity:  "critical",
+		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -735,8 +735,8 @@ func TestResolveFromNewStatus(t *testing.T) {
 	ag := &model.AlertGroup{
 		ID: "ag-new-resolve", DedupKey: "new-resolve-group",
 		Status: model.AlertGroupStatusNew, TeamID: "devops", TeamNameSnapshot: "DevOps",
-		Severity: "warning",
-		Alerts:   []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
+		Severity:  "warning",
+		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)

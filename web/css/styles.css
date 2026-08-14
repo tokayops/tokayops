@@ -6415,3 +6415,22 @@ body::before {
         transform: translateY(0);
     }
 }
+/* An ambiguous local time states which of the two moments it took, and offers
+   the other. Presented inline in the note so the choice sits with the reason
+   it exists rather than in a separate control. */
+.override-fold-toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    margin-left: 6px;
+    color: var(--accent-primary);
+    cursor: pointer;
+    font: inherit;
+    text-decoration: underline;
+}
+
+/* Failing to read who is on call is not the same as nobody being on call. */
+.on-call-user-name.is-unavailable,
+.oncall-status-badge.unavailable {
+    color: var(--status-critical, #dc2626);
+}

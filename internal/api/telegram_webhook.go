@@ -13,12 +13,12 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rbac"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
 )
 
 // telegramMeta is the metadata attached to timeline events originating from Telegram.
