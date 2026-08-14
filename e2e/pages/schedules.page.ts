@@ -28,8 +28,7 @@ export class SchedulesPage {
   readonly l1GroupsEditor: Locator;
   readonly l1AddGroupBtn: Locator;
 
-  // L2 user lists (still flat)
-  readonly l2AvailableList: Locator;
+  // The L2 order: flat, one person per row
   readonly l2UsersList: Locator;
 
   // Override modal
@@ -92,8 +91,6 @@ export class SchedulesPage {
     this.l1GroupsEditor = page.locator('#l1-groups-editor');
     this.l1AddGroupBtn = page.locator('#l1-add-group');
 
-    // L2 user lists (still flat sortable)
-    this.l2AvailableList = page.locator('#l2-available');
     this.l2UsersList = page.locator('#l2-users-list');
 
     // Override modal (also uses generic modal-overlay)
@@ -209,7 +206,7 @@ export class SchedulesPage {
   }
 
   async getL2UserCount(): Promise<number> {
-    return await this.l2UsersList.locator('.rotation-user').count();
+    return await this.l2UsersList.locator('.group-row').count();
   }
 
   /**
@@ -242,6 +239,36 @@ export class SchedulesPage {
   async deleteL1Group(groupIndex: number) {
     const row = this.l1GroupsEditor.locator('.group-row').nth(groupIndex);
     await row.locator('.group-delete').click();
+  }
+
+  /**
+   * Add someone to the L2 backup order from the picker.
+   */
+  async addL2User(userId: string) {
+    await this.page.locator('#l2-add-user').selectOption(userId);
+  }
+
+  /**
+   * Remove the person at the given position from the L2 backup order.
+   */
+  async removeL2User(index: number) {
+    await this.l2UsersList.locator('.group-row').nth(index).locator('.group-delete').click();
+  }
+
+  /**
+   * The backup order as it stands in the editor, top to bottom.
+   */
+  async getL2UserIds(): Promise<string[]> {
+    return await this.l2UsersList.locator('.group-row')
+      .evaluateAll(rows => rows.map(r => (r as HTMLElement).dataset.userId || ''));
+  }
+
+  /**
+   * The visible position numbers of the L2 rows, top to bottom.
+   */
+  async getL2Positions(): Promise<string[]> {
+    return await this.l2UsersList.locator('.group-row .group-label')
+      .evaluateAll(labels => labels.map(l => l.textContent?.trim() || ''));
   }
 
   async saveSchedule() {
