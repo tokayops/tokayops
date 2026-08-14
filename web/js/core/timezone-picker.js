@@ -104,10 +104,22 @@ export function initTimezonePicker(containerId, options = {}) {
     // Append to body to escape modal overflow clipping
     document.body.appendChild(dropdown);
 
+    // The panel lists "Region/City  UTC+05:30", which needs room the trigger
+    // does not: the trigger is sized by whatever zone is currently selected,
+    // and inside a compact row that can be narrow enough to clip every name in
+    // the list down to "Pac...". The panel is a floating layer, so it can be
+    // wider than what opened it.
+    const MIN_DROPDOWN_WIDTH = 260;
+    const VIEWPORT_MARGIN = 8;
+
     function positionDropdown() {
         const rect = display.getBoundingClientRect();
-        dropdown.style.left = rect.left + 'px';
-        dropdown.style.width = rect.width + 'px';
+        const width = Math.max(rect.width, MIN_DROPDOWN_WIDTH);
+        dropdown.style.width = width + 'px';
+        // Aligned to the trigger, but never past the right edge - widening it
+        // is what makes that reachable.
+        const maxLeft = window.innerWidth - width - VIEWPORT_MARGIN;
+        dropdown.style.left = Math.max(VIEWPORT_MARGIN, Math.min(rect.left, maxLeft)) + 'px';
         // Show below button, or above if not enough space below
         const spaceBelow = window.innerHeight - rect.bottom;
         const dropdownHeight = 290; // search + list max-height
@@ -126,6 +138,11 @@ export function initTimezonePicker(containerId, options = {}) {
 
     function updateDisplay() {
         const info = getTzInfo(currentValue);
+        // Named as well as read out. The trigger's text is the zone it is
+        // showing, which tells someone what is selected but not what the
+        // control is for - and where this sits without a visible label, that
+        // is the only thing saying so.
+        display.setAttribute('aria-label', `Timezone: ${info.name}`);
         display.innerHTML = `
             <span class="tz-picker-value">${escapeHtml(info.name)}</span>
             <span class="tz-picker-offset">${info.offset}</span>

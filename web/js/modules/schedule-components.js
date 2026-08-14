@@ -196,11 +196,25 @@ export function assignmentTimes(layer) {
  * Render on-call list header (similar to teams list header)
  */
 export function onCallListHeader() {
+    // The column is in the reader's timezone, and says so. This list puts
+    // every team on one screen, and each schedule keeps its own zone: shown
+    // in those, two rows reading "12:00 PM" would be different instants. One
+    // scale is the right answer here - the reader's - and the calendar, which
+    // is about one schedule, stays in that schedule's.
+    //
+    // The zone is named beside the column, short form, with the full name in
+    // the title: "GMT+3" fits on the line where "Europe/Moscow" would not.
+    const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const shortZone = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' })
+        .formatToParts(new Date())
+        .find(part => part.type === 'timeZoneName')?.value || '';
     return `
         <div class="oncall-list-header">
             <div class="oncall-cell oncall-cell-primary">Team</div>
             <div class="oncall-cell">On-Call</div>
-            <div class="oncall-cell">Until</div>
+            <div class="oncall-cell" title="Shown in your timezone${localZone ? ` (${escapeAttr(localZone)})` : ''}">
+                Until${shortZone ? ` <span class="oncall-cell-note">${escapeHtml(shortZone)}</span>` : ''}
+            </div>
             <div class="oncall-cell">Status</div>
             <div class="oncall-cell oncall-cell-actions"></div>
         </div>
@@ -410,30 +424,34 @@ export function scheduleConfigModal(state, teamId) {
 
     const nameOf = (id) => names.get(id) || id;
 
-    // The L2 order can name someone who has since left the team. They are
-    // shown so they can be seen and removed; they are not in `members`, so
-    // the picker will not offer them again.
-    const l2SelectedIds = new Set(l2UserIds);
-    const l2Available = members.filter(u => !l2SelectedIds.has(u.id));
-
-    const renderUserItem = (id, name) => `
-        <div class="rotation-user" data-user-id="${escapeAttr(id)}">
-            <i data-lucide="grip-vertical" class="drag-handle"></i>
-            <div class="rotation-user-avatar">${escapeHtml((name || '?').charAt(0).toUpperCase())}</div>
-            <span class="rotation-user-name">${escapeHtml(name)}</span>
+    // An L2 row is an L1 group row carrying one person, because that is what
+    // an L2 slot is: the API takes a flat order and the server turns each
+    // entry into a group of one. Same shape, same handle, same trash - the
+    // difference between the layers stays in what they mean, not in how they
+    // are operated.
+    //
+    // Kept in step with createL2Row in schedule-editor.js, as the L1 pair is.
+    const renderL2Row = (id, index) => `
+        <div class="group-row user-row" data-user-id="${escapeAttr(id)}">
+            <i data-lucide="grip-vertical" class="group-drag-handle"></i>
+            <span class="group-label" aria-label="Position ${index + 1}">${index + 1}</span>
+            <span class="row-name" title="${escapeAttr(nameOf(id))}">${escapeHtml(nameOf(id))}</span>
+            <button type="button" class="btn btn-icon btn-sm group-delete" aria-label="Remove from rotation">
+                <i data-lucide="trash-2"></i>
+            </button>
         </div>
-    `;
+    `.trim();
 
     const renderUserChip = (id) => `
         <span class="user-chip" data-user-id="${escapeAttr(id)}">
-            ${escapeHtml(nameOf(id))}
+            <span class="chip-name" title="${escapeAttr(nameOf(id))}">${escapeHtml(nameOf(id))}</span>
             <button type="button" class="chip-remove" aria-label="Remove">×</button>
         </span>
     `;
 
     const renderAddUserSelect = () => `
-        <select class="form-select group-add-user">
-            <option value="">+ Add user</option>
+        <select class="form-select group-add-user" aria-label="Add a user to this group">
+            <option value="">+ Add</option>
             ${members.map(u => `<option value="${escapeAttr(u.id)}">${escapeHtml(u.name)}</option>`).join('')}
         </select>
     `;
@@ -441,10 +459,14 @@ export function scheduleConfigModal(state, teamId) {
     // data-group-id is the row's identity, and it is what lets the server
     // tell "this group gained a member" from "the groups were replaced".
     // Losing it across a reorder would restart the rotation.
+    //
+    // The ordinal is the group's place in the rotation, so it is shown as a
+    // number rather than as the words "Group 3": the position is the
+    // information, and the noun is already in the panel heading.
     const renderGroupRow = (group, index) => `
         <div class="group-row" data-group-id="${escapeAttr(group.id)}">
             <i data-lucide="grip-vertical" class="group-drag-handle"></i>
-            <span class="group-label">Group ${index + 1}</span>
+            <span class="group-label" aria-label="Group ${index + 1}">${index + 1}</span>
             <div class="group-chips">
                 ${(group.user_ids || []).map(renderUserChip).join('')}
             </div>
@@ -453,7 +475,7 @@ export function scheduleConfigModal(state, teamId) {
                 <i data-lucide="trash-2"></i>
             </button>
         </div>
-    `;
+    `.trim();
 
     const dayOption = (value, label, selected) =>
         `<option value="${value}" ${selected === value ? 'selected' : ''}>${label}</option>`;
@@ -484,165 +506,181 @@ export function scheduleConfigModal(state, teamId) {
                 </div>
             </div>
             ` : ''}
-            <div class="schedule-config-grid">
-                <!-- Left Column: Settings -->
-                <div class="schedule-settings">
-                    <div class="form-section">
-                        <h4 class="form-section-title">
-                            <i data-lucide="globe"></i>
-                            General Settings
-                        </h4>
-                        <div class="form-group">
-                            <label for="schedule-timezone">Timezone</label>
-                            <div id="schedule-timezone" class="tz-picker" data-name="timezone"></div>
-                        </div>
-                        <div class="form-group">
-                            <label for="slack-usergroup-id">
-                                Slack Usergroup
-                                <span class="tooltip-icon" data-tooltip="Syncs @usergroup with current on-call. Get ID: Slack → Usergroup Settings → Copy ID">
-                                    <i data-lucide="info" style="width:14px;height:14px;opacity:0.6;vertical-align:middle;margin-left:4px;"></i>
-                                </span>
-                            </label>
-                            <input type="text" id="slack-usergroup-id" name="slack_usergroup_id"
-                                   class="form-input"
-                                   value="${escapeAttr(config?.slack_usergroup_id || '')}"
-                                   placeholder="S12345678">
-                        </div>
-                    </div>
+            <div class="schedule-editor">
+                <!--
+                    The cadence reads as a sentence rather than as four labelled
+                    fields. It is one fact - when the shift changes hands - and
+                    splitting it into stacked form groups was what made the
+                    left column taller than everything it was next to.
 
-                    <div class="form-section">
-                        <h4 class="form-section-title">
-                            <i data-lucide="clock"></i>
-                            Rotation Settings
-                        </h4>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="l1-rotation-type">Type</label>
-                                <select id="l1-rotation-type" name="l1_rotation_type" class="form-select">
-                                    <option value="daily" ${l1Daily ? 'selected' : ''}>Daily</option>
-                                    <option value="weekly" ${l1Daily ? '' : 'selected'}>Weekly</option>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label for="l1-handoff-time">Handoff</label>
-                                <input type="time" id="l1-handoff-time" name="l1_handoff_time"
-                                       value="${escapeAttr(l1.handoff_time || '11:00')}" class="form-input">
-                            </div>
-                        </div>
-                        <div class="form-group l1-weekly-only" style="${l1Daily ? 'display:none' : ''}">
-                            <label for="l1-handoff-day">Handoff Day</label>
-                            <select id="l1-handoff-day" name="l1_handoff_day" class="form-select">
-                                ${dayOptions(l1.handoff_day === null || l1.handoff_day === undefined ? 1 : l1.handoff_day)}
-                            </select>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h4 class="form-section-title">
-                            <label class="toggle-label">
-                                <input type="checkbox" id="l2-enabled" name="l2_enabled" ${l2Enabled ? 'checked' : ''}>
-                                <i data-lucide="shield"></i>
-                                L2 Escalation
-                            </label>
-                        </h4>
-                        <!--
-                            The L2 policy is sent whether or not the layer is on: the
-                            server validates both layers either way, and a disabled
-                            layer with no handoff time is not a valid configuration.
-                            Hidden, not omitted.
-                        -->
-                        <div class="l2-config" style="${l2Enabled ? '' : 'display:none'}">
-                            <div class="form-group">
-                                <label for="l2-escalation-timeout">Escalation after (minutes)</label>
-                                <input type="number" id="l2-escalation-timeout" name="l2_escalation_timeout"
-                                       value="${l2.escalation_timeout_minutes || 5}" min="1" max="1440" class="form-input">
-                            </div>
-                            <div class="form-row">
-                                <div class="form-group">
-                                    <label for="l2-rotation-type">Type</label>
-                                    <select id="l2-rotation-type" name="l2_rotation_type" class="form-select">
-                                        <option value="daily" ${l2Daily ? 'selected' : ''}>Daily</option>
-                                        <option value="weekly" ${l2Daily ? '' : 'selected'}>Weekly</option>
-                                    </select>
-                                </div>
-                                <div class="form-group">
-                                    <label for="l2-handoff-time">Handoff</label>
-                                    <input type="time" id="l2-handoff-time" name="l2_handoff_time"
-                                           value="${escapeAttr(l2.handoff_time || '11:00')}" class="form-input">
-                                </div>
-                            </div>
-                            <div class="form-group l2-weekly-only" style="${l2Daily ? 'display:none' : ''}">
-                                <label for="l2-handoff-day">Handoff Day</label>
-                                <select id="l2-handoff-day" name="l2_handoff_day" class="form-select">
-                                    ${dayOptions(l2.handoff_day === null || l2.handoff_day === undefined ? 1 : l2.handoff_day)}
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <div class="form-group">
-                            <label for="schedule-reason">Reason for this change <span class="form-optional">(optional)</span></label>
-                            <input type="text" id="schedule-reason" name="reason" class="form-input"
-                                   maxlength="200" placeholder="Recorded with this revision">
-                        </div>
-                    </div>
+                    "handing off <day>" is one element because the cadence
+                    binding hides a single node: a daily rotation has no
+                    handoff day, and the words have to go with the control.
+                -->
+                <!--
+                    The zone governs every time in this editor, L2's handoff
+                    included, so it sits above both sentences rather than
+                    inside one of them. In L1's it was also the widest control
+                    of the five, and the only reason the sentence needed a
+                    modal wide enough to hold it.
+                -->
+                <div class="schedule-timezone">
+                    <span id="schedule-timezone" class="tz-picker" data-name="timezone"></span>
                 </div>
 
-                <!-- Right Column: User Rotation -->
-                <div class="schedule-users">
-                    <div class="rotation-panel">
+                <div class="cadence-strip">
+                    <span class="cadence-word">rotates</span>
+                    <select id="l1-rotation-type" name="l1_rotation_type"
+                            class="form-select cadence-control" aria-label="Rotation cadence">
+                        <option value="daily" ${l1Daily ? 'selected' : ''}>daily</option>
+                        <option value="weekly" ${l1Daily ? '' : 'selected'}>weekly</option>
+                    </select>
+                    <span class="cadence-part l1-weekly-only" style="${l1Daily ? 'display:none' : ''}">
+                        <span class="cadence-word">handing off</span>
+                        <select id="l1-handoff-day" name="l1_handoff_day"
+                                class="form-select cadence-control" aria-label="Handoff day">
+                            ${dayOptions(l1.handoff_day === null || l1.handoff_day === undefined ? 1 : l1.handoff_day)}
+                        </select>
+                    </span>
+                    <span class="cadence-part">
+                        <span class="cadence-word">at</span>
+                        <input type="time" id="l1-handoff-time" name="l1_handoff_time"
+                               value="${escapeAttr(l1.handoff_time || '11:00')}"
+                               class="form-input cadence-control cadence-time" aria-label="Handoff time">
+                    </span>
+                </div>
+
+                <section class="rotation-panel">
+                    <div class="rotation-panel-head">
                         <h4 class="rotation-panel-title">
                             <i data-lucide="users"></i>
-                            L1 Primary Rotation
+                            L1 primary rotation
                         </h4>
-                        <p class="rotation-panel-hint">Each group rotates as a unit. Multiple users in one group share the on-call shift simultaneously.</p>
-                        <div class="groups-editor" id="l1-groups-editor">
-                            ${l1Groups.map((g, i) => renderGroupRow(g, i)).join('')}
-                        </div>
-                        <button type="button" class="btn btn-secondary btn-sm" id="l1-add-group">
-                            <i data-lucide="plus"></i>
-                            Add Group
-                        </button>
+                        <p class="rotation-panel-hint">A group takes the shift together; the next handoff moves it to the group below.</p>
+                    </div>
+                    <!-- No whitespace inside: the container's empty state is a
+                         :empty rule, and an indented newline is a text node.
+                         The row templates are trimmed for the same reason -
+                         deleting the last row must not leave one behind. -->
+                    <div class="groups-editor" id="l1-groups-editor">${l1Groups.map((g, i) => renderGroupRow(g, i)).join('')}</div>
+                    <button type="button" class="btn btn-secondary btn-sm" id="l1-add-group">
+                        <i data-lucide="plus"></i>
+                        Add group
+                    </button>
+                </section>
+
+                <section class="l2-section">
+                    <!--
+                        The timeout sits in the sentence that says what it is,
+                        rather than in the cadence strip below. It qualifies the
+                        escalation, not the rotation, and putting it there also
+                        left L2's strip a whole clause longer than L1's - two
+                        strips that say the same thing and do not look alike.
+
+                        The label stops at the title, so clicking the number
+                        does not toggle the layer.
+                    -->
+                    <div class="l2-toggle">
+                        <input type="checkbox" id="l2-enabled" name="l2_enabled" ${l2Enabled ? 'checked' : ''}>
+                        <i data-lucide="shield"></i>
+                        <label class="l2-toggle-title" for="l2-enabled">L2 escalation</label>
+                        <p class="l2-toggle-hint">
+                            Pages a backup rotation when L1 does not acknowledge in
+                            <!--
+                                A layer that is off has nothing to set, so the
+                                sentence keeps its number and loses its control.
+                                The input stays in the DOM either way: the L2
+                                policy is sent whether or not the layer is on.
+                            -->
+                            <span class="l2-timeout-static" ${l2Enabled ? 'hidden' : ''}>${escapeHtml(String(l2.escalation_timeout_minutes || 5))}</span>
+                            <input type="number" id="l2-escalation-timeout" name="l2_escalation_timeout"
+                                   value="${l2.escalation_timeout_minutes || 5}" min="1" max="1440"
+                                   class="form-input cadence-control cadence-number" aria-label="Escalate after, minutes"
+                                   ${l2Enabled ? '' : 'hidden'}>
+                            min.
+                        </p>
                     </div>
 
-                    <div class="rotation-panel l2-users-panel" style="${l2Enabled ? '' : 'display:none'}">
-                        <h4 class="rotation-panel-title">
-                            <i data-lucide="shield"></i>
-                            L2 Backup Rotation
-                        </h4>
-                        <div class="rotation-columns">
-                            <div class="rotation-column">
-                                <div class="rotation-column-header">Available</div>
-                                <div class="rotation-list" id="l2-available">
-                                    ${l2Available.map(u => renderUserItem(u.id, u.name)).join('')}
-                                </div>
-                            </div>
-                            <div class="rotation-column">
-                                <div class="rotation-column-header">On-Call Order</div>
-                                <div class="rotation-list rotation-list-selected" id="l2-users-list">
-                                    ${l2UserIds.map(id => renderUserItem(id, nameOf(id))).join('')}
-                                </div>
-                            </div>
+                    <!--
+                        The L2 policy is sent whether or not the layer is on: the
+                        server validates both layers either way, and a disabled
+                        layer with no handoff time is not a valid configuration.
+                        Hidden, not omitted.
+                    -->
+                    <div class="l2-config l2-users-panel" style="${l2Enabled ? '' : 'display:none'}">
+                        <div class="cadence-strip">
+                            <span class="cadence-word">rotates</span>
+                            <select id="l2-rotation-type" name="l2_rotation_type"
+                                    class="form-select cadence-control" aria-label="L2 rotation cadence">
+                                <option value="daily" ${l2Daily ? 'selected' : ''}>daily</option>
+                                <option value="weekly" ${l2Daily ? '' : 'selected'}>weekly</option>
+                            </select>
+                            <span class="cadence-part l2-weekly-only" style="${l2Daily ? 'display:none' : ''}">
+                                <span class="cadence-word">handing off</span>
+                                <select id="l2-handoff-day" name="l2_handoff_day"
+                                        class="form-select cadence-control" aria-label="L2 handoff day">
+                                    ${dayOptions(l2.handoff_day === null || l2.handoff_day === undefined ? 1 : l2.handoff_day)}
+                                </select>
+                            </span>
+                            <span class="cadence-part">
+                                <span class="cadence-word">at</span>
+                                <input type="time" id="l2-handoff-time" name="l2_handoff_time"
+                                       value="${escapeAttr(l2.handoff_time || '11:00')}"
+                                       class="form-input cadence-control cadence-time" aria-label="L2 handoff time">
+                            </span>
                         </div>
+                        <section class="rotation-panel">
+                            <div class="rotation-panel-head">
+                                <h4 class="rotation-panel-title">
+                                    <i data-lucide="list-ordered"></i>
+                                    Backup order
+                                </h4>
+                                <p class="rotation-panel-hint">One person stands by at a time; the next handoff moves the shift down the list.</p>
+                            </div>
+                            <div class="groups-editor" id="l2-users-list">${l2UserIds.map((id, i) => renderL2Row(id, i)).join('')}</div>
+                            <select class="l2-add-user" id="l2-add-user" aria-label="Add a person to the backup rotation">
+                                <option value="">+ Add person</option>
+                                ${members.map(u => `<option value="${escapeAttr(u.id)}">${escapeHtml(u.name)}</option>`).join('')}
+                            </select>
+                        </section>
+                    </div>
+                </section>
+
+                <div class="schedule-meta">
+                    <div class="form-group">
+                        <label for="slack-usergroup-id">
+                            Slack usergroup
+                            <span class="tooltip-icon" data-tooltip="Syncs @usergroup with current on-call. Get ID: Slack → Usergroup Settings → Copy ID">
+                                <i data-lucide="info" style="width:14px;height:14px;opacity:0.6;vertical-align:middle;margin-left:4px;"></i>
+                            </span>
+                        </label>
+                        <input type="text" id="slack-usergroup-id" name="slack_usergroup_id"
+                               class="form-input"
+                               value="${escapeAttr(config?.slack_usergroup_id || '')}"
+                               placeholder="S12345678">
+                    </div>
+                    <div class="form-group">
+                        <label for="schedule-reason">Reason for this change <span class="form-optional">(optional)</span></label>
+                        <input type="text" id="schedule-reason" name="reason" class="form-input"
+                               maxlength="200" placeholder="Recorded with this revision">
                     </div>
                 </div>
             </div>
 
             ${config && !state.deletedAt ? `
-            <div class="team-modal-section" style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border-color);">
-                <h4 class="team-modal-section-title" style="color: var(--severity-critical);">
+            <div class="schedule-danger">
+                <h4 class="schedule-danger-title">
                     <i data-lucide="alert-triangle"></i>
                     Danger Zone
                 </h4>
-                <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 12px;">
+                <p class="schedule-danger-text">
                     Deleting this schedule stops the rotation and clears its overrides.
                     Past shifts stay in the calendar, and the schedule can be recreated later.
                 </p>
                 <button type="button" class="btn btn-sm btn-danger delete-schedule-btn"
                         data-team-id="${escapeAttr(teamId)}">
-                    <i data-lucide="trash-2" style="width:14px;height:14px;"></i>
-                    Delete Schedule
+                    <i data-lucide="trash-2"></i>
+                    Delete schedule
                 </button>
             </div>
             ` : ''}
@@ -966,8 +1004,9 @@ export function monthlyScheduleCalendar(render, startDate, timezone = 'UTC', nam
  * @param {string} timezone
  */
 export function schedulePreview(preview, names = new Map(), timezone = 'UTC') {
+    const onCallAfter = onCallNames(preview.on_call_after?.l1, names);
     const before = onCallNames(preview.on_call_before?.l1, names) || 'nobody';
-    const after = onCallNames(preview.on_call_after?.l1, names) || 'nobody';
+    const after = onCallAfter || 'nobody';
     const evaluatedAt = new Date(preview.evaluated_at).toLocaleString(undefined, {
         month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
     });
@@ -991,14 +1030,18 @@ export function schedulePreview(preview, names = new Map(), timezone = 'UTC') {
             <div class="schedule-banner schedule-banner-warning">
                 <i data-lucide="user-cog"></i>
                 <div>
-                    <strong>This changes who is on duty right now.</strong>
-                    ${escapeHtml(before)} → ${escapeHtml(after)}
+                    <strong>On duty right now changes.</strong>
+                    <span class="banner-who">${escapeHtml(before)}</span>
+                    <span class="banner-arrow">→</span>
+                    <span class="banner-who">${escapeHtml(after)}</span>
                 </div>
             </div>
             ` : `
             <div class="schedule-banner schedule-banner-info">
                 <i data-lucide="check-circle"></i>
-                <div>Who is on duty right now does not change: ${escapeHtml(after)} stays on.</div>
+                <div>${onCallAfter
+                    ? `<span class="banner-who">${escapeHtml(onCallAfter)}</span> stays on duty.`
+                    : 'Nobody is on duty, and saving does not change that.'}</div>
             </div>
             `}
 

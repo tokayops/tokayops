@@ -248,7 +248,9 @@ test.describe('Schedule editor', () => {
 
     const preview = page.locator('.schedule-preview');
     await preview.waitFor({ state: 'visible' });
-    await expect(preview, 'a change of duty is called out').toContainText('on duty right now');
+    // Matched without regard to case: the banner opens with this sentence, so
+    // its first letter is a matter of sentence casing, not of meaning.
+    await expect(preview, 'a change of duty is called out').toContainText(/on duty right now changes/i);
     await expect(preview).toContainText('E2E ann');
     await expect(preview).toContainText('E2E ben');
     await expect(preview, 'the preview does not pretend to be a guarantee')
