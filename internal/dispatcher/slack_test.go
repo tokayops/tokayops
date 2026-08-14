@@ -11,8 +11,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/slack-go/slack"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // mockTokenSource implements SlackTokenSource for testing

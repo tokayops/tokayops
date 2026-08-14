@@ -191,3 +191,94 @@ func TestOnCallClipsToRevisionEnd(t *testing.T) {
 		t.Fatalf("grid slot end = %v, want the raw handoff", got.L1.GridSlotEnd)
 	}
 }
+
+// TestOnCallOverrideSpanningTwoSlotsReportsItsOwnEnd: the grid slot decides
+// which rotation group is on duty; it must not decide when an override ends.
+//
+// A daily rotation hands off at 11:00, so an override from 08:00 to 15:00
+// crosses the boundary. renderSlot answers per slot and clips to it, and the
+// historical renderer never notices because MergeAdjacent joins the pieces back
+// together. This projection renders one slot and merges nothing, so before the
+// fix it told the caller the stand-in ended at 11:00 - the moment the person
+// being stood in for would otherwise have handed over.
+func TestOnCallOverrideSpanningTwoSlotsReportsItsOwnEnd(t *testing.T) {
+	start := utc(2026, 5, 1, 11, 0)
+	revs := chain(t, revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"),
+		group(groupA, "alice"), group(groupB, "bob"))})
+	rev := revs[0]
+
+	ovrStart := utc(2026, 5, 2, 8, 0)
+	ovrEnd := utc(2026, 5, 2, 15, 0)
+	overrides := []scheduleconfig.OverrideRevision{
+		override("ovr-1", LayerL1, "carol", ovrStart, ovrEnd, start),
+	}
+
+	for _, at := range []time.Time{
+		utc(2026, 5, 2, 9, 0),  // in the slot the override starts in
+		utc(2026, 5, 2, 13, 0), // in the slot it ends in
+	} {
+		got := onCallAt(t, rev, at, overrides)
+		if got.L1 == nil || got.L1.Source != SourceOverride {
+			t.Fatalf("at %v: want the override in force, got %+v", at, got.L1)
+		}
+		if !got.L1.AssignmentStart.Equal(ovrStart) || !got.L1.AssignmentEnd.Equal(ovrEnd) {
+			t.Errorf("at %v: assignment = %v..%v, want the override's own %v..%v",
+				at, got.L1.AssignmentStart, got.L1.AssignmentEnd, ovrStart, ovrEnd)
+		}
+		// The grid pair still reports the slot, and the two must not collapse
+		// into one another: that is why the DTO carries both.
+		if got.L1.GridSlotEnd.Equal(ovrEnd) {
+			t.Errorf("at %v: the grid pair took the override's boundaries", at)
+		}
+	}
+
+	// And rotation-sourced assignments still end where the slot does: for them
+	// the slot IS the shift, and widening those would be the opposite defect.
+	after := onCallAt(t, rev, utc(2026, 5, 2, 16, 0), overrides)
+	if after.L1 == nil || after.L1.Source != SourceRotation {
+		t.Fatalf("after the override the rotation must resume: %+v", after.L1)
+	}
+	if !after.L1.AssignmentStart.Equal(ovrEnd) || !after.L1.AssignmentEnd.Equal(utc(2026, 5, 3, 11, 0)) {
+		t.Errorf("rotation assignment = %v..%v, want %v..%v",
+			after.L1.AssignmentStart, after.L1.AssignmentEnd, ovrEnd, utc(2026, 5, 3, 11, 0))
+	}
+}
+
+// TestHistoricalAssignmentsStayDisjointAcrossSlots is the other half of the
+// same fix, and it guards the tempting shortcut: widening renderSlot itself.
+//
+// renderSlot is shared with the historical renderer, which calls it once per
+// slot. If it returned an override beyond the slot it was asked about, the
+// renderer would emit the same stretch twice - once from each slot - and the
+// raw assignments would overlap. Merging happens after, so the damage would be
+// invisible in the merged output and very visible in anything reading raw.
+func TestHistoricalAssignmentsStayDisjointAcrossSlots(t *testing.T) {
+	start := utc(2026, 5, 1, 11, 0)
+	revs := chain(t, revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"),
+		group(groupA, "alice"), group(groupB, "bob"))})
+
+	overrides := []scheduleconfig.OverrideRevision{
+		override("ovr-1", LayerL1, "carol", utc(2026, 5, 2, 8, 0), utc(2026, 5, 2, 15, 0), start),
+	}
+	res, err := Render(Input{
+		Root: root(start), Revisions: revs, Overrides: overrides,
+		From: start, Until: utc(2026, 5, 4, 11, 0),
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	var l1 []Assignment
+	for _, a := range res.Assignments {
+		if a.Layer == LayerL1 {
+			l1 = append(l1, a)
+		}
+	}
+	for i := 1; i < len(l1); i++ {
+		if l1[i].AssignmentStart.Before(l1[i-1].AssignmentEnd) {
+			t.Fatalf("raw assignments overlap: %v..%v then %v..%v",
+				l1[i-1].AssignmentStart, l1[i-1].AssignmentEnd,
+				l1[i].AssignmentStart, l1[i].AssignmentEnd)
+		}
+	}
+}

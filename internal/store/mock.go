@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/integrations"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/google/uuid"
 )
 
 // MockStore is an in-memory implementation of StoreInterface for testing.
@@ -1414,12 +1414,9 @@ func (m *MockStore) copyAlertGroup(ag *model.AlertGroup) *model.AlertGroup {
 	return &agCopy
 }
 
-
-
 // ========================================
 // Rotation Epochs (schedule history stubs)
 // ========================================
-
 
 // ========================================
 // API Tokens

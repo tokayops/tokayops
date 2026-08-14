@@ -54,10 +54,23 @@ function zonedParts(instant, timeZone) {
     return parts;
 }
 
-/** The zone's UTC offset at an instant, in milliseconds. */
+/**
+ * The zone's UTC offset at an instant, in milliseconds.
+ *
+ * The rendered parts stop at the second, so the instant is truncated to the
+ * second before the subtraction: otherwise the sub-second part leaks into the
+ * result and an instant at .123 reports an offset 123ms away from the one the
+ * same zone reports for a whole second. Every caller compares offsets, so a
+ * difference that small is as good as a different zone.
+ *
+ * Everything built inside this module lands on a whole minute, so this only
+ * shows up on instants that came from outside - the API takes RFC3339 and
+ * PostgreSQL stores microseconds.
+ */
 function offsetAt(instant, timeZone) {
     const p = zonedParts(instant, timeZone);
-    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - instant.getTime();
+    const wholeSecond = Math.floor(instant.getTime() / 1000) * 1000;
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - wholeSecond;
 }
 
 /** Parse "YYYY-MM-DDTHH:MM" into its fields, or null if it is not that. */
@@ -195,4 +208,41 @@ export function resolveWindow(fromLocal, toLocal, timeZone) {
  */
 export function gapMessage(timeZone) {
     return `This local time does not exist in ${timeZone} (daylight saving change). Pick another time.`;
+}
+
+/**
+ * Which pass of an ambiguous local time an instant is on.
+ *
+ * When the clocks go back, one local time happens twice, and a form built from
+ * "YYYY-MM-DDTHH:MM" cannot tell the two apart - the string is identical. The
+ * fold is the missing bit: it says which of the two the stored instant is.
+ *
+ * Filling a form from an existing value has to ask this. Assuming 'earlier',
+ * as a create form reasonably does for a value nobody has chosen yet, silently
+ * moves an override anchored to the second pass an hour back the first time
+ * anyone opens it and saves - without touching the field.
+ *
+ * Unambiguous instants answer 'earlier', which is what every non-fold moment
+ * resolves to anyway.
+ *
+ * @param {Date|string} instant
+ * @param {string} timeZone - IANA name
+ * @returns {'earlier'|'later'}
+ */
+export function foldOf(instant, timeZone) {
+    const date = instant instanceof Date ? instant : new Date(instant);
+    if (!timeZone || Number.isNaN(date.getTime())) return 'earlier';
+
+    const resolved = resolveLocalTime(instantToLocalInput(date, timeZone), timeZone);
+    if (resolved.kind !== 'ambiguous' || resolved.candidates.length < 2) return 'earlier';
+
+    // Compared by UTC offset, not by timestamp. The candidates are built from a
+    // "YYYY-MM-DDTHH:MM" string and so land on the minute, while the instant
+    // being classified came from the API and may carry seconds - the two are
+    // equal on neither side of the fold, and an exact comparison called every
+    // such instant 'later'. The offset is what actually distinguishes the two
+    // passes: before the clocks go back it is the larger one.
+    return offsetAt(date, timeZone) === offsetAt(resolved.candidates[0], timeZone)
+        ? 'earlier'
+        : 'later';
 }

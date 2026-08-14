@@ -16,11 +16,10 @@ import (
 // Service is the only application entry point for schedule configuration
 // commands. HTTP handlers bind and map errors; they never touch a repository.
 type Service struct {
-	repo    ScheduleConfigRepository
-	now     func() time.Time
-	newID   func() string
-	logf    func(format string, args ...any)
-
+	repo  ScheduleConfigRepository
+	now   func() time.Time
+	newID func() string
+	logf  func(format string, args ...any)
 }
 
 // Option customizes a Service. The clock and ID source are injectable so tests
@@ -38,7 +37,6 @@ func WithIDSource(newID func() string) Option {
 	return func(s *Service) { s.newID = newID }
 }
 
-
 // WithLogger overrides the commit log sink.
 func WithLogger(logf func(format string, args ...any)) Option {
 	return func(s *Service) { s.logf = logf }
@@ -47,10 +45,10 @@ func WithLogger(logf func(format string, args ...any)) Option {
 // NewService builds a Service over a repository.
 func NewService(repo ScheduleConfigRepository, opts ...Option) *Service {
 	s := &Service{
-		repo:           repo,
-		now:            func() time.Time { return time.Now().UTC() },
-		newID:          func() string { return uuid.New().String() },
-		logf:           log.Printf,
+		repo:  repo,
+		now:   func() time.Time { return time.Now().UTC() },
+		newID: func() string { return uuid.New().String() },
+		logf:  log.Printf,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -147,7 +145,6 @@ func (s *Service) Save(ctx context.Context, teamID string, cmd SaveCommand) (*Sa
 func (s *Service) runCommand(ctx context.Context, fn func(ScheduleConfigTx) error) error {
 	return s.repo.WithinTx(ctx, fn)
 }
-
 
 func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	desired rotation.ScheduleConfiguration, cmd SaveCommand) (*SaveResult, error) {
@@ -322,13 +319,27 @@ func (s *Service) appendRevision(ctx context.Context, tx ScheduleConfigTx, targe
 		target.root.ConfigVersion, target.effectiveAt, actorID), nil
 }
 
-
 // initialize writes the root, revision 1 and the creation event.
 func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID string,
 	desired rotation.ScheduleConfiguration, actorID string, reason *string) (*SaveResult, error) {
 
-	// No schedule row exists yet, so there is nothing to lock and no tail
-	// revision to stay ahead of: effective time is simply now.
+	// The team row is the serialization point, and it is taken BEFORE
+	// membership is read.
+	//
+	// There is no schedule row to lock yet - that is the whole shape of this
+	// branch - but that does not mean there is nothing to lock. Without this,
+	// RemoveTeamMember's own no-schedule branch (which deletes a membership and
+	// takes no schedule lock either, because there is none) can commit between
+	// the read below and this transaction's commit, leaving a schedule whose
+	// rotation names somebody the team no longer contains.
+	//
+	// Lock order across this package is team -> schedule, the same order
+	// DeleteTeam and RemoveTeamMember take, so no pair of them can deadlock.
+	if err := tx.LockTeam(ctx, teamID); err != nil {
+		return nil, err
+	}
+
+	// No tail revision to stay ahead of: effective time is simply now.
 	effectiveAt := NormalizeTimestamp(s.now().UTC())
 
 	if err := ValidateMembership(ctx, tx, teamID, ConfigurationUserIDs(desired)); err != nil {
@@ -443,7 +454,7 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 	if err := tx.InsertRevision(ctx, deleted); err != nil {
 		return nil, err
 	}
-	if err := s.tombstoneLiveOverrides(ctx, tx, target.root.ID, target.effectiveAt, cmd.ActorID); err != nil {
+	if err := s.endLiveOverrides(ctx, tx, target.root.ID, target.effectiveAt, cmd.ActorID, cmd.Reason); err != nil {
 		return nil, err
 	}
 	if err := tx.SetScheduleDeleted(ctx, target.root.ID, &target.effectiveAt); err != nil {
@@ -456,12 +467,12 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 		target.root.ConfigVersion, target.effectiveAt, cmd.ActorID), nil
 }
 
-// tombstoneLiveOverrides appends a delete revision to every override that is
-// still alive. They share one recordedAt: the monotonicity rule applies to a
-// command, not to each row it writes, and the next override command will still
-// land above all of them.
-func (s *Service) tombstoneLiveOverrides(ctx context.Context, tx ScheduleConfigTx,
-	scheduleID string, at time.Time, actorID string) error {
+// endLiveOverrides ends every override the schedule still has, by the same
+// rule a cancel follows. They share one recordedAt: the monotonicity rule
+// applies to a command, not to each row it writes, and the next override
+// command will still land above all of them.
+func (s *Service) endLiveOverrides(ctx context.Context, tx ScheduleConfigTx,
+	scheduleID string, at time.Time, actorID string, reason *string) error {
 
 	heads, err := tx.ListOverrideHeads(ctx, scheduleID, false)
 	if err != nil {
@@ -472,13 +483,33 @@ func (s *Service) tombstoneLiveOverrides(ctx context.Context, tx ScheduleConfigT
 	}
 	recordedAt := NormalizeTimestamp(at)
 	for _, head := range heads {
-		tombstone := head
-		tombstone.RevisionID = s.newID()
-		tombstone.Revision = head.Revision + 1
-		tombstone.Deleted = true
-		tombstone.RecordedAt = recordedAt
-		tombstone.RecordedBy = optionalString(actorID)
-		if err := tx.InsertOverrideRevision(ctx, &tombstone); err != nil {
+		next := head
+		next.RevisionID = s.newID()
+		next.Revision = head.Revision + 1
+		next.RecordedAt = recordedAt
+		next.RecordedBy = optionalString(actorID)
+		// The deleter's reason, not the one whoever created the override
+		// wrote: a revision's reason and its recorded_by are the same
+		// person's, or the audit trail attributes words to someone who never
+		// said them.
+		next.Reason = reason
+		// The schedule is going away, and so is every override on it - but by
+		// the same rule a cancel follows: an override that has already covered
+		// some hours keeps them, and only the rest goes. Tombstoning all of
+		// them would take the served ones out of the projection and rewrite
+		// who was on duty before the schedule was deleted.
+		//
+		// Already-ended overrides need nothing: they are outside the deletion
+		// instant and the projection already answers them correctly.
+		switch {
+		case !recordedAt.After(head.ValidFrom):
+			next.Deleted = true
+		case recordedAt.Before(head.ValidTo):
+			next.ValidTo = recordedAt
+		default:
+			continue
+		}
+		if err := tx.InsertOverrideRevision(ctx, &next); err != nil {
 			return err
 		}
 	}
@@ -495,13 +526,28 @@ func (s *Service) tombstoneLiveOverrides(ctx context.Context, tx ScheduleConfigT
 // without someone deciding it does - and would be inconsistent here.
 //
 // The check is team-scoped, unlike erasure's global sweep, and it serializes
-// against Save on the schedule row lock. That is why Save re-reads membership
-// after taking that lock.
+// against Save on the schedule row lock, and - when the team has no schedule
+// yet - on the team row lock. That is why Save re-reads membership after taking
+// a lock, and why both of these paths take the team row before anything else:
+// the schedule lock cannot serialize a schedule that does not exist.
 func (s *Service) RemoveTeamMember(ctx context.Context, teamID, userID string) error {
 	if teamID == "" || userID == "" {
 		return invalidField("team_id", "and user_id are required")
 	}
 	return s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
+		// Taken first, and for both branches. The branch below that finds no
+		// schedule used to take no lock at all, which made it the half of a
+		// race the schedule lock could not cover: a concurrent first Save has
+		// no schedule row to be blocked by either, so nothing serialized the
+		// two and the save could commit a rotation naming a member this
+		// transaction had already removed.
+		//
+		// Lock order is team -> schedule here and everywhere else in this
+		// package.
+		if err := tx.LockTeam(ctx, teamID); err != nil {
+			return err
+		}
+
 		root, err := tx.GetScheduleRootByTeam(ctx, teamID)
 		if errors.Is(err, ErrScheduleNotFound) {
 			// No schedule means no assignment to protect.
@@ -712,9 +758,6 @@ func optionalString(s string) *string {
 	v := s
 	return &v
 }
-
-
-
 
 // commitLog is one line about a committed change, assembled while the facts
 // are at hand and written only once the transaction is known to have

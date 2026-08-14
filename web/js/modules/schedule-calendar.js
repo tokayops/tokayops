@@ -18,6 +18,7 @@ import { beginModalSession, modalShell } from '/js/core/modal-session.js';
 import { initTimezonePicker } from '/js/core/timezone-picker.js';
 import { resolveNames } from '/js/core/users-directory.js';
 import { monthlyScheduleCalendar } from '/js/modules/schedule-components.js';
+import { overrideHasEnded } from '/js/modules/schedule-shared.js';
 
 // Which zone the calendar is read in. A preference rather than state: it
 // outlives the modal on purpose, and keeping it in storage is what lets it do
@@ -158,6 +159,10 @@ function bindCalendarEvents(session, view, options) {
         if (!entry?.dataset.overrideId) return;
         e.preventDefault();
         e.stopPropagation();
+        // A band that is over is history, and history is not actionable: the
+        // server refuses both an edit and a cancel of an override whose window
+        // has closed, so a menu here would offer two buttons that always fail.
+        if (overrideHasEnded(entry.dataset.validTo)) return;
         showContextMenu(view, entry);
     });
 
@@ -193,7 +198,7 @@ function getOrCreateContextMenu(view) {
         </button>
         <button type="button" class="override-context-menu-item danger" data-action="delete">
             <i data-lucide="trash-2"></i>
-            Delete
+            End now
         </button>
     `;
     document.body.appendChild(menu);

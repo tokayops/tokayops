@@ -24,9 +24,9 @@ func testSnapshot(t *testing.T) rotation.ScheduleRevisionSnapshot {
 	t.Helper()
 	monday := 1
 	weekly := rotation.RotationPolicy{
-		Cadence:       model.RotationWeekly,
-		HandoffTime:   "11:00",
-		HandoffDay:    &monday,
+		Cadence:     model.RotationWeekly,
+		HandoffTime: "11:00",
+		HandoffDay:  &monday,
 	}
 	plan, err := rotation.PlanTransition(rotation.TransitionInput{
 		Desired: rotation.ScheduleConfiguration{

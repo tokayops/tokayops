@@ -18,12 +18,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
+	"github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/slackcard"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
-	"github.com/slack-go/slack"
 )
 
 // capturedEphemeral collects ephemeral messages sent via respondEphemeral.

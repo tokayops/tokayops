@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
 )
 
 // TestUpdateTeam_RoutingConfig_ShouldUpdate verifies that routing fields

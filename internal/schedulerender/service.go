@@ -40,7 +40,6 @@ func New(repo scheduleconfig.ScheduleReadRepository, opts ...Option) *Service {
 }
 
 // RenderRange answers who was on duty across [from, until).
-//
 func (s *Service) RenderRange(ctx context.Context, scheduleID string, from, until time.Time) (Result, error) {
 	from = scheduleconfig.NormalizeTimestamp(from)
 	until = scheduleconfig.NormalizeTimestamp(until)

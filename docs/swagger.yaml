@@ -2014,8 +2014,10 @@ paths:
       - providers
   /api/v1/schedules/{schedule_id}/overrides/{id}:
     delete:
-      description: Appends a tombstone. The override history is kept and stays replayable
-        as of any past instant.
+      description: Ends the override from this moment. An override that has not started
+        is removed; one that is in force keeps the hours it has already covered and
+        loses the rest; one that has already ended is refused, because cancelling
+        it would rewrite who was on duty. History is append-only either way.
       parameters:
       - description: Schedule ID
         in: path
@@ -2049,7 +2051,11 @@ paths:
           description: Conflict
           schema:
             $ref: '#/definitions/api.ErrorResponse'
-      summary: Delete an override
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Cancel an override
       tags:
       - schedules
     put:

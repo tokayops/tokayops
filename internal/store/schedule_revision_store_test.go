@@ -341,10 +341,17 @@ func TestCreateScheduleForUnknownTeam(t *testing.T) {
 		t.Fatalf("%d schedule roots were written", n)
 	}
 
-	// And through the service, the more specific refusal.
+	// And through the service, which now answers about the team rather than
+	// about its membership.
+	//
+	// It used to say "user is not a member of the team" - true, and a poor
+	// answer for a team that does not exist. Taking the team row before
+	// reading membership (the serialization the first Save needs) also puts
+	// the more specific refusal first, and it maps to 404 team_not_found
+	// instead of 422.
 	if _, err := createViaSave(context.Background(), newTestScheduleService(s, start),
-		"ghost-team", revTestConfig(), "", nil); !errors.Is(err, scheduleconfig.ErrUserNotTeamMember) {
-		t.Fatalf("service error = %v, want a membership rejection", err)
+		"ghost-team", revTestConfig(), "", nil); !errors.Is(err, scheduleconfig.ErrTeamNotFound) {
+		t.Fatalf("service error = %v, want ErrTeamNotFound", err)
 	}
 }
 

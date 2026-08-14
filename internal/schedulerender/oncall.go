@@ -28,10 +28,13 @@ type LayerOnCall struct {
 	// OverrideRevisionID identifies the VERSION of the override in force, and
 	// is set only for SourceOverride.
 	//
-	// It is what tells two arrivals of the same stand-in apart. Editing an
-	// override does not move its valid_from, so neither the composition nor
-	// AssignmentStart changes when the person on it is swapped and swapped
-	// back - only the revision does.
+	// It is part of what tells two arrivals of the same stand-in apart. It used
+	// to be the whole of it: editing an override left its valid_from alone, so
+	// swapping the person on it and swapping them back changed neither the
+	// composition nor AssignmentStart. Editing an override that is in force
+	// now splits it, so those two arrivals differ by override id and start
+	// instant as well - and this still moves, which keeps the case covered for
+	// edits that do not split.
 	OverrideRevisionID string
 }
 
@@ -94,6 +97,41 @@ func onCallSlots(rev scheduleconfig.ScheduleRevision, at time.Time) ([]layerSlot
 	return out, nil
 }
 
+// overrideSpan gives an override-sourced assignment back its own boundaries.
+//
+// renderSlot answers per grid slot, so an override that runs past the end of
+// the slot containing `at` comes back clipped to that slot. The historical
+// renderer never notices - it renders every slot and MergeAdjacent joins the
+// pieces back into one shift. This projection renders exactly one slot and
+// merges nothing, so the clip would reach the caller raw, telling a consumer
+// that a stand-in ends at the handoff boundary when they are on until 18:00.
+//
+// The fix belongs here and not in renderSlot: that primitive is shared with the
+// historical renderer (renderer.go), and letting it return assignments beyond
+// the slot it was asked about would make that renderer emit overlapping
+// duplicates in adjacent slots - a worse defect than the one being fixed.
+//
+// The grid slot still decides which rotation group is on duty; it just does not
+// decide the boundaries of an override. Rotation-sourced assignments keep the
+// slot's boundaries, because for them the slot IS the shift.
+func overrideSpan(a Assignment, overrides []scheduleconfig.OverrideRevision,
+	revBound interval) interval {
+
+	span := interval{Start: a.AssignmentStart, End: a.AssignmentEnd}
+	if a.Source != SourceOverride {
+		return span
+	}
+	for _, o := range overrides {
+		if o.OverrideID != a.OverrideID {
+			continue
+		}
+		// Clipped to the revision, which is deliberate and pinned: a
+		// configuration change ends the assignment it was made under.
+		return interval{Start: o.ValidFrom, End: o.ValidTo}.intersect(revBound)
+	}
+	return span
+}
+
 // projectOnCall overlays the overrides onto each layer's slot and picks the
 // assignment covering `at`.
 //
@@ -106,6 +144,7 @@ func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []la
 	overrides []scheduleconfig.OverrideRevision) (OnCall, error) {
 
 	out := OnCall{At: at}
+	revBound := revisionInterval(rev)
 	for _, ls := range slots {
 		assignments, err := renderSlot(slotInput{
 			RevisionID: rev.ID,
@@ -123,13 +162,14 @@ func projectOnCall(rev scheduleconfig.ScheduleRevision, at time.Time, slots []la
 		if found == nil {
 			continue
 		}
+		assignment := overrideSpan(*found, overrides, revBound)
 		layerOnCall := &LayerOnCall{
 			GroupID:            found.GroupID,
 			UserIDs:            found.UserIDs,
 			GridSlotStart:      found.GridSlotStart,
 			GridSlotEnd:        found.GridSlotEnd,
-			AssignmentStart:    found.AssignmentStart,
-			AssignmentEnd:      found.AssignmentEnd,
+			AssignmentStart:    assignment.Start,
+			AssignmentEnd:      assignment.End,
 			ScheduleRevisionID: found.ScheduleRevisionID,
 			Source:             found.Source,
 			OverrideID:         found.OverrideID,

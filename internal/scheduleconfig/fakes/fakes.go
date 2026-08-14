@@ -364,11 +364,17 @@ func (r *ScheduleConfigRepo) SetTeamMembers(teamID string, userIDs ...string) {
 	for _, id := range userIDs {
 		r.state.knownUsers[id] = true
 	}
+	// A team with members exists. In the store that is a foreign key; here it
+	// has to be said, and saying it anywhere else would let a test build a
+	// team the production schema could not hold - which is the shape of fake
+	// that hides a real defect rather than exposing one.
+	r.state.knownTeams[teamID] = true
 }
 
-// AddTeams registers teams that exist. Only DeleteTeam asks - every other
-// command reaches a team through its schedule - so a test that does not delete
-// teams need not call this.
+// AddTeams registers teams that exist without giving them members.
+//
+// SetTeamMembers registers them too, so most tests never call this. It is for
+// the cases that need an existing team with an empty roster.
 func (r *ScheduleConfigRepo) AddTeams(teamIDs ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

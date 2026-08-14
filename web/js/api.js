@@ -658,7 +658,12 @@ const API = {
         },
 
         /**
-         * Append a tombstone. The override history is kept.
+         * End an override from this moment.
+         *
+         * One that has not started is removed; one that is in force keeps the
+         * hours it has already covered and loses the rest; one that has
+         * already ended is refused. History is append-only either way.
+         *
          * @param {string} scheduleId
          * @param {string} overrideId
          * @param {number} expectedRevision - from listOverrides

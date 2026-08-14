@@ -213,7 +213,6 @@ func (t *scheduleConfigTx) SetScheduleDeleted(ctx context.Context, scheduleID st
 	return requireOneRow(res, scheduleconfig.ErrScheduleNotFound)
 }
 
-
 // LockUsers takes a shared row lock on the named users, in ID order.
 //
 // FOR SHARE, not FOR UPDATE: two commands naming overlapping users have no

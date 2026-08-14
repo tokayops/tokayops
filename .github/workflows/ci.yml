@@ -27,6 +27,22 @@ jobs:
       with:
         go-version-file: 'go.mod'
 
+    # The whole tree, not the files a PR touched. A diff-scoped gate needs
+    # fetch-depth: 0 and a different base for push and pull_request, and it
+    # only pays for itself when the baseline is dirty - this one is clean, so
+    # the blunt check is both cheaper and stricter.
+    - name: Check formatting
+      run: |
+        unformatted=$(gofmt -l ./cmd ./internal)
+        if [ -n "$unformatted" ]; then
+          echo "These files are not gofmt-clean:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    - name: Vet
+      run: go vet ./...
+
     - name: Run tests with coverage
       run: go test ./... -v -coverprofile=coverage.out
 

@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/lib/pq"
 
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
@@ -234,5 +237,66 @@ func TestRevisionOverlapConstraintLookupIsTableQualified(t *testing.T) {
 	}
 	if present {
 		t.Fatal("a constraint of the same name on another table was reported as this one")
+	}
+}
+
+// TestCutoverSchemaChecksResolveThroughSearchPath: nothing else in this package
+// names a schema, so this check must not either.
+//
+// The failure it guards against is the loudest one available: on an installation
+// whose search_path puts the tables somewhere other than `public`, InitDB
+// creates them happily and every query reads them happily, and a check that
+// looked in `public` would find nothing and refuse to start a database that is
+// in perfect shape.
+//
+// The whole sequence runs on the non-default schema, not just the check: a
+// regression that only asserted RequireCutoverSchema would pass while the reset
+// still hardcoded a schema of its own.
+func TestCutoverSchemaChecksResolveThroughSearchPath(t *testing.T) {
+	s := newThrowawayDB(t)
+
+	if _, err := s.db.Exec(`CREATE SCHEMA app`); err != nil {
+		t.Fatalf("create the schema: %v", err)
+	}
+	// SET LOCAL would not survive the pool; ALTER DATABASE is the
+	// connection-independent form, and it is what an installation configures.
+	var dbName string
+	if err := s.db.QueryRow(`SELECT current_database()`).Scan(&dbName); err != nil {
+		t.Fatalf("read the database name: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`ALTER DATABASE ` + pq.QuoteIdentifier(dbName) + ` SET search_path = app, public`); err != nil {
+		t.Fatalf("set the search_path: %v", err)
+	}
+	// Existing pooled connections still carry the old setting.
+	s.db.SetMaxIdleConns(0)
+	s.db.SetMaxIdleConns(2)
+
+	var path string
+	if err := s.db.QueryRow(`SHOW search_path`).Scan(&path); err != nil {
+		t.Fatalf("read back the search_path: %v", err)
+	}
+	if !strings.Contains(path, "app") {
+		t.Skipf("search_path did not take (%q); the fixture cannot make its point", path)
+	}
+
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("InitDB on a non-public search_path: %v", err)
+	}
+	if err := s.RequireCutoverSchema(); err != nil {
+		t.Fatalf("the gate refused a database it should accept: %v", err)
+	}
+
+	// And the shape is really in `app`, so the check passed for the right
+	// reason rather than by looking at leftovers in public.
+	var schema string
+	if err := s.db.QueryRow(`
+		SELECT n.nspname FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.oid = to_regclass('schedules')`).Scan(&schema); err != nil {
+		t.Fatalf("locate the schedules table: %v", err)
+	}
+	if schema != "app" {
+		t.Fatalf("schedules landed in %q, so this test proves nothing", schema)
 	}
 }

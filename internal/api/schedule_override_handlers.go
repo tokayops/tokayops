@@ -84,8 +84,8 @@ func (a *API) UpdateScheduleOverride(c echo.Context) error {
 }
 
 // DeleteScheduleOverride godoc
-// @Summary Delete an override
-// @Description Appends a tombstone. The override history is kept and stays replayable as of any past instant.
+// @Summary Cancel an override
+// @Description Ends the override from this moment. An override that has not started is removed; one that is in force keeps the hours it has already covered and loses the rest; one that has already ended is refused, because cancelling it would rewrite who was on duty. History is append-only either way.
 // @Tags schedules
 // @Produce json
 // @Param schedule_id path string true "Schedule ID"
@@ -95,6 +95,7 @@ func (a *API) UpdateScheduleOverride(c echo.Context) error {
 // @Failure 400 {object} ErrorResponse
 // @Failure 404 {object} ErrorResponse
 // @Failure 409 {object} ErrorResponse
+// @Failure 422 {object} ErrorResponse
 // @Router /api/v1/schedules/{schedule_id}/overrides/{id} [delete]
 func (a *API) DeleteScheduleOverride(c echo.Context) error {
 	// Query rather than body: a DELETE body is not carried reliably by every
@@ -105,8 +106,13 @@ func (a *API) DeleteScheduleOverride(c echo.Context) error {
 		return badRequest(c, CodeInvalidParameter, "expected_revision query parameter is required")
 	}
 
-	if err := a.scheduleConfig.DeleteOverride(c.Request().Context(),
-		c.Param("schedule_id"), c.Param("id"), expected, actorID(c)); err != nil {
+	// No reason over HTTP yet, deliberately. The command takes one - that is
+	// what keeps a cancel from inheriting the previous author's words - but
+	// nothing sends one, and a query parameter is the wrong place for free
+	// text: it lands in every access log along the way. It goes back in a
+	// request body when there is a caller with something to say.
+	if err := a.scheduleConfig.CancelOverride(c.Request().Context(),
+		c.Param("schedule_id"), c.Param("id"), expected, actorID(c), nil); err != nil {
 		return a.mapScheduleError(c, err)
 	}
 	return c.NoContent(http.StatusNoContent)

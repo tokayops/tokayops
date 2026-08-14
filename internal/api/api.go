@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/dispatcher"
@@ -20,8 +22,6 @@ import (
 	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/slackcard"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/google/uuid"
-	"github.com/labstack/echo/v4"
 )
 
 // SlackMessenger defines the interface for Slack operations needed by the API layer.
@@ -68,10 +68,10 @@ type API struct {
 	// store.StoreInterface. The revision model is not mirrored into MockStore,
 	// and routing it through the same interface would put the configuration back
 	// behind the door its own tables were taken out from.
-	scheduleConfig      *scheduleconfig.Service
-	scheduleRead        scheduleconfig.ScheduleReadRepository
-	scheduleRenderer    *schedulerender.Service
-	userEraser          *erasure.Service
+	scheduleConfig   *scheduleconfig.Service
+	scheduleRead     scheduleconfig.ScheduleReadRepository
+	scheduleRenderer *schedulerender.Service
+	userEraser       *erasure.Service
 }
 
 // NewAPI creates a new API instance. Pass nil for oidc if not using OIDC.
@@ -117,7 +117,6 @@ func (a *API) SetScheduleRenderer(svc *schedulerender.Service) {
 func (a *API) SetUserEraser(svc *erasure.Service) {
 	a.userEraser = svc
 }
-
 
 // SetCardRenderer enables instant Slack card replacement on Ack/Resolve button clicks.
 func (a *API) SetCardRenderer(r SlackCardRenderer) {

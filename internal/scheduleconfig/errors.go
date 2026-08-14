@@ -36,6 +36,21 @@ var (
 	// override of the same layer already covers.
 	ErrOverrideOverlap = errors.New("scheduleconfig: override overlaps an existing override")
 
+	// ErrOverrideAlreadyEnded means a command tried to change an override
+	// whose window is entirely in the past.
+	//
+	// It is a refusal rather than a no-op, and that is the point: cancelling
+	// something that already happened used to answer 204 and remove it from
+	// every rendered range, so the caller was told they had removed a shift
+	// when what they had done was rewrite who was on duty last Tuesday.
+	ErrOverrideAlreadyEnded = errors.New("scheduleconfig: override has already ended")
+
+	// ErrOverrideEndsInThePast means an update asked for a validity that ends
+	// at or before now. Shortening an override to the present is what cancel
+	// does; an update that did it would be cancelling under another name, and
+	// ending it BEFORE now would erase duty somebody already served.
+	ErrOverrideEndsInThePast = errors.New("scheduleconfig: an update cannot end an override in the past")
+
 	// ErrUserNotTeamMember means the configuration names someone who is not a
 	// member of the owning team.
 	ErrUserNotTeamMember = errors.New("scheduleconfig: user is not a member of the team")
@@ -158,6 +173,38 @@ func (e *OverrideOverlapError) Error() string {
 }
 
 func (e *OverrideOverlapError) Unwrap() error { return ErrOverrideOverlap }
+
+// OverrideAlreadyEndedError names the window that has already closed.
+//
+// It carries the window because the operator's next question is always "since
+// when", and a bare refusal would send them to the audit trail to find out.
+type OverrideAlreadyEndedError struct {
+	OverrideID string
+	ValidFrom  time.Time
+	ValidTo    time.Time
+}
+
+func (e *OverrideAlreadyEndedError) Error() string {
+	return fmt.Sprintf("scheduleconfig: override %s ended at %s and cannot be cancelled",
+		e.OverrideID, e.ValidTo.Format(time.RFC3339))
+}
+
+func (e *OverrideAlreadyEndedError) Unwrap() error { return ErrOverrideAlreadyEnded }
+
+// OverrideEndsInThePastError is an update trying to do a cancel's job.
+type OverrideEndsInThePastError struct {
+	OverrideID string
+	ValidTo    time.Time
+	Now        time.Time
+}
+
+func (e *OverrideEndsInThePastError) Error() string {
+	return fmt.Sprintf(
+		"scheduleconfig: override %s cannot be updated to end at %s, which is not after %s - cancel it instead",
+		e.OverrideID, e.ValidTo.Format(time.RFC3339), e.Now.Format(time.RFC3339))
+}
+
+func (e *OverrideEndsInThePastError) Unwrap() error { return ErrOverrideEndsInThePast }
 
 // UserNotTeamMemberError lists every offending user rather than the first one:
 // the editor shows them all at once, and reporting one per round-trip would

@@ -78,8 +78,8 @@ func pipelineSchedule(t *testing.T, env *IntegrationTestEnv, teamID string,
 // group configured here is the one on duty for the rest of the test.
 func pipelineConfig(l1Groups []rotation.RotationGroup, l2User string) rotation.ScheduleConfiguration {
 	policy := rotation.RotationPolicy{
-		Cadence:       model.RotationDaily,
-		HandoffTime:   "00:00",
+		Cadence:     model.RotationDaily,
+		HandoffTime: "00:00",
 	}
 	cfg := rotation.ScheduleConfiguration{
 		Timezone: "UTC",

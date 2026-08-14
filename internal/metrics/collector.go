@@ -3,8 +3,8 @@ package metrics
 import (
 	"log"
 
-	"github.com/tokayops/tokayops/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/tokayops/tokayops/internal/store"
 )
 
 var (

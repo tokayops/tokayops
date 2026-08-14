@@ -70,8 +70,8 @@ func BenchmarkPositionAt(b *testing.B) {
 func weeklyBenchPolicy() RotationPolicy {
 	monday := 1
 	return RotationPolicy{
-		Cadence:       model.RotationWeekly,
-		HandoffTime:   "11:00",
-		HandoffDay:    &monday,
+		Cadence:     model.RotationWeekly,
+		HandoffTime: "11:00",
+		HandoffDay:  &monday,
 	}
 }

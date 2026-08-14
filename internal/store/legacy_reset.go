@@ -261,10 +261,10 @@ func deleteLegacySchedules(tx *sql.Tx) (int, error) {
 // requireEveryScheduleHasHorizon refuses ahead of the tightening, naming the
 // schedules that block it.
 //
-// Named for what it checks rather than for the predicate this sprint deleted:
-// "initialized root" is the vocabulary that went away with the concept, and a
-// helper carrying it would keep the phrase alive in a grep that exists to prove
-// it is gone.
+// Named for what it checks rather than for the predicate that was deleted with
+// the cutover: "initialized root" is the vocabulary that went away with the
+// concept, and a helper carrying it would keep the phrase alive in a grep that
+// exists to prove it is gone.
 func requireEveryScheduleHasHorizon(tx *sql.Tx) error {
 	rows, err := tx.Query(
 		`SELECT id FROM schedules WHERE history_complete_from IS NULL ORDER BY id`)

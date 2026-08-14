@@ -72,7 +72,31 @@ func (s *Service) CreateOverride(ctx context.Context, teamID string, cmd Overrid
 	return created, nil
 }
 
-// UpdateOverride appends the next revision of an existing override.
+// UpdateOverride changes an override, and splits it when part of it has
+// already been served.
+//
+// A future override is simply replaced: nothing has happened yet, so the next
+// revision can say whatever the caller asked for, including a window that
+// reaches into the past - recording that somebody covered yesterday is adding
+// a fact, not erasing one.
+//
+// An override that is IN FORCE cannot be replaced that way. Revision N+1 would
+// win the whole projection, so swapping the person at 14:00 would rewrite the
+// four hours the first person had already covered. Instead:
+//
+//  1. the current override is truncated to now, exactly as a cancel would;
+//  2. a NEW override carries the change from now to the requested end.
+//
+// The identity therefore changes, and that is the honest answer rather than an
+// implementation leak: what carol covered until 14:00 and what dave covers
+// after it are two assignments, and the audit reads as one ending where the
+// other begins. The caller is told which one is live now - the returned
+// revision names the new override.
+//
+// valid_from is not editable on the part that has been served: the new segment
+// starts at now, and a valid_from the caller sent is ignored. valid_to at or
+// before now is refused rather than obeyed - ending it now is what cancel does,
+// and ending it earlier would erase duty somebody served.
 func (s *Service) UpdateOverride(ctx context.Context, scheduleID, overrideID string,
 	expectedRevision int64, cmd OverrideCommand) (*OverrideRevision, error) {
 
@@ -99,23 +123,73 @@ func (s *Service) UpdateOverride(ctx context.Context, scheduleID, overrideID str
 			return err
 		}
 
+		if !recordedAt.Before(head.ValidTo) {
+			return &OverrideAlreadyEndedError{
+				OverrideID: overrideID,
+				ValidFrom:  head.ValidFrom,
+				ValidTo:    head.ValidTo,
+			}
+		}
+
+		inForce := recordedAt.After(head.ValidFrom)
+		if !inForce {
+			// Nothing served yet: one revision replaces another.
+			rev := s.nextOverrideRevision(head, cmd, recordedAt)
+			rev.ValidFrom = NormalizeTimestamp(cmd.ValidFrom)
+			// Excluding itself is not an optimization: the head is part of the
+			// current projection, so without it every update of an override
+			// would collide with the version it replaces.
+			if err := s.checkOverrideOverlap(ctx, tx, rev, overrideID); err != nil {
+				return err
+			}
+			if err := tx.InsertOverrideRevision(ctx, rev); err != nil {
+				return err
+			}
+			updated = rev
+			return nil
+		}
+
+		validTo := NormalizeTimestamp(cmd.ValidTo)
+		if !validTo.After(recordedAt) {
+			return &OverrideEndsInThePastError{OverrideID: overrideID, ValidTo: validTo, Now: recordedAt}
+		}
+
+		// 1. Close the served part where it actually stops.
+		//
+		// The reason is the editor's, like the recorder: both revisions this
+		// command writes are one act by one person, and carrying the previous
+		// author's words under this actor's name is the attribution defect
+		// that closing it on the cancel path was supposed to end.
+		truncated := *head
+		truncated.RevisionID = s.newID()
+		truncated.Revision = head.Revision + 1
+		truncated.ValidTo = recordedAt
+		truncated.Reason = cmd.Reason
+		truncated.RecordedAt = recordedAt
+		truncated.RecordedBy = optionalString(cmd.ActorID)
+		if err := tx.InsertOverrideRevision(ctx, &truncated); err != nil {
+			return err
+		}
+
+		// 2. The change itself, as its own override starting now.
 		rev := &OverrideRevision{
 			RevisionID: s.newID(),
-			OverrideID: overrideID,
+			OverrideID: s.newID(),
 			ScheduleID: scheduleID,
-			Revision:   head.Revision + 1,
+			Revision:   1,
 			Layer:      head.Layer,
 			UserID:     cmd.UserID,
-			ValidFrom:  NormalizeTimestamp(cmd.ValidFrom),
-			ValidTo:    NormalizeTimestamp(cmd.ValidTo),
+			ValidFrom:  recordedAt,
+			ValidTo:    validTo,
 			Reason:     cmd.Reason,
 			RecordedAt: recordedAt,
 			RecordedBy: optionalString(cmd.ActorID),
 		}
-		// Excluding itself is not an optimization: the head is part of the
-		// current projection, so without it every update of an override would
-		// collide with the version it replaces.
-		if err := s.checkOverrideOverlap(ctx, tx, rev, overrideID); err != nil {
+		// Checked against the projection this transaction has already changed:
+		// the truncation above is visible here, so the two halves do not
+		// collide with each other. Nothing is excluded - the new override is
+		// new, and the old one now ends where this one starts.
+		if err := s.checkOverrideOverlap(ctx, tx, rev, ""); err != nil {
 			return err
 		}
 		if err := tx.InsertOverrideRevision(ctx, rev); err != nil {
@@ -130,15 +204,57 @@ func (s *Service) UpdateOverride(ctx context.Context, scheduleID, overrideID str
 	return updated, nil
 }
 
-// DeleteOverride appends a tombstone. Nothing is removed: the override's
-// history stays readable, and an as-of query still shows it live up to this
-// moment.
-func (s *Service) DeleteOverride(ctx context.Context, scheduleID, overrideID string,
-	expectedRevision int64, actorID string) error {
+// nextOverrideRevision is the successor revision of a head, carrying the
+// caller's values.
+func (s *Service) nextOverrideRevision(head *OverrideRevision, cmd OverrideCommand,
+	recordedAt time.Time) *OverrideRevision {
+
+	return &OverrideRevision{
+		RevisionID: s.newID(),
+		OverrideID: head.OverrideID,
+		ScheduleID: head.ScheduleID,
+		Revision:   head.Revision + 1,
+		Layer:      head.Layer,
+		UserID:     cmd.UserID,
+		ValidFrom:  NormalizeTimestamp(cmd.ValidFrom),
+		ValidTo:    NormalizeTimestamp(cmd.ValidTo),
+		Reason:     cmd.Reason,
+		RecordedAt: recordedAt,
+		RecordedBy: optionalString(cmd.ActorID),
+	}
+}
+
+// CancelOverride ends an override, and what that means depends on whether any
+// of it has happened yet.
+//
+// The old behaviour was one branch: append a tombstone, which drops the
+// override out of the current projection - and the projection is what every
+// render reads, so a stand-in who had already covered four hours vanished from
+// last week's calendar too. Nothing was destroyed, the revisions are all still
+// there, but the answer to "who was on duty at 11:00 last Tuesday" changed
+// because somebody cancelled a shift today.
+//
+// The rule is that you can cancel the future and cannot un-happen the past:
+//
+//	T <= valid_from   the override never started    -> tombstone
+//	in force          part of it has happened       -> truncate to T
+//	T >= valid_to     it is over                    -> refuse
+//
+// The first boundary is <= rather than <: truncating an override to
+// valid_to == valid_from would violate the CHECK on the table, so cancelling
+// exactly at the start has to take the tombstone branch. It also means the same
+// thing - nobody stood in for anybody.
+//
+// The reason is the canceller's own, and is not inherited from the revision
+// being ended. Copying it forward put one person's words under another
+// person's name, and the words are not lost: they are on the revisions that
+// carried them, which is where history lives.
+func (s *Service) CancelOverride(ctx context.Context, scheduleID, overrideID string,
+	expectedRevision int64, actorID string, reason *string) error {
 
 	return s.repo.WithinTx(ctx, func(tx ScheduleConfigTx) error {
-		// A delete adds no assignment, but it does record who did it and copies
-		// the reason forward, so the actor is still locked and checked.
+		// A cancel adds no assignment, but it does record who did it, so the
+		// actor is still locked and checked.
 		if err := tx.LockUsers(ctx, commandUserIDs(actorID)); err != nil {
 			return err
 		}
@@ -153,13 +269,30 @@ func (s *Service) DeleteOverride(ctx context.Context, scheduleID, overrideID str
 		if err != nil {
 			return err
 		}
-		tombstone := *head
-		tombstone.RevisionID = s.newID()
-		tombstone.Revision = head.Revision + 1
-		tombstone.Deleted = true
-		tombstone.RecordedAt = recordedAt
-		tombstone.RecordedBy = optionalString(actorID)
-		return tx.InsertOverrideRevision(ctx, &tombstone)
+
+		next := *head
+		next.RevisionID = s.newID()
+		next.Revision = head.Revision + 1
+		next.RecordedAt = recordedAt
+		next.RecordedBy = optionalString(actorID)
+		next.Reason = reason
+
+		switch {
+		case !recordedAt.Before(head.ValidTo):
+			return &OverrideAlreadyEndedError{
+				OverrideID: overrideID,
+				ValidFrom:  head.ValidFrom,
+				ValidTo:    head.ValidTo,
+			}
+		case !recordedAt.After(head.ValidFrom):
+			// Not started. It never happened, so there is nothing to keep.
+			next.Deleted = true
+		default:
+			// In force. The part that has been served stays exactly as it was
+			// served; only the rest goes.
+			next.ValidTo = recordedAt
+		}
+		return tx.InsertOverrideRevision(ctx, &next)
 	})
 }
 
@@ -185,7 +318,6 @@ func (s *Service) lockForOverride(ctx context.Context, tx ScheduleConfigTx, sche
 	// As-of reads are gone.
 	return locked, NormalizeTimestamp(s.now().UTC()), nil
 }
-
 
 // liveOverrideHead resolves the override an update or a delete names and
 // checks the caller is not working from a stale version.
@@ -230,9 +362,11 @@ func (s *Service) validateOverrideTarget(ctx context.Context, view ScheduleReadV
 	if !until.After(from) {
 		return invalidField("valid_to", "must be after valid_from")
 	}
-	// A valid_from in the past is allowed. The record is append-only and
-	// as-of queries preserve what was known when, so a retroactive correction
-	// stays explainable instead of rewriting history.
+	// A valid_from in the past is allowed, and is not in tension with refusing
+	// to cancel an override that has already ended. The two are opposites:
+	// recording "bob covered yesterday, we forgot" ADDS a fact, and the
+	// revision carrying it says when it was recorded; cancelling a shift that
+	// was served would remove one.
 
 	return ValidateMembership(ctx, view, teamID, []string{cmd.UserID})
 }

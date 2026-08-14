@@ -219,11 +219,17 @@ func TestSnapshotIsolatesConcurrentWrites(t *testing.T) {
 	}
 }
 
-// The projection is always the current one. Rendering "as of" an earlier
-// system time was a contract with no product behind it - the option existed in
-// Go and in this test, and nothing ever asked for it. Editing an override
-// therefore changes what a render shows; the history of the edit lives in the
-// override revisions, which is where it was always kept.
+// The projection is always the current one: the renderer reads the head of
+// each override and nothing else. Rendering "as of" an earlier system time was
+// a contract with no product behind it - the option existed in Go and in this
+// test, and nothing ever asked for it.
+//
+// What that does NOT mean, and used to: that editing an override rewrites the
+// hours it already covered. This test seeds revisions directly, so it still
+// shows the head winning - but the command side no longer produces a head that
+// covers served hours with somebody else. An edit of an override in force
+// truncates it and starts a new one (UpdateOverride), so the past keeps the
+// person who lived it. The guarantee is in the commands; this is the reader.
 func TestRenderShowsTheCurrentOverrideRevision(t *testing.T) {
 	start := utc(2026, 5, 1, 11, 0)
 	revs := chain(t, revisionStep{at: start, cfg: config("UTC", dailyPolicy("11:00"), group(groupA, "alice"))})
