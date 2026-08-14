@@ -1342,12 +1342,6 @@ const docTemplate = `{
                         "name": "expected_revision",
                         "in": "query",
                         "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Why it is being cancelled",
-                        "name": "reason",
-                        "in": "query"
                     }
                 ],
                 "responses": {

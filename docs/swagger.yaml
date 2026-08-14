@@ -2034,10 +2034,6 @@ paths:
         name: expected_revision
         required: true
         type: integer
-      - description: Why it is being cancelled
-        in: query
-        name: reason
-        type: string
       produces:
       - application/json
       responses:

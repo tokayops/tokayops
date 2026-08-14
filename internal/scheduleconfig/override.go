@@ -155,10 +155,16 @@ func (s *Service) UpdateOverride(ctx context.Context, scheduleID, overrideID str
 		}
 
 		// 1. Close the served part where it actually stops.
+		//
+		// The reason is the editor's, like the recorder: both revisions this
+		// command writes are one act by one person, and carrying the previous
+		// author's words under this actor's name is the attribution defect
+		// that closing it on the cancel path was supposed to end.
 		truncated := *head
 		truncated.RevisionID = s.newID()
 		truncated.Revision = head.Revision + 1
 		truncated.ValidTo = recordedAt
+		truncated.Reason = cmd.Reason
 		truncated.RecordedAt = recordedAt
 		truncated.RecordedBy = optionalString(cmd.ActorID)
 		if err := tx.InsertOverrideRevision(ctx, &truncated); err != nil {
@@ -356,9 +362,11 @@ func (s *Service) validateOverrideTarget(ctx context.Context, view ScheduleReadV
 	if !until.After(from) {
 		return invalidField("valid_to", "must be after valid_from")
 	}
-	// A valid_from in the past is allowed. The record is append-only and
-	// as-of queries preserve what was known when, so a retroactive correction
-	// stays explainable instead of rewriting history.
+	// A valid_from in the past is allowed, and is not in tension with refusing
+	// to cancel an override that has already ended. The two are opposites:
+	// recording "bob covered yesterday, we forgot" ADDS a fact, and the
+	// revision carrying it says when it was recorded; cancelling a shift that
+	// was served would remove one.
 
 	return ValidateMembership(ctx, view, teamID, []string{cmd.UserID})
 }

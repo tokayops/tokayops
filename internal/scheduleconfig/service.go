@@ -454,7 +454,7 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 	if err := tx.InsertRevision(ctx, deleted); err != nil {
 		return nil, err
 	}
-	if err := s.endLiveOverrides(ctx, tx, target.root.ID, target.effectiveAt, cmd.ActorID); err != nil {
+	if err := s.endLiveOverrides(ctx, tx, target.root.ID, target.effectiveAt, cmd.ActorID, cmd.Reason); err != nil {
 		return nil, err
 	}
 	if err := tx.SetScheduleDeleted(ctx, target.root.ID, &target.effectiveAt); err != nil {
@@ -472,7 +472,7 @@ func (s *Service) delete(ctx context.Context, tx ScheduleConfigTx, teamID string
 // applies to a command, not to each row it writes, and the next override
 // command will still land above all of them.
 func (s *Service) endLiveOverrides(ctx context.Context, tx ScheduleConfigTx,
-	scheduleID string, at time.Time, actorID string) error {
+	scheduleID string, at time.Time, actorID string, reason *string) error {
 
 	heads, err := tx.ListOverrideHeads(ctx, scheduleID, false)
 	if err != nil {
@@ -488,6 +488,11 @@ func (s *Service) endLiveOverrides(ctx context.Context, tx ScheduleConfigTx,
 		next.Revision = head.Revision + 1
 		next.RecordedAt = recordedAt
 		next.RecordedBy = optionalString(actorID)
+		// The deleter's reason, not the one whoever created the override
+		// wrote: a revision's reason and its recorded_by are the same
+		// person's, or the audit trail attributes words to someone who never
+		// said them.
+		next.Reason = reason
 		// The schedule is going away, and so is every override on it - but by
 		// the same rule a cancel follows: an override that has already covered
 		// some hours keeps them, and only the rest goes. Tombstoning all of

@@ -13,7 +13,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/core/utils.js';
 import { Permissions } from '/js/modules/permissions.js';
-import { assertScheduleKind, scheduleActive, scheduleExists } from '/js/modules/schedule-shared.js';
+import { assertScheduleKind, scheduleActive, scheduleExists, overrideHasEnded } from '/js/modules/schedule-shared.js';
 
 /**
  * Render enhanced on-call widget with schedule data
@@ -663,7 +663,14 @@ export function scheduleConfigModal(state, teamId) {
  * @param {Map} names - id -> display name
  */
 export function overridesList(overrides = [], scheduleId = '', names = new Map()) {
-    if (!overrides || overrides.length === 0) return '';
+    // The heading says Current & Upcoming, and after this release that is a
+    // filter rather than a description. Editing an override that is in force
+    // closes the served part and starts a new one, so a schedule routinely
+    // has live heads whose window is over - and both actions on this row would
+    // be refused by the server. Listing them under this heading would offer
+    // two buttons that always fail.
+    overrides = (overrides || []).filter(o => !overrideHasEnded(o.valid_to));
+    if (overrides.length === 0) return '';
 
     const formatDateTime = (dateStr) => new Date(dateStr).toLocaleString(undefined, {
         month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -770,9 +777,10 @@ export function overrideModal(state, teamId) {
                          transition: it may not exist, or it may happen twice. -->
                     <div class="override-time-note" id="override-time-note"></div>
                     <div class="form-group">
-                        <label for="override-reason">Reason (optional)</label>
+                        <label for="override-reason" id="override-reason-label">Reason (optional)</label>
                         <input type="text" id="override-reason" name="reason" class="form-input"
                                placeholder="e.g., Vacation coverage">
+                        <div class="override-reason-note" id="override-reason-note"></div>
                     </div>
                 </form>
             </div>

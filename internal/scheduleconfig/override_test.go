@@ -503,3 +503,90 @@ func TestUpdateOverrideInForceRefusesToEndInThePast(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitDoesNotAttributeSomebodyElsesReason: every revision's reason and
+// recorded_by belong to the same person, or the audit trail says one person
+// wrote words another person actually wrote.
+//
+// The split writes two revisions in one act, and both carry the editor's
+// reason - including the truncation, which is the one that used to inherit.
+func TestSplitDoesNotAttributeSomebodyElsesReason(t *testing.T) {
+	f := overrideFixture(t)
+	scheduleID := f.scheduleID(t)
+
+	alicesReason := "alice is at the dentist"
+	from := f.clock.at.Add(-time.Hour)
+	created, err := f.svc.CreateOverride(context.Background(), "devops", scheduleconfig.OverrideCommand{
+		UserID: "bob", ValidFrom: from, ValidTo: f.clock.at.Add(3 * time.Hour),
+		Reason: &alicesReason, ActorID: "alice",
+	})
+	if err != nil {
+		t.Fatalf("CreateOverride: %v", err)
+	}
+
+	f.clock.advance(time.Hour)
+	carolsReason := "carol takes it from here"
+	updated, err := f.svc.UpdateOverride(context.Background(), scheduleID, created.OverrideID, 1,
+		scheduleconfig.OverrideCommand{
+			UserID: "carol", ValidFrom: from, ValidTo: f.clock.at.Add(2 * time.Hour),
+			Reason: &carolsReason, ActorID: "bob",
+		})
+	if err != nil {
+		t.Fatalf("UpdateOverride: %v", err)
+	}
+
+	truncated := f.liveHead(t, scheduleID, created.OverrideID)
+	if truncated == nil {
+		t.Fatal("the served part was removed")
+	}
+	if truncated.Reason == nil || *truncated.Reason != carolsReason {
+		t.Errorf("the truncation carries %v under recorded_by %v; both must be the editor's",
+			truncated.Reason, truncated.RecordedBy)
+	}
+	if updated.Reason == nil || *updated.Reason != carolsReason {
+		t.Errorf("the new segment carries %v, want the editor's reason", updated.Reason)
+	}
+
+	// And alice's words are not lost - they are on the revision she wrote.
+	history := f.repo.OverrideRevisions(scheduleID)
+	if history[0].Reason == nil || *history[0].Reason != alicesReason {
+		t.Errorf("revision 1 no longer carries the reason its author wrote: %v", history[0].Reason)
+	}
+}
+
+// The same rule where the schedule itself is deleted: the deleter's reason
+// goes on the revisions the deletion writes.
+func TestDeletingAScheduleDoesNotInheritOverrideReasons(t *testing.T) {
+	f := newFixture(t)
+	created := f.mustSave(t, scheduleconfig.SaveCommand{
+		Desired: groupsConfig(group(groupAlice, "alice"), group(groupBob, "bob")),
+		ActorID: "alice",
+	})
+	scheduleID := created.Revision.ScheduleID
+
+	theirs := "covering the on-call week"
+	running, err := f.svc.CreateOverride(context.Background(), "devops", scheduleconfig.OverrideCommand{
+		UserID: "bob", ValidFrom: f.clock.at.Add(-time.Hour), ValidTo: f.clock.at.Add(3 * time.Hour),
+		Reason: &theirs, ActorID: "alice",
+	})
+	if err != nil {
+		t.Fatalf("CreateOverride: %v", err)
+	}
+
+	f.clock.advance(time.Hour)
+	mine := "team disbanded"
+	if err := f.svc.Delete(context.Background(), "devops", scheduleconfig.DeleteCommand{
+		ExpectedVersion: 1, ActorID: "bob", Reason: &mine,
+	}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	head := f.liveHead(t, scheduleID, running.OverrideID)
+	if head == nil {
+		t.Fatal("the override in force was erased instead of ended")
+	}
+	if head.Reason == nil || *head.Reason != mine {
+		t.Errorf("the ending revision carries %v under recorded_by %v; both must be the deleter's",
+			head.Reason, head.RecordedBy)
+	}
+}

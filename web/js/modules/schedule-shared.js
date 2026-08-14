@@ -100,3 +100,28 @@ export function scheduleContext(teamId, state = {}) {
 export function unavailableContext(teamId) {
     return { teamId, kind: 'unavailable', scheduleId: '', deletedAt: null, names: new Map() };
 }
+
+/**
+ * Whether an override's window has already closed.
+ *
+ * The server refuses to edit or cancel one that has: cancelling a shift
+ * somebody served would rewrite who was on duty, so both commands answer 422.
+ * The UI therefore must not offer either action, and this is the one place
+ * that decides it - the override list and the calendar's context menu both
+ * ask, and two copies of the question would drift apart the first time the
+ * rule moved.
+ *
+ * Such an override is a normal thing to have, not damage: editing one that was
+ * in force closes the served part and starts a new override, and the closed
+ * part stays live and readable for exactly as long as history does.
+ *
+ * @param {string|Date} validTo
+ * @param {Date} [now]
+ * @returns {boolean}
+ */
+export function overrideHasEnded(validTo, now = new Date()) {
+    if (!validTo) return false;
+    const end = validTo instanceof Date ? validTo : new Date(validTo);
+    if (Number.isNaN(end.getTime())) return false;
+    return end.getTime() <= now.getTime();
+}

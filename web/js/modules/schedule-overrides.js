@@ -262,8 +262,23 @@ function populateEditForm(state, head, scheduleId) {
     if (startInput) startInput.value = instantToLocalInput(head.valid_from, tz);
     if (endInput) endInput.value = instantToLocalInput(head.valid_to, tz);
 
+    // Deliberately NOT prefilled with head.reason.
+    //
+    // A revision's reason and its recorded_by are one person's - the server
+    // takes care of that - but prefilling defeats it from this side: the
+    // editor saves without touching the field and the previous author's words
+    // are submitted as theirs. The old reason is still worth seeing, so it is
+    // shown beside the field rather than inside it.
     const reasonInput = document.getElementById('override-reason');
-    if (reasonInput) reasonInput.value = head.reason || '';
+    if (reasonInput) reasonInput.value = '';
+
+    const reasonLabel = document.getElementById('override-reason-label');
+    if (reasonLabel) reasonLabel.textContent = 'Reason for this change (optional)';
+
+    const reasonNote = document.getElementById('override-reason-note');
+    if (reasonNote) {
+        reasonNote.textContent = head.reason ? `Previously: ${head.reason}` : '';
+    }
 
     const title = document.querySelector('.override-form-title');
     if (title) title.innerHTML = '<i data-lucide="pencil"></i> Edit Override';
@@ -279,6 +294,10 @@ function populateEditForm(state, head, scheduleId) {
 function resetForm(state) {
     state.fold = { start: 'earlier', end: 'later' };
     state.editing = null;
+    const reasonLabel = document.getElementById('override-reason-label');
+    if (reasonLabel) reasonLabel.textContent = 'Reason (optional)';
+    const reasonNote = document.getElementById('override-reason-note');
+    if (reasonNote) reasonNote.textContent = '';
     const title = document.querySelector('.override-form-title');
     if (title) title.innerHTML = '<i data-lucide="plus-circle"></i> Create New Override';
     const submitBtn = document.querySelector('#modal-footer button[type="submit"]');
@@ -457,8 +476,11 @@ async function handleSubmit(e, session, state, options, leave) {
         user_id: userId,
         valid_from: from.instant.toISOString(),
         valid_to: to.instant.toISOString(),
-        reason: document.getElementById('override-reason')?.value || '',
     };
+    // Omitted rather than sent empty: the field is optional, and "" would
+    // store an empty reason where there is none.
+    const reason = document.getElementById('override-reason')?.value.trim();
+    if (reason) overrideData.reason = reason;
 
     try {
         // Writes carry no session signal: closing the modal must not abort a
@@ -499,7 +521,10 @@ async function handleSubmit(e, session, state, options, leave) {
 }
 
 /**
- * Remove an override, wherever it was reached from.
+ * End an override, wherever it was reached from.
+ *
+ * "End" rather than "remove": one that has already started keeps the hours it
+ * covered, and only an override that never started disappears.
  *
  * The revision is what makes the removal safe, and only the list of override
  * heads carries it: a calendar band and an on-call row both know which
@@ -509,7 +534,7 @@ async function handleSubmit(e, session, state, options, leave) {
  * @param {Object} target - {teamId, overrideId, scheduleId?, revision?}
  * @param {Object} [handlers]
  * @param {() => Promise<void>|void} [handlers.onStale] - what the caller shows is behind
- * @returns {Promise<boolean>} whether the override is gone
+ * @returns {Promise<boolean>} whether the override was ended
  */
 export async function removeOverride(target, { onStale } = {}) {
     let { scheduleId, revision } = target;

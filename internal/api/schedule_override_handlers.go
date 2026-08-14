@@ -91,7 +91,6 @@ func (a *API) UpdateScheduleOverride(c echo.Context) error {
 // @Param schedule_id path string true "Schedule ID"
 // @Param id path string true "Override ID"
 // @Param expected_revision query int true "Revision the caller loaded"
-// @Param reason query string false "Why it is being cancelled"
 // @Success 204
 // @Failure 400 {object} ErrorResponse
 // @Failure 404 {object} ErrorResponse
@@ -101,19 +100,19 @@ func (a *API) UpdateScheduleOverride(c echo.Context) error {
 func (a *API) DeleteScheduleOverride(c echo.Context) error {
 	// Query rather than body: a DELETE body is not carried reliably by every
 	// client and proxy, and losing it here would silently skip the conflict
-	// check the parameter exists to perform. The reason rides along for the
-	// same reason.
+	// check the parameter exists to perform.
 	expected, err := strconv.ParseInt(c.QueryParam("expected_revision"), 10, 64)
 	if err != nil {
 		return badRequest(c, CodeInvalidParameter, "expected_revision query parameter is required")
 	}
-	var reason *string
-	if raw := c.QueryParam("reason"); raw != "" {
-		reason = &raw
-	}
 
+	// No reason over HTTP yet, deliberately. The command takes one - that is
+	// what keeps a cancel from inheriting the previous author's words - but
+	// nothing sends one, and a query parameter is the wrong place for free
+	// text: it lands in every access log along the way. It goes back in a
+	// request body when there is a caller with something to say.
 	if err := a.scheduleConfig.CancelOverride(c.Request().Context(),
-		c.Param("schedule_id"), c.Param("id"), expected, actorID(c), reason); err != nil {
+		c.Param("schedule_id"), c.Param("id"), expected, actorID(c), nil); err != nil {
 		return a.mapScheduleError(c, err)
 	}
 	return c.NoContent(http.StatusNoContent)
