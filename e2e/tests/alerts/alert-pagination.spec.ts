@@ -89,18 +89,17 @@ test.describe('Alert Pagination', () => {
   });
 
   test('should update alert list when navigating pages', async ({ dashboardPage, page }) => {
-    // Get first alert title on page 1
+    // Identity, not title: titles are not unique, and a database with enough
+    // alerts from earlier runs puts a same-named group at the top of both
+    // pages. The page would have turned; the test would say it had not.
     const alertCards = dashboardPage.alertGroupsGrid.locator('.alert-group-card');
-    const firstAlertPage1 = await alertCards.first().locator('.alert-group-title').textContent();
+    const firstAlertPage1 = await alertCards.first().getAttribute('data-alert-group-id');
 
-    // Go to page 2
     await dashboardPage.goToNextPage();
     await page.waitForTimeout(300);
 
-    // Get first alert title on page 2
-    const firstAlertPage2 = await alertCards.first().locator('.alert-group-title').textContent();
+    const firstAlertPage2 = await alertCards.first().getAttribute('data-alert-group-id');
 
-    // Alerts should be different
     expect(firstAlertPage2).not.toBe(firstAlertPage1);
   });
 });

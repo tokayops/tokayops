@@ -176,6 +176,293 @@ test.describe('Schedule Configuration', () => {
     await schedulesPage.closeScheduleModal();
   });
 
+  /**
+   * The Until column is in the reader's timezone, not each schedule's, and the
+   * header is the only thing that says so. Without it the column reads as if
+   * it were in the zone the schedule was configured with.
+   */
+  test('should say whose timezone the Until column is in', async ({ page }) => {
+    const until = page.locator('.oncall-list-header .oncall-cell').filter({ hasText: 'Until' });
+    // The short zone itself is not asserted: it is the runner's own, and it
+    // changes with the locale and with daylight saving. That it is there, and
+    // that the title says whose it is, are the parts that carry the meaning.
+    await expect(until.locator('.oncall-cell-note')).not.toBeEmpty();
+    await expect(until).toHaveAttribute('title', /Shown in your timezone/);
+
+    // The label sits beside the column name rather than under it. On its own
+    // line it made the header taller than the rows and pulled the columns out
+    // of line, so the alignment is what gets pinned.
+    const columns = await page.evaluate(() => {
+      const left = (el: Element | null) => el
+        ? [...el.children].map(child => Math.round(child.getBoundingClientRect().left))
+        : null;
+      return {
+        header: left(document.querySelector('.oncall-list-header')),
+        row: left(document.querySelector('.oncall-row')),
+      };
+    });
+    expect(columns.header).not.toBeNull();
+    if (columns.row) {
+      // A row carries a border and padding the header does not, so its
+      // columns start a pixel over rather than exactly on.
+      for (const [i, headerLeft] of columns.header!.entries()) {
+        expect(Math.abs(headerLeft - columns.row[i])).toBeLessThanOrEqual(2);
+      }
+    }
+  });
+
+  /**
+   * The cadence reads as a sentence, and the modal is exactly as wide as those
+   * sentences need at their longest. A weekly rotation is the case that sets
+   * the width, and L2's copy of it is the tighter of the two - it sits a
+   * section's padding deeper. One more word in a strip, or one more pixel on a
+   * control, and they wrap again.
+   */
+  test('should keep both cadence sentences on one line', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    await oncallRow.locator('.edit-schedule-btn').click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    // Weekly adds the handoff day, the clause that makes a sentence longest.
+    const l2Checkbox = page.locator('#l2-enabled');
+    if (!await l2Checkbox.isChecked()) {
+      await l2Checkbox.check();
+    }
+    await page.locator('#l1-rotation-type').selectOption('weekly');
+    await page.locator('#l2-rotation-type').selectOption('weekly');
+    await expect(page.locator('.l1-weekly-only')).toBeVisible();
+    await expect(page.locator('.l2-weekly-only')).toBeVisible();
+
+    // A strip centres its controls, so items on one line share a vertical
+    // centre even where their heights differ. Their top edges do not.
+    const lines = await page.locator('.cadence-strip').evaluateAll(strips =>
+      strips.map(strip => new Set([...strip.children].map(child => {
+        const box = child.getBoundingClientRect();
+        return Math.round(box.top + box.height / 2);
+      })).size));
+    expect(lines).toEqual([1, 1]);
+
+    await schedulesPage.closeScheduleModal();
+  });
+
+  /**
+   * A layer that is off has nothing to set, so the escalation timeout is a
+   * number in a sentence rather than a control. Nothing here saves.
+   */
+  test('should show the L2 timeout only while the layer is on', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    await oncallRow.locator('.edit-schedule-btn').click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    const l2Checkbox = page.locator('#l2-enabled');
+    const timeout = page.locator('#l2-escalation-timeout');
+    const asText = page.locator('.l2-timeout-static');
+
+    if (!await l2Checkbox.isChecked()) {
+      await l2Checkbox.check();
+    }
+    await expect(timeout).toBeVisible();
+    await expect(asText).toBeHidden();
+
+    await timeout.fill('12');
+    await l2Checkbox.uncheck();
+    await expect(timeout).toBeHidden();
+    // What was typed, not what the modal opened with: otherwise switching the
+    // layer off and on again would look like the edit had been discarded.
+    await expect(asText).toHaveText('12');
+
+    await l2Checkbox.check();
+    await expect(timeout).toBeVisible();
+    await expect(timeout).toHaveValue('12');
+
+    await schedulesPage.closeScheduleModal();
+  });
+
+  /**
+   * The L2 order is edited the way L1 is - pick to add, trash to remove - and
+   * nothing here saves: the standing fixture belongs to every other test in
+   * this file, and the behaviour under test is the editor's, not the API's.
+   */
+  test('should edit the L2 backup order', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    await oncallRow.locator('.edit-schedule-btn').click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    const l2Checkbox = page.locator('#l2-enabled');
+    if (!await l2Checkbox.isChecked()) {
+      await l2Checkbox.check();
+    }
+
+    const picker = page.locator('#l2-add-user');
+    await expect(picker).toBeVisible();
+
+    // Two people the picker offers who are not already in the order. Two,
+    // because removing one of two is what shows the rest renumbering.
+    const before = await schedulesPage.getL2UserIds();
+    const inOrder = new Set(before);
+    const candidates = (await picker.locator('option').evaluateAll(
+      opts => opts.map(o => (o as HTMLOptionElement).value)))
+      .filter(value => value && !inOrder.has(value))
+      .slice(0, 2);
+
+    if (candidates.length < 2) {
+      test.skip();
+      return;
+    }
+
+    const [first, second] = candidates;
+    await schedulesPage.addL2User(first);
+    await schedulesPage.addL2User(second);
+    await expect.poll(() => schedulesPage.getL2UserIds())
+      .toEqual([...before, first, second]);
+
+    // The picker keeps offering everyone; selecting a duplicate is refused
+    // rather than appended, which is the L1 bargain.
+    await schedulesPage.addL2User(first);
+    await expect.poll(() => schedulesPage.getL2UserIds())
+      .toEqual([...before, first, second]);
+
+    // Positions are the order, so removing one renumbers what follows.
+    await schedulesPage.removeL2User(before.length);
+    await expect.poll(() => schedulesPage.getL2UserIds())
+      .toEqual([...before, second]);
+    expect(await schedulesPage.getL2Positions())
+      .toEqual(Array.from({ length: before.length + 1 }, (_, i) => String(i + 1)));
+
+    await schedulesPage.closeScheduleModal();
+  });
+
+  /**
+   * The editor is bounded by the modal on a phone too, and the name of whoever
+   * is in a group survives being there.
+   *
+   * Both were lost the same way: the flexible tracks are the ones carrying
+   * names, so they are the ones that reach zero, and a tooltip 200px wide
+   * anchored inside a 238px column pushed the rest sideways while invisible.
+   */
+  test('should stay inside the modal at 320px', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    await page.setViewportSize({ width: 320, height: 900 });
+    await oncallRow.locator('.edit-schedule-btn').click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    // By id: every modal in the app carries a .modal-body, and only this one
+    // is the shell the schedule editor was rendered into.
+    const overflow = await page.locator('#modal-body')
+      .evaluate(body => body.scrollWidth - body.clientWidth);
+    expect(overflow, 'the editor does not scroll sideways').toBeLessThanOrEqual(0);
+
+    const chip = page.locator('#l1-groups-editor .user-chip').first();
+    if (await chip.count() > 0) {
+      const width = await chip.evaluate(el => Math.round(el.getBoundingClientRect().width));
+      expect(width, 'the name in a group is still on screen').toBeGreaterThan(40);
+    }
+
+    // The track count, and not just the look of the row, because this is the
+    // rule the cascade can undo without any visible sign. A media query has no
+    // specificity of its own, so the same selector later in the file wins: the
+    // chips still move to a line of their own - they are matched by a selector
+    // nothing else claims - inside a grid that is quietly still five columns
+    // wide, with the picker back in a track that can be squeezed to nothing.
+    const tracks = await page.locator('#l1-groups-editor .group-row').first()
+      .evaluate(row => getComputedStyle(row).gridTemplateColumns.split(/\s+/).length);
+    expect(tracks, 'the row restacks to four tracks at this width').toBe(4);
+
+    await schedulesPage.closeScheduleModal();
+  });
+
+  /**
+   * What the rows say and what the save would send are two different claims,
+   * and the one that matters is the second: the order on screen is only worth
+   * anything if it is the order that leaves the browser. Reading the DOM back
+   * cannot tell a broken serializer from a working one - collectConfig could
+   * lose the selector, sort the ids or ignore a reorder, and every assertion
+   * about the rows would still pass.
+   *
+   * Preview carries the exact payload the save would and writes nothing, so
+   * the claim can be checked without touching the standing fixture.
+   */
+  test('should send the L2 order that is on screen', async ({ schedulesPage, page }) => {
+    const oncallRow = await getOnCallRowWithSchedule(page);
+
+    if (!oncallRow) {
+      test.skip();
+      return;
+    }
+
+    await oncallRow.locator('.edit-schedule-btn').click();
+    await schedulesPage.expectScheduleModalVisible();
+
+    const l2Checkbox = page.locator('#l2-enabled');
+    if (!await l2Checkbox.isChecked()) {
+      await l2Checkbox.check();
+    }
+
+    const picker = page.locator('#l2-add-user');
+    const inOrder = new Set(await schedulesPage.getL2UserIds());
+    const candidates = (await picker.locator('option').evaluateAll(
+      opts => opts.map(o => (o as HTMLOptionElement).value)))
+      .filter(value => value && !inOrder.has(value))
+      .slice(0, 2);
+
+    if (candidates.length < 2) {
+      test.skip();
+      return;
+    }
+
+    for (const id of candidates) {
+      await schedulesPage.addL2User(id);
+    }
+
+    // Dragged rather than only added, because reordering is the part a DOM
+    // assertion cannot vouch for: the rows move, and whether the serializer
+    // reads them in their new order is exactly the open question.
+    const rows = page.locator('#l2-users-list .group-row');
+    const count = await rows.count();
+    await page.dragAndDrop(
+      `#l2-users-list .group-row:nth-child(${count}) .group-drag-handle`,
+      '#l2-users-list .group-row:nth-child(1)');
+
+    const onScreen = await schedulesPage.getL2UserIds();
+    expect(onScreen[0], 'the dragged row moved to the top').toBe(candidates[1]);
+
+    const previewRequest = page.waitForRequest(request =>
+      request.url().includes('/schedule/preview') && request.method() === 'POST');
+    await page.locator('#schedule-form-submit').click();
+    const sent = (await previewRequest).postDataJSON();
+
+    expect(sent.l2.user_ids).toEqual(onScreen);
+    await expect(page.locator('.schedule-preview')).toBeVisible();
+
+    // Left at the preview: confirming is what would write, and this test has
+    // no business changing the schedule every other test reads.
+    await schedulesPage.closeScheduleModal();
+  });
+
   test('should save schedule configuration', async ({ schedulesPage, page }) => {
     const oncallRow = await getOnCallRowWithSchedule(page);
 
@@ -246,8 +533,10 @@ test.describe('Schedule Deletion', () => {
     await editBtn.click();
     await schedulesPage.expectScheduleModalVisible();
 
-    // Danger Zone title should be visible
-    const dangerZone = page.locator('.team-modal-section').filter({ hasText: 'Danger Zone' });
+    // Danger Zone title should be visible. Its own section class, not the
+    // generic team one: the block is styled here rather than by inline rules
+    // borrowed from another modal.
+    const dangerZone = page.locator('.schedule-danger');
     await expect(dangerZone).toBeVisible();
 
     // The warning says what is actually true: the rotation stops and overrides

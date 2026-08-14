@@ -110,7 +110,7 @@ function bindScheduleFormEvents(session, { members, options }) {
     if (!form) return;
 
     initGroupsEditor(session, 'l1-groups-editor', 'l1-add-group', members);
-    initSortableLists('l2-available', 'l2-users-list');
+    initOrderedUserList(session, 'l2-users-list', 'l2-add-user', members);
 
     // Cadence toggles. The handoff day is meaningless for a daily rotation and
     // the server canonicalizes it away, so the field is hidden rather than
@@ -129,10 +129,22 @@ function bindScheduleFormEvents(session, { members, options }) {
     const l2Enabled = document.getElementById('l2-enabled');
     const l2Config = document.querySelector('.l2-config');
     const l2Panel = document.querySelector('.l2-users-panel');
+    const l2Timeout = document.getElementById('l2-escalation-timeout');
+    const l2TimeoutStatic = document.querySelector('.l2-timeout-static');
     if (l2Enabled) {
         l2Enabled.addEventListener('change', () => {
             if (l2Config) l2Config.style.display = l2Enabled.checked ? '' : 'none';
             if (l2Panel) l2Panel.style.display = l2Enabled.checked ? '' : 'none';
+            // Switching the layer off leaves the number in the sentence as
+            // text, so it still says what would happen if it were on. It
+            // carries whatever was typed, not what the schedule was opened
+            // with, or turning the layer off and on again would appear to
+            // discard the edit.
+            if (l2Timeout && l2TimeoutStatic) {
+                if (!l2Enabled.checked) l2TimeoutStatic.textContent = l2Timeout.value;
+                l2Timeout.hidden = !l2Enabled.checked;
+                l2TimeoutStatic.hidden = l2Enabled.checked;
+            }
         }, { signal: session.signal });
     }
 
@@ -151,50 +163,83 @@ function bindScheduleFormEvents(session, { members, options }) {
 }
 
 /**
- * Initialize SortableJS for a pair of available/selected lists
+ * The L2 backup order: one person per row, reordered by dragging, added from a
+ * picker and removed from the row.
+ *
+ * It is the L1 editor with the group step taken out, and that is the whole
+ * point: L2 has no groups to manage - the API takes a flat order - so the only
+ * honest difference between the two editors is that this one has no chips.
+ *
+ * The list it replaced asked to be operated a third way, by dragging people
+ * across from a second column of everyone available. That column also silently
+ * doubled as the roster, which made removing someone and re-adding them a trip
+ * in each direction.
  */
-function initSortableLists(availableId, selectedId) {
-    const availableList = document.getElementById(availableId);
-    const selectedList = document.getElementById(selectedId);
+function initOrderedUserList(session, listId, pickerId, members) {
+    const list = document.getElementById(listId);
+    const picker = document.getElementById(pickerId);
+    if (!list) return;
 
-    if (!availableList || !selectedList || typeof Sortable === 'undefined') return;
+    const renumber = () => {
+        list.querySelectorAll('.group-row').forEach((row, i) => {
+            const label = row.querySelector('.group-label');
+            if (!label) return;
+            label.textContent = String(i + 1);
+            label.setAttribute('aria-label', `Position ${i + 1}`);
+        });
+    };
 
-    new Sortable(availableList, {
-        group: availableId.replace('-available', '-rotation'),
-        animation: 150,
-        ghostClass: 'sortable-ghost',
-        chosenClass: 'sortable-chosen',
-        sort: false,
-        onEnd: () => {
-            if (window.lucide) lucide.createIcons();
-        }
-    });
+    // Kept in step with renderL2Row in schedule-components.js.
+    const createL2Row = (userId, name, index) => {
+        const row = document.createElement('div');
+        row.className = 'group-row user-row';
+        row.dataset.userId = userId;
+        row.innerHTML = `
+            <i data-lucide="grip-vertical" class="group-drag-handle"></i>
+            <span class="group-label" aria-label="Position ${index + 1}">${index + 1}</span>
+            <span class="row-name" title="${escapeAttr(name)}">${escapeHtml(name)}</span>
+            <button type="button" class="btn btn-icon btn-sm group-delete" aria-label="Remove from rotation">
+                <i data-lucide="trash-2"></i>
+            </button>
+        `;
+        return row;
+    };
 
-    new Sortable(selectedList, {
-        group: availableId.replace('-available', '-rotation'),
-        animation: 150,
-        ghostClass: 'sortable-ghost',
-        chosenClass: 'sortable-chosen',
-        handle: '.drag-handle',
-        onAdd: (evt) => {
-            const item = evt.item;
-            if (!item.querySelector('.drag-handle')) {
-                const handle = document.createElement('i');
-                handle.setAttribute('data-lucide', 'grip-vertical');
-                handle.className = 'drag-handle';
-                item.insertBefore(handle, item.firstChild);
+    if (typeof Sortable !== 'undefined') {
+        new Sortable(list, {
+            animation: 150,
+            handle: '.group-drag-handle',
+            ghostClass: 'sortable-ghost',
+            chosenClass: 'sortable-chosen',
+            onEnd: () => {
+                renumber();
                 if (window.lucide) lucide.createIcons();
             }
-        },
-        onRemove: (evt) => {
-            const item = evt.item;
-            const handle = item.querySelector('.drag-handle');
-            if (handle) handle.remove();
-        },
-        onEnd: () => {
-            if (window.lucide) lucide.createIcons();
-        }
-    });
+        });
+    }
+
+    list.addEventListener('click', (e) => {
+        const remove = e.target.closest('.group-delete');
+        if (!remove) return;
+        remove.closest('.group-row')?.remove();
+        renumber();
+        clearGroupErrors(list);
+    }, { signal: session.signal });
+
+    // The picker offers every member, including one already in the order, and
+    // refuses the duplicate on selection - the same bargain the L1 picker
+    // makes, and it keeps the list of people from changing under a click.
+    picker?.addEventListener('change', () => {
+        const userId = picker.value;
+        if (!userId) return;
+        picker.value = '';
+        if (list.querySelector(`.group-row[data-user-id="${CSS.escape(userId)}"]`)) return;
+
+        const name = members.find(u => u.id === userId)?.name || userId;
+        list.appendChild(createL2Row(userId, name, list.querySelectorAll('.group-row').length));
+        if (window.lucide) lucide.createIcons();
+        clearGroupErrors(list);
+    }, { signal: session.signal });
 }
 
 /**
@@ -213,7 +258,7 @@ function initGroupsEditor(session, editorId, addGroupBtnId, members) {
     if (!editor) return;
 
     const buildOptions = () => {
-        const opts = ['<option value="">+ Add user</option>'];
+        const opts = ['<option value="">+ Add</option>'];
         for (const u of members) {
             opts.push(`<option value="${escapeAttr(u.id)}">${escapeHtml(u.name)}</option>`);
         }
@@ -223,7 +268,12 @@ function initGroupsEditor(session, editorId, addGroupBtnId, members) {
     const renumberGroups = () => {
         editor.querySelectorAll('.group-row').forEach((row, i) => {
             const label = row.querySelector('.group-label');
-            if (label) label.textContent = `Group ${i + 1}`;
+            if (!label) return;
+            // The number is the group's place in the rotation; the word
+            // "group" is in the panel heading, and only assistive tech needs
+            // it repeated here.
+            label.textContent = String(i + 1);
+            label.setAttribute('aria-label', `Group ${i + 1}`);
         });
     };
 
@@ -231,11 +281,13 @@ function initGroupsEditor(session, editorId, addGroupBtnId, members) {
         const row = document.createElement('div');
         row.className = 'group-row';
         row.dataset.groupId = crypto.randomUUID();
+        // Kept in step with renderGroupRow in schedule-components.js: the two
+        // build the same row, one from stored config and one from a click.
         row.innerHTML = `
             <i data-lucide="grip-vertical" class="group-drag-handle"></i>
-            <span class="group-label">Group ${index + 1}</span>
+            <span class="group-label" aria-label="Group ${index + 1}">${index + 1}</span>
             <div class="group-chips"></div>
-            <select class="form-select group-add-user">${buildOptions()}</select>
+            <select class="form-select group-add-user" aria-label="Add a user to this group">${buildOptions()}</select>
             <button type="button" class="btn btn-icon btn-sm group-delete" aria-label="Delete group">
                 <i data-lucide="trash-2"></i>
             </button>
@@ -299,7 +351,8 @@ function initGroupsEditor(session, editorId, addGroupBtnId, members) {
         const chip = document.createElement('span');
         chip.className = 'user-chip';
         chip.dataset.userId = userId;
-        chip.innerHTML = `${escapeHtml(optionText)}<button type="button" class="chip-remove" aria-label="Remove">×</button>`;
+        chip.innerHTML = `<span class="chip-name" title="${escapeAttr(optionText)}">${escapeHtml(optionText)}</span>`
+            + `<button type="button" class="chip-remove" aria-label="Remove">×</button>`;
         chips.appendChild(chip);
         select.value = '';
         clearGroupErrors(editor);
@@ -329,7 +382,7 @@ function collectConfig() {
     });
 
     const l2UserIds = [];
-    document.querySelectorAll('#l2-users-list .rotation-user').forEach(item => {
+    document.querySelectorAll('#l2-users-list .group-row').forEach(item => {
         l2UserIds.push(item.dataset.userId);
     });
 
