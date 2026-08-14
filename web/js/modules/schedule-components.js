@@ -1007,14 +1007,25 @@ export function schedulePreview(preview, names = new Map(), timezone = 'UTC') {
     const onCallAfter = onCallNames(preview.on_call_after?.l1, names);
     const before = onCallNames(preview.on_call_before?.l1, names) || 'nobody';
     const after = onCallAfter || 'nobody';
+
+    // Every time in this preview is the schedule's, and the zone is named on
+    // screen. The cadence above was typed in that zone, so its handoffs read
+    // back at the hour that was typed; and one modal showing two unlabelled
+    // zones is how "calculated at 10:56" and a first row saying "07:56" turn
+    // out to be the same instant looking like two.
     const evaluatedAt = new Date(preview.evaluated_at).toLocaleString(undefined, {
-        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: timezone,
     });
 
-    // The next few handoffs, so the effect on the rotation order is
-    // visible rather than inferred from one name.
+    // The next few handoffs, so the effect on the rotation order is visible
+    // rather than inferred from one name. Handoffs, strictly: the render
+    // window opens at evaluated_at, so the shift already in progress comes
+    // back clipped to that instant - a start time that is really "now", under
+    // a heading that says these are what comes next. The banner above is that
+    // shift's story; the list keeps what actually changes hands later.
+    const evaluatedTs = new Date(preview.evaluated_at).getTime();
     const upcoming = (preview.entries || [])
-        .filter(e => e.layer === 'l1')
+        .filter(e => e.layer === 'l1' && new Date(e.start).getTime() > evaluatedTs)
         .slice(0, 6)
         .map(e => ({
             when: new Date(e.start).toLocaleString(undefined, {
@@ -1048,7 +1059,10 @@ export function schedulePreview(preview, names = new Map(), timezone = 'UTC') {
             ${scheduleWarnings(preview.warnings)}
 
             <div class="preview-shifts">
-                <h4 class="preview-shifts-title">Next shifts after saving</h4>
+                <h4 class="preview-shifts-title">
+                    Next handoffs after saving
+                    <span class="preview-shifts-zone">${escapeHtml(timezone)}</span>
+                </h4>
                 ${upcoming.length > 0 ? `
                 <ul class="preview-shift-list">
                     ${upcoming.map(shift => `
@@ -1059,13 +1073,14 @@ export function schedulePreview(preview, names = new Map(), timezone = 'UTC') {
                         </li>
                     `).join('')}
                 </ul>
-                ` : '<p class="preview-empty">No shifts in the previewed window.</p>'}
+                ` : '<p class="preview-empty">No handoffs in the previewed window: the current shift carries on.</p>'}
             </div>
 
             <p class="preview-caveat">
                 <i data-lucide="info"></i>
-                Calculated at ${escapeHtml(evaluatedAt)}. Saving recalculates it, so a handoff
-                or an override in the meantime can change the result.
+                Calculated at ${escapeHtml(evaluatedAt)} (${escapeHtml(timezone)}). Saving
+                recalculates it, so a handoff or an override in the meantime can change
+                the result.
             </p>
         </div>
     `;

@@ -4334,6 +4334,18 @@ body::before {
     color: var(--text-muted);
 }
 
+/* The zone the list's times are in, beside the heading - the same treatment
+   as the on-call list's Until column, and for the same reason: an unlabelled
+   timestamp gets read in whatever zone the reader is in. */
+.preview-shifts-zone {
+    margin-left: 4px;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+    font-size: 0.7rem;
+    opacity: 0.8;
+}
+
 .preview-shift-list {
     display: flex;
     flex-direction: column;
