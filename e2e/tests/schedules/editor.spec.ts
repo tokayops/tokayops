@@ -253,8 +253,37 @@ test.describe('Schedule editor', () => {
     await expect(preview, 'a change of duty is called out').toContainText(/on duty right now changes/i);
     await expect(preview).toContainText('E2E ann');
     await expect(preview).toContainText('E2E ben');
+    await expect(preview, 'the shift list holds handoffs, and one group never hands off')
+      .toContainText('No handoffs in the previewed window');
     await expect(preview, 'the preview does not pretend to be a guarantee')
       .toContainText('Saving recalculates it');
+  });
+
+  test('the preview lists handoffs in the schedule zone', async ({ page }) => {
+    const env = await seedTeam(page, 'zones');
+    await save(page, env.teamId, config([['e2e-ann'], ['e2e-ben']], 0));
+
+    await openEditor(page, env.teamId);
+    await page.locator('#schedule-form-submit').click();
+    const preview = page.locator('.schedule-preview');
+    await preview.waitFor({ state: 'visible' });
+
+    // The times are the schedule's (UTC here), not the reader's, and the zone
+    // is named next to them: an unlabelled timestamp gets read in whatever
+    // zone the reader is in.
+    await expect(preview.locator('.preview-shifts-zone')).toHaveText('UTC');
+    await expect(preview.locator('.preview-caveat')).toContainText('(UTC)');
+
+    // Every row is a genuine handoff, so every row shows the configured hour.
+    // The render window opens at "now", and the shift already in progress
+    // used to come back clipped to that instant - a first row whose time was
+    // the preview's own evaluated_at, under a heading promising what comes
+    // next.
+    const times = await preview.locator('.preview-shift-when').allTextContents();
+    expect(times.length).toBeGreaterThan(0);
+    for (const time of times) {
+      expect(time, 'a handoff happens at the handoff hour').toContain('09:00');
+    }
   });
 
   test('a form opened before someone else saved is refused', async ({ page }) => {
