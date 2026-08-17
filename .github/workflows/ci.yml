@@ -96,43 +96,73 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v5
 
+    # The runtime stages are alpine + `apk add`, which runs as the target
+    # architecture. On an amd64 runner the arm64 leg needs emulation, so QEMU
+    # has to be registered before buildx.
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
     - name: Login to GitHub Container Registry
+      if: github.event_name == 'push'
       uses: docker/login-action@v3
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Determine Docker tag
+    - name: Determine Docker tags
       id: docker_tag
       run: |
-        if [ "${{ github.ref }}" == "refs/heads/main" ]; then
-          echo "tag=latest" >> $GITHUB_OUTPUT
-        else
-          echo "tag=develop" >> $GITHUB_OUTPUT
+        # Every build gets the immutable sha- tag. A moving tag is added only
+        # for the two branches we publish from: main -> latest, develop ->
+        # develop. Pull requests build but never publish - github.ref is
+        # refs/pull/N/merge there, so without this a PR would overwrite
+        # :develop with unreviewed code.
+        moving=""
+        if [ "${{ github.event_name }}" = "push" ]; then
+          case "${{ github.ref }}" in
+            refs/heads/main)    moving="latest" ;;
+            refs/heads/develop) moving="develop" ;;
+          esac
         fi
+        emit_tags() {
+          output_name="$1"
+          image="$2"
+          {
+            echo "${output_name}<<TAGS_EOF"
+            echo "ghcr.io/tokayops/${image}:sha-${{ github.sha }}"
+            if [ -n "$moving" ]; then
+              echo "ghcr.io/tokayops/${image}:${moving}"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+        }
+        emit_tags app_tags tokayops
+        emit_tags receiver_tags webhook-receiver
 
     - name: Build and push Tokay
       uses: docker/build-push-action@v5
       with:
         context: .
-        push: true
+        push: ${{ github.event_name == 'push' }}
+        # amd64-only images cannot be installed on Apple Silicon or ARM servers:
+        # `docker compose up` fails with "no matching manifest for linux/arm64".
+        platforms: linux/amd64,linux/arm64
         build-args: |
           GIT_COMMIT=${{ github.sha }}
           GIT_BRANCH=${{ github.ref_name }}
-        tags: |
-          ghcr.io/tokayops/tokayops:${{ steps.docker_tag.outputs.tag }}
-          ghcr.io/tokayops/tokayops:sha-${{ github.sha }}
+        tags: ${{ steps.docker_tag.outputs.app_tags }}
 
     - name: Build and push Webhook Receiver
       uses: docker/build-push-action@v5
       with:
         context: .
         file: cmd/webhook-receiver/Dockerfile
-        push: true
-        tags: |
-          ghcr.io/tokayops/webhook-receiver:${{ steps.docker_tag.outputs.tag }}
-          ghcr.io/tokayops/webhook-receiver:sha-${{ github.sha }}
+        push: ${{ github.event_name == 'push' }}
+        platforms: linux/amd64,linux/arm64
+        tags: ${{ steps.docker_tag.outputs.receiver_tags }}
