@@ -1,18 +1,20 @@
 # TokayOps
 
 TokayOps is a lightweight, source-available incident management layer between
-Alertmanager and your on-call engineer, designed for speed and simplicity. It
-groups noisy alerts into a single incident, routes them to the right team by
-severity and on-call schedule, escalates until someone answers, and lets them
-Acknowledge / Resolve straight from Slack or Telegram. It ships a clean,
-glassmorphism-inspired web UI. One container, your Postgres.
+Alertmanager and your on-call engineer, designed for speed and simplicity.
+Alertmanager decides what belongs together; TokayOps keeps that group as one
+live escalation, routes it to the right team by severity and on-call schedule,
+escalates until someone answers, and lets them Acknowledge / Resolve straight
+from Slack or Telegram. It ships a clean, glassmorphism-inspired web UI. One
+container, your Postgres.
 
 ## Architecture
 
 TokayOps is an asynchronous pipeline: ingest (Alertmanager webhook) -> store
 (PostgreSQL) -> policy engine -> dispatcher (pluggable providers) -> Slack /
-Telegram. The primary runtime entity is the **AlertGroup**: grouped,
-deduplicated alerts with a status lifecycle, timeline and escalation state.
+Telegram. The primary runtime entity is the **AlertGroup**: the alerts
+Alertmanager grouped, deduplicated by `groupKey`, with a status lifecycle,
+timeline and escalation state.
 
 Delivery is built to be reliable and horizontally safe: a transactional outbox
 commits events in the same transaction as the status change, and job steps run
@@ -21,7 +23,10 @@ re-claimed instead of lost.
 
 ## Features
 
-- Automatic alert grouping and deduplication by `groupKey`.
+- Deduplication by Alertmanager's `groupKey` (alert fingerprint as fallback):
+  repeat deliveries merge into the live Alert Group and update its message in
+  place instead of opening a new one, and the group resolves itself once every
+  alert has cleared.
 - Team-based routing with severity-selected escalation policies.
 - On-call schedules with multi-user groups (1+ users per rotation slot), L2
   backup, overrides and calendar.
@@ -48,7 +53,7 @@ re-claimed instead of lost.
 ## Getting Started
 
 ### Prerequisites
-- **Go**: 1.22+
+- **Go**: 1.25+ (see `go.mod`; only needed to build from source)
 - **PostgreSQL**: 13+
 
 ### Configuration
@@ -204,23 +209,54 @@ Note: SSO users cannot change their name (synced from provider).
 `/api/v1/incidents/*` endpoints are aliased to `/api/v1/alert-groups/*` for backward compatibility.
 
 ## Deployment
-TokayOps is packaged as a Docker container.
 
-```bash
-docker build -t tokayops .
-docker run -d \
-  -p 8080:8080 \
-  -e DB_HOST="postgres.example.com" \
-  -e DB_USER="tokay" \
-  -e DB_PASSWORD="my%secret#password" \
-  -e DB_NAME="tokay" \
-  -e ENCRYPTION_KEY="$(openssl rand -hex 32)" \
-  -e JWT_SECRET="$(openssl rand -base64 32)" \
-  -e APP_ENV="production" \
-  tokayops
+Prebuilt images are published to GHCR for `linux/amd64` and `linux/arm64`:
+
+```
+ghcr.io/tokayops/tokayops:develop      # current build of the develop branch
+ghcr.io/tokayops/tokayops:sha-<commit>  # immutable, pin this for reproducibility
 ```
 
-**Note**: In production, ensure `APP_ENV=production` is set to enable HTTPOnly Secure cookies (requires HTTPS).
+There is no stable release yet, so `:develop` is the tag to start from. `:latest`
+is built from `main`, which currently lags well behind.
+
+Deploy with the bundled compose file, which brings up Postgres alongside the app:
+
+```bash
+curl -fLO https://raw.githubusercontent.com/tokayops/tokayops/develop/docker-compose.prod.yml
+curl -fL -o .env https://raw.githubusercontent.com/tokayops/tokayops/develop/.env.example
+docker compose -f docker-compose.prod.yml up -d
+```
+
+Before that `up`, `.env` needs five values. The template ships with the first
+three empty or set for development:
+
+| Variable | Set it to |
+| --- | --- |
+| `ENCRYPTION_KEY` | `openssl rand -hex 32` (exactly 64 hex chars) |
+| `JWT_SECRET` | `openssl rand -base64 32` |
+| `DB_PASSWORD` | a strong password |
+| `APP_ENV` | `production` (the template says `development`) |
+| `TOKAY_SELF_URL` | your public HTTPS URL (commented out in the template) |
+
+Create the first user - it becomes admin automatically:
+
+```bash
+docker compose -f docker-compose.prod.yml exec tokay \
+  /app/tokayops user create admin@example.com '<password>' 'Admin User'
+```
+
+Two things that are easy to miss:
+
+- `APP_ENV=production` enables HTTPOnly Secure cookies and CSRF, so the app must
+  be served over HTTPS. The compose file binds both ports to loopback; put a
+  reverse proxy in front.
+- `TOKAY_SELF_URL` must be your public HTTPS URL. Without it the app still runs,
+  but Slack/Telegram Ack/Resolve buttons are hidden and Telegram linking cannot
+  complete.
+
+**Full installation guide, including Slack, Telegram and Alertmanager wiring:
+https://tokayops.com/install**
 
 ## Project Structure
 - `cmd/tokayops`: Main application entry point.
