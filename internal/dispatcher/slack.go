@@ -25,7 +25,8 @@ type SlackTokenSource interface {
 
 type SlackProvider struct {
 	tokenSource SlackTokenSource
-	selfURL     string // TokayOps base URL for deep links
+	selfURL     string     // TokayOps base URL for deep links
+	teamLookup  TeamLookup // nil means "assume onboarded", see teamIsOnboarded
 	mu          sync.Mutex
 	cachedToken string
 	client      *slack.Client
@@ -58,10 +59,11 @@ func parseSlackData(raw string) (*SlackData, bool) {
 	return &data, true
 }
 
-func NewSlackProvider(tokenSource SlackTokenSource, selfURL string) *SlackProvider {
+func NewSlackProvider(tokenSource SlackTokenSource, selfURL string, teamLookup TeamLookup) *SlackProvider {
 	return &SlackProvider{
 		tokenSource: tokenSource,
 		selfURL:     selfURL,
+		teamLookup:  teamLookup,
 	}
 }
 
@@ -526,6 +528,47 @@ func truncateText(s string, maxLen int) string {
 	return body + suffix
 }
 
+// maxTeamLabelLen bounds the alert's team label before it is put into a card.
+// The label is free text carried by the alert, and a section block has a hard
+// size limit; a team name longer than this is malformed anyway.
+const maxTeamLabelLen = 80
+
+// slackLabelSanitizer neutralises the characters that would break out of the
+// notice's markup. The backtick closes the code span the label sits in and the
+// line breaks split the block; the other three are mrkdwn-significant. It runs
+// as a single pass, so nothing is escaped twice.
+var slackLabelSanitizer = strings.NewReplacer(
+	"&", "&amp;",
+	"<", "&lt;",
+	">", "&gt;",
+	"`", "'",
+	"\r", " ",
+	"\n", " ",
+)
+
+// sanitizeTeamLabel makes an alert's team label safe to interpolate into card
+// mrkdwn. Truncation happens BEFORE escaping, so a cut can never sever an
+// entity and leave "&am" behind.
+func sanitizeTeamLabel(teamID string) string {
+	if r := []rune(teamID); len(r) > maxTeamLabelLen {
+		teamID = string(r[:maxTeamLabelLen]) + "…"
+	}
+	return slackLabelSanitizer.Replace(teamID)
+}
+
+// unknownTeamNotice is what stands in for the action buttons when the alert
+// group names a team TokayOps does not have.
+func (s *SlackProvider) unknownTeamNotice(teamID string) string {
+	notice := fmt.Sprintf(
+		"*⚠️ Unknown team `%s`*\nTokayOps has no such team, so this alert cannot be acknowledged or resolved from Slack.",
+		sanitizeTeamLabel(teamID),
+	)
+	if s.selfURL != "" {
+		notice += fmt.Sprintf(" <%s/#/cfg/teams|Set up the team>", s.selfURL)
+	}
+	return notice
+}
+
 // plainTitle returns the unformatted title for use as the top-level message
 // text (notification preview / accessibility fallback).
 func (s *SlackProvider) plainTitle(ag *model.AlertGroup, isResolved bool) string {
@@ -581,10 +624,23 @@ func (s *SlackProvider) renderBodyAttachment(ag *model.AlertGroup, isResolved bo
 		nil, nil,
 	))
 
-	// Action buttons (conditional on status + interactive toggle)
+	// Action buttons (conditional on status, interactive toggle and whether the
+	// alert group's team is onboarded at all).
+	//
+	// The lookup is skipped unless it can change the card. A resolved card never
+	// carries buttons, and with interactivity switched off their absence is the
+	// administrator's decision rather than a problem to report, so neither state
+	// gets buttons OR the notice - and neither should pay a query for it, least
+	// of all while the database is the thing that is struggling.
 	interactive := s.tokenSource != nil && s.tokenSource.GetSlackInteractive()
-	showAck := interactive && !isResolved && ag.Status != model.AlertGroupStatusAcknowledged
-	showResolve := interactive && !isResolved
+	actionable := interactive && !isResolved
+	teamOnboarded := true
+	if actionable {
+		teamOnboarded = teamIsOnboarded(s.teamLookup, ag.TeamID)
+	}
+
+	showAck := actionable && teamOnboarded && ag.Status != model.AlertGroupStatusAcknowledged
+	showResolve := actionable && teamOnboarded
 
 	if showAck || showResolve {
 		blocks = append(blocks, slack.NewDividerBlock())
@@ -606,6 +662,17 @@ func (s *SlackProvider) renderBodyAttachment(ag *model.AlertGroup, isResolved bo
 			buttons = append(buttons, resolveBtn)
 		}
 		blocks = append(blocks, slack.NewActionBlock("alert_actions", buttons...))
+	} else if actionable && !teamOnboarded {
+		// Where the buttons would have been, say why they are not there. The
+		// claim is deliberately limited to what the lookup proves: the team is
+		// absent, so nobody can act on this from Slack. It says nothing about
+		// escalation, because alert_groups.team_id has no foreign key and an
+		// escalation started before the team was deleted keeps running.
+		blocks = append(blocks, slack.NewDividerBlock())
+		blocks = append(blocks, slack.NewSectionBlock(
+			slack.NewTextBlockObject(slack.MarkdownType, s.unknownTeamNotice(ag.TeamID), false, false),
+			nil, nil,
+		))
 	}
 
 	// Context footer

@@ -37,6 +37,15 @@ var (
 		Name: "alert_groups_resolved_total",
 		Help: "Total number of alert groups auto-resolved (all alerts cleared).",
 	}, []string{"team"})
+
+	// Counted only for alert groups that were actually created, so retries and
+	// merges into an existing group do not inflate it. The label is the raw
+	// team label off the alert, which is the string an operator has to act on:
+	// either onboard that team or fix the label.
+	UnknownTeamAlertGroupsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "unknown_team_alert_groups_total",
+		Help: "Alert groups created with a team label that matches no team in TokayOps.",
+	}, []string{"team"})
 )
 
 // Tier 3 — Dispatcher / notification delivery
@@ -175,6 +184,7 @@ func init() {
 	// Tier 2
 	prometheus.MustRegister(AlertsReceivedTotal)
 	prometheus.MustRegister(AlertGroupsCreatedTotal)
+	prometheus.MustRegister(UnknownTeamAlertGroupsTotal)
 	prometheus.MustRegister(AlertGroupsResolvedTotal)
 
 	// Tier 3
