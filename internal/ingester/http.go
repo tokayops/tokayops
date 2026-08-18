@@ -219,7 +219,14 @@ func (i *Ingester) mergeIntoGroup(c echo.Context, active *model.AlertGroup, inco
 		existingFingerprints[a.Fingerprint] = a.Status
 	}
 
-	updatedAlerts := mergeAlerts(active.Alerts, incomingAlerts)
+	relevant := filterMergeableAlerts(incomingAlerts, existingFingerprints)
+	if len(relevant) == 0 {
+		// Nothing in this payload belongs to the group. Skip the alerts_data
+		// rewrite and the Slack re-render it would trigger.
+		return c.String(http.StatusOK, "Ignored Resolved")
+	}
+
+	updatedAlerts := mergeAlerts(active.Alerts, relevant)
 	active.Alerts = updatedAlerts
 
 	// Check statuses
@@ -235,7 +242,7 @@ func (i *Ingester) mergeIntoGroup(c echo.Context, active *model.AlertGroup, inco
 		log.Printf("Ingester: All alerts resolved. Resolving alert group %s", active.ID)
 
 		now := time.Now()
-		timelineEvents := buildMergeTimelineEvents(active.ID, incomingAlerts, existingFingerprints, now)
+		timelineEvents := buildMergeTimelineEvents(active.ID, relevant, existingFingerprints, now)
 		timelineEvents = append(timelineEvents, &model.TimelineEvent{
 			ID:           uuid.New().String(),
 			AlertGroupID: active.ID,
@@ -295,7 +302,7 @@ func (i *Ingester) mergeIntoGroup(c echo.Context, active *model.AlertGroup, inco
 
 	// Timeline events only after successful store writes (avoids duplicates on AM retry)
 	now := time.Now()
-	for _, e := range buildMergeTimelineEvents(active.ID, incomingAlerts, existingFingerprints, now) {
+	for _, e := range buildMergeTimelineEvents(active.ID, relevant, existingFingerprints, now) {
 		if err := i.store.AddTimelineEvent(e); err != nil {
 			log.Printf("Ingester: Failed to add timeline event: %v", err)
 		}
@@ -361,4 +368,20 @@ func (i *Ingester) generateTitle(p *AMPayload) string {
 		return p.Alerts[0].Labels["alertname"]
 	}
 	return "Unknown Alert Group"
+}
+
+// filterMergeableAlerts drops incoming alerts that do not belong to the group.
+// Alertmanager re-sends alerts it resolved earlier for the same aggregation
+// group; those were closed together with a previous alert group carrying the
+// same dedup key, so only a firing alert may introduce a fingerprint the group
+// has never seen. Mirrors the firing-only filter the create path applies.
+func filterMergeableAlerts(incoming []model.Alert, existingFingerprints map[string]model.AlertStatus) []model.Alert {
+	var relevant []model.Alert
+	for _, a := range incoming {
+		if _, known := existingFingerprints[a.Fingerprint]; !known && a.Status != model.AlertStatusFiring {
+			continue
+		}
+		relevant = append(relevant, a)
+	}
+	return relevant
 }

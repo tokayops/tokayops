@@ -502,3 +502,168 @@ func TestIngester_UnknownTeamCounter(t *testing.T) {
 		}
 	})
 }
+
+// postAlerts drives one Alertmanager webhook carrying a raw alerts array through
+// the ingester and returns the recorder.
+func postAlerts(t *testing.T, e *echo.Echo, groupKey, alerts string) *httptest.ResponseRecorder {
+	t.Helper()
+	payload := fmt.Sprintf(
+		`{"status":"firing","groupKey":%q,"commonLabels":{"team":"devops","severity":"warning","alertname":"InstanceJustRebooted"},"alerts":[%s]}`,
+		groupKey, alerts,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret", strings.NewReader(payload))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	return rec
+}
+
+// fingerprints lists the fingerprints stored on an alert group. mergeAlerts
+// builds its result by ranging a map, so the order is not stable - callers must
+// compare as a set.
+func fingerprints(ag *model.AlertGroup) map[string]model.AlertStatus {
+	got := make(map[string]model.AlertStatus, len(ag.Alerts))
+	for _, a := range ag.Alerts {
+		got[a.Fingerprint] = a.Status
+	}
+	return got
+}
+
+// TestRegression_ResolvedAlertFromPreviousGroup_NotMergedIntoNewGroup covers
+// GitHub issue #23: hosts firing the same alertname one after another share one
+// Alertmanager groupKey, and Alertmanager keeps re-sending alerts it resolved
+// earlier for that aggregation group. Those alerts were closed together with a
+// previous alert group carrying the same dedup key, so the merge path must not
+// pull them into the group that came after.
+func TestRegression_ResolvedAlertFromPreviousGroup_NotMergedIntoNewGroup(t *testing.T) {
+	const groupKey = "leak-group"
+	const alertA = `{"status":%q,"labels":{"alertname":"InstanceJustRebooted","instance":"10.64.172.135"},"fingerprint":"A"}`
+	const alertB = `{"status":%q,"labels":{"alertname":"InstanceJustRebooted","instance":"10.64.173.65"},"fingerprint":"B"}`
+
+	mock := store.NewMockStore()
+	validator := &mockSecretValidator{secrets: map[string]bool{"secret": true}}
+	e := echo.New()
+	NewIngester(mock, &config.Config{}, validator).RegisterRoutes(e)
+
+	firingA := fmt.Sprintf(alertA, model.AlertStatusFiring)
+	resolvedA := fmt.Sprintf(alertA, model.AlertStatusResolved)
+	firingB := fmt.Sprintf(alertB, model.AlertStatusFiring)
+	resolvedB := fmt.Sprintf(alertB, model.AlertStatusResolved)
+
+	// 1. Host A reboots: first group is created.
+	if body := postAlerts(t, e, groupKey, firingA).Body.String(); body != "Created" {
+		t.Fatalf("step 1: got %q, want \"Created\"", body)
+	}
+	first, err := mock.GetActiveAlertGroup(groupKey)
+	if err != nil || first == nil {
+		t.Fatalf("step 1: first group not created: %v", err)
+	}
+
+	// 2. Host A recovers: first group resolves.
+	if body := postAlerts(t, e, groupKey, resolvedA).Body.String(); body != "Resolved" {
+		t.Fatalf("step 2: got %q, want \"Resolved\"", body)
+	}
+
+	// 3. Host B reboots. Alertmanager still carries the resolved A along; the
+	//    create path already filters it out, so a fresh group holds only B.
+	if body := postAlerts(t, e, groupKey, firingB+","+resolvedA).Body.String(); body != "Created" {
+		t.Fatalf("step 3: got %q, want \"Created\"", body)
+	}
+	second, err := mock.GetActiveAlertGroup(groupKey)
+	if err != nil || second == nil {
+		t.Fatalf("step 3: second group not created: %v", err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("step 3: expected a new group, got the resolved one back (%s)", second.ID)
+	}
+	if got := fingerprints(second); len(got) != 1 || got["B"] != model.AlertStatusFiring {
+		t.Fatalf("step 3: second group holds %v, want only B firing", got)
+	}
+
+	// 4. Host B recovers. This merge used to add the stale resolved A.
+	if body := postAlerts(t, e, groupKey, resolvedB+","+resolvedA).Body.String(); body != "Resolved" {
+		t.Fatalf("step 4: got %q, want \"Resolved\"", body)
+	}
+
+	stored, err := mock.GetAlertGroupByID(second.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("step 4: second group not readable: %v", err)
+	}
+	if stored.Status != model.AlertGroupStatusResolved {
+		t.Errorf("second group status = %q, want %q", stored.Status, model.AlertGroupStatusResolved)
+	}
+	got := fingerprints(stored)
+	if len(got) != 1 || got["B"] != model.AlertStatusResolved {
+		t.Errorf("second group holds %v, want only B resolved", got)
+	}
+
+	// The first incident stays a faithful record of itself.
+	firstStored, err := mock.GetAlertGroupByID(first.ID)
+	if err != nil || firstStored == nil {
+		t.Fatalf("first group not readable: %v", err)
+	}
+	if got := fingerprints(firstStored); len(got) != 1 || got["A"] != model.AlertStatusResolved {
+		t.Errorf("first group holds %v, want only A resolved", got)
+	}
+
+	// The timeline never knew about A in the second group, and alerts_data must agree.
+	events, err := mock.GetTimelineEvents(second.ID)
+	if err != nil {
+		t.Fatalf("timeline read: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Metadata["fingerprint"] == "A" {
+			t.Errorf("second group timeline mentions alert A: %s %q", ev.Type, ev.Message)
+		}
+	}
+}
+
+// TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp verifies that a
+// payload holding nothing the group owns is a no-op: no alerts_data rewrite and
+// no Slack re-render flag.
+func TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp(t *testing.T) {
+	mock := store.NewMockStore()
+
+	created := time.Now().Add(-time.Hour)
+	ag := &model.AlertGroup{
+		ID: "ag-foreign-noop", DedupKey: "foreign-noop-group",
+		Status: model.AlertGroupStatusTriggered, TeamID: "devops", TeamNameSnapshot: "DevOps",
+		Severity: "warning",
+		Alerts: []model.Alert{
+			{Fingerprint: "A", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "InstanceJustRebooted"}},
+		},
+		CreatedAt: created, UpdatedAt: created,
+	}
+	if err := mock.CreateAlertGroup(ag); err != nil {
+		t.Fatalf("seed alert group: %v", err)
+	}
+
+	validator := &mockSecretValidator{secrets: map[string]bool{"secret": true}}
+	e := echo.New()
+	NewIngester(mock, &config.Config{}, validator).RegisterRoutes(e)
+
+	// Only a resolved alert the group has never seen (closed with an earlier incident).
+	rec := postAlerts(t, e, "foreign-noop-group",
+		`{"status":"resolved","labels":{"alertname":"InstanceJustRebooted"},"fingerprint":"X"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); body != "Ignored Resolved" {
+		t.Errorf("body = %q, want \"Ignored Resolved\"", body)
+	}
+
+	stored, err := mock.GetAlertGroupByID("ag-foreign-noop")
+	if err != nil || stored == nil {
+		t.Fatalf("alert group not readable: %v", err)
+	}
+	if got := fingerprints(stored); len(got) != 1 || got["A"] != model.AlertStatusFiring {
+		t.Errorf("group holds %v, want only A firing", got)
+	}
+	if stored.SlackUpdatePending {
+		t.Error("SlackUpdatePending = true, want false - nothing changed, so no card re-render")
+	}
+	// Both MockStore writes bump UpdatedAt, so an untouched timestamp proves neither ran.
+	if !stored.UpdatedAt.Equal(created) {
+		t.Errorf("UpdatedAt moved to %v, want %v - the group was written for nothing", stored.UpdatedAt, created)
+	}
+}
