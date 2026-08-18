@@ -19,9 +19,10 @@ advisory unless you would rather stay anonymous.
 
 ## Supported versions
 
-TokayOps has no stable release yet. Only the current `develop` build receives
-fixes. Older `sha-<commit>` images are not patched - upgrade to a current build
-instead.
+Only the newest release receives fixes, security ones included, and they ship as
+a patch on top of it (`0.1.0` -> `0.1.1`). Older releases, `develop` builds and
+`sha-<commit>` images are not patched - upgrade to the newest release instead.
+See the [release policy](README.md#releases).
 
 ## Scope
 

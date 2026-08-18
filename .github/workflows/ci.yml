@@ -118,15 +118,25 @@ jobs:
     - name: Determine Docker tags
       id: docker_tag
       run: |
-        # Every build gets the immutable sha- tag. A moving tag is added only
-        # for the two branches we publish from: main -> latest, develop ->
-        # develop. Pull requests build but never publish - github.ref is
-        # refs/pull/N/merge there, so without this a PR would overwrite
-        # :develop with unreviewed code.
+        # Every build gets its own sha- tag, and this workflow is the only
+        # publisher of those - release.yml publishes version tags instead. A
+        # sha- tag identifies a build, it does not pin one: re-running CI on
+        # the same commit rebuilds and overwrites it, with a fresh build date
+        # and whatever the base images say that day. The reference that cannot
+        # move is the image digest.
+        # The only moving tag set here is :develop. Version tags and :latest
+        # belong to a release and are published by release.yml off the git tag,
+        # so a merge into main does not move :latest on its own. Pull requests
+        # build but never publish - github.ref is refs/pull/N/merge there, so
+        # without this a PR would overwrite :develop with unreviewed code.
+        #
+        # Read from the environment rather than through an Actions expression:
+        # a branch name is free text and matches feat/** just as happily with a
+        # $(...) in it, and an expression is substituted into the script text
+        # before bash ever sees it.
         moving=""
-        if [ "${{ github.event_name }}" = "push" ]; then
-          case "${{ github.ref }}" in
-            refs/heads/main)    moving="latest" ;;
+        if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+          case "$GITHUB_REF" in
             refs/heads/develop) moving="develop" ;;
           esac
         fi
@@ -135,7 +145,7 @@ jobs:
           image="$2"
           {
             echo "${output_name}<<TAGS_EOF"
-            echo "ghcr.io/tokayops/${image}:sha-${{ github.sha }}"
+            echo "ghcr.io/tokayops/${image}:sha-${GITHUB_SHA}"
             if [ -n "$moving" ]; then
               echo "ghcr.io/tokayops/${image}:${moving}"
             fi

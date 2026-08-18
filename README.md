@@ -212,19 +212,30 @@ Note: SSO users cannot change their name (synced from provider).
 
 Prebuilt images are published to GHCR for `linux/amd64` and `linux/arm64`:
 
-```
-ghcr.io/tokayops/tokayops:develop      # current build of the develop branch
-ghcr.io/tokayops/tokayops:sha-<commit>  # immutable, pin this for reproducibility
-```
+| Tag | Points at |
+| --- | --- |
+| `latest` | the newest stable release |
+| `0.1.0` | that release, and nothing else afterwards |
+| `0.1` | the newest patch of the `0.1` series |
+| `develop` | the current build of the develop branch, not a release |
+| `sha-<commit>` | a CI build of that commit, for trying an unreleased fix |
 
-There is no stable release yet, so `:develop` is the tag to start from. `:latest`
-is built from `main`, which currently lags well behind.
+Start from `:latest`, or set `TOKAY_TAG` in `.env` to pin a version. See
+[Releases](#releases) for what the numbers promise, and
+[CHANGELOG.md](CHANGELOG.md) for what each one changed.
+
+Release policy is that a version tag is never re-pointed at a different build,
+but registry tags are mutable by nature, and `sha-<commit>` is not covered by
+that promise at all: re-running CI on a commit rebuilds and replaces it. For a
+reference that provably cannot move, use the digest. Every GitHub Release lists
+one per image, ready to paste into a compose file as
+`image: ghcr.io/tokayops/tokayops@sha256:...`.
 
 Deploy with the bundled compose file, which brings up Postgres alongside the app:
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/tokayops/tokayops/develop/docker-compose.prod.yml
-curl -fL -o .env https://raw.githubusercontent.com/tokayops/tokayops/develop/.env.example
+curl -fLO https://raw.githubusercontent.com/tokayops/tokayops/main/docker-compose.prod.yml
+curl -fL -o .env https://raw.githubusercontent.com/tokayops/tokayops/main/.env.example
 docker compose -f docker-compose.prod.yml up -d
 ```
 
@@ -257,6 +268,38 @@ Two things that are easy to miss:
 
 **Full installation guide, including Slack, Telegram and Alertmanager wiring:
 https://tokayops.com/install**
+
+## Releases
+
+TokayOps follows [Semantic Versioning](https://semver.org/). Releases are cut
+from `main`, tagged `vX.Y.Z`, and written up in [CHANGELOG.md](CHANGELOG.md).
+The running build reports itself at `/api/version` and in the UI footer.
+
+While the version is `0.x`:
+
+- A **minor** bump (`0.1.0` -> `0.2.0`) may change the public contract, and may
+  need a manual step. The changelog says which.
+- A **patch** bump (`0.1.0` -> `0.1.1`) is fixes only.
+
+The public contract is the REST API under `/api`, the Alertmanager webhook it
+accepts, the environment variables and `tokay.yaml`, the CLI commands, and the
+image tags above. Not part of it: the Go packages under `internal/` (this is an
+application, not a library), the frontend assets, and `make seed`.
+
+### Support and upgrades
+
+- Only the newest release is supported. Fixes, security ones included, ship as a
+  patch on top of it.
+- Upgrade forward one minor version at a time, reading the upgrade notes of each
+  release you pass through.
+- **Downgrades are not supported.** The schema is created and extended in place
+  on startup, so going back means restoring a database backup taken before the
+  upgrade. Take one.
+- Anything on its way out is announced in the changelog at least one minor
+  version before it is removed.
+
+1.0 waits on a versioned migration system and on holding the API still; until
+then, read the release notes before every minor upgrade.
 
 ## Project Structure
 - `cmd/tokayops`: Main application entry point.

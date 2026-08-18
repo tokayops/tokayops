@@ -15,9 +15,9 @@ services:
       retries: 5
 
   tokay:
-    # There is no stable release yet. TOKAY_TAG lets you pin an immutable
-    # sha-<commit> tag instead of following the develop branch.
-    image: ghcr.io/tokayops/tokayops:${TOKAY_TAG:-develop}
+    # Follows the newest stable release. TOKAY_TAG pins an exact version
+    # (0.1.0) or an exact build (sha-<commit>) instead.
+    image: ghcr.io/tokayops/tokayops:${TOKAY_TAG:-latest}
     restart: unless-stopped
     depends_on:
       postgres:
