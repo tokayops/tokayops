@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -306,10 +307,23 @@ func main() {
 	}
 
 	// Register Providers - from DB with dynamic token lookup.
+	// An alert group's team is a label carried by the alert, not a foreign key,
+	// so it can name a team that was never set up here. Both providers ask this
+	// before offering Ack/Resolve.
+	teamLookup := func(teamID string) (bool, error) {
+		if _, err := st.GetTeamByID(teamID); err != nil {
+			if err == sql.ErrNoRows {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	}
+
 	// The concrete slackProvider instance is also used by the API layer (SlackMessenger
 	// + SlackCardRenderer below), so the dispatcher factory returns that same instance;
 	// the registry keys it by integration ID.
-	slackProvider := dispatcher.NewSlackProvider(integrationCache, cfg.Global.SelfURL)
+	slackProvider := dispatcher.NewSlackProvider(integrationCache, cfg.Global.SelfURL, teamLookup)
 	disp.RegisterProviderFactory("slack", model.IntegrationTypeSlack, func(integ *model.Integration) (dispatcher.Provider, error) {
 		return slackProvider, nil
 	})
@@ -323,7 +337,7 @@ func main() {
 	// webhook + interactivity (which would need the provider in the API layer like
 	// slackProvider above) land in Sprint 3. The capability registration here is
 	// what makes telegram appear in the policy editor and handoff fan-out.
-	telegramProvider := dispatcher.NewTelegramProvider(integrationCache, cfg.Global.SelfURL)
+	telegramProvider := dispatcher.NewTelegramProvider(integrationCache, cfg.Global.SelfURL, dispatcher.WithTeamLookup(teamLookup))
 	disp.RegisterProviderFactory("telegram", model.IntegrationTypeTelegram, func(integ *model.Integration) (dispatcher.Provider, error) {
 		return telegramProvider, nil
 	})

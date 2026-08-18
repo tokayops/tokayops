@@ -996,3 +996,226 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 		t.Error("buildAlertList should not truncate — that's renderBodyAttachment's job")
 	}
 }
+
+// countingTeamLookup is a TeamLookup that records how often it ran, so a test
+// can assert the lookup was skipped, not just that its answer was ignored.
+type countingTeamLookup struct {
+	calls     int
+	onboarded bool
+	err       error
+}
+
+func (c *countingTeamLookup) fn(string) (bool, error) {
+	c.calls++
+	return c.onboarded, c.err
+}
+
+// findActionBlock reports whether the attachment offers Ack/Resolve.
+func findActionBlock(att slack.Attachment) *slack.ActionBlock {
+	for _, b := range att.Blocks.BlockSet {
+		if ab, ok := b.(*slack.ActionBlock); ok {
+			return ab
+		}
+	}
+	return nil
+}
+
+// findUnknownTeamNotice returns the notice section's text, or "" when absent.
+// The footer is a context block, so only sections are candidates.
+func findUnknownTeamNotice(att slack.Attachment) string {
+	for _, b := range att.Blocks.BlockSet {
+		sb, ok := b.(*slack.SectionBlock)
+		if !ok || sb.Text == nil {
+			continue
+		}
+		if strings.Contains(sb.Text.Text, "Unknown team") {
+			return sb.Text.Text
+		}
+	}
+	return ""
+}
+
+func teamGateAlertGroup(teamID string) *model.AlertGroup {
+	return &model.AlertGroup{
+		ID:       "ag-team-gate",
+		Title:    "High Latency",
+		TeamID:   teamID,
+		Severity: "critical",
+		Status:   model.AlertGroupStatusTriggered,
+		Alerts: []model.Alert{
+			{Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "A1", "severity": "critical"}},
+		},
+	}
+}
+
+// Buttons are offered only where somebody can actually press them. An alert
+// group's team is a label off the alert, so it can name a team that was never
+// set up here, and for that team RBAC denies everyone but a global admin.
+func TestSlack_TeamGate(t *testing.T) {
+	tests := []struct {
+		name        string
+		interactive bool
+		isResolved  bool
+		lookup      *countingTeamLookup
+		useNilHook  bool
+		wantButtons bool
+		wantNotice  bool
+		wantCalls   int
+	}{
+		{
+			name:        "onboarded team keeps its buttons",
+			interactive: true,
+			lookup:      &countingTeamLookup{onboarded: true},
+			wantButtons: true,
+			wantCalls:   1,
+		},
+		{
+			name:        "unknown team gets the notice instead of buttons",
+			interactive: true,
+			lookup:      &countingTeamLookup{onboarded: false},
+			wantNotice:  true,
+			wantCalls:   1,
+		},
+		{
+			// A database blip must not strip buttons from teams that are set up
+			// and announce it in the channel everyone reads.
+			name:        "a failing lookup degrades to onboarded",
+			interactive: true,
+			lookup:      &countingTeamLookup{onboarded: false, err: errors.New("db down")},
+			wantButtons: true,
+			wantCalls:   1,
+		},
+		{
+			name:        "no lookup wired up behaves as before",
+			interactive: true,
+			useNilHook:  true,
+			wantButtons: true,
+		},
+		{
+			// Interactivity off is the administrator's decision, not a fault, so
+			// it earns no notice - and no query either.
+			name:        "interactivity off gives neither buttons nor notice",
+			interactive: false,
+			lookup:      &countingTeamLookup{onboarded: false},
+			wantCalls:   0,
+		},
+		{
+			name:        "resolved card gives neither buttons nor notice",
+			interactive: true,
+			isResolved:  true,
+			lookup:      &countingTeamLookup{onboarded: false},
+			wantCalls:   0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &SlackProvider{
+				tokenSource: &mockTokenSource{token: "tok", interactive: tt.interactive},
+				selfURL:     "https://tokay.example",
+			}
+			if !tt.useNilHook {
+				provider.teamLookup = tt.lookup.fn
+			}
+
+			att := provider.renderBodyAttachment(teamGateAlertGroup("payments"), tt.isResolved)
+
+			if got := findActionBlock(att) != nil; got != tt.wantButtons {
+				t.Errorf("buttons present = %v, want %v", got, tt.wantButtons)
+			}
+
+			notice := findUnknownTeamNotice(att)
+			if got := notice != ""; got != tt.wantNotice {
+				t.Errorf("notice present = %v, want %v (notice=%q)", got, tt.wantNotice, notice)
+			}
+			if tt.wantNotice && !strings.Contains(notice, "payments") {
+				t.Errorf("notice does not name the team label: %q", notice)
+			}
+
+			if !tt.useNilHook && tt.lookup.calls != tt.wantCalls {
+				t.Errorf("team lookup ran %d times, want %d", tt.lookup.calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
+// The team label is free text off the alert and it lands inside a code span, so
+// a backtick would close that span early and a newline would split the block.
+func TestSlack_UnknownTeamNotice_SanitisesLabel(t *testing.T) {
+	provider := &SlackProvider{selfURL: "https://tokay.example"}
+
+	tests := []struct {
+		name        string
+		teamID      string
+		wantAbsent  []string
+		wantPresent []string
+	}{
+		{
+			name:        "backtick cannot close the code span",
+			teamID:      "pay`ments",
+			wantAbsent:  []string{"pay`ments"},
+			wantPresent: []string{"pay'ments"},
+		},
+		{
+			name:       "line breaks do not split the block",
+			teamID:     "pay\nments\rteam",
+			wantAbsent: []string{"\npay", "ments\rteam"},
+		},
+		{
+			name:        "mrkdwn specials are escaped",
+			teamID:      "a<b>&c",
+			wantAbsent:  []string{"a<b>&c"},
+			wantPresent: []string{"a&lt;b&gt;&amp;c"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := provider.unknownTeamNotice(tt.teamID)
+			for _, want := range tt.wantPresent {
+				if !strings.Contains(got, want) {
+					t.Errorf("notice %q does not contain %q", got, want)
+				}
+			}
+			for _, bad := range tt.wantAbsent {
+				if strings.Contains(got, bad) {
+					t.Errorf("notice %q still contains raw %q", got, bad)
+				}
+			}
+		})
+	}
+
+	t.Run("a long label is capped", func(t *testing.T) {
+		long := strings.Repeat("x", maxTeamLabelLen*3)
+		got := provider.unknownTeamNotice(long)
+		if strings.Contains(got, long) {
+			t.Error("full oversized label was interpolated")
+		}
+		if !strings.Contains(got, "…") {
+			t.Errorf("truncated label is not marked as truncated: %q", got)
+		}
+	})
+
+	t.Run("truncation cannot sever an escape entity", func(t *testing.T) {
+		// Every rune is escaped to 5 characters, so a cut applied after escaping
+		// would land inside an entity.
+		got := sanitizeTeamLabel(strings.Repeat("&", maxTeamLabelLen*2))
+		if strings.HasSuffix(strings.TrimSuffix(got, "…"), "&am") {
+			t.Errorf("entity was severed: %q", got)
+		}
+		if strings.Count(got, "&amp;") != maxTeamLabelLen {
+			t.Errorf("expected %d whole entities, got %q", maxTeamLabelLen, got)
+		}
+	})
+
+	t.Run("the link is omitted without a selfURL", func(t *testing.T) {
+		withURL := (&SlackProvider{selfURL: "https://tokay.example"}).unknownTeamNotice("payments")
+		if !strings.Contains(withURL, "/#/cfg/teams|Set up the team>") {
+			t.Errorf("expected a setup link, got %q", withURL)
+		}
+		without := (&SlackProvider{}).unknownTeamNotice("payments")
+		if strings.Contains(without, "Set up the team") {
+			t.Errorf("expected no link without selfURL, got %q", without)
+		}
+	})
+}

@@ -21,6 +21,7 @@ func TestAllMetricsRegistered(t *testing.T) {
 		{"alerts_received_total", descFromCounterVec(AlertsReceivedTotal)},
 		{"alert_groups_created_total", descFromCounterVec(AlertGroupsCreatedTotal)},
 		{"alert_groups_resolved_total", descFromCounterVec(AlertGroupsResolvedTotal)},
+		{"unknown_team_alert_groups_total", descFromCounterVec(UnknownTeamAlertGroupsTotal)},
 		{"job_steps_processed_total", descFromCounterVec(JobStepsProcessedTotal)},
 		{"notification_sent_total", descFromCounterVec(NotificationSentTotal)},
 		{"notification_errors_total", descFromCounterVec(NotificationErrorsTotal)},

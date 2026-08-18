@@ -43,8 +43,9 @@ type TelegramTokenSource interface {
 // base URL are fully under our control.
 type TelegramProvider struct {
 	tokenSource TelegramTokenSource
-	selfURL     string // TokayOps base URL for deep links
-	baseURL     string // Bot API base; default telegramDefaultBaseURL, overridable in tests
+	selfURL     string     // TokayOps base URL for deep links
+	teamLookup  TeamLookup // nil means "assume onboarded", see teamIsOnboarded
+	baseURL     string     // Bot API base; default telegramDefaultBaseURL, overridable in tests
 	mu          sync.Mutex
 	cachedToken string
 	client      *http.Client
@@ -66,6 +67,14 @@ func WithBaseURL(u string) TelegramOption {
 			p.baseURL = strings.TrimRight(u, "/")
 		}
 	}
+}
+
+// WithTeamLookup wires the check for whether an alert group's team is onboarded.
+// Telegram never posts a card for an unonboarded team today (that path is
+// firehose, which is Slack-only), so this exists to keep the two channels from
+// drifting apart if that ever changes.
+func WithTeamLookup(lookup TeamLookup) TelegramOption {
+	return func(p *TelegramProvider) { p.teamLookup = lookup }
 }
 
 func NewTelegramProvider(tokenSource TelegramTokenSource, selfURL string, opts ...TelegramOption) *TelegramProvider {
@@ -358,6 +367,14 @@ func (t *TelegramProvider) keyboardFor(ag *model.AlertGroup, isResolved bool) in
 		return nil
 	}
 	if t.tokenSource == nil || !t.tokenSource.GetTelegramInteractive() {
+		return emptyInlineKeyboard()
+	}
+	// A resolved card carries no buttons either way, so return early rather
+	// than pay for a team lookup that cannot change the answer.
+	if isResolved {
+		return emptyInlineKeyboard()
+	}
+	if !teamIsOnboarded(t.teamLookup, ag.TeamID) {
 		return emptyInlineKeyboard()
 	}
 	return ackResolveKeyboard(ag, isResolved)

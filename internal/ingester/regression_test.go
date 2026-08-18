@@ -11,7 +11,9 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/tokayops/tokayops/internal/config"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -403,3 +405,100 @@ func TestRegression_ConcurrentResolve_AlertsConverge(t *testing.T) {
 // before reaching CreateAlertGroup, so the duplicate key retry path is not
 // exercised for pure resolve webhooks. The DB error scenario
 // (TestRegression_DBError_ResolveLost) covers resolve loss prevention.
+
+// unknownTeamCount reads the counter for one team label. Metrics are process
+// globals shared by every test in the binary, so each case uses its own label
+// and compares a delta rather than an absolute value.
+func unknownTeamCount(t *testing.T, team string) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := metrics.UnknownTeamAlertGroupsTotal.WithLabelValues(team).Write(&m); err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+// postFiring drives one firing webhook through the ingester and returns the
+// HTTP status.
+func postFiring(t *testing.T, st store.StoreInterface, groupKey, team string) int {
+	t.Helper()
+	validator := &mockSecretValidator{secrets: map[string]bool{"secret": true}}
+	e := echo.New()
+	NewIngester(st, &config.Config{}, validator).RegisterRoutes(e)
+
+	payload := fmt.Sprintf(
+		`{"status":"firing","groupKey":%q,"commonLabels":{"team":%q,"severity":"warning","alertname":"Test"},"alerts":[{"status":"firing","labels":{"alertname":"Test"},"fingerprint":"fp1"}]}`,
+		groupKey, team,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret", strings.NewReader(payload))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// The counter answers "which teams should be onboarded next", so it must count
+// alert groups that were actually created. Counting at the team lookup instead
+// would also count Alertmanager retries, the duplicate-key merge path and
+// requests that go on to fail.
+func TestIngester_UnknownTeamCounter(t *testing.T) {
+	t.Run("counts a created group with an unknown team", func(t *testing.T) {
+		const team = "counter_unknown"
+		before := unknownTeamCount(t, team)
+
+		if code := postFiring(t, store.NewMockStore(), "counter-unknown-group", team); code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", code)
+		}
+		if got := unknownTeamCount(t, team) - before; got != 1 {
+			t.Errorf("counter delta = %v, want 1", got)
+		}
+	})
+
+	t.Run("does not count a known team", func(t *testing.T) {
+		// MockStore seeds a "devops" team.
+		const team = "devops"
+		before := unknownTeamCount(t, team)
+
+		if code := postFiring(t, store.NewMockStore(), "counter-known-group", team); code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", code)
+		}
+		if got := unknownTeamCount(t, team) - before; got != 0 {
+			t.Errorf("counter delta = %v, want 0 for an onboarded team", got)
+		}
+	})
+
+	t.Run("does not count a request that fails", func(t *testing.T) {
+		const team = "counter_failed"
+		before := unknownTeamCount(t, team)
+
+		st := &errTeamLookupStore{MockStore: store.NewMockStore(), teamErr: fmt.Errorf("pq: connection refused")}
+		if code := postFiring(t, st, "counter-failed-group", team); code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", code)
+		}
+		if got := unknownTeamCount(t, team) - before; got != 0 {
+			t.Errorf("counter delta = %v, want 0 when nothing was created", got)
+		}
+	})
+
+	t.Run("does not count a merge into an existing group", func(t *testing.T) {
+		const team = "counter_merged"
+		before := unknownTeamCount(t, team)
+
+		mock := store.NewMockStore()
+		existing := &model.AlertGroup{
+			ID: "ag-merge", DedupKey: "counter-merge-group", Status: model.AlertGroupStatusTriggered,
+			TeamID: team, Severity: "warning", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}
+		if err := mock.CreateAlertGroup(existing); err != nil {
+			t.Fatalf("seed alert group: %v", err)
+		}
+
+		st := &duplicateKeyStore{MockStore: mock}
+		if code := postFiring(t, st, "counter-merge-group", team); code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", code)
+		}
+		if got := unknownTeamCount(t, team) - before; got != 0 {
+			t.Errorf("counter delta = %v, want 0 for a merge", got)
+		}
+	})
+}

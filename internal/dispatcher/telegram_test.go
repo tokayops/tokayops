@@ -473,3 +473,97 @@ func TestTelegram_BotUsername_Caches(t *testing.T) {
 		t.Errorf("getMe should be cached, called %d times", count)
 	}
 }
+
+// Telegram never posts a card for an unonboarded team today - that path is
+// firehose, which is Slack-only - so these lock the shared helper down from the
+// Telegram side and keep the two channels from drifting apart.
+func TestTelegram_TeamGate(t *testing.T) {
+	tests := []struct {
+		name         string
+		interactive  bool
+		isResolved   bool
+		lookup       *countingTeamLookup
+		useNilHook   bool
+		wantKeyboard string
+		wantCalls    int
+	}{
+		{
+			name:         "onboarded team keeps its buttons",
+			interactive:  true,
+			lookup:       &countingTeamLookup{onboarded: true},
+			wantKeyboard: "buttons",
+			wantCalls:    1,
+		},
+		{
+			name:         "unknown team gets an empty keyboard, not nil",
+			interactive:  true,
+			lookup:       &countingTeamLookup{onboarded: false},
+			wantKeyboard: "empty",
+			wantCalls:    1,
+		},
+		{
+			name:         "a failing lookup degrades to onboarded",
+			interactive:  true,
+			lookup:       &countingTeamLookup{onboarded: false, err: errors.New("db down")},
+			wantKeyboard: "buttons",
+			wantCalls:    1,
+		},
+		{
+			name:         "no lookup wired up behaves as before",
+			interactive:  true,
+			useNilHook:   true,
+			wantKeyboard: "buttons",
+		},
+		{
+			name:         "interactivity off short-circuits before the lookup",
+			interactive:  false,
+			lookup:       &countingTeamLookup{onboarded: false},
+			wantKeyboard: "empty",
+			wantCalls:    0,
+		},
+		{
+			name:         "resolved card short-circuits before the lookup",
+			interactive:  true,
+			isResolved:   true,
+			lookup:       &countingTeamLookup{onboarded: false},
+			wantKeyboard: "empty",
+			wantCalls:    0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := []TelegramOption{WithBaseURL("http://unused.invalid")}
+			if !tt.useNilHook {
+				opts = append(opts, WithTeamLookup(tt.lookup.fn))
+			}
+			p := NewTelegramProvider(
+				&mockTelegramTokenSource{token: "tok", interactiveOff: !tt.interactive},
+				"https://tokay.example",
+				opts...,
+			)
+
+			ag := testAlertGroup()
+			ag.TeamID = "payments"
+
+			b, err := json.Marshal(p.keyboardFor(ag, tt.isResolved))
+			if err != nil {
+				t.Fatalf("marshal keyboard: %v", err)
+			}
+			switch tt.wantKeyboard {
+			case "empty":
+				if string(b) != `{"inline_keyboard":[]}` {
+					t.Errorf("keyboard = %s, want an empty inline_keyboard", b)
+				}
+			case "buttons":
+				if !strings.Contains(string(b), "ack:") || !strings.Contains(string(b), "res:") {
+					t.Errorf("keyboard = %s, want ack/res buttons", b)
+				}
+			}
+
+			if !tt.useNilHook && tt.lookup.calls != tt.wantCalls {
+				t.Errorf("team lookup ran %d times, want %d", tt.lookup.calls, tt.wantCalls)
+			}
+		})
+	}
+}

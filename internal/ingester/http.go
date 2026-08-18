@@ -151,6 +151,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	// Not-found is normal (unknown team label from Alertmanager) — use teamID as snapshot.
 	// Any other DB error is transient and must fail the request so Alertmanager retries.
 	teamName := teamID
+	unknownTeam := true
 	team, err := i.store.GetTeamByID(teamID)
 	if err != nil && err != sql.ErrNoRows {
 		log.Printf("Ingester: Failed to resolve team %s: %v", teamID, err)
@@ -158,6 +159,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	}
 	if team != nil {
 		teamName = team.Name
+		unknownTeam = false
 	}
 	ag.TeamNameSnapshot = teamName
 
@@ -199,6 +201,12 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		return c.String(http.StatusInternalServerError, "Failed to persist")
 	}
 	metrics.AlertGroupsCreatedTotal.WithLabelValues(teamID, severity).Inc()
+	// Deliberately here and not at the lookup above: counting there would also
+	// count Alertmanager retries, the duplicate-key path that merges into an
+	// existing group, and requests that go on to fail.
+	if unknownTeam {
+		metrics.UnknownTeamAlertGroupsTotal.WithLabelValues(teamID).Inc()
+	}
 	log.Printf("Ingester: Created alert group %s", ag.ID)
 
 	return c.String(http.StatusOK, "Created")
