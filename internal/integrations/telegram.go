@@ -29,9 +29,11 @@ func init() {
 				if c.BotToken == model.MaskedSecret {
 					return errors.New("cannot use masked value as bot_token")
 				}
-				// secret_token is required: interactivity (the webhook) is mandatory
-				// for telegram in Epic 8, and the webhook middleware rejects calls
-				// without a configured secret. Requiring it avoids dead Ack/Resolve buttons.
+				// secret_token is required even though Ack/Resolve buttons can be
+				// switched off per integration: the same webhook carries account
+				// linking, and its middleware rejects calls without a configured
+				// secret. Requiring it up front also stops an operator from turning
+				// the buttons on later and getting dead ones.
 				if c.SecretToken == "" {
 					return errors.New("telegram secret_token is required")
 				}

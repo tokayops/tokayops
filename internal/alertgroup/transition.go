@@ -12,9 +12,9 @@ import (
 type TransitionOutcome string
 
 const (
-	OutcomeApplied    TransitionOutcome = "applied"
+	OutcomeApplied     TransitionOutcome = "applied"
 	OutcomeAlreadyDone TransitionOutcome = "already_done"
-	OutcomeNotFound   TransitionOutcome = "not_found"
+	OutcomeNotFound    TransitionOutcome = "not_found"
 )
 
 type Actor struct {

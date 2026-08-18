@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tokayops/tokayops/internal/store"
 	"github.com/labstack/echo/v4"
+	"github.com/tokayops/tokayops/internal/store"
 )
 
 // Locks the Sprint-3-review webhook lifecycle contract: setWebhook on enable,

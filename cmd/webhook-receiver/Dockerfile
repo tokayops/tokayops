@@ -1,11 +1,14 @@
 # Build
-FROM golang:1.25.8-alpine AS builder
+# Native builder, cross-compiled output - see the note in the root Dockerfile.
+FROM --platform=$BUILDPLATFORM golang:1.25.8-alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache git
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o webhook-receiver cmd/webhook-receiver/main.go
+ARG TARGETOS=linux
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o webhook-receiver cmd/webhook-receiver/main.go
 
 # Runtime
 FROM alpine:3.20

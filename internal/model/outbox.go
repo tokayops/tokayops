@@ -142,13 +142,13 @@ type OutboxDelivery struct {
 	ID                string               `json:"id"`
 	EventID           string               `json:"event_id"`
 	IntegrationID     string               `json:"integration_id"`
-	Status            OutboxDeliveryStatus  `json:"status"`
-	Attempts          int                   `json:"attempts"`
-	NextAttemptAt     *time.Time            `json:"next_attempt_at,omitempty"`
-	LastHTTPStatus    *int                  `json:"last_http_status,omitempty"`
-	LastError         *string               `json:"last_error,omitempty"`
-	RequestPayload    *string               `json:"request_payload,omitempty"`
-	ResponseBodyTrunc *string               `json:"response_body_trunc,omitempty"`
-	CreatedAt         time.Time             `json:"created_at"`
-	SentAt            *time.Time            `json:"sent_at,omitempty"`
+	Status            OutboxDeliveryStatus `json:"status"`
+	Attempts          int                  `json:"attempts"`
+	NextAttemptAt     *time.Time           `json:"next_attempt_at,omitempty"`
+	LastHTTPStatus    *int                 `json:"last_http_status,omitempty"`
+	LastError         *string              `json:"last_error,omitempty"`
+	RequestPayload    *string              `json:"request_payload,omitempty"`
+	ResponseBodyTrunc *string              `json:"response_body_trunc,omitempty"`
+	CreatedAt         time.Time            `json:"created_at"`
+	SentAt            *time.Time           `json:"sent_at,omitempty"`
 }

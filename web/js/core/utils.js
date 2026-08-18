@@ -210,6 +210,24 @@ export function escapeHtml(str) {
 }
 
 /**
+ * Escape a string for use inside a double-quoted HTML attribute.
+ *
+ * Escapes the quotes as well as the angle brackets, which is what separates it
+ * from escapeHtml: a value that only has to be safe as text is not safe as an
+ * attribute. The classic-script side of the app carries its own copy, because
+ * a script that is not a module cannot import this one.
+ */
+export function escapeAttr(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+/**
  * Open a modal with standardized behavior
  * @param {string} modalId - Modal overlay ID
  */

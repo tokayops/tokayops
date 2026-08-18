@@ -1,5 +1,6 @@
 import { test, expect } from '../../fixtures/auth.fixture';
 import { Page } from '@playwright/test';
+import { deleteTeam } from '../../fixtures/team.fixture';
 
 // ========================================
 // Helper: seed test data via API
@@ -43,27 +44,48 @@ async function seedTestEnv(page: Page, suffix: string): Promise<TestEnv> {
   });
   expect([200, 201]).toContain(addBob.status());
 
-  // Create schedule
-  const schedRes = await page.request.put(`/api/v1/teams/${teamId}/schedule`, {
-    data: {
-      timezone: 'UTC',
-      l1_rotation_type: 'daily',
-      l1_handoff_time: '09:00',
-      l1_rotation_start: new Date().toISOString(),
-    },
+  // One save, carrying the whole configuration. Each member is their own
+  // group, which is what the flat rotation of the old model meant.
+  const schedRes = await page.request.put(`/api/v1/teams/${teamId}/schedule/config`, {
+    data: scheduleConfig([['e2e-alice'], ['e2e-bob']], 0),
   });
-  expect([200, 201]).toContain(schedRes.status());
-  const schedule = await schedRes.json();
+  expect(schedRes.status(), await schedRes.text()).toBe(200);
 
-  // Set L1 groups (each user as singleton group, equivalent to old flat list)
-  await page.request.put(`/api/v1/teams/${teamId}/schedule/l1-groups`, {
-    data: { groups: [['e2e-alice'], ['e2e-bob']] },
-  });
+  const config = await (await page.request.get(`/api/v1/teams/${teamId}/schedule/config`)).json();
 
   return {
     teamId,
-    scheduleId: schedule.id,
+    scheduleId: config.schedule_id,
     memberIds: ['e2e-alice', 'e2e-bob'],
+  };
+}
+
+/**
+ * A complete configuration payload.
+ *
+ * The L2 policy is present even though the layer is off: the server validates
+ * both layers regardless, so a disabled layer still needs a cadence and a
+ * handoff time that parse.
+ */
+export function scheduleConfig(groups: string[][], expectedVersion: number, timezone = 'UTC') {
+  return {
+    expected_version: expectedVersion,
+    timezone,
+    l1: {
+      enabled: true,
+      rotation_type: 'daily',
+      handoff_time: '09:00',
+      handoff_day: null,
+      groups: groups.map(userIds => ({ id: crypto.randomUUID(), user_ids: userIds })),
+    },
+    l2: {
+      enabled: false,
+      escalation_timeout_minutes: 5,
+      rotation_type: 'daily',
+      handoff_time: '09:00',
+      handoff_day: null,
+      user_ids: [],
+    },
   };
 }
 
@@ -79,15 +101,17 @@ async function createOverrideViaAPI(
   reason: string,
 ) {
   const res = await page.request.post(`/api/v1/teams/${teamId}/schedule/overrides`, {
-    data: { user_id: userId, start_time: startTime, end_time: endTime, reason },
+    data: { user_id: userId, valid_from: startTime, valid_to: endTime, reason },
   });
-  expect(res.status()).toBe(201);
+  expect(res.status(), await res.text()).toBe(201);
   return await res.json();
 }
 
-/** Cleanup: delete team (cascades to schedule + overrides) */
+/** Cleanup: through the shared helper, so a failed delete is not mistaken for
+ *  a successful one. See deleteTeam for why some teams are retained. */
 async function cleanup(page: Page, teamId: string) {
-  await page.request.delete(`/api/v1/teams/${teamId}`);
+  const outcome = await deleteTeam(page, teamId);
+  expect(outcome.result, `cleanup of ${teamId} failed`).not.toBe('failed');
 }
 
 /**
@@ -192,8 +216,12 @@ test.describe('Calendar Override Context Menu', () => {
     // User select should be pre-populated with e2e-bob
     await expect(schedulesPage.overrideUserSelect).toHaveValue('e2e-bob');
 
-    // Reason field should be populated
-    await expect(schedulesPage.overrideReason).toHaveValue('E2E test override');
+    // The reason field is NOT pre-populated, and that is deliberate: it would
+    // submit the previous author's words under the editor's name. The old
+    // reason is shown beside the field instead.
+    await expect(schedulesPage.overrideReason).toHaveValue('');
+    await expect(schedulesPage.page.locator('#override-reason-note'))
+      .toContainText('E2E test override');
 
     // Submit button text changes to "Save Changes" in edit mode
     await expect(schedulesPage.overrideSubmitBtn).toContainText(/save changes/i);
@@ -223,8 +251,10 @@ test.describe('Calendar Override Context Menu', () => {
     const deleteRes = await deletePromise;
     expect(deleteRes.status()).toBe(204);
 
-    // Toast should confirm deletion
-    await schedulesPage.expectToastVisible('removed');
+    // "ended", not "removed": this one never started, so it is gone entirely -
+    // but the wording is shared with an override that keeps the hours it
+    // covered, and promising removal there would be untrue.
+    await schedulesPage.expectToastVisible('ended');
 
     // Override should disappear from the calendar
     await expect(schedulesPage.calendarOverrideEntries).toHaveCount(0, { timeout: 5000 });
@@ -276,9 +306,12 @@ test.describe('Override Edit from Modal List', () => {
     // Click the edit button on the first override
     await schedulesPage.editOverrideFromList(0);
 
-    // Form should be populated
+    // Form should be populated - except the reason, which stays the editor's
+    // to write. See "Editing an override and its reason" below.
     await expect(schedulesPage.overrideUserSelect).toHaveValue('e2e-alice');
-    await expect(schedulesPage.overrideReason).toHaveValue('Modal list test');
+    await expect(schedulesPage.overrideReason).toHaveValue('');
+    await expect(schedulesPage.page.locator('#override-reason-note'))
+      .toContainText('Modal list test');
 
     // Submit button should say "Save Changes"
     await expect(schedulesPage.overrideSubmitBtn).toContainText(/save changes/i);
@@ -333,7 +366,7 @@ test.describe('Override Edit from Modal List', () => {
     const deleteRes = await deletePromise;
     expect(deleteRes.status()).toBe(204);
 
-    await schedulesPage.expectToastVisible('removed');
+    await schedulesPage.expectToastVisible('ended');
 
     // Override list should have one fewer item
     await expect(schedulesPage.overrideItems).toHaveCount(countBefore - 1, { timeout: 5000 });
@@ -506,20 +539,19 @@ test.describe('Calendar Override Data Attributes', () => {
 
     const entry = schedulesPage.calendarOverrideEntries.first();
 
-    // Verify data attributes are present and correct
+    // A calendar entry is a shift, not an override record. It carries enough
+    // to identify which override to act on; the revision and the reason are
+    // read from the override list when one is opened, because a shift does not
+    // know them and guessing would be how a stale edit gets through.
     const overrideId = await entry.getAttribute('data-override-id');
-    const scheduleId = await entry.getAttribute('data-schedule-id');
     const userId = await entry.getAttribute('data-user-id');
-    const startTime = await entry.getAttribute('data-start-time');
-    const endTime = await entry.getAttribute('data-end-time');
-    const reason = await entry.getAttribute('data-reason');
+    const validFrom = await entry.getAttribute('data-valid-from');
+    const validTo = await entry.getAttribute('data-valid-to');
 
     expect(overrideId).toBeTruthy();
-    expect(scheduleId).toBe(env.scheduleId);
     expect(userId).toBe('e2e-bob');
-    expect(startTime).toBeTruthy();
-    expect(endTime).toBeTruthy();
-    expect(reason).toBe('Data attrs test');
+    expect(validFrom).toBeTruthy();
+    expect(validTo).toBeTruthy();
 
     // The entry should display "OVERRIDE" label and user name
     await expect(entry.locator('.entry-layer')).toContainText(/override/i);
@@ -537,5 +569,156 @@ test.describe('Calendar Override Data Attributes', () => {
     expect(cursor).toBe('pointer');
 
     await schedulesPage.closeCalendarView();
+  });
+});
+
+/**
+ * Deleting from the calendar is two reads before the delete, and the second
+ * one used to be outside the guard.
+ *
+ * The calendar knows an override's id and nothing else - not its revision, not
+ * which schedule it belongs to - so removal reads the override head and then
+ * the schedule config. Wrapping only the first left the second to reject out
+ * of a click handler: no error UI, an unhandled rejection, and a user with no
+ * idea whether anything happened.
+ */
+test.describe('Override removal: the second read fails', () => {
+  let env: TestEnv;
+
+  test.beforeEach(async ({ page, schedulesPage }) => {
+    env = await seedTestEnv(page, 'cfgfail');
+    const { start, end } = futureOverrideWindow();
+    await createOverrideViaAPI(page, env.teamId, 'e2e-bob', start, end, 'Second read fails');
+    await schedulesPage.gotoOnCall();
+  });
+
+  test.afterEach(async ({ page }) => {
+    await deleteTeam(page, env.teamId);
+  });
+
+  test('reports the failure instead of throwing, and sends no delete', async ({
+    page,
+    schedulesPage,
+  }) => {
+    const pageErrors: string[] = [];
+    page.on('pageerror', e => pageErrors.push(e.message));
+
+    await schedulesPage.openCalendarView(env.teamId);
+    await expect(schedulesPage.calendarOverrideEntries.first()).toBeVisible({ timeout: 5000 });
+
+    // The head read succeeds; the config read - the one the calendar path
+    // needs because it carries no schedule id - does not.
+    await page.route(`**/api/v1/teams/${env.teamId}/schedule/config`, route =>
+      route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"boom"}' }));
+
+    const deleteRequests: string[] = [];
+    page.on('request', req => {
+      if (req.method() === 'DELETE' && req.url().includes('/overrides/')) {
+        deleteRequests.push(req.url());
+      }
+    });
+    // The confirm would come after both reads; it must never be reached.
+    page.on('dialog', d => d.accept());
+
+    await schedulesPage.clickCalendarOverride(0);
+    await schedulesPage.expectContextMenuVisible();
+    await schedulesPage.contextMenuDelete.click();
+
+    await expect(page.locator('#toast-container')).toContainText(
+      /could not reach the server/i,
+      { timeout: 5000 },
+    );
+
+    expect(deleteRequests, 'nothing may be deleted when the preflight failed').toHaveLength(0);
+    expect(pageErrors, 'the failure must be handled, not thrown out of the click handler')
+      .toHaveLength(0);
+  });
+});
+
+/**
+ * An override whose window has closed is a normal thing to have, and it must
+ * not be offered for editing or cancelling.
+ *
+ * Editing an override that is in force closes the served part and starts a new
+ * one, so a schedule routinely carries live heads whose window is over. The
+ * server refuses both commands on those - cancelling a shift somebody served
+ * would rewrite who was on duty - so a row with two buttons that always answer
+ * 422 is the UI promising something it cannot do.
+ */
+test.describe('Overrides that have ended', () => {
+  let env: TestEnv;
+
+  test.beforeEach(async ({ page, schedulesPage }) => {
+    env = await seedTestEnv(page, 'ended');
+
+    // One that is over, and one that is still to come, so the assertion is
+    // "the ended one is filtered" rather than "the list is empty".
+    const past = new Date(Date.now() - 4 * 3600 * 1000);
+    await createOverrideViaAPI(page, env.teamId, 'e2e-bob',
+      past.toISOString(), new Date(past.getTime() + 2 * 3600 * 1000).toISOString(), 'Already over');
+
+    const { start, end } = futureOverrideWindow();
+    await createOverrideViaAPI(page, env.teamId, 'e2e-alice', start, end, 'Still to come');
+
+    await schedulesPage.gotoOnCall();
+  });
+
+  test.afterEach(async ({ page }) => {
+    await deleteTeam(page, env.teamId);
+  });
+
+  test('are not offered under Current & Upcoming', async ({ schedulesPage, page }) => {
+    await schedulesPage.openCreateOverrideModal(env.teamId);
+
+    await expect(schedulesPage.overrideItems).toHaveCount(1, { timeout: 5000 });
+    await expect(schedulesPage.overrideItems.first()).toContainText('E2E Alice');
+
+    // The ended one is not merely unlabelled - it offers no action at all.
+    await expect(page.locator('.override-item', { hasText: 'E2E Bob' })).toHaveCount(0);
+  });
+});
+
+/**
+ * Editing an override must not put the previous author's words in the
+ * editor's mouth.
+ *
+ * The server makes a revision's reason and its recorded_by one person's, and
+ * prefilling the form defeats that from this side: the editor saves without
+ * touching the field and alice's "Vacation" is submitted as bob's. It affects
+ * an ordinary edit of a future override as much as the split of one in force,
+ * and a test that types a new reason cannot see it.
+ */
+test.describe('Editing an override and its reason', () => {
+  let env: TestEnv;
+
+  test.beforeEach(async ({ page, schedulesPage }) => {
+    env = await seedTestEnv(page, 'reason');
+    const { start, end } = futureOverrideWindow();
+    await createOverrideViaAPI(page, env.teamId, 'e2e-bob', start, end, 'Vacation');
+    await schedulesPage.gotoOnCall();
+  });
+
+  test.afterEach(async ({ page }) => {
+    await deleteTeam(page, env.teamId);
+  });
+
+  test('does not resubmit the previous author\'s reason', async ({ page, schedulesPage }) => {
+    await schedulesPage.openCreateOverrideModal(env.teamId);
+    await expect(schedulesPage.overrideItems).toHaveCount(1, { timeout: 5000 });
+    await schedulesPage.editOverrideFromList(0);
+
+    // The field is empty, and the old reason is shown beside it rather than
+    // inside it: still readable, no longer submittable as somebody else's.
+    await expect(page.locator('#override-reason')).toHaveValue('');
+    await expect(page.locator('#override-reason-note')).toContainText('Vacation');
+    await expect(page.locator('#override-reason-label')).toContainText('this change');
+
+    const put = page.waitForRequest(
+      r => r.method() === 'PUT' && r.url().includes('/overrides/'));
+    await schedulesPage.overrideSubmitBtn.click();
+    const body = (await put).postDataJSON() as { reason?: string };
+
+    expect(body.reason ?? null, 'an untouched reason field must send nothing at all')
+      .toBeNull();
   });
 });

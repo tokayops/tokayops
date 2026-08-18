@@ -7,11 +7,11 @@ import (
 	"log"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/google/uuid"
 )
 
 type EscalationExecutor struct {

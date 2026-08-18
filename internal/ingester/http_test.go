@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
 )
 
 // seedDefaultTeams creates the teams commonly used by ingester tests in the mock store.
@@ -689,8 +689,8 @@ func TestResolveCreatesOutboxEvent(t *testing.T) {
 	ag := &model.AlertGroup{
 		ID: "ag-outbox-resolve", DedupKey: "outbox-resolve-group",
 		Status: model.AlertGroupStatusTriggered, TeamID: "devops", TeamNameSnapshot: "DevOps",
-		Severity: "critical",
-		Alerts:   []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
+		Severity:  "critical",
+		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -735,8 +735,8 @@ func TestResolveFromNewStatus(t *testing.T) {
 	ag := &model.AlertGroup{
 		ID: "ag-new-resolve", DedupKey: "new-resolve-group",
 		Status: model.AlertGroupStatusNew, TeamID: "devops", TeamNameSnapshot: "DevOps",
-		Severity: "warning",
-		Alerts:   []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
+		Severity:  "warning",
+		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -768,3 +768,71 @@ func TestResolveFromNewStatus(t *testing.T) {
 
 // Note: concurrent resolve idempotency (changed=false with alerts convergence)
 // is tested in regression_test.go:TestRegression_ConcurrentResolve_AlertsConverge
+
+func TestFilterMergeableAlerts(t *testing.T) {
+	existing := map[string]model.AlertStatus{
+		"known-firing":   model.AlertStatusFiring,
+		"known-resolved": model.AlertStatusResolved,
+	}
+
+	tests := []struct {
+		name     string
+		incoming []model.Alert
+		expected []string
+	}{
+		{
+			name:     "unknown resolved alert is dropped",
+			incoming: []model.Alert{{Fingerprint: "stranger", Status: model.AlertStatusResolved}},
+			expected: nil,
+		},
+		{
+			name:     "unknown firing alert joins the group",
+			incoming: []model.Alert{{Fingerprint: "newcomer", Status: model.AlertStatusFiring}},
+			expected: []string{"newcomer"},
+		},
+		{
+			name:     "known alert resolving is kept",
+			incoming: []model.Alert{{Fingerprint: "known-firing", Status: model.AlertStatusResolved}},
+			expected: []string{"known-firing"},
+		},
+		{
+			name:     "known alert re-firing is kept",
+			incoming: []model.Alert{{Fingerprint: "known-resolved", Status: model.AlertStatusFiring}},
+			expected: []string{"known-resolved"},
+		},
+		{
+			name:     "known alert with unchanged status is kept",
+			incoming: []model.Alert{{Fingerprint: "known-firing", Status: model.AlertStatusFiring}},
+			expected: []string{"known-firing"},
+		},
+		{
+			name: "mixed payload keeps everything but the unknown resolved alert",
+			incoming: []model.Alert{
+				{Fingerprint: "known-firing", Status: model.AlertStatusResolved},
+				{Fingerprint: "stranger", Status: model.AlertStatusResolved},
+				{Fingerprint: "newcomer", Status: model.AlertStatusFiring},
+			},
+			expected: []string{"known-firing", "newcomer"},
+		},
+		{
+			name:     "empty payload stays empty",
+			incoming: nil,
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := filterMergeableAlerts(tt.incoming, existing)
+			if len(got) != len(tt.expected) {
+				t.Fatalf("got %d alerts, want %d (%v)", len(got), len(tt.expected), got)
+			}
+			// Order is preserved, so index comparison is safe.
+			for i, fp := range tt.expected {
+				if got[i].Fingerprint != fp {
+					t.Errorf("alert %d = %q, want %q", i, got[i].Fingerprint, fp)
+				}
+			}
+		})
+	}
+}

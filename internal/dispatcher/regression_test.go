@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/slack-go/slack"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // TestRegression_Resolve_ErrorLeak verifies that SlackProvider.Resolve()

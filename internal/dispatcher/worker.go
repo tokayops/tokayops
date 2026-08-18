@@ -7,12 +7,12 @@ import (
 	"log"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/dispatcher/builders"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/google/uuid"
 )
 
 // NotificationTarget identifies where a notification goes, in provider-agnostic
@@ -414,7 +414,7 @@ func (d *Dispatcher) ProcessAcknowledgedAlertGroups(ctx context.Context) {
 		}
 
 		// 3. Try to create the job
-		if _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
+		if _, _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
 			// Transient error - do NOT mark as processed, allow retry on next iteration
 			log.Printf("JobController: Failed to create update job for %s (will retry): %v", ag.ID, err)
 			continue
@@ -470,7 +470,7 @@ func (d *Dispatcher) ProcessResolvedAlertGroups(ctx context.Context) {
 
 		if job != nil {
 			// 3. Create resolution job
-			if _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
+			if _, _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
 				log.Printf("JobController: Failed to create resolution job for %s (will retry): %v", ag.ID, err)
 				continue // transient error → retry next tick
 			}
@@ -544,8 +544,8 @@ func (d *Dispatcher) ProcessAlertUpdates(ctx context.Context) {
 			continue
 		}
 
-		// CreateJobWithDedup returns (existingID, nil) on dedup hit — not an error
-		if _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
+		// CreateJobWithDedup returns (existingID, false, nil) on dedup hit — not an error
+		if _, _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
 			// Transient error — keep flag, retry next tick
 			log.Printf("JobController: Failed to create alert update job for %s (will retry): %v", ag.ID, err)
 			continue

@@ -112,7 +112,7 @@ test.describe('Integrations CRUD', () => {
 
     await page.waitForTimeout(100);
 
-    // Interactive toggle should not be present for non-Slack types
+    // Inbound types have no interactive toggle (Slack and Telegram both do)
     await expect(integrationsPage.configInteractiveToggle).toBeHidden();
   });
 

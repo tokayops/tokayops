@@ -13,11 +13,16 @@ import (
 )
 
 // mockTelegramTokenSource implements TelegramTokenSource for testing.
+// interactiveOff is negated on purpose: the zero value has to mean "buttons on",
+// which is what every existing test that renders a card expects.
 type mockTelegramTokenSource struct {
-	token string
+	token          string
+	interactiveOff bool
 }
 
 func (m *mockTelegramTokenSource) GetTelegramToken() string { return m.token }
+
+func (m *mockTelegramTokenSource) GetTelegramInteractive() bool { return !m.interactiveOff }
 
 // fakeBotAPI returns an httptest server that answers sendMessage/editMessageText
 // and counts calls per method. sendMessage returns the given message_id.
@@ -287,6 +292,85 @@ func TestTelegram_CardHasAckResolveKeyboard(t *testing.T) {
 	}
 }
 
+// Switching interactivity off must strip the buttons from a card that was
+// already posted with them. editMessageText leaves the existing keyboard alone
+// when reply_markup is absent, so the update has to carry an explicitly empty
+// inline_keyboard - sending nil would strand live buttons in the chat.
+func TestTelegram_InteractiveOff_UpdateClearsKeyboard(t *testing.T) {
+	var sentBody, editedBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
+			_ = json.NewDecoder(r.Body).Decode(&sentBody)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"message_id": 7}})
+		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
+			_ = json.NewDecoder(r.Body).Decode(&editedBody)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": true})
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	src := &mockTelegramTokenSource{token: "tok"}
+	p := NewTelegramProvider(src, "https://tokay.example", WithBaseURL(server.URL))
+	ctx := context.Background()
+	ag := testAlertGroup()
+
+	payload, err := p.Send(ctx, NotificationRequest{
+		Target: NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: ag, Editable: true,
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if sentBody["reply_markup"] == nil {
+		t.Fatalf("card was posted without a keyboard, nothing to clear later: %v", sentBody)
+	}
+
+	src.interactiveOff = true
+
+	if _, err := p.Update(ctx, &model.NotificationDelivery{ID: "del-1", ProviderPayload: payload}, ag); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	markup, ok := editedBody["reply_markup"]
+	if !ok {
+		t.Fatalf("editMessageText omitted reply_markup, so the old buttons survive: %v", editedBody)
+	}
+	b, _ := json.Marshal(markup)
+	if string(b) != `{"inline_keyboard":[]}` {
+		t.Errorf("reply_markup = %s, want an empty inline_keyboard", b)
+	}
+}
+
+// A card posted while interactivity is off never gets a keyboard in the first
+// place.
+func TestTelegram_InteractiveOff_SendHasEmptyKeyboard(t *testing.T) {
+	var sentBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			_ = json.NewDecoder(r.Body).Decode(&sentBody)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"message_id": 8}})
+			return
+		}
+		t.Errorf("unexpected request: %s", r.URL.Path)
+	}))
+	defer server.Close()
+
+	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok", interactiveOff: true}, "https://tokay.example", WithBaseURL(server.URL))
+	if _, err := p.Send(context.Background(), NotificationRequest{
+		Target: NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	b, _ := json.Marshal(sentBody["reply_markup"])
+	if string(b) != `{"inline_keyboard":[]}` {
+		t.Errorf("reply_markup = %s, want an empty inline_keyboard", b)
+	}
+}
+
 func TestTelegram_NoButtonsWithoutSelfURL(t *testing.T) {
 	var sentBody map[string]interface{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -387,5 +471,99 @@ func TestTelegram_BotUsername_Caches(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("getMe should be cached, called %d times", count)
+	}
+}
+
+// Telegram never posts a card for an unonboarded team today - that path is
+// firehose, which is Slack-only - so these lock the shared helper down from the
+// Telegram side and keep the two channels from drifting apart.
+func TestTelegram_TeamGate(t *testing.T) {
+	tests := []struct {
+		name         string
+		interactive  bool
+		isResolved   bool
+		lookup       *countingTeamLookup
+		useNilHook   bool
+		wantKeyboard string
+		wantCalls    int
+	}{
+		{
+			name:         "onboarded team keeps its buttons",
+			interactive:  true,
+			lookup:       &countingTeamLookup{onboarded: true},
+			wantKeyboard: "buttons",
+			wantCalls:    1,
+		},
+		{
+			name:         "unknown team gets an empty keyboard, not nil",
+			interactive:  true,
+			lookup:       &countingTeamLookup{onboarded: false},
+			wantKeyboard: "empty",
+			wantCalls:    1,
+		},
+		{
+			name:         "a failing lookup degrades to onboarded",
+			interactive:  true,
+			lookup:       &countingTeamLookup{onboarded: false, err: errors.New("db down")},
+			wantKeyboard: "buttons",
+			wantCalls:    1,
+		},
+		{
+			name:         "no lookup wired up behaves as before",
+			interactive:  true,
+			useNilHook:   true,
+			wantKeyboard: "buttons",
+		},
+		{
+			name:         "interactivity off short-circuits before the lookup",
+			interactive:  false,
+			lookup:       &countingTeamLookup{onboarded: false},
+			wantKeyboard: "empty",
+			wantCalls:    0,
+		},
+		{
+			name:         "resolved card short-circuits before the lookup",
+			interactive:  true,
+			isResolved:   true,
+			lookup:       &countingTeamLookup{onboarded: false},
+			wantKeyboard: "empty",
+			wantCalls:    0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := []TelegramOption{WithBaseURL("http://unused.invalid")}
+			if !tt.useNilHook {
+				opts = append(opts, WithTeamLookup(tt.lookup.fn))
+			}
+			p := NewTelegramProvider(
+				&mockTelegramTokenSource{token: "tok", interactiveOff: !tt.interactive},
+				"https://tokay.example",
+				opts...,
+			)
+
+			ag := testAlertGroup()
+			ag.TeamID = "payments"
+
+			b, err := json.Marshal(p.keyboardFor(ag, tt.isResolved))
+			if err != nil {
+				t.Fatalf("marshal keyboard: %v", err)
+			}
+			switch tt.wantKeyboard {
+			case "empty":
+				if string(b) != `{"inline_keyboard":[]}` {
+					t.Errorf("keyboard = %s, want an empty inline_keyboard", b)
+				}
+			case "buttons":
+				if !strings.Contains(string(b), "ack:") || !strings.Contains(string(b), "res:") {
+					t.Errorf("keyboard = %s, want ack/res buttons", b)
+				}
+			}
+
+			if !tt.useNilHook && tt.lookup.calls != tt.wantCalls {
+				t.Errorf("team lookup ran %d times, want %d", tt.lookup.calls, tt.wantCalls)
+			}
+		})
 	}
 }

@@ -3,9 +3,9 @@ package testutil
 import (
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/google/uuid"
 )
 
 func SeedTeam(t *testing.T, s *store.Store, id string) *model.Team {

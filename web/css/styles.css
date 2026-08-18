@@ -1458,6 +1458,23 @@ body::before {
     transform: scale(1) translateY(0);
 }
 
+/* The schedule editor is the densest thing this shell carries: a cadence
+   sentence that reads as one line. At the default width it wraps as soon as a
+   weekly rotation names its handoff day.
+   At its longest - a weekly cadence, a handoff day and a time - L1's sentence
+   stops wrapping at 580 and L2's at 620, L2 being a section's padding deeper.
+   640 is the wider of those with a little to spare and nothing beyond it. The
+   rest of the editor is comfortable well below this, so a wider modal would
+   only be empty on the right.
+   The shell is shared with every other modal, so it cannot wear a size class:
+   one added on open is one some path has to remember to take off again.
+   Selected by what the modal contains instead. It holds through the preview
+   step because the form is hidden there rather than removed, which is also why
+   the modal does not jump width between reviewing a save and going back. */
+.modal:has(.schedule-editor) {
+    max-width: 640px;
+}
+
 .modal-header {
     display: flex;
     justify-content: space-between;
@@ -3077,6 +3094,50 @@ body::before {
     transform: none;
 }
 
+/* Except at the foot of a long form, where "below" is under the footer. The
+   modal body scrolls, so an absolutely positioned tooltip is clipped at its
+   edges; this field is near the bottom edge and has the whole form above it. */
+.schedule-meta .tooltip-icon::after {
+    top: auto;
+    bottom: calc(100% + 8px);
+}
+
+/* Text tooltip: reveals the full value of truncated text on hover */
+.text-tip {
+    position: relative;
+}
+
+.text-tip::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 8px);
+    padding: 8px 12px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    font-size: 0.8rem;
+    font-weight: 400;
+    color: var(--text-primary);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.15s, visibility 0.15s;
+    z-index: 1000;
+    pointer-events: none;
+    box-shadow: var(--shadow-lg);
+    width: max-content;
+    max-width: 280px;
+    white-space: normal;
+    text-align: left;
+    line-height: 1.4;
+}
+
+.text-tip:hover::after {
+    opacity: 1;
+    visibility: visible;
+    transition-delay: 0.3s;
+}
+
 .form-group input,
 .form-group textarea {
     padding: var(--space-sm) var(--space-md);
@@ -3269,6 +3330,9 @@ body::before {
 .oncall-list-header {
     display: grid;
     grid-template-columns: 200px 150px 120px 120px 1fr;
+    /* The column names share a baseline, so the one carrying a note below it
+       does not push the others off the line they sit on. */
+    align-items: baseline;
     gap: var(--space-md);
     padding: 0 var(--space-md);
     font-size: 0.75rem;
@@ -3276,6 +3340,17 @@ body::before {
     letter-spacing: 0.08em;
     color: var(--text-muted);
     margin-bottom: var(--space-xs);
+}
+
+/* Which timezone the column is in, said once beside the column name rather
+   than on every row. On the same line - a second line here pushed the header
+   taller than the row it labels - and lighter, because it is an aside about
+   that column and not a second column name. */
+.oncall-cell-note {
+    margin-left: 4px;
+    letter-spacing: 0;
+    font-size: 0.7rem;
+    opacity: 0.7;
 }
 
 .oncall-list-body {
@@ -3371,6 +3446,19 @@ body::before {
 .oncall-user-name {
     font-weight: 600;
     color: var(--text-primary);
+}
+
+/* The tooltip must escape the cell, so the cell stops clipping
+   and the inner name span takes over the ellipsis */
+.oncall-cell.text-tip {
+    overflow: visible;
+}
+
+.oncall-cell.text-tip .oncall-user-name {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .oncall-user-name.is-muted {
@@ -3619,12 +3707,21 @@ body::before {
     display: flex;
     flex-direction: column;
     gap: 2px;
+    min-width: 0;
+}
+
+.on-call-user-name-wrap {
+    min-width: 0;
 }
 
 .on-call-user-name {
+    display: block;
     font-size: 1.125rem;
     font-weight: 600;
     color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .on-call-override-badge {
@@ -3930,12 +4027,11 @@ body::before {
     color: white;
 }
 
-/* L2 Config Toggle */
+/* What the L2 toggle reveals is laid out exactly as L1 is - a cadence strip
+   above a rotation panel - so it carries no box of its own. A second grey
+   surface around it would nest L2's panel one level deeper than L1's and make
+   two identical layouts read as different ones. */
 .l2-config {
-    margin-top: var(--space-md);
-    padding: var(--space-md);
-    background: var(--bg-tertiary);
-    border-radius: var(--radius-md);
     transition: opacity var(--transition-base);
 }
 
@@ -3943,29 +4039,389 @@ body::before {
    Schedule Config Modal - Redesigned
    ====================================== */
 
-.schedule-config-grid {
+.schedule-editor {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-lg);
+}
+
+/* The cadence reads as a sentence: controls sit inline with the words that
+   join them, so "when does this hand over" is one line instead of four
+   stacked form groups. */
+.cadence-strip {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-xs) var(--space-sm);
+    padding: var(--space-md);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+}
+
+.cadence-word {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+/* One node, so the cadence binding can hide the words with the control: a
+   daily rotation has no handoff day, and "handing off" alone is nonsense. */
+.cadence-part {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+/* One control, whatever element it happens to be.
+   Two things pull them apart otherwise. The surface: .form-input is tertiary
+   and .form-select is secondary, so a sentence built from both reads as two
+   quiet fields and two white boxes. And the height: a select and a text input
+   with the same padding come out 32 and 35 in Chromium and 22 and 35 in
+   WebKit, so the row centres on nothing.
+   Sized by its own content, too. .form-select carries flex: 1, which gives a
+   select a zero basis plus a share of the free space: the same control comes
+   out wide in a short sentence and clipped to "wee" in a long one. */
+.cadence-control {
+    flex: 0 0 auto;
+    width: auto;
+    height: 34px;
+    padding: 0 10px;
+    font-size: 0.9rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+}
+
+.cadence-time {
+    min-width: 7.5rem;
+}
+
+.cadence-number {
+    width: 5rem;
+    text-align: center;
+}
+
+/* The zone is one fact about the whole schedule, so it stands on a line of its
+   own above both cadence sentences: it governs the times in both. It carries
+   no label - a control showing "Europe/Moscow UTC+3" says what it is - so its
+   name is on the trigger for anyone not reading it by eye.
+   On its own line it no longer competes for width, so it shows the zone's full
+   name and only ellipsizes past a length no real zone reaches. */
+.schedule-timezone {
+    display: flex;
+    align-items: center;
+    margin: 0;
+}
+
+.schedule-timezone .tz-picker {
+    flex: 0 1 auto;
+    min-width: 11rem;
+    max-width: 20rem;
+}
+
+.schedule-timezone .tz-picker-display {
+    height: 34px;
+    padding: 0 var(--space-md);
+}
+
+/* The L2 layer: a toggle that reveals a block shaped exactly like L1, so the
+   second rotation is read with the vocabulary already learned from the first. */
+.l2-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    padding: var(--space-md);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+}
+
+/* Checkbox, icon and title on one line, with the hint under the title rather
+   than under the checkbox - the hint continues the title's sentence. */
+.l2-toggle {
     display: grid;
-    grid-template-columns: 1fr 1.5fr;
-    gap: var(--space-xl);
-    min-height: 400px;
+    grid-template-columns: auto auto minmax(0, 1fr);
+    align-items: center;
+    column-gap: var(--space-sm);
+    row-gap: var(--space-xs);
 }
 
-@media (max-width: 900px) {
-    .schedule-config-grid {
-        grid-template-columns: 1fr;
-    }
+.l2-toggle input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent-primary);
 }
 
-.schedule-settings {
+.l2-toggle-title {
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.l2-toggle-hint {
+    grid-column: 3;
+    margin: 0;
+    font-weight: 400;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+/* The control flows with the words instead of being a flex item beside them,
+   so a hint that runs long wraps as one sentence rather than dropping the
+   number onto a line of its own.
+   It is also sized to the sentence it stands in, not to the cadence strip it
+   came from: a 34px box at 0.9rem inside a 0.8rem line sits proud of its own
+   words, and on a baseline it rides above them as well.
+   And no stepper: this is a word in a sentence, and the arrows are a box of
+   their own inside it - drawn on hover in Chromium and always in WebKit, so
+   the line would change height between engines. */
+.l2-toggle-hint .cadence-control {
+    display: inline-block;
+    vertical-align: middle;
+    width: 2.75rem;
+    height: 22px;
+    margin: 0 2px;
+    padding: 0 6px;
+    font-size: 0.8rem;
+    appearance: textfield;
+    -moz-appearance: textfield;
+}
+
+.l2-toggle-hint .cadence-control::-webkit-outer-spin-button,
+.l2-toggle-hint .cadence-control::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+/* The display above outranks the user agent's [hidden] rule, which is a class
+   against a bare attribute; without this the control stays on screen with the
+   layer switched off. */
+.l2-toggle-hint .cadence-control[hidden],
+.l2-toggle-hint .l2-timeout-static[hidden] {
+    display: none;
+}
+
+.l2-config {
     display: flex;
     flex-direction: column;
     gap: var(--space-md);
 }
 
-.schedule-users {
+/* Deleting is the one destructive thing in this modal, so it is set apart by
+   colour and a rule rather than by a bare margin, and it is last. */
+.schedule-danger {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    margin-top: var(--space-lg);
+    padding-top: var(--space-lg);
+    border-top: 1px solid var(--border-color);
+}
+
+.schedule-danger-title {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    margin: 0;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--severity-critical);
+}
+
+.schedule-danger-title i {
+    width: 16px;
+    height: 16px;
+}
+
+.schedule-danger-text {
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+.schedule-danger .btn {
+    align-self: flex-start;
+}
+
+/* ======================================
+   Schedule preview: what a save would do
+   ====================================== */
+
+.schedule-preview {
     display: flex;
     flex-direction: column;
     gap: var(--space-lg);
+}
+
+/* Banners carry a consequence, so the icon says how it lands and the text
+   states it. Shared with the calendar's warnings, which are the same shape. */
+.schedule-banners {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.schedule-banner {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    gap: var(--space-sm);
+    padding: var(--space-md);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-left-width: 3px;
+    border-radius: var(--radius-md);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: var(--text-primary);
+}
+
+/* Lucide swaps the <i> for a 24px svg, which is a line and a half tall next
+   to this text. The nudge aligns it to the first line rather than to the
+   block, so a banner that wraps keeps its icon beside the sentence it marks. */
+.schedule-banner svg {
+    width: 18px;
+    height: 18px;
+    margin-top: 2px;
+}
+
+.schedule-banner strong {
+    display: block;
+    font-weight: 600;
+}
+
+/* The names are what the banner is about, so they carry the weight and the
+   words joining them stay quiet. */
+.banner-who {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.banner-arrow {
+    margin: 0 2px;
+    color: var(--text-muted);
+}
+
+.schedule-banner-info {
+    border-left-color: var(--accent-primary);
+}
+
+.schedule-banner-info svg {
+    color: var(--accent-primary);
+}
+
+.schedule-banner-warning {
+    border-left-color: var(--severity-warning-border);
+}
+
+.schedule-banner-warning svg {
+    color: var(--severity-warning-border);
+}
+
+.preview-shifts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.preview-shifts-title {
+    margin: 0;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+/* The zone the list's times are in, beside the heading - the same treatment
+   as the on-call list's Until column, and for the same reason: an unlabelled
+   timestamp gets read in whatever zone the reader is in. */
+.preview-shifts-zone {
+    margin-left: 4px;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+    font-size: 0.7rem;
+    opacity: 0.8;
+}
+
+.preview-shift-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+/* When and who are two columns, not one sentence: the point of the list is
+   reading down the names, and "Aug 14, 02:56 PM E2E ann" hides where one
+   ends and the other begins. */
+.preview-shift {
+    display: grid;
+    grid-template-columns: 11rem minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-sm);
+    font-size: 0.875rem;
+}
+
+.preview-shift:nth-child(odd) {
+    background: var(--bg-tertiary);
+}
+
+.preview-shift-when {
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+.preview-shift-who {
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.preview-empty {
+    margin: 0;
+    font-size: 0.875rem;
+    color: var(--text-muted);
+}
+
+/* The caveat is a footnote about the answer above it, and it is set as one:
+   quieter than what it qualifies, and separated by a rule so it does not read
+   as another shift. */
+.preview-caveat {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    gap: var(--space-sm);
+    margin: 0;
+    padding-top: var(--space-md);
+    border-top: 1px solid var(--border-color);
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--text-muted);
+}
+
+.preview-caveat svg {
+    width: 14px;
+    height: 14px;
+    margin-top: 3px;
+}
+
+
+/* Slack usergroup and the change reason are metadata about the save, not part
+   of the rotation, so they sit together after it rather than above it. */
+/* min() rather than a bare 240px: a track with a fixed minimum wider than its
+   container does not collapse to one column, it overflows, and on a phone the
+   whole editor then scrolls sideways behind the two fields that caused it. */
+.schedule-meta {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+    gap: var(--space-md);
 }
 
 /* Form Section with Icons */
@@ -3987,26 +4443,23 @@ body::before {
     color: var(--accent-primary);
 }
 
-.toggle-label {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    cursor: pointer;
-}
-
-.toggle-label input[type="checkbox"] {
-    width: 16px;
-    height: 16px;
-    accent-color: var(--accent-primary);
-}
-
-
 /* Rotation Panel */
 .rotation-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
     background: var(--glass-bg);
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-lg);
     padding: var(--space-md);
+}
+
+/* Title and hint travel together, so the hint reads as part of the heading
+   rather than as the first line of the list under it. */
+.rotation-panel-head {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
 }
 
 .rotation-panel-title {
@@ -4016,139 +4469,13 @@ body::before {
     font-size: 0.875rem;
     font-weight: 600;
     color: var(--text-primary);
-    margin-bottom: var(--space-md);
+    margin: 0;
 }
 
 .rotation-panel-title i {
     width: 18px;
     height: 18px;
     color: var(--accent-primary);
-}
-
-/* Two Column Layout for Users */
-.rotation-columns {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--space-md);
-}
-
-.rotation-column {
-    display: flex;
-    flex-direction: column;
-}
-
-.rotation-column-header {
-    font-size: 0.75rem;
-    font-weight: 600;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: var(--space-sm);
-    padding: 0 var(--space-sm);
-    min-height: 32px;
-}
-
-.rotation-hint {
-    display: block;
-    font-size: 0.625rem;
-    font-weight: 400;
-    color: var(--text-muted);
-    text-transform: none;
-    opacity: 0.7;
-}
-
-.rotation-list {
-    min-height: 150px;
-    max-height: 250px;
-    overflow-y: auto;
-    background: var(--bg-tertiary);
-    border: 2px dashed var(--border-color);
-    border-radius: var(--radius-md);
-    padding: var(--space-sm);
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-xs);
-}
-
-.rotation-list-selected {
-    border-color: var(--accent-primary);
-    border-style: solid;
-    background: rgba(99, 102, 241, 0.05);
-}
-
-.rotation-list:empty::after {
-    content: "Drag users here";
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    height: 100%;
-    color: var(--text-muted);
-    font-size: 0.75rem;
-}
-
-/* User Item in Rotation */
-.rotation-user {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    padding: var(--space-sm) var(--space-md);
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-sm);
-    cursor: grab;
-    transition: all var(--transition-fast);
-}
-
-.rotation-user:hover {
-    background: var(--glass-bg-hover);
-    border-color: var(--accent-primary);
-}
-
-.rotation-user:active {
-    cursor: grabbing;
-}
-
-.rotation-user.sortable-ghost {
-    opacity: 0.4;
-    background: var(--accent-primary);
-}
-
-.rotation-user.sortable-chosen {
-    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
-}
-
-.drag-handle {
-    width: 16px;
-    height: 16px;
-    color: var(--text-muted);
-    cursor: grab;
-    flex-shrink: 0;
-}
-
-.rotation-user-avatar {
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: white;
-    font-size: 0.75rem;
-    font-weight: 600;
-    flex-shrink: 0;
-}
-
-.rotation-user-name {
-    font-size: 0.875rem;
-    font-weight: 500;
-    color: var(--text-primary);
-}
-
-/* Selected list styling */
-.rotation-list-selected .rotation-user {
-    background: var(--bg-secondary);
-    border-color: var(--accent-primary);
 }
 
 /* ======================================
@@ -4158,7 +4485,7 @@ body::before {
 .rotation-panel-hint {
     font-size: 0.8rem;
     color: var(--text-muted);
-    margin: 0 0 var(--space-md) 0;
+    margin: 0;
 }
 
 .groups-editor {
@@ -4168,8 +4495,31 @@ body::before {
     margin-bottom: var(--space-md);
 }
 
+/* The counterpart of "Add group" one layer down, so it is dressed as that
+   button: same padding, same border, same size, sitting at its own width at
+   the foot of the list. It stays a select because a person has to be picked -
+   the chevron is the only honest difference between the two. */
+.l2-add-user {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    width: auto;
+    padding: var(--space-xs) var(--space-sm);
+    background: transparent;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.l2-add-user:hover {
+    border-color: var(--accent-primary);
+}
+
 .groups-editor:empty::after {
-    content: "No groups configured. Click 'Add Group' to start.";
+    content: "No groups yet. Add a group to start.";
     display: flex;
     align-items: center;
     justify-content: center;
@@ -4181,19 +4531,46 @@ body::before {
     border-radius: var(--radius-md);
 }
 
+#l2-users-list:empty::after {
+    content: "Nobody on backup yet. Add a person to start.";
+}
+
+/* Grid, not flex, and the chip track is minmax(0, 1fr).
+
+   As a flex row this could not hold what it was given: a flex item's
+   min-width defaults to auto, so the chip area refused to shrink below the
+   width of its longest name and pushed the add-user control past the edge of
+   the modal. minmax(0, 1fr) is the track that is allowed to be narrower than
+   its content, which is what makes the row bounded by the panel instead of by
+   whatever somebody is called. */
 .group-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: auto auto minmax(0, 1fr) auto auto;
     align-items: center;
     gap: var(--space-sm);
     padding: var(--space-sm) var(--space-md);
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-md);
-    transition: all var(--transition-fast);
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 
 .group-row:hover {
     border-color: var(--accent-primary);
+}
+
+/* An L2 row carries a name where an L1 row carries chips and a picker, so it
+   is one column short. */
+.user-row {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+}
+
+.row-name {
+    font-size: 0.875rem;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .group-row.sortable-ghost {
@@ -4214,19 +4591,28 @@ body::before {
     cursor: grabbing;
 }
 
+/* The ordinal is the group's place in the rotation. It is a number because
+   that is the information; the noun lives in the panel heading. */
 .group-label {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
     font-weight: 600;
-    font-size: 0.85rem;
-    min-width: 64px;
-    color: var(--text-primary);
-    flex-shrink: 0;
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
 }
 
 .group-chips {
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-xs);
-    flex: 1;
+    min-width: 0;
     min-height: 28px;
     align-items: center;
 }
@@ -4234,13 +4620,24 @@ body::before {
 .user-chip {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    max-width: 100%;
+    gap: 2px;
     padding: 2px 4px 2px 10px;
     background: var(--bg-primary);
     border: 1px solid var(--border-color);
     border-radius: 12px;
     font-size: 0.8rem;
     color: var(--text-primary);
+}
+
+/* One long name truncates instead of wrapping the chip onto a second line
+   and taking the row's height with it. The full name stays available as the
+   title, so nothing is hidden - only shortened. */
+.chip-name {
+    max-width: 18ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .chip-remove {
@@ -4255,6 +4652,7 @@ body::before {
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    flex-shrink: 0;
 }
 
 .chip-remove:hover {
@@ -4262,15 +4660,26 @@ body::before {
     background: rgba(239, 68, 68, 0.1);
 }
 
+/* A picker, sized like the action it is rather than like an empty field.
+   The width is fixed rather than automatic: a select sizes itself to its
+   widest OPTION, so one long name made this control wider than the chips it
+   sits beside. The closed state always reads "+ Add" - the value is cleared
+   as soon as a chip is made - so nothing is ever truncated here. */
+/* A control on a tertiary row is the tertiary surface plus a border, the same
+   bargain the cadence controls strike. .form-select's own background is a
+   shade lighter, which on this row reads as a white box someone forgot. */
 .group-add-user {
-    flex-shrink: 0;
-    min-width: 130px;
+    width: 5.5rem;
+    min-width: 0;
+    height: 28px;
     font-size: 0.8rem;
-    padding: 4px 8px;
+    padding: 0 8px;
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
 }
 
 .group-delete {
-    flex-shrink: 0;
     color: var(--text-muted);
 }
 
@@ -4285,6 +4694,60 @@ body::before {
 /* ======================================
    Overrides List in Modal
    ====================================== */
+
+/* On a phone the editor's rows run out of room in a way that costs information
+   rather than looks: the chip track and the shift name are the flexible
+   columns, so they are the ones that reach zero, and what disappears is a
+   person's name. Both get a line of their own before that happens.
+   The desktop rule stands - a row is one line, and a name never widens it -
+   and this is where that trade stops paying.
+
+   This block has to stay below the rules it overrides. A media query carries
+   no specificity of its own, so .group-row here and .group-row there are an
+   even match and the later one wins; moved above them, the template override
+   silently stops applying while the chips still move, which looks close enough
+   to working to survive a screenshot. */
+@media (max-width: 480px) {
+    .group-row {
+        grid-template-columns: auto auto minmax(0, 1fr) auto;
+        row-gap: var(--space-sm);
+    }
+
+    .group-chips {
+        grid-row: 2;
+        grid-column: 1 / -1;
+    }
+
+    .preview-shift {
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .preview-shift-when {
+        grid-column: 1 / -1;
+    }
+
+    .preview-shift-who {
+        white-space: normal;
+    }
+
+    /* The tooltip is 200px wide and anchored to an icon in the middle of a
+       238px column, so at this width it is what makes the editor scroll
+       sideways - while invisible. Anchored to the field instead of the icon it
+       has an edge to stay inside. */
+    .schedule-meta .form-group {
+        position: relative;
+    }
+
+    .schedule-meta .tooltip-icon {
+        position: static;
+    }
+
+    .schedule-meta .tooltip-icon::after {
+        left: 0;
+        min-width: 0;
+        max-width: 100%;
+    }
+}
 
 .override-modal-content {
     display: flex;
@@ -6356,4 +6819,23 @@ body::before {
         opacity: 1;
         transform: translateY(0);
     }
+}
+/* An ambiguous local time states which of the two moments it took, and offers
+   the other. Presented inline in the note so the choice sits with the reason
+   it exists rather than in a separate control. */
+.override-fold-toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    margin-left: 6px;
+    color: var(--accent-primary);
+    cursor: pointer;
+    font: inherit;
+    text-decoration: underline;
+}
+
+/* Failing to read who is on call is not the same as nobody being on call. */
+.on-call-user-name.is-unavailable,
+.oncall-status-badge.unavailable {
+    color: var(--status-critical, #dc2626);
 }

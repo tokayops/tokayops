@@ -286,56 +286,19 @@ const (
 	RotationWeekly RotationType = "weekly"
 )
 
-// Schedule represents an on-call schedule for a team (1:1 relationship)
-type Schedule struct {
-	ID       string `json:"id"`
-	TeamID   string `json:"team_id"`
-	Timezone string `json:"timezone"` // IANA timezone, e.g., "Asia/Bangkok"
-
-	// Slack Usergroup Sync (optional)
-	SlackUsergroupID string `json:"slack_usergroup_id,omitempty"`
-
-	// L1 Layer Config (Primary)
-	L1RotationType  RotationType `json:"l1_rotation_type"`  // "daily" | "weekly"
-	L1HandoffTime   string       `json:"l1_handoff_time"`   // "11:00" format
-	L1HandoffDay    *int         `json:"l1_handoff_day"`    // 0=Sun, 1=Mon (for weekly)
-	L1RotationStart time.Time    `json:"l1_rotation_start"` // When rotation started
-	L1Groups        [][]*User    `json:"l1_groups,omitempty"`
-
-	// L2 Layer Config (Secondary, optional)
-	L2Enabled           bool         `json:"l2_enabled"`
-	L2EscalationTimeout int          `json:"l2_escalation_timeout_min"` // Minutes before escalating to L2
-	L2RotationType      RotationType `json:"l2_rotation_type,omitempty"`
-	L2HandoffTime       string       `json:"l2_handoff_time,omitempty"`
-	L2HandoffDay        *int         `json:"l2_handoff_day,omitempty"`
-	L2RotationStart     *time.Time   `json:"l2_rotation_start,omitempty"`
-	L2Users             []*User      `json:"l2_users,omitempty"`
-
-	Overrides []*ScheduleOverride `json:"overrides,omitempty"`
-	CreatedAt time.Time           `json:"created_at"`
-	UpdatedAt time.Time           `json:"updated_at"`
-}
-
-// ScheduleOverride represents a temporary on-call override (vacation, swap)
-type ScheduleOverride struct {
-	ID         string    `json:"id"`
-	ScheduleID string    `json:"schedule_id"`
-	UserID     string    `json:"user_id"`
-	User       *User     `json:"user,omitempty"` // Populated on read
-	StartTime  time.Time `json:"start_time"`     // Minute precision
-	EndTime    time.Time `json:"end_time"`
-	Reason     string    `json:"reason,omitempty"`
-	CreatedBy  string    `json:"created_by,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-}
-
 // OnCallResult represents the current on-call user(s) for a schedule
 type OnCallResult struct {
-	L1Users  []*User           `json:"l1_users"`
-	L2User   *User             `json:"l2_user,omitempty"`
-	Override *ScheduleOverride `json:"override,omitempty"` // If override is active
-	L1Since  *time.Time        `json:"l1_since,omitempty"` // When L1 shift started
-	L1Until  *time.Time        `json:"l1_until,omitempty"` // When L1 shift ends. nil = forever/unknown
+	L1Users []*User    `json:"l1_users"`
+	L2User  *User      `json:"l2_user,omitempty"`
+	L1Since *time.Time `json:"l1_since,omitempty"` // When L1 shift started
+	L1Until *time.Time `json:"l1_until,omitempty"` // When L1 shift ends. nil = forever/unknown
+
+	// Source is "rotation" or "override": what put L1Users on duty. The
+	// projection overlays an override onto the layer, so L1Users already names
+	// whoever is really on call - Source is what keeps the fact that they are
+	// standing in from being lost, now that there is no legacy override row to
+	// point at. Empty on snapshots written before it existed.
+	Source string `json:"source,omitempty"`
 }
 
 // ========================================

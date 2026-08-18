@@ -217,3 +217,55 @@ func TestIntegrationCache_ThreadSafe(t *testing.T) {
 	<-done
 	<-done
 }
+
+// The cache is what the send path actually reads, so the "absent means enabled"
+// rule has to survive the round trip through stored JSON, not just live in the
+// model accessor.
+func TestIntegrationCache_TelegramInteractive(t *testing.T) {
+	load := func(t *testing.T, cfg json.RawMessage) *IntegrationCache {
+		t.Helper()
+		store := NewMockStore()
+		store.CreateIntegration(&model.Integration{
+			ID:      "int-tg",
+			Type:    model.IntegrationTypeTelegram,
+			Enabled: true,
+			Config:  cfg,
+		})
+		cache := NewIntegrationCache()
+		if err := cache.LoadAll(store); err != nil {
+			t.Fatalf("LoadAll failed: %v", err)
+		}
+		return cache
+	}
+
+	t.Run("config written before the field existed stays enabled", func(t *testing.T) {
+		cache := load(t, json.RawMessage(`{"bot_token":"123:abc","secret_token":"shh"}`))
+		if !cache.GetTelegramInteractive() {
+			t.Error("interactive = false, want true for a record with no interactive key")
+		}
+	})
+
+	t.Run("explicit false is honoured", func(t *testing.T) {
+		cache := load(t, json.RawMessage(`{"bot_token":"123:abc","secret_token":"shh","interactive":false}`))
+		if cache.GetTelegramInteractive() {
+			t.Error("interactive = true, want the stored false")
+		}
+	})
+
+	t.Run("explicit true is honoured", func(t *testing.T) {
+		cache := load(t, json.RawMessage(`{"bot_token":"123:abc","secret_token":"shh","interactive":true}`))
+		if !cache.GetTelegramInteractive() {
+			t.Error("interactive = false, want the stored true")
+		}
+	})
+
+	t.Run("no telegram integration at all", func(t *testing.T) {
+		cache := NewIntegrationCache()
+		if err := cache.LoadAll(NewMockStore()); err != nil {
+			t.Fatalf("LoadAll failed: %v", err)
+		}
+		if cache.GetTelegramInteractive() {
+			t.Error("interactive = true with no integration configured")
+		}
+	})
+}

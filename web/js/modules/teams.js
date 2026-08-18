@@ -7,6 +7,7 @@ import { State } from '/js/core/state.js';
 import { Elements, showToast } from '/js/core/utils.js';
 import { ViewManager } from '/js/core/viewManager.js';
 import { loadTeamAlertGroups } from '/js/modules/alerts.js';
+import { loadOnCallWidget } from '/js/modules/schedules.js';
 
 /**
  * Load teams from API
@@ -169,22 +170,9 @@ export async function loadTeamMembers(teamId, force = false) {
 async function renderOnCall(teamId, members) {
     if (!Elements.onCallContainer) return;
 
-    try {
-        // Fetch schedule and on-call data (both may 404 if not configured)
-        const [schedule, onCallResult] = await Promise.all([
-            API.schedules.get(teamId).catch(() => null),
-            API.schedules.getOnCall(teamId).catch(() => null)
-        ]);
-
-        // Always use new widget - it handles null gracefully and shows setup prompt
-        Elements.onCallContainer.innerHTML = Components.onCallWidget(schedule, onCallResult, teamId);
-        if (window.lucide) lucide.createIcons();
-    } catch (e) {
-        console.warn('Failed to load on-call data', e);
-        // Show widget with null data (will display "Not configured" prompt)
-        Elements.onCallContainer.innerHTML = Components.onCallWidget(null, null, teamId);
-        if (window.lucide) lucide.createIcons();
-    }
+    // The widget module owns this: it knows that "not configured" and "nobody
+    // on duty" are two different answers and which requests tell them apart.
+    await loadOnCallWidget(teamId, Elements.onCallContainer);
 }
 
 /**

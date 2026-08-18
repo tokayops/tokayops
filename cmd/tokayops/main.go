@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,30 +13,35 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	echoSwagger "github.com/swaggo/echo-swagger"
 	"github.com/tokayops/tokayops/internal/api"
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/engine"
+	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/ingester"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbox"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
-	"github.com/labstack/echo/v4"
-	"github.com/labstack/echo/v4/middleware"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	echoSwagger "github.com/swaggo/echo-swagger"
 
 	_ "github.com/tokayops/tokayops/docs" // swagger docs
 )
 
-// Build metadata, injected at link time via -ldflags "-X main.buildBranch=... -X main.buildCommit=... -X main.buildDate=...".
+// Build metadata, injected at link time via -ldflags "-X main.buildVersion=... -X main.buildBranch=...".
 // See the Makefile (local builds) and Dockerfile (image builds). Defaults apply to `go run`/un-stamped builds.
+// buildVersion carries the release tag ("v0.1.0"); anything not built from a tag stays "dev".
 var (
-	buildBranch = "dev"
-	buildCommit = "unknown"
-	buildDate   = "unknown"
+	buildVersion = "dev"
+	buildBranch  = "dev"
+	buildCommit  = "unknown"
+	buildDate    = "unknown"
 )
 
 // @title TokayOps API
@@ -79,6 +85,17 @@ func main() {
 
 	if err := st.InitDB(); err != nil {
 		log.Fatalf("Failed to init DB schema: %v", err)
+	}
+
+	// Offline schema migrations run right after InitDB, ahead of every
+	// runtime-only check below: they touch nothing that integration
+	// encryption or webhook networking configures, so a misconfigured
+	// integration must not be able to block one. Nothing further down starts
+	// either: HTTP, the scheduler and the background workers are all beyond
+	// this point.
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		runMigrate(st, os.Args[2:])
+		return
 	}
 
 	// Validate ENCRYPTION_KEY is set (required for integrations)
@@ -240,9 +257,44 @@ func main() {
 
 	// Normal Server Startup
 
+	// The schedule cutover has to have happened before anything serves.
+	//
+	// Deliberately here and not right after the `migrate` branch above: between
+	// the two sit `seed`, `user create`, `team create` and
+	// `migrate-slack-identities` - the tools an operator may well need on a
+	// database in the middle of a cutover window. None of them touches
+	// schedules, and gating them would turn one skipped step into a locked
+	// toolbox.
+	if err := st.RequireCutoverSchema(); err != nil {
+		log.Fatalf("Refusing to start: %v", err)
+	}
+
+	// Defence in depth, reported rather than enforced - see
+	// RevisionOverlapConstraintPresent for why this warns instead of refusing.
+	// The DDL swallows a missing btree_gist with a NOTICE nobody reads, so
+	// without this line an installation cannot tell it is running without the
+	// constraint.
+	if present, err := st.RevisionOverlapConstraintPresent(); err != nil {
+		log.Fatalf("Failed to inspect the schedule schema: %v", err)
+	} else if !present {
+		log.Println("WARN: the schedule_revisions non-overlap constraint is absent " +
+			"(btree_gist unavailable when the schema was created). Overlapping revisions are still " +
+			"prevented by the write path's row lock; the database-level backstop is not in place. " +
+			"Install the btree_gist extension and restart to add it.")
+	}
+
 	// 3. Init Components
+
+	// Schedule projection. It is constructed here, before its first consumer,
+	// because the engine, the escalation builder, the handoff notifier, the
+	// usergroup syncer and the API all read on-call state through it and must
+	// read it the same way. A second schedulerender.New would be a second
+	// object with its own clock, and the two would answer differently under
+	// WithClock - visibly in tests, silently in production.
+	scheduleRenderer := schedulerender.New(st.ScheduleReadRepository())
+
 	// Engine
-	eng := engine.NewEngine(st, cfg)
+	eng := engine.NewEngine(st, scheduleRenderer, cfg)
 
 	// 4. Integration Cache (for webhook secrets and Slack config)
 	integrationCache := store.NewIntegrationCache()
@@ -257,10 +309,23 @@ func main() {
 	}
 
 	// Register Providers - from DB with dynamic token lookup.
+	// An alert group's team is a label carried by the alert, not a foreign key,
+	// so it can name a team that was never set up here. Both providers ask this
+	// before offering Ack/Resolve.
+	teamLookup := func(teamID string) (bool, error) {
+		if _, err := st.GetTeamByID(teamID); err != nil {
+			if err == sql.ErrNoRows {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	}
+
 	// The concrete slackProvider instance is also used by the API layer (SlackMessenger
 	// + SlackCardRenderer below), so the dispatcher factory returns that same instance;
 	// the registry keys it by integration ID.
-	slackProvider := dispatcher.NewSlackProvider(integrationCache, cfg.Global.SelfURL)
+	slackProvider := dispatcher.NewSlackProvider(integrationCache, cfg.Global.SelfURL, teamLookup)
 	disp.RegisterProviderFactory("slack", model.IntegrationTypeSlack, func(integ *model.Integration) (dispatcher.Provider, error) {
 		return slackProvider, nil
 	})
@@ -274,7 +339,7 @@ func main() {
 	// webhook + interactivity (which would need the provider in the API layer like
 	// slackProvider above) land in Sprint 3. The capability registration here is
 	// what makes telegram appear in the policy editor and handoff fan-out.
-	telegramProvider := dispatcher.NewTelegramProvider(integrationCache, cfg.Global.SelfURL)
+	telegramProvider := dispatcher.NewTelegramProvider(integrationCache, cfg.Global.SelfURL, dispatcher.WithTeamLookup(teamLookup))
 	disp.RegisterProviderFactory("telegram", model.IntegrationTypeTelegram, func(integ *model.Integration) (dispatcher.Provider, error) {
 		return telegramProvider, nil
 	})
@@ -309,6 +374,16 @@ func main() {
 	// 8. API
 	apiService := api.NewAPI(st, oidcProvider, slackProvider, integrationCache, cfg.Global.SelfURL, api.NewProviderCapsAdapter(disp.Providers()))
 	apiService.SetCardRenderer(slackProvider)
+
+	// Schedule configuration (revision model). The command service, the read
+	// side and the renderer are built from the store's narrow repositories
+	// rather than from StoreInterface: the revision model is deliberately not
+	// part of that interface.
+	scheduleConfigService := scheduleconfig.NewService(st.ScheduleConfigRepository())
+	apiService.SetScheduleConfigService(scheduleConfigService)
+	apiService.SetScheduleReadRepository(st.ScheduleReadRepository())
+	apiService.SetScheduleRenderer(scheduleRenderer)
+	apiService.SetUserEraser(erasure.NewService(st.ErasureRepository()))
 	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle (Epic 8 Sprint 3)
 	// Register the Telegram webhook at boot so TOKAY_SELF_URL + restart suffices (no
 	// need to re-save the integration). Best-effort; goroutine so a slow/unreachable
@@ -326,7 +401,7 @@ func main() {
 	go outboxWorker.Run(ctx)
 
 	// Usergroup Syncer Manager - allows dynamic start/stop when Slack integration changes
-	syncerManager := dispatcher.NewUsergroupSyncerManager(st, 5*time.Minute)
+	syncerManager := dispatcher.NewUsergroupSyncerManager(st, scheduleRenderer, 5*time.Minute)
 	apiService.SetUsergroupSyncerManager(ctx, syncerManager)
 
 	// Start syncer if token is already available
@@ -346,7 +421,7 @@ func main() {
 	// Handoff Notifier - DMs on-call user when shift starts. Provider lookup
 	// supplies the dm-capable set so the notifier doesn't fan out to
 	// identities from unregistered providers (Sprint 4 / Epic 7 L7).
-	handoffNotifier := dispatcher.NewHandoffNotifier(st, disp.Providers(), 60*time.Second)
+	handoffNotifier := dispatcher.NewHandoffNotifier(st, scheduleRenderer, disp.Providers(), 60*time.Second)
 	go handoffNotifier.Run(ctx)
 	log.Println("Handoff notifier enabled (60 second interval)")
 
@@ -406,9 +481,10 @@ func main() {
 	// login page can show the running version; GET is auto-skipped by CSRF middleware.
 	e.GET("/api/version", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{
-			"branch": buildBranch,
-			"commit": buildCommit,
-			"date":   buildDate,
+			"version": buildVersion,
+			"branch":  buildBranch,
+			"commit":  buildCommit,
+			"date":    buildDate,
 		})
 	})
 
@@ -450,6 +526,43 @@ func main() {
 	defer shutdownCancel()
 	if err := internalSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Internal server shutdown error: %v", err)
+	}
+}
+
+// runMigrate dispatches the offline schema migration subcommands. Destructive
+// operations live here rather than behind a startup flag on purpose: they must
+// never be a variant of a normal start.
+func runMigrate(st *store.Store, args []string) {
+	if len(args) == 0 {
+		log.Fatal("Usage: tokayops migrate reset-schedules")
+	}
+	switch subCmd := args[0]; subCmd {
+	case "reset-schedules":
+		if len(args) > 1 {
+			log.Fatal("Usage: tokayops migrate reset-schedules")
+		}
+		res, err := st.ResetLegacySchedules()
+		if err != nil {
+			log.Fatalf("Schedule reset failed: %v", err)
+		}
+		// Three outcomes, three sentences. A database that had already been
+		// reset by an earlier release gets the physical cleanup and deletes
+		// nothing; saying "0 schedule(s) deleted" there would be true and
+		// thoroughly misleading in the one moment the output is read closely,
+		// because it reads as "there was nothing here" rather than "the live
+		// schedules were deliberately left alone".
+		switch {
+		case res.AlreadyApplied:
+			log.Println("Schedule cutover already complete - nothing to do.")
+		case res.RowsAlreadyReset:
+			log.Println("Legacy schedule schema removed and the history horizon tightened. " +
+				"The rows had already been reset by an earlier upgrade and were left untouched.")
+		default:
+			log.Printf("Schedule reset complete: %d schedule(s) deleted, legacy schema removed. "+
+				"Recreate schedules with the new binary running.", res.SchedulesDeleted)
+		}
+	default:
+		log.Fatalf("Unknown migrate command: %s", subCmd)
 	}
 }
 

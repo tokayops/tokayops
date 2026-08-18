@@ -27,6 +27,22 @@ jobs:
       with:
         go-version-file: 'go.mod'
 
+    # The whole tree, not the files a PR touched. A diff-scoped gate needs
+    # fetch-depth: 0 and a different base for push and pull_request, and it
+    # only pays for itself when the baseline is dirty - this one is clean, so
+    # the blunt check is both cheaper and stricter.
+    - name: Check formatting
+      run: |
+        unformatted=$(gofmt -l ./cmd ./internal)
+        if [ -n "$unformatted" ]; then
+          echo "These files are not gofmt-clean:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    - name: Vet
+      run: go vet ./...
+
     - name: Run tests with coverage
       run: go test ./... -v -coverprofile=coverage.out
 
@@ -80,43 +96,83 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v5
 
+    # The runtime stages are alpine + `apk add`, which runs as the target
+    # architecture. On an amd64 runner the arm64 leg needs emulation, so QEMU
+    # has to be registered before buildx.
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
     - name: Login to GitHub Container Registry
+      if: github.event_name == 'push'
       uses: docker/login-action@v3
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Determine Docker tag
+    - name: Determine Docker tags
       id: docker_tag
       run: |
-        if [ "${{ github.ref }}" == "refs/heads/main" ]; then
-          echo "tag=latest" >> $GITHUB_OUTPUT
-        else
-          echo "tag=develop" >> $GITHUB_OUTPUT
+        # Every build gets its own sha- tag, and this workflow is the only
+        # publisher of those - release.yml publishes version tags instead. A
+        # sha- tag identifies a build, it does not pin one: re-running CI on
+        # the same commit rebuilds and overwrites it, with a fresh build date
+        # and whatever the base images say that day. The reference that cannot
+        # move is the image digest.
+        # The only moving tag set here is :develop. Version tags and :latest
+        # belong to a release and are published by release.yml off the git tag,
+        # so a merge into main does not move :latest on its own. Pull requests
+        # build but never publish - github.ref is refs/pull/N/merge there, so
+        # without this a PR would overwrite :develop with unreviewed code.
+        #
+        # Read from the environment rather than through an Actions expression:
+        # a branch name is free text and matches feat/** just as happily with a
+        # $(...) in it, and an expression is substituted into the script text
+        # before bash ever sees it.
+        moving=""
+        if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+          case "$GITHUB_REF" in
+            refs/heads/develop) moving="develop" ;;
+          esac
         fi
+        emit_tags() {
+          output_name="$1"
+          image="$2"
+          {
+            echo "${output_name}<<TAGS_EOF"
+            echo "ghcr.io/tokayops/${image}:sha-${GITHUB_SHA}"
+            if [ -n "$moving" ]; then
+              echo "ghcr.io/tokayops/${image}:${moving}"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+        }
+        emit_tags app_tags tokayops
+        emit_tags receiver_tags webhook-receiver
 
     - name: Build and push Tokay
       uses: docker/build-push-action@v5
       with:
         context: .
-        push: true
+        push: ${{ github.event_name == 'push' }}
+        # amd64-only images cannot be installed on Apple Silicon or ARM servers:
+        # `docker compose up` fails with "no matching manifest for linux/arm64".
+        platforms: linux/amd64,linux/arm64
         build-args: |
           GIT_COMMIT=${{ github.sha }}
           GIT_BRANCH=${{ github.ref_name }}
-        tags: |
-          ghcr.io/tokayops/tokayops:${{ steps.docker_tag.outputs.tag }}
-          ghcr.io/tokayops/tokayops:sha-${{ github.sha }}
+        tags: ${{ steps.docker_tag.outputs.app_tags }}
 
     - name: Build and push Webhook Receiver
       uses: docker/build-push-action@v5
       with:
         context: .
         file: cmd/webhook-receiver/Dockerfile
-        push: true
-        tags: |
-          ghcr.io/tokayops/webhook-receiver:${{ steps.docker_tag.outputs.tag }}
-          ghcr.io/tokayops/webhook-receiver:sha-${{ github.sha }}
+        push: ${{ github.event_name == 'push' }}
+        platforms: linux/amd64,linux/arm64
+        tags: ${{ steps.docker_tag.outputs.receiver_tags }}

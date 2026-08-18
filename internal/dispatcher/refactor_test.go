@@ -9,6 +9,7 @@ import (
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/dispatcher/builders"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -141,8 +142,8 @@ func TestEscalationFlow_BuilderIntegration(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	// Build Job via Builder (now uses Store)
-	builder := builders.NewEscalationJobBuilder(s, cfg)
-	job, stages, steps, _, err := builder.Build(ag, "p1")
+	builder := builders.NewEscalationJobBuilder(s, &fakeTeamOnCall{}, cfg)
+	job, stages, steps, _, err := builder.Build(context.Background(), ag, "p1", schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	if err != nil {
 		t.Fatalf("Builder failed: %v", err)
 	}

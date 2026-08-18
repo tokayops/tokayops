@@ -3,8 +3,8 @@ package store
 import (
 	"testing"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 func TestEscalationPolicy_MessagePersistence(t *testing.T) {

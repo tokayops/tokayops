@@ -29,11 +29,13 @@ const (
 	telegramMaxMessageLen = 4096
 )
 
-// TelegramTokenSource provides dynamic bot-token lookup (mirror of SlackTokenSource).
-// The webhook secret token is intentionally NOT here — it is a webhook-verification
-// concern read off the concrete IntegrationCache in Sprint 3, not a send-time concern.
+// TelegramTokenSource provides the send-time Telegram settings (mirror of
+// SlackTokenSource): the bot token and whether Ack/Resolve buttons are enabled.
+// The webhook secret token is intentionally NOT here - it is a webhook-verification
+// concern read off the concrete IntegrationCache, not a send-time concern.
 type TelegramTokenSource interface {
 	GetTelegramToken() string
+	GetTelegramInteractive() bool
 }
 
 // TelegramProvider implements dispatcher.Provider against the Telegram Bot API
@@ -41,8 +43,9 @@ type TelegramTokenSource interface {
 // base URL are fully under our control.
 type TelegramProvider struct {
 	tokenSource TelegramTokenSource
-	selfURL     string // TokayOps base URL for deep links
-	baseURL     string // Bot API base; default telegramDefaultBaseURL, overridable in tests
+	selfURL     string     // TokayOps base URL for deep links
+	teamLookup  TeamLookup // nil means "assume onboarded", see teamIsOnboarded
+	baseURL     string     // Bot API base; default telegramDefaultBaseURL, overridable in tests
 	mu          sync.Mutex
 	cachedToken string
 	client      *http.Client
@@ -64,6 +67,14 @@ func WithBaseURL(u string) TelegramOption {
 			p.baseURL = strings.TrimRight(u, "/")
 		}
 	}
+}
+
+// WithTeamLookup wires the check for whether an alert group's team is onboarded.
+// Telegram never posts a card for an unonboarded team today (that path is
+// firehose, which is Slack-only), so this exists to keep the two channels from
+// drifting apart if that ever changes.
+func WithTeamLookup(lookup TeamLookup) TelegramOption {
+	return func(p *TelegramProvider) { p.teamLookup = lookup }
 }
 
 func NewTelegramProvider(tokenSource TelegramTokenSource, selfURL string, opts ...TelegramOption) *TelegramProvider {
@@ -339,15 +350,40 @@ func (t *TelegramProvider) Permalink(d *model.NotificationDelivery) string {
 	return ""
 }
 
-// keyboardFor returns the inline keyboard for a card, or nil when interactivity
-// is impossible. Without a public selfURL the webhook can't be registered, so the
-// Ack/Resolve buttons would be dead — we omit them entirely (the card still sends
-// as a plain notification, consistent with the footer degrading to plain text).
+// keyboardFor returns the inline keyboard for a card.
+//
+// Without a public selfURL the webhook can't be registered, so the Ack/Resolve
+// buttons would be dead - we omit the keyboard entirely (the card still sends as
+// a plain notification, consistent with the footer degrading to plain text).
+// Returning nil here is deliberate: no keyboard was ever sent, so there is
+// nothing to take back.
+//
+// When interactivity is switched off the card HAS to carry an empty keyboard
+// rather than nil, because editMessageText leaves the existing keyboard in place
+// when reply_markup is absent. Sending nil would strand live buttons on cards
+// posted before the switch was flipped.
 func (t *TelegramProvider) keyboardFor(ag *model.AlertGroup, isResolved bool) interface{} {
 	if t.selfURL == "" {
 		return nil
 	}
+	if t.tokenSource == nil || !t.tokenSource.GetTelegramInteractive() {
+		return emptyInlineKeyboard()
+	}
+	// A resolved card carries no buttons either way, so return early rather
+	// than pay for a team lookup that cannot change the answer.
+	if isResolved {
+		return emptyInlineKeyboard()
+	}
+	if !teamIsOnboarded(t.teamLookup, ag.TeamID) {
+		return emptyInlineKeyboard()
+	}
 	return ackResolveKeyboard(ag, isResolved)
+}
+
+// emptyInlineKeyboard is a keyboard with no buttons, i.e. the payload that
+// removes buttons from an already-sent card.
+func emptyInlineKeyboard() map[string]interface{} {
+	return map[string]interface{}{"inline_keyboard": [][]map[string]string{}}
 }
 
 // ackResolveKeyboard builds the inline keyboard for an alert-group card. A
@@ -356,7 +392,7 @@ func (t *TelegramProvider) keyboardFor(ag *model.AlertGroup, isResolved bool) in
 // "<prefix><agID>" — well within Telegram's 64-byte limit.
 func ackResolveKeyboard(ag *model.AlertGroup, isResolved bool) map[string]interface{} {
 	if isResolved {
-		return map[string]interface{}{"inline_keyboard": [][]map[string]string{}}
+		return emptyInlineKeyboard()
 	}
 	var row []map[string]string
 	if ag.Status != model.AlertGroupStatusAcknowledged {

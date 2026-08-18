@@ -1,12 +1,15 @@
 package builders
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -14,7 +17,8 @@ import (
 // from EscalationStep is successfully propagated to the JobStep Data.
 func TestEscalationJobBuilder_MessagePropagation(t *testing.T) {
 	s := store.NewMockStore()
-	builder := NewEscalationJobBuilder(s, nil)
+	proj := &fakeProjection{}
+	builder := NewEscalationJobBuilder(s, proj, nil)
 
 	// Setup Policy with a message
 	policyID := "pol-msg-1"
@@ -44,7 +48,7 @@ func TestEscalationJobBuilder_MessagePropagation(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	// Build Job
-	job, _, steps, _, err := builder.Build(ag, policyID)
+	job, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -75,7 +79,8 @@ func TestEscalationJobBuilder_MessagePropagation(t *testing.T) {
 // changes, so this is a regression guard for the capability-driven path.
 func TestEscalationJobBuilder_TelegramStepPropagation(t *testing.T) {
 	s := store.NewMockStore()
-	builder := NewEscalationJobBuilder(s, nil)
+	proj := &fakeProjection{}
+	builder := NewEscalationJobBuilder(s, proj, nil)
 
 	policyID := "pol-tg-1"
 	s.CreateEscalationPolicy(&model.EscalationPolicy{
@@ -89,7 +94,7 @@ func TestEscalationJobBuilder_TelegramStepPropagation(t *testing.T) {
 	ag := &model.AlertGroup{ID: "ag-tg", DedupKey: "dk-tg", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
-	_, _, steps, _, err := builder.Build(ag, policyID)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -118,17 +123,11 @@ func TestEscalationJobBuilder_TelegramScheduleFanOut(t *testing.T) {
 	s.CreateUser(user1)
 
 	schedID := "sched-tg-fanout"
-	s.CreateSchedule(&model.Schedule{
-		ID:              schedID,
-		TeamID:          "team-1",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	})
-	s.SetScheduleGroups(schedID, [][]string{{user1.ID}})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ScheduleID: schedID, Layer: "l1",
-		StartTime: time.Now().Add(-2 * time.Hour),
-		Groups:    [][]string{{user1.ID}},
-	})
+	proj := &fakeProjection{
+		teams: map[string]schedulerender.TeamOnCall{
+			"team-1": teamSchedule(schedID, onDuty("g-a", user1.ID)),
+		},
+	}
 
 	policyID := "pol-tg-fanout"
 	s.CreateEscalationPolicy(&model.EscalationPolicy{
@@ -140,12 +139,12 @@ func TestEscalationJobBuilder_TelegramScheduleFanOut(t *testing.T) {
 		},
 	})
 
-	ag := &model.AlertGroup{ID: "ag-tg-fanout", DedupKey: "dk-tg-fanout", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-tg-fanout", DedupKey: "dk-tg-fanout", TeamID: "team-1", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
 	// Empty cfg → no firehose stage prepended.
-	builder := NewEscalationJobBuilder(s, &config.Config{})
-	_, _, steps, _, err := builder.Build(ag, policyID)
+	builder := NewEscalationJobBuilder(s, proj, &config.Config{})
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -176,7 +175,8 @@ func TestEscalationJobBuilder_TelegramScheduleFanOut(t *testing.T) {
 // from EscalationStep is successfully propagated to the JobStep.
 func TestEscalationJobBuilder_ContinueOnFailurePropagation(t *testing.T) {
 	s := store.NewMockStore()
-	builder := NewEscalationJobBuilder(s, nil)
+	proj := &fakeProjection{}
+	builder := NewEscalationJobBuilder(s, proj, nil)
 
 	// Setup Policy with ContinueOnFailure=true
 	policyID := "pol-cof-1"
@@ -213,7 +213,7 @@ func TestEscalationJobBuilder_ContinueOnFailurePropagation(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	// Build Job
-	_, _, steps, _, err := builder.Build(ag, policyID)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -244,26 +244,23 @@ func TestEscalationJobBuilder_ScheduleFanOut(t *testing.T) {
 	s.CreateUser(user1)
 	s.CreateUser(user2)
 
-	// Setup schedule with L1=user1, L2=user2
+	// Schedule with L1=user1 and L2=user2. L2 is projected but must not be
+	// escalated to: it is not an escalation target today.
 	schedID := "sched-fanout"
-	s.CreateSchedule(&model.Schedule{
-		ID:              schedID,
-		TeamID:          "team-1",
-		L2Enabled:       true,
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	})
-	s.SetScheduleGroups(schedID, [][]string{{user1.ID}})
-	s.SetScheduleUsers(schedID, "l2", []string{user2.ID})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ScheduleID: schedID, Layer: "l1",
-		StartTime: time.Now().Add(-2 * time.Hour),
-		Groups:    [][]string{{user1.ID}},
-	})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ScheduleID: schedID, Layer: "l2",
-		StartTime: time.Now().Add(-2 * time.Hour),
-		Groups:    [][]string{{user2.ID}},
-	})
+	l1AndL2 := onDuty("g-a", user1.ID)
+	l1AndL2.L2 = &schedulerender.LayerOnCall{
+		GroupID: user2.ID, UserIDs: []string{user2.ID},
+		Source:          schedulerender.SourceRotation,
+		GridSlotStart:   projectionBase,
+		GridSlotEnd:     projectionBase.Add(24 * time.Hour),
+		AssignmentStart: projectionBase,
+		AssignmentEnd:   projectionBase.Add(24 * time.Hour),
+	}
+	proj := &fakeProjection{
+		teams: map[string]schedulerender.TeamOnCall{
+			"team-1": teamSchedule(schedID, l1AndL2),
+		},
+	}
 
 	// Policy: firehose → schedule(fan-out) → channel
 	cfg := &config.Config{}
@@ -278,11 +275,11 @@ func TestEscalationJobBuilder_ScheduleFanOut(t *testing.T) {
 		},
 	})
 
-	ag := &model.AlertGroup{ID: "ag-fanout", DedupKey: "dk-fanout", Severity: "warning", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-fanout", DedupKey: "dk-fanout", TeamID: "team-1", Severity: "warning", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
-	builder := NewEscalationJobBuilder(s, cfg)
-	_, stages, steps, snapshot, err := builder.Build(ag, policyID)
+	builder := NewEscalationJobBuilder(s, proj, cfg)
+	_, stages, steps, snapshot, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -352,22 +349,13 @@ func TestEscalationJobBuilder_ScheduleOverride(t *testing.T) {
 	s.CreateUser(user2)
 
 	schedID := "sched-override"
-	s.CreateSchedule(&model.Schedule{
-		ID: schedID, TeamID: "team-1",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	})
-	s.SetScheduleGroups(schedID, [][]string{{user1.ID}})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ScheduleID: schedID, Layer: "l1",
-		StartTime: time.Now().Add(-2 * time.Hour),
-		Groups:    [][]string{{user1.ID}},
-	})
-	// Override: user2 is on-call instead
-	s.CreateScheduleOverride(&model.ScheduleOverride{
-		ID: "ov-1", ScheduleID: schedID, UserID: user2.ID,
-		StartTime: time.Now().Add(-1 * time.Hour),
-		EndTime:   time.Now().Add(1 * time.Hour),
-	})
+	// The override is already overlaid onto L1 by the projection - there is no
+	// second, older answer for the builder to prefer.
+	proj := &fakeProjection{
+		teams: map[string]schedulerender.TeamOnCall{
+			"team-1": teamSchedule(schedID, onDutyByOverride("ov-1", user2.ID)),
+		},
+	}
 
 	policyID := "pol-ov"
 	s.CreateEscalationPolicy(&model.EscalationPolicy{
@@ -377,11 +365,11 @@ func TestEscalationJobBuilder_ScheduleOverride(t *testing.T) {
 		},
 	})
 
-	ag := &model.AlertGroup{ID: "ag-ov", DedupKey: "dk-ov", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-ov", DedupKey: "dk-ov", TeamID: "team-1", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
-	builder := NewEscalationJobBuilder(s, nil)
-	_, _, steps, _, err := builder.Build(ag, policyID)
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -409,18 +397,6 @@ func TestEscalationJobBuilder_StaleScheduleID_ResolvesCurrentUser(t *testing.T) 
 	s.CreateUser(userOld)
 	s.CreateUser(userNew)
 
-	// Old schedule for team-1 with user-old on-call
-	s.CreateSchedule(&model.Schedule{
-		ID: "sched-old", TeamID: "team-1",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	})
-	s.SetScheduleGroups("sched-old", [][]string{{userOld.ID}})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ScheduleID: "sched-old", Layer: "l1",
-		StartTime: time.Now().Add(-2 * time.Hour),
-		Groups:    [][]string{{userOld.ID}},
-	})
-
 	// Policy referencing old schedule
 	policyID := "pol-stale"
 	s.CreateEscalationPolicy(&model.EscalationPolicy{
@@ -431,22 +407,17 @@ func TestEscalationJobBuilder_StaleScheduleID_ResolvesCurrentUser(t *testing.T) 
 	})
 
 	// === SIMULATE SCHEDULE RECREATION ===
-	// Orphan old schedule (clear TeamID, epochs remain)
-	s.CreateSchedule(&model.Schedule{
-		ID: "sched-old", TeamID: "",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	})
-	// Create new schedule for team-1
-	s.CreateSchedule(&model.Schedule{
-		ID: "sched-new", TeamID: "team-1",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	})
-	s.SetScheduleGroups("sched-new", [][]string{{userNew.ID}})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ScheduleID: "sched-new", Layer: "l1",
-		StartTime: time.Now().Add(-2 * time.Hour),
-		Groups:    [][]string{{userNew.ID}},
-	})
+	// The old schedule is orphaned but still readable by ID and still has
+	// user-old on it; team-1 now belongs to a new schedule with user-new.
+	proj := &fakeProjection{
+		teams: map[string]schedulerender.TeamOnCall{
+			"team-1": teamSchedule("sched-new", onDuty("g-new", userNew.ID)),
+		},
+		schedules: map[string]schedulerender.OnCall{
+			"sched-old": onDuty("g-old", userOld.ID),
+			"sched-new": onDuty("g-new", userNew.ID),
+		},
+	}
 
 	// AlertGroup belongs to team-1
 	ag := &model.AlertGroup{
@@ -455,8 +426,8 @@ func TestEscalationJobBuilder_StaleScheduleID_ResolvesCurrentUser(t *testing.T) 
 	}
 	s.CreateAlertGroup(ag)
 
-	builder := NewEscalationJobBuilder(s, nil)
-	_, _, steps, _, err := builder.Build(ag, policyID)
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -482,18 +453,6 @@ func TestEscalationJobBuilder_DeletedSchedule_ResolvesCurrentUser(t *testing.T) 
 	s.CreateUser(userOld)
 	s.CreateUser(userNew)
 
-	// Old schedule
-	s.CreateSchedule(&model.Schedule{
-		ID: "sched-old", TeamID: "team-1",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	})
-	s.SetScheduleGroups("sched-old", [][]string{{userOld.ID}})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ScheduleID: "sched-old", Layer: "l1",
-		StartTime: time.Now().Add(-2 * time.Hour),
-		Groups:    [][]string{{userOld.ID}},
-	})
-
 	// Policy referencing old schedule
 	policyID := "pol-deleted"
 	s.CreateEscalationPolicy(&model.EscalationPolicy{
@@ -504,17 +463,16 @@ func TestEscalationJobBuilder_DeletedSchedule_ResolvesCurrentUser(t *testing.T) 
 	})
 
 	// === DELETE old schedule, create new one ===
-	s.DeleteSchedule("sched-old")
-	s.CreateSchedule(&model.Schedule{
-		ID: "sched-new", TeamID: "team-1",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	})
-	s.SetScheduleGroups("sched-new", [][]string{{userNew.ID}})
-	s.CreateRotationEpoch(&model.RotationEpoch{
-		ScheduleID: "sched-new", Layer: "l1",
-		StartTime: time.Now().Add(-2 * time.Hour),
-		Groups:    [][]string{{userNew.ID}},
-	})
+	// The deleted schedule projects nobody; team-1's current schedule answers.
+	proj := &fakeProjection{
+		teams: map[string]schedulerender.TeamOnCall{
+			"team-1": teamSchedule("sched-new", onDuty("g-new", userNew.ID)),
+		},
+		schedules: map[string]schedulerender.OnCall{
+			"sched-old": nobodyOnDuty(),
+			"sched-new": onDuty("g-new", userNew.ID),
+		},
+	}
 
 	ag := &model.AlertGroup{
 		ID: "ag-deleted", DedupKey: "dk-deleted", TeamID: "team-1",
@@ -522,8 +480,8 @@ func TestEscalationJobBuilder_DeletedSchedule_ResolvesCurrentUser(t *testing.T) 
 	}
 	s.CreateAlertGroup(ag)
 
-	builder := NewEscalationJobBuilder(s, nil)
-	_, _, steps, _, err := builder.Build(ag, policyID)
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -544,11 +502,12 @@ func TestEscalationJobBuilder_ScheduleEmpty(t *testing.T) {
 	s := store.NewMockStore()
 
 	schedID := "sched-empty"
-	s.CreateSchedule(&model.Schedule{
-		ID: schedID, TeamID: "team-1",
-		L1RotationStart: time.Now().Add(-24 * time.Hour),
-	})
-	// No users, no epochs
+	// The schedule exists and has nobody on duty at this instant.
+	proj := &fakeProjection{
+		teams: map[string]schedulerender.TeamOnCall{
+			"team-1": teamSchedule(schedID, nobodyOnDuty()),
+		},
+	}
 
 	policyID := "pol-empty"
 	s.CreateEscalationPolicy(&model.EscalationPolicy{
@@ -558,11 +517,11 @@ func TestEscalationJobBuilder_ScheduleEmpty(t *testing.T) {
 		},
 	})
 
-	ag := &model.AlertGroup{ID: "ag-empty", DedupKey: "dk-empty", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-empty", DedupKey: "dk-empty", TeamID: "team-1", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
-	builder := NewEscalationJobBuilder(s, nil)
-	_, stages, steps, _, err := builder.Build(ag, policyID)
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, stages, steps, _, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
@@ -582,5 +541,431 @@ func TestEscalationJobBuilder_ScheduleEmpty(t *testing.T) {
 	json.Unmarshal(steps[0].Data, &data)
 	if data.TargetID != "" {
 		t.Errorf("Empty schedule step should have empty TargetID, got %s", data.TargetID)
+	}
+}
+
+// TestEscalationJobBuilder_UnknownScheduleTarget_MarkerStep: a policy step
+// naming a schedule that does not exist, or belongs to another team, keeps its
+// old behaviour - a marker step the executor fails - rather than failing the
+// build. An alert must still reach the rest of the policy.
+func TestEscalationJobBuilder_UnknownScheduleTarget_MarkerStep(t *testing.T) {
+	s := store.NewMockStore()
+
+	policyID := "pol-unknown-sched"
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Unknown Schedule Policy",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-nobody-knows"},
+			{ID: "s2", Provider: "slack", TargetKind: "channel", TargetType: "channel", TargetID: "C_ALERTS"},
+		},
+	})
+
+	ag := &model.AlertGroup{
+		ID: "ag-unknown-sched", DedupKey: "dk-unknown-sched", TeamID: "team-without-schedule",
+		Status: model.AlertGroupStatusProcessing,
+	}
+	s.CreateAlertGroup(ag)
+
+	// Neither the team nor the named schedule is known to the projection.
+	proj := &fakeProjection{}
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
+	if err != nil {
+		t.Fatalf("Build failed instead of degrading to a marker step: %v", err)
+	}
+	if len(steps) != 2 {
+		t.Fatalf("Expected 2 steps (marker + channel), got %d", len(steps))
+	}
+
+	var marker model.EscalationStepData
+	json.Unmarshal(steps[0].Data, &marker)
+	if marker.TargetID != "" {
+		t.Errorf("Expected an empty marker target, got %s", marker.TargetID)
+	}
+	if !steps[0].ContinueOnFailure {
+		t.Error("The marker step must not block the rest of the policy")
+	}
+	if steps[1].StepType != "channel" {
+		t.Errorf("Step 1 should still be the channel step, got %s", steps[1].StepType)
+	}
+}
+
+// TestEscalationJobBuilder_TeamScheduleDeleted_NoFallThrough: a team WITH a
+// schedule answers for itself even when that schedule is deleted. Falling
+// through to the stored ID would page the group of a schedule the team no longer
+// owns - which is the same defect the stale-ID test guards from the other side.
+func TestEscalationJobBuilder_TeamScheduleDeleted_NoFallThrough(t *testing.T) {
+	s := store.NewMockStore()
+	userOld := &model.User{ID: "user-old", Name: "John"}
+	s.CreateUser(userOld)
+
+	policyID := "pol-team-deleted"
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Deleted Team Schedule Policy",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-old"},
+		},
+	})
+
+	ag := &model.AlertGroup{
+		ID: "ag-team-deleted", DedupKey: "dk-team-deleted", TeamID: "team-1",
+		Status: model.AlertGroupStatusProcessing,
+	}
+	s.CreateAlertGroup(ag)
+
+	proj := &fakeProjection{
+		teams: map[string]schedulerender.TeamOnCall{
+			"team-1": deletedTeamSchedule("sched-current"),
+		},
+		// Still readable by ID, and still holding somebody.
+		schedules: map[string]schedulerender.OnCall{
+			"sched-old": onDuty("g-old", userOld.ID),
+		},
+	}
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+	if len(steps) != 1 {
+		t.Fatalf("Expected 1 step, got %d", len(steps))
+	}
+
+	var data model.EscalationStepData
+	json.Unmarshal(steps[0].Data, &data)
+	if data.TargetID != "" {
+		t.Errorf("Expected nobody escalated to, got %s - the stored schedule ID was used", data.TargetID)
+	}
+}
+
+// TestEscalationJobBuilder_ProjectionFailure_MarkerStep: a projection that could
+// not be read is not a reason to fail the whole escalation. The step degrades to
+// the marker the executor reports, and the rest of the policy still runs.
+func TestEscalationJobBuilder_ProjectionFailure_MarkerStep(t *testing.T) {
+	s := store.NewMockStore()
+
+	policyID := "pol-proj-fail"
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Projection Failure Policy",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1"},
+		},
+	})
+	ag := &model.AlertGroup{
+		ID: "ag-proj-fail", DedupKey: "dk-proj-fail", TeamID: "team-1",
+		Status: model.AlertGroupStatusProcessing,
+	}
+	s.CreateAlertGroup(ag)
+
+	proj := &fakeProjection{err: errors.New("could not begin transaction")}
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
+	if err != nil {
+		t.Fatalf("Build failed on an unreadable projection: %v", err)
+	}
+	if len(steps) != 1 {
+		t.Fatalf("Expected 1 marker step, got %d", len(steps))
+	}
+	var data model.EscalationStepData
+	json.Unmarshal(steps[0].Data, &data)
+	if data.TargetID != "" {
+		t.Errorf("Expected an empty marker target, got %s", data.TargetID)
+	}
+}
+
+// countingProjection counts what was read and can fail one read at a time, so a
+// test can put a transient failure exactly where it hurts.
+type countingProjection struct {
+	teams     map[string]schedulerender.TeamOnCall
+	teamErr   error
+	teamCalls int
+
+	// answers is consulted by call index, so read N can fail while read N+1
+	// would have succeeded.
+	answers       []scheduleAnswer
+	scheduleCalls int
+}
+
+type scheduleAnswer struct {
+	onCall schedulerender.OnCall
+	err    error
+}
+
+func (c *countingProjection) CurrentTeamOnCallNow(ctx context.Context, teamID string) (schedulerender.TeamOnCall, error) {
+	c.teamCalls++
+	if c.teamErr != nil {
+		return schedulerender.TeamOnCall{}, c.teamErr
+	}
+	return c.teams[teamID], nil
+}
+
+func (c *countingProjection) CurrentOnCallNow(ctx context.Context, scheduleID string) (schedulerender.OnCall, error) {
+	i := c.scheduleCalls
+	c.scheduleCalls++
+	if i < len(c.answers) {
+		return c.answers[i].onCall, c.answers[i].err
+	}
+	return schedulerender.OnCall{}, nil
+}
+
+// twoScheduleStepPolicy is a policy whose two steps name the same schedule -
+// one question asked twice.
+func twoScheduleStepPolicy(t *testing.T, s *store.MockStore, policyID, scheduleID string) {
+	t.Helper()
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Same Schedule Twice",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: scheduleID},
+			{ID: "s2", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: scheduleID},
+		},
+	})
+}
+
+// dmTargets lists what the dm steps of a built job would page.
+func dmTargets(t *testing.T, steps []*model.JobStep) []string {
+	t.Helper()
+	var out []string
+	for _, step := range steps {
+		if step.StepType != "dm" {
+			continue
+		}
+		var data model.EscalationStepData
+		if err := json.Unmarshal(step.Data, &data); err != nil {
+			t.Fatalf("unmarshal step data: %v", err)
+		}
+		out = append(out, data.TargetID)
+	}
+	return out
+}
+
+// TestEscalationJobBuilder_SameScheduleResolvedOnce: two policy steps naming the
+// same schedule are one question. Reading twice lets a handoff land between them,
+// and one job would then page two different groups for the same target.
+func TestEscalationJobBuilder_SameScheduleResolvedOnce(t *testing.T) {
+	s := store.NewMockStore()
+	outgoing := &model.User{ID: "user-outgoing", Name: "Alice"}
+	incoming := &model.User{ID: "user-incoming", Name: "Bob"}
+	s.CreateUser(outgoing)
+	s.CreateUser(incoming)
+
+	policyID := "pol-same-schedule"
+	twoScheduleStepPolicy(t, s, policyID, "sched-1")
+	// No team schedule, so both steps take the fallback-by-ID path.
+	ag := &model.AlertGroup{
+		ID: "ag-same-schedule", DedupKey: "dk-same-schedule", TeamID: "team-without-schedule",
+		Status: model.AlertGroupStatusProcessing,
+	}
+	s.CreateAlertGroup(ag)
+
+	// The shift changes hands the instant after the first read.
+	proj := &countingProjection{answers: []scheduleAnswer{
+		{onCall: onDuty("g-outgoing", outgoing.ID)},
+		{onCall: onDuty("g-incoming", incoming.ID)},
+	}}
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	if proj.scheduleCalls != 1 {
+		t.Errorf("schedule read %d times for one job, want 1", proj.scheduleCalls)
+	}
+	targets := dmTargets(t, steps)
+	if len(targets) != 2 {
+		t.Fatalf("expected 2 dm steps, got %d", len(targets))
+	}
+	if targets[0] != targets[1] {
+		t.Errorf("one job pages %q and %q for the same schedule", targets[0], targets[1])
+	}
+}
+
+// TestEscalationJobBuilder_UnreadableTeam_NoFallback: a failed team read is not a
+// team without a schedule.
+//
+// If it were, the builder would go looking for the schedule ID stored on the
+// policy step - a second transaction, which may well succeed, and which may name
+// a schedule this team no longer owns. The alert would then page last quarter's
+// rotation while the alert group, which knows the read failed, records nothing.
+func TestEscalationJobBuilder_UnreadableTeam_NoFallback(t *testing.T) {
+	s := store.NewMockStore()
+	stale := &model.User{ID: "user-stale", Name: "John"}
+	s.CreateUser(stale)
+
+	policyID := "pol-unreadable-team"
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Unreadable Team Policy",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-old"},
+		},
+	})
+	ag := &model.AlertGroup{
+		ID: "ag-unreadable-team", DedupKey: "dk-unreadable-team", TeamID: "team-1",
+		Status: model.AlertGroupStatusProcessing,
+	}
+	s.CreateAlertGroup(ag)
+
+	// The team read fails; the stale schedule would answer perfectly well.
+	proj := &countingProjection{
+		teamErr: errors.New("could not begin transaction"),
+		answers: []scheduleAnswer{{onCall: onDuty("g-old", stale.ID)}},
+	}
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
+	if err != nil {
+		t.Fatalf("Build failed instead of degrading to a marker step: %v", err)
+	}
+
+	if proj.scheduleCalls != 0 {
+		t.Errorf("the fallback schedule was read %d times after a failed team read, want 0", proj.scheduleCalls)
+	}
+	targets := dmTargets(t, steps)
+	if len(targets) != 1 || targets[0] != "" {
+		t.Fatalf("job pages %v, want a single empty marker step", targets)
+	}
+}
+
+// TestEscalationJobBuilder_FailedScheduleReadIsRemembered: a read that failed is
+// an answer to remember too.
+//
+// Cache only the successes and the second step re-reads: one build then produces
+// a marker for the first step and a real recipient for the second, which is
+// precisely the "one schedule, two answers" this memo exists to prevent.
+func TestEscalationJobBuilder_FailedScheduleReadIsRemembered(t *testing.T) {
+	s := store.NewMockStore()
+	user := &model.User{ID: "user-1", Name: "Alice"}
+	s.CreateUser(user)
+
+	policyID := "pol-transient-schedule"
+	twoScheduleStepPolicy(t, s, policyID, "sched-1")
+	ag := &model.AlertGroup{
+		ID: "ag-transient-schedule", DedupKey: "dk-transient-schedule", TeamID: "team-without-schedule",
+		Status: model.AlertGroupStatusProcessing,
+	}
+	s.CreateAlertGroup(ag)
+
+	// The first read fails; the second would have succeeded.
+	proj := &countingProjection{answers: []scheduleAnswer{
+		{err: errors.New("could not begin transaction")},
+		{onCall: onDuty("g-a", user.ID)},
+	}}
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
+	if err != nil {
+		t.Fatalf("Build failed instead of degrading to marker steps: %v", err)
+	}
+
+	if proj.scheduleCalls != 1 {
+		t.Errorf("schedule read %d times for one job, want 1", proj.scheduleCalls)
+	}
+	targets := dmTargets(t, steps)
+	if len(targets) != 2 {
+		t.Fatalf("expected 2 dm steps, got %d: %v", len(targets), targets)
+	}
+	if targets[0] != targets[1] {
+		t.Errorf("one job pages %q and %q for the same schedule after a transient failure", targets[0], targets[1])
+	}
+	if targets[0] != "" {
+		t.Errorf("job pages %q from a read that failed, want a marker", targets[0])
+	}
+}
+
+// flakyUserStore fails the first N GetUsersByIDs calls, so a test can put a
+// transient failure between two policy steps that ask the same question.
+type flakyUserStore struct {
+	store.StoreInterface
+	failures int
+	calls    int
+}
+
+func (f *flakyUserStore) GetUsersByIDs(ids []string) ([]*model.User, error) {
+	f.calls++
+	if f.calls <= f.failures {
+		return nil, errors.New("transient db error")
+	}
+	return f.StoreInterface.GetUsersByIDs(ids)
+}
+
+// TestEscalationJobBuilder_TeamOnCallHydratedOnce: the team's answer is turned
+// into people once per job.
+//
+// The projection is fixed for the build, but hydration is a database read of its
+// own. Repeat it per step and a transient failure hands one step a marker and the
+// next one real recipients - one job disagreeing with itself about who is on
+// call, which is the very thing reading the projection once was meant to stop.
+func TestEscalationJobBuilder_TeamOnCallHydratedOnce(t *testing.T) {
+	mock := store.NewMockStore()
+	user := &model.User{ID: "user-1", Name: "Alice"}
+	mock.CreateUser(user)
+
+	policyID := "pol-team-hydration"
+	twoScheduleStepPolicy(t, mock, policyID, "sched-1")
+	ag := &model.AlertGroup{
+		ID: "ag-team-hydration", DedupKey: "dk-team-hydration", TeamID: "team-1",
+		Status: model.AlertGroupStatusProcessing,
+	}
+	mock.CreateAlertGroup(ag)
+
+	// The team's schedule answers, so both steps take the team path. The first
+	// hydration fails; the second would have succeeded.
+	s := &flakyUserStore{StoreInterface: mock, failures: 1}
+	proj := &countingProjection{teams: map[string]schedulerender.TeamOnCall{
+		"team-1": teamSchedule("sched-current", onDuty("g-a", user.ID)),
+	}}
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
+	if err != nil {
+		t.Fatalf("Build failed instead of degrading to marker steps: %v", err)
+	}
+
+	if s.calls != 1 {
+		t.Errorf("on-call hydrated %d times for one job, want 1", s.calls)
+	}
+	if proj.scheduleCalls != 0 {
+		t.Errorf("the fallback schedule was read %d times although the team has one, want 0", proj.scheduleCalls)
+	}
+	targets := dmTargets(t, steps)
+	if len(targets) != 2 {
+		t.Fatalf("expected 2 dm steps, got %d: %v", len(targets), targets)
+	}
+	if targets[0] != targets[1] {
+		t.Errorf("one job pages %q and %q for the same team after a transient failure", targets[0], targets[1])
+	}
+	if targets[0] != "" {
+		t.Errorf("job pages %q from a hydration that failed, want a marker", targets[0])
+	}
+}
+
+// TestEscalationJobBuilder_TeamOnCallHydrationIsShared: the successful case of
+// the same rule - two steps, one hydration, the same recipients.
+func TestEscalationJobBuilder_TeamOnCallHydrationIsShared(t *testing.T) {
+	mock := store.NewMockStore()
+	user := &model.User{ID: "user-1", Name: "Alice"}
+	mock.CreateUser(user)
+
+	policyID := "pol-team-hydration-ok"
+	twoScheduleStepPolicy(t, mock, policyID, "sched-1")
+	ag := &model.AlertGroup{
+		ID: "ag-team-hydration-ok", DedupKey: "dk-team-hydration-ok", TeamID: "team-1",
+		Status: model.AlertGroupStatusProcessing,
+	}
+	mock.CreateAlertGroup(ag)
+
+	s := &flakyUserStore{StoreInterface: mock}
+	proj := &countingProjection{teams: map[string]schedulerender.TeamOnCall{
+		"team-1": teamSchedule("sched-current", onDuty("g-a", user.ID)),
+	}}
+	builder := NewEscalationJobBuilder(s, proj, nil)
+	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	if s.calls != 1 {
+		t.Errorf("on-call hydrated %d times for one job, want 1", s.calls)
+	}
+	targets := dmTargets(t, steps)
+	if len(targets) != 2 || targets[0] != user.ID || targets[1] != user.ID {
+		t.Errorf("job pages %v, want both steps aimed at %s", targets, user.ID)
 	}
 }

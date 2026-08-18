@@ -26,7 +26,12 @@ import {
     bindTeamModalClose
 } from '/js/modules/teams.js';
 import { bindUsersEvents, showUsersView } from '/js/modules/users.js';
-import { bindScheduleEvents, loadOnCallOverviewRow } from '/js/modules/schedules.js';
+import {
+    bindScheduleEvents,
+    loadOnCallOverviewRow,
+    loadOnCallOverviewRows,
+    onCallListHeader,
+} from '/js/modules/schedules.js';
 import { bindPoliciesEvents, showPoliciesView } from '/js/modules/policies.js';
 import { bindIntegrationsEvents, showIntegrationsView } from '/js/modules/integrations.js';
 
@@ -258,7 +263,7 @@ function handleHashRoute() {
                                 (a.name || a.id || '').localeCompare(b.name || b.id || '')
                             );
                             container.innerHTML = `
-                                ${Components.onCallListHeader()}
+                                ${onCallListHeader()}
                                 <div class="oncall-list-body">
                                     ${teams.map(team => `
                                         <div class="oncall-row-slot" data-team-id="${escapeHtml(team.id)}"></div>
@@ -266,12 +271,14 @@ function handleHashRoute() {
                                 </div>
                             `;
 
-                            teams.forEach(team => {
-                                const safeId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(team.id) : team.id;
-                                const rowContainer = container.querySelector(`.oncall-row-slot[data-team-id="${safeId}"]`);
-                                if (rowContainer) {
-                                    loadOnCallOverviewRow(team, rowContainer);
-                                }
+                            // All rows together, so the names they mention are
+                            // looked up once for the page rather than once per
+                            // row. A team whose state cannot be read still gets
+                            // its own row saying so.
+                            loadOnCallOverviewRows(teams, (teamId) => {
+                                const safeId = typeof CSS !== 'undefined' && CSS.escape
+                                    ? CSS.escape(teamId) : teamId;
+                                return container.querySelector(`.oncall-row-slot[data-team-id="${safeId}"]`);
                             });
                         }
                     }

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 func TestAlertGroupLifecycle(t *testing.T) {
@@ -1735,9 +1735,17 @@ func TestMigration_OrphanedTeam_BackfillSnapshot(t *testing.T) {
 		t.Fatalf("CreateAlertGroup: %v", err)
 	}
 
-	// 2. Delete the team (orphans the AG)
-	if err := s.DeleteTeam(teamID); err != nil {
-		t.Fatalf("DeleteTeam: %v", err)
+	// 2. Delete the team (orphans the AG).
+	//
+	// Straight SQL: deleting a team is a scheduleconfig command now, and what
+	// this test needs is the end state, not the guards around reaching it.
+	// alert_groups.team_id carries no foreign key, which is what makes an
+	// orphaned group possible at all and is exactly what is under test here.
+	if _, err := s.GetDB().Exec(`DELETE FROM team_members WHERE team_id = $1`, teamID); err != nil {
+		t.Fatalf("delete team_members: %v", err)
+	}
+	if _, err := s.GetDB().Exec(`DELETE FROM teams WHERE id = $1`, teamID); err != nil {
+		t.Fatalf("delete team: %v", err)
 	}
 
 	// 3. Simulate re-migration: drop NOT NULL first, then clear snapshot

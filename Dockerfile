@@ -1,5 +1,8 @@
 # Build Stage
-FROM golang:1.25.8-alpine AS builder
+# Pinned to the build host's own architecture: the binary is pure Go with CGO
+# off, so we cross-compile for the target below instead of emulating the
+# builder under QEMU.
+FROM --platform=$BUILDPLATFORM golang:1.25.8-alpine AS builder
 
 WORKDIR /app
 
@@ -24,11 +27,19 @@ RUN swag init -g cmd/tokayops/main.go -o docs
 ARG GIT_COMMIT=""
 ARG GIT_BRANCH=""
 ARG BUILD_DATE=""
+# Release tag ("v0.1.0"), set by the release workflow. Branch and local builds leave it "dev".
+ARG VERSION=""
+
+# Target platform, supplied by buildx. Defaults keep a plain `docker build`
+# (which sets neither) producing a linux binary for the host architecture.
+ARG TARGETOS=linux
+ARG TARGETARCH
 
 # Build Binary
 # CGO_ENABLED=0 helps with static linking for Alpine
-RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags "-X main.buildBranch=${GIT_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)} \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags "-X main.buildVersion=${VERSION:-dev} \
+              -X main.buildBranch=${GIT_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)} \
               -X main.buildCommit=${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)} \
               -X main.buildDate=${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
     -o tokayops cmd/tokayops/main.go
@@ -50,6 +61,6 @@ COPY --from=builder /app/web ./web
 # Copy Config (Optional: In k8s/prod this acts as a default or is overwritten by ConfigMap)
 COPY tokay.yaml .
 
-EXPOSE 8080
+EXPOSE 8080 9090
 
 ENTRYPOINT ["/app/tokayops"]

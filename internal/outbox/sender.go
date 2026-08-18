@@ -140,7 +140,7 @@ func BuildHeaders(eventID string, eventType model.OutboxEventType, body []byte,
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 
 	h := map[string]string{
-		"Content-Type":       "application/json",
+		"Content-Type":      "application/json",
 		"X-Tokay-Event":     string(eventType),
 		"X-Tokay-Event-ID":  eventID,
 		"X-Tokay-Timestamp": ts,

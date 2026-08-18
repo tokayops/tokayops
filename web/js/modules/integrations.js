@@ -450,15 +450,16 @@ async function handleIntegrationSubmit(e) {
         const botToken = document.getElementById('config-bot-token')?.value?.trim() || '';
         const secretToken = document.getElementById('config-secret-token')?.value?.trim() || '';
         const defaultChatID = document.getElementById('config-default-chat-id')?.value?.trim() || '';
+        const interactive = document.getElementById('config-interactive')?.checked || false;
 
-        config = { bot_token: botToken, secret_token: secretToken, default_chat_id: defaultChatID };
+        config = { bot_token: botToken, secret_token: secretToken, default_chat_id: defaultChatID, interactive };
 
         if (!State.editingIntegration && !botToken) {
             showToast('Bot token is required', 'error');
             return;
         }
         if (!State.editingIntegration && !secretToken) {
-            showToast('Secret token is required (needed for Ack/Resolve buttons)', 'error');
+            showToast('Secret token is required (the webhook needs it for account linking and Ack/Resolve buttons)', 'error');
             return;
         }
     } else if (type === 'alertmanager_webhook') {

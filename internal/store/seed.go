@@ -7,9 +7,9 @@ import (
 	"log"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/google/uuid"
 )
 
 // Seed populates the database with initial data
@@ -21,9 +21,6 @@ func (s *Store) Seed() error {
 		return err
 	}
 	if err := s.seedUsers(); err != nil {
-		return err
-	}
-	if err := s.seedSchedules(); err != nil {
 		return err
 	}
 	if err := s.seedIntegrations(); err != nil {
@@ -160,76 +157,6 @@ func (s *Store) seedUsers() error {
 	_ = s.AddTeamMember("platform", "charlie", model.TeamMemberRoleAdmin)
 	_ = s.AddTeamMember("triage", "admin", model.TeamMemberRoleMember)
 
-	return nil
-}
-
-func (s *Store) seedSchedules() error {
-	monday := 1
-
-	schedules := []struct {
-		schedule model.Schedule
-		l1Users  []string
-		l2Users  []string
-	}{
-		{
-			schedule: model.Schedule{
-				ID:                  "schedule-devops",
-				TeamID:              "devops",
-				Timezone:            "UTC",
-				L1RotationType:      model.RotationWeekly,
-				L1HandoffTime:       "09:00",
-				L1HandoffDay:        &monday,
-				L1RotationStart:     time.Now(),
-				L2Enabled:           true,
-				L2EscalationTimeout: 15,
-				L2RotationType:      model.RotationWeekly,
-				L2HandoffTime:       "09:00",
-				L2HandoffDay:        &monday,
-			},
-			l1Users: []string{"admin", "alice"},
-			l2Users: []string{"bob"},
-		},
-		{
-			schedule: model.Schedule{
-				ID:              "schedule-platform",
-				TeamID:          "platform",
-				Timezone:        "UTC",
-				L1RotationType:  model.RotationDaily,
-				L1HandoffTime:   "10:00",
-				L1RotationStart: time.Now(),
-				L2Enabled:       false,
-			},
-			l1Users: []string{"charlie"},
-			l2Users: nil,
-		},
-	}
-
-	for _, item := range schedules {
-		// Check if schedule exists
-		_, err := s.GetScheduleByTeamID(item.schedule.TeamID)
-		if err == sql.ErrNoRows {
-			// Create schedule
-			if err := s.CreateSchedule(&item.schedule); err != nil {
-				return fmt.Errorf("create schedule %s: %w", item.schedule.ID, err)
-			}
-			// Set L1 groups (each user as singleton group)
-			if len(item.l1Users) > 0 {
-				groups := make([][]string, len(item.l1Users))
-				for i, id := range item.l1Users {
-					groups[i] = []string{id}
-				}
-				if err := s.SetScheduleGroups(item.schedule.ID, groups); err != nil {
-					return fmt.Errorf("set L1 groups for %s: %w", item.schedule.ID, err)
-				}
-			}
-			// Set L2 users
-			if len(item.l2Users) > 0 {
-				if err := s.SetScheduleUsers(item.schedule.ID, "L2", item.l2Users); err != nil {
-					return fmt.Errorf("set L2 users for %s: %w", item.schedule.ID, err)
-				}
-			}
-		}
-	}
 	return nil
 }
 

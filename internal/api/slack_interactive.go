@@ -15,13 +15,13 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/labstack/echo/v4"
+	"github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rbac"
 	"github.com/tokayops/tokayops/internal/slackcard"
-	"github.com/labstack/echo/v4"
-	"github.com/slack-go/slack"
 )
 
 // Re-export Slack action IDs from model for use in tests and this package.

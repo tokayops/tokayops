@@ -15,25 +15,35 @@ services:
       retries: 5
 
   tokay:
-    image: ghcr.io/tokayops/tokayops:latest
+    # Follows the newest stable release. TOKAY_TAG pins an exact version
+    # (0.1.0) or an exact build (sha-<commit>) instead.
+    image: ghcr.io/tokayops/tokayops:${TOKAY_TAG:-latest}
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "8080:8080"   # API + UI
-      - "9090:9090"   # Health + Prometheus metrics
-    env_file:
-      - path: .env
-        required: false
+      # Bound to loopback: terminate TLS in a reverse proxy in front of these.
+      # Publish on 0.0.0.0 only if you know nothing else can reach the host.
+      - "127.0.0.1:${TOKAY_PORT:-8080}:8080"                              # API + UI
+      - "127.0.0.1:${INTERNAL_PORT:-9090}:${INTERNAL_PORT:-9090}"         # Health + Prometheus metrics
+    env_file: .env
     environment:
+      # Pinned to the bundled service, and deliberately not substitutable:
+      # .env.example ships DB_HOST=localhost for running the binary on the host,
+      # which inside this container would point at the container itself.
+      # `environment` beats `env_file`, so DB_HOST in .env has no effect here -
+      # to use an external Postgres, edit these two lines and drop the postgres
+      # service along with the depends_on below.
       DB_HOST: postgres
       DB_PORT: 5432
-    volumes:
-      # Mount your production config (optional — image has a default tokay.yaml)
-      - ./tokay.yaml:/app/tokay.yaml:ro
+    # The image ships a default tokay.yaml. To override it, uncomment the mount
+    # below and put your own tokay.yaml next to this file - creating the mount
+    # without the file makes Docker create a directory and the container exits.
+    # volumes:
+    #   - ./tokay.yaml:/app/tokay.yaml:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9090/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:${INTERNAL_PORT:-9090}/health"]
       interval: 15s
       timeout: 5s
       retries: 3

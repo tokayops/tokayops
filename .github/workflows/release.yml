@@ -1,0 +1,319 @@
+name: Release
+
+# Tagging is the release. Everything below runs off the tag: the images, their
+# version tags, and the GitHub Release notes.
+#
+# The tag is attacker-shaped input: the trigger patterns below are globs, not
+# anchors, so a tag like `v0.1.0-$(id)` matches them. It is validated in the
+# first job against SemVer without build metadata (a `+` is not a legal Docker
+# tag), and no step interpolates it into a shell script with ${{ }} - values
+# reach `run` through the environment.
+# See https://docs.github.com/en/actions/concepts/security/script-injections
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'   # pre-releases: v0.2.0-rc1
+
+# Two releases must never be promoting tags at the same time. Nothing here may
+# be cancelled either: a cancelled run can stop mid-promotion, between :X.Y and
+# :latest. `queue: max` keeps waiting runs queued in FIFO order - the default,
+# `single`, holds one pending run and drops it when the next arrives.
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  # A tag can be pushed onto any commit, including one CI never saw green.
+  # These are the same gates as ci.yml, run again against the exact tagged tree.
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read     # read the E2E run for this commit
+    services:
+      postgres:
+        image: postgres:13-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_tokay
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U test_user -d test_tokay"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+      with:
+        fetch-depth: 0   # the tag checks below need the history
+
+    - name: Check the tag
+      id: tag
+      run: |
+        if ! printf '%s' "$GITHUB_REF_NAME" | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?$'; then
+          echo "Tag $GITHUB_REF_NAME is not a release tag: vMAJOR.MINOR.PATCH, optionally -prerelease."
+          exit 1
+        fi
+
+        # Annotated, so the tag carries who cut the release and when.
+        git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+        if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" != "tag" ]; then
+          echo "Tag $GITHUB_REF_NAME is lightweight. Cut release tags with git tag -a."
+          exit 1
+        fi
+
+        # On the tip of main, not merely somewhere in its history: a tag on an
+        # older commit would publish that commit and drag :latest backwards.
+        git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+        commit="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
+        main_sha="$(git rev-parse refs/remotes/origin/main)"
+        if [ "$commit" != "$main_sha" ]; then
+          echo "Tag $GITHUB_REF_NAME is on $commit, but origin/main is at $main_sha."
+          echo "Releases are cut from the tip of main: merge develop into main, let it go green, then tag."
+          exit 1
+        fi
+        echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+    # E2E is not re-run here (it needs the whole compose stack and ~10 minutes),
+    # so the gate is that it already passed for this exact commit. It runs on
+    # pushes to main, which is where a release commit lands.
+    - name: Require a green E2E run for this commit
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        COMMIT: ${{ steps.tag.outputs.commit }}
+      run: |
+        green="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/e2e.yml/runs?head_sha=${COMMIT}&per_page=100" \
+          --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
+        if [ "$green" -eq 0 ]; then
+          echo "No successful E2E run for $COMMIT."
+          echo "E2E runs on pushes to main: wait for it to finish, or re-run it, then re-run this release."
+          exit 1
+        fi
+
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: 'go.mod'
+
+    - name: Check formatting
+      run: |
+        unformatted=$(gofmt -l ./cmd ./internal)
+        if [ -n "$unformatted" ]; then
+          echo "These files are not gofmt-clean:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    - name: Vet
+      run: go vet ./...
+
+    - name: Run unit tests
+      run: go test ./...
+
+    - name: Run integration tests
+      env:
+        TEST_DB_DSN: postgres://test_user:test_password@localhost:5433/test_tokay?sslmode=disable
+        ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      run: go test -p 1 -tags=integration ./internal/...
+
+  # Publishing order matters. The exact version goes up first, then the GitHub
+  # Release, and only a finished release gets promoted to :X.Y and :latest.
+  # :latest is the tag an unpinned deployment pulls, so it moves last of all
+  # and reads as either the previous release or this one.
+  #
+  # Only the app is released. cmd/webhook-receiver is a local debugging helper
+  # (see the Makefile); ci.yml publishes it, nothing deploys it.
+  release:
+    runs-on: ubuntu-latest
+    needs: [verify]
+    permissions:
+      contents: write   # create the GitHub Release
+      packages: write   # push images to GHCR via GITHUB_TOKEN
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Derive version
+      id: version
+      run: |
+        version="$GITHUB_REF_NAME"
+        # Re-checked here: this job builds the image tags, and a job can be
+        # re-run on its own.
+        if ! printf '%s' "$version" | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?$'; then
+          echo "Refusing to build from tag $version."
+          exit 1
+        fi
+        semver="${version#v}"                # 0.1.0
+        minor="${semver%.*}"                 # 0.1
+        # A pre-release publishes only its exact version: :latest and the :X.Y
+        # series tag must keep pointing at the last stable build.
+        prerelease=false
+        case "$semver" in *-*) prerelease=true ;; esac
+        {
+          echo "version=$version"
+          echo "semver=$semver"
+          echo "minor=$minor"
+          echo "prerelease=$prerelease"
+          echo "commit=$(git rev-parse HEAD)"
+        } >> "$GITHUB_OUTPUT"
+
+    # The changelog entry is the release notes, so a missing one fails the
+    # release rather than shipping an empty GitHub Release.
+    - name: Extract release notes from CHANGELOG
+      env:
+        SEMVER: ${{ steps.version.outputs.semver }}
+      run: |
+        awk -v v="$SEMVER" '
+          $0 ~ "^## \\[" v "\\]" { found = 1; next }
+          found && /^## / { exit }
+          found && $0 ~ "^\\[[^]]+\\]: " { next }   # link definitions at the end of the file
+          found { print }
+        ' CHANGELOG.md > release-notes.md
+        if ! grep -q '[^[:space:]]' release-notes.md; then
+          echo "CHANGELOG.md has no section for $SEMVER."
+          exit 1
+        fi
+        cat release-notes.md
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    # Re-running a release must not rebuild a version that is already in the
+    # registry: the rebuild stamps a new build date, so the same version number
+    # would end up meaning two different images. Skip to what did not finish.
+    - name: Check whether this version is already published
+      id: published
+      env:
+        SEMVER: ${{ steps.version.outputs.semver }}
+      run: |
+        if out="$(docker buildx imagetools inspect "ghcr.io/tokayops/tokayops:${SEMVER}" 2>&1)"; then
+          echo "tokayops ${SEMVER} is already published, skipping the build"
+          echo "already=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        # Only a genuine "no such tag" means "go build it". Any other error
+        # (auth, registry hiccup) is ambiguous, and guessing "not published"
+        # here is what would overwrite a released version.
+        case "$out" in
+          *"not found"*|*"manifest unknown"*|*MANIFEST_UNKNOWN*|*NAME_UNKNOWN*)
+            echo "already=false" >> "$GITHUB_OUTPUT" ;;
+          *)
+            echo "$out"
+            echo "Cannot tell whether tokayops:${SEMVER} is already published. Stopping."
+            exit 1 ;;
+        esac
+
+    - name: Build and push Tokay
+      if: steps.published.outputs.already != 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        platforms: linux/amd64,linux/arm64
+        build-args: |
+          VERSION=${{ steps.version.outputs.version }}
+          GIT_COMMIT=${{ steps.version.outputs.commit }}
+          GIT_BRANCH=main
+        # The exact version only. Moving tags are promoted at the end of this
+        # job, and sha-<commit> belongs to ci.yml: the same name must not stand
+        # for a CI build and a release build of the same commit.
+        tags: ghcr.io/tokayops/tokayops:${{ steps.version.outputs.semver }}
+
+    # Registry tags can be re-pointed; a digest cannot. Resolve it once, use it
+    # for the promotion below, and hand it to users in the release notes.
+    - name: Resolve the published digest
+      id: digest
+      env:
+        SEMVER: ${{ steps.version.outputs.semver }}
+      run: |
+        # The first Digest: line of the default output is the index digest.
+        # Parsed rather than templated: --format's handling of .Manifest
+        # differs between buildx versions.
+        digest="$(docker buildx imagetools inspect "ghcr.io/tokayops/tokayops:${SEMVER}" | awk '/^Digest:/ {print $2; exit}')"
+        case "$digest" in
+          sha256:*) ;;
+          *) echo "Could not resolve a digest for tokayops:${SEMVER} (got '${digest}')."; exit 1 ;;
+        esac
+        echo "digest=$digest" >> "$GITHUB_OUTPUT"
+        {
+          printf '\n### Image\n\nPinned reference for this exact build:\n\n'
+          printf -- '- `ghcr.io/tokayops/tokayops@%s` (also tagged `%s`)\n' "$digest" "$SEMVER"
+        } >> release-notes.md
+
+    - name: Create the GitHub Release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        VERSION: ${{ steps.version.outputs.version }}
+        PRERELEASE: ${{ steps.version.outputs.prerelease }}
+      run: |
+        flags=""
+        if [ "$PRERELEASE" = "true" ]; then
+          flags="--prerelease"
+        fi
+        if gh release view "$VERSION" >/dev/null 2>&1; then
+          # Left over from a run that died after this point.
+          gh release edit "$VERSION" --notes-file release-notes.md $flags
+        else
+          gh release create "$VERSION" --title "$VERSION" --notes-file release-notes.md $flags
+        fi
+
+    # Only now, with the image up and the release published, do the tags that
+    # an unpinned deployment follows move. imagetools re-points them at the
+    # digest that is already in the registry - nothing is rebuilt.
+    #
+    # This step is also the one thing here that can move a tag backwards, and
+    # GitHub can re-run a single failed job long after the run it belonged to,
+    # so it re-checks what `verify` checked instead of trusting it.
+    - name: Promote to the series and latest tags
+      if: steps.version.outputs.prerelease == 'false'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        VERSION: ${{ steps.version.outputs.version }}
+        MINOR: ${{ steps.version.outputs.minor }}
+        APP_DIGEST: ${{ steps.digest.outputs.digest }}
+      run: |
+        git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+        head="$(git rev-parse HEAD)"
+        main_sha="$(git rev-parse refs/remotes/origin/main)"
+        if [ "$head" != "$main_sha" ]; then
+          echo "$VERSION is on $head, but origin/main is now at $main_sha."
+          echo "Refusing to move :latest to a commit main has moved past."
+          echo "The version images and the GitHub Release are published; cut the next patch to move :latest."
+          exit 1
+        fi
+
+        # Belt and braces: main could in principle be back at this commit while
+        # a newer version is already out. Published stable releases are the
+        # record of what :latest is allowed to point at.
+        newest="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+          --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+          | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+        if [ "$newest" != "$VERSION" ]; then
+          echo "The newest published release is ${newest:-none}, not $VERSION."
+          echo "Refusing to move :latest backwards."
+          exit 1
+        fi
+
+        # Two tag writes, so still not one atomic step: :X.Y moves first and
+        # :latest last, because :latest is what docker-compose.prod.yml pulls
+        # when nothing is pinned. Re-running this step finishes the job.
+        app="ghcr.io/tokayops/tokayops"
+        docker buildx imagetools create --tag "${app}:${MINOR}" "${app}@${APP_DIGEST}"
+        docker buildx imagetools create --tag "${app}:latest"   "${app}@${APP_DIGEST}"

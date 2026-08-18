@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	_ "github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
-	_ "github.com/lib/pq"
 )
 
 // BindIdentity binds an external identity (provider + external ID) to a user via
@@ -31,7 +31,10 @@ func BindSlack(t *testing.T, s *store.Store, userID, slackID string) {
 
 // SetupDB creates a connection to the test database and truncates tables.
 // It skips the test if TEST_DB_DSN is not set.
-func SetupDB(t *testing.T) *store.Store {
+//
+// It takes testing.TB rather than *testing.T because benchmarks need the same
+// fixture: a benchmark measuring a database read has to build one first.
+func SetupDB(t testing.TB) *store.Store {
 	t.Helper()
 
 	dsn := os.Getenv("TEST_DB_DSN")
@@ -58,7 +61,7 @@ func SetupDB(t *testing.T) *store.Store {
 	return s
 }
 
-func TruncateTables(t *testing.T, s *store.Store) {
+func TruncateTables(t testing.TB, s *store.Store) {
 	t.Helper()
 
 	tables := []string{
@@ -66,9 +69,9 @@ func TruncateTables(t *testing.T, s *store.Store) {
 		"event_outbox_deliveries",
 		"event_outbox",
 		"integrations",
-		"schedule_overrides",
-		"schedule_users",
-		"rotation_epochs",
+		"schedule_revisions",
+		"schedule_override_revisions",
+		"migration_markers",
 		"link_tokens",
 		"external_identities",
 		"schedules",

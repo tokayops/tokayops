@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 // ProviderCapabilitiesLookup is the read-only view of the dispatcher's
@@ -77,7 +77,7 @@ func (a *API) ListPolicies(c echo.Context) error {
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
 	}
-	user, err := a.store.GetUserByID(userID)
+	user, err := a.store.GetActiveUserByID(userID)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 	}

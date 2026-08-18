@@ -32,35 +32,14 @@ jobs:
           npm ci
           npx playwright install chromium --with-deps
 
+      # Build, wait and seed come from the Makefile, which is where the E2E
+      # environment is defined. This step used to keep its own copy of the
+      # sequence, and when the destructive schedule reset became part of the
+      # environment the copy never got it: `env.spec.ts` failed here on every
+      # branch while `make e2e-test` was green locally. Calling the targets is
+      # what keeps the two from drifting again.
       - name: Start E2E environment
-        run: |
-          docker compose -f docker-compose.e2e.yml up -d --build
-
-          # Wait for the app to be healthy
-          echo "Waiting for application to be ready..."
-          MAX_ATTEMPTS=60
-          ATTEMPT=0
-
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            if curl -s http://localhost:8081/swagger/index.html > /dev/null 2>&1; then
-              echo "Application is ready!"
-              break
-            fi
-            ATTEMPT=$((ATTEMPT + 1))
-            echo "Waiting for app... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
-            sleep 2
-          done
-
-          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-            echo "Application failed to start"
-            docker compose -f docker-compose.e2e.yml logs tokay_app
-            exit 1
-          fi
-
-      - name: Create test user and seed data
-        run: |
-          docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops user create admin@example.com 'Admin123!' 'Test Admin' || true
-          docker compose -f docker-compose.e2e.yml exec -T tokay_app /app/tokayops seed || true
+        run: make e2e-up
 
       - name: Run E2E tests
         working-directory: e2e
