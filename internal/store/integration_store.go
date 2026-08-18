@@ -309,6 +309,12 @@ func mergeSecrets(integrationType model.IntegrationType, existingConfig, newConf
 		if new.DefaultChatID == "" {
 			new.DefaultChatID = existing.DefaultChatID
 		}
+		// Keep existing interactive if not provided. Without this an update that
+		// omits the field would reset it to nil, which resolves to true, silently
+		// switching the buttons back on for someone who had turned them off.
+		if new.Interactive == nil {
+			new.Interactive = existing.Interactive
+		}
 		merged, _ := json.Marshal(new)
 		return merged
 

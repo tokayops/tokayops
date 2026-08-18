@@ -13,11 +13,16 @@ import (
 )
 
 // mockTelegramTokenSource implements TelegramTokenSource for testing.
+// interactiveOff is negated on purpose: the zero value has to mean "buttons on",
+// which is what every existing test that renders a card expects.
 type mockTelegramTokenSource struct {
-	token string
+	token          string
+	interactiveOff bool
 }
 
 func (m *mockTelegramTokenSource) GetTelegramToken() string { return m.token }
+
+func (m *mockTelegramTokenSource) GetTelegramInteractive() bool { return !m.interactiveOff }
 
 // fakeBotAPI returns an httptest server that answers sendMessage/editMessageText
 // and counts calls per method. sendMessage returns the given message_id.
@@ -284,6 +289,85 @@ func TestTelegram_CardHasAckResolveKeyboard(t *testing.T) {
 	b, _ := json.Marshal(sentBody["reply_markup"])
 	if !strings.Contains(string(b), "ack:ag-1") || !strings.Contains(string(b), "res:ag-1") {
 		t.Errorf("keyboard missing ack/res callback_data: %s", b)
+	}
+}
+
+// Switching interactivity off must strip the buttons from a card that was
+// already posted with them. editMessageText leaves the existing keyboard alone
+// when reply_markup is absent, so the update has to carry an explicitly empty
+// inline_keyboard - sending nil would strand live buttons in the chat.
+func TestTelegram_InteractiveOff_UpdateClearsKeyboard(t *testing.T) {
+	var sentBody, editedBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
+			_ = json.NewDecoder(r.Body).Decode(&sentBody)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"message_id": 7}})
+		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
+			_ = json.NewDecoder(r.Body).Decode(&editedBody)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": true})
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	src := &mockTelegramTokenSource{token: "tok"}
+	p := NewTelegramProvider(src, "https://tokay.example", WithBaseURL(server.URL))
+	ctx := context.Background()
+	ag := testAlertGroup()
+
+	payload, err := p.Send(ctx, NotificationRequest{
+		Target: NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: ag, Editable: true,
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if sentBody["reply_markup"] == nil {
+		t.Fatalf("card was posted without a keyboard, nothing to clear later: %v", sentBody)
+	}
+
+	src.interactiveOff = true
+
+	if _, err := p.Update(ctx, &model.NotificationDelivery{ID: "del-1", ProviderPayload: payload}, ag); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	markup, ok := editedBody["reply_markup"]
+	if !ok {
+		t.Fatalf("editMessageText omitted reply_markup, so the old buttons survive: %v", editedBody)
+	}
+	b, _ := json.Marshal(markup)
+	if string(b) != `{"inline_keyboard":[]}` {
+		t.Errorf("reply_markup = %s, want an empty inline_keyboard", b)
+	}
+}
+
+// A card posted while interactivity is off never gets a keyboard in the first
+// place.
+func TestTelegram_InteractiveOff_SendHasEmptyKeyboard(t *testing.T) {
+	var sentBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			_ = json.NewDecoder(r.Body).Decode(&sentBody)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"message_id": 8}})
+			return
+		}
+		t.Errorf("unexpected request: %s", r.URL.Path)
+	}))
+	defer server.Close()
+
+	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok", interactiveOff: true}, "https://tokay.example", WithBaseURL(server.URL))
+	if _, err := p.Send(context.Background(), NotificationRequest{
+		Target: NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	b, _ := json.Marshal(sentBody["reply_markup"])
+	if string(b) != `{"inline_keyboard":[]}` {
+		t.Errorf("reply_markup = %s, want an empty inline_keyboard", b)
 	}
 }
 

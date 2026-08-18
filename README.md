@@ -38,9 +38,9 @@ re-claimed instead of lost.
   account gets a shift-start DM.
 - Dual-send: team channel + firehose logging.
 - Slack interactivity: Ack/Resolve buttons in Block Kit messages via a
-  signature-verified endpoint.
-- Telegram channel: outbound delivery, policy routing and interactive
-  Ack/Resolve.
+  signature-verified endpoint. Toggled per integration.
+- Telegram channel: outbound delivery, policy routing and Ack/Resolve buttons
+  via a secret-verified webhook. Toggled per integration.
 - Generic outgoing webhooks through a transactional outbox: HMAC-signed,
   SSRF-guarded, retried with backoff, with a delivery log and replay.
 - Observability: Prometheus metrics endpoint including MTTA/MTTR histograms and
