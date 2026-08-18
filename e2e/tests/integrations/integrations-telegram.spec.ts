@@ -95,6 +95,85 @@ test.describe('Telegram integration', () => {
     await integrationsPage.closeIntegrationModal();
   });
 
+  // The checkbox has to answer three different questions: a brand new integration
+  // starts off, one stored before the field existed had buttons on, and an explicit
+  // false stays off. Only the middle case is a regression risk, and no Go test
+  // covers the form.
+  test('interactive toggle starts unchecked on create and posts interactive: false', async ({ integrationsPage, page }) => {
+    const suffix = Math.random().toString(36).substring(2, 8);
+
+    await integrationsPage.openTelegramForm(`TG Interactive ${Date.now()}-${suffix}`, `123456:bot-${suffix}`);
+    await expect(integrationsPage.configInteractiveToggle).toBeVisible();
+    await expect(integrationsPage.configInteractive).not.toBeChecked();
+
+    await integrationsPage.configSecretToken.fill(`sek-${suffix}`);
+
+    const responsePromise = page.waitForResponse(
+      (r) => r.url().includes('/api/v1/integrations') && r.request().method() === 'POST',
+    );
+    await integrationsPage.integrationFormSubmit.click();
+
+    const response = await responsePromise;
+    expect([200, 201]).toContain(response.status());
+    const requestBody = JSON.parse(response.request().postData() || '{}');
+    expect(requestBody.config?.interactive).toBe(false);
+
+    const data = await response.json();
+    if (data.id) createdIntegrationIds.push(data.id);
+  });
+
+  test('edit form shows the toggle checked for a config stored without the field', async ({ integrationsPage, page }) => {
+    const suffix = Math.random().toString(36).substring(2, 8);
+
+    // No interactive key at all - the shape of every record written before the
+    // switch existed. Create does not normalise the config, so this is exact.
+    const created = await page.request.post('/api/v1/integrations', {
+      data: {
+        type: 'telegram',
+        name: `TG Legacy ${Date.now()}-${suffix}`,
+        enabled: true,
+        config: { bot_token: `123456:legacy-${suffix}`, secret_token: `sek-legacy-${suffix}` },
+      },
+    });
+    expect(created.ok()).toBeTruthy();
+    const id = (await created.json()).id;
+    createdIntegrationIds.push(id);
+
+    // Reload rather than goto: the app is hash-routed, so navigating to the same
+    // fragment does not refetch and the list would still show the previous state.
+    await page.reload();
+    await integrationsPage.waitForIntegrationsLoad();
+    await integrationsPage.openIntegrationModal(id);
+
+    await expect(integrationsPage.configInteractive).toBeChecked();
+    await integrationsPage.closeIntegrationModal();
+  });
+
+  test('edit form shows the toggle unchecked for interactive: false', async ({ integrationsPage, page }) => {
+    const suffix = Math.random().toString(36).substring(2, 8);
+
+    const created = await page.request.post('/api/v1/integrations', {
+      data: {
+        type: 'telegram',
+        name: `TG Off ${Date.now()}-${suffix}`,
+        enabled: true,
+        config: { bot_token: `123456:off-${suffix}`, secret_token: `sek-off-${suffix}`, interactive: false },
+      },
+    });
+    expect(created.ok()).toBeTruthy();
+    const id = (await created.json()).id;
+    createdIntegrationIds.push(id);
+
+    // Reload rather than goto: the app is hash-routed, so navigating to the same
+    // fragment does not refetch and the list would still show the previous state.
+    await page.reload();
+    await integrationsPage.waitForIntegrationsLoad();
+    await integrationsPage.openIntegrationModal(id);
+
+    await expect(integrationsPage.configInteractive).not.toBeChecked();
+    await integrationsPage.closeIntegrationModal();
+  });
+
   test.afterAll(async ({ request }) => {
     for (const id of createdIntegrationIds) {
       try {

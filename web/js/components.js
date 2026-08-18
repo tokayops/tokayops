@@ -1775,6 +1775,11 @@ const Components = {
             const defaultChatID = config?.default_chat_id || '';
             const botMasked = botToken === '****';
             const secretMasked = secretToken === '****';
+            // Three states, three answers: a new integration starts off, an existing
+            // one written before this field existed had buttons on, and an explicit
+            // false stays off. Testing `config.interactive` alone would render the
+            // legacy case unchecked and switch buttons off on the next save.
+            const interactive = config != null && config.interactive !== false;
 
             return `
                 <div class="form-group">
@@ -1785,7 +1790,7 @@ const Components = {
                     ${botMasked ? '<small class="form-hint">Current token: ****. Leave empty to keep.</small>' : ''}
                 </div>
                 <div class="form-group">
-                    <label for="config-secret-token">Secret Token * <span class="tooltip-icon" data-tooltip="X-Telegram-Bot-Api-Secret-Token used to verify incoming webhook calls. Required — Ack/Resolve buttons need it."><i data-lucide="help-circle" style="width:14px;height:14px;color:var(--text-muted);"></i></span></label>
+                    <label for="config-secret-token">Secret Token * <span class="tooltip-icon" data-tooltip="X-Telegram-Bot-Api-Secret-Token used to verify incoming webhook calls. Required - the webhook also carries account linking, so it is needed even with buttons off."><i data-lucide="help-circle" style="width:14px;height:14px;color:var(--text-muted);"></i></span></label>
                     <input type="password" id="config-secret-token" class="form-input" autocomplete="new-password"
                            placeholder="${secretMasked ? 'Leave empty to keep existing' : 'webhook secret token'}"
                            value="">
@@ -1797,6 +1802,14 @@ const Components = {
                            placeholder="-1001234567890"
                            value="${escapeHtml(defaultChatID)}">
                     ${defaultChatID ? '<small class="form-hint">Leave empty to keep existing.</small>' : ''}
+                </div>
+                <div class="form-group">
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="config-interactive" ${interactive ? 'checked' : ''}>
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-text">Enable interactive buttons (Acknowledge / Resolve)</span>
+                    </label>
+                    <small class="form-hint">Requires a reachable webhook: TOKAY_SELF_URL must be set and the secret token configured.</small>
                 </div>
             `;
         } else if (type === 'alertmanager_webhook') {

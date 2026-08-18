@@ -59,8 +59,23 @@ type SlackConfig struct {
 // telegram Descriptor.SecretFields so MaskSecrets/mergeSecrets find them.
 type TelegramConfig struct {
 	BotToken      string `json:"bot_token"`                 // Bot API token for notifications
-	SecretToken   string `json:"secret_token,omitempty"`    // X-Telegram-Bot-Api-Secret-Token for webhook verification (Sprint 3)
-	DefaultChatID string `json:"default_chat_id,omitempty"` // Default chat id (convenience; not used in send path in S1)
+	SecretToken   string `json:"secret_token,omitempty"`    // X-Telegram-Bot-Api-Secret-Token for webhook verification
+	DefaultChatID string `json:"default_chat_id,omitempty"` // Default chat id (convenience; not used in send path)
+	// Interactive enables Ack/Resolve buttons in Telegram cards. A nil value
+	// means "not set" and resolves to true: records written before this field
+	// existed had interactivity switched on unconditionally, and an upgrade
+	// must not silently take their buttons away. Read it via IsInteractive().
+	Interactive *bool `json:"interactive,omitempty"`
+}
+
+// IsInteractive reports whether Ack/Resolve buttons are enabled, defaulting to
+// true when the field was never set. Mirrors config.GlobalConfig's
+// DmFallbackToFirehose accessor.
+func (c TelegramConfig) IsInteractive() bool {
+	if c.Interactive == nil {
+		return true
+	}
+	return *c.Interactive
 }
 
 // WebhookConfig is the config schema for Alertmanager webhook integrations

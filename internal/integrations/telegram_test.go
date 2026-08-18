@@ -30,7 +30,8 @@ func TestTelegram_ValidateConfig(t *testing.T) {
 	if err := ValidateConfig(model.IntegrationTypeTelegram, json.RawMessage(`{"bot_token":"123:abc","secret_token":"****"}`), false); err == nil {
 		t.Error("create with masked secret_token should error")
 	}
-	// Create: secret_token required (interactivity is mandatory in Epic 8 S3).
+	// Create: secret_token required (the webhook needs it regardless of the
+	// interactive switch).
 	if err := ValidateConfig(model.IntegrationTypeTelegram, json.RawMessage(`{"bot_token":"123:abc"}`), false); err == nil {
 		t.Error("create without secret_token should error")
 	}

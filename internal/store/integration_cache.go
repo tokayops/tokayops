@@ -18,6 +18,7 @@ type IntegrationCache struct {
 	slackInteractive    bool
 	telegramToken       string
 	telegramSecretToken string
+	telegramInteractive bool
 	webhookSecrets      []string
 }
 
@@ -46,6 +47,7 @@ func (c *IntegrationCache) LoadAll(store StoreInterface) error {
 	c.slackInteractive = false
 	c.telegramToken = ""
 	c.telegramSecretToken = ""
+	c.telegramInteractive = false
 	c.webhookSecrets = []string{}
 
 	for _, i := range integrations {
@@ -73,6 +75,7 @@ func (c *IntegrationCache) LoadAll(store StoreInterface) error {
 			}
 			c.telegramToken = tgCfg.BotToken
 			c.telegramSecretToken = tgCfg.SecretToken
+			c.telegramInteractive = tgCfg.IsInteractive()
 		case model.IntegrationTypeAlertmanagerWebhook:
 			var webhookCfg model.WebhookConfig
 			if err := json.Unmarshal(i.Config, &webhookCfg); err != nil {
@@ -141,6 +144,15 @@ func (c *IntegrationCache) GetTelegramSecretToken() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.telegramSecretToken
+}
+
+// GetTelegramInteractive returns whether Ack/Resolve buttons are enabled for
+// Telegram. Mirrors GetSlackInteractive; the stored config resolves a missing
+// value to true (see model.TelegramConfig.IsInteractive).
+func (c *IntegrationCache) GetTelegramInteractive() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.telegramInteractive
 }
 
 // ValidateWebhookSecret checks if the given secret matches any configured webhook
