@@ -34,12 +34,14 @@ import (
 	_ "github.com/tokayops/tokayops/docs" // swagger docs
 )
 
-// Build metadata, injected at link time via -ldflags "-X main.buildBranch=... -X main.buildCommit=... -X main.buildDate=...".
+// Build metadata, injected at link time via -ldflags "-X main.buildVersion=... -X main.buildBranch=...".
 // See the Makefile (local builds) and Dockerfile (image builds). Defaults apply to `go run`/un-stamped builds.
+// buildVersion carries the release tag ("v0.1.0"); anything not built from a tag stays "dev".
 var (
-	buildBranch = "dev"
-	buildCommit = "unknown"
-	buildDate   = "unknown"
+	buildVersion = "dev"
+	buildBranch  = "dev"
+	buildCommit  = "unknown"
+	buildDate    = "unknown"
 )
 
 // @title TokayOps API
@@ -479,9 +481,10 @@ func main() {
 	// login page can show the running version; GET is auto-skipped by CSRF middleware.
 	e.GET("/api/version", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{
-			"branch": buildBranch,
-			"commit": buildCommit,
-			"date":   buildDate,
+			"version": buildVersion,
+			"branch":  buildBranch,
+			"commit":  buildCommit,
+			"date":    buildDate,
 		})
 	})
 

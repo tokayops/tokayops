@@ -27,6 +27,8 @@ RUN swag init -g cmd/tokayops/main.go -o docs
 ARG GIT_COMMIT=""
 ARG GIT_BRANCH=""
 ARG BUILD_DATE=""
+# Release tag ("v0.1.0"), set by the release workflow. Branch and local builds leave it "dev".
+ARG VERSION=""
 
 # Target platform, supplied by buildx. Defaults keep a plain `docker build`
 # (which sets neither) producing a linux binary for the host architecture.
@@ -36,7 +38,8 @@ ARG TARGETARCH
 # Build Binary
 # CGO_ENABLED=0 helps with static linking for Alpine
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-    -ldflags "-X main.buildBranch=${GIT_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)} \
+    -ldflags "-X main.buildVersion=${VERSION:-dev} \
+              -X main.buildBranch=${GIT_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)} \
               -X main.buildCommit=${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)} \
               -X main.buildDate=${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
     -o tokayops cmd/tokayops/main.go

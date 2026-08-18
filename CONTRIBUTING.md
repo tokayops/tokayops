@@ -18,14 +18,26 @@ Bug reports are most useful with: the build you are running
 the smallest sequence that reproduces it. Do **not** report security issues in a
 public issue - see [SECURITY.md](SECURITY.md).
 
-## Branches
+## Branches and releases
 
 `develop` is the working branch and the one CI publishes `:develop` from. Branch
-off `develop` and target it with your pull request. `main` is not currently
-maintained as a release branch.
+off `develop` and target it with your pull request.
+
+`main` holds the last release. Cutting one means merging `develop` into `main`
+and pushing an annotated `vX.Y.Z` tag: the tag is what publishes the versioned
+images, moves `:latest`, and creates the GitHub Release. A hotfix branches from
+the tag, lands in `main`, gets a patch tag, and is merged back into `develop`.
+What the numbers promise is in the [release policy](README.md#releases).
 
 Branch names that CI builds: `feature/**`, `feat/**`, `fix/**`, `hotfix/**`,
 `epic*`.
+
+## Changelog
+
+If your change is visible to someone running TokayOps - behaviour, API, config,
+or anything that needs a manual step on upgrade - add a line to the `Unreleased`
+section of [CHANGELOG.md](CHANGELOG.md) in the same pull request. Refactors and
+test-only changes do not need one.
 
 ## Development setup
 
@@ -79,7 +91,8 @@ them, so a PR cannot affect anyone's deployment.
 ## Things to know before changing them
 
 - **Database schema** lives in `InitDB`; there is no versioned migration system.
-  A schema change needs a matching thought about existing deployments.
+  A schema change needs a matching thought about existing deployments, and an
+  upgrade note in the changelog if operators have to do anything.
 - **Delivery is at-least-once.** Do not build on an exactly-once assumption.
 - **Integration secrets** are encrypted with `ENCRYPTION_KEY`, which cannot be
   rotated.

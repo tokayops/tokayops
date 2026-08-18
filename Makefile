@@ -15,7 +15,9 @@ SWAG_VERSION := v1.16.3
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS := -X main.buildBranch=$(GIT_BRANCH) -X main.buildCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
+# Exact tag only: a local build one commit past v0.1.0 must not claim to be v0.1.0.
+VERSION ?= $(shell git describe --tags --exact-match --match 'v*' 2>/dev/null || echo dev)
+LDFLAGS := -X main.buildVersion=$(VERSION) -X main.buildBranch=$(GIT_BRANCH) -X main.buildCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
 
 swagger:
 	go run github.com/swaggo/swag/cmd/swag@$(SWAG_VERSION) init -g cmd/tokayops/main.go -o docs

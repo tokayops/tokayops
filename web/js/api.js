@@ -840,9 +840,10 @@ window.API = API;
 
 /**
  * Fetch build metadata from the public /api/version endpoint and render it into
- * the element with the given id. Compact form "branch@commit · date" on screen,
- * full detail in the title (hover tooltip). No-ops quietly if the element is
- * missing or the request fails — version display is non-critical.
+ * the element with the given id. Release builds show the tag ("v0.1.0 · abc1234");
+ * untagged builds fall back to "branch@commit · date". Full detail is in the title
+ * (hover tooltip). No-ops quietly if the element is missing or the request fails —
+ * version display is non-critical.
  * @param {string} elId - id of the target element
  */
 async function renderAppVersion(elId) {
@@ -852,12 +853,17 @@ async function renderAppVersion(elId) {
         const res = await fetch('/api/version');
         if (!res.ok) return;
         const v = await res.json();
+        const version = v.version || 'dev';
         const branch = v.branch || 'unknown';
         const commit = v.commit || 'unknown';
         const shortCommit = commit.slice(0, 7);
         const date = (v.date || '').slice(0, 10);
-        el.textContent = date ? `${branch}@${shortCommit} · ${date}` : `${branch}@${shortCommit}`;
-        el.title = `branch: ${branch}\ncommit: ${commit}\nbuilt: ${v.date || 'unknown'}`;
+        if (version !== 'dev') {
+            el.textContent = `${version} · ${shortCommit}`;
+        } else {
+            el.textContent = date ? `${branch}@${shortCommit} · ${date}` : `${branch}@${shortCommit}`;
+        }
+        el.title = `version: ${version}\nbranch: ${branch}\ncommit: ${commit}\nbuilt: ${v.date || 'unknown'}`;
     } catch (e) {
         // Version display is non-critical; leave the element empty on failure.
     }
