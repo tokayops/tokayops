@@ -67,6 +67,10 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   schedule whose stored data cannot be read at all still escalates without that
   recipient, since retrying cannot repair it, and the rest of the policy runs as
   before.
+- A Slack call that never answers no longer hangs forever. Requests now give up
+  after 30 seconds, so a stalled connection stops holding the notification
+  worker that made it, and on-call usergroup syncing keeps running instead of
+  stopping until the next restart.
 
 ### Added
 

@@ -128,7 +128,7 @@ func NewUsergroupSyncer(st identityLookup, oncall onCallLister, slackToken strin
 	return &UsergroupSyncer{
 		store:        st,
 		oncall:       oncall,
-		slackClient:  slack.New(slackToken),
+		slackClient:  newSlackClient(slackToken, slackHTTPTimeout),
 		syncInterval: interval,
 		cache:        make(map[string]cacheEntry),
 	}

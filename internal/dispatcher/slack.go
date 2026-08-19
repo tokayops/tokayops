@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
@@ -16,6 +18,31 @@ import (
 
 // ErrSlackUserNotFound means the email has no matching Slack account.
 var ErrSlackUserNotFound = errors.New("slack user not found")
+
+// slackHTTPTimeout bounds a single Slack API call.
+//
+// Without it slack-go keeps the &http.Client{} it builds itself, whose Timeout
+// is zero, so a black-holed connection is not a slow call but a permanent one.
+// It costs two things that do not repair themselves: the goroutine of the job
+// step that made it never returns, and the usergroup syncer - which has its own
+// client, no lease over it and no retry - simply stops syncing until the
+// process is restarted.
+//
+// It bounds a CALL, not a delivery, and duplicates are not what it fixes.
+// sendCard makes three calls, so a step can still outlive the 60s job lease and
+// be re-claimed; and a timeout can fire on a request Slack already accepted,
+// which the retry then sends again. Both are accepted - see the register.
+const slackHTTPTimeout = 30 * time.Second
+
+// newSlackClient is the only place a Slack client is built, so the timeout
+// cannot be forgotten by the next caller that needs one.
+//
+// The timeout is a parameter rather than read from the constant here so a test
+// can prove the option reaches the client in milliseconds instead of thirty
+// seconds; opts is what lets that test point the client at a server of its own.
+func newSlackClient(token string, timeout time.Duration, opts ...slack.Option) *slack.Client {
+	return slack.New(token, append(opts, slack.OptionHTTPClient(&http.Client{Timeout: timeout}))...)
+}
 
 // SlackTokenSource provides dynamic token and config lookup
 type SlackTokenSource interface {
@@ -101,7 +128,7 @@ func (s *SlackProvider) getClient() (*slack.Client, error) {
 			log.Printf("SlackProvider: Token changed, recreating client")
 		}
 		s.cachedToken = token
-		s.client = slack.New(token)
+		s.client = newSlackClient(token, slackHTTPTimeout)
 	}
 	return s.client, nil
 }

@@ -22,8 +22,13 @@ var ErrNoTelegramToken = fmt.Errorf("telegram integration not configured (no tok
 const (
 	// telegramDefaultBaseURL is the public Bot API host; overridable in tests via WithBaseURL.
 	telegramDefaultBaseURL = "https://api.telegram.org"
-	// telegramHTTPTimeout bounds a single Bot API call. Must stay < the 60s job lease
-	// so a stuck call fails the step instead of being re-leased and duplicated.
+	// telegramHTTPTimeout bounds a single Bot API call, so a stuck call fails
+	// rather than holding its goroutine for good.
+	//
+	// It does NOT bound the step: an executor may make several calls, and their
+	// timeouts add up past the 60s job lease - which an earlier version of this
+	// comment claimed it prevented. Whether a step can outlive its lease is a
+	// question for the worker, not for this constant.
 	telegramHTTPTimeout = 30 * time.Second
 	// telegramMaxMessageLen is the Bot API hard limit for a message text.
 	telegramMaxMessageLen = 4096
