@@ -3,6 +3,7 @@ package builders
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -27,6 +28,18 @@ type OnCallProjection interface {
 	// CurrentOnCallNow answers for one schedule by ID.
 	CurrentOnCallNow(ctx context.Context, scheduleID string) (schedulerender.OnCall, error)
 }
+
+// ErrOnCallResolutionUnavailable means the on-call recipients could not be
+// resolved: the projection would not answer, or its answer could not be
+// hydrated into people.
+//
+// It is NOT "nobody is on duty". That is an answer, and a step aimed at nobody
+// still builds - as a marker the executor reports. This is the absence of an
+// answer, and a job built on it would page nobody while looking like a job that
+// had. The caller must retry rather than commit one: once an alert group has an
+// escalation job, nothing picks it up again, so the page is not late, it is
+// gone.
+var ErrOnCallResolutionUnavailable = errors.New("on-call recipients could not be resolved")
 
 // EscalationJobBuilder builds escalation jobs from Store-based policies
 type EscalationJobBuilder struct {
@@ -234,10 +247,26 @@ func (b *EscalationJobBuilder) Build(ctx context.Context, ag *model.AlertGroup, 
 				stage := newStage()
 				status, nextRunAt := stepStatusFor(stageIndex)
 
+				// Which failure this is decides what to do with it, and the
+				// renderer already draws that line. Damage to stored data will
+				// answer the same way on every retry, so degrading to a marker
+				// is the best available outcome: the rest of the policy still
+				// runs and the alert still reaches its channel. Anything else -
+				// a transaction that would not open, a hydration read that
+				// failed - may well answer next tick, and committing a job now
+				// spends the only chance this alert had to page its on-call.
 				users, resolveErr := onCall.resolveScheduleUsers(ctx, stepCfg.TargetID)
 				if resolveErr != nil {
-					log.Printf("EscalationBuilder: Failed to resolve schedule %s: %v", stepCfg.TargetID, resolveErr)
-					// Create a single step that will fail gracefully
+					reason, damaged := schedulerender.FailureReasonOf(resolveErr)
+					if !damaged {
+						return nil, nil, nil, nil, fmt.Errorf("%w: schedule target %s: %w",
+							ErrOnCallResolutionUnavailable, stepCfg.TargetID, resolveErr)
+					}
+					// The target is named, not blamed: a team whose own
+					// schedule is damaged fails here too, and that schedule is
+					// not the one this step names.
+					log.Printf("EscalationBuilder: on-call resolution for schedule target %s failed due to projection damage (%s), degrading to a marker step: %v",
+						stepCfg.TargetID, reason, resolveErr)
 					users = nil
 				}
 

@@ -9,6 +9,23 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ## [Unreleased]
 
+### Fixed
+
+- An alert no longer loses its page when the on-call state cannot be read. A
+  policy step aimed at a schedule used to escalate to nobody if the read failed
+  at that moment, and nothing retried it, so the person on duty was never told.
+  The escalation is now held back and rebuilt on the next tick instead. A
+  schedule whose stored data cannot be read at all still escalates without that
+  recipient, since retrying cannot repair it, and the rest of the policy runs as
+  before.
+
+### Added
+
+- `engine_escalation_build_deferrals_total` counts escalations held back because
+  the on-call recipients could not be resolved. Its increase over a window
+  should normally be zero; alert on a positive increase rather than on the
+  value, which never returns to zero once it has moved.
+
 ## [0.1.0] - 2026-08-18
 
 First tagged release. Converts to Apache-2.0 on 2028-08-18.
