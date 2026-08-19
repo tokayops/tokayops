@@ -1,14 +1,21 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/dispatcher/builders"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
@@ -977,8 +984,8 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 	}
 }
 
-// TestEngine_OnCallReadFailure_NoSnapshotWritten: a tick that could not read the
-// projection records nothing and pages nobody.
+// TestEngine_OnCallReadFailure_DefersEverything: a tick that could not read the
+// projection records nothing, pages nobody, and commits nothing.
 //
 // Writing an empty snapshot would state that nobody was on call, which is a
 // claim about the schedule rather than about the database that just refused to
@@ -986,7 +993,13 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 // zero value it reads as "this team has no schedule", which sends the builder to
 // the schedule ID stored on the policy step - here a schedule the team no longer
 // owns, which would answer, and page the wrong people.
-func TestEngine_OnCallReadFailure_NoSnapshotWritten(t *testing.T) {
+//
+// The job is not committed either, and the alert group is left new. A job built
+// on an unknown roster pages nobody, and an alert group that owns one is never
+// picked up again - so committing it would decide, permanently, that this alert
+// reaches no one. TestEngine_OnCallReadRecovers_PagesOnCall is the other side of
+// this: left alone, the next tick delivers.
+func TestEngine_OnCallReadFailure_DefersEverything(t *testing.T) {
 	s := store.NewMockStore()
 	stale := &model.User{ID: "user-stale", Name: "John"}
 	s.CreateUser(stale)
@@ -1011,6 +1024,7 @@ func TestEngine_OnCallReadFailure_NoSnapshotWritten(t *testing.T) {
 		err:  errors.New("could not begin transaction"),
 		byID: map[string]schedulerender.OnCall{"sched-old": onDuty("g-old", stale.ID)},
 	}
+	deferralsBefore := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
 	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
@@ -1020,15 +1034,189 @@ func TestEngine_OnCallReadFailure_NoSnapshotWritten(t *testing.T) {
 	if updated.OnCallSnapshot != nil {
 		t.Errorf("snapshot = %+v after an unreadable projection, want none", updated.OnCallSnapshot)
 	}
+	if updated.Status != model.AlertGroupStatusNew {
+		t.Errorf("status = %q after an unreadable projection, want %q so the next tick picks it up",
+			updated.Status, model.AlertGroupStatusNew)
+	}
 	if proj.scheduleCalls != 0 {
 		t.Errorf("the fallback schedule was read %d times after a failed team read, want 0", proj.scheduleCalls)
 	}
 
 	job, err := s.GetJobByDedupKey(ag.DedupKey)
-	if err != nil || job == nil {
-		t.Fatalf("job not found: %v", err)
+	if err == nil && job != nil {
+		t.Errorf("job %s was committed on an unknown roster - nothing would ever rebuild it", job.ID)
 	}
-	for _, step := range s.GetJobStepsByJobID(job.ID) {
+
+	if got := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal) - deferralsBefore; got != 1 {
+		t.Errorf("deferrals counted = %v, want 1", got)
+	}
+}
+
+// TestEngine_OnCallReadRecovers_PagesOnCall is the regression for the defect
+// itself: a read that failed once must cost the alert a tick, not its page.
+//
+// Before the fix, the first tick committed a job whose schedule step named
+// nobody. That job made the alert group ineligible for pickup, so the second
+// tick - with the projection answering again - never ran, and the person on duty
+// was simply never told. Here the first tick defers, and the second delivers.
+func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
+	s := store.NewMockStore()
+	onDutyUser := &model.User{ID: "user-on-duty", Name: "Alice"}
+	s.CreateUser(onDutyUser)
+
+	teamID := "team-recovers"
+	policyID := "pol-recovers"
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Recovering Policy",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-current"},
+		},
+	})
+	s.CreateTeam(&model.Team{ID: teamID, Name: "Recovers", DefaultPolicyID: policyID})
+	ag := &model.AlertGroup{
+		ID: "ag-recovers", DedupKey: "dk-recovers", TeamID: teamID, Severity: "info",
+		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	s.CreateAlertGroup(ag)
+
+	// The first read fails, every later one answers.
+	proj := &countingProjection{
+		err:          errors.New("could not begin transaction"),
+		errUntilCall: 1,
+		first:        teamSchedule("sched-current", onDuty("g-a", onDutyUser.ID)),
+	}
+	engine := NewEngine(s, proj, &config.Config{})
+
+	deferralsBefore := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
+	engine.ProcessNewAlertGroups(context.Background())
+
+	if job, _ := s.GetJobByDedupKey(ag.DedupKey); job != nil {
+		t.Fatalf("first tick committed job %s although the roster was unknown", job.ID)
+	}
+	deferralsAfterFirst := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
+	if got := deferralsAfterFirst - deferralsBefore; got != 1 {
+		t.Fatalf("deferrals counted on the first tick = %v, want 1", got)
+	}
+
+	engine.ProcessNewAlertGroups(context.Background())
+
+	job, err := s.GetJobByDedupKey(ag.DedupKey)
+	if err != nil || job == nil {
+		t.Fatalf("second tick built no job although the projection answered: %v", err)
+	}
+	targets := dmTargetsOf(t, s.GetJobStepsByJobID(job.ID))
+	if len(targets) != 1 || targets[0] != onDutyUser.ID {
+		t.Errorf("second tick pages %v, want the on-call user %q", targets, onDutyUser.ID)
+	}
+
+	updated, err := s.GetAlertGroupByID(ag.ID)
+	if err != nil {
+		t.Fatalf("GetAlertGroupByID: %v", err)
+	}
+	if updated.OnCallSnapshot == nil || len(updated.OnCallSnapshot.L1Users) != 1 ||
+		updated.OnCallSnapshot.L1Users[0].ID != onDutyUser.ID {
+		t.Errorf("snapshot = %+v, want the same on-call user the job pages", updated.OnCallSnapshot)
+	}
+
+	if got := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal) - deferralsAfterFirst; got != 0 {
+		t.Errorf("deferrals counted on the successful tick = %v, want 0", got)
+	}
+}
+
+// TestEngine_DeferredTick_NamesTheBatchOnceAndNothingPerGroup pins both halves
+// of what the tick may write while nothing can be built.
+//
+// The line naming the batch has to come BEFORE any group is touched: everything
+// else is written after the work it describes, so without it a group that hangs
+// or panics leaves nothing to narrow the search to. And it has to be the only
+// line, whatever the batch size - a deferred group returns every second, so a
+// line per group is a line per group per second for as long as the trouble
+// lasts. Both properties were broken once and are cheap to break again.
+//
+// The batch order is whatever the store returned, so the expected first group
+// is read out of the line rather than assumed: MockStore walks a map, and
+// assuming one made this test fail 16 times in 200 runs.
+func TestEngine_DeferredTick_NamesTheBatchOnceAndNothingPerGroup(t *testing.T) {
+	s := store.NewMockStore()
+	policyID := "pol-batch"
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Batch",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-x"},
+		},
+	})
+	s.CreateTeam(&model.Team{ID: "team-batch", Name: "Batch", DefaultPolicyID: policyID})
+	for _, id := range []string{"ag-first", "ag-second"} {
+		s.CreateAlertGroup(&model.AlertGroup{
+			ID: id, DedupKey: "dk-" + id, TeamID: "team-batch", Severity: "info",
+			Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		})
+	}
+
+	var buf bytes.Buffer
+	restore := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(restore)
+
+	proj := &countingProjection{err: errors.New("could not begin transaction")}
+	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
+
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("a tick that built nothing wrote %d lines, want 2 (the batch and the tally):\n%s",
+			len(lines), buf.String())
+	}
+	for _, id := range []string{"ag-first", "ag-second"} {
+		if !strings.Contains(lines[0], id) {
+			t.Errorf("the batch line does not name %s, so a hang on it could not be narrowed down: %q", id, lines[0])
+		}
+	}
+
+	_, listed, ok := strings.Cut(lines[0], "group(s): ")
+	if !ok {
+		t.Fatalf("the batch line does not list any group: %q", lines[0])
+	}
+	firstInBatch := strings.Fields(listed)[0]
+	if !strings.Contains(lines[1], firstInBatch) {
+		t.Errorf("the tally names a different group than the batch begins with (%s): %q", firstInBatch, lines[1])
+	}
+}
+
+// TestAlertGroupIDs_CapsTheList: the breadcrumb is bounded, and the boundary is
+// where a bound goes wrong. Beyond the cap the ids are not merely unlisted, they
+// are unavailable - which is one half of why this line narrows a hang down
+// rather than naming it.
+func TestAlertGroupIDs_CapsTheList(t *testing.T) {
+	batch := func(n int) []*model.AlertGroup {
+		out := make([]*model.AlertGroup, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, &model.AlertGroup{ID: fmt.Sprintf("ag-%02d", i)})
+		}
+		return out
+	}
+
+	ten := alertGroupIDs(batch(10))
+	if strings.Contains(ten, "more") {
+		t.Errorf("a batch of exactly 10 was truncated: %q", ten)
+	}
+	if !strings.Contains(ten, "ag-09") {
+		t.Errorf("a batch of exactly 10 lost its last id: %q", ten)
+	}
+
+	eleven := alertGroupIDs(batch(11))
+	if !strings.Contains(eleven, "ag-09") || strings.Contains(eleven, "ag-10") {
+		t.Errorf("a batch of 11 should list ids 00..09 and no more, got %q", eleven)
+	}
+	if !strings.Contains(eleven, "(and 1 more)") {
+		t.Errorf("a batch of 11 does not say how many it left out: %q", eleven)
+	}
+}
+
+// dmTargetsOf lists what the dm steps of a built job would page.
+func dmTargetsOf(t *testing.T, steps []*model.JobStep) []string {
+	t.Helper()
+	var out []string
+	for _, step := range steps {
 		if step.StepType != "dm" {
 			continue
 		}
@@ -1036,8 +1224,19 @@ func TestEngine_OnCallReadFailure_NoSnapshotWritten(t *testing.T) {
 		if err := json.Unmarshal(step.Data, &data); err != nil {
 			t.Fatalf("unmarshal step data: %v", err)
 		}
-		if data.TargetID != "" {
-			t.Errorf("job pages %q after a failed team read, want a marker step", data.TargetID)
-		}
+		out = append(out, data.TargetID)
 	}
+	return out
+}
+
+// counterValue reads a counter without prometheus/testutil, which would promote
+// prometheus/common from an indirect dependency for one assertion. Counters are
+// process-wide, so callers compare a delta rather than an absolute.
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
 }

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -638,38 +640,101 @@ func TestEscalationJobBuilder_TeamScheduleDeleted_NoFallThrough(t *testing.T) {
 	}
 }
 
-// TestEscalationJobBuilder_ProjectionFailure_MarkerStep: a projection that could
-// not be read is not a reason to fail the whole escalation. The step degrades to
-// the marker the executor reports, and the rest of the policy still runs.
-func TestEscalationJobBuilder_ProjectionFailure_MarkerStep(t *testing.T) {
+// TestEscalationJobBuilder_ResolutionUnavailable_CommitsNothing: a read that
+// would not answer defers the whole build instead of degrading to a marker, and
+// the deferral is all-or-nothing, firehose included.
+//
+// A marker is what "nobody is on duty" looks like, and committing one here would
+// say that about a schedule nobody could read - for good, since an alert group
+// with an escalation job is never picked up again. The engine leaves the group
+// new and asks again next tick.
+//
+// The firehose stage is assembled before the policy steps, so returning what was
+// built so far is the tempting shortcut - and it is the defect, not a partial
+// success: the alert group would then own an escalation job, nothing would pick
+// it up again, and the missing stage would be the one that pages the on-call.
+// Delivering the channel a few seconds later is the cheaper half of that trade.
+func TestEscalationJobBuilder_ResolutionUnavailable_CommitsNothing(t *testing.T) {
 	s := store.NewMockStore()
 
-	policyID := "pol-proj-fail"
+	policyID := "pol-firehose-and-schedule"
 	s.CreateEscalationPolicy(&model.EscalationPolicy{
-		ID: policyID, Name: "Projection Failure Policy",
+		ID: policyID, Name: "Firehose And Schedule",
 		Steps: []*model.EscalationStep{
 			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1"},
 		},
 	})
 	ag := &model.AlertGroup{
-		ID: "ag-proj-fail", DedupKey: "dk-proj-fail", TeamID: "team-1",
+		ID: "ag-firehose-and-schedule", DedupKey: "dk-firehose-and-schedule", TeamID: "team-1",
+		Severity: "critical", Status: model.AlertGroupStatusProcessing,
+	}
+	s.CreateAlertGroup(ag)
+
+	cfg := &config.Config{}
+	cfg.Global.FirehoseCriticalChannel = "C_FIREHOSE"
+
+	proj := &fakeProjection{err: errors.New("could not begin transaction")}
+	builder := NewEscalationJobBuilder(s, proj, cfg)
+	job, stages, steps, snapshot, err := buildFor(t, builder, proj, ag, policyID)
+
+	if !errors.Is(err, ErrOnCallResolutionUnavailable) {
+		t.Fatalf("Build error = %v, want ErrOnCallResolutionUnavailable", err)
+	}
+	if job != nil {
+		t.Errorf("job = %+v, want nothing to commit", job)
+	}
+	if stages != nil {
+		t.Errorf("stages = %d, want nothing to commit", len(stages))
+	}
+	if steps != nil {
+		t.Errorf("steps = %d, want nothing to commit - the firehose stage is built first and must not survive", len(steps))
+	}
+	if snapshot != nil {
+		t.Errorf("snapshot = %+v, want nothing to commit", snapshot)
+	}
+}
+
+// TestEscalationJobBuilder_DamagedSchedule_MarkerStep: stored data that cannot be
+// projected keeps the old behaviour, and that is the other half of the rule.
+//
+// Retrying answers nothing here: the snapshot will fail to decode next tick too,
+// and the tick after that, so deferring would trade one lost page for an alert
+// that never reaches anyone at all. The step degrades to the marker the executor
+// reports and the rest of the policy runs - the same trade BulkOnCall makes when
+// it refuses to let one damaged row fail a whole projection.
+func TestEscalationJobBuilder_DamagedSchedule_MarkerStep(t *testing.T) {
+	s := store.NewMockStore()
+
+	policyID := "pol-damaged-sched"
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Damaged Schedule Policy",
+		Steps: []*model.EscalationStep{
+			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1"},
+			{ID: "s2", Provider: "slack", TargetKind: "channel", TargetType: "channel", TargetID: "C_ALERTS"},
+		},
+	})
+	ag := &model.AlertGroup{
+		ID: "ag-damaged-sched", DedupKey: "dk-damaged-sched", TeamID: "team-1",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
 
-	proj := &fakeProjection{err: errors.New("could not begin transaction")}
+	proj := &fakeProjection{err: fmt.Errorf("revision r7: %w", scheduleconfig.ErrSnapshotDecode)}
 	builder := NewEscalationJobBuilder(s, proj, nil)
 	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
 	if err != nil {
-		t.Fatalf("Build failed on an unreadable projection: %v", err)
+		t.Fatalf("Build failed instead of degrading to a marker step: %v", err)
 	}
-	if len(steps) != 1 {
-		t.Fatalf("Expected 1 marker step, got %d", len(steps))
+	if len(steps) != 2 {
+		t.Fatalf("Expected 2 steps (marker + channel), got %d", len(steps))
 	}
-	var data model.EscalationStepData
-	json.Unmarshal(steps[0].Data, &data)
-	if data.TargetID != "" {
-		t.Errorf("Expected an empty marker target, got %s", data.TargetID)
+	var marker model.EscalationStepData
+	json.Unmarshal(steps[0].Data, &marker)
+	if marker.TargetID != "" {
+		t.Errorf("Expected an empty marker target, got %s", marker.TargetID)
+	}
+	if steps[1].StepType != "channel" {
+		t.Errorf("Step 1 should still be the channel step, got %s", steps[1].StepType)
 	}
 }
 
@@ -787,6 +852,9 @@ func TestEscalationJobBuilder_SameScheduleResolvedOnce(t *testing.T) {
 // policy step - a second transaction, which may well succeed, and which may name
 // a schedule this team no longer owns. The alert would then page last quarter's
 // rotation while the alert group, which knows the read failed, records nothing.
+//
+// The fallback staying untouched is the point here; that the build is deferred
+// rather than degraded is the neighbouring rule, asserted so the two cannot drift.
 func TestEscalationJobBuilder_UnreadableTeam_NoFallback(t *testing.T) {
 	s := store.NewMockStore()
 	stale := &model.User{ID: "user-stale", Name: "John"}
@@ -811,42 +879,42 @@ func TestEscalationJobBuilder_UnreadableTeam_NoFallback(t *testing.T) {
 		answers: []scheduleAnswer{{onCall: onDuty("g-old", stale.ID)}},
 	}
 	builder := NewEscalationJobBuilder(s, proj, nil)
-	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
-	if err != nil {
-		t.Fatalf("Build failed instead of degrading to a marker step: %v", err)
+	_, _, _, _, err := buildFor(t, builder, proj, ag, policyID)
+	if !errors.Is(err, ErrOnCallResolutionUnavailable) {
+		t.Fatalf("Build error = %v, want ErrOnCallResolutionUnavailable", err)
 	}
 
 	if proj.scheduleCalls != 0 {
 		t.Errorf("the fallback schedule was read %d times after a failed team read, want 0", proj.scheduleCalls)
 	}
-	targets := dmTargets(t, steps)
-	if len(targets) != 1 || targets[0] != "" {
-		t.Fatalf("job pages %v, want a single empty marker step", targets)
-	}
 }
 
-// TestEscalationJobBuilder_FailedScheduleReadIsRemembered: a read that failed is
+// TestEscalationJobBuilder_DamagedScheduleReadIsRemembered: a read that failed is
 // an answer to remember too.
 //
 // Cache only the successes and the second step re-reads: one build then produces
 // a marker for the first step and a real recipient for the second, which is
 // precisely the "one schedule, two answers" this memo exists to prevent.
-func TestEscalationJobBuilder_FailedScheduleReadIsRemembered(t *testing.T) {
+//
+// The case is damaged data on purpose. Any other failure defers the whole build
+// at the first step, and a memo proves nothing about a loop that stops - here
+// the build carries on, so the second step really can ask again.
+func TestEscalationJobBuilder_DamagedScheduleReadIsRemembered(t *testing.T) {
 	s := store.NewMockStore()
 	user := &model.User{ID: "user-1", Name: "Alice"}
 	s.CreateUser(user)
 
-	policyID := "pol-transient-schedule"
+	policyID := "pol-damaged-schedule"
 	twoScheduleStepPolicy(t, s, policyID, "sched-1")
 	ag := &model.AlertGroup{
-		ID: "ag-transient-schedule", DedupKey: "dk-transient-schedule", TeamID: "team-without-schedule",
+		ID: "ag-damaged-schedule", DedupKey: "dk-damaged-schedule", TeamID: "team-without-schedule",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
 
-	// The first read fails; the second would have succeeded.
+	// The first read finds damage; the second would have answered.
 	proj := &countingProjection{answers: []scheduleAnswer{
-		{err: errors.New("could not begin transaction")},
+		{err: fmt.Errorf("revision r7: %w", scheduleconfig.ErrSnapshotDecode)},
 		{onCall: onDuty("g-a", user.ID)},
 	}}
 	builder := NewEscalationJobBuilder(s, proj, nil)
@@ -863,10 +931,10 @@ func TestEscalationJobBuilder_FailedScheduleReadIsRemembered(t *testing.T) {
 		t.Fatalf("expected 2 dm steps, got %d: %v", len(targets), targets)
 	}
 	if targets[0] != targets[1] {
-		t.Errorf("one job pages %q and %q for the same schedule after a transient failure", targets[0], targets[1])
+		t.Errorf("one job pages %q and %q for the same damaged schedule", targets[0], targets[1])
 	}
 	if targets[0] != "" {
-		t.Errorf("job pages %q from a read that failed, want a marker", targets[0])
+		t.Errorf("job pages %q from a schedule that could not be projected, want a marker", targets[0])
 	}
 }
 
@@ -887,12 +955,13 @@ func (f *flakyUserStore) GetUsersByIDs(ids []string) ([]*model.User, error) {
 }
 
 // TestEscalationJobBuilder_TeamOnCallHydratedOnce: the team's answer is turned
-// into people once per job.
+// into people once per job, and a hydration that failed defers the build.
 //
-// The projection is fixed for the build, but hydration is a database read of its
-// own. Repeat it per step and a transient failure hands one step a marker and the
-// next one real recipients - one job disagreeing with itself about who is on
-// call, which is the very thing reading the projection once was meant to stop.
+// Hydration is a database read of its own, so it fails the way reads fail, and
+// its failure means the same thing as a projection that would not answer: the
+// recipients are unknown, not absent. Repeating the read per step would have one
+// job disagree with itself about who is on call; committing it either way would
+// page nobody for good.
 func TestEscalationJobBuilder_TeamOnCallHydratedOnce(t *testing.T) {
 	mock := store.NewMockStore()
 	user := &model.User{ID: "user-1", Name: "Alice"}
@@ -913,9 +982,9 @@ func TestEscalationJobBuilder_TeamOnCallHydratedOnce(t *testing.T) {
 		"team-1": teamSchedule("sched-current", onDuty("g-a", user.ID)),
 	}}
 	builder := NewEscalationJobBuilder(s, proj, nil)
-	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
-	if err != nil {
-		t.Fatalf("Build failed instead of degrading to marker steps: %v", err)
+	_, _, _, _, err := buildFor(t, builder, proj, ag, policyID)
+	if !errors.Is(err, ErrOnCallResolutionUnavailable) {
+		t.Fatalf("Build error = %v, want ErrOnCallResolutionUnavailable", err)
 	}
 
 	if s.calls != 1 {
@@ -923,16 +992,6 @@ func TestEscalationJobBuilder_TeamOnCallHydratedOnce(t *testing.T) {
 	}
 	if proj.scheduleCalls != 0 {
 		t.Errorf("the fallback schedule was read %d times although the team has one, want 0", proj.scheduleCalls)
-	}
-	targets := dmTargets(t, steps)
-	if len(targets) != 2 {
-		t.Fatalf("expected 2 dm steps, got %d: %v", len(targets), targets)
-	}
-	if targets[0] != targets[1] {
-		t.Errorf("one job pages %q and %q for the same team after a transient failure", targets[0], targets[1])
-	}
-	if targets[0] != "" {
-		t.Errorf("job pages %q from a hydration that failed, want a marker", targets[0])
 	}
 }
 

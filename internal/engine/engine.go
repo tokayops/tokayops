@@ -2,7 +2,10 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/config"
@@ -75,12 +78,35 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 	}
 	metrics.EngineAlertGroupsPickedTotal.Add(float64(len(alertGroups)))
 
-	for _, ag := range alertGroups {
-		if ag.Status == model.AlertGroupStatusProcessing {
-			log.Printf("AlertEngine: Reconciling stale processing AG %s (stuck since %s)", ag.ID, ag.UpdatedAt.Format(time.RFC3339))
-		}
-		log.Printf("AlertEngine: Processing %s (Team: %s, Sev: %s)", ag.ID, ag.TeamID, ag.Severity)
+	// The tick names the batch before it touches it, because every other line
+	// below is written after the work it describes. Without this one, a hang or
+	// a panic - in resolvePolicy, which reads the database without a context at
+	// all, or anywhere inside Build - leaves nothing at all to go on, and a
+	// poison group in a crash loop cannot be narrowed down.
+	//
+	// One line per tick rather than one per group: a group that cannot be built
+	// is back in the next tick's batch, so anything written per group is written
+	// again every second for as long as the trouble lasts.
+	//
+	// It BOUNDS the search, it does not name the culprit, and the two ways it
+	// falls short are worth knowing before relying on it. A group deferred
+	// earlier in the same tick has no Processing line either, and the tally that
+	// would have named it never runs when a later group hangs - so the candidates
+	// are every listed group without a Processing line, not one. And past the cap
+	// the ids are not printed at all. Naming the group exactly needs a watchdog
+	// over the group in flight, which is separate work.
+	if len(alertGroups) > 0 {
+		log.Printf("AlertEngine: tick picked %d group(s): %s", len(alertGroups), alertGroupIDs(alertGroups))
+	}
 
+	// A deferred alert group stays "new", so this tick's answer is next tick's
+	// question. The count, the first group and the first error are collected
+	// here and reported once for the whole tick instead.
+	deferred := 0
+	deferredFirst := ""
+	var deferredErr error
+
+	for _, ag := range alertGroups {
 		// Resolve Policy (may be empty - that's OK for firehose-only)
 		policyID := e.resolvePolicy(ag.TeamID, ag.Severity)
 
@@ -94,12 +120,41 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		// sends it looking for the schedule ID stored on the policy step, which
 		// may name a schedule this team no longer owns.
 		teamOnCall := schedulerender.TeamOnCallRead(e.oncall.CurrentTeamOnCallNow(ctx, ag.TeamID))
-		if err := teamOnCall.Err(); err != nil {
-			log.Printf("AlertEngine: Failed to fetch oncall for %s: %v", ag.ID, err)
-		}
 
 		// Build unified job (includes firehose as step 0 if configured)
 		job, stages, steps, snapshot, err := e.escBuilder.Build(ctx, ag, policyID, teamOnCall)
+
+		// The recipients could not be resolved, so no job is committed and the
+		// alert group stays "new" for the next tick to try again. Committing
+		// one would spend this alert's only chance to page its on-call: nothing
+		// picks up an alert group that already has an escalation job.
+		//
+		// Nothing is logged for this group: it will be back next tick, and the
+		// tick after that. The tally declared above the loop reports all of
+		// them in one line once the loop is done.
+		if errors.Is(err, builders.ErrOnCallResolutionUnavailable) {
+			metrics.EngineEscalationBuildDeferralsTotal.Inc()
+			deferred++
+			if deferredErr == nil {
+				deferredErr = err
+				deferredFirst = ag.ID
+			}
+			continue
+		}
+
+		// Everything the tick says about this group individually is said here,
+		// after the decision to keep it, and never for a group it deferred.
+		if ag.Status == model.AlertGroupStatusProcessing {
+			log.Printf("AlertEngine: Reconciling stale processing AG %s (stuck since %s)", ag.ID, ag.UpdatedAt.Format(time.RFC3339))
+		}
+		log.Printf("AlertEngine: Processing %s (Team: %s, Sev: %s)", ag.ID, ag.TeamID, ag.Severity)
+		// Still reachable, and worth one line: a policy with no schedule-typed
+		// step builds fine without this answer, and damaged schedule data
+		// degrades to a marker rather than deferring. Both commit a job, so
+		// this group is processed once rather than every tick.
+		if err := teamOnCall.Err(); err != nil {
+			log.Printf("AlertEngine: Failed to fetch oncall for %s: %v", ag.ID, err)
+		}
 
 		if err != nil {
 			// Build failed — leave AG as "new" so it retries on next tick
@@ -150,6 +205,33 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 			log.Printf("AlertEngine: Failed to save oncall snapshot for %s: %v", ag.ID, err)
 		}
 	}
+
+	if deferred > 0 {
+		log.Printf("AlertEngine: deferred %d alert group(s), first %s - on-call recipients could not be resolved, the next tick retries: %v",
+			deferred, deferredFirst, deferredErr)
+	}
+}
+
+// alertGroupIDs names the batch a tick picked up, capped so that a storm does
+// not turn one breadcrumb into one enormous line. The order is the order the
+// loop works in, which is what lets a reader narrow a hang down to the groups
+// that never reported back. What the cap leaves out is counted, not hidden -
+// a reader who sees "and N more" knows the answer may be outside the list.
+func alertGroupIDs(ags []*model.AlertGroup) string {
+	const shown = 10
+
+	var b strings.Builder
+	for i, ag := range ags {
+		if i == shown {
+			fmt.Fprintf(&b, " (and %d more)", len(ags)-i)
+			break
+		}
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(ag.ID)
+	}
+	return b.String()
 }
 
 // onCallSnapshot records who was on duty when the alert arrived.
