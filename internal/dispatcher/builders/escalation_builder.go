@@ -133,7 +133,6 @@ func (b *EscalationJobBuilder) Build(ctx context.Context, ag *model.AlertGroup, 
 	}
 
 	jobID := uuid.New().String()
-	dedupKey := ag.DedupKey
 	now := time.Now()
 
 	snapshot := &model.EscalationPolicySnapshot{
@@ -143,13 +142,12 @@ func (b *EscalationJobBuilder) Build(ctx context.Context, ag *model.AlertGroup, 
 		snapshot.Name = policy.Name
 	}
 
-	agID := ag.ID
+	// Identity, type and alert group are not set here: EnsureEscalationJob
+	// derives all three from the group it locks, so this builder cannot hand it
+	// a job that contradicts itself.
 	job := &model.Job{
 		ID:           jobID,
-		Type:         "escalation",
 		Status:       model.JobStatusPending,
-		DedupKey:     &dedupKey,
-		AlertGroupID: &agID,
 		CurrentStage: 0,
 		CreatedAt:    now,
 		UpdatedAt:    now,

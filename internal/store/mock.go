@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/integrations"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
@@ -130,12 +131,12 @@ func (m *MockStore) Close() error {
 // Alert Groups (renamed from Incidents)
 // ========================================
 
-func (m *MockStore) GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error) {
+func (m *MockStore) GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	for _, ag := range m.alertGroups {
-		if ag.DedupKey == dedupKey &&
+		if ag.AlertKey == alertKey &&
 			ag.Status != model.AlertGroupStatusResolved &&
 			ag.Status != model.AlertGroupStatusClosed {
 			return m.copyAlertGroup(ag), nil
@@ -192,7 +193,14 @@ func (m *MockStore) insertOutboxEvent(event *model.OutboxEvent) {
 	m.outboxEvents[event.ID] = event
 }
 
-func (m *MockStore) UpdateAlertGroupStatus(id string, status model.AlertGroupStatus) error {
+// SetAlertGroupStatus puts a group into a status whatever it is in now.
+//
+// A test fixture, deliberately absent from StoreInterface: production changes a
+// group's status through TransitionAlertGroupStatus, which has to say what it
+// expected to find. Tests that rewind a group to set up the next assertion have
+// no such expectation to state, and saying so here is better than keeping an
+// unconditional setter in the contract for their sake.
+func (m *MockStore) SetAlertGroupStatus(id string, status model.AlertGroupStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -203,20 +211,6 @@ func (m *MockStore) UpdateAlertGroupStatus(id string, status model.AlertGroupSta
 			now := time.Now()
 			ag.ResolvedAt = &now
 		}
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
-func (m *MockStore) UpdateAlertGroupAcknowledged(id string, acknowledgedBy string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if ag, ok := m.alertGroups[id]; ok {
-		ag.Status = model.AlertGroupStatusAcknowledged
-		ag.AcknowledgedBy = acknowledgedBy
-		ag.AckProcessedAt = nil // Clear to allow re-processing on re-ack
-		ag.UpdatedAt = time.Now()
 		return nil
 	}
 	return sql.ErrNoRows
@@ -588,7 +582,7 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 			}
 		}
 		filtered = append(filtered, &model.AlertGroupSummary{
-			ID: ag.ID, DedupKey: ag.DedupKey, Status: ag.Status, Title: ag.Title,
+			ID: ag.ID, AlertKey: ag.AlertKey, Status: ag.Status, Title: ag.Title,
 			TeamID: ag.TeamID, Severity: ag.Severity, CurrentStep: ag.CurrentStep,
 			OnCallSnapshot: ag.OnCallSnapshot, ExternalURL: ag.ExternalURL,
 			AcknowledgedBy: ag.AcknowledgedBy, ResolvedBy: ag.ResolvedBy,
@@ -656,7 +650,7 @@ func (m *MockStore) TouchAlertGroup(id string) error {
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -689,12 +683,12 @@ func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string
 
 	m.insertOutboxEvent(outboxEvent)
 
-	m.cancelJobByDedupKeyLocked(dedupKey)
+	m.cancelEscalationJobByAlertGroupIDLocked(id)
 
 	return true, nil
 }
 
-func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -727,12 +721,12 @@ func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]st
 
 	m.insertOutboxEvent(outboxEvent)
 
-	m.cancelJobByDedupKeyLocked(dedupKey)
+	m.cancelEscalationJobByAlertGroupIDLocked(id)
 
 	return true, nil
 }
 
-func (m *MockStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (m *MockStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -764,20 +758,44 @@ func (m *MockStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.
 	}
 
 	m.insertOutboxEvent(outboxEvent)
-	m.cancelJobByDedupKeyLocked(dedupKey)
+	m.cancelEscalationJobByAlertGroupIDLocked(id)
 
 	return true, nil
 }
 
-// cancelJobByDedupKeyLocked cancels jobs matching dedupKey. Caller must hold m.mu.
-func (m *MockStore) cancelJobByDedupKeyLocked(dedupKey string) {
-	if dedupKey == "" {
+// cancelEscalationJobByAlertGroupIDLocked cancels one alert group's escalation
+// job, its active stages and its pending steps. Caller must hold m.mu.
+//
+// One helper, because there is one cancellation. Before Epic 11 the mock held
+// three different answers to the same question: the transitions cancelled the
+// job alone, the public method cancelled the job and its stages, and neither
+// touched steps - while the real store cancelled all three. A double that
+// disagrees with the store is a test that proves the wrong thing.
+func (m *MockStore) cancelEscalationJobByAlertGroupIDLocked(alertGroupID string) {
+	if alertGroupID == "" {
 		return
 	}
 	for _, job := range m.jobs {
-		if job.DedupKey != nil && *job.DedupKey == dedupKey {
-			if job.Status == model.JobStatusPending || job.Status == model.JobStatusRunning {
-				job.Status = model.JobStatusCanceled
+		if job.Type != escalationJobType() || job.AlertGroupID == nil || *job.AlertGroupID != alertGroupID {
+			continue
+		}
+		if job.Status != model.JobStatusPending && job.Status != model.JobStatusRunning {
+			continue
+		}
+		job.Status = model.JobStatusCanceled
+
+		for _, stage := range m.jobStages {
+			if stage.JobID == job.ID &&
+				(stage.Status == model.JobStageStatusActive || stage.Status == model.JobStageStatusBlocked) {
+				stage.Status = model.JobStageStatusCanceled
+			}
+		}
+		for _, step := range m.jobSteps {
+			if step.JobID == job.ID &&
+				(step.Status == model.JobStepStatusPending ||
+					step.Status == model.JobStepStatusBlocked ||
+					step.Status == model.JobStepStatusRetry) {
+				step.Status = model.JobStepStatusCanceled
 			}
 		}
 	}
@@ -813,16 +831,42 @@ func (m *MockStore) MarkAckProcessed(agID string) error {
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) SetSlackUpdatePending(id string, pending bool) error {
+// UpdateAlertGroupAlertsAndRaiseSlackUpdate mirrors the store: the alerts, the
+// flag and its version move in one write, so no state exists in which the alert
+// is recorded and the gate is down.
+func (m *MockStore) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ag, ok := m.alertGroups[id]; ok {
-		ag.SlackUpdatePending = pending
-		ag.UpdatedAt = time.Now()
-		return nil
+	ag, ok := m.alertGroups[id]
+	if !ok {
+		return sql.ErrNoRows
 	}
-	return sql.ErrNoRows
+	ag.Alerts = append([]model.Alert(nil), alerts...)
+	ag.SlackUpdatePending = true
+	ag.SlackUpdateGeneration++
+	ag.UpdatedAt = time.Now()
+	return nil
+}
+
+// ClearSlackUpdate mirrors the store's conditional clear, including the answer
+// it gives when a newer raise has overtaken the caller.
+func (m *MockStore) ClearSlackUpdate(id string, observedGeneration int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ag, ok := m.alertGroups[id]
+	if !ok {
+		// The store answers the same way: nothing was lowered, and saying so is
+		// not an error either implementation reports.
+		return false, nil
+	}
+	if ag.SlackUpdateGeneration != observedGeneration {
+		return false, nil
+	}
+	ag.SlackUpdatePending = false
+	ag.UpdatedAt = time.Now()
+	return true, nil
 }
 
 func (m *MockStore) GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error) {
@@ -1801,11 +1845,42 @@ func (m *MockStore) CountAdmins() (int, error) {
 }
 
 // Jobs Mocks (Phase 2)
-// NOTE: We add a map to store jobs for testing
-func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// Initialize maps if needed (hack for existing tests)
+
+// dedupClaimHeld is the mock's whole model of the two partial indexes, and the
+// reason it is one function is that the store has one insert point: a rule
+// written twice is a rule that drifts, which is exactly how the mock used to
+// disagree with the database.
+//
+// Identity is (namespace, key). Scope decides which existing rows count:
+// forever means any job ever admitted under that identity, while_active means
+// only one that has not finished.
+// A scope this build has no rule for is an error rather than a silent answer,
+// the same way the store refuses to insert without a conflict clause: the
+// dangerous reading here is "false", which admits the job and calls it
+// deduplicated.
+func (m *MockStore) dedupClaimHeld(spec *jobdedup.Spec) (bool, error) {
+	if spec.Scope() != jobdedup.ScopeWhileActive && spec.Scope() != jobdedup.ScopeForever {
+		return false, fmt.Errorf("scope %q has no uniqueness rule in this build", spec.Scope())
+	}
+
+	for _, existing := range m.jobs {
+		if existing.Dedup == nil {
+			continue
+		}
+		if existing.Dedup.Namespace() != spec.Namespace() || existing.Dedup.Key() != spec.Key() {
+			continue
+		}
+		if spec.Scope() == jobdedup.ScopeForever {
+			return true, nil
+		}
+		if existing.Status == model.JobStatusPending || existing.Status == model.JobStatusRunning {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *MockStore) initJobMaps() {
 	if m.jobs == nil {
 		m.jobs = make(map[string]*model.Job)
 	}
@@ -1815,22 +1890,11 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 	if m.jobSteps == nil {
 		m.jobSteps = make(map[string]*model.JobStep)
 	}
+}
 
-	// Implement dedup: check if job with same dedup_key exists and is pending/running
-	if job.DedupKey != nil {
-		for _, existing := range m.jobs {
-			if existing.DedupKey != nil && *existing.DedupKey == *job.DedupKey {
-				if existing.Status == model.JobStatusPending || existing.Status == model.JobStatusRunning {
-					// Dedup: return existing job ID, nothing was created
-					return existing.ID, false, nil
-				}
-			}
-		}
-	}
-
+func (m *MockStore) storeJob(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) {
 	jobCopy := *job
 	m.jobs[job.ID] = &jobCopy
-
 	for _, stage := range stages {
 		stageCopy := *stage
 		m.jobStages[stage.ID] = &stageCopy
@@ -1839,7 +1903,32 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 		stepCopy := *step
 		m.jobSteps[step.ID] = &stepCopy
 	}
-	return job.ID, true, nil
+}
+
+func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
+	if err := refuseEscalationHere(job); err != nil {
+		return false, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.initJobMaps()
+
+	if err := job.Dedup.Validate(); err != nil {
+		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
+	}
+	job.Type = job.Dedup.JobType()
+
+	held, err := m.dedupClaimHeld(job.Dedup)
+	if err != nil {
+		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
+	}
+	if held {
+		return false, nil
+	}
+
+	m.storeJob(job, stages, steps)
+	return true, nil
 }
 
 // EnsureEscalationJob atomically transitions an AG from new/processing → processing
@@ -1863,7 +1952,10 @@ func (m *MockStore) EnsureEscalationJob(agID string, job *model.Job, stages []*m
 		return false, fmt.Errorf("alert group %s not found", agID)
 	}
 
-	// Only new or processing are eligible
+	// Only new or processing are eligible. Checked before anything is written -
+	// including the caller's job, which the store also leaves untouched when it
+	// returns here: a double that had already stamped it would let a test read
+	// a job production never produced.
 	if ag.Status != model.AlertGroupStatusNew && ag.Status != model.AlertGroupStatusProcessing {
 		return false, nil
 	}
@@ -1872,25 +1964,24 @@ func (m *MockStore) EnsureEscalationJob(agID string, job *model.Job, stages []*m
 	ag.Status = model.AlertGroupStatusProcessing
 	ag.UpdatedAt = time.Now()
 
-	// Dedup: check if ANY escalation job exists for this AG (any status)
-	for _, existing := range m.jobs {
-		if existing.AlertGroupID != nil && *existing.AlertGroupID == agID && existing.Type == "escalation" {
-			// Escalation already exists (any status) — don't create duplicate
-			return false, nil
-		}
+	// Everything that says "the escalation of THIS group" is set here, from the
+	// one argument that says which group it is - as the store does, and for the
+	// same reason: a caller able to supply them separately is a caller able to
+	// contradict itself.
+	job.Dedup = jobdedup.Escalation(agID)
+	job.AlertGroupID = &agID
+	job.Type = job.Dedup.JobType()
+
+	// An escalation is claimed forever, so a job of any status is the answer.
+	held, err := m.dedupClaimHeld(job.Dedup)
+	if err != nil {
+		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
+	}
+	if held {
+		return false, nil
 	}
 
-	// Create job + stages + steps
-	jobCopy := *job
-	m.jobs[job.ID] = &jobCopy
-	for _, stage := range stages {
-		stageCopy := *stage
-		m.jobStages[stage.ID] = &stageCopy
-	}
-	for _, step := range steps {
-		stepCopy := *step
-		m.jobSteps[step.ID] = &stepCopy
-	}
+	m.storeJob(job, stages, steps)
 
 	// Save snapshot
 	if snapshot != nil {
@@ -1920,33 +2011,87 @@ func (m *MockStore) GetJobByID(id string) (*model.Job, error) {
 	return nil, sql.ErrNoRows
 }
 
-func (m *MockStore) GetJobByDedupKey(dedupKey string) (*model.Job, error) {
+// SeedEscalationJob puts an escalation job in the double the way
+// EnsureEscalationJob would have.
+//
+// It exists because production admits escalations through exactly one door, and
+// some states a test needs are on the far side of it: a group that has been
+// acknowledged or triggered while its escalation is still in flight cannot be
+// reached through EnsureEscalationJob, which refuses those statuses on purpose.
+func (m *MockStore) SeedEscalationJob(agID string, job *model.Job, stages []*model.JobStage, steps []*model.JobStep) error {
+	// Derived from the group, exactly as EnsureEscalationJob does it: a fixture
+	// that could name the three columns separately could build the
+	// contradictory row the schema forbids, and then a test would be proving
+	// behaviour over a state production cannot reach.
+	job.Dedup = jobdedup.Escalation(agID)
+	job.AlertGroupID = &agID
+	job.Type = job.Dedup.JobType()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.initJobMaps()
+
+	// "The way EnsureEscalationJob would have" includes refusing when the claim
+	// is already held: a double holding two escalations for one group is a
+	// state the database cannot represent.
+	held, err := m.dedupClaimHeld(job.Dedup)
+	if err != nil {
+		return fmt.Errorf("seed job %s: %w", job.ID, err)
+	}
+	if held {
+		return fmt.Errorf("seed job %s: the escalation of %s is already claimed", job.ID, agID)
+	}
+
+	m.storeJob(job, stages, steps)
+	return nil
+}
+
+// FindJobByIdentity is a test helper: the engine creates jobs internally, so a
+// test never learns their IDs and has to ask by identity instead.
+//
+// It is not a method the interface grew. The store used to expose a lookup by
+// dedup key that no production code ever called, and renaming that into a lookup
+// by identity would have kept a contract with no product - so the lookup lives
+// here, on the double, where the only callers are.
+func (m *MockStore) FindJobByIdentity(spec *jobdedup.Spec) (*model.Job, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var latest *model.Job
 	for _, j := range m.jobs {
-		if j.DedupKey != nil && *j.DedupKey == dedupKey {
-			if latest == nil || j.CreatedAt.After(latest.CreatedAt) {
-				latest = j
-			}
+		if j.Dedup == nil || j.Dedup.Namespace() != spec.Namespace() || j.Dedup.Key() != spec.Key() {
+			continue
+		}
+		if latest == nil || j.CreatedAt.After(latest.CreatedAt) {
+			latest = j
 		}
 	}
-	if latest != nil {
-		jobCopy := *latest
-		return &jobCopy, nil
+	if latest == nil {
+		return nil, sql.ErrNoRows
 	}
-	return nil, sql.ErrNoRows
+	jobCopy := *latest
+	return &jobCopy, nil
 }
 
-// MarkJobSucceeded is a test helper to mark a job as succeeded by dedup key
-func (m *MockStore) MarkJobSucceeded(dedupKey string) {
+// MarkJobSucceeded is a test helper for ageing a job the engine created
+// internally, so the test never sees its ID. It takes the identity a producer
+// would build rather than a bare string: a raw key in a test is the same guess
+// about namespaces that the model exists to remove.
+func (m *MockStore) MarkJobSucceeded(spec *jobdedup.Spec) {
+	m.MarkJobFinished(spec, model.JobStatusSucceeded)
+}
+
+// MarkJobFinished is the same helper for the terminal statuses that are not
+// success. Which of them a job ended in is the whole question for a
+// while_active identity - it is free again - and equally the whole question for
+// a forever one, which is not.
+func (m *MockStore) MarkJobFinished(spec *jobdedup.Spec, status model.JobStatus) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	for _, j := range m.jobs {
-		if j.DedupKey != nil && *j.DedupKey == dedupKey {
-			j.Status = model.JobStatusSucceeded
+		if j.Dedup != nil && j.Dedup.Namespace() == spec.Namespace() && j.Dedup.Key() == spec.Key() {
+			j.Status = status
 			return
 		}
 	}
@@ -2141,34 +2286,17 @@ func (m *MockStore) FinishStepAndAdvance(stepID string, leaseToken string, outco
 
 	return model.AdvanceUnlockedNextStage, nil
 }
-func (m *MockStore) CancelJobByDedupKey(dedupKey string) error {
+func (m *MockStore) CancelEscalationJobByAlertGroupID(alertGroupID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for _, job := range m.jobs {
-		if job.DedupKey != nil && *job.DedupKey == dedupKey {
-			if job.Status == model.JobStatusPending || job.Status == model.JobStatusRunning {
-				job.Status = model.JobStatusCanceled
-				// Cancel active/blocked stages
-				for _, stage := range m.jobStages {
-					if stage.JobID == job.ID {
-						if stage.Status == model.JobStageStatusActive || stage.Status == model.JobStageStatusBlocked {
-							stage.Status = model.JobStageStatusCanceled
-						}
-					}
-				}
-			}
-		}
-	}
+	m.cancelEscalationJobByAlertGroupIDLocked(alertGroupID)
 	return nil
 }
+
 func (m *MockStore) ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error {
 	return nil
 }
-func (m *MockStore) GetJobsByIDs(ids []string) (map[string]*model.Job, error) {
-	return make(map[string]*model.Job), nil
-}
-
 func (m *MockStore) FailJob(jobID, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

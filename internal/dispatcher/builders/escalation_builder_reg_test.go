@@ -44,7 +44,7 @@ func TestEscalationJobBuilder_MessagePropagation(t *testing.T) {
 	// Setup AlertGroup
 	ag := &model.AlertGroup{
 		ID:       "ag-1",
-		DedupKey: "dedup-1",
+		AlertKey: "dedup-1",
 		Status:   model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -93,7 +93,7 @@ func TestEscalationJobBuilder_TelegramStepPropagation(t *testing.T) {
 		},
 	})
 
-	ag := &model.AlertGroup{ID: "ag-tg", DedupKey: "dk-tg", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-tg", AlertKey: "dk-tg", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
 	_, _, steps, _, err := buildFor(t, builder, proj, ag, policyID)
@@ -141,7 +141,7 @@ func TestEscalationJobBuilder_TelegramScheduleFanOut(t *testing.T) {
 		},
 	})
 
-	ag := &model.AlertGroup{ID: "ag-tg-fanout", DedupKey: "dk-tg-fanout", TeamID: "team-1", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-tg-fanout", AlertKey: "dk-tg-fanout", TeamID: "team-1", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
 	// Empty cfg → no firehose stage prepended.
@@ -209,7 +209,7 @@ func TestEscalationJobBuilder_ContinueOnFailurePropagation(t *testing.T) {
 	// Setup AlertGroup
 	ag := &model.AlertGroup{
 		ID:       "ag-cof-1",
-		DedupKey: "dedup-cof-1",
+		AlertKey: "dedup-cof-1",
 		Status:   model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -277,7 +277,7 @@ func TestEscalationJobBuilder_ScheduleFanOut(t *testing.T) {
 		},
 	})
 
-	ag := &model.AlertGroup{ID: "ag-fanout", DedupKey: "dk-fanout", TeamID: "team-1", Severity: "warning", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-fanout", AlertKey: "dk-fanout", TeamID: "team-1", Severity: "warning", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
 	builder := NewEscalationJobBuilder(s, proj, cfg)
@@ -367,7 +367,7 @@ func TestEscalationJobBuilder_ScheduleOverride(t *testing.T) {
 		},
 	})
 
-	ag := &model.AlertGroup{ID: "ag-ov", DedupKey: "dk-ov", TeamID: "team-1", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-ov", AlertKey: "dk-ov", TeamID: "team-1", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
 	builder := NewEscalationJobBuilder(s, proj, nil)
@@ -423,7 +423,7 @@ func TestEscalationJobBuilder_StaleScheduleID_ResolvesCurrentUser(t *testing.T) 
 
 	// AlertGroup belongs to team-1
 	ag := &model.AlertGroup{
-		ID: "ag-stale", DedupKey: "dk-stale", TeamID: "team-1",
+		ID: "ag-stale", AlertKey: "dk-stale", TeamID: "team-1",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -477,7 +477,7 @@ func TestEscalationJobBuilder_DeletedSchedule_ResolvesCurrentUser(t *testing.T) 
 	}
 
 	ag := &model.AlertGroup{
-		ID: "ag-deleted", DedupKey: "dk-deleted", TeamID: "team-1",
+		ID: "ag-deleted", AlertKey: "dk-deleted", TeamID: "team-1",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -519,7 +519,7 @@ func TestEscalationJobBuilder_ScheduleEmpty(t *testing.T) {
 		},
 	})
 
-	ag := &model.AlertGroup{ID: "ag-empty", DedupKey: "dk-empty", TeamID: "team-1", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-empty", AlertKey: "dk-empty", TeamID: "team-1", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
 	builder := NewEscalationJobBuilder(s, proj, nil)
@@ -563,7 +563,7 @@ func TestEscalationJobBuilder_UnknownScheduleTarget_MarkerStep(t *testing.T) {
 	})
 
 	ag := &model.AlertGroup{
-		ID: "ag-unknown-sched", DedupKey: "dk-unknown-sched", TeamID: "team-without-schedule",
+		ID: "ag-unknown-sched", AlertKey: "dk-unknown-sched", TeamID: "team-without-schedule",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -610,7 +610,7 @@ func TestEscalationJobBuilder_TeamScheduleDeleted_NoFallThrough(t *testing.T) {
 	})
 
 	ag := &model.AlertGroup{
-		ID: "ag-team-deleted", DedupKey: "dk-team-deleted", TeamID: "team-1",
+		ID: "ag-team-deleted", AlertKey: "dk-team-deleted", TeamID: "team-1",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -665,7 +665,7 @@ func TestEscalationJobBuilder_ResolutionUnavailable_CommitsNothing(t *testing.T)
 		},
 	})
 	ag := &model.AlertGroup{
-		ID: "ag-firehose-and-schedule", DedupKey: "dk-firehose-and-schedule", TeamID: "team-1",
+		ID: "ag-firehose-and-schedule", AlertKey: "dk-firehose-and-schedule", TeamID: "team-1",
 		Severity: "critical", Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -714,7 +714,7 @@ func TestEscalationJobBuilder_DamagedSchedule_MarkerStep(t *testing.T) {
 		},
 	})
 	ag := &model.AlertGroup{
-		ID: "ag-damaged-sched", DedupKey: "dk-damaged-sched", TeamID: "team-1",
+		ID: "ag-damaged-sched", AlertKey: "dk-damaged-sched", TeamID: "team-1",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -817,7 +817,7 @@ func TestEscalationJobBuilder_SameScheduleResolvedOnce(t *testing.T) {
 	twoScheduleStepPolicy(t, s, policyID, "sched-1")
 	// No team schedule, so both steps take the fallback-by-ID path.
 	ag := &model.AlertGroup{
-		ID: "ag-same-schedule", DedupKey: "dk-same-schedule", TeamID: "team-without-schedule",
+		ID: "ag-same-schedule", AlertKey: "dk-same-schedule", TeamID: "team-without-schedule",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -868,7 +868,7 @@ func TestEscalationJobBuilder_UnreadableTeam_NoFallback(t *testing.T) {
 		},
 	})
 	ag := &model.AlertGroup{
-		ID: "ag-unreadable-team", DedupKey: "dk-unreadable-team", TeamID: "team-1",
+		ID: "ag-unreadable-team", AlertKey: "dk-unreadable-team", TeamID: "team-1",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -907,7 +907,7 @@ func TestEscalationJobBuilder_DamagedScheduleReadIsRemembered(t *testing.T) {
 	policyID := "pol-damaged-schedule"
 	twoScheduleStepPolicy(t, s, policyID, "sched-1")
 	ag := &model.AlertGroup{
-		ID: "ag-damaged-schedule", DedupKey: "dk-damaged-schedule", TeamID: "team-without-schedule",
+		ID: "ag-damaged-schedule", AlertKey: "dk-damaged-schedule", TeamID: "team-without-schedule",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	s.CreateAlertGroup(ag)
@@ -970,7 +970,7 @@ func TestEscalationJobBuilder_TeamOnCallHydratedOnce(t *testing.T) {
 	policyID := "pol-team-hydration"
 	twoScheduleStepPolicy(t, mock, policyID, "sched-1")
 	ag := &model.AlertGroup{
-		ID: "ag-team-hydration", DedupKey: "dk-team-hydration", TeamID: "team-1",
+		ID: "ag-team-hydration", AlertKey: "dk-team-hydration", TeamID: "team-1",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	mock.CreateAlertGroup(ag)
@@ -1005,7 +1005,7 @@ func TestEscalationJobBuilder_TeamOnCallHydrationIsShared(t *testing.T) {
 	policyID := "pol-team-hydration-ok"
 	twoScheduleStepPolicy(t, mock, policyID, "sched-1")
 	ag := &model.AlertGroup{
-		ID: "ag-team-hydration-ok", DedupKey: "dk-team-hydration-ok", TeamID: "team-1",
+		ID: "ag-team-hydration-ok", AlertKey: "dk-team-hydration-ok", TeamID: "team-1",
 		Status: model.AlertGroupStatusProcessing,
 	}
 	mock.CreateAlertGroup(ag)

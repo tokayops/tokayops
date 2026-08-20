@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -46,14 +47,12 @@ func (b *ResolutionJobBuilder) Build(ag *model.AlertGroup) (*model.Job, []*model
 
 	// Job Setup
 	jobID := uuid.New().String()
-	dedupKey := "resolve_" + ag.ID
 	now := time.Now()
 
 	job := &model.Job{
 		ID:           jobID,
-		Type:         "resolution",
 		Status:       model.JobStatusPending,
-		DedupKey:     &dedupKey,
+		Dedup:        jobdedup.Resolution(ag.ID),
 		CurrentStage: 0,
 		Payload:      json.RawMessage("{}"),
 		CreatedAt:    now,

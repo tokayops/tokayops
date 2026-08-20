@@ -61,7 +61,7 @@ func TestOutbox_AtomicEventSurvives(t *testing.T) {
 	now := time.Now()
 	ag := &model.AlertGroup{
 		ID:               agID,
-		DedupKey:         "outbox-atomic-dedup",
+		AlertKey:         "outbox-atomic-dedup",
 		Status:           model.AlertGroupStatusTriggered,
 		Title:            "Atomic Outbox Test",
 		TeamID:           team.ID,
@@ -184,7 +184,7 @@ func TestOutbox_WorkerDeliversToRealHTTP(t *testing.T) {
 	now := time.Now()
 	ag := &model.AlertGroup{
 		ID:               agID,
-		DedupKey:         "http-e2e-dedup",
+		AlertKey:         "http-e2e-dedup",
 		Status:           model.AlertGroupStatusTriggered,
 		Title:            "HTTP E2E Test",
 		TeamID:           team.ID,
@@ -356,7 +356,7 @@ func TestOutbox_TeamScopeFilteringE2E(t *testing.T) {
 	now := time.Now()
 	ag := &model.AlertGroup{
 		ID:               agID,
-		DedupKey:         "scope-filter-dedup",
+		AlertKey:         "scope-filter-dedup",
 		Status:           model.AlertGroupStatusTriggered,
 		Title:            "Scope Filter Test",
 		TeamID:           teamA.ID,

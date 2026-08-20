@@ -9,8 +9,57 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Stop every running instance before starting this version.** The schema
+  change it applies at startup is not one an older instance can write against:
+  the previous version keeps starting, but every background job it tries to
+  create is rejected, which means alerts stop being escalated for as long as it
+  is left running. Take a database backup first, as always, and do not start an
+  older image against the upgraded database afterwards - downgrading is not
+  supported.
+- The column that carries an alert's own key is renamed at startup
+  (`alert_groups.dedup_key` becomes `alert_key`); the rename is instant, touches
+  no data, and the name every API response, webhook and page uses is unchanged.
+  An older instance started against the upgraded database now fails on any read
+  of an alert group rather than quietly failing to create jobs - louder, and
+  still a reason to stop every instance first.
+- While a mixture of versions is running, the "you are now on-call" message is
+  the part that suffers first: the two versions recognise a handover
+  differently, so one shift change can be announced twice and another not at
+  all. This is the same instruction as above - stop every instance - said for
+  the case where escalations are not what you notice.
+- The upgrade refuses to run while a job it cannot classify is still executing,
+  and names the job in the message. That job either finishes or is cancelled,
+  and the upgrade is started again. The alternative would be to let it run on
+  without its claim on the work, which for an escalation means a second round of
+  pages for one incident.
+
 ### Fixed
 
+- Two unrelated pieces of background work no longer cancel each other out by
+  accident. Deduplication used to compare one opaque key across every kind of
+  job, so a collision between, say, an escalation and a message update silently
+  dropped one of them. Each kind of work now declares what identifies it, and
+  identical keys in different kinds are simply different work.
+- The escalation of a repeat incident is no longer at risk of being taken for
+  the previous one. An escalation is now identified by its alert group rather
+  than by the alert fingerprint, which several groups share over time as the
+  same alert fires, resolves and fires again.
+- Coming on call is announced once, however many instances of TokayOps are
+  running. Whether the second instance was told depended on how quickly the
+  first one's notification finished: a shift change noticed a moment later was a
+  second direct message to the same people. A handover notification is now
+  identified by the shift change it announces, and that identity is kept for
+  good rather than for as long as the notification takes to send.
+- An alert that arrives while the group's message is being updated is no longer
+  left out of it. Three things could lose one: the mark that said "this message
+  is out of date" was cleared by an update that had been built before the alert
+  arrived; it was written separately from the alert itself, so an interruption
+  in between kept the alert and dropped the mark; and a notification that
+  appeared while the update was being prepared was taken as proof that no update
+  was needed. An alert and the mark are now recorded together, and the mark is
+  cleared only once an update job has accepted that change.
 - An alert no longer loses its page when the on-call state cannot be read. A
   policy step aimed at a schedule used to escalate to nobody if the read failed
   at that moment, and nothing retried it, so the person on duty was never told.

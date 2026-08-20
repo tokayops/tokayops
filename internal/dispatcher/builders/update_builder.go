@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -30,11 +31,21 @@ func NewUpdateJobBuilder(cfg *config.Config, s store.StoreInterface) (*UpdateJob
 	return &UpdateJobBuilder{Config: cfg, Store: s}, nil
 }
 
+// Build builds the update that follows an acknowledgement.
 func (b *UpdateJobBuilder) Build(ag *model.AlertGroup) (*model.Job, []*model.JobStage, []*model.JobStep, error) {
-	return b.BuildWithDedup(ag, "update_ack")
+	return b.build(ag, jobdedup.AckUpdate(ag.ID))
 }
 
-func (b *UpdateJobBuilder) BuildWithDedup(ag *model.AlertGroup, dedupPrefix string) (*model.Job, []*model.JobStage, []*model.JobStep, error) {
+// BuildAlertUpdate builds the update that follows a new alert in the group.
+//
+// Two families share the job type "update", and which one this is used to be a
+// string a caller passed in. It is a dedup spec now: the family is chosen by
+// naming it, not by spelling a prefix.
+func (b *UpdateJobBuilder) BuildAlertUpdate(ag *model.AlertGroup) (*model.Job, []*model.JobStage, []*model.JobStep, error) {
+	return b.build(ag, jobdedup.AlertUpdate(ag.ID))
+}
+
+func (b *UpdateJobBuilder) build(ag *model.AlertGroup, spec *jobdedup.Spec) (*model.Job, []*model.JobStage, []*model.JobStep, error) {
 	if b.Store == nil {
 		return nil, nil, nil, fmt.Errorf("update builder requires store")
 	}
@@ -60,14 +71,12 @@ func (b *UpdateJobBuilder) BuildWithDedup(ag *model.AlertGroup, dedupPrefix stri
 
 	// Job Setup
 	jobID := uuid.New().String()
-	dedupKey := dedupPrefix + "_" + ag.ID
 	now := time.Now()
 
 	job := &model.Job{
 		ID:           jobID,
-		Type:         "update",
 		Status:       model.JobStatusPending,
-		DedupKey:     &dedupKey,
+		Dedup:        spec,
 		CurrentStage: 0,
 		Payload:      json.RawMessage("{}"),
 		CreatedAt:    now,

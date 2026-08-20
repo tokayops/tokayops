@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -13,7 +14,7 @@ func createAG(t *testing.T, s *store.MockStore, id string, status model.AlertGro
 	t.Helper()
 	ag := &model.AlertGroup{
 		ID:               id,
-		DedupKey:         "dedup-" + id,
+		AlertKey:         "dedup-" + id,
 		Status:           status,
 		Title:            "Test Alert",
 		TeamID:           "devops",
@@ -169,14 +170,17 @@ func TestAck_CancelsEscalation(t *testing.T) {
 	svc := NewService(s)
 	createAG(t, s, "ag-cancel", model.AlertGroupStatusTriggered)
 
-	// Create a pending escalation job with matching dedupKey
-	dedupKey := "dedup-ag-cancel"
-	s.CreateJobWithDedup(&model.Job{
-		Type:     "escalation",
-		Status:   model.JobStatusPending,
-		Payload:  json.RawMessage("{}"),
-		DedupKey: &dedupKey,
-	}, nil, nil)
+	// A pending escalation job shaped like the real one: cancellation addresses
+	// it by alert group, so a fixture without alert_group_id would be a job the
+	// escalation builder never produces.
+	agID := "ag-cancel"
+	if err := s.SeedEscalationJob(agID, &model.Job{
+		ID:      "job-ag-cancel",
+		Status:  model.JobStatusPending,
+		Payload: json.RawMessage("{}"),
+	}, nil, nil); err != nil {
+		t.Fatalf("SeedEscalationJob: %v", err)
+	}
 
 	result, err := svc.Ack("ag-cancel", Actor{Name: "Denis"}, nil)
 	if err != nil {
@@ -187,8 +191,11 @@ func TestAck_CancelsEscalation(t *testing.T) {
 	}
 
 	// Verify job was cancelled
-	job, _ := s.GetJobByDedupKey(dedupKey)
-	if job != nil && job.Status != model.JobStatusCanceled {
+	job, err := s.FindJobByIdentity(jobdedup.Escalation(agID))
+	if err != nil || job == nil {
+		t.Fatalf("escalation job not found after ack: %v", err)
+	}
+	if job.Status != model.JobStatusCanceled {
 		t.Errorf("Expected job to be canceled, got %s", job.Status)
 	}
 }

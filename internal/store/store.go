@@ -107,7 +107,15 @@ func (s *Store) InitDB() error {
 	-- Alert Groups table (renamed from incidents)
 	CREATE TABLE IF NOT EXISTS alert_groups (
 		id TEXT PRIMARY KEY,
-		dedup_key TEXT NOT NULL,
+		-- What the alerting system calls this alert: the group key Alertmanager
+		-- sends, or the fingerprint of a single alert. It names the ALERT and
+		-- not this row - the same key comes back every time the same thing
+		-- breaks, and each time it is a new incident with a new id.
+		--
+		-- Not to be confused with jobs.dedup_key, which names a piece of
+		-- background work. Confusing the two is how an escalation once came to
+		-- be identified by the alert instead of by the incident.
+		alert_key TEXT NOT NULL,
 		status TEXT NOT NULL,
 		title TEXT,
 		
@@ -143,9 +151,21 @@ func (s *Store) InitDB() error {
 		IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'alert_groups' AND column_name = 'oncall_snapshot') THEN
 			ALTER TABLE alert_groups ADD COLUMN oncall_snapshot JSONB;
 		END IF;
+		-- dedup_key -> alert_key. Two different identities were spelled the
+		-- same way in one schema: the alert this group is about, and the work
+		-- a job claims. The index below follows the column, so nothing else
+		-- has to change here.
+		IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'alert_groups' AND column_name = 'dedup_key')
+		   AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'alert_groups' AND column_name = 'alert_key') THEN
+			ALTER TABLE alert_groups RENAME COLUMN dedup_key TO alert_key;
+		END IF;
 	END $$;
 	
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_active_alert_groups ON alert_groups(dedup_key) WHERE status NOT IN ('resolved', 'closed');
+	-- One live incident per alert: while a group is open, another one for the
+	-- same alert key cannot be created, and once it is resolved or closed the
+	-- key is free for the next time the same thing breaks. This index is that
+	-- rule; nothing else states it.
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_active_alert_groups ON alert_groups(alert_key) WHERE status NOT IN ('resolved', 'closed');
 	CREATE INDEX IF NOT EXISTS idx_alert_groups_status ON alert_groups(status);
 	CREATE INDEX IF NOT EXISTS idx_alert_groups_team_id ON alert_groups(team_id);
 
@@ -238,7 +258,13 @@ func (s *Store) InitDB() error {
 		type TEXT NOT NULL,
 		status TEXT NOT NULL,
 		payload TEXT NOT NULL DEFAULT '{}',
+		-- Identity and policy: (dedup_namespace, dedup_key) names the work,
+		-- dedup_scope says how long that name is exclusive. All three or none;
+		-- the uniqueness rules themselves live with the migration that
+		-- introduces them (job_dedup_migration.go).
+		dedup_namespace TEXT,
 		dedup_key TEXT,
+		dedup_scope TEXT,
 		alert_group_id TEXT,
 		current_stage INTEGER DEFAULT 0,
 		error TEXT,
@@ -248,9 +274,6 @@ func (s *Store) InitDB() error {
 		canceled_at TIMESTAMPTZ
 	);
 
-	DROP INDEX IF EXISTS idx_active_jobs_dedup;
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_active_jobs_dedup ON jobs(dedup_key)
-	WHERE status IN ('pending', 'running');
 	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 
 	-- Job Stages (Phase 2: sequential execution groups within a job)
@@ -367,37 +390,34 @@ func (s *Store) InitDB() error {
 			ALTER TABLE alert_groups ADD COLUMN slack_update_pending BOOLEAN NOT NULL DEFAULT FALSE;
 		END IF;
 
+		-- 8. The version of the flag above. Raising the flag increments it, and
+		-- the producer clears the flag only for the version it read, so an
+		-- alert that arrives while the update job is being created keeps the
+		-- flag up instead of being cleared away with it.
+		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_generation') THEN
+			ALTER TABLE alert_groups ADD COLUMN slack_update_generation BIGINT NOT NULL DEFAULT 0;
+		END IF;
+
 		-- 9. Add alert_group_id column to jobs table
 		IF NOT EXISTS(SELECT 1 FROM information_schema.columns
 		              WHERE table_name='jobs' AND column_name='alert_group_id') THEN
 			ALTER TABLE jobs ADD COLUMN alert_group_id TEXT;
 		END IF;
 
-		-- 9b. Drop unique index before backfill (backfill creates temporary duplicates)
-		DROP INDEX IF EXISTS idx_one_escalation_per_ag;
-
-		-- 9c. Backfill alert_group_id from payload for all NULL rows
-		UPDATE jobs SET alert_group_id = payload::jsonb->>'alert_group_id'
-		WHERE type = 'escalation' AND alert_group_id IS NULL
-		  AND payload::jsonb->>'alert_group_id' IS NOT NULL;
-
-		-- 9d. Dedup: keep only latest escalation job per AG, nullify older dupes
-		WITH ranked AS (
-			SELECT id,
-			       ROW_NUMBER() OVER (PARTITION BY alert_group_id ORDER BY created_at DESC) as rn
-			FROM jobs
-			WHERE type = 'escalation' AND alert_group_id IS NOT NULL
-		)
-		UPDATE jobs SET alert_group_id = NULL
-		FROM ranked
-		WHERE jobs.id = ranked.id AND ranked.rn > 1;
-
-		-- 9e. Recreate unique index (after dedup guarantees no conflicts)
-		CREATE UNIQUE INDEX idx_one_escalation_per_ag
-		ON jobs(alert_group_id) WHERE type = 'escalation' AND alert_group_id IS NOT NULL;
+		-- 9b. Filling alert_group_id and keeping one escalation row per group
+		-- used to happen here, around a unique index this block dropped and
+		-- recreated on every start. Both moved into the one-shot job dedup
+		-- migration: recreating that index after the model exists would put
+		-- back the rule the model replaced.
 	END $$;
 	`
 	if _, err := s.db.Exec(migrationQuery); err != nil {
+		return err
+	}
+
+	// Job dedup model: policy table, one-shot migration and the sweep for
+	// legacy indexes, in that order and under one lock.
+	if err := s.applyJobDedupModel(); err != nil {
 		return err
 	}
 
@@ -919,9 +939,10 @@ func (s *Store) InitDB() error {
 
 // alertGroupColumns is the standard SELECT clause for alert_groups.
 // All query functions should use this to ensure consistent column ordering.
-const alertGroupColumns = `id, dedup_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step,
+const alertGroupColumns = `id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step,
 	external_url, alerts_data, policy_snapshot, oncall_snapshot,
-	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, ack_processed_at, slack_update_pending`
+	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, ack_processed_at,
+	slack_update_pending, slack_update_generation`
 
 // alertGroupScanner is an interface for scanning rows (works with *sql.Row and *sql.Rows).
 type alertGroupScanner interface {
@@ -937,12 +958,12 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	var alertsData, policySnapshot, oncallSnapshot, acknowledgedBy, resolvedBy sql.NullString
 
 	err := scanner.Scan(
-		&ag.ID, &ag.DedupKey, &ag.Status, &ag.Title,
+		&ag.ID, &ag.AlertKey, &ag.Status, &ag.Title,
 		&teamID, &teamNameSnapshot, &severity, &policyID, &ag.CurrentStep,
 		&externalURL, &alertsData,
 		&policySnapshot, &oncallSnapshot,
 		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt, &acknowledgedBy, &resolvedBy, &ackProcessedAt,
-		&ag.SlackUpdatePending,
+		&ag.SlackUpdatePending, &ag.SlackUpdateGeneration,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -981,12 +1002,15 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	return &ag, nil
 }
 
-func (s *Store) GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error) {
+// GetActiveAlertGroupByAlertKey finds the incident currently open for an alert,
+// if there is one. A resolved or closed group is not it: the same alert firing
+// again is the next incident, not this one.
+func (s *Store) GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error) {
 	query := `SELECT ` + alertGroupColumns + `
 			  FROM alert_groups
-			  WHERE dedup_key = $1 AND status NOT IN ($2, $3)`
+			  WHERE alert_key = $1 AND status NOT IN ($2, $3)`
 
-	row := s.db.QueryRow(query, dedupKey, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed)
+	row := s.db.QueryRow(query, alertKey, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed)
 	ag, err := scanAlertGroupRow(row)
 	if err != nil {
 		return nil, err
@@ -1006,7 +1030,7 @@ func (s *Store) CreateAlertGroup(ag *model.AlertGroup) error {
 		snapshotJson, _ = json.Marshal(ag.PolicySnapshot)
 	}
 
-	query := `INSERT INTO alert_groups (id, dedup_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at)
+	query := `INSERT INTO alert_groups (id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at)
 			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`
 
 	var snapshotVal sql.NullString
@@ -1014,7 +1038,7 @@ func (s *Store) CreateAlertGroup(ag *model.AlertGroup) error {
 		snapshotVal = sql.NullString{String: string(snapshotJson), Valid: true}
 	}
 
-	_, err := s.db.Exec(query, ag.ID, ag.DedupKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep, ag.ExternalURL, string(alertsJson), snapshotVal, ag.AcknowledgedBy, ag.ResolvedBy, ag.CreatedAt, ag.UpdatedAt)
+	_, err := s.db.Exec(query, ag.ID, ag.AlertKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep, ag.ExternalURL, string(alertsJson), snapshotVal, ag.AcknowledgedBy, ag.ResolvedBy, ag.CreatedAt, ag.UpdatedAt)
 	return err
 }
 
@@ -1038,9 +1062,9 @@ func (s *Store) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*m
 		snapshotVal = sql.NullString{String: string(snapshotJson), Valid: true}
 	}
 	_, err = tx.Exec(
-		`INSERT INTO alert_groups (id, dedup_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at)
+		`INSERT INTO alert_groups (id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-		ag.ID, ag.DedupKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep,
+		ag.ID, ag.AlertKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep,
 		ag.ExternalURL, string(alertsJson), snapshotVal,
 		ag.AcknowledgedBy, ag.ResolvedBy, ag.CreatedAt, ag.UpdatedAt,
 	)
@@ -1074,22 +1098,15 @@ func (s *Store) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*m
 	return tx.Commit()
 }
 
-func (s *Store) UpdateAlertGroupStatus(id string, status model.AlertGroupStatus) error {
-	query := `UPDATE alert_groups SET status = $1, updated_at = $2 WHERE id = $3`
-
-	if status == model.AlertGroupStatusResolved {
-		query = `UPDATE alert_groups SET status = $1, updated_at = $2, resolved_at = $3 WHERE id = $4`
-		_, err := s.db.Exec(query, status, time.Now(), time.Now(), id)
-		return err
-	}
-
-	_, err := s.db.Exec(query, status, time.Now(), id)
-	return err
-}
-
-// TransitionAlertGroupStatus conditionally updates status only if the current status
-// matches fromStatus (CAS semantics). Returns (true, nil) if the row was updated,
-// (false, nil) if the current status did not match, or (false, err) on DB error.
+// TransitionAlertGroupStatus moves a group from one status to another and
+// reports whether it was in the status the caller expected.
+//
+// It is the only way this store changes a group's status, and the condition is
+// the point: an assignment - "set this group to closed" - cannot say what it
+// assumed about the group it is closing, so a stale read or a mistaken ID ends
+// an incident nobody has finished. Producers gate their work on status
+// (`ProcessResolvedAlertGroups` closes what it has told everyone about), and a
+// gate that can be lowered from any state is not a gate.
 func (s *Store) TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error) {
 	now := time.Now()
 	res, err := s.db.Exec(
@@ -1104,13 +1121,6 @@ func (s *Store) TransitionAlertGroupStatus(id string, fromStatus, toStatus model
 		return false, err
 	}
 	return rows > 0, nil
-}
-
-func (s *Store) UpdateAlertGroupAcknowledged(id string, acknowledgedBy string) error {
-	// Clear ack_processed_at to allow re-processing on re-ack (retry scenario)
-	query := `UPDATE alert_groups SET status = $1, acknowledged_by = $2, ack_processed_at = NULL, updated_at = $3 WHERE id = $4`
-	_, err := s.db.Exec(query, model.AlertGroupStatusAcknowledged, acknowledgedBy, time.Now(), id)
-	return err
 }
 
 func (s *Store) UpdateAlertGroupPolicy(id string, policyID string, snapshot *model.EscalationPolicySnapshot) error {
@@ -1175,7 +1185,7 @@ func insertOutboxEventTx(tx *sql.Tx, event *model.OutboxEvent) error {
 // Timeline event and status update happen in a single transaction.
 // Returns (true, nil) if the ack was applied, (false, nil) if the alert group
 // was not in 'processing' or 'triggered' status (idempotent/race loser), or (false, err) on failure.
-func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -1227,10 +1237,8 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	}
 
 	// 4. Cancel escalation job (same TX)
-	if dedupKey != "" {
-		if err := cancelJobByDedupKeyTx(tx, dedupKey); err != nil {
-			return false, err
-		}
+	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
+		return false, err
 	}
 
 	return true, tx.Commit()
@@ -1240,7 +1248,7 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 // Timeline event and status update happen in a single transaction.
 // Returns (true, nil) if the resolve was applied, (false, nil) if the alert group
 // was not in 'processing', 'triggered', or 'acknowledged' status, or (false, err) on failure.
-func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -1292,10 +1300,8 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	}
 
 	// 4. Cancel escalation job (same TX)
-	if dedupKey != "" {
-		if err := cancelJobByDedupKeyTx(tx, dedupKey); err != nil {
-			return false, err
-		}
+	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
+		return false, err
 	}
 
 	return true, tx.Commit()
@@ -1305,7 +1311,7 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 // Used by the ingester when all incoming alerts are resolved (auto-resolve).
 // Allows transition from new/processing/triggered/acknowledged → resolved.
 // Returns (true, nil) if applied, (false, nil) if already resolved (idempotent).
-func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -1360,35 +1366,69 @@ func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Aler
 	}
 
 	// 4. Cancel escalation job
-	if dedupKey != "" {
-		if err := cancelJobByDedupKeyTx(tx, dedupKey); err != nil {
-			return false, err
-		}
+	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
+		return false, err
 	}
 
 	return true, tx.Commit()
 }
 
-// cancelJobByDedupKeyTx cancels an active escalation job and its pending steps within the given transaction.
-func cancelJobByDedupKeyTx(tx *sql.Tx, dedupKey string) error {
-	var jobID string
-	err := tx.QueryRow(`
+// cancelEscalationJobByAlertGroupIDTx cancels the escalation jobs of one alert
+// group, with their stages and their steps.
+//
+// It addresses them by what the caller means - this group's escalation - and not
+// by the dedup key, which is how this was written before. The key is a string
+// whose namespace each builder invents; addressing by it made the correctness of
+// cancellation depend on a uniqueness index rather than on the query, and it
+// would break silently the moment a job's identity changed.
+//
+// Every returned id is collected rather than the first one. The dedup model
+// admits one escalation per alert group, so a single Scan would look correct -
+// and would quietly stop being correct the moment a second namespace is allowed
+// to fill alert_group_id. Cancelling the jobs but only one job's children is the
+// kind of half-done state this function exists to prevent.
+//
+// type = 'escalation' is a schema predicate here, not a statement about
+// families. It does not make alert_group_id an escalation-only column - nothing
+// stops another type from filling it, which is precisely why the type predicate
+// is written out.
+func cancelEscalationJobByAlertGroupIDTx(tx *sql.Tx, alertGroupID string) error {
+	rows, err := tx.Query(`
 		UPDATE jobs SET status='canceled', canceled_at=NOW(), finished_at=NOW(), updated_at=NOW()
-		WHERE dedup_key=$1 AND status IN ('pending','running')
-		RETURNING id`, dedupKey).Scan(&jobID)
-	if err == sql.ErrNoRows {
-		return nil
-	}
+		WHERE type='escalation' AND alert_group_id=$1 AND status IN ('pending','running')
+		RETURNING id`, alertGroupID)
 	if err != nil {
 		return err
 	}
+	var jobIDs []string
+	for rows.Next() {
+		var jobID string
+		if err := rows.Scan(&jobID); err != nil {
+			rows.Close()
+			return err
+		}
+		jobIDs = append(jobIDs, jobID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	// Closed before the next statement, not deferred: lib/pq serves one
+	// statement at a time per connection, and the transaction has more to do.
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(jobIDs) == 0 {
+		return nil
+	}
+
 	_, err = tx.Exec(`UPDATE job_stages SET status='canceled', updated_at=NOW()
-		WHERE job_id=$1 AND status IN ('active','blocked')`, jobID)
+		WHERE job_id = ANY($1) AND status IN ('active','blocked')`, pq.Array(jobIDs))
 	if err != nil {
 		return err
 	}
 	_, err = tx.Exec(`UPDATE job_steps SET status='canceled', updated_at=NOW()
-		WHERE job_id=$1 AND status IN ('pending','blocked','retry')`, jobID)
+		WHERE job_id = ANY($1) AND status IN ('pending','blocked','retry')`, pq.Array(jobIDs))
 	return err
 }
 
@@ -1629,6 +1669,12 @@ func (s *Store) GetNewAlertGroups() ([]*model.AlertGroup, error) {
 	// status update and job creation — but ONLY if no escalation job exists.
 	// If any escalation job exists (succeeded, failed, canceled, etc.), the AG was
 	// already processed and should not spawn a duplicate job.
+	//
+	// Asked by type and alert_group_id rather than by the escalation identity,
+	// for the same reason cancellation is (see cancelEscalationJobByAlertGroupIDTx):
+	// the question is what this group already holds, not what holds a
+	// particular dedup claim. EnsureEscalationJob is what keeps the type and
+	// the namespace from disagreeing.
 	staleThreshold := time.Now().Add(-30 * time.Second)
 	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups ag
 	          WHERE ag.status = $1
@@ -1726,11 +1772,71 @@ func (s *Store) MarkAckProcessed(agID string) error {
 	return err
 }
 
-func (s *Store) SetSlackUpdatePending(id string, pending bool) error {
-	_, err := s.db.Exec(`
-		UPDATE alert_groups SET slack_update_pending = $1, updated_at = $2 WHERE id = $3
-	`, pending, time.Now(), id)
-	return err
+// UpdateAlertGroupAlertsAndRaiseSlackUpdate records a changed alert set and
+// says, in the same write, that the group's message no longer shows it.
+//
+// One statement rather than two calls, and that is the whole point: they used
+// to be an alerts write followed by a flag write, and a process that stopped
+// between them left the new alert stored with the gate down. Nothing would
+// raise it again either - Alertmanager repeating the payload finds the alerts
+// already recorded and merges nothing.
+//
+// The version goes up with every such write, monotonically, so a producer can
+// tell the state it read from the state that arrived while it worked.
+//
+// A group that is not there is an error and not a quiet no-op: the alerts have
+// to land somewhere, and a caller that is told nothing would answer its webhook
+// with 200 for a change it lost.
+func (s *Store) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error {
+	data, err := json.Marshal(alerts)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`
+		UPDATE alert_groups
+		   SET alerts_data = $1,
+		       slack_update_pending = TRUE,
+		       slack_update_generation = slack_update_generation + 1,
+		       updated_at = $2
+		 WHERE id = $3
+	`, string(data), time.Now(), id)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ClearSlackUpdate lowers the gate for the version the caller read, and reports
+// whether it did. A group that is not there answers false, like a group that
+// has moved on: the gate is not down because of this call either way.
+//
+// The condition is the whole point. Admitting the update job and lowering the
+// gate are two transactions, and an alert that lands between them raises the
+// flag again; clearing it unconditionally - as this did while it was one
+// setter with a boolean - throws that alert away, and the message never shows
+// it. A false answer is not a failure: it means the work has to be done again,
+// and the next tick does it.
+func (s *Store) ClearSlackUpdate(id string, observedGeneration int64) (bool, error) {
+	res, err := s.db.Exec(`
+		UPDATE alert_groups
+		   SET slack_update_pending = FALSE, updated_at = $1
+		 WHERE id = $2 AND slack_update_generation = $3
+	`, time.Now(), id, observedGeneration)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 func (s *Store) GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error) {
@@ -1854,7 +1960,7 @@ func (s *Store) GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset 
 // alertGroupSummaryColumns selects lightweight fields for list views,
 // skipping heavy JSONB columns (alerts_data, policy_snapshot)
 // and computing alert counts from alerts_data inline.
-const alertGroupSummaryColumns = `id, dedup_key, status, title, team_id, severity, current_step,
+const alertGroupSummaryColumns = `id, alert_key, status, title, team_id, severity, current_step,
 	oncall_snapshot, external_url, acknowledged_by, resolved_by,
 	created_at, updated_at, resolved_at,
 	jsonb_array_length(COALESCE(alerts_data::jsonb, '[]'::jsonb)),
@@ -1866,7 +1972,7 @@ func scanAlertGroupSummaryRow(scanner alertGroupScanner) (*model.AlertGroupSumma
 	var teamID, severity, externalURL, oncallSnapshot, acknowledgedBy, resolvedBy sql.NullString
 
 	err := scanner.Scan(
-		&ag.ID, &ag.DedupKey, &ag.Status, &ag.Title,
+		&ag.ID, &ag.AlertKey, &ag.Status, &ag.Title,
 		&teamID, &severity, &ag.CurrentStep,
 		&oncallSnapshot, &externalURL, &acknowledgedBy, &resolvedBy,
 		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt,

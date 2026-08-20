@@ -381,22 +381,30 @@ func (d *Dispatcher) ProcessAcknowledgedAlertGroups(ctx context.Context) {
 		return
 	}
 
+	gate := d.ackUpdateGate()
+
 	for _, ag := range alertGroups {
 		// 1. Cancel any active escalation jobs - user acknowledged, no more escalation needed
-		if ag.DedupKey != "" {
-			if err := d.store.CancelJobByDedupKey(ag.DedupKey); err != nil {
-				log.Printf("JobController: Failed to cancel escalation for acknowledged AG %s: %v", ag.ID, err)
-			}
+		if err := d.store.CancelEscalationJobByAlertGroupID(ag.ID); err != nil {
+			log.Printf("JobController: Failed to cancel escalation for acknowledged AG %s: %v", ag.ID, err)
 		}
 
-		// 2. Create update job to update Slack message to yellow
+		// 2. Build the update that turns the message yellow.
 		job, stages, steps, err := builder.Build(ag)
 		if err != nil {
 			if errors.Is(err, builders.ErrNoUpdatableDeliveries) {
-				// No deliveries to update - mark as processed (permanent, expected)
-				if markErr := d.store.MarkAckProcessed(ag.ID); markErr != nil {
-					log.Printf("JobController: Failed to mark ack processed for %s: %v", ag.ID, markErr)
-				}
+				// Nothing to update, so the gate comes down - and here that is
+				// the right trade, where for an alert update it is not.
+				//
+				// What is given up is narrow: a message whose sending straddled
+				// the acknowledgement was rendered before it and will keep
+				// saying "triggered" until the next alert refreshes it. What is
+				// bought is that this loop, which runs every two seconds and
+				// cancels an escalation on each pass, stops looking at a group
+				// it can do nothing for. An alert update makes the opposite
+				// trade because what it carries is an alert, not a colour.
+				log.Printf("JobController: No updatable deliveries for acknowledged %s", ag.ID)
+				gate.lower(ag)
 				continue
 			}
 			// Other errors (e.g., ListDeliveries DB error) - transient, allow retry
@@ -407,24 +415,15 @@ func (d *Dispatcher) ProcessAcknowledgedAlertGroups(ctx context.Context) {
 		// Defensive nil check - Build contract guarantees job != nil when err == nil,
 		// but guard against future changes to builder
 		if job == nil {
-			// Invariant violation - Build should never return (nil, _, nil)
-			// Don't mark as processed - allow retry and investigation
+			// Invariant violation - Build should never return (nil, _, nil).
+			// The gate stays up: retry and investigation.
 			log.Printf("JobController: ERROR Build returned nil job for %s (will retry)", ag.ID)
 			continue
 		}
 
-		// 3. Try to create the job
-		if _, _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
-			// Transient error - do NOT mark as processed, allow retry on next iteration
-			log.Printf("JobController: Failed to create update job for %s (will retry): %v", ag.ID, err)
-			continue
-		}
-
-		// 4. Job created successfully - mark as processed
-		log.Printf("JobController: Update job created for acknowledged %s", ag.ID)
-		if err := d.store.MarkAckProcessed(ag.ID); err != nil {
-			log.Printf("JobController: Failed to mark ack processed for %s: %v", ag.ID, err)
-		}
+		// 3. Offer it. Whether it was admitted or found already in flight, the
+		// gate comes down - see jobGate.lowerOnDuplicate.
+		d.offer(gate, ag, job, stages, steps)
 	}
 }
 
@@ -454,33 +453,31 @@ func (d *Dispatcher) ProcessResolvedAlertGroups(ctx context.Context) {
 	}
 
 	builder := builders.NewResolutionJobBuilder(d.cfg, d.store)
+	gate := d.resolutionGate()
 
 	for _, ag := range alertGroups {
 		// 1. Cancel any active escalation jobs
-		if err := d.store.CancelJobByDedupKey(ag.DedupKey); err != nil {
+		if err := d.store.CancelEscalationJobByAlertGroupID(ag.ID); err != nil {
 			log.Printf("JobController: Failed to cancel jobs for resolved AG %s: %v", ag.ID, err)
 		}
 
-		// 2. Build resolution job
+		// 2. Build the resolution
 		job, stages, steps, err := builder.Build(ag)
 		if err != nil {
 			log.Printf("JobController: Build failed for resolved AG %s (will retry): %v", ag.ID, err)
-			continue // transient error → retry next tick
+			continue // transient error, the gate stays up
 		}
 
-		if job != nil {
-			// 3. Create resolution job
-			if _, _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
-				log.Printf("JobController: Failed to create resolution job for %s (will retry): %v", ag.ID, err)
-				continue // transient error → retry next tick
-			}
-			log.Printf("JobController: Resolution job created for %s", ag.ID)
+		if job == nil {
+			// Nobody to tell: no delivery this group produced can be updated.
+			// The group is still resolved, and closing it is the only thing
+			// left to do.
+			gate.lower(ag)
+			continue
 		}
 
-		// 4. Mark as Closed — only after successful job creation (or no job needed)
-		if err := d.store.UpdateAlertGroupStatus(ag.ID, model.AlertGroupStatusClosed); err != nil {
-			log.Printf("JobController: Failed to close alert group %s: %v", ag.ID, err)
-		}
+		// 3. Offer it, and close the group once its resolution is someone's.
+		d.offer(gate, ag, job, stages, steps)
 	}
 }
 
@@ -518,23 +515,35 @@ func (d *Dispatcher) ProcessAlertUpdates(ctx context.Context) {
 		return
 	}
 
+	gate := d.alertUpdateGate()
+
 	for _, ag := range alertGroups {
-		job, stages, steps, err := builder.BuildWithDedup(ag, "update_alert")
+		job, stages, steps, err := builder.BuildAlertUpdate(ag)
 		if errors.Is(err, builders.ErrNoUpdatableDeliveries) {
-			// Distinguish: no deliveries at all (escalation pending) vs. deliveries exist but none updatable
-			deliveries, dErr := d.store.ListDeliveries(ag.ID)
-			if dErr != nil {
-				log.Printf("JobController: Failed to list deliveries for %s (will retry): %v", ag.ID, dErr)
-			} else if len(deliveries) > 0 {
-				// Deliveries exist but none support updates — clear flag, no Slack to update
-				log.Printf("JobController: No updatable deliveries for %s (%d total), clearing flag", ag.ID, len(deliveries))
-				d.store.SetSlackUpdatePending(ag.ID, false)
-			}
-			// No deliveries at all — escalation still in progress, keep flag for retry
+			// Nothing this group has sent can be updated - as of the moment
+			// that listing was taken. The gate stays up, and it stays up
+			// silently: this tick will repeat every few seconds for as long as
+			// the group is open, and a line per tick would bury everything
+			// else in the log.
+			//
+			// It used to come down here, on the evidence of a second listing
+			// of the deliveries: "some exist, so no more are coming". That
+			// evidence is not sound. Deliveries are written by escalation
+			// steps, and one written a moment later - by a step still running
+			// after its job was canceled, or after the listing the build was
+			// working from - would find the gate already down and the alert
+			// that raised it in no message at all.
+			//
+			// There is no cheaper proof available, so no proof is claimed. The
+			// cost is bounded: the group leaves this queue when it is resolved.
+			// If it ever shows up in measurements, the queue can select on a
+			// delivery that supports updates instead - the gate stays up either
+			// way, so the alert is safe with or without that filter. Until it
+			// does show up, one rule fewer.
 			continue
 		}
 		if err != nil {
-			// Transient error (e.g., DB) — keep flag, retry next tick
+			// Transient error - the gate stays up, retry next tick
 			log.Printf("JobController: Build failed for alert update %s (will retry): %v", ag.ID, err)
 			continue
 		}
@@ -544,18 +553,9 @@ func (d *Dispatcher) ProcessAlertUpdates(ctx context.Context) {
 			continue
 		}
 
-		// CreateJobWithDedup returns (existingID, false, nil) on dedup hit — not an error
-		if _, _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
-			// Transient error — keep flag, retry next tick
-			log.Printf("JobController: Failed to create alert update job for %s (will retry): %v", ag.ID, err)
-			continue
-		}
-
-		// Job created (or dedup hit) — clear flag
-		log.Printf("JobController: Alert update job created for %s", ag.ID)
-		if err := d.store.SetSlackUpdatePending(ag.ID, false); err != nil {
-			log.Printf("JobController: Failed to clear slack update pending for %s: %v", ag.ID, err)
-		}
+		// Offered, and the gate comes down only if this update was admitted and
+		// no further alert arrived meanwhile - see jobGate.
+		d.offer(gate, ag, job, stages, steps)
 	}
 }
 

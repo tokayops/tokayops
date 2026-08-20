@@ -220,7 +220,7 @@ func TestTelegramPipeline_SendCallbackAck(t *testing.T) {
 	if got := env.Bot.count("sendMessage"); got != 1 {
 		t.Fatalf("sendMessage calls = %d, want 1", got)
 	}
-	ag, err := env.S.GetActiveAlertGroup("tg_e2e_1")
+	ag, err := env.S.GetActiveAlertGroupByAlertKey("tg_e2e_1")
 	if err != nil {
 		t.Fatalf("GetActiveAlertGroup: %v", err)
 	}
@@ -301,7 +301,7 @@ func deliverCardForLinkedUser(t *testing.T, env *tgPipelineEnv, ctx context.Cont
 	env.Eng.ProcessNewAlertGroups(context.Background())
 	go runDispatcherLoop(ctx, env.Disp)
 	waitForStepCompletion(t, env.S, dedup, 0)
-	ag, err := env.S.GetActiveAlertGroup(dedup)
+	ag, err := env.S.GetActiveAlertGroupByAlertKey(dedup)
 	if err != nil {
 		t.Fatalf("GetActiveAlertGroup: %v", err)
 	}

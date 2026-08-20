@@ -10,10 +10,8 @@ import (
 // This allows for mocking in tests.
 type StoreInterface interface {
 	// Alert Groups (renamed from Incidents)
-	GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error)
+	GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error)
 	CreateAlertGroup(ag *model.AlertGroup) error
-	UpdateAlertGroupStatus(id string, status model.AlertGroupStatus) error
-	UpdateAlertGroupAcknowledged(id string, acknowledgedBy string) error
 	UpdateAlertGroupPolicy(id string, policyID string, snapshot *model.EscalationPolicySnapshot) error
 	UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResult) error
 	UpdateAlertGroupAlerts(id string, alerts []model.Alert) error
@@ -22,7 +20,13 @@ type StoreInterface interface {
 	GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error)
 	GetResolvedAlertGroups() ([]*model.AlertGroup, error)
 	MarkAckProcessed(agID string) error
-	SetSlackUpdatePending(id string, pending bool) error
+	// The two halves of one gate, and they are not symmetrical. It is raised by
+	// the write that changes the group - in the same statement, so no crash can
+	// separate the alert from the fact that the message is stale - and lowered
+	// for one version, which is how a producer avoids clearing away a change
+	// that arrived while it worked.
+	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
+	ClearSlackUpdate(id string, observedGeneration int64) (bool, error)
 	GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error)
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
 	GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset int) ([]*model.AlertGroup, int, error)
@@ -37,11 +41,11 @@ type StoreInterface interface {
 	CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) error
 
 	// Atomic ack/resolve (single-winner semantics, timeline + status + escalation cancel in one transaction)
-	AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (changed bool, err error)
-	ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (changed bool, err error)
+	AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
 
 	// Atomic resolve with alerts update (ingester auto-resolve: alerts + status + timeline + outbox in one transaction)
-	ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent, dedupKey string) (changed bool, err error)
+	ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (changed bool, err error)
 
 	// Conditional status transition (CAS semantics)
 	TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error)
@@ -125,22 +129,20 @@ type StoreInterface interface {
 
 	// Jobs (Phase 2)
 	//
-	// CreateJobWithDedup reports whether the job was inserted: false means an
-	// active job already held the dedup key and its ID came back instead. A
-	// caller that counts notifications actually sent needs that answer, and
-	// comparing the returned ID against the proposed one would be inferring it
-	// from a string match when the insert already knows.
-	CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (id string, created bool, err error)
+	// CreateJobWithDedup reports whether the job was inserted: false means the
+	// identity was already claimed under its own policy and nothing was
+	// written. A caller that counts notifications actually sent needs that
+	// answer. The existing job's ID is not returned, because no caller ever
+	// read it.
+	CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (created bool, err error)
 	EnsureEscalationJob(agID string, job *model.Job, stages []*model.JobStage, steps []*model.JobStep, snapshot *model.EscalationPolicySnapshot) (bool, error)
 	GetJobByID(id string) (*model.Job, error)
-	GetJobByDedupKey(dedupKey string) (*model.Job, error)
 	GetJobStepByID(stepID string) (*model.JobStep, error)
 	ClaimNextJobSteps(limit int, duration time.Duration) ([]*model.JobStep, error)
 	UpdateJobStepIfOwned(step *model.JobStep, leaseToken string) (bool, error)
 	FinishStepAndAdvance(stepID string, leaseToken string, outcome model.JobStepStatus, result string, stepError string) (model.AdvanceResult, error)
-	CancelJobByDedupKey(dedupKey string) error
+	CancelEscalationJobByAlertGroupID(alertGroupID string) error
 	ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error
-	GetJobsByIDs(ids []string) (map[string]*model.Job, error)
 	FailJob(jobID string, errorMsg string) error
 
 	// Escalation Policies (Phase 4)

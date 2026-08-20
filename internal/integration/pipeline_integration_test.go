@@ -224,26 +224,29 @@ func sendWebhook(t *testing.T, e *echo.Echo, payload string) {
 	}
 }
 
-func waitForStepCompletion(t *testing.T, s *store.Store, dedupKey string, stageIndex int) {
+func waitForStepCompletion(t *testing.T, s *store.Store, alertKey string, stageIndex int) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		var status string
-		// Find job by dedup_key, locate step via stage_index (each stage has step_index=0 for single-step stages)
+		// The escalation is identified by its alert group, so the group's
+		// dedup key - the alert fingerprint the caller has - reaches the job
+		// through alert_groups rather than off the job row.
 		err := s.GetDB().QueryRow(`
 			SELECT js.status
 			FROM job_steps js
 			JOIN job_stages jst ON js.stage_id = jst.id
 			JOIN jobs j ON jst.job_id = j.id
-			WHERE j.dedup_key = $1 AND jst.stage_index = $2
+			JOIN alert_groups ag ON j.alert_group_id = ag.id
+			WHERE ag.alert_key = $1 AND jst.stage_index = $2
 			LIMIT 1
-		`, dedupKey, stageIndex).Scan(&status)
+		`, alertKey, stageIndex).Scan(&status)
 
 		if err == nil && (status == string(model.JobStepStatusSucceeded) || status == string(model.JobStepStatusFailed) || status == string(model.JobStepStatusCanceled)) {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("Timeout waiting for stage %d of group %s to complete", stageIndex, dedupKey)
+	t.Fatalf("Timeout waiting for stage %d of group %s to complete", stageIndex, alertKey)
 }
 
 // runDispatcherLoop runs ProcessPendingSteps in a loop until context is canceled
@@ -260,22 +263,22 @@ func runDispatcherLoop(ctx context.Context, disp *dispatcher.Dispatcher) {
 	}
 }
 
-func waitForAlertGroupStatus(t *testing.T, s *store.Store, dedupKey string, expectedStatus model.AlertGroupStatus) {
+func waitForAlertGroupStatus(t *testing.T, s *store.Store, alertKey string, expectedStatus model.AlertGroupStatus) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		ag, err := s.GetActiveAlertGroup(dedupKey)
+		ag, err := s.GetActiveAlertGroupByAlertKey(alertKey)
 		if err == nil && ag.Status == expectedStatus {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	// Fetch one last time for error message
-	ag, _ := s.GetActiveAlertGroup(dedupKey)
+	ag, _ := s.GetActiveAlertGroupByAlertKey(alertKey)
 	current := "unknown"
 	if ag != nil {
 		current = string(ag.Status)
 	}
-	t.Fatalf("Timeout waiting for AG %s to reach status %s. Current: %s", dedupKey, expectedStatus, current)
+	t.Fatalf("Timeout waiting for AG %s to reach status %s. Current: %s", alertKey, expectedStatus, current)
 }
 
 func TestPipeline_HappyPath(t *testing.T) {
@@ -302,7 +305,7 @@ func TestPipeline_HappyPath(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 
 	// Verify DB state
-	active, err := env.S.GetActiveAlertGroup("test_dedup_1")
+	active, err := env.S.GetActiveAlertGroupByAlertKey("test_dedup_1")
 	if err != nil {
 		t.Fatalf("Failed to get alert group: %v", err)
 	}
@@ -312,7 +315,7 @@ func TestPipeline_HappyPath(t *testing.T) {
 
 	// 2. Engine
 	env.Eng.ProcessNewAlertGroups(context.Background())
-	active, _ = env.S.GetActiveAlertGroup("test_dedup_1")
+	active, _ = env.S.GetActiveAlertGroupByAlertKey("test_dedup_1")
 	if active.Status != model.AlertGroupStatusProcessing {
 		t.Errorf("Expected status Processing, got %s", active.Status)
 	}
@@ -385,7 +388,7 @@ func TestPipeline_PartialUpdate(t *testing.T) {
 	sendWebhook(t, env.Echo, payload2)
 
 	// Ingester keeps status as triggered (no regression) and flags Slack update.
-	active, _ := env.S.GetActiveAlertGroup("test_partial_1")
+	active, _ := env.S.GetActiveAlertGroupByAlertKey("test_partial_1")
 	if active.Status != model.AlertGroupStatusTriggered {
 		t.Errorf("Expected status to stay triggered, got %s", active.Status)
 	}
@@ -433,7 +436,7 @@ func TestPipeline_FullResolve(t *testing.T) {
 
 	// Verify Ingester Logic (Should set to Resolved)
 	var status string
-	env.S.GetDB().QueryRow("SELECT status FROM alert_groups WHERE dedup_key = $1", "test_resolve_1").Scan(&status)
+	env.S.GetDB().QueryRow("SELECT status FROM alert_groups WHERE alert_key = $1", "test_resolve_1").Scan(&status)
 	if status != string(model.AlertGroupStatusResolved) {
 		t.Errorf("Expected status Resolved, got %s", status)
 	}
@@ -457,7 +460,7 @@ func TestPipeline_FullResolve(t *testing.T) {
 	}
 
 	// Verify Closed
-	env.S.GetDB().QueryRow("SELECT status FROM alert_groups WHERE dedup_key = $1", "test_resolve_1").Scan(&status)
+	env.S.GetDB().QueryRow("SELECT status FROM alert_groups WHERE alert_key = $1", "test_resolve_1").Scan(&status)
 	if status != string(model.AlertGroupStatusClosed) {
 		t.Errorf("Expected status Closed, got %s", status)
 	}
@@ -480,7 +483,7 @@ func TestPipeline_Dedup(t *testing.T) {
 
 	// Check count (should be 1)
 	var count int
-	err := env.S.GetDB().QueryRow("SELECT COUNT(*) FROM alert_groups WHERE dedup_key = $1", "test_dedup_idempotency_1").Scan(&count)
+	err := env.S.GetDB().QueryRow("SELECT COUNT(*) FROM alert_groups WHERE alert_key = $1", "test_dedup_idempotency_1").Scan(&count)
 	if err != nil {
 		t.Fatalf("DB Error: %v", err)
 	}
@@ -495,7 +498,7 @@ func TestPipeline_Dedup(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 
 	// Check count again (should still be 1, not 2)
-	err = env.S.GetDB().QueryRow("SELECT COUNT(*) FROM alert_groups WHERE dedup_key = $1", "test_dedup_idempotency_1").Scan(&count)
+	err = env.S.GetDB().QueryRow("SELECT COUNT(*) FROM alert_groups WHERE alert_key = $1", "test_dedup_idempotency_1").Scan(&count)
 	if err != nil {
 		t.Fatalf("DB Error: %v", err)
 	}
@@ -587,7 +590,7 @@ func TestPipeline_FirehoseOnly(t *testing.T) {
 
 	// 2. Engine
 	env.Eng.ProcessNewAlertGroups(context.Background())
-	active, _ := env.S.GetActiveAlertGroup("test_firehose_only_1")
+	active, _ := env.S.GetActiveAlertGroupByAlertKey("test_firehose_only_1")
 	if active.Status != model.AlertGroupStatusProcessing {
 		t.Errorf("Expected status Processing, got %s", active.Status)
 	}
@@ -692,7 +695,7 @@ func TestPipeline_ResolutionAllDeliveries(t *testing.T) {
 
 	// Verify AG is closed
 	var status string
-	env.S.GetDB().QueryRow("SELECT status FROM alert_groups WHERE dedup_key = $1", "test_resolve_all_1").Scan(&status)
+	env.S.GetDB().QueryRow("SELECT status FROM alert_groups WHERE alert_key = $1", "test_resolve_all_1").Scan(&status)
 	if status != string(model.AlertGroupStatusClosed) {
 		t.Errorf("Expected status Closed, got %s", status)
 	}
@@ -771,7 +774,8 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 	env.S.GetDB().QueryRow(`
 		SELECT COUNT(*) FROM job_stages jst
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_fanout_1'
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_fanout_1'
 	`).Scan(&stageCount)
 	if stageCount != 2 {
 		t.Errorf("Expected 2 stages, got %d", stageCount)
@@ -783,7 +787,8 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_fanout_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_fanout_1' AND jst.stage_index = 1
 	`).Scan(&fanoutStepCount)
 	if fanoutStepCount < 1 {
 		t.Errorf("Expected at least 1 step in fan-out stage, got %d", fanoutStepCount)
@@ -795,7 +800,8 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_fanout_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_fanout_1' AND jst.stage_index = 1
 		  AND js.continue_on_failure = false
 	`).Scan(&nonCofCount)
 	if nonCofCount > 0 {
@@ -878,7 +884,8 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 	env.S.GetDB().QueryRow(`
 		SELECT COUNT(*) FROM job_stages jst
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_multi_fanout_1'
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_multi_fanout_1'
 	`).Scan(&stageCount)
 	if stageCount != 2 {
 		t.Errorf("Expected 2 stages, got %d", stageCount)
@@ -890,7 +897,8 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_multi_fanout_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_multi_fanout_1' AND jst.stage_index = 1
 	`).Scan(&fanoutStepCount)
 	if fanoutStepCount != 2 {
 		t.Errorf("Expected exactly 2 fan-out steps, got %d", fanoutStepCount)
@@ -902,7 +910,8 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_multi_fanout_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_multi_fanout_1' AND jst.stage_index = 1
 		  AND js.continue_on_failure = false
 	`).Scan(&nonCofCount)
 	if nonCofCount > 0 {
@@ -1015,7 +1024,8 @@ func TestPipeline_ScheduleFanOut_OverrideOverGroup(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_override_group_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_override_group_1' AND jst.stage_index = 1
 	`).Scan(&stepCount)
 	if stepCount != 1 {
 		t.Errorf("Expected exactly 1 step (override replaces group), got %d", stepCount)
@@ -1114,7 +1124,8 @@ func TestPipeline_ScheduleFanOut_NoL2Additive(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_no_l2_additive_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_no_l2_additive_1' AND jst.stage_index = 1
 	`).Scan(&stepCount)
 	if stepCount != 1 {
 		t.Errorf("Expected exactly 1 fan-out step (L1 only, no L2 additive), got %d", stepCount)
@@ -1196,7 +1207,8 @@ func TestPipeline_DisabledProvider_PermanentFail(t *testing.T) {
 		FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_disabled_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_disabled_1' AND jst.stage_index = 1
 		LIMIT 1
 	`).Scan(&status, &attempts); err != nil {
 		t.Fatalf("query blocked step: %v", err)
@@ -1264,7 +1276,7 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 		SELECT nd.supports_update
 		FROM notification_deliveries nd
 		JOIN alert_groups ag ON nd.alert_group_id = ag.id
-		WHERE ag.dedup_key = $1 AND nd.target_id = 'C_POLICY_CHAN'
+		WHERE ag.alert_key = $1 AND nd.target_id = 'C_POLICY_CHAN'
 	`, "test_channel_update_1").Scan(&supportsUpdate); err != nil {
 		t.Fatalf("query channel delivery: %v", err)
 	}
@@ -1276,7 +1288,7 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 	// metadata (step_type=channel + the channel id) so the test fails if the
 	// channel step stops emitting it. The firehose event (step_type=firehose,
 	// channel_id=C_WARNING) must not satisfy this.
-	active, err := env.S.GetActiveAlertGroup("test_channel_update_1")
+	active, err := env.S.GetActiveAlertGroupByAlertKey("test_channel_update_1")
 	if err != nil {
 		t.Fatalf("GetActiveAlertGroup: %v", err)
 	}
@@ -1358,7 +1370,8 @@ func TestPipeline_EscalationUnlinked(t *testing.T) {
 		FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_unlinked_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_unlinked_1' AND jst.stage_index = 1
 		LIMIT 1
 	`).Scan(&status, &attempts); err != nil {
 		t.Fatalf("query unlinked step: %v", err)
@@ -1382,10 +1395,16 @@ func TestPipeline_EscalationUnlinked(t *testing.T) {
 	waitForJobStatus(t, env.S, "test_unlinked_1", model.JobStatusFailed)
 }
 
-// TestPipeline_CancelDuringExecution tests the real ack-driven cancellation path:
-// AckAlertGroupAtomic transitions AG → acknowledged, then ProcessAcknowledgedAlertGroups
-// cancels the escalation job via CancelJobByDedupKey. The DM step (stage 1) has a delay,
-// so it's still blocked/pending when ack fires — verifying cancel reaches pending stages.
+// TestPipeline_CancelDuringExecution tests the real ack-driven cancellation path.
+//
+// The cancellation happens inside AckAlertGroupAtomic itself, in the same
+// transaction as the status change - not in the ProcessAcknowledgedAlertGroups
+// pass that follows, whose own cancel is a second, idempotent one. The comment
+// used to credit the later pass, which made this test look like it covered a
+// path it does not.
+//
+// The DM step (stage 1) has a delay, so it is still blocked/pending when ack
+// fires - which is what verifies that cancel reaches pending stages.
 func TestPipeline_CancelDuringExecution(t *testing.T) {
 	env := setupIntegrationTest(t)
 
@@ -1437,11 +1456,11 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	waitForStepCompletion(t, env.S, "test_cancel_exec_1", 0)
 
 	// Ack via the real production path: AckAlertGroupAtomic
-	ag, err := env.S.GetActiveAlertGroup("test_cancel_exec_1")
+	ag, err := env.S.GetActiveAlertGroupByAlertKey("test_cancel_exec_1")
 	if err != nil {
 		t.Fatalf("GetActiveAlertGroup: %v", err)
 	}
-	changed, err := env.S.AckAlertGroupAtomic(ag.ID, "test-user", nil, nil, ag.DedupKey)
+	changed, err := env.S.AckAlertGroupAtomic(ag.ID, "test-user", nil, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic: %v", err)
 	}
@@ -1453,7 +1472,8 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	cancel()
 	time.Sleep(200 * time.Millisecond) // let goroutine drain
 
-	// Run the ack processing — this calls CancelJobByDedupKey internally
+	// Run the ack processing. Its own cancel is the second, idempotent one: the
+	// job was already cancelled inside AckAlertGroupAtomic above.
 	ackCtx := context.Background()
 	env.Disp.ProcessAcknowledgedAlertGroups(ackCtx)
 
@@ -1465,7 +1485,8 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	env.S.GetDB().QueryRow(`
 		SELECT COUNT(*) FROM job_stages jst
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_cancel_exec_1' AND j.status = 'canceled'
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = 'test_cancel_exec_1' AND j.status = 'canceled'
 		  AND jst.status IN ('active', 'blocked')
 	`).Scan(&activeStageCnt)
 	if activeStageCnt != 0 {
@@ -1479,17 +1500,23 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	}
 }
 
-func waitForJobStatus(t *testing.T, s *store.Store, dedupKey string, expected model.JobStatus) {
+func waitForJobStatus(t *testing.T, s *store.Store, alertKey string, expected model.JobStatus) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		var status string
-		err := s.GetDB().QueryRow(`SELECT status FROM jobs WHERE dedup_key = $1`, dedupKey).Scan(&status)
+		err := s.GetDB().QueryRow(`
+			SELECT j.status FROM jobs j
+			JOIN alert_groups ag ON j.alert_group_id = ag.id
+			WHERE ag.alert_key = $1`, alertKey).Scan(&status)
 		if err == nil && status == string(expected) {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	var actual string
-	s.GetDB().QueryRow(`SELECT status FROM jobs WHERE dedup_key = $1`, dedupKey).Scan(&actual)
-	t.Fatalf("Timeout waiting for job %s to reach status %s, current: %s", dedupKey, expected, actual)
+	s.GetDB().QueryRow(`
+		SELECT j.status FROM jobs j
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.alert_key = $1`, alertKey).Scan(&actual)
+	t.Fatalf("Timeout waiting for job %s to reach status %s, current: %s", alertKey, expected, actual)
 }

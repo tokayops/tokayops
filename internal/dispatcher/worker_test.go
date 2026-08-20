@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tokayops/tokayops/internal/config"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -59,6 +60,14 @@ func (m *MockProvider) Permalink(d *model.NotificationDelivery) string {
 	return ""
 }
 
+// testJobIdentity gives a fixture job an identity. Tests about the step
+// machinery do not care which family a job belongs to; an alert update is
+// borrowed because it is while_active, so a fixture never has to reason about
+// a claim outliving the job it was written for.
+func testJobIdentity(jobID string) *jobdedup.Spec {
+	return jobdedup.AlertUpdate("test:" + jobID)
+}
+
 func TestProcessStep_SlackSuccess(t *testing.T) {
 	s := store.NewMockStore()
 	cfg := &config.Config{
@@ -79,15 +88,15 @@ func TestProcessStep_SlackSuccess(t *testing.T) {
 	d.RegisterProvider("slack", mp)
 
 	// Seed AG
-	ag := &model.AlertGroup{ID: "ag1", DedupKey: "dk1"}
+	ag := &model.AlertGroup{ID: "ag1", AlertKey: "dk1"}
 	s.CreateAlertGroup(ag)
 
 	// Seed Job (Required for processStep lookup)
 	leaseToken := "lease-slack-success"
 	job := &model.Job{
-		ID:       "job1",
-		DedupKey: strPtr("dk1"),
-		Status:   model.JobStatusRunning,
+		ID:     "job1",
+		Dedup:  testJobIdentity("job1"),
+		Status: model.JobStatusRunning,
 	}
 	// Prepare Step
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
@@ -132,11 +141,11 @@ func TestProcessStep_Retry(t *testing.T) {
 	d.RegisterProvider("slack", mp)
 
 	// Create AG to avoid "alert group not found"
-	s.CreateAlertGroup(&model.AlertGroup{ID: "ag1", DedupKey: "dk1"})
+	s.CreateAlertGroup(&model.AlertGroup{ID: "ag1", AlertKey: "dk1"})
 
 	// Seed Job
 	leaseToken := "lease-retry"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -210,7 +219,7 @@ func TestProcessStep_Firehose(t *testing.T) {
 
 	// Seed Job
 	leaseToken := "lease-firehose"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -252,7 +261,7 @@ func TestProcessStep_MaxRetries(t *testing.T) {
 
 	s.CreateAlertGroup(&model.AlertGroup{ID: "ag1"})
 	leaseToken := "lease-max-retries"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -293,7 +302,7 @@ func TestProcessStep_Canceled(t *testing.T) {
 	s.CreateAlertGroup(&model.AlertGroup{ID: "ag1"})
 	// Job is Canceled
 	leaseToken := "lease-canceled"
-	job := &model.Job{ID: "job1", Status: model.JobStatusCanceled}
+	job := &model.Job{ID: "job1", Status: model.JobStatusCanceled, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -369,7 +378,7 @@ func TestProcessStep_TransientError(t *testing.T) {
 	stages := []*model.JobStage{
 		{ID: "stage-0", JobID: "job1", StageIndex: 0, Status: model.JobStageStatusActive},
 	}
-	realStore.CreateJobWithDedup(&model.Job{ID: "job1", Status: model.JobStatusRunning}, stages, []*model.JobStep{step})
+	realStore.CreateJobWithDedup(&model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}, stages, []*model.JobStep{step})
 
 	d.processStep(context.Background(), step)
 
@@ -404,7 +413,7 @@ func TestFailStep_ContinueOnFailure_HasNextStep(t *testing.T) {
 
 	// Create job with TWO steps: firehose (index 0) + dm (index 1)
 	leaseToken := "lease-cof-next"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
@@ -474,7 +483,7 @@ func TestFailStep_ContinueOnFailure_NoNextStep(t *testing.T) {
 
 	// Create job with ONLY one step (firehose) - simulates firehose-only job
 	leaseToken := "lease-cof-no-next"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -526,7 +535,7 @@ func TestFailStep_Default(t *testing.T) {
 
 	// Create job with two steps, but first step has ContinueOnFailure=false (default)
 	leaseToken := "lease-default-fail"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U2", ProviderName: "slack"}
@@ -616,7 +625,7 @@ func TestContinueOnFailure_UnlockRetrySuccess(t *testing.T) {
 
 	// Create job with TWO steps (each in its own stage)
 	leaseToken := "lease-unlock-retry"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
@@ -692,7 +701,7 @@ func TestContinueOnFailure_UnlockRetryExhausted(t *testing.T) {
 
 	// Create job with TWO steps (each in its own stage)
 	leaseToken := "lease-retry-exhaust"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
@@ -745,14 +754,14 @@ type JobCountingStoreWrapper struct {
 	JobsCreated int
 }
 
-func (w *JobCountingStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
+func (w *JobCountingStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
 	// Call real implementation
-	id, created, err := w.StoreInterface.CreateJobWithDedup(job, stages, steps)
+	created, err := w.StoreInterface.CreateJobWithDedup(job, stages, steps)
 	if created {
 		// Only count if THIS job was actually created (not deduped to existing)
 		w.JobsCreated++
 	}
-	return id, created, err
+	return created, err
 }
 
 // TestProcessAcknowledgedAlertGroups_NoDuplicateJobs_WithJobCompletion tests that
@@ -779,7 +788,7 @@ func TestProcessAcknowledgedAlertGroups_NoDuplicateJobs_WithJobCompletion(t *tes
 	// Create acknowledged AG
 	ag := &model.AlertGroup{
 		ID:       "ag1",
-		DedupKey: "dk1",
+		AlertKey: "dk1",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	realStore.CreateAlertGroup(ag)
@@ -805,7 +814,7 @@ func TestProcessAcknowledgedAlertGroups_NoDuplicateJobs_WithJobCompletion(t *tes
 
 	// Simulate job completion: mark job as succeeded in the mock store
 	// This simulates what happens between loop iterations when the job executes
-	realStore.MarkJobSucceeded("update_ack_ag1")
+	realStore.MarkJobSucceeded(jobdedup.AckUpdate("ag1"))
 
 	// Second iteration: should skip because succeeded job exists
 	d.ProcessAcknowledgedAlertGroups(ctx)
@@ -839,7 +848,7 @@ func TestProcessAcknowledgedAlertGroups_CancelsEscalationJob(t *testing.T) {
 	// Create acknowledged AG with a dedup key
 	ag := &model.AlertGroup{
 		ID:       "ag1",
-		DedupKey: "test_dedup_key",
+		AlertKey: "test_dedup_key",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	s.CreateAlertGroup(ag)
@@ -855,13 +864,16 @@ func TestProcessAcknowledgedAlertGroups_CancelsEscalationJob(t *testing.T) {
 	}
 	s.UpsertNotificationDelivery(delivery)
 
-	// Create an active escalation job (simulating ongoing escalation)
-	escalationDedupKey := "test_dedup_key" // Same as ag.DedupKey
+	// Create an active escalation job (simulating ongoing escalation), shaped
+	// like the builder's: cancellation addresses alert_group_id, and the dedup
+	// identity is that same group.
+	escalationAGID := ag.ID
 	escalationJob := &model.Job{
-		ID:       "escalation_job_1",
-		Type:     "escalation",
-		Status:   model.JobStatusRunning,
-		DedupKey: &escalationDedupKey,
+		ID:           "escalation_job_1",
+		Type:         "escalation",
+		Status:       model.JobStatusRunning,
+		Dedup:        jobdedup.Escalation(ag.ID),
+		AlertGroupID: &escalationAGID,
 	}
 	escalationStep := &model.JobStep{
 		ID:        "step1",
@@ -869,7 +881,9 @@ func TestProcessAcknowledgedAlertGroups_CancelsEscalationJob(t *testing.T) {
 		StepIndex: 1,
 		Status:    model.JobStepStatusBlocked, // Waiting to run
 	}
-	s.CreateJobWithDedup(escalationJob, nil, []*model.JobStep{escalationStep})
+	if err := s.SeedEscalationJob(ag.ID, escalationJob, nil, []*model.JobStep{escalationStep}); err != nil {
+		t.Fatalf("SeedEscalationJob: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -904,7 +918,7 @@ func TestProcessAcknowledgedAlertGroups_MarksAsProcessed(t *testing.T) {
 	// Create acknowledged AG
 	ag := &model.AlertGroup{
 		ID:       "ag1",
-		DedupKey: "dk1",
+		AlertKey: "dk1",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	s.CreateAlertGroup(ag)
@@ -950,7 +964,7 @@ func TestProcessAcknowledgedAlertGroups_NoInfiniteLoop_NoDeliveries(t *testing.T
 	// Create acknowledged AG WITHOUT any deliveries (this triggers the bug)
 	ag := &model.AlertGroup{
 		ID:       "ag_no_deliveries",
-		DedupKey: "dk_no_deliveries",
+		AlertKey: "dk_no_deliveries",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	s.CreateAlertGroup(ag)
@@ -988,7 +1002,7 @@ func TestProcessAcknowledgedAlertGroups_MultipleIterations_NoLoop(t *testing.T) 
 	// Create acknowledged AG with a delivery
 	ag := &model.AlertGroup{
 		ID:       "ag1",
-		DedupKey: "dk1",
+		AlertKey: "dk1",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	s.CreateAlertGroup(ag)
@@ -1030,13 +1044,13 @@ func TestGetAcknowledgedAlertGroups_FiltersProcessed(t *testing.T) {
 	// Create two acknowledged AGs
 	ag1 := &model.AlertGroup{
 		ID:       "ag_unprocessed",
-		DedupKey: "dk1",
+		AlertKey: "dk1",
 		Status:   model.AlertGroupStatusAcknowledged,
 		// AckProcessedAt is nil (not processed)
 	}
 	ag2 := &model.AlertGroup{
 		ID:       "ag_processed",
-		DedupKey: "dk2",
+		AlertKey: "dk2",
 		Status:   model.AlertGroupStatusAcknowledged,
 		// Will be marked as processed below
 	}
@@ -1070,7 +1084,7 @@ func TestMarkAckProcessed_SetsTimestamp(t *testing.T) {
 	// Create AG
 	ag := &model.AlertGroup{
 		ID:       "ag1",
-		DedupKey: "dk1",
+		AlertKey: "dk1",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	s.CreateAlertGroup(ag)
@@ -1107,7 +1121,7 @@ func TestProcessAcknowledgedAlertGroups_MarksProcessedOnError(t *testing.T) {
 	// when there are no deliveries, which is normal and should still mark as processed
 	ag := &model.AlertGroup{
 		ID:       "ag_error",
-		DedupKey: "dk_error",
+		AlertKey: "dk_error",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	s.CreateAlertGroup(ag)
@@ -1132,10 +1146,10 @@ type FailingCreateJobStoreWrapper struct {
 	FailCount int
 }
 
-func (f *FailingCreateJobStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
+func (f *FailingCreateJobStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
 	if f.FailCount > 0 {
 		f.FailCount--
-		return "", false, errors.New("transient db error")
+		return false, errors.New("transient db error")
 	}
 	return f.StoreInterface.CreateJobWithDedup(job, stages, steps)
 }
@@ -1160,7 +1174,7 @@ func TestProcessAcknowledgedAlertGroups_TransientJobCreationError_ShouldRetry(t 
 	// Create acknowledged AG with delivery
 	ag := &model.AlertGroup{
 		ID:       "ag_transient",
-		DedupKey: "dk_transient",
+		AlertKey: "dk_transient",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	realStore.CreateAlertGroup(ag)
@@ -1190,60 +1204,50 @@ func TestProcessAcknowledgedAlertGroups_TransientJobCreationError_ShouldRetry(t 
 	d.ProcessAcknowledgedAlertGroups(ctx)
 
 	// Verify job was created on retry
-	job, _ := realStore.GetJobByDedupKey("update_ack_ag_transient")
+	job, _ := realStore.FindJobByIdentity(jobdedup.AckUpdate("ag_transient"))
 	if job == nil {
 		t.Error("Expected update job to be created on retry")
 	}
 }
 
-// TestReAck_ShouldClearAckProcessedAt tests that when a user re-acknowledges an AG
-// (to retry Slack update after a failure), ack_processed_at should be cleared
-// so the AG is picked up again by ProcessAcknowledgedAlertGroups.
-//
-// ISSUE: UpdateAlertGroupAcknowledged doesn't clear ack_processed_at, so re-ack is broken.
-func TestReAck_ShouldClearAckProcessedAt(t *testing.T) {
+// TestAckGateIsRaisedOncePerGroup is the double's half of the same statement
+// the store test makes: an acknowledged group cannot be acknowledged again, so
+// the ack update gate is raised once and the producer may lower it without
+// asking whether anything arrived meanwhile.
+func TestAckGateIsRaisedOncePerGroup(t *testing.T) {
 	s := store.NewMockStore()
 
-	// Create AG and mark as acknowledged
-	ag := &model.AlertGroup{
-		ID:       "ag_reack",
-		DedupKey: "dk_reack",
-		Status:   model.AlertGroupStatusTriggered, // Start as triggered
+	s.CreateAlertGroup(&model.AlertGroup{
+		ID:       "ag_ack_once",
+		AlertKey: "dk_ack_once",
+		Status:   model.AlertGroupStatusTriggered,
+	})
+
+	if changed, err := s.AckAlertGroupAtomic("ag_ack_once", "user1", nil, nil); err != nil || !changed {
+		t.Fatalf("first ack: changed=%v err=%v", changed, err)
 	}
-	s.CreateAlertGroup(ag)
-
-	// First ack
-	s.UpdateAlertGroupAcknowledged("ag_reack", "user1")
-
-	// Mark as processed (simulating first ack processing completed)
-	s.MarkAckProcessed("ag_reack")
-
-	// Verify it's processed
-	fetched, _ := s.GetAlertGroupByID("ag_reack")
-	if fetched.AckProcessedAt == nil {
-		t.Fatal("Setup error: AckProcessedAt should be set")
+	if err := s.MarkAckProcessed("ag_ack_once"); err != nil {
+		t.Fatalf("MarkAckProcessed: %v", err)
 	}
 
-	// Re-ack (user wants to retry)
-	s.UpdateAlertGroupAcknowledged("ag_reack", "user2")
-
-	// ack_processed_at should be cleared to allow reprocessing
-	fetched, _ = s.GetAlertGroupByID("ag_reack")
-	if fetched.AckProcessedAt != nil {
-		t.Error("Re-ack should clear ack_processed_at to allow retry, but it's still set!")
+	changed, err := s.AckAlertGroupAtomic("ag_ack_once", "user2", nil, nil)
+	if err != nil {
+		t.Fatalf("second ack: %v", err)
+	}
+	if changed {
+		t.Error("an acknowledged group was acknowledged again")
 	}
 
-	// AG should appear in GetAcknowledgedAlertGroups for reprocessing
+	ag, _ := s.GetAlertGroupByID("ag_ack_once")
+	if ag.AckProcessedAt == nil {
+		t.Error("the ack gate went back up for a group that was already acknowledged")
+	}
+
 	ags, _ := s.GetAcknowledgedAlertGroups()
-	found := false
-	for _, ag := range ags {
-		if ag.ID == "ag_reack" {
-			found = true
-			break
+	for _, waiting := range ags {
+		if waiting.ID == "ag_ack_once" {
+			t.Error("the group is waiting for a second ack update it will never need")
 		}
-	}
-	if !found {
-		t.Error("Re-acked AG should be returned by GetAcknowledgedAlertGroups for retry")
 	}
 }
 
@@ -1258,7 +1262,7 @@ func TestGetAlertGroupByID_ShouldIncludeAckProcessedAt(t *testing.T) {
 	// Create AG
 	ag := &model.AlertGroup{
 		ID:       "ag_api",
-		DedupKey: "dk_api",
+		AlertKey: "dk_api",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	s.CreateAlertGroup(ag)
@@ -1293,7 +1297,7 @@ func TestDeliveryCreatedAfterAck_ShouldBeUpdated(t *testing.T) {
 	// Create AG and acknowledge it
 	ag := &model.AlertGroup{
 		ID:       "ag_late_delivery",
-		DedupKey: "dk_late_delivery",
+		AlertKey: "dk_late_delivery",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	s.CreateAlertGroup(ag)
@@ -1386,7 +1390,7 @@ func TestProcessAcknowledgedAlertGroups_OnlyMarkProcessedOnSuccess(t *testing.T)
 
 			ag := &model.AlertGroup{
 				ID:       "ag_" + tc.name,
-				DedupKey: "dk_" + tc.name,
+				AlertKey: "dk_" + tc.name,
 				Status:   model.AlertGroupStatusAcknowledged,
 			}
 			realStore.CreateAlertGroup(ag)
@@ -1453,7 +1457,7 @@ func TestProcessAcknowledgedAlertGroups_TransientBuildError_ShouldRetry(t *testi
 	// Create acknowledged AG with delivery
 	ag := &model.AlertGroup{
 		ID:       "ag_build_transient",
-		DedupKey: "dk_build_transient",
+		AlertKey: "dk_build_transient",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	realStore.CreateAlertGroup(ag)
@@ -1496,7 +1500,7 @@ func TestProcessAcknowledgedAlertGroups_TransientBuildError_ShouldRetry(t *testi
 	d.ProcessAcknowledgedAlertGroups(ctx)
 
 	// Verify job was created on retry
-	job, _ := realStore.GetJobByDedupKey("update_ack_ag_build_transient")
+	job, _ := realStore.FindJobByIdentity(jobdedup.AckUpdate("ag_build_transient"))
 	if job == nil {
 		t.Error("Expected update job to be created on retry after transient Build error")
 	}
@@ -1533,11 +1537,11 @@ func TestRegression_CompleteStep_UnlockFailure(t *testing.T) {
 	}
 	d.RegisterProvider("slack", mp)
 
-	realStore.CreateAlertGroup(&model.AlertGroup{ID: "ag1", DedupKey: "dk1"})
+	realStore.CreateAlertGroup(&model.AlertGroup{ID: "ag1", AlertKey: "dk1"})
 
 	// Create job with TWO steps (each in its own stage)
 	leaseToken := "lease-regression"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U2", ProviderName: "slack"}
@@ -1598,7 +1602,7 @@ func TestRegression_ProcessResolved_CreateJobFailure(t *testing.T) {
 	// Create resolved AG with an updatable delivery
 	ag := &model.AlertGroup{
 		ID:       "ag_resolved",
-		DedupKey: "dk_resolved",
+		AlertKey: "dk_resolved",
 		Status:   model.AlertGroupStatusResolved,
 	}
 	realStore.CreateAlertGroup(ag)
@@ -1634,6 +1638,77 @@ func TestRegression_ProcessResolved_CreateJobFailure(t *testing.T) {
 	}
 }
 
+// closeFailingStore lets the resolution job be created and then loses the write
+// that closes the group - the one interleaving in which the producer sees a
+// group it has already built a job for.
+type closeFailingStore struct {
+	store.StoreInterface
+	failClose bool
+}
+
+func (c *closeFailingStore) TransitionAlertGroupStatus(id string,
+	fromStatus, toStatus model.AlertGroupStatus) (bool, error) {
+	if c.failClose && toStatus == model.AlertGroupStatusClosed {
+		c.failClose = false
+		return false, errors.New("closing the group failed")
+	}
+	return c.StoreInterface.TransitionAlertGroupStatus(id, fromStatus, toStatus)
+}
+
+// TestProcessResolved_ClosesTheGroupOnADedupHit: the resolution gate is the
+// group's own status, and a dedup hit means the resolution was already
+// admitted - so the gate comes down.
+//
+// This is the opposite answer from the alert update, and the difference is not
+// the mechanism but the event: a group is resolved once, so a hit here can only
+// be this producer's own earlier attempt, whereas an alert update that loses
+// its race has an alert nobody has rendered yet.
+func TestProcessResolved_ClosesTheGroupOnADedupHit(t *testing.T) {
+	realStore := store.NewMockStore()
+	wrapper := &closeFailingStore{StoreInterface: realStore, failClose: true}
+
+	d := mustNewDispatcher(t, wrapper, &config.Config{})
+	d.RegisterProvider("slack", &MockProvider{})
+
+	realStore.CreateAlertGroup(&model.AlertGroup{
+		ID:       "ag_resolve_twice",
+		AlertKey: "dk_resolve_twice",
+		Status:   model.AlertGroupStatusResolved,
+	})
+	realStore.UpsertNotificationDelivery(&model.NotificationDelivery{
+		ID:              "del_resolve_twice",
+		AlertGroupID:    "ag_resolve_twice",
+		Provider:        "slack",
+		SupportsUpdate:  true,
+		IsPrimary:       true,
+		ProviderPayload: `{"channel":"C123","ts":"1234567890.000000"}`,
+	})
+
+	ctx := context.Background()
+
+	// The job is created; the close is lost.
+	d.ProcessResolvedAlertGroups(ctx)
+	first, _ := realStore.FindJobByIdentity(jobdedup.Resolution("ag_resolve_twice"))
+	if first == nil {
+		t.Fatal("no resolution job was created")
+	}
+	if ag, _ := realStore.GetAlertGroupByID("ag_resolve_twice"); ag.Status != model.AlertGroupStatusResolved {
+		t.Fatalf("group is %s after a failed close, want it still resolved", ag.Status)
+	}
+
+	// The next tick finds the group again. Its resolution is already in flight,
+	// so nothing new is admitted - and the group is closed all the same.
+	d.ProcessResolvedAlertGroups(ctx)
+
+	after, _ := realStore.FindJobByIdentity(jobdedup.Resolution("ag_resolve_twice"))
+	if after == nil || after.ID != first.ID {
+		t.Errorf("a second resolution job was written for one resolution: %+v", after)
+	}
+	if ag, _ := realStore.GetAlertGroupByID("ag_resolve_twice"); ag.Status != model.AlertGroupStatusClosed {
+		t.Errorf("group is %s, want closed - its resolution was admitted", ag.Status)
+	}
+}
+
 // TestRegression_ProcessResolved_BuildFailure tests that when Build() returns an error
 // for a resolved AG, the AG stays in "resolved" status (not "closed"),
 // allowing retry on the next tick.
@@ -1654,7 +1729,7 @@ func TestRegression_ProcessResolved_BuildFailure(t *testing.T) {
 	// Create resolved AG with an updatable delivery
 	ag := &model.AlertGroup{
 		ID:       "ag_build_fail",
-		DedupKey: "dk_build_fail",
+		AlertKey: "dk_build_fail",
 		Status:   model.AlertGroupStatusResolved,
 	}
 	realStore.CreateAlertGroup(ag)
@@ -1702,7 +1777,7 @@ func TestProcessAcknowledgedAlertGroups_NoDeliveries_UsesError(t *testing.T) {
 	// Create acknowledged AG WITHOUT any deliveries
 	ag := &model.AlertGroup{
 		ID:       "ag_no_deliveries_sentinel",
-		DedupKey: "dk_no_deliveries_sentinel",
+		AlertKey: "dk_no_deliveries_sentinel",
 		Status:   model.AlertGroupStatusAcknowledged,
 	}
 	s.CreateAlertGroup(ag)
@@ -1747,13 +1822,13 @@ func TestProcessAlertUpdates_CreatesUpdateJob(t *testing.T) {
 	// Setup: create AG in processing state with slack_update_pending
 	ag := &model.AlertGroup{
 		ID:       "ag_update",
-		DedupKey: "dk_update",
+		AlertKey: "dk_update",
 		Status:   model.AlertGroupStatusProcessing,
 		Title:    "Test",
 		Severity: "critical",
 	}
 	s.CreateAlertGroup(ag)
-	s.SetSlackUpdatePending("ag_update", true)
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_update", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	// Create a delivery so UpdateJobBuilder can find it
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
@@ -1769,7 +1844,7 @@ func TestProcessAlertUpdates_CreatesUpdateJob(t *testing.T) {
 	d.ProcessAlertUpdates(ctx)
 
 	// Verify: job was created
-	job, err := s.GetJobByDedupKey("update_alert_ag_update")
+	job, err := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_update"))
 	if err != nil {
 		t.Fatalf("Job not found: %v", err)
 	}
@@ -1787,33 +1862,117 @@ func TestProcessAlertUpdates_CreatesUpdateJob(t *testing.T) {
 	}
 }
 
-func TestProcessAlertUpdates_KeepsFlagWhenNoDeliveries(t *testing.T) {
+// TestProcessAlertUpdates_KeepsFlagWhenNothingCanBeUpdatedYet: nothing has been
+// delivered yet, so there is no message to refresh - and no way to know that a
+// message will not appear a moment later. The gate stays up for it.
+func TestProcessAlertUpdates_KeepsFlagWhenNothingCanBeUpdatedYet(t *testing.T) {
 	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d, _ := NewDispatcher(s, cfg)
+	d, _ := NewDispatcher(s, &config.Config{})
 
-	// Setup: AG with flag but NO deliveries (escalation not done yet)
-	ag := &model.AlertGroup{
+	s.CreateAlertGroup(&model.AlertGroup{
 		ID:       "ag_no_del",
-		DedupKey: "dk_no_del",
+		AlertKey: "dk_no_del",
 		Status:   model.AlertGroupStatusProcessing,
 		Title:    "Test",
 		Severity: "info",
+	})
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_no_del", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
+
+	d.ProcessAlertUpdates(context.Background())
+
+	updated, _ := s.GetAlertGroupByID("ag_no_del")
+	if !updated.SlackUpdatePending {
+		t.Error("the gate came down although no message has been sent that could carry this alert")
 	}
-	s.CreateAlertGroup(ag)
-	s.SetSlackUpdatePending("ag_no_del", true)
+}
+
+// deliveringStore writes a delivery at the moment the producer reads the ones
+// that exist - the interleaving in which the escalation records what it has
+// just sent while the update is being built.
+//
+// This is the race the producer used to lose: it asked a second time whether
+// any deliveries existed, saw the new one, and took that as proof no update was
+// needed. The card had been rendered before the alert arrived, so the alert
+// reached no message at all.
+type deliveringStore struct {
+	store.StoreInterface
+	mock  *store.MockStore
+	agID  string
+	built bool
+}
+
+// ListDeliveries answers with what the escalation had sent when the build
+// started, and only then records the message it was busy sending. The build
+// therefore sees nothing to update, and a delivery that can be updated exists
+// a moment later.
+func (ds *deliveringStore) ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error) {
+	existing, err := ds.StoreInterface.ListDeliveries(alertGroupID)
+	if !ds.built && alertGroupID == ds.agID {
+		ds.built = true
+		ds.mock.UpsertNotificationDelivery(&model.NotificationDelivery{
+			ID:              "del_late",
+			AlertGroupID:    ds.agID,
+			Provider:        "slack",
+			SupportsUpdate:  true,
+			ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
+		})
+	}
+	return existing, err
+}
+
+// TestProcessAlertUpdates_KeepsFlagWhenADeliveryLandsMidBuild: a delivery
+// written between the producer's reads must not take the gate down.
+func TestProcessAlertUpdates_KeepsFlagWhenADeliveryLandsMidBuild(t *testing.T) {
+	s := store.NewMockStore()
+	racing := &deliveringStore{StoreInterface: s, mock: s, agID: "ag_late"}
+	d, _ := NewDispatcher(racing, &config.Config{})
+	d.RegisterProvider("slack", &MockProvider{
+		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
+			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
+		},
+	})
+
+	s.CreateAlertGroup(&model.AlertGroup{
+		ID:       "ag_late",
+		AlertKey: "dk_late",
+		Status:   model.AlertGroupStatusProcessing,
+		Title:    "Test",
+		Severity: "info",
+	})
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_late", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	ctx := context.Background()
 	d.ProcessAlertUpdates(ctx)
 
-	// Verify: flag should STILL be true (no deliveries → retry later)
-	updated, _ := s.GetAlertGroupByID("ag_no_del")
+	updated, _ := s.GetAlertGroupByID("ag_late")
 	if !updated.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to stay true when no deliveries exist")
+		t.Fatal("the gate came down for a delivery the build never saw; this alert reached no message")
+	}
+
+	// The next tick sees the delivery and gives the alert its update.
+	d.ProcessAlertUpdates(ctx)
+	if job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_late")); job == nil {
+		t.Error("no update job was created once the delivery was there")
+	}
+	settled, _ := s.GetAlertGroupByID("ag_late")
+	if settled.SlackUpdatePending {
+		t.Error("the gate is still up after the update was admitted")
 	}
 }
 
-func TestProcessAlertUpdates_ClearsFlagWhenNoUpdatableDeliveries(t *testing.T) {
+// TestProcessAlertUpdates_KeepsFlagWhenNoUpdatableDeliveries: a group whose
+// messages refuse updates keeps its gate up.
+//
+// This test asserted the opposite until the gate was looked at properly. The
+// old reading - "deliveries exist, so no more are coming, so nothing will ever
+// be updatable" - is not something this producer can know: a delivery written a
+// moment later, by a step still running after its job was canceled, would find
+// the gate already down and the alert that raised it in no message.
+//
+// The gate stays up instead. It costs a listing per tick for as long as the
+// group is open, and it says something true: that message really is out of
+// date.
+func TestProcessAlertUpdates_KeepsFlagWhenNoUpdatableDeliveries(t *testing.T) {
 	s := store.NewMockStore()
 	cfg := &config.Config{}
 	d, _ := NewDispatcher(s, cfg)
@@ -1821,13 +1980,13 @@ func TestProcessAlertUpdates_ClearsFlagWhenNoUpdatableDeliveries(t *testing.T) {
 	// Setup: AG with flag and a delivery that does NOT support updates
 	ag := &model.AlertGroup{
 		ID:       "ag_no_upd",
-		DedupKey: "dk_no_upd",
+		AlertKey: "dk_no_upd",
 		Status:   model.AlertGroupStatusProcessing,
 		Title:    "Test",
 		Severity: "info",
 	}
 	s.CreateAlertGroup(ag)
-	s.SetSlackUpdatePending("ag_no_upd", true)
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_no_upd", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
 		ID:             "del_no_upd",
@@ -1839,14 +1998,20 @@ func TestProcessAlertUpdates_ClearsFlagWhenNoUpdatableDeliveries(t *testing.T) {
 	ctx := context.Background()
 	d.ProcessAlertUpdates(ctx)
 
-	// Verify: flag cleared — deliveries exist but none support updates, so flag would be stuck forever
 	updated, _ := s.GetAlertGroupByID("ag_no_upd")
-	if updated.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be false when deliveries exist but none are updatable")
+	if !updated.SlackUpdatePending {
+		t.Error("the gate came down on the evidence that some delivery exists, which proves nothing about the next one")
 	}
 }
 
-func TestProcessAlertUpdates_ClearsFlagOnDedupHit(t *testing.T) {
+// TestProcessAlertUpdates_KeepsFlagOnDedupHit: an update that was not admitted
+// does not lower the gate.
+//
+// This test used to assert the opposite, and the opposite is how an alert got
+// lost: the running job had already rendered the message, the new alert raised
+// the flag, and the tick took the flag down for a job it never created. The
+// alert then waited for the next one to arrive, which may never happen.
+func TestProcessAlertUpdates_KeepsFlagOnDedupHit(t *testing.T) {
 	s := store.NewMockStore()
 	cfg := &config.Config{}
 	d, _ := NewDispatcher(s, cfg)
@@ -1859,13 +2024,13 @@ func TestProcessAlertUpdates_ClearsFlagOnDedupHit(t *testing.T) {
 	// Setup: AG with delivery and flag
 	ag := &model.AlertGroup{
 		ID:       "ag_dedup",
-		DedupKey: "dk_dedup",
+		AlertKey: "dk_dedup",
 		Status:   model.AlertGroupStatusProcessing,
 		Title:    "Test",
 		Severity: "info",
 	}
 	s.CreateAlertGroup(ag)
-	s.SetSlackUpdatePending("ag_dedup", true)
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_dedup", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
 		ID:              "del_dedup",
@@ -1880,7 +2045,7 @@ func TestProcessAlertUpdates_ClearsFlagOnDedupHit(t *testing.T) {
 	d.ProcessAlertUpdates(ctx)
 
 	// Verify first job was created and flag cleared
-	job, _ := s.GetJobByDedupKey("update_alert_ag_dedup")
+	job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_dedup"))
 	if job == nil {
 		t.Fatal("Expected job to be created on first run")
 	}
@@ -1888,25 +2053,116 @@ func TestProcessAlertUpdates_ClearsFlagOnDedupHit(t *testing.T) {
 		t.Fatalf("Expected job status pending, got %s", job.Status)
 	}
 
-	// Re-set flag (simulating new alerts arriving while job is still pending)
-	s.SetSlackUpdatePending("ag_dedup", true)
+	// A new alert arrives while the first job is still pending.
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_dedup", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
-	// Second run — job is still pending, so CreateJobWithDedup returns (existingID, nil) = dedup hit
+	// Second run — the job is still pending, so CreateJobWithDedup reports
+	// created=false and nothing was admitted for this alert.
 	d.ProcessAlertUpdates(ctx)
 
-	// Verify: flag cleared even though no new job was created (dedup hit)
 	updated, _ := s.GetAlertGroupByID("ag_dedup")
-	if updated.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be false after dedup hit")
+	if !updated.SlackUpdatePending {
+		t.Error("the gate came down for an update that was never created; this alert is now lost")
 	}
 
-	// Verify: still the same job (dedup returned existing, didn't create new)
-	jobAfter, _ := s.GetJobByDedupKey("update_alert_ag_dedup")
+	// Nothing new was written either - the running job holds the identity.
+	jobAfter, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_dedup"))
 	if jobAfter == nil {
 		t.Fatal("Expected job to still exist")
 	}
 	if jobAfter.ID != job.ID {
 		t.Errorf("Expected same job ID %s after dedup hit, got %s", job.ID, jobAfter.ID)
+	}
+
+	// Once it finishes, the flag that stayed up is what gets the alert onto the
+	// message: the next tick is admitted and lowers the gate itself.
+	s.MarkJobSucceeded(jobdedup.AlertUpdate("ag_dedup"))
+	d.ProcessAlertUpdates(ctx)
+
+	settled, _ := s.GetAlertGroupByID("ag_dedup")
+	if settled.SlackUpdatePending {
+		t.Error("the gate is still up after an update was admitted for it")
+	}
+}
+
+// gateRacingStore raises the update gate at the exact moment a job is
+// admitted, which is the interleaving that loses an alert. It is injected here
+// rather than raced for: the window is a scheduling accident in production and
+// would be a flaky test if reproduced by timing.
+type gateRacingStore struct {
+	store.StoreInterface
+	onAdmit func()
+}
+
+func (g *gateRacingStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
+	steps []*model.JobStep) (bool, error) {
+	created, err := g.StoreInterface.CreateJobWithDedup(job, stages, steps)
+	if created && g.onAdmit != nil {
+		g.onAdmit()
+	}
+	return created, err
+}
+
+// TestProcessAlertUpdates_KeepsFlagWhenAnAlertArrivesDuringAdmission: admitting
+// the job and lowering the gate are two writes, and an alert that lands between
+// them belongs to neither.
+//
+// The admitted job renders the message at some point of its own; whether it
+// happens to include this alert is not something the producer can know. What it
+// can know is that the gate it is about to lower is no longer the one it read -
+// so it leaves it up, and the alert gets an update of its own.
+func TestProcessAlertUpdates_KeepsFlagWhenAnAlertArrivesDuringAdmission(t *testing.T) {
+	s := store.NewMockStore()
+	racing := &gateRacingStore{StoreInterface: s}
+	d, _ := NewDispatcher(racing, &config.Config{})
+	d.RegisterProvider("slack", &MockProvider{
+		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
+			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
+		},
+	})
+
+	s.CreateAlertGroup(&model.AlertGroup{
+		ID:       "ag_race",
+		AlertKey: "dk_race",
+		Status:   model.AlertGroupStatusProcessing,
+		Title:    "Test",
+		Severity: "info",
+	})
+	s.UpsertNotificationDelivery(&model.NotificationDelivery{
+		ID:              "del_race",
+		AlertGroupID:    "ag_race",
+		Provider:        "slack",
+		SupportsUpdate:  true,
+		ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
+	})
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_race", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
+
+	// The new alert lands after the job is admitted and before the gate comes
+	// down.
+	racing.onAdmit = func() {
+		s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_race", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
+	}
+
+	ctx := context.Background()
+	d.ProcessAlertUpdates(ctx)
+
+	if job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_race")); job == nil {
+		t.Fatal("no update job was created for the first alert")
+	}
+	ag, _ := s.GetAlertGroupByID("ag_race")
+	if !ag.SlackUpdatePending {
+		t.Fatal("the gate came down for a version that was already stale; the second alert is now lost")
+	}
+
+	// The in-flight job finishes, the next tick is admitted, and the gate comes
+	// down for the version that raised it.
+	racing.onAdmit = nil
+	s.MarkJobSucceeded(jobdedup.AlertUpdate("ag_race"))
+	d.ProcessAlertUpdates(ctx)
+
+	settled, _ := s.GetAlertGroupByID("ag_race")
+	if settled.SlackUpdatePending {
+		t.Error("the gate is still up after the second alert got an update of its own")
 	}
 }
 
@@ -1923,13 +2179,13 @@ func TestProcessAlertUpdates_HandlesTriggeredGroups(t *testing.T) {
 	// Setup: triggered AG with slack_update_pending
 	ag := &model.AlertGroup{
 		ID:       "ag_triggered",
-		DedupKey: "dk_triggered",
+		AlertKey: "dk_triggered",
 		Status:   model.AlertGroupStatusTriggered,
 		Title:    "Test Triggered",
 		Severity: "critical",
 	}
 	s.CreateAlertGroup(ag)
-	s.SetSlackUpdatePending("ag_triggered", true)
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_triggered", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
 		ID:              "del_triggered",
@@ -1943,7 +2199,7 @@ func TestProcessAlertUpdates_HandlesTriggeredGroups(t *testing.T) {
 	d.ProcessAlertUpdates(ctx)
 
 	// Verify: job created for triggered group
-	job, _ := s.GetJobByDedupKey("update_alert_ag_triggered")
+	job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_triggered"))
 	if job == nil {
 		t.Fatal("Expected alert update job to be created for triggered group")
 	}
@@ -1968,15 +2224,14 @@ func TestProcessAlertUpdates_HandlesAcknowledgedGroups(t *testing.T) {
 	// Setup: acknowledged AG with ack already processed + new flag
 	ag := &model.AlertGroup{
 		ID:       "ag_acked",
-		DedupKey: "dk_acked",
+		AlertKey: "dk_acked",
 		Status:   model.AlertGroupStatusAcknowledged,
 		Title:    "Test",
 		Severity: "critical",
 	}
 	s.CreateAlertGroup(ag)
-	s.UpdateAlertGroupAcknowledged("ag_acked", "user1")
 	s.MarkAckProcessed("ag_acked")
-	s.SetSlackUpdatePending("ag_acked", true)
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_acked", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
 		ID:              "del_acked",
@@ -1990,7 +2245,7 @@ func TestProcessAlertUpdates_HandlesAcknowledgedGroups(t *testing.T) {
 	d.ProcessAlertUpdates(ctx)
 
 	// Verify: job created for acknowledged group
-	job, _ := s.GetJobByDedupKey("update_alert_ag_acked")
+	job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_acked"))
 	if job == nil {
 		t.Fatal("Expected alert update job to be created for acknowledged group")
 	}

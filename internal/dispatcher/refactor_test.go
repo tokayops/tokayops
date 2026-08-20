@@ -8,6 +8,7 @@ import (
 
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/dispatcher/builders"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
@@ -43,7 +44,7 @@ func TestResolutionFlow(t *testing.T) {
 		ID:       "ag_res",
 		Status:   model.AlertGroupStatusResolved, // Ready for processing
 		PolicyID: "p1",
-		DedupKey: "dk_res",
+		AlertKey: "dk_res",
 		PolicySnapshot: &model.EscalationPolicySnapshot{
 			Name: "p1",
 			Steps: []*model.EscalationStepSnapshot{
@@ -72,7 +73,7 @@ func TestResolutionFlow(t *testing.T) {
 	}
 
 	// 2. Verify Job Created
-	job, err := s.GetJobByDedupKey("resolve_ag_res")
+	job, err := s.FindJobByIdentity(jobdedup.Resolution("ag_res"))
 	if err != nil {
 		t.Fatalf("Failed to find resolution job: %v", err)
 	}
@@ -138,7 +139,7 @@ func TestEscalationFlow_BuilderIntegration(t *testing.T) {
 	d.RegisterProvider("slack", mp)
 
 	// Create AG
-	ag := &model.AlertGroup{ID: "ag1", TeamID: "team1", Severity: "critical", DedupKey: "dk1"}
+	ag := &model.AlertGroup{ID: "ag1", TeamID: "team1", Severity: "critical", AlertKey: "dk1"}
 	s.CreateAlertGroup(ag)
 
 	// Build Job via Builder (now uses Store)
@@ -154,7 +155,9 @@ func TestEscalationFlow_BuilderIntegration(t *testing.T) {
 	step.Status = model.JobStepStatusRunning
 	step.LockedBy = &leaseToken
 
-	s.CreateJobWithDedup(job, stages, steps)
+	if err := s.SeedEscalationJob(ag.ID, job, stages, steps); err != nil {
+		t.Fatalf("SeedEscalationJob: %v", err)
+	}
 
 	d.processStep(context.Background(), step)
 
@@ -182,7 +185,7 @@ func TestUnknownExecutor_FailsJob(t *testing.T) {
 	d := mustNewDispatcher(t, s, &config.Config{})
 
 	leaseToken := "lease-unknown"
-	job := &model.Job{ID: "job_u", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job_u", Status: model.JobStatusRunning, Dedup: testJobIdentity("job_u")}
 	step := &model.JobStep{
 		ID:        "step_u",
 		JobID:     "job_u",
@@ -225,7 +228,7 @@ func TestJobCompletion_Succeeds(t *testing.T) {
 	// Step 1: Running -> Succeeds -> Job Succeeded.
 
 	leaseToken := "lease-completion"
-	job := &model.Job{ID: "job_done", Status: model.JobStatusRunning, CurrentStage: 1}
+	job := &model.Job{ID: "job_done", Status: model.JobStatusRunning, CurrentStage: 1, Dedup: testJobIdentity("job_done")}
 	step0 := &model.JobStep{ID: "s0", JobID: "job_done", StageID: "stage-0", StepIndex: 0, Status: model.JobStepStatusSucceeded}
 	step1 := &model.JobStep{
 		ID:        "s1",
@@ -274,7 +277,7 @@ func TestJobFailure_MaxRetries(t *testing.T) {
 	d := mustNewDispatcher(t, s, &config.Config{})
 
 	leaseToken := "lease-fail"
-	job := &model.Job{ID: "job_fail", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job_fail", Status: model.JobStatusRunning, Dedup: testJobIdentity("job_fail")}
 	step := &model.JobStep{
 		ID:           "s_fail",
 		JobID:        "job_fail",

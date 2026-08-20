@@ -25,11 +25,11 @@ type errLookupStore struct {
 	lookupErr error
 }
 
-func (s *errLookupStore) GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error) {
+func (s *errLookupStore) GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error) {
 	if s.lookupErr != nil {
 		return nil, s.lookupErr
 	}
-	return s.MockStore.GetActiveAlertGroup(dedupKey)
+	return s.MockStore.GetActiveAlertGroupByAlertKey(alertKey)
 }
 
 // duplicateKeyStore simulates a race condition:
@@ -41,13 +41,13 @@ type duplicateKeyStore struct {
 	lookupCalls int
 }
 
-func (s *duplicateKeyStore) GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error) {
+func (s *duplicateKeyStore) GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error) {
 	s.lookupCalls++
 	if s.lookupCalls == 1 {
 		return nil, sql.ErrNoRows
 	}
 	// On retry, return the group from the underlying store
-	return s.MockStore.GetActiveAlertGroup(dedupKey)
+	return s.MockStore.GetActiveAlertGroupByAlertKey(alertKey)
 }
 
 func (s *duplicateKeyStore) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) error {
@@ -68,7 +68,7 @@ func TestRegression_DBError_ResolveLost(t *testing.T) {
 	// Pre-create an active alert group with a firing alert
 	ag := &model.AlertGroup{
 		ID:       "ag-db-err",
-		DedupKey: "db-err-group",
+		AlertKey: "db-err-group",
 		Status:   model.AlertGroupStatusTriggered,
 		Alerts: []model.Alert{
 			{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "TestAlert"}},
@@ -145,7 +145,7 @@ func TestRegression_DuplicateKey_RetryMerge(t *testing.T) {
 	// Pre-create the group in the underlying store (simulates: another webhook created it concurrently)
 	ag := &model.AlertGroup{
 		ID:       "ag-dup-key",
-		DedupKey: "dup-group",
+		AlertKey: "dup-group",
 		Status:   model.AlertGroupStatusNew,
 		Alerts: []model.Alert{
 			{Fingerprint: "fp-existing", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "ExistingAlert"}},
@@ -191,7 +191,7 @@ func TestRegression_MergeDoesNotRegressTriggeredStatus(t *testing.T) {
 	// Pre-create an active alert group in triggered status
 	ag := &model.AlertGroup{
 		ID:       "ag-triggered",
-		DedupKey: "triggered-group",
+		AlertKey: "triggered-group",
 		Status:   model.AlertGroupStatusTriggered,
 		TeamID:   "devops",
 		Severity: "critical",
@@ -273,7 +273,7 @@ func TestRegression_UnknownTeam_OutboxCreated(t *testing.T) {
 	}
 
 	// AG should exist with TeamNameSnapshot falling back to teamID
-	ag, err := mock.GetActiveAlertGroup("phantom-group")
+	ag, err := mock.GetActiveAlertGroupByAlertKey("phantom-group")
 	if err != nil || ag == nil {
 		t.Fatal("Expected alert group to be created")
 	}
@@ -321,7 +321,7 @@ func TestRegression_TeamDBError_Returns500(t *testing.T) {
 	}
 
 	// No AG should be created
-	ag, _ := mock.GetActiveAlertGroup("team-err-group")
+	ag, _ := mock.GetActiveAlertGroupByAlertKey("team-err-group")
 	if ag != nil {
 		t.Error("Expected no alert group to be created on DB error")
 	}
@@ -340,7 +340,7 @@ type concurrentResolveStore struct {
 	*store.MockStore
 }
 
-func (s *concurrentResolveStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *concurrentResolveStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
 	// Simulate: another request resolved the AG between our read and this call
 	return false, nil
 }
@@ -353,7 +353,7 @@ func TestRegression_ConcurrentResolve_AlertsConverge(t *testing.T) {
 
 	// Pre-create an active AG with a firing alert
 	ag := &model.AlertGroup{
-		ID: "ag-race-resolve", DedupKey: "race-resolve-group",
+		ID: "ag-race-resolve", AlertKey: "race-resolve-group",
 		Status: model.AlertGroupStatusTriggered, TeamID: "triage", TeamNameSnapshot: "triage",
 		Severity: "warning",
 		Alerts: []model.Alert{
@@ -486,7 +486,7 @@ func TestIngester_UnknownTeamCounter(t *testing.T) {
 
 		mock := store.NewMockStore()
 		existing := &model.AlertGroup{
-			ID: "ag-merge", DedupKey: "counter-merge-group", Status: model.AlertGroupStatusTriggered,
+			ID: "ag-merge", AlertKey: "counter-merge-group", Status: model.AlertGroupStatusTriggered,
 			TeamID: team, Severity: "warning", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}
 		if err := mock.CreateAlertGroup(existing); err != nil {
@@ -554,7 +554,7 @@ func TestRegression_ResolvedAlertFromPreviousGroup_NotMergedIntoNewGroup(t *test
 	if body := postAlerts(t, e, groupKey, firingA).Body.String(); body != "Created" {
 		t.Fatalf("step 1: got %q, want \"Created\"", body)
 	}
-	first, err := mock.GetActiveAlertGroup(groupKey)
+	first, err := mock.GetActiveAlertGroupByAlertKey(groupKey)
 	if err != nil || first == nil {
 		t.Fatalf("step 1: first group not created: %v", err)
 	}
@@ -569,7 +569,7 @@ func TestRegression_ResolvedAlertFromPreviousGroup_NotMergedIntoNewGroup(t *test
 	if body := postAlerts(t, e, groupKey, firingB+","+resolvedA).Body.String(); body != "Created" {
 		t.Fatalf("step 3: got %q, want \"Created\"", body)
 	}
-	second, err := mock.GetActiveAlertGroup(groupKey)
+	second, err := mock.GetActiveAlertGroupByAlertKey(groupKey)
 	if err != nil || second == nil {
 		t.Fatalf("step 3: second group not created: %v", err)
 	}
@@ -626,7 +626,7 @@ func TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp(t *testing.T)
 
 	created := time.Now().Add(-time.Hour)
 	ag := &model.AlertGroup{
-		ID: "ag-foreign-noop", DedupKey: "foreign-noop-group",
+		ID: "ag-foreign-noop", AlertKey: "foreign-noop-group",
 		Status: model.AlertGroupStatusTriggered, TeamID: "devops", TeamNameSnapshot: "DevOps",
 		Severity: "warning",
 		Alerts: []model.Alert{

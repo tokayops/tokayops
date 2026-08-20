@@ -21,7 +21,7 @@ func TestIngester_PartialUpdate_KeepsStatusAndFlagsSlackUpdate(t *testing.T) {
 	existingID := "existing-group-id"
 	existingAG := &model.AlertGroup{
 		ID:       existingID,
-		DedupKey: "g1",
+		AlertKey: "g1",
 		Status:   model.AlertGroupStatusTriggered,
 		Alerts: []model.Alert{
 			{Fingerprint: "f1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Alert1"}},
@@ -57,7 +57,7 @@ func TestIngester_PartialUpdate_KeepsStatusAndFlagsSlackUpdate(t *testing.T) {
 	}
 
 	// Verify State in Store
-	updatedAG, err := s.GetActiveAlertGroup("g1")
+	updatedAG, err := s.GetActiveAlertGroupByAlertKey("g1")
 	if err != nil {
 		t.Fatalf("Failed to get AG: %v", err)
 	}

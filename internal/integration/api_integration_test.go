@@ -142,7 +142,7 @@ func TestAPI_AlertGroups_Lifecycle(t *testing.T) {
 	// Seed Alert Group
 	ag := &model.AlertGroup{
 		ID:               "ag-api-1",
-		DedupKey:         "dedup-api-1",
+		AlertKey:         "dedup-api-1",
 		Status:           model.AlertGroupStatusTriggered,
 		Title:            "API Test Alert",
 		TeamID:           team.ID,
@@ -179,7 +179,7 @@ func TestAPI_AlertGroups_Lifecycle(t *testing.T) {
 	}
 
 	// Verify DB State
-	updated, err := env.S.GetActiveAlertGroup(ag.DedupKey)
+	updated, err := env.S.GetActiveAlertGroupByAlertKey(ag.AlertKey)
 	if err != nil {
 		t.Fatalf("Failed to fetch AG: %v", err)
 	}

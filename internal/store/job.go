@@ -3,51 +3,116 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// createJobWithDedupTx inserts a job and its steps within the given transaction.
-// Returns (jobID, created, error):
-//   - (id, true, nil)  — job created
-//   - (id, false, nil) — dedup conflict, returned existing job ID
-//   - ("", false, err) — DB error
-func (s *Store) createJobWithDedupTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
+// escalationJobType is the type an escalation row carries. It is read from the
+// model rather than spelled out here: the registry decides what a family is,
+// and a second copy of the answer is a second thing to keep in step.
+func escalationJobType() string {
+	policy, ok := jobdedup.PolicyOf(jobdedup.NamespaceEscalation)
+	if !ok {
+		panic("jobdedup: the escalation namespace is not declared")
+	}
+	return policy.JobType
+}
+
+// refuseEscalationHere keeps escalations to a single door.
+//
+// An escalation claim is held forever, so writing one anywhere else takes the
+// claim without doing any of what admitting an escalation means: the alert
+// group is not moved to processing and no policy snapshot is stored. The real
+// EnsureEscalationJob then finds the claim taken, reports created=false, and
+// commits the group into processing - where nothing looks for it again. The
+// group is never paged.
+//
+// Asked of the job TYPE rather than of one namespace, because the type is the
+// property that does the harm: it is what the engine's queries read. The epic's
+// own rule - a family whose policy changes takes a new name - guarantees that
+// one day a second escalation namespace exists, and a gate written against
+// today's name would wave it straight through.
+func refuseEscalationHere(job *model.Job) error {
+	if job.Dedup != nil && job.Dedup.JobType() == escalationJobType() {
+		return fmt.Errorf("job %s: a job of type %q is an escalation to every query that "+
+			"looks for one, and is admitted by EnsureEscalationJob, which also moves the "+
+			"alert group and stores its policy snapshot", job.ID, job.Dedup.JobType())
+	}
+	return nil
+}
+
+// insertJobTx inserts a job with its stages and steps inside the given
+// transaction and reports whether it was inserted at all.
+//
+// Which uniqueness rule applies is the job's own answer: the scope on its dedup
+// spec picks the partial index the ON CONFLICT clause aims at. Nothing here
+// classifies failures by constraint name, so a conflict on jobs_pkey - or on any
+// constraint added later - stays an error instead of quietly reading as
+// "already deduplicated".
+func insertJobTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
+	// A job without an identity is refused rather than inserted unclaimed. No
+	// producer builds one, and the schema tolerates an empty spec only for
+	// historical rows the upgrade could not classify.
+	if err := job.Dedup.Validate(); err != nil {
+		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
+	}
+
+	// Derived, never taken from the caller: the type belongs to the family, and
+	// a job that could name one family while carrying another's type would
+	// answer the engine's questions under a name it does not hold a claim
+	// under. The schema says the same through the policy table's foreign key.
+	job.Type = job.Dedup.JobType()
+
 	payloadBytes, err := json.Marshal(job.Payload)
 	if err != nil {
-		return "", false, fmt.Errorf("failed to marshal payload: %w", err)
+		return false, fmt.Errorf("failed to marshal payload: %w", err)
 	}
 	if job.Payload == nil {
 		payloadBytes = []byte("{}")
 	}
 
+	// One clause per policy, and a policy this build cannot aim at is refused
+	// rather than inserted. Falling through with an empty clause would insert
+	// the row with no uniqueness rule at all - the job would be admitted, look
+	// deduplicated, and be deduplicated by nothing, which is the defect this
+	// whole model exists to remove. A third scope has no index either, so
+	// nothing downstream would catch it.
+	var onConflict string
+	switch job.Dedup.Scope() {
+	case jobdedup.ScopeWhileActive:
+		onConflict = `ON CONFLICT (dedup_namespace, dedup_key)
+			WHERE dedup_scope = 'while_active' AND status IN ('pending', 'running') DO NOTHING`
+	case jobdedup.ScopeForever:
+		onConflict = `ON CONFLICT (dedup_namespace, dedup_key)
+			WHERE dedup_scope = 'forever' DO NOTHING`
+	default:
+		return false, fmt.Errorf("insert job %s: scope %q has no uniqueness rule in this build",
+			job.ID, job.Dedup.Scope())
+	}
+
 	var jobID string
-	query := `
-		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id, current_stage, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		ON CONFLICT (dedup_key) WHERE status IN ('pending', 'running') DO NOTHING
-		RETURNING id`
+	// nosemgrep: string-formatted-query - onConflict is one of the two literals above
+	err = tx.QueryRow(`
+		INSERT INTO jobs (id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
+			alert_group_id, current_stage, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`+onConflict+`
+		RETURNING id`,
+		job.ID, job.Type, job.Status, string(payloadBytes),
+		string(job.Dedup.Namespace()), job.Dedup.Key(), string(job.Dedup.Scope()),
+		job.AlertGroupID, job.CurrentStage, job.CreatedAt, job.UpdatedAt,
+	).Scan(&jobID)
 
-	err = tx.QueryRow(query,
-		job.ID, job.Type, job.Status, string(payloadBytes), job.DedupKey, job.AlertGroupID, job.CurrentStage,
-		job.CreatedAt, job.UpdatedAt).Scan(&jobID)
-
-	if err == sql.ErrNoRows {
-		if job.DedupKey == nil {
-			return "", false, fmt.Errorf("duplicate job check failed: dedup_key is nil")
-		}
-		err = tx.QueryRow(`SELECT id FROM jobs WHERE dedup_key = $1 AND status IN ('pending', 'running')`,
-			job.DedupKey).Scan(&jobID)
-		if err != nil {
-			return "", false, fmt.Errorf("failed to fetch existing job: %w", err)
-		}
-		return jobID, false, nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("failed to insert job: %w", err)
+		return false, fmt.Errorf("failed to insert job: %w", err)
 	}
 
 	// Insert stages
@@ -57,7 +122,7 @@ func (s *Store) createJobWithDedupTx(tx *sql.Tx, job *model.Job, stages []*model
 			VALUES ($1, $2, $3, $4, $5, $6)`,
 			stage.ID, jobID, stage.StageIndex, stage.Status, stage.CreatedAt, stage.UpdatedAt)
 		if err != nil {
-			return "", false, fmt.Errorf("failed to insert stage %d: %w", stage.StageIndex, err)
+			return false, fmt.Errorf("failed to insert stage %d: %w", stage.StageIndex, err)
 		}
 	}
 
@@ -69,14 +134,14 @@ func (s *Store) createJobWithDedupTx(tx *sql.Tx, job *model.Job, stages []*model
 			timeout_seconds, max_attempts, continue_on_failure, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`)
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
 	defer stmt.Close()
 
 	for _, step := range steps {
 		dataBytes, err := json.Marshal(step.Data)
 		if err != nil {
-			return "", false, fmt.Errorf("failed to marshal step data: %w", err)
+			return false, fmt.Errorf("failed to marshal step data: %w", err)
 		}
 		if step.Data == nil {
 			dataBytes = []byte("{}")
@@ -89,28 +154,34 @@ func (s *Store) createJobWithDedupTx(tx *sql.Tx, job *model.Job, stages []*model
 			step.CreatedAt, step.UpdatedAt,
 		)
 		if err != nil {
-			return "", false, fmt.Errorf("failed to insert step %d: %w", step.StepIndex, err)
+			return false, fmt.Errorf("failed to insert step %d: %w", step.StepIndex, err)
 		}
 	}
 
-	return jobID, true, nil
+	return true, nil
 }
 
-// CreateJobWithDedup creates a job and its steps atomically.
-// If a job with the same dedup_key exists and is active, it returns that job's
-// ID (idempotent) with created false.
-func (s *Store) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
+// CreateJobWithDedup creates a job with its stages and steps atomically and
+// reports whether it was created. False means the identity was already claimed
+// under its own policy, and nothing was written.
+//
+// It does not admit escalations - see refuseEscalationHere.
+func (s *Store) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
+	if err := refuseEscalationHere(job); err != nil {
+		return false, err
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
 	defer tx.Rollback()
 
-	jobID, created, err := s.createJobWithDedupTx(tx, job, stages, steps)
+	created, err := insertJobTx(tx, job, stages, steps)
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
-	return jobID, created, tx.Commit()
+	return created, tx.Commit()
 }
 
 // EnsureEscalationJob atomically transitions an AG from new/processing → processing
@@ -148,83 +219,28 @@ func (s *Store) EnsureEscalationJob(agID string, job *model.Job, stages []*model
 		return false, fmt.Errorf("failed to update AG status: %w", err)
 	}
 
-	// 4. Validate: alert_group_id must match
-	if job.AlertGroupID == nil || *job.AlertGroupID != agID {
-		return false, fmt.Errorf("job.AlertGroupID must match agID")
-	}
+	// 4. Everything that says "the escalation of THIS group" is set here, from
+	// the one argument that says which group it is.
+	//
+	// Three columns say it: the dedup identity that holds the claim, the type
+	// that the engine's queries read, and the alert group that cancellation
+	// addresses. A caller able to supply them separately is a caller able to
+	// contradict itself, and the contradiction costs a page - so it does not
+	// supply them at all.
+	job.Dedup = jobdedup.Escalation(agID)
+	job.AlertGroupID = &agID
 
-	// 5. Create escalation job — dedup by alert_group_id via unique index
-	payloadBytes, err := json.Marshal(job.Payload)
-	if err != nil {
-		return false, fmt.Errorf("failed to marshal payload: %w", err)
-	}
-	if job.Payload == nil {
-		payloadBytes = []byte("{}")
-	}
-
-	var jobID string
-	err = tx.QueryRow(`
-		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id, current_stage, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		ON CONFLICT (alert_group_id) WHERE type = 'escalation' AND alert_group_id IS NOT NULL
-		DO NOTHING
-		RETURNING id`,
-		job.ID, job.Type, job.Status, string(payloadBytes), job.DedupKey, job.AlertGroupID,
-		job.CurrentStage, job.CreatedAt, job.UpdatedAt,
-	).Scan(&jobID)
-
-	if err == sql.ErrNoRows {
-		// Escalation job already exists for this AG (any status) — don't create duplicate
-		return false, tx.Commit()
-	}
-	if err != nil {
-		return false, fmt.Errorf("failed to insert escalation job: %w", err)
-	}
-
-	// 6. Insert stages
-	for _, stage := range stages {
-		_, err = tx.Exec(`
-			INSERT INTO job_stages (id, job_id, stage_index, status, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			stage.ID, jobID, stage.StageIndex, stage.Status, stage.CreatedAt, stage.UpdatedAt)
-		if err != nil {
-			return false, fmt.Errorf("failed to insert stage %d: %w", stage.StageIndex, err)
-		}
-	}
-
-	// 7. Insert steps
-	stmt, err := tx.Prepare(`
-		INSERT INTO job_steps (
-			id, job_id, stage_id, step_index, step_type, status, data, next_run_at,
-			locked_by, locked_until,
-			timeout_seconds, max_attempts, continue_on_failure, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`)
+	// 5. Create the escalation job. Its identity is forever-scoped, so an
+	// existing job of any status - not only an active one - is the answer.
+	created, err := insertJobTx(tx, job, stages, steps)
 	if err != nil {
 		return false, err
 	}
-	defer stmt.Close()
-
-	for _, step := range steps {
-		dataBytes, err := json.Marshal(step.Data)
-		if err != nil {
-			return false, fmt.Errorf("failed to marshal step data: %w", err)
-		}
-		if step.Data == nil {
-			dataBytes = []byte("{}")
-		}
-
-		_, err = stmt.Exec(
-			step.ID, jobID, step.StageID, step.StepIndex, step.StepType, step.Status, string(dataBytes),
-			step.NextRunAt, step.LockedBy, step.LockedUntil,
-			step.TimeoutSeconds, step.MaxAttempts, step.ContinueOnFailure,
-			step.CreatedAt, step.UpdatedAt,
-		)
-		if err != nil {
-			return false, fmt.Errorf("failed to insert step %d: %w", step.StepIndex, err)
-		}
+	if !created {
+		return false, tx.Commit()
 	}
 
-	// 8. Job created — save policy snapshot
+	// 6. Job created — save policy snapshot
 	var snapshotVal sql.NullString
 	if snapshot != nil {
 		data, _ := json.Marshal(snapshot)
@@ -243,38 +259,45 @@ func (s *Store) EnsureEscalationJob(agID string, job *model.Job, stages []*model
 	return true, tx.Commit()
 }
 
+// scanDedupSpec turns the three dedup columns into a spec, or into nothing.
+//
+// A row carries all three or none: the schema enforces it, and a partial set
+// read back is a corrupted row rather than an approximate identity, so it is
+// reported instead of guessed at.
+func scanDedupSpec(jobID string, ns, key, scope sql.NullString) (*jobdedup.Spec, error) {
+	switch {
+	case !ns.Valid && !key.Valid && !scope.Valid:
+		return nil, nil
+	case ns.Valid && key.Valid && scope.Valid:
+		spec, err := jobdedup.New(jobdedup.Namespace(ns.String), key.String, jobdedup.Scope(scope.String))
+		if err != nil {
+			return nil, fmt.Errorf("job %s: %w", jobID, err)
+		}
+		return spec, nil
+	default:
+		return nil, fmt.Errorf("job %s: partial dedup spec in the database", jobID)
+	}
+}
+
 // GetJobByID fetches a job by ID
 func (s *Store) GetJobByID(id string) (*model.Job, error) {
 	job := &model.Job{}
 	var payloadStr string
 	var statusStr string
+	var ns, key, scope sql.NullString
 
 	err := s.db.QueryRow(`
-		SELECT id, type, status, payload, dedup_key, alert_group_id, current_stage, error, created_at, updated_at, finished_at, canceled_at
+		SELECT id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
+		       alert_group_id, current_stage, error, created_at, updated_at, finished_at, canceled_at
 		FROM jobs WHERE id = $1`, id).Scan(
-		&job.ID, &job.Type, &statusStr, &payloadStr, &job.DedupKey, &job.AlertGroupID, &job.CurrentStage,
+		&job.ID, &job.Type, &statusStr, &payloadStr, &ns, &key, &scope,
+		&job.AlertGroupID, &job.CurrentStage,
 		&job.Error, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &job.CanceledAt,
 	)
 	if err != nil {
 		return nil, err
 	}
-	job.Status = model.JobStatus(statusStr)
-	job.Payload = json.RawMessage(payloadStr)
-	return job, nil
-}
-
-// GetJobByDedupKey fetches the latest job by dedup key
-func (s *Store) GetJobByDedupKey(dedupKey string) (*model.Job, error) {
-	job := &model.Job{}
-	var payloadStr string
-	var statusStr string
-
-	err := s.db.QueryRow(`
-		SELECT id, type, status, payload, dedup_key, alert_group_id, current_stage, error, created_at, updated_at, finished_at, canceled_at
-		FROM jobs WHERE dedup_key = $1 ORDER BY created_at DESC LIMIT 1`, dedupKey).Scan(
-		&job.ID, &job.Type, &statusStr, &payloadStr, &job.DedupKey, &job.AlertGroupID, &job.CurrentStage,
-		&job.Error, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &job.CanceledAt,
-	)
+	job.Dedup, err = scanDedupSpec(job.ID, ns, key, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -396,7 +419,7 @@ func (s *Store) UpdateJobStepIfOwned(step *model.JobStep, leaseToken string) (bo
 }
 
 // FinishStepAndAdvance atomically finalizes a step and advances the job.
-// Single TX, lock order: job → stage → step (matches CancelJobByDedupKey).
+// Single TX, lock order: job → stage → step (matches CancelEscalationJobByAlertGroupID).
 func (s *Store) FinishStepAndAdvance(
 	stepID string,
 	leaseToken string,
@@ -589,47 +612,23 @@ func nilIfEmpty(s string) *string {
 	return &s
 }
 
-// CancelJobByDedupKey cancels a job and its pending steps
-func (s *Store) CancelJobByDedupKey(dedupKey string) error {
+// CancelEscalationJobByAlertGroupID cancels the escalation job of one alert
+// group - the job, its active stages and its pending steps - in one transaction.
+//
+// The body lives in cancelEscalationJobByAlertGroupIDTx, which the atomic alert
+// group transitions call from inside their own transaction. Before Epic 11 the
+// two were separate near-copies in separate files, alike in meaning and
+// drifting in form; there is one cancellation, so there is one implementation.
+func (s *Store) CancelEscalationJobByAlertGroupID(alertGroupID string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	// 1. Cancel active job
-	var jobID string
-	err = tx.QueryRow(`
-		UPDATE jobs 
-		SET status = 'canceled', canceled_at = NOW(), finished_at = NOW(), updated_at = NOW()
-		WHERE dedup_key = $1 AND status IN ('pending', 'running')
-		RETURNING id`, dedupKey).Scan(&jobID)
-
-	if err == sql.ErrNoRows {
-		return nil
-	}
-	if err != nil {
+	if err := cancelEscalationJobByAlertGroupIDTx(tx, alertGroupID); err != nil {
 		return err
 	}
-
-	// 2. Cancel active/blocked stages
-	_, err = tx.Exec(`
-		UPDATE job_stages
-		SET status = 'canceled', updated_at = NOW()
-		WHERE job_id = $1 AND status IN ('active', 'blocked')`, jobID)
-	if err != nil {
-		return err
-	}
-
-	// 3. Cancel pending steps
-	_, err = tx.Exec(`
-		UPDATE job_steps
-		SET status = 'canceled', updated_at = NOW()
-		WHERE job_id = $1 AND status IN ('pending', 'blocked', 'retry')`, jobID)
-	if err != nil {
-		return err
-	}
-
 	return tx.Commit()
 }
 
@@ -648,34 +647,6 @@ func (s *Store) ExtendStepLease(stepID string, leaseToken string, duration time.
 		return fmt.Errorf("step %s not found or lost lock", stepID)
 	}
 	return nil
-}
-
-// GetJobsByIDs fetches multiple jobs
-func (s *Store) GetJobsByIDs(ids []string) (map[string]*model.Job, error) {
-	rows, err := s.db.Query(`
-		SELECT id, type, status, payload, dedup_key, alert_group_id, current_stage, error, created_at
-		FROM jobs WHERE id = ANY($1)`, pq.Array(ids))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := make(map[string]*model.Job)
-	for rows.Next() {
-		job := &model.Job{}
-		var payloadStr, statusStr string
-		err := rows.Scan(
-			&job.ID, &job.Type, &statusStr, &payloadStr, &job.DedupKey, &job.AlertGroupID, &job.CurrentStage,
-			&job.Error, &job.CreatedAt,
-		)
-		if err != nil {
-			return nil, err
-		}
-		job.Status = model.JobStatus(statusStr)
-		job.Payload = json.RawMessage(payloadStr)
-		result[job.ID] = job
-	}
-	return result, nil
 }
 
 // FailJob marks a job as failed with an error message
