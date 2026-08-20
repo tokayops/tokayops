@@ -37,11 +37,11 @@ type StoreInterface interface {
 	CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) error
 
 	// Atomic ack/resolve (single-winner semantics, timeline + status + escalation cancel in one transaction)
-	AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (changed bool, err error)
-	ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (changed bool, err error)
+	AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
 
 	// Atomic resolve with alerts update (ingester auto-resolve: alerts + status + timeline + outbox in one transaction)
-	ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent, dedupKey string) (changed bool, err error)
+	ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (changed bool, err error)
 
 	// Conditional status transition (CAS semantics)
 	TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error)
@@ -138,7 +138,7 @@ type StoreInterface interface {
 	ClaimNextJobSteps(limit int, duration time.Duration) ([]*model.JobStep, error)
 	UpdateJobStepIfOwned(step *model.JobStep, leaseToken string) (bool, error)
 	FinishStepAndAdvance(stepID string, leaseToken string, outcome model.JobStepStatus, result string, stepError string) (model.AdvanceResult, error)
-	CancelJobByDedupKey(dedupKey string) error
+	CancelEscalationJobByAlertGroupID(alertGroupID string) error
 	ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error
 	GetJobsByIDs(ids []string) (map[string]*model.Job, error)
 	FailJob(jobID string, errorMsg string) error

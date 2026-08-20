@@ -730,18 +730,18 @@ func (s *errorStore) GetUserTeamRole(userID, teamID string) (model.TeamMemberRol
 	return s.MockStore.GetUserTeamRole(userID, teamID)
 }
 
-func (s *errorStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *errorStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	if s.ackAlertGroupAtomicErr != nil {
 		return false, s.ackAlertGroupAtomicErr
 	}
-	return s.MockStore.AckAlertGroupAtomic(id, actor, meta, outboxEvent, dedupKey)
+	return s.MockStore.AckAlertGroupAtomic(id, actor, meta, outboxEvent)
 }
 
-func (s *errorStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *errorStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	if s.resolveAlertGroupAtomicErr != nil {
 		return false, s.resolveAlertGroupAtomicErr
 	}
-	return s.MockStore.ResolveAlertGroupAtomic(id, actor, meta, outboxEvent, dedupKey)
+	return s.MockStore.ResolveAlertGroupAtomic(id, actor, meta, outboxEvent)
 }
 
 // setupErrorAPI creates an API with an errorStore wrapper, a linked user, and a triggered AG.
@@ -1508,7 +1508,7 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		api.replaceOriginal = replace.post
 
 		// Pre-ack the alert group
-		s.AckAlertGroupAtomic(agID, "Other User", nil, nil, "")
+		s.AckAlertGroupAtomic(agID, "Other User", nil, nil)
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec := httptest.NewRecorder()
@@ -1530,15 +1530,19 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		captured := newCapturedEphemeral()
 		api.respondEphemeral = captured.post
 
-		// Create an escalation job with the AG's dedup key
+		// An escalation job shaped like the real one: cancellation addresses it by
+		// alert group, so alert_group_id is what makes this a job the escalation
+		// builder would actually have produced.
 		ag, _ := s.GetAlertGroupByID(agID)
 		dedupKey := ag.DedupKey
+		jobAGID := agID
 		jobID := "job-esc-" + agID
 		s.CreateJobWithDedup(&model.Job{
-			ID:       jobID,
-			DedupKey: &dedupKey,
-			Type:     "escalation",
-			Status:   model.JobStatusPending,
+			ID:           jobID,
+			DedupKey:     &dedupKey,
+			AlertGroupID: &jobAGID,
+			Type:         "escalation",
+			Status:       model.JobStatusPending,
 		}, nil, []*model.JobStep{
 			{ID: "step-1", JobID: jobID, Status: model.JobStepStatusPending},
 		})
@@ -1568,12 +1572,14 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 
 		ag, _ := s.GetAlertGroupByID(agID)
 		dedupKey := ag.DedupKey
+		jobAGID := agID
 		jobID := "job-esc-resolve-" + agID
 		s.CreateJobWithDedup(&model.Job{
-			ID:       jobID,
-			DedupKey: &dedupKey,
-			Type:     "escalation",
-			Status:   model.JobStatusPending,
+			ID:           jobID,
+			DedupKey:     &dedupKey,
+			AlertGroupID: &jobAGID,
+			Type:         "escalation",
+			Status:       model.JobStatusPending,
 		}, nil, []*model.JobStep{
 			{ID: "step-1", JobID: jobID, Status: model.JobStepStatusPending},
 		})

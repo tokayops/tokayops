@@ -169,13 +169,18 @@ func TestAck_CancelsEscalation(t *testing.T) {
 	svc := NewService(s)
 	createAG(t, s, "ag-cancel", model.AlertGroupStatusTriggered)
 
-	// Create a pending escalation job with matching dedupKey
+	// A pending escalation job shaped like the real one: cancellation addresses
+	// it by alert group, so a fixture without alert_group_id would be a job the
+	// escalation builder never produces.
 	dedupKey := "dedup-ag-cancel"
+	agID := "ag-cancel"
 	s.CreateJobWithDedup(&model.Job{
-		Type:     "escalation",
-		Status:   model.JobStatusPending,
-		Payload:  json.RawMessage("{}"),
-		DedupKey: &dedupKey,
+		ID:           "job-ag-cancel",
+		Type:         "escalation",
+		Status:       model.JobStatusPending,
+		Payload:      json.RawMessage("{}"),
+		DedupKey:     &dedupKey,
+		AlertGroupID: &agID,
 	}, nil, nil)
 
 	result, err := svc.Ack("ag-cancel", Actor{Name: "Denis"}, nil)
@@ -187,8 +192,11 @@ func TestAck_CancelsEscalation(t *testing.T) {
 	}
 
 	// Verify job was cancelled
-	job, _ := s.GetJobByDedupKey(dedupKey)
-	if job != nil && job.Status != model.JobStatusCanceled {
+	job, err := s.GetJobByDedupKey(dedupKey)
+	if err != nil || job == nil {
+		t.Fatalf("escalation job not found after ack: %v", err)
+	}
+	if job.Status != model.JobStatusCanceled {
 		t.Errorf("Expected job to be canceled, got %s", job.Status)
 	}
 }

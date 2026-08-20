@@ -396,7 +396,7 @@ func (s *Store) UpdateJobStepIfOwned(step *model.JobStep, leaseToken string) (bo
 }
 
 // FinishStepAndAdvance atomically finalizes a step and advances the job.
-// Single TX, lock order: job → stage → step (matches CancelJobByDedupKey).
+// Single TX, lock order: job → stage → step (matches CancelEscalationJobByAlertGroupID).
 func (s *Store) FinishStepAndAdvance(
 	stepID string,
 	leaseToken string,
@@ -589,47 +589,23 @@ func nilIfEmpty(s string) *string {
 	return &s
 }
 
-// CancelJobByDedupKey cancels a job and its pending steps
-func (s *Store) CancelJobByDedupKey(dedupKey string) error {
+// CancelEscalationJobByAlertGroupID cancels the escalation job of one alert
+// group - the job, its active stages and its pending steps - in one transaction.
+//
+// The body lives in cancelEscalationJobByAlertGroupIDTx, which the atomic alert
+// group transitions call from inside their own transaction. Before Epic 11 the
+// two were separate near-copies in separate files, alike in meaning and
+// drifting in form; there is one cancellation, so there is one implementation.
+func (s *Store) CancelEscalationJobByAlertGroupID(alertGroupID string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	// 1. Cancel active job
-	var jobID string
-	err = tx.QueryRow(`
-		UPDATE jobs 
-		SET status = 'canceled', canceled_at = NOW(), finished_at = NOW(), updated_at = NOW()
-		WHERE dedup_key = $1 AND status IN ('pending', 'running')
-		RETURNING id`, dedupKey).Scan(&jobID)
-
-	if err == sql.ErrNoRows {
-		return nil
-	}
-	if err != nil {
+	if err := cancelEscalationJobByAlertGroupIDTx(tx, alertGroupID); err != nil {
 		return err
 	}
-
-	// 2. Cancel active/blocked stages
-	_, err = tx.Exec(`
-		UPDATE job_stages
-		SET status = 'canceled', updated_at = NOW()
-		WHERE job_id = $1 AND status IN ('active', 'blocked')`, jobID)
-	if err != nil {
-		return err
-	}
-
-	// 3. Cancel pending steps
-	_, err = tx.Exec(`
-		UPDATE job_steps
-		SET status = 'canceled', updated_at = NOW()
-		WHERE job_id = $1 AND status IN ('pending', 'blocked', 'retry')`, jobID)
-	if err != nil {
-		return err
-	}
-
 	return tx.Commit()
 }
 

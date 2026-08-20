@@ -268,7 +268,7 @@ func (i *Ingester) mergeIntoGroup(c echo.Context, active *model.AlertGroup, inco
 		}
 
 		changed, err := i.store.ResolveAlertGroupWithAlertsAtomic(
-			active.ID, active.Alerts, timelineEvents, outboxEvent, active.DedupKey,
+			active.ID, active.Alerts, timelineEvents, outboxEvent,
 		)
 		if err != nil {
 			log.Printf("Ingester: Failed to resolve group %s: %v", active.ID, err)
