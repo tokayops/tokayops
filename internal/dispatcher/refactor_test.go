@@ -155,7 +155,9 @@ func TestEscalationFlow_BuilderIntegration(t *testing.T) {
 	step.Status = model.JobStepStatusRunning
 	step.LockedBy = &leaseToken
 
-	s.CreateJobWithDedup(job, stages, steps)
+	if err := s.SeedEscalationJob(ag.ID, job, stages, steps); err != nil {
+		t.Fatalf("SeedEscalationJob: %v", err)
+	}
 
 	d.processStep(context.Background(), step)
 

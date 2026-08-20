@@ -293,7 +293,8 @@ func TestJobDedupPolicies_UnknownNamespaceIsTolerated(t *testing.T) {
 	}
 
 	if _, err := s.db.Exec(
-		`INSERT INTO job_dedup_policies (namespace, scope) VALUES ('a_later_family', 'forever')`); err != nil {
+		`INSERT INTO job_dedup_policies (namespace, scope, job_type)
+		 VALUES ('a_later_family', 'forever', 'a_later_type')`); err != nil {
 		t.Fatalf("seed a future policy: %v", err)
 	}
 
@@ -326,5 +327,43 @@ func TestJobDedupModel_LegacyIndexesAreRemovedAgain(t *testing.T) {
 
 	if indexExists(t, s, "idx_active_jobs_dedup") || indexExists(t, s, "idx_one_escalation_per_ag") {
 		t.Error("a legacy index recreated by an older image survived a start")
+	}
+}
+
+// Two instances starting at once are a supported case, and the contract has to
+// hold on the very first start, when the policy table does not exist yet:
+// CREATE TABLE IF NOT EXISTS is not atomic against a concurrent creator, and
+// what the loser gets is a unique violation on a catalog index rather than
+// anything it could read as "somebody else got there first".
+func TestJobDedupModel_ConcurrentFirstStart(t *testing.T) {
+	s := newPreModelDB(t)
+	if _, err := s.db.Exec(`DROP TABLE IF EXISTS job_dedup_policies`); err != nil {
+		t.Fatalf("undo the policy table: %v", err)
+	}
+
+	errs := make(chan error, 2)
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			errs <- s.applyJobDedupModel()
+		}()
+	}
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent start %d: %v", i, err)
+		}
+	}
+
+	if !indexExists(t, s, "idx_jobs_dedup_forever") {
+		t.Error("the model did not end up applied")
+	}
+	var policies int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM job_dedup_policies`).Scan(&policies); err != nil {
+		t.Fatalf("count policies: %v", err)
+	}
+	if policies != 5 {
+		t.Errorf("job_dedup_policies has %d rows, want the 5 the code declares", policies)
 	}
 }

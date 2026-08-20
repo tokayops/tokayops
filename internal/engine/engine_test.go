@@ -524,7 +524,9 @@ func TestEngine_StaleProcessing_WithSucceededJob_NotReconciled(t *testing.T) {
 	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
 	job, stages, steps, snapshot, _ := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	// Create job directly (bypassing engine) and mark as succeeded
-	s.CreateJobWithDedup(job, stages, steps)
+	if err := s.SeedEscalationJob(ag.ID, job, stages, steps); err != nil {
+		t.Fatalf("SeedEscalationJob: %v", err)
+	}
 	s.MarkJobSucceeded(jobdedup.Escalation(ag.ID))
 	// Save snapshot so we can verify it's not overwritten
 	s.UpdateAlertGroupPolicy(ag.ID, snapshot.PolicyID, snapshot)

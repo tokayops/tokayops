@@ -7,10 +7,14 @@
 // different jobs - which is the defect this package exists to remove, not a
 // distinction anyone wants.
 //
-// Scope is therefore never chosen by a caller. Every constructor below fixes
-// the scope its family is entitled to, and Policies() is the single place where
-// that mapping is written down: the schema seeds its reference table from it,
-// and a composite foreign key holds jobs to it.
+// Everything else about a family follows from its namespace, and follows from
+// it HERE. The alternative - independent fields on a job that a caller fills in
+// and something else checks for agreement - is how a job came to be able to
+// claim one family while answering for another, which is a page nobody gets.
+// So the namespace is a closed set, each member declares the scope and the job
+// type that go with it, and a Spec cannot be assembled any other way: its
+// fields are readable and not writable, and the constructors below are the only
+// way to make one.
 package jobdedup
 
 import (
@@ -29,9 +33,7 @@ const (
 	ScopeForever Scope = "forever"
 )
 
-// Namespace is a family of jobs. It is not job.Type: two families
-// (ack updates and alert updates) share the type "update", and the rule that
-// tells them apart has to live somewhere other than that column.
+// Namespace is a family of jobs.
 type Namespace string
 
 const (
@@ -42,77 +44,127 @@ const (
 	NamespaceHandoff     Namespace = "handoff"
 )
 
-// policies is the whole model of "which family is exclusive for how long".
+// Policy is everything a namespace determines: how long its identities are
+// exclusive, and the job type its rows carry.
+//
+// The job type is not a second name for the family. It predates the namespace
+// and is what the engine's own queries read - "has this group been escalated"
+// asks about the type - so a row whose type and namespace disagree holds a
+// claim under one name while answering under another. Keeping the two in one
+// table is what makes them impossible to state separately.
+type Policy struct {
+	Namespace Namespace
+	Scope     Scope
+	JobType   string
+}
+
+// determined is what a namespace decides about its family. The namespace itself
+// is not in here: it is the key, and writing it twice would let a typo make
+// PolicyOf and Policies describe two different registries.
+type determined struct {
+	scope   Scope
+	jobType string
+}
+
+// policies is the whole model of what each family is.
 //
 // A namespace never changes its policy. Changing one would mean claiming, in
 // hindsight, that every row already written under that name meant something
 // else; a family whose policy changes takes a NEW name instead, and both stay
 // here - the old one owning its history, the new one owning what follows.
-var policies = map[Namespace]Scope{
-	NamespaceEscalation:  ScopeForever,
-	NamespaceAckUpdate:   ScopeWhileActive,
-	NamespaceAlertUpdate: ScopeWhileActive,
-	NamespaceResolution:  ScopeWhileActive,
-	NamespaceHandoff:     ScopeWhileActive,
+var policies = map[Namespace]determined{
+	NamespaceEscalation:  {ScopeForever, "escalation"},
+	NamespaceAckUpdate:   {ScopeWhileActive, "update"},
+	NamespaceAlertUpdate: {ScopeWhileActive, "update"},
+	NamespaceResolution:  {ScopeWhileActive, "resolution"},
+	NamespaceHandoff:     {ScopeWhileActive, "handoff_notify"},
 }
 
-// Policies returns every known namespace with its scope, ordered by namespace
-// so a seed writes the same rows in the same order every time.
+// Policies returns every known namespace with what it determines, ordered by
+// namespace so a seed writes the same rows in the same order every time.
 func Policies() []Policy {
 	out := make([]Policy, 0, len(policies))
-	for ns, scope := range policies {
-		out = append(out, Policy{Namespace: ns, Scope: scope})
+	for ns, d := range policies {
+		out = append(out, Policy{Namespace: ns, Scope: d.scope, JobType: d.jobType})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Namespace < out[j].Namespace })
 	return out
 }
 
-// Policy is one namespace and the scope it is entitled to.
-type Policy struct {
-	Namespace Namespace
-	Scope     Scope
+// PolicyOf reports what a namespace determines, and whether it is known at all.
+func PolicyOf(ns Namespace) (Policy, bool) {
+	d, ok := policies[ns]
+	if !ok {
+		return Policy{}, false
+	}
+	return Policy{Namespace: ns, Scope: d.scope, JobType: d.jobType}, true
 }
 
-// ScopeOf reports the policy of a namespace, and whether it is known at all.
-func ScopeOf(ns Namespace) (Scope, bool) {
-	scope, ok := policies[ns]
-	return scope, ok
-}
-
-// Spec is a job's dedup identity together with the policy that governs it.
+// Spec is a job's dedup identity together with everything its namespace
+// determines. Read it; you cannot write it.
 type Spec struct {
-	Namespace Namespace `json:"namespace"`
-	Key       string    `json:"key"`
-	Scope     Scope     `json:"scope"`
+	namespace Namespace
+	key       string
+	scope     Scope
+	jobType   string
 }
+
+// Namespace is the family this job belongs to.
+func (s *Spec) Namespace() Namespace { return s.namespace }
+
+// Key names the subject or the event inside that family.
+func (s *Spec) Key() string { return s.key }
+
+// Scope is how long this identity is exclusive.
+func (s *Spec) Scope() Scope { return s.scope }
+
+// JobType is the type a row with this identity carries.
+func (s *Spec) JobType() string { return s.jobType }
 
 // New rebuilds a Spec from stored values. It is for the row scanner; producers
-// use the constructors below, which cannot get the scope wrong.
+// use the constructors below, which cannot get anything wrong.
+//
+// The scope is not taken on trust: it is checked against the namespace's policy
+// rather than copied, so a row that somehow carries the wrong one is a read
+// error and not a job that quietly means something else.
 func New(ns Namespace, key string, scope Scope) (*Spec, error) {
-	spec := &Spec{Namespace: ns, Key: key, Scope: scope}
-	if err := spec.Validate(); err != nil {
-		return nil, err
+	d, ok := policies[ns]
+	if !ok {
+		return nil, fmt.Errorf("jobdedup: unknown namespace %q", ns)
 	}
-	return spec, nil
+	if key == "" {
+		return nil, fmt.Errorf("jobdedup: namespace %q has an empty key", ns)
+	}
+	if scope != d.scope {
+		return nil, fmt.Errorf("jobdedup: namespace %q is %s, not %s", ns, d.scope, scope)
+	}
+	return &Spec{namespace: ns, key: key, scope: d.scope, jobType: d.jobType}, nil
 }
 
-// Validate checks a Spec against the policy table: an unknown namespace, an
-// empty key, or a scope its namespace is not entitled to.
+// Validate refuses a Spec that is missing or that names a family this build
+// does not know. A Spec built here cannot be inconsistent; this is the check on
+// its existence.
 func (s *Spec) Validate() error {
 	if s == nil {
 		return fmt.Errorf("jobdedup: spec is nil")
 	}
-	want, ok := policies[s.Namespace]
-	if !ok {
-		return fmt.Errorf("jobdedup: unknown namespace %q", s.Namespace)
+	if _, ok := policies[s.namespace]; !ok {
+		return fmt.Errorf("jobdedup: unknown namespace %q", s.namespace)
 	}
-	if s.Key == "" {
-		return fmt.Errorf("jobdedup: namespace %q has an empty key", s.Namespace)
-	}
-	if s.Scope != want {
-		return fmt.Errorf("jobdedup: namespace %q is %s, not %s", s.Namespace, want, s.Scope)
+	if s.key == "" {
+		return fmt.Errorf("jobdedup: namespace %q has an empty key", s.namespace)
 	}
 	return nil
+}
+
+func mustSpec(ns Namespace, key string) *Spec {
+	d, ok := policies[ns]
+	if !ok {
+		// Unreachable: every constructor below names a namespace declared
+		// above, and both are in this file.
+		panic("jobdedup: no policy for " + string(ns))
+	}
+	return &Spec{namespace: ns, key: key, scope: d.scope, jobType: d.jobType}
 }
 
 // Escalation identifies the escalation of one alert group.
@@ -122,30 +174,30 @@ func (s *Spec) Validate() error {
 // so a forever claim on that string would silently swallow the escalation of
 // every repeat incident - nobody would be paged.
 func Escalation(alertGroupID string) *Spec {
-	return &Spec{Namespace: NamespaceEscalation, Key: alertGroupID, Scope: ScopeForever}
+	return mustSpec(NamespaceEscalation, alertGroupID)
 }
 
 // AckUpdate identifies the message update that follows an acknowledgement.
 func AckUpdate(alertGroupID string) *Spec {
-	return &Spec{Namespace: NamespaceAckUpdate, Key: "update_ack_" + alertGroupID, Scope: ScopeWhileActive}
+	return mustSpec(NamespaceAckUpdate, "update_ack_"+alertGroupID)
 }
 
 // AlertUpdate identifies the message update that follows a new alert.
 func AlertUpdate(alertGroupID string) *Spec {
-	return &Spec{Namespace: NamespaceAlertUpdate, Key: "update_alert_" + alertGroupID, Scope: ScopeWhileActive}
+	return mustSpec(NamespaceAlertUpdate, "update_alert_"+alertGroupID)
 }
 
 // Resolution identifies the message update that follows a resolve.
 func Resolution(alertGroupID string) *Spec {
-	return &Spec{Namespace: NamespaceResolution, Key: "resolve_" + alertGroupID, Scope: ScopeWhileActive}
+	return mustSpec(NamespaceResolution, "resolve_"+alertGroupID)
 }
 
 // Handoff identifies one on-call handover notification.
 //
 // The prefixes above and this key keep the encoding they had before the model
 // existed. Sprint 3 decides each family's identity for real; rewriting the
-// strings here would mean reading the history two different ways in two
+// strings here would mean reading the same history two different ways in two
 // releases.
 func Handoff(occurrenceKey string) *Spec {
-	return &Spec{Namespace: NamespaceHandoff, Key: occurrenceKey, Scope: ScopeWhileActive}
+	return mustSpec(NamespaceHandoff, occurrenceKey)
 }

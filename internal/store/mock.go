@@ -783,7 +783,7 @@ func (m *MockStore) cancelEscalationJobByAlertGroupIDLocked(alertGroupID string)
 		return
 	}
 	for _, job := range m.jobs {
-		if job.Type != "escalation" || job.AlertGroupID == nil || *job.AlertGroupID != alertGroupID {
+		if job.Type != escalationJobType() || job.AlertGroupID == nil || *job.AlertGroupID != alertGroupID {
 			continue
 		}
 		if job.Status != model.JobStatusPending && job.Status != model.JobStatusRunning {
@@ -1840,10 +1840,10 @@ func (m *MockStore) dedupClaimHeld(spec *jobdedup.Spec) bool {
 		if existing.Dedup == nil {
 			continue
 		}
-		if existing.Dedup.Namespace != spec.Namespace || existing.Dedup.Key != spec.Key {
+		if existing.Dedup.Namespace() != spec.Namespace() || existing.Dedup.Key() != spec.Key() {
 			continue
 		}
-		if spec.Scope == jobdedup.ScopeForever {
+		if spec.Scope() == jobdedup.ScopeForever {
 			return true
 		}
 		if existing.Status == model.JobStatusPending || existing.Status == model.JobStatusRunning {
@@ -1879,6 +1879,10 @@ func (m *MockStore) storeJob(job *model.Job, stages []*model.JobStage, steps []*
 }
 
 func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
+	if err := refuseEscalationHere(job); err != nil {
+		return false, err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.initJobMaps()
@@ -1886,6 +1890,8 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 	if err := job.Dedup.Validate(); err != nil {
 		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
 	}
+	job.Type = job.Dedup.JobType()
+
 	if m.dedupClaimHeld(job.Dedup) {
 		return false, nil
 	}
@@ -1915,7 +1921,10 @@ func (m *MockStore) EnsureEscalationJob(agID string, job *model.Job, stages []*m
 		return false, fmt.Errorf("alert group %s not found", agID)
 	}
 
-	// Only new or processing are eligible
+	// Only new or processing are eligible. Checked before anything is written -
+	// including the caller's job, which the store also leaves untouched when it
+	// returns here: a double that had already stamped it would let a test read
+	// a job production never produced.
 	if ag.Status != model.AlertGroupStatusNew && ag.Status != model.AlertGroupStatusProcessing {
 		return false, nil
 	}
@@ -1924,14 +1933,13 @@ func (m *MockStore) EnsureEscalationJob(agID string, job *model.Job, stages []*m
 	ag.Status = model.AlertGroupStatusProcessing
 	ag.UpdatedAt = time.Now()
 
-	// The job must be the escalation OF THIS group, by both columns that say
-	// so - the one cancellation addresses and the one dedup claims.
-	if job.AlertGroupID == nil || *job.AlertGroupID != agID {
-		return false, fmt.Errorf("job.AlertGroupID must match agID")
-	}
-	if job.Dedup == nil || job.Dedup.Namespace != jobdedup.NamespaceEscalation || job.Dedup.Key != agID {
-		return false, fmt.Errorf("job dedup identity must be the escalation of %s", agID)
-	}
+	// Everything that says "the escalation of THIS group" is set here, from the
+	// one argument that says which group it is - as the store does, and for the
+	// same reason: a caller able to supply them separately is a caller able to
+	// contradict itself.
+	job.Dedup = jobdedup.Escalation(agID)
+	job.AlertGroupID = &agID
+	job.Type = job.Dedup.JobType()
 
 	// An escalation is claimed forever, so a job of any status is the answer.
 	if m.dedupClaimHeld(job.Dedup) {
@@ -1968,6 +1976,37 @@ func (m *MockStore) GetJobByID(id string) (*model.Job, error) {
 	return nil, sql.ErrNoRows
 }
 
+// SeedEscalationJob puts an escalation job in the double the way
+// EnsureEscalationJob would have.
+//
+// It exists because production admits escalations through exactly one door, and
+// some states a test needs are on the far side of it: a group that has been
+// acknowledged or triggered while its escalation is still in flight cannot be
+// reached through EnsureEscalationJob, which refuses those statuses on purpose.
+func (m *MockStore) SeedEscalationJob(agID string, job *model.Job, stages []*model.JobStage, steps []*model.JobStep) error {
+	// Derived from the group, exactly as EnsureEscalationJob does it: a fixture
+	// that could name the three columns separately could build the
+	// contradictory row the schema forbids, and then a test would be proving
+	// behaviour over a state production cannot reach.
+	job.Dedup = jobdedup.Escalation(agID)
+	job.AlertGroupID = &agID
+	job.Type = job.Dedup.JobType()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.initJobMaps()
+
+	// "The way EnsureEscalationJob would have" includes refusing when the claim
+	// is already held: a double holding two escalations for one group is a
+	// state the database cannot represent.
+	if m.dedupClaimHeld(job.Dedup) {
+		return fmt.Errorf("seed job %s: the escalation of %s is already claimed", job.ID, agID)
+	}
+
+	m.storeJob(job, stages, steps)
+	return nil
+}
+
 // FindJobByIdentity is a test helper: the engine creates jobs internally, so a
 // test never learns their IDs and has to ask by identity instead.
 //
@@ -1981,7 +2020,7 @@ func (m *MockStore) FindJobByIdentity(spec *jobdedup.Spec) (*model.Job, error) {
 
 	var latest *model.Job
 	for _, j := range m.jobs {
-		if j.Dedup == nil || j.Dedup.Namespace != spec.Namespace || j.Dedup.Key != spec.Key {
+		if j.Dedup == nil || j.Dedup.Namespace() != spec.Namespace() || j.Dedup.Key() != spec.Key() {
 			continue
 		}
 		if latest == nil || j.CreatedAt.After(latest.CreatedAt) {
@@ -2004,7 +2043,7 @@ func (m *MockStore) MarkJobSucceeded(spec *jobdedup.Spec) {
 	defer m.mu.Unlock()
 
 	for _, j := range m.jobs {
-		if j.Dedup != nil && j.Dedup.Namespace == spec.Namespace && j.Dedup.Key == spec.Key {
+		if j.Dedup != nil && j.Dedup.Namespace() == spec.Namespace() && j.Dedup.Key() == spec.Key() {
 			j.Status = model.JobStatusSucceeded
 			return
 		}

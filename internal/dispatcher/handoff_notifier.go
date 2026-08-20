@@ -305,7 +305,6 @@ func (n *HandoffNotifier) createHandoffJob(sc schedulerender.ScheduleOnCall, kin
 	now := time.Now()
 	job := &model.Job{
 		ID:     uuid.New().String(),
-		Type:   "handoff_notify",
 		Status: model.JobStatusPending,
 		Dedup:  jobdedup.Handoff(occurrenceKey(kind, sc.ScheduleID, next)),
 		// Stamped like every other job builder does. Left unset - as it was

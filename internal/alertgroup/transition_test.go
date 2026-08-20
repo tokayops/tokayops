@@ -174,14 +174,13 @@ func TestAck_CancelsEscalation(t *testing.T) {
 	// it by alert group, so a fixture without alert_group_id would be a job the
 	// escalation builder never produces.
 	agID := "ag-cancel"
-	s.CreateJobWithDedup(&model.Job{
-		ID:           "job-ag-cancel",
-		Type:         "escalation",
-		Status:       model.JobStatusPending,
-		Payload:      json.RawMessage("{}"),
-		Dedup:        jobdedup.Escalation(agID),
-		AlertGroupID: &agID,
-	}, nil, nil)
+	if err := s.SeedEscalationJob(agID, &model.Job{
+		ID:      "job-ag-cancel",
+		Status:  model.JobStatusPending,
+		Payload: json.RawMessage("{}"),
+	}, nil, nil); err != nil {
+		t.Fatalf("SeedEscalationJob: %v", err)
+	}
 
 	result, err := svc.Ack("ag-cancel", Actor{Name: "Denis"}, nil)
 	if err != nil {

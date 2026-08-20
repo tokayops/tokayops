@@ -94,7 +94,7 @@ func TestProcessStep_SlackSuccess(t *testing.T) {
 	leaseToken := "lease-slack-success"
 	job := &model.Job{
 		ID:     "job1",
-		Dedup:  jobdedup.Escalation("ag1"),
+		Dedup:  testJobIdentity("job1"),
 		Status: model.JobStatusRunning,
 	}
 	// Prepare Step
@@ -880,7 +880,9 @@ func TestProcessAcknowledgedAlertGroups_CancelsEscalationJob(t *testing.T) {
 		StepIndex: 1,
 		Status:    model.JobStepStatusBlocked, // Waiting to run
 	}
-	s.CreateJobWithDedup(escalationJob, nil, []*model.JobStep{escalationStep})
+	if err := s.SeedEscalationJob(ag.ID, escalationJob, nil, []*model.JobStep{escalationStep}); err != nil {
+		t.Fatalf("SeedEscalationJob: %v", err)
+	}
 
 	ctx := context.Background()
 

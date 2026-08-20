@@ -387,18 +387,9 @@ func (s *Store) InitDB() error {
 		return err
 	}
 
-	// Job dedup model, in three steps whose order is part of the design:
-	// the policy reference table first, because the migration's foreign key
-	// needs its rows; the one-shot migration second; the sweep for legacy
-	// indexes last, since on a first run it would otherwise remove the
-	// guarantees the migration itself leans on.
-	if err := s.syncJobDedupPolicies(); err != nil {
-		return err
-	}
-	if err := s.migrateJobDedupModel(); err != nil {
-		return err
-	}
-	if err := s.dropLegacyJobDedupIndexes(); err != nil {
+	// Job dedup model: policy table, one-shot migration and the sweep for
+	// legacy indexes, in that order and under one lock.
+	if err := s.applyJobDedupModel(); err != nil {
 		return err
 	}
 
@@ -1660,6 +1651,12 @@ func (s *Store) GetNewAlertGroups() ([]*model.AlertGroup, error) {
 	// status update and job creation — but ONLY if no escalation job exists.
 	// If any escalation job exists (succeeded, failed, canceled, etc.), the AG was
 	// already processed and should not spawn a duplicate job.
+	//
+	// Asked by type and alert_group_id rather than by the escalation identity,
+	// for the same reason cancellation is (see cancelEscalationJobByAlertGroupIDTx):
+	// the question is what this group already holds, not what holds a
+	// particular dedup claim. EnsureEscalationJob is what keeps the type and
+	// the namespace from disagreeing.
 	staleThreshold := time.Now().Add(-30 * time.Second)
 	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups ag
 	          WHERE ag.status = $1

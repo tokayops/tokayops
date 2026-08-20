@@ -32,21 +32,103 @@ var legacyJobDedupIndexes = []string{"idx_active_jobs_dedup", "idx_one_escalatio
 var ErrJobDedupActiveUnclassified = errors.New(
 	"store: an active job holds a dedup key this version cannot express")
 
-// syncJobDedupPolicies keeps the policy reference table in step with the code,
+// jobDedupAdvisoryLock serializes the whole sequence below across instances.
+//
+// `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent creator:
+// two instances starting together can both find the table missing and then
+// collide on pg_type's unique index rather than on the table name, which is not
+// an error either of them can read as "somebody else got there first". The
+// contract this schema promises - start the instances in any order - has to be
+// held by something, and a lock taken before the first statement is the
+// cheapest something available.
+//
+// The number is arbitrary and only has to stay stable: "tokay" truncated, plus
+// the epic that introduced the model.
+const jobDedupAdvisoryLock int64 = 0x746F6B6111
+
+// applyJobDedupModel brings a database onto the job dedup model, in one
+// transaction, on every start.
+//
+// Three steps, and their order is part of the design: the policy table first,
+// because the migration's foreign key needs its rows; the one-shot migration
+// second; the sweep for legacy indexes last, since on a first run it would
+// otherwise remove the guarantees the migration itself leans on.
+func (s *Store) applyJobDedupModel() error {
+	migrated, err := jobDedupModelApplied(s.db)
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, jobDedupAdvisoryLock); err != nil {
+		return fmt.Errorf("failed to take the job dedup migration lock: %w", err)
+	}
+
+	if err := syncJobDedupPoliciesTx(tx); err != nil {
+		return err
+	}
+
+	var stripped int64
+	if !migrated {
+		// Asked again under the lock: the instance that waited here has to see
+		// the finished work rather than repeat it.
+		migrated, err = jobDedupModelApplied(tx)
+		if err != nil {
+			return err
+		}
+		if !migrated {
+			if stripped, err = migrateJobDedupModelTx(tx); err != nil {
+				return err
+			}
+		}
+	}
+
+	dropped, err := dropLegacyJobDedupIndexesTx(tx)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Reported only now: before the commit none of it was true.
+	if stripped > 0 {
+		log.Printf("Job dedup migration: %d historical job(s) had a dedup key no family claims; "+
+			"their key was cleared (the jobs and their outcomes were left alone)", stripped)
+	}
+	for _, name := range dropped {
+		log.Printf("WARN: removed legacy job dedup index %s - an older version of TokayOps "+
+			"was started against this database and recreated it", name)
+	}
+	return nil
+}
+
+// syncJobDedupPoliciesTx keeps the policy reference table in step with the code,
 // and runs on EVERY start rather than inside the one-shot migration.
 //
 // A namespace introduced by a later release has to reach the table on the first
 // start of the release that knows it. Seeding from inside the migration would
 // mean the row never appears - the migration is long done - and the first job of
 // that family would fail its foreign key.
-func (s *Store) syncJobDedupPolicies() error {
-	if _, err := s.db.Exec(`
+func syncJobDedupPoliciesTx(tx *sql.Tx) error {
+	if _, err := tx.Exec(`
 		CREATE TABLE IF NOT EXISTS job_dedup_policies (
 			namespace TEXT PRIMARY KEY,
 			scope     TEXT NOT NULL CHECK (scope IN ('while_active', 'forever')),
-			-- Not redundant with the primary key: it is the target a composite
-			-- foreign key from jobs(dedup_namespace, dedup_scope) needs.
-			UNIQUE (namespace, scope)
+			-- The type a row of this family carries. It lives here, next to the
+			-- scope, because the two are the same statement about the same
+			-- family: a job free to name one family and carry another's type
+			-- holds its claim under one name and answers queries under the
+			-- other, and the alert group it belongs to is never paged.
+			job_type  TEXT NOT NULL,
+			-- Not redundant with the primary key: it is the target the
+			-- composite foreign key from jobs needs.
+			UNIQUE (namespace, scope, job_type)
 		)`); err != nil {
 		return fmt.Errorf("failed to create job_dedup_policies: %w", err)
 	}
@@ -56,15 +138,15 @@ func (s *Store) syncJobDedupPolicies() error {
 	// carries ON UPDATE RESTRICT, so an UPDATE here would be refused by the
 	// database the moment any job referenced the row.
 	for _, p := range jobdedup.Policies() {
-		if _, err := s.db.Exec(`
-			INSERT INTO job_dedup_policies (namespace, scope) VALUES ($1, $2)
+		if _, err := tx.Exec(`
+			INSERT INTO job_dedup_policies (namespace, scope, job_type) VALUES ($1, $2, $3)
 			ON CONFLICT (namespace) DO NOTHING`,
-			string(p.Namespace), string(p.Scope)); err != nil {
+			string(p.Namespace), string(p.Scope), p.JobType); err != nil {
 			return fmt.Errorf("failed to seed job dedup policy %s: %w", p.Namespace, err)
 		}
 	}
 
-	return s.verifyJobDedupPolicies()
+	return verifyJobDedupPoliciesTx(tx)
 }
 
 // verifyJobDedupPolicies compares the table with the code.
@@ -73,19 +155,19 @@ func (s *Store) syncJobDedupPolicies() error {
 // introducing a new namespace. Left to the foreign key, that mistake surfaces on
 // the first insert - which, for an escalation, is the moment someone should have
 // been paged. Refusing to start moves it to a moment nobody is waiting.
-func (s *Store) verifyJobDedupPolicies() error {
-	rows, err := s.db.Query(`SELECT namespace, scope FROM job_dedup_policies ORDER BY namespace`)
+func verifyJobDedupPoliciesTx(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT namespace, scope, job_type FROM job_dedup_policies ORDER BY namespace`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var namespace, scope string
-		if err := rows.Scan(&namespace, &scope); err != nil {
+		var namespace, scope, jobType string
+		if err := rows.Scan(&namespace, &scope, &jobType); err != nil {
 			return err
 		}
-		want, known := jobdedup.ScopeOf(jobdedup.Namespace(namespace))
+		want, known := jobdedup.PolicyOf(jobdedup.Namespace(namespace))
 		if !known {
 			// A database written by a newer release. Nothing here uses that
 			// namespace, so refusing to start would turn a harmless trace into
@@ -94,72 +176,14 @@ func (s *Store) verifyJobDedupPolicies() error {
 				"this database has been used by a newer release", namespace)
 			continue
 		}
-		if string(want) != scope {
+		if string(want.Scope) != scope || want.JobType != jobType {
 			return fmt.Errorf(
-				"store: job dedup policy %q is %q in this database and %q in this build; "+
-					"a namespace never changes its policy - introduce a new namespace instead",
-				namespace, scope, want)
+				"store: job dedup policy %q is (%s, %s) in this database and (%s, %s) in this "+
+					"build; a namespace never changes its policy - introduce a new namespace instead",
+				namespace, scope, jobType, want.Scope, want.JobType)
 		}
 	}
 	return rows.Err()
-}
-
-// migrateJobDedupModel moves the jobs table onto the model, once, in one
-// transaction.
-//
-// One transaction is not tidiness: between dropping a legacy index and building
-// the one that replaces it, nothing enforces the guarantee, and a crash in that
-// window would leave a database where two escalations for one alert group are
-// possible. Either the whole thing lands or none of it does.
-func (s *Store) migrateJobDedupModel() error {
-	// Every start after the first answers here, without taking a lock on a
-	// table the running fleet is reading and writing.
-	done, err := jobDedupModelApplied(s.db)
-	if err != nil {
-		return err
-	}
-	if done {
-		return nil
-	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// Inside the transaction the lock comes BEFORE the check, and as its own
-	// statement. Two instances starting together would otherwise both read
-	// "not migrated" - neither holds a DDL lock yet - and both would enter; the
-	// second would reach ADD CONSTRAINT, which has no IF NOT EXISTS in
-	// Postgres, and die on startup. Under READ COMMITTED the statement after
-	// the wait gets a fresh snapshot, so the second instance sees the finished
-	// work and leaves.
-	if _, err := tx.Exec(`LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE`); err != nil {
-		return fmt.Errorf("failed to lock jobs: %w", err)
-	}
-	done, err = jobDedupModelApplied(tx)
-	if err != nil {
-		return err
-	}
-	if done {
-		return nil
-	}
-
-	stripped, err := migrateJobDedupModelTx(tx)
-	if err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-
-	// Reported only now: before the commit it was not yet true.
-	if stripped > 0 {
-		log.Printf("Job dedup migration: %d historical job(s) had a dedup key no family claims; "+
-			"their key was cleared (the jobs and their outcomes were left alone)", stripped)
-	}
-	return nil
 }
 
 // jobDedupModelApplied asks the catalog whether the migration has run.
@@ -184,6 +208,15 @@ func jobDedupModelApplied(q interface {
 //
 // Returns how many historical rows were left without a dedup key.
 func migrateJobDedupModelTx(tx *sql.Tx) (int64, error) {
+	// Taken before the first read, not left to the DDL below to acquire on its
+	// own: between the pre-flight check and the backfill there must be no
+	// window in which somebody writes a job. The advisory lock above serializes
+	// instances running this migration; this one is about every other writer,
+	// including an older instance the operator forgot to stop.
+	if _, err := tx.Exec(`LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE`); err != nil {
+		return 0, fmt.Errorf("failed to lock jobs: %w", err)
+	}
+
 	// The escalation index goes first, and only this one: the alert_group_id
 	// backfill immediately below temporarily produces duplicates, which is why
 	// the pre-model migration dropped it around the same statements.
@@ -285,12 +318,40 @@ func migrateJobDedupModelTx(tx *sql.Tx) (int64, error) {
 		return 0, err
 	}
 
+	// The row points at a whole policy, not at parts of one: namespace, scope
+	// AND type together have to be a combination the registry declares. That is
+	// what makes "escalation namespace with another type" and "escalation type
+	// under another namespace" equally impossible - both are harmful, because
+	// one of the two names holds the claim while the other answers the engine's
+	// queries, and a row that splits them belongs to a group nobody pages.
+	//
+	// MATCH SIMPLE is what lets history through: a row with no spec has NULLs
+	// in two of the three columns, so the foreign key does not apply to it.
 	if _, err := tx.Exec(`
 		ALTER TABLE jobs ADD CONSTRAINT jobs_dedup_policy_fk
-			FOREIGN KEY (dedup_namespace, dedup_scope)
-			REFERENCES job_dedup_policies (namespace, scope)
+			FOREIGN KEY (dedup_namespace, dedup_scope, type)
+			REFERENCES job_dedup_policies (namespace, scope, job_type)
 			ON UPDATE RESTRICT ON DELETE RESTRICT`); err != nil {
 		return 0, fmt.Errorf("failed to add dedup policy foreign key: %w", err)
+	}
+
+	// What a foreign key cannot say: an escalation answers for a particular
+	// alert group, and the column that says which one is not part of any
+	// policy. Required explicitly rather than merely compared - comparing a
+	// NULL yields NULL, and a CHECK counts NULL as satisfied, which is exactly
+	// the row that claims a group without answering for it.
+	//
+	// Written against the TYPE, not against one namespace: the type is what the
+	// engine's queries read, and a second escalation namespace is not
+	// hypothetical - it is how this model says a family changed its policy. A
+	// row with no spec is exempt, which is what lets a disowned escalation from
+	// before the upgrade keep its type without an alert group.
+	if _, err := tx.Exec(`
+		ALTER TABLE jobs ADD CONSTRAINT jobs_escalation_identity CHECK (
+			dedup_namespace IS NULL
+			OR type <> 'escalation'
+			OR (alert_group_id IS NOT NULL AND alert_group_id = dedup_key))`); err != nil {
+		return 0, fmt.Errorf("failed to add escalation identity check: %w", err)
 	}
 
 	// Last, and the marker of a finished migration. It is also the only thing
@@ -352,29 +413,30 @@ func refuseUnclassifiedActiveJobs(tx *sql.Tx) error {
 		ErrJobDedupActiveUnclassified, strings.Join(found, ", "))
 }
 
-// dropLegacyJobDedupIndexes runs on every start, after the migration.
+// dropLegacyJobDedupIndexesTx runs on every start, after the migration.
 //
 // An older image started against this database recreates both indexes from its
 // own InitDB. It cannot write jobs any more - the spec check refuses its rows -
 // but the indexes it leaves behind are enough to break this version: the global
 // one over dedup_key knows nothing of namespaces, so it turns a deduplication
 // that should be silent into a unique violation. Removing them again is cheaper
-// than a runbook step, and the log line keeps it from being a silent repair.
-func (s *Store) dropLegacyJobDedupIndexes() error {
+// than a runbook step; the names it removed go back to the caller, which logs
+// them after the commit, so the repair is never silent.
+func dropLegacyJobDedupIndexesTx(tx *sql.Tx) ([]string, error) {
+	var dropped []string
 	for _, name := range legacyJobDedupIndexes {
 		var present bool
-		if err := s.db.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, name).Scan(&present); err != nil {
-			return err
+		if err := tx.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, name).Scan(&present); err != nil {
+			return nil, err
 		}
 		if !present {
 			continue
 		}
 		// nosemgrep: string-formatted-query - names come from the list above
-		if _, err := s.db.Exec(`DROP INDEX IF EXISTS ` + name); err != nil {
-			return err
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + name); err != nil {
+			return nil, err
 		}
-		log.Printf("WARN: removed legacy job dedup index %s - an older version of TokayOps "+
-			"was started against this database and recreated it", name)
+		dropped = append(dropped, name)
 	}
-	return nil
+	return dropped, nil
 }

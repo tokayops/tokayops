@@ -380,11 +380,18 @@ func TestClaimNextJobSteps_SkipsBlockedStages(t *testing.T) {
 	step1ID := uuid.New().String()
 	now := time.Now()
 
+	// Due a minute ago, not now: the claim compares next_run_at against the
+	// DATABASE clock, and a fixture stamped from this process is a coin flip on
+	// a database whose clock runs a few milliseconds behind - which is every
+	// containerised one. The test is about blocked stages, not about the
+	// instant a step becomes due.
+	due := now.Add(-time.Minute)
+
 	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, Dedup: jobdedup.Handoff(key), CreatedAt: now, UpdatedAt: now}
 	stage0 := &model.JobStage{ID: stage0ID, JobID: jobID, StageIndex: 0, Status: model.JobStageStatusActive, CreatedAt: now, UpdatedAt: now}
 	stage1 := &model.JobStage{ID: stage1ID, JobID: jobID, StageIndex: 1, Status: model.JobStageStatusBlocked, CreatedAt: now, UpdatedAt: now}
-	step0 := &model.JobStep{ID: step0ID, JobID: jobID, StageID: stage0ID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusPending, NextRunAt: &now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
-	step1 := &model.JobStep{ID: step1ID, JobID: jobID, StageID: stage1ID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusPending, NextRunAt: &now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
+	step0 := &model.JobStep{ID: step0ID, JobID: jobID, StageID: stage0ID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusPending, NextRunAt: &due, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
+	step1 := &model.JobStep{ID: step1ID, JobID: jobID, StageID: stage1ID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusPending, NextRunAt: &due, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
 
 	if _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage0, stage1}, []*model.JobStep{step0, step1}); err != nil {
 		t.Fatalf("CreateJobWithDedup: %v", err)

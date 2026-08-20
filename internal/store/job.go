@@ -12,6 +12,40 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 )
 
+// escalationJobType is the type an escalation row carries. It is read from the
+// model rather than spelled out here: the registry decides what a family is,
+// and a second copy of the answer is a second thing to keep in step.
+func escalationJobType() string {
+	policy, ok := jobdedup.PolicyOf(jobdedup.NamespaceEscalation)
+	if !ok {
+		panic("jobdedup: the escalation namespace is not declared")
+	}
+	return policy.JobType
+}
+
+// refuseEscalationHere keeps escalations to a single door.
+//
+// An escalation claim is held forever, so writing one anywhere else takes the
+// claim without doing any of what admitting an escalation means: the alert
+// group is not moved to processing and no policy snapshot is stored. The real
+// EnsureEscalationJob then finds the claim taken, reports created=false, and
+// commits the group into processing - where nothing looks for it again. The
+// group is never paged.
+//
+// Asked of the job TYPE rather than of one namespace, because the type is the
+// property that does the harm: it is what the engine's queries read. The epic's
+// own rule - a family whose policy changes takes a new name - guarantees that
+// one day a second escalation namespace exists, and a gate written against
+// today's name would wave it straight through.
+func refuseEscalationHere(job *model.Job) error {
+	if job.Dedup != nil && job.Dedup.JobType() == escalationJobType() {
+		return fmt.Errorf("job %s: a job of type %q is an escalation to every query that "+
+			"looks for one, and is admitted by EnsureEscalationJob, which also moves the "+
+			"alert group and stores its policy snapshot", job.ID, job.Dedup.JobType())
+	}
+	return nil
+}
+
 // insertJobTx inserts a job with its stages and steps inside the given
 // transaction and reports whether it was inserted at all.
 //
@@ -28,6 +62,12 @@ func insertJobTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*
 		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
 	}
 
+	// Derived, never taken from the caller: the type belongs to the family, and
+	// a job that could name one family while carrying another's type would
+	// answer the engine's questions under a name it does not hold a claim
+	// under. The schema says the same through the policy table's foreign key.
+	job.Type = job.Dedup.JobType()
+
 	payloadBytes, err := json.Marshal(job.Payload)
 	if err != nil {
 		return false, fmt.Errorf("failed to marshal payload: %w", err)
@@ -37,7 +77,7 @@ func insertJobTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*
 	}
 
 	var onConflict string
-	switch job.Dedup.Scope {
+	switch job.Dedup.Scope() {
 	case jobdedup.ScopeWhileActive:
 		onConflict = `ON CONFLICT (dedup_namespace, dedup_key)
 			WHERE dedup_scope = 'while_active' AND status IN ('pending', 'running') DO NOTHING`
@@ -55,7 +95,7 @@ func insertJobTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*
 		`+onConflict+`
 		RETURNING id`,
 		job.ID, job.Type, job.Status, string(payloadBytes),
-		string(job.Dedup.Namespace), job.Dedup.Key, string(job.Dedup.Scope),
+		string(job.Dedup.Namespace()), job.Dedup.Key(), string(job.Dedup.Scope()),
 		job.AlertGroupID, job.CurrentStage, job.CreatedAt, job.UpdatedAt,
 	).Scan(&jobID)
 
@@ -115,7 +155,13 @@ func insertJobTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*
 // CreateJobWithDedup creates a job with its stages and steps atomically and
 // reports whether it was created. False means the identity was already claimed
 // under its own policy, and nothing was written.
+//
+// It does not admit escalations - see refuseEscalationHere.
 func (s *Store) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
+	if err := refuseEscalationHere(job); err != nil {
+		return false, err
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -164,14 +210,16 @@ func (s *Store) EnsureEscalationJob(agID string, job *model.Job, stages []*model
 		return false, fmt.Errorf("failed to update AG status: %w", err)
 	}
 
-	// 4. Validate: the job must be the escalation OF THIS group, by both columns
-	// that say so - the one cancellation addresses and the one dedup claims.
-	if job.AlertGroupID == nil || *job.AlertGroupID != agID {
-		return false, fmt.Errorf("job.AlertGroupID must match agID")
-	}
-	if job.Dedup == nil || job.Dedup.Namespace != jobdedup.NamespaceEscalation || job.Dedup.Key != agID {
-		return false, fmt.Errorf("job dedup identity must be the escalation of %s", agID)
-	}
+	// 4. Everything that says "the escalation of THIS group" is set here, from
+	// the one argument that says which group it is.
+	//
+	// Three columns say it: the dedup identity that holds the claim, the type
+	// that the engine's queries read, and the alert group that cancellation
+	// addresses. A caller able to supply them separately is a caller able to
+	// contradict itself, and the contradiction costs a page - so it does not
+	// supply them at all.
+	job.Dedup = jobdedup.Escalation(agID)
+	job.AlertGroupID = &agID
 
 	// 5. Create the escalation job. Its identity is forever-scoped, so an
 	// existing job of any status - not only an active one - is the answer.

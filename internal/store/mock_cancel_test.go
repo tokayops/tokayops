@@ -36,8 +36,8 @@ func TestMockStore_CancelEscalationCascade(t *testing.T) {
 		{ID: "step-pending", JobID: jobID, StageID: "stage-active", Status: model.JobStepStatusPending},
 		{ID: "step-blocked", JobID: jobID, StageID: "stage-blocked", StepIndex: 1, Status: model.JobStepStatusBlocked},
 	}
-	if _, err := s.CreateJobWithDedup(job, stages, steps); err != nil {
-		t.Fatalf("CreateJobWithDedup: %v", err)
+	if err := s.SeedEscalationJob(agID, job, stages, steps); err != nil {
+		t.Fatalf("SeedEscalationJob: %v", err)
 	}
 
 	if err := s.CancelEscalationJobByAlertGroupID(agID); err != nil {

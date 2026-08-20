@@ -75,7 +75,6 @@ func (b *UpdateJobBuilder) build(ag *model.AlertGroup, spec *jobdedup.Spec) (*mo
 
 	job := &model.Job{
 		ID:           jobID,
-		Type:         "update",
 		Status:       model.JobStatusPending,
 		Dedup:        spec,
 		CurrentStage: 0,

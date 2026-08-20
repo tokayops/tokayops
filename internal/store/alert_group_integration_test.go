@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
@@ -907,8 +906,10 @@ func findEscalationJob(t *testing.T, s *Store, agID string) *model.Job {
 	return job
 }
 
-// makeTestJob builds an escalation job the way the real builder does: its
-// identity is the alert group, which is also what cancellation addresses.
+// makeTestJob builds an escalation job the way the real builder does - which,
+// since the family became a closed registry, means NOT naming its identity, its
+// type or its alert group: EnsureEscalationJob derives all three from the group
+// it locks. The parameter is here for the stage and step fixtures.
 func makeTestJob(agID string) (*model.Job, []*model.JobStage, []*model.JobStep, *model.EscalationPolicySnapshot) {
 	now := time.Now()
 	jobID := uuid.New().String()
@@ -917,10 +918,7 @@ func makeTestJob(agID string) (*model.Job, []*model.JobStage, []*model.JobStep, 
 
 	job := &model.Job{
 		ID:           jobID,
-		Type:         "escalation",
 		Status:       model.JobStatusPending,
-		Dedup:        jobdedup.Escalation(agID),
-		AlertGroupID: &agID,
 		CurrentStage: 0,
 		CreatedAt:    now,
 		UpdatedAt:    now,

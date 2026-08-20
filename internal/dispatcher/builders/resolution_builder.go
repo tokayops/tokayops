@@ -51,7 +51,6 @@ func (b *ResolutionJobBuilder) Build(ag *model.AlertGroup) (*model.Job, []*model
 
 	job := &model.Job{
 		ID:           jobID,
-		Type:         "resolution",
 		Status:       model.JobStatusPending,
 		Dedup:        jobdedup.Resolution(ag.ID),
 		CurrentStage: 0,
