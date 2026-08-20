@@ -20,11 +20,12 @@ type StoreInterface interface {
 	GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error)
 	GetResolvedAlertGroups() ([]*model.AlertGroup, error)
 	MarkAckProcessed(agID string) error
-	// RaiseSlackUpdate and ClearSlackUpdate are the two halves of one gate, and
-	// they are not symmetrical: raising is unconditional and bumps the
-	// generation, clearing answers one generation and reports whether it was
-	// still current. A single setter with a boolean hid that.
-	RaiseSlackUpdate(id string) error
+	// The two halves of one gate, and they are not symmetrical. It is raised by
+	// the write that changes the group - in the same statement, so no crash can
+	// separate the alert from the fact that the message is stale - and lowered
+	// for one version, which is how a producer avoids clearing away a change
+	// that arrived while it worked.
+	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
 	ClearSlackUpdate(id string, observedGeneration int64) (bool, error)
 	GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error)
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)

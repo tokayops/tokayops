@@ -1772,22 +1772,50 @@ func (s *Store) MarkAckProcessed(agID string) error {
 	return err
 }
 
-// RaiseSlackUpdate records that the group's alerts changed and its message has
-// to be re-rendered. Unconditional and monotonic: every raise is a new version
-// of the request, and ClearSlackUpdate below can only answer one of them.
-func (s *Store) RaiseSlackUpdate(id string) error {
-	_, err := s.db.Exec(`
+// UpdateAlertGroupAlertsAndRaiseSlackUpdate records a changed alert set and
+// says, in the same write, that the group's message no longer shows it.
+//
+// One statement rather than two calls, and that is the whole point: they used
+// to be an alerts write followed by a flag write, and a process that stopped
+// between them left the new alert stored with the gate down. Nothing would
+// raise it again either - Alertmanager repeating the payload finds the alerts
+// already recorded and merges nothing.
+//
+// The version goes up with every such write, monotonically, so a producer can
+// tell the state it read from the state that arrived while it worked.
+//
+// A group that is not there is an error and not a quiet no-op: the alerts have
+// to land somewhere, and a caller that is told nothing would answer its webhook
+// with 200 for a change it lost.
+func (s *Store) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error {
+	data, err := json.Marshal(alerts)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`
 		UPDATE alert_groups
-		   SET slack_update_pending = TRUE,
+		   SET alerts_data = $1,
+		       slack_update_pending = TRUE,
 		       slack_update_generation = slack_update_generation + 1,
-		       updated_at = $1
-		 WHERE id = $2
-	`, time.Now(), id)
-	return err
+		       updated_at = $2
+		 WHERE id = $3
+	`, string(data), time.Now(), id)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // ClearSlackUpdate lowers the gate for the version the caller read, and reports
-// whether it did.
+// whether it did. A group that is not there answers false, like a group that
+// has moved on: the gate is not down because of this call either way.
 //
 // The condition is the whole point. Admitting the update job and lowering the
 // gate are two transactions, and an alert that lands between them raises the

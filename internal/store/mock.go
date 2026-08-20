@@ -831,19 +831,22 @@ func (m *MockStore) MarkAckProcessed(agID string) error {
 	return sql.ErrNoRows
 }
 
-// RaiseSlackUpdate mirrors the store: the flag and its generation move
-// together, in one place, so they cannot disagree.
-func (m *MockStore) RaiseSlackUpdate(id string) error {
+// UpdateAlertGroupAlertsAndRaiseSlackUpdate mirrors the store: the alerts, the
+// flag and its version move in one write, so no state exists in which the alert
+// is recorded and the gate is down.
+func (m *MockStore) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ag, ok := m.alertGroups[id]; ok {
-		ag.SlackUpdatePending = true
-		ag.SlackUpdateGeneration++
-		ag.UpdatedAt = time.Now()
-		return nil
+	ag, ok := m.alertGroups[id]
+	if !ok {
+		return sql.ErrNoRows
 	}
-	return sql.ErrNoRows
+	ag.Alerts = append([]model.Alert(nil), alerts...)
+	ag.SlackUpdatePending = true
+	ag.SlackUpdateGeneration++
+	ag.UpdatedAt = time.Now()
+	return nil
 }
 
 // ClearSlackUpdate mirrors the store's conditional clear, including the answer
@@ -854,7 +857,9 @@ func (m *MockStore) ClearSlackUpdate(id string, observedGeneration int64) (bool,
 
 	ag, ok := m.alertGroups[id]
 	if !ok {
-		return false, sql.ErrNoRows
+		// The store answers the same way: nothing was lowered, and saying so is
+		// not an error either implementation reports.
+		return false, nil
 	}
 	if ag.SlackUpdateGeneration != observedGeneration {
 		return false, nil

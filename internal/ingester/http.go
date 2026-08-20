@@ -287,17 +287,18 @@ func (i *Ingester) mergeIntoGroup(c echo.Context, active *model.AlertGroup, inco
 	}
 
 	log.Printf("Ingester: Updating alert group %s (Partial State)", active.ID)
-	if err := i.store.UpdateAlertGroupAlerts(active.ID, active.Alerts); err != nil {
+
+	// The alerts and the "this message is out of date" gate go down in one
+	// write. Two writes had a gap in them, and a process that stopped there
+	// left the alert recorded with the gate down - after which Alertmanager
+	// repeating the payload merges nothing and never raises it again.
+	//
+	// Don't regress status - the ingester only records alerts. Status
+	// transitions are owned by the engine (new->processing) and by user
+	// actions (ack/resolve).
+	if err := i.store.UpdateAlertGroupAlertsAndRaiseSlackUpdate(active.ID, active.Alerts); err != nil {
 		log.Printf("Ingester: Failed to update alerts for %s: %v", active.ID, err)
 		return c.String(http.StatusInternalServerError, "Failed to update alerts")
-	}
-
-	// Don't regress status — ingester only updates alerts data and flags Slack update.
-	// Status transitions are owned by engine (new→processing) and user actions (ack/resolve).
-
-	// Flag Slack message for update (picked up by alertUpdateProcessingLoop)
-	if err := i.store.RaiseSlackUpdate(active.ID); err != nil {
-		log.Printf("Ingester: Failed to set slack update pending for %s: %v", active.ID, err)
 	}
 
 	// Timeline events only after successful store writes (avoids duplicates on AM retry)

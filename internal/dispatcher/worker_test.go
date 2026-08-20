@@ -1828,7 +1828,7 @@ func TestProcessAlertUpdates_CreatesUpdateJob(t *testing.T) {
 		Severity: "critical",
 	}
 	s.CreateAlertGroup(ag)
-	s.RaiseSlackUpdate("ag_update")
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_update", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	// Create a delivery so UpdateJobBuilder can find it
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
@@ -1862,33 +1862,117 @@ func TestProcessAlertUpdates_CreatesUpdateJob(t *testing.T) {
 	}
 }
 
-func TestProcessAlertUpdates_KeepsFlagWhenNoDeliveries(t *testing.T) {
+// TestProcessAlertUpdates_KeepsFlagWhenNothingCanBeUpdatedYet: nothing has been
+// delivered yet, so there is no message to refresh - and no way to know that a
+// message will not appear a moment later. The gate stays up for it.
+func TestProcessAlertUpdates_KeepsFlagWhenNothingCanBeUpdatedYet(t *testing.T) {
 	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d, _ := NewDispatcher(s, cfg)
+	d, _ := NewDispatcher(s, &config.Config{})
 
-	// Setup: AG with flag but NO deliveries (escalation not done yet)
-	ag := &model.AlertGroup{
+	s.CreateAlertGroup(&model.AlertGroup{
 		ID:       "ag_no_del",
 		AlertKey: "dk_no_del",
 		Status:   model.AlertGroupStatusProcessing,
 		Title:    "Test",
 		Severity: "info",
+	})
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_no_del", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
+
+	d.ProcessAlertUpdates(context.Background())
+
+	updated, _ := s.GetAlertGroupByID("ag_no_del")
+	if !updated.SlackUpdatePending {
+		t.Error("the gate came down although no message has been sent that could carry this alert")
 	}
-	s.CreateAlertGroup(ag)
-	s.RaiseSlackUpdate("ag_no_del")
+}
+
+// deliveringStore writes a delivery at the moment the producer reads the ones
+// that exist - the interleaving in which the escalation records what it has
+// just sent while the update is being built.
+//
+// This is the race the producer used to lose: it asked a second time whether
+// any deliveries existed, saw the new one, and took that as proof no update was
+// needed. The card had been rendered before the alert arrived, so the alert
+// reached no message at all.
+type deliveringStore struct {
+	store.StoreInterface
+	mock  *store.MockStore
+	agID  string
+	built bool
+}
+
+// ListDeliveries answers with what the escalation had sent when the build
+// started, and only then records the message it was busy sending. The build
+// therefore sees nothing to update, and a delivery that can be updated exists
+// a moment later.
+func (ds *deliveringStore) ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error) {
+	existing, err := ds.StoreInterface.ListDeliveries(alertGroupID)
+	if !ds.built && alertGroupID == ds.agID {
+		ds.built = true
+		ds.mock.UpsertNotificationDelivery(&model.NotificationDelivery{
+			ID:              "del_late",
+			AlertGroupID:    ds.agID,
+			Provider:        "slack",
+			SupportsUpdate:  true,
+			ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
+		})
+	}
+	return existing, err
+}
+
+// TestProcessAlertUpdates_KeepsFlagWhenADeliveryLandsMidBuild: a delivery
+// written between the producer's reads must not take the gate down.
+func TestProcessAlertUpdates_KeepsFlagWhenADeliveryLandsMidBuild(t *testing.T) {
+	s := store.NewMockStore()
+	racing := &deliveringStore{StoreInterface: s, mock: s, agID: "ag_late"}
+	d, _ := NewDispatcher(racing, &config.Config{})
+	d.RegisterProvider("slack", &MockProvider{
+		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
+			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
+		},
+	})
+
+	s.CreateAlertGroup(&model.AlertGroup{
+		ID:       "ag_late",
+		AlertKey: "dk_late",
+		Status:   model.AlertGroupStatusProcessing,
+		Title:    "Test",
+		Severity: "info",
+	})
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_late", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	ctx := context.Background()
 	d.ProcessAlertUpdates(ctx)
 
-	// Verify: flag should STILL be true (no deliveries → retry later)
-	updated, _ := s.GetAlertGroupByID("ag_no_del")
+	updated, _ := s.GetAlertGroupByID("ag_late")
 	if !updated.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to stay true when no deliveries exist")
+		t.Fatal("the gate came down for a delivery the build never saw; this alert reached no message")
+	}
+
+	// The next tick sees the delivery and gives the alert its update.
+	d.ProcessAlertUpdates(ctx)
+	if job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_late")); job == nil {
+		t.Error("no update job was created once the delivery was there")
+	}
+	settled, _ := s.GetAlertGroupByID("ag_late")
+	if settled.SlackUpdatePending {
+		t.Error("the gate is still up after the update was admitted")
 	}
 }
 
-func TestProcessAlertUpdates_ClearsFlagWhenNoUpdatableDeliveries(t *testing.T) {
+// TestProcessAlertUpdates_KeepsFlagWhenNoUpdatableDeliveries: a group whose
+// messages refuse updates keeps its gate up.
+//
+// This test asserted the opposite until the gate was looked at properly. The
+// old reading - "deliveries exist, so no more are coming, so nothing will ever
+// be updatable" - is not something this producer can know: a delivery written a
+// moment later, by a step still running after its job was canceled, would find
+// the gate already down and the alert that raised it in no message.
+//
+// The gate stays up instead. It costs a listing per tick for as long as the
+// group is open, and it says something true: that message really is out of
+// date.
+func TestProcessAlertUpdates_KeepsFlagWhenNoUpdatableDeliveries(t *testing.T) {
 	s := store.NewMockStore()
 	cfg := &config.Config{}
 	d, _ := NewDispatcher(s, cfg)
@@ -1902,7 +1986,7 @@ func TestProcessAlertUpdates_ClearsFlagWhenNoUpdatableDeliveries(t *testing.T) {
 		Severity: "info",
 	}
 	s.CreateAlertGroup(ag)
-	s.RaiseSlackUpdate("ag_no_upd")
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_no_upd", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
 		ID:             "del_no_upd",
@@ -1914,10 +1998,9 @@ func TestProcessAlertUpdates_ClearsFlagWhenNoUpdatableDeliveries(t *testing.T) {
 	ctx := context.Background()
 	d.ProcessAlertUpdates(ctx)
 
-	// Verify: flag cleared — deliveries exist but none support updates, so flag would be stuck forever
 	updated, _ := s.GetAlertGroupByID("ag_no_upd")
-	if updated.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be false when deliveries exist but none are updatable")
+	if !updated.SlackUpdatePending {
+		t.Error("the gate came down on the evidence that some delivery exists, which proves nothing about the next one")
 	}
 }
 
@@ -1947,7 +2030,7 @@ func TestProcessAlertUpdates_KeepsFlagOnDedupHit(t *testing.T) {
 		Severity: "info",
 	}
 	s.CreateAlertGroup(ag)
-	s.RaiseSlackUpdate("ag_dedup")
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_dedup", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
 		ID:              "del_dedup",
@@ -1971,7 +2054,7 @@ func TestProcessAlertUpdates_KeepsFlagOnDedupHit(t *testing.T) {
 	}
 
 	// A new alert arrives while the first job is still pending.
-	s.RaiseSlackUpdate("ag_dedup")
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_dedup", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	// Second run — the job is still pending, so CreateJobWithDedup reports
 	// created=false and nothing was admitted for this alert.
@@ -2052,11 +2135,13 @@ func TestProcessAlertUpdates_KeepsFlagWhenAnAlertArrivesDuringAdmission(t *testi
 		SupportsUpdate:  true,
 		ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
 	})
-	s.RaiseSlackUpdate("ag_race")
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_race", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	// The new alert lands after the job is admitted and before the gate comes
 	// down.
-	racing.onAdmit = func() { s.RaiseSlackUpdate("ag_race") }
+	racing.onAdmit = func() {
+		s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_race", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
+	}
 
 	ctx := context.Background()
 	d.ProcessAlertUpdates(ctx)
@@ -2100,7 +2185,7 @@ func TestProcessAlertUpdates_HandlesTriggeredGroups(t *testing.T) {
 		Severity: "critical",
 	}
 	s.CreateAlertGroup(ag)
-	s.RaiseSlackUpdate("ag_triggered")
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_triggered", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
 		ID:              "del_triggered",
@@ -2146,7 +2231,7 @@ func TestProcessAlertUpdates_HandlesAcknowledgedGroups(t *testing.T) {
 	}
 	s.CreateAlertGroup(ag)
 	s.MarkAckProcessed("ag_acked")
-	s.RaiseSlackUpdate("ag_acked")
+	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_acked", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
 		ID:              "del_acked",

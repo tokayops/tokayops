@@ -393,9 +393,16 @@ func (d *Dispatcher) ProcessAcknowledgedAlertGroups(ctx context.Context) {
 		job, stages, steps, err := builder.Build(ag)
 		if err != nil {
 			if errors.Is(err, builders.ErrNoUpdatableDeliveries) {
-				// There is nothing to update and nothing will change that, so
-				// the gate comes down: left up, this group would be picked up
-				// on every tick forever.
+				// Nothing to update, so the gate comes down - and here that is
+				// the right trade, where for an alert update it is not.
+				//
+				// What is given up is narrow: a message whose sending straddled
+				// the acknowledgement was rendered before it and will keep
+				// saying "triggered" until the next alert refreshes it. What is
+				// bought is that this loop, which runs every two seconds and
+				// cancels an escalation on each pass, stops looking at a group
+				// it can do nothing for. An alert update makes the opposite
+				// trade because what it carries is an alert, not a colour.
 				log.Printf("JobController: No updatable deliveries for acknowledged %s", ag.ID)
 				gate.lower(ag)
 				continue
@@ -513,18 +520,22 @@ func (d *Dispatcher) ProcessAlertUpdates(ctx context.Context) {
 	for _, ag := range alertGroups {
 		job, stages, steps, err := builder.BuildAlertUpdate(ag)
 		if errors.Is(err, builders.ErrNoUpdatableDeliveries) {
-			// Distinguish: no deliveries at all (escalation pending) vs. deliveries exist but none updatable
-			deliveries, dErr := d.store.ListDeliveries(ag.ID)
-			if dErr != nil {
-				log.Printf("JobController: Failed to list deliveries for %s (will retry): %v", ag.ID, dErr)
-			} else if len(deliveries) > 0 {
-				// Deliveries exist but none can be updated, and no later alert
-				// will change that for the ones already sent.
-				log.Printf("JobController: No updatable deliveries for %s (%d total)", ag.ID, len(deliveries))
-				gate.lower(ag)
-			}
-			// No deliveries at all - the escalation has not sent anything yet,
-			// so the gate stays up and the next tick tries again.
+			// Nothing this group has sent can be updated - as of the moment
+			// that listing was taken. The gate stays up, and it stays up
+			// silently: this tick will repeat every few seconds for as long as
+			// the group is open, and a line per tick would bury everything
+			// else in the log.
+			//
+			// It used to come down here, on the evidence of a second listing
+			// of the deliveries: "some exist, so no more are coming". That
+			// evidence is not sound. Deliveries are written by escalation
+			// steps, and one written a moment later - by a step still running
+			// after its job was canceled, or after the listing the build was
+			// working from - would find the gate already down and the alert
+			// that raised it in no message at all.
+			//
+			// There is no cheaper proof available, so no proof is claimed. The
+			// cost is bounded: the group leaves this queue when it is resolved.
 			continue
 		}
 		if err != nil {

@@ -52,12 +52,15 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   second direct message to the same people. A handover notification is now
   identified by the shift change it announces, and that identity is kept for
   good rather than for as long as the notification takes to send.
-- An alert that arrives while a message update is already on its way is no
-  longer left out of that message. The flag that says "this alert group's
-  message is out of date" used to be cleared by whichever update ran next, even
-  when that update had been built before the alert arrived - so the alert waited
-  for the next one, which may never come. The flag now comes down only for the
-  changes that were actually handed to an update.
+- An alert that arrives while the group's message is being updated is no longer
+  left out of it. Three things could lose one: the mark that said "this message
+  is out of date" was cleared by an update that had been built before the alert
+  arrived; it was written separately from the alert itself, so an interruption
+  in between kept the alert and dropped the mark; and a notification that
+  appeared while the update was being prepared was taken as proof that no update
+  was needed. An alert and the mark are now recorded together, and the mark is
+  cleared only for a change an update actually carried - or once the escalation
+  can no longer send anything to update at all.
 - An alert no longer loses its page when the on-call state cannot be read. A
   policy step aimed at a schedule used to escalate to nobody if the read failed
   at that moment, and nothing retried it, so the person on duty was never told.

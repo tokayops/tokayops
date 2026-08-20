@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -54,8 +56,27 @@ var slackUpdateGateCases = []struct {
 type slackUpdateGate interface {
 	CreateAlertGroup(ag *model.AlertGroup) error
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
-	RaiseSlackUpdate(id string) error
+	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
 	ClearSlackUpdate(id string, observedGeneration int64) (bool, error)
+}
+
+// raise is what the ingester does when an alert changes the group: the alerts
+// and the gate move in one write. The tests below raise the gate that way and
+// not through a flag setter, because a flag setter is not a thing this store
+// has - separating the two is what lost an alert.
+func raise(t *testing.T, s slackUpdateGate, id string, alertNames ...string) {
+	t.Helper()
+	alerts := make([]model.Alert, 0, len(alertNames))
+	for _, name := range alertNames {
+		alerts = append(alerts, model.Alert{
+			Fingerprint: name,
+			Status:      model.AlertStatusFiring,
+			Labels:      map[string]string{"alertname": name},
+		})
+	}
+	if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(id, alerts); err != nil {
+		t.Fatalf("record alerts and raise the gate: %v", err)
+	}
 }
 
 func runSlackUpdateGateCases(t *testing.T, newStore func(t *testing.T) slackUpdateGate) {
@@ -77,9 +98,7 @@ func runSlackUpdateGateCases(t *testing.T, newStore func(t *testing.T) slackUpda
 			}
 
 			for i := 0; i < tc.raisesBeforeRead; i++ {
-				if err := s.RaiseSlackUpdate(id); err != nil {
-					t.Fatalf("RaiseSlackUpdate: %v", err)
-				}
+				raise(t, s, id, "alert-a")
 			}
 
 			read, err := s.GetAlertGroupByID(id)
@@ -91,9 +110,7 @@ func runSlackUpdateGateCases(t *testing.T, newStore func(t *testing.T) slackUpda
 			}
 
 			for i := 0; i < tc.raisesAfterRead; i++ {
-				if err := s.RaiseSlackUpdate(id); err != nil {
-					t.Fatalf("RaiseSlackUpdate: %v", err)
-				}
+				raise(t, s, id, "alert-a", "alert-b")
 			}
 
 			cleared, err := s.ClearSlackUpdate(id, read.SlackUpdateGeneration)
@@ -123,6 +140,86 @@ func TestSlackUpdateGate_MockStore(t *testing.T) {
 	runSlackUpdateGateCases(t, func(t *testing.T) slackUpdateGate { return NewMockStore() })
 }
 
+// TestSlackUpdateGateMovesWithTheAlerts: the alerts and the gate move in one
+// write, so there is no moment in which the group holds a change its message is
+// not marked as missing.
+//
+// Two writes had such a moment, and a process that stopped in it lost the alert
+// for good: Alertmanager repeating the payload finds the alerts already
+// recorded, merges nothing, and never raises the gate again.
+func TestSlackUpdateGateMovesWithTheAlerts(t *testing.T) {
+	for _, impl := range []struct {
+		name  string
+		build func(t *testing.T) slackUpdateGate
+	}{
+		{"Store", func(t *testing.T) slackUpdateGate { return setupTestDB(t) }},
+		{"MockStore", func(t *testing.T) slackUpdateGate { return NewMockStore() }},
+	} {
+		t.Run(impl.name, func(t *testing.T) {
+			s := impl.build(t)
+
+			id := uuid.New().String()
+			if err := s.CreateAlertGroup(&model.AlertGroup{
+				ID: id, AlertKey: "dk-" + id, Status: model.AlertGroupStatusProcessing,
+				Title: "gate", Severity: "info",
+			}); err != nil {
+				t.Fatalf("CreateAlertGroup: %v", err)
+			}
+
+			raise(t, s, id, "alert-a", "alert-b")
+
+			ag, err := s.GetAlertGroupByID(id)
+			if err != nil {
+				t.Fatalf("GetAlertGroupByID: %v", err)
+			}
+			if len(ag.Alerts) != 2 {
+				t.Fatalf("the group holds %d alerts, want the two just recorded", len(ag.Alerts))
+			}
+			if !ag.SlackUpdatePending {
+				t.Error("the alerts were recorded with the gate down")
+			}
+			if ag.SlackUpdateGeneration == 0 {
+				t.Error("the version did not move with the alerts")
+			}
+		})
+	}
+}
+
+// TestSlackUpdateGateOnAGroupThatIsNotThere: the two halves answer a missing
+// group differently, and each answer is the one its caller can act on.
+//
+// The write must land somewhere - a caller told nothing would answer its
+// webhook with 200 for an alert it dropped - so it reports that it did not.
+// The conditional clear has no such duty: nothing was lowered, which is the
+// same answer it gives for a group that has moved on.
+func TestSlackUpdateGateOnAGroupThatIsNotThere(t *testing.T) {
+	for _, impl := range []struct {
+		name  string
+		build func(t *testing.T) slackUpdateGate
+	}{
+		{"Store", func(t *testing.T) slackUpdateGate { return setupTestDB(t) }},
+		{"MockStore", func(t *testing.T) slackUpdateGate { return NewMockStore() }},
+	} {
+		t.Run(impl.name, func(t *testing.T) {
+			s := impl.build(t)
+			missing := uuid.New().String()
+
+			err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(missing, []model.Alert{{Fingerprint: "fp"}})
+			if !errors.Is(err, sql.ErrNoRows) {
+				t.Errorf("recording alerts for a group that is not there returned %v, want sql.ErrNoRows", err)
+			}
+
+			cleared, err := s.ClearSlackUpdate(missing, 1)
+			if err != nil {
+				t.Errorf("lowering the gate of a group that is not there returned %v, want no error", err)
+			}
+			if cleared {
+				t.Error("a gate was lowered on a group that is not there")
+			}
+		})
+	}
+}
+
 // The version only ever goes up, and it goes up on every alert. Were a raise to
 // leave it where it was, two alerts in the same gap would look like one and the
 // second would be cleared away with the first.
@@ -150,9 +247,7 @@ func TestSlackUpdateGateIsMonotonic(t *testing.T) {
 
 			var seen []int64
 			for i := 0; i < 3; i++ {
-				if err := s.RaiseSlackUpdate(id); err != nil {
-					t.Fatalf("RaiseSlackUpdate: %v", err)
-				}
+				raise(t, s, id, "alert-a")
 				ag, err := s.GetAlertGroupByID(id)
 				if err != nil {
 					t.Fatalf("GetAlertGroupByID: %v", err)
