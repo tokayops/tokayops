@@ -9,8 +9,32 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Stop every running instance before starting this version.** The schema
+  change it applies at startup is not one an older instance can write against:
+  the previous version keeps starting, but every background job it tries to
+  create is rejected, which means alerts stop being escalated for as long as it
+  is left running. Take a database backup first, as always, and do not start an
+  older image against the upgraded database afterwards - downgrading is not
+  supported.
+- The upgrade refuses to run while a job it cannot classify is still executing,
+  and names the job in the message. That job either finishes or is cancelled,
+  and the upgrade is started again. The alternative would be to let it run on
+  without its claim on the work, which for an escalation means a second round of
+  pages for one incident.
+
 ### Fixed
 
+- Two unrelated pieces of background work no longer cancel each other out by
+  accident. Deduplication used to compare one opaque key across every kind of
+  job, so a collision between, say, an escalation and a message update silently
+  dropped one of them. Each kind of work now declares what identifies it, and
+  identical keys in different kinds are simply different work.
+- The escalation of a repeat incident is no longer at risk of being taken for
+  the previous one. An escalation is now identified by its alert group rather
+  than by the alert fingerprint, which several groups share over time as the
+  same alert fires, resolves and fires again.
 - An alert no longer loses its page when the on-call state cannot be read. A
   policy step aimed at a schedule used to escalate to nobody if the read failed
   at that moment, and nothing retried it, so the person on duty was never told.

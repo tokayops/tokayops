@@ -3,51 +3,67 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// createJobWithDedupTx inserts a job and its steps within the given transaction.
-// Returns (jobID, created, error):
-//   - (id, true, nil)  — job created
-//   - (id, false, nil) — dedup conflict, returned existing job ID
-//   - ("", false, err) — DB error
-func (s *Store) createJobWithDedupTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
+// insertJobTx inserts a job with its stages and steps inside the given
+// transaction and reports whether it was inserted at all.
+//
+// Which uniqueness rule applies is the job's own answer: the scope on its dedup
+// spec picks the partial index the ON CONFLICT clause aims at. Nothing here
+// classifies failures by constraint name, so a conflict on jobs_pkey - or on any
+// constraint added later - stays an error instead of quietly reading as
+// "already deduplicated".
+func insertJobTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
+	// A job without an identity is refused rather than inserted unclaimed. No
+	// producer builds one, and the schema tolerates an empty spec only for
+	// historical rows the upgrade could not classify.
+	if err := job.Dedup.Validate(); err != nil {
+		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
+	}
+
 	payloadBytes, err := json.Marshal(job.Payload)
 	if err != nil {
-		return "", false, fmt.Errorf("failed to marshal payload: %w", err)
+		return false, fmt.Errorf("failed to marshal payload: %w", err)
 	}
 	if job.Payload == nil {
 		payloadBytes = []byte("{}")
 	}
 
+	var onConflict string
+	switch job.Dedup.Scope {
+	case jobdedup.ScopeWhileActive:
+		onConflict = `ON CONFLICT (dedup_namespace, dedup_key)
+			WHERE dedup_scope = 'while_active' AND status IN ('pending', 'running') DO NOTHING`
+	case jobdedup.ScopeForever:
+		onConflict = `ON CONFLICT (dedup_namespace, dedup_key)
+			WHERE dedup_scope = 'forever' DO NOTHING`
+	}
+
 	var jobID string
-	query := `
-		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id, current_stage, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		ON CONFLICT (dedup_key) WHERE status IN ('pending', 'running') DO NOTHING
-		RETURNING id`
+	// nosemgrep: string-formatted-query - onConflict is one of the two literals above
+	err = tx.QueryRow(`
+		INSERT INTO jobs (id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
+			alert_group_id, current_stage, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`+onConflict+`
+		RETURNING id`,
+		job.ID, job.Type, job.Status, string(payloadBytes),
+		string(job.Dedup.Namespace), job.Dedup.Key, string(job.Dedup.Scope),
+		job.AlertGroupID, job.CurrentStage, job.CreatedAt, job.UpdatedAt,
+	).Scan(&jobID)
 
-	err = tx.QueryRow(query,
-		job.ID, job.Type, job.Status, string(payloadBytes), job.DedupKey, job.AlertGroupID, job.CurrentStage,
-		job.CreatedAt, job.UpdatedAt).Scan(&jobID)
-
-	if err == sql.ErrNoRows {
-		if job.DedupKey == nil {
-			return "", false, fmt.Errorf("duplicate job check failed: dedup_key is nil")
-		}
-		err = tx.QueryRow(`SELECT id FROM jobs WHERE dedup_key = $1 AND status IN ('pending', 'running')`,
-			job.DedupKey).Scan(&jobID)
-		if err != nil {
-			return "", false, fmt.Errorf("failed to fetch existing job: %w", err)
-		}
-		return jobID, false, nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("failed to insert job: %w", err)
+		return false, fmt.Errorf("failed to insert job: %w", err)
 	}
 
 	// Insert stages
@@ -57,7 +73,7 @@ func (s *Store) createJobWithDedupTx(tx *sql.Tx, job *model.Job, stages []*model
 			VALUES ($1, $2, $3, $4, $5, $6)`,
 			stage.ID, jobID, stage.StageIndex, stage.Status, stage.CreatedAt, stage.UpdatedAt)
 		if err != nil {
-			return "", false, fmt.Errorf("failed to insert stage %d: %w", stage.StageIndex, err)
+			return false, fmt.Errorf("failed to insert stage %d: %w", stage.StageIndex, err)
 		}
 	}
 
@@ -69,14 +85,14 @@ func (s *Store) createJobWithDedupTx(tx *sql.Tx, job *model.Job, stages []*model
 			timeout_seconds, max_attempts, continue_on_failure, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`)
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
 	defer stmt.Close()
 
 	for _, step := range steps {
 		dataBytes, err := json.Marshal(step.Data)
 		if err != nil {
-			return "", false, fmt.Errorf("failed to marshal step data: %w", err)
+			return false, fmt.Errorf("failed to marshal step data: %w", err)
 		}
 		if step.Data == nil {
 			dataBytes = []byte("{}")
@@ -89,28 +105,28 @@ func (s *Store) createJobWithDedupTx(tx *sql.Tx, job *model.Job, stages []*model
 			step.CreatedAt, step.UpdatedAt,
 		)
 		if err != nil {
-			return "", false, fmt.Errorf("failed to insert step %d: %w", step.StepIndex, err)
+			return false, fmt.Errorf("failed to insert step %d: %w", step.StepIndex, err)
 		}
 	}
 
-	return jobID, true, nil
+	return true, nil
 }
 
-// CreateJobWithDedup creates a job and its steps atomically.
-// If a job with the same dedup_key exists and is active, it returns that job's
-// ID (idempotent) with created false.
-func (s *Store) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
+// CreateJobWithDedup creates a job with its stages and steps atomically and
+// reports whether it was created. False means the identity was already claimed
+// under its own policy, and nothing was written.
+func (s *Store) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
 	defer tx.Rollback()
 
-	jobID, created, err := s.createJobWithDedupTx(tx, job, stages, steps)
+	created, err := insertJobTx(tx, job, stages, steps)
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
-	return jobID, created, tx.Commit()
+	return created, tx.Commit()
 }
 
 // EnsureEscalationJob atomically transitions an AG from new/processing → processing
@@ -148,83 +164,26 @@ func (s *Store) EnsureEscalationJob(agID string, job *model.Job, stages []*model
 		return false, fmt.Errorf("failed to update AG status: %w", err)
 	}
 
-	// 4. Validate: alert_group_id must match
+	// 4. Validate: the job must be the escalation OF THIS group, by both columns
+	// that say so - the one cancellation addresses and the one dedup claims.
 	if job.AlertGroupID == nil || *job.AlertGroupID != agID {
 		return false, fmt.Errorf("job.AlertGroupID must match agID")
 	}
-
-	// 5. Create escalation job — dedup by alert_group_id via unique index
-	payloadBytes, err := json.Marshal(job.Payload)
-	if err != nil {
-		return false, fmt.Errorf("failed to marshal payload: %w", err)
-	}
-	if job.Payload == nil {
-		payloadBytes = []byte("{}")
+	if job.Dedup == nil || job.Dedup.Namespace != jobdedup.NamespaceEscalation || job.Dedup.Key != agID {
+		return false, fmt.Errorf("job dedup identity must be the escalation of %s", agID)
 	}
 
-	var jobID string
-	err = tx.QueryRow(`
-		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id, current_stage, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		ON CONFLICT (alert_group_id) WHERE type = 'escalation' AND alert_group_id IS NOT NULL
-		DO NOTHING
-		RETURNING id`,
-		job.ID, job.Type, job.Status, string(payloadBytes), job.DedupKey, job.AlertGroupID,
-		job.CurrentStage, job.CreatedAt, job.UpdatedAt,
-	).Scan(&jobID)
-
-	if err == sql.ErrNoRows {
-		// Escalation job already exists for this AG (any status) — don't create duplicate
-		return false, tx.Commit()
-	}
-	if err != nil {
-		return false, fmt.Errorf("failed to insert escalation job: %w", err)
-	}
-
-	// 6. Insert stages
-	for _, stage := range stages {
-		_, err = tx.Exec(`
-			INSERT INTO job_stages (id, job_id, stage_index, status, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			stage.ID, jobID, stage.StageIndex, stage.Status, stage.CreatedAt, stage.UpdatedAt)
-		if err != nil {
-			return false, fmt.Errorf("failed to insert stage %d: %w", stage.StageIndex, err)
-		}
-	}
-
-	// 7. Insert steps
-	stmt, err := tx.Prepare(`
-		INSERT INTO job_steps (
-			id, job_id, stage_id, step_index, step_type, status, data, next_run_at,
-			locked_by, locked_until,
-			timeout_seconds, max_attempts, continue_on_failure, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`)
+	// 5. Create the escalation job. Its identity is forever-scoped, so an
+	// existing job of any status - not only an active one - is the answer.
+	created, err := insertJobTx(tx, job, stages, steps)
 	if err != nil {
 		return false, err
 	}
-	defer stmt.Close()
-
-	for _, step := range steps {
-		dataBytes, err := json.Marshal(step.Data)
-		if err != nil {
-			return false, fmt.Errorf("failed to marshal step data: %w", err)
-		}
-		if step.Data == nil {
-			dataBytes = []byte("{}")
-		}
-
-		_, err = stmt.Exec(
-			step.ID, jobID, step.StageID, step.StepIndex, step.StepType, step.Status, string(dataBytes),
-			step.NextRunAt, step.LockedBy, step.LockedUntil,
-			step.TimeoutSeconds, step.MaxAttempts, step.ContinueOnFailure,
-			step.CreatedAt, step.UpdatedAt,
-		)
-		if err != nil {
-			return false, fmt.Errorf("failed to insert step %d: %w", step.StepIndex, err)
-		}
+	if !created {
+		return false, tx.Commit()
 	}
 
-	// 8. Job created — save policy snapshot
+	// 6. Job created — save policy snapshot
 	var snapshotVal sql.NullString
 	if snapshot != nil {
 		data, _ := json.Marshal(snapshot)
@@ -243,38 +202,45 @@ func (s *Store) EnsureEscalationJob(agID string, job *model.Job, stages []*model
 	return true, tx.Commit()
 }
 
+// scanDedupSpec turns the three dedup columns into a spec, or into nothing.
+//
+// A row carries all three or none: the schema enforces it, and a partial set
+// read back is a corrupted row rather than an approximate identity, so it is
+// reported instead of guessed at.
+func scanDedupSpec(jobID string, ns, key, scope sql.NullString) (*jobdedup.Spec, error) {
+	switch {
+	case !ns.Valid && !key.Valid && !scope.Valid:
+		return nil, nil
+	case ns.Valid && key.Valid && scope.Valid:
+		spec, err := jobdedup.New(jobdedup.Namespace(ns.String), key.String, jobdedup.Scope(scope.String))
+		if err != nil {
+			return nil, fmt.Errorf("job %s: %w", jobID, err)
+		}
+		return spec, nil
+	default:
+		return nil, fmt.Errorf("job %s: partial dedup spec in the database", jobID)
+	}
+}
+
 // GetJobByID fetches a job by ID
 func (s *Store) GetJobByID(id string) (*model.Job, error) {
 	job := &model.Job{}
 	var payloadStr string
 	var statusStr string
+	var ns, key, scope sql.NullString
 
 	err := s.db.QueryRow(`
-		SELECT id, type, status, payload, dedup_key, alert_group_id, current_stage, error, created_at, updated_at, finished_at, canceled_at
+		SELECT id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
+		       alert_group_id, current_stage, error, created_at, updated_at, finished_at, canceled_at
 		FROM jobs WHERE id = $1`, id).Scan(
-		&job.ID, &job.Type, &statusStr, &payloadStr, &job.DedupKey, &job.AlertGroupID, &job.CurrentStage,
+		&job.ID, &job.Type, &statusStr, &payloadStr, &ns, &key, &scope,
+		&job.AlertGroupID, &job.CurrentStage,
 		&job.Error, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &job.CanceledAt,
 	)
 	if err != nil {
 		return nil, err
 	}
-	job.Status = model.JobStatus(statusStr)
-	job.Payload = json.RawMessage(payloadStr)
-	return job, nil
-}
-
-// GetJobByDedupKey fetches the latest job by dedup key
-func (s *Store) GetJobByDedupKey(dedupKey string) (*model.Job, error) {
-	job := &model.Job{}
-	var payloadStr string
-	var statusStr string
-
-	err := s.db.QueryRow(`
-		SELECT id, type, status, payload, dedup_key, alert_group_id, current_stage, error, created_at, updated_at, finished_at, canceled_at
-		FROM jobs WHERE dedup_key = $1 ORDER BY created_at DESC LIMIT 1`, dedupKey).Scan(
-		&job.ID, &job.Type, &statusStr, &payloadStr, &job.DedupKey, &job.AlertGroupID, &job.CurrentStage,
-		&job.Error, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &job.CanceledAt,
-	)
+	job.Dedup, err = scanDedupSpec(job.ID, ns, key, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -629,7 +595,8 @@ func (s *Store) ExtendStepLease(stepID string, leaseToken string, duration time.
 // GetJobsByIDs fetches multiple jobs
 func (s *Store) GetJobsByIDs(ids []string) (map[string]*model.Job, error) {
 	rows, err := s.db.Query(`
-		SELECT id, type, status, payload, dedup_key, alert_group_id, current_stage, error, created_at
+		SELECT id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
+		       alert_group_id, current_stage, error, created_at
 		FROM jobs WHERE id = ANY($1)`, pq.Array(ids))
 	if err != nil {
 		return nil, err
@@ -640,10 +607,16 @@ func (s *Store) GetJobsByIDs(ids []string) (map[string]*model.Job, error) {
 	for rows.Next() {
 		job := &model.Job{}
 		var payloadStr, statusStr string
+		var ns, key, scope sql.NullString
 		err := rows.Scan(
-			&job.ID, &job.Type, &statusStr, &payloadStr, &job.DedupKey, &job.AlertGroupID, &job.CurrentStage,
+			&job.ID, &job.Type, &statusStr, &payloadStr, &ns, &key, &scope,
+			&job.AlertGroupID, &job.CurrentStage,
 			&job.Error, &job.CreatedAt,
 		)
+		if err != nil {
+			return nil, err
+		}
+		job.Dedup, err = scanDedupSpec(job.ID, ns, key, scope)
 		if err != nil {
 			return nil, err
 		}

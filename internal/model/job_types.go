@@ -3,6 +3,8 @@ package model
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/tokayops/tokayops/internal/jobdedup"
 )
 
 // JobStatus represents job lifecycle state
@@ -69,7 +71,7 @@ type Job struct {
 	Type         string          `json:"type" db:"type"`
 	Status       JobStatus       `json:"status" db:"status"`
 	Payload      json.RawMessage `json:"payload" db:"payload"`
-	DedupKey     *string         `json:"dedup_key" db:"dedup_key"`
+	Dedup        *jobdedup.Spec  `json:"dedup"`
 	AlertGroupID *string         `json:"alert_group_id" db:"alert_group_id"`
 	CurrentStage int             `json:"current_stage" db:"current_stage"`
 	Error        *string         `json:"error" db:"error"`

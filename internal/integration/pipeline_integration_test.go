@@ -228,13 +228,16 @@ func waitForStepCompletion(t *testing.T, s *store.Store, dedupKey string, stageI
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		var status string
-		// Find job by dedup_key, locate step via stage_index (each stage has step_index=0 for single-step stages)
+		// The escalation is identified by its alert group, so the group's
+		// dedup key - the alert fingerprint the caller has - reaches the job
+		// through alert_groups rather than off the job row.
 		err := s.GetDB().QueryRow(`
 			SELECT js.status
 			FROM job_steps js
 			JOIN job_stages jst ON js.stage_id = jst.id
 			JOIN jobs j ON jst.job_id = j.id
-			WHERE j.dedup_key = $1 AND jst.stage_index = $2
+			JOIN alert_groups ag ON j.alert_group_id = ag.id
+			WHERE ag.dedup_key = $1 AND jst.stage_index = $2
 			LIMIT 1
 		`, dedupKey, stageIndex).Scan(&status)
 
@@ -771,7 +774,8 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 	env.S.GetDB().QueryRow(`
 		SELECT COUNT(*) FROM job_stages jst
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_fanout_1'
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_fanout_1'
 	`).Scan(&stageCount)
 	if stageCount != 2 {
 		t.Errorf("Expected 2 stages, got %d", stageCount)
@@ -783,7 +787,8 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_fanout_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_fanout_1' AND jst.stage_index = 1
 	`).Scan(&fanoutStepCount)
 	if fanoutStepCount < 1 {
 		t.Errorf("Expected at least 1 step in fan-out stage, got %d", fanoutStepCount)
@@ -795,7 +800,8 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_fanout_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_fanout_1' AND jst.stage_index = 1
 		  AND js.continue_on_failure = false
 	`).Scan(&nonCofCount)
 	if nonCofCount > 0 {
@@ -878,7 +884,8 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 	env.S.GetDB().QueryRow(`
 		SELECT COUNT(*) FROM job_stages jst
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_multi_fanout_1'
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_multi_fanout_1'
 	`).Scan(&stageCount)
 	if stageCount != 2 {
 		t.Errorf("Expected 2 stages, got %d", stageCount)
@@ -890,7 +897,8 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_multi_fanout_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_multi_fanout_1' AND jst.stage_index = 1
 	`).Scan(&fanoutStepCount)
 	if fanoutStepCount != 2 {
 		t.Errorf("Expected exactly 2 fan-out steps, got %d", fanoutStepCount)
@@ -902,7 +910,8 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_multi_fanout_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_multi_fanout_1' AND jst.stage_index = 1
 		  AND js.continue_on_failure = false
 	`).Scan(&nonCofCount)
 	if nonCofCount > 0 {
@@ -1015,7 +1024,8 @@ func TestPipeline_ScheduleFanOut_OverrideOverGroup(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_override_group_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_override_group_1' AND jst.stage_index = 1
 	`).Scan(&stepCount)
 	if stepCount != 1 {
 		t.Errorf("Expected exactly 1 step (override replaces group), got %d", stepCount)
@@ -1114,7 +1124,8 @@ func TestPipeline_ScheduleFanOut_NoL2Additive(t *testing.T) {
 		SELECT COUNT(*) FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_no_l2_additive_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_no_l2_additive_1' AND jst.stage_index = 1
 	`).Scan(&stepCount)
 	if stepCount != 1 {
 		t.Errorf("Expected exactly 1 fan-out step (L1 only, no L2 additive), got %d", stepCount)
@@ -1196,7 +1207,8 @@ func TestPipeline_DisabledProvider_PermanentFail(t *testing.T) {
 		FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_disabled_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_disabled_1' AND jst.stage_index = 1
 		LIMIT 1
 	`).Scan(&status, &attempts); err != nil {
 		t.Fatalf("query blocked step: %v", err)
@@ -1358,7 +1370,8 @@ func TestPipeline_EscalationUnlinked(t *testing.T) {
 		FROM job_steps js
 		JOIN job_stages jst ON js.stage_id = jst.id
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_unlinked_1' AND jst.stage_index = 1
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_unlinked_1' AND jst.stage_index = 1
 		LIMIT 1
 	`).Scan(&status, &attempts); err != nil {
 		t.Fatalf("query unlinked step: %v", err)
@@ -1472,7 +1485,8 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	env.S.GetDB().QueryRow(`
 		SELECT COUNT(*) FROM job_stages jst
 		JOIN jobs j ON jst.job_id = j.id
-		WHERE j.dedup_key = 'test_cancel_exec_1' AND j.status = 'canceled'
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = 'test_cancel_exec_1' AND j.status = 'canceled'
 		  AND jst.status IN ('active', 'blocked')
 	`).Scan(&activeStageCnt)
 	if activeStageCnt != 0 {
@@ -1490,13 +1504,19 @@ func waitForJobStatus(t *testing.T, s *store.Store, dedupKey string, expected mo
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		var status string
-		err := s.GetDB().QueryRow(`SELECT status FROM jobs WHERE dedup_key = $1`, dedupKey).Scan(&status)
+		err := s.GetDB().QueryRow(`
+			SELECT j.status FROM jobs j
+			JOIN alert_groups ag ON j.alert_group_id = ag.id
+			WHERE ag.dedup_key = $1`, dedupKey).Scan(&status)
 		if err == nil && status == string(expected) {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	var actual string
-	s.GetDB().QueryRow(`SELECT status FROM jobs WHERE dedup_key = $1`, dedupKey).Scan(&actual)
+	s.GetDB().QueryRow(`
+		SELECT j.status FROM jobs j
+		JOIN alert_groups ag ON j.alert_group_id = ag.id
+		WHERE ag.dedup_key = $1`, dedupKey).Scan(&actual)
 	t.Fatalf("Timeout waiting for job %s to reach status %s, current: %s", dedupKey, expected, actual)
 }

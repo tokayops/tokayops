@@ -74,22 +74,22 @@ func (m *mockNotifierStore) GetIdentitiesForUsers(userIDs []string) (map[string]
 	return out, nil
 }
 
-func (m *mockNotifierStore) CreateJobWithDedup(job *model.Job, _ []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
+func (m *mockNotifierStore) CreateJobWithDedup(job *model.Job, _ []*model.JobStage, steps []*model.JobStep) (bool, error) {
 	if m.createJobErr != nil {
-		return "", false, m.createJobErr
+		return false, m.createJobErr
 	}
-	if job.DedupKey != nil && m.dedupHits[*job.DedupKey] {
-		return "existing-job", false, nil
+	if job.Dedup != nil && m.dedupHits[job.Dedup.Key] {
+		return false, nil
 	}
 	m.jobs = append(m.jobs, &createdJob{job: job, steps: steps})
-	return job.ID, true, nil
+	return true, nil
 }
 
 func (m *mockNotifierStore) dedupKeys() []string {
 	var out []string
 	for _, j := range m.jobs {
-		if j.job.DedupKey != nil {
-			out = append(out, *j.job.DedupKey)
+		if j.job.Dedup != nil {
+			out = append(out, j.job.Dedup.Key)
 		}
 	}
 	return out
@@ -195,8 +195,8 @@ func TestNotifierNaturalHandoff(t *testing.T) {
 	if got := env.targets(); strings.Join(got, ",") != "U-CAROL" {
 		t.Fatalf("notified %v, want carol alone - bob was already on call", got)
 	}
-	if key := env.jobs()[0].job.DedupKey; key == nil || !strings.HasPrefix(*key, kindHandoff+":sched-1:") {
-		t.Fatalf("dedup key = %v, want a handoff key for sched-1", key)
+	if spec := env.jobs()[0].job.Dedup; spec == nil || !strings.HasPrefix(spec.Key, kindHandoff+":sched-1:") {
+		t.Fatalf("dedup spec = %+v, want a handoff key for sched-1", spec)
 	}
 }
 
@@ -211,8 +211,8 @@ func TestNotifierAddedToActiveShift(t *testing.T) {
 	if got := env.targets(); strings.Join(got, ",") != "U-DAVE" {
 		t.Fatalf("notified %v, want dave alone", got)
 	}
-	if key := env.jobs()[0].job.DedupKey; key == nil || !strings.HasPrefix(*key, kindAddedToActiveShift+":") {
-		t.Fatalf("dedup key = %v, want an added_to_active_shift key", key)
+	if spec := env.jobs()[0].job.Dedup; spec == nil || !strings.HasPrefix(spec.Key, kindAddedToActiveShift+":") {
+		t.Fatalf("dedup spec = %+v, want an added_to_active_shift key", spec)
 	}
 	if msg := env.message(); !strings.Contains(msg, "added to the on-call shift in progress") {
 		t.Fatalf("message does not announce joining a shift in progress:\n%s", msg)

@@ -412,7 +412,7 @@ func (d *Dispatcher) ProcessAcknowledgedAlertGroups(ctx context.Context) {
 		}
 
 		// 3. Try to create the job
-		if _, _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
+		if _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
 			// Transient error - do NOT mark as processed, allow retry on next iteration
 			log.Printf("JobController: Failed to create update job for %s (will retry): %v", ag.ID, err)
 			continue
@@ -468,7 +468,7 @@ func (d *Dispatcher) ProcessResolvedAlertGroups(ctx context.Context) {
 
 		if job != nil {
 			// 3. Create resolution job
-			if _, _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
+			if _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
 				log.Printf("JobController: Failed to create resolution job for %s (will retry): %v", ag.ID, err)
 				continue // transient error → retry next tick
 			}
@@ -517,7 +517,7 @@ func (d *Dispatcher) ProcessAlertUpdates(ctx context.Context) {
 	}
 
 	for _, ag := range alertGroups {
-		job, stages, steps, err := builder.BuildWithDedup(ag, "update_alert")
+		job, stages, steps, err := builder.BuildAlertUpdate(ag)
 		if errors.Is(err, builders.ErrNoUpdatableDeliveries) {
 			// Distinguish: no deliveries at all (escalation pending) vs. deliveries exist but none updatable
 			deliveries, dErr := d.store.ListDeliveries(ag.ID)
@@ -542,8 +542,8 @@ func (d *Dispatcher) ProcessAlertUpdates(ctx context.Context) {
 			continue
 		}
 
-		// CreateJobWithDedup returns (existingID, false, nil) on dedup hit — not an error
-		if _, _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
+		// CreateJobWithDedup returns (false, nil) on a dedup hit — not an error
+		if _, err := d.store.CreateJobWithDedup(job, stages, steps); err != nil {
 			// Transient error — keep flag, retry next tick
 			log.Printf("JobController: Failed to create alert update job for %s (will retry): %v", ag.ID, err)
 			continue

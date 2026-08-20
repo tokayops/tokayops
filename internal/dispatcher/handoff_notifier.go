@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -50,7 +51,7 @@ type identityLookup interface {
 
 type jobCreator interface {
 	CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
-		steps []*model.JobStep) (id string, created bool, err error)
+		steps []*model.JobStep) (created bool, err error)
 }
 
 // notifierStore is the three roles together, so the constructor keeps taking
@@ -301,17 +302,16 @@ func (n *HandoffNotifier) createHandoffJob(sc schedulerender.ScheduleOnCall, kin
 
 	message := formatHandoffMessage(kind, teamName, sc.Timezone, next)
 
-	dedupKey := occurrenceKey(kind, sc.ScheduleID, next)
 	now := time.Now()
 	job := &model.Job{
-		ID:       uuid.New().String(),
-		Type:     "handoff_notify",
-		Status:   model.JobStatusPending,
-		DedupKey: &dedupKey,
+		ID:     uuid.New().String(),
+		Type:   "handoff_notify",
+		Status: model.JobStatusPending,
+		Dedup:  jobdedup.Handoff(occurrenceKey(kind, sc.ScheduleID, next)),
 		// Stamped like every other job builder does. Left unset - as it was
 		// before - the row lands at year zero, and anything ordering jobs by
-		// creation time (the job list, GetJobByDedupKey) sees notifications in
-		// an order that has nothing to do with when they happened.
+		// creation time sees notifications in an order that has nothing to do
+		// with when they happened.
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -362,7 +362,7 @@ func (n *HandoffNotifier) createHandoffJob(sc schedulerender.ScheduleOnCall, kin
 		return true
 	}
 
-	_, created, err := n.store.CreateJobWithDedup(job, []*model.JobStage{stage}, steps)
+	created, err := n.store.CreateJobWithDedup(job, []*model.JobStage{stage}, steps)
 	if err != nil {
 		log.Printf("[HandoffNotifier] Failed to create %s job for schedule %s: %v", kind, sc.ScheduleID, err)
 		return false

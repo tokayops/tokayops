@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/testutil"
 )
@@ -20,7 +21,7 @@ func TestUpdateJobStepIfOwned_Persistence(t *testing.T) {
 		ID:        jobID,
 		Type:      "test",
 		Status:    model.JobStatusRunning,
-		DedupKey:  &key,
+		Dedup:     jobdedup.Handoff(key),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
@@ -51,7 +52,7 @@ func TestUpdateJobStepIfOwned_Persistence(t *testing.T) {
 		UpdatedAt:    time.Now(),
 	}
 
-	_, _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage}, []*model.JobStep{step})
+	_, err := s.CreateJobWithDedup(job, []*model.JobStage{stage}, []*model.JobStep{step})
 	if err != nil {
 		t.Fatalf("Failed to create job: %v", err)
 	}
@@ -89,7 +90,7 @@ func TestFinishStepAndAdvance_Basic(t *testing.T) {
 	key := "dedup_advance"
 	job := &model.Job{
 		ID:        jobID,
-		DedupKey:  &key,
+		Dedup:     jobdedup.Handoff(key),
 		Status:    model.JobStatusRunning,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
@@ -142,7 +143,7 @@ func TestFinishStepAndAdvance_Basic(t *testing.T) {
 		UpdatedAt: time.Now(),
 	}
 
-	_, _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage0, stage1}, []*model.JobStep{step0, step1})
+	_, err := s.CreateJobWithDedup(job, []*model.JobStage{stage0, stage1}, []*model.JobStep{step0, step1})
 	if err != nil {
 		t.Fatalf("Failed to create job: %v", err)
 	}
@@ -218,11 +219,11 @@ func TestFinishStepAndAdvance_LeaseLost(t *testing.T) {
 	stepID := uuid.New().String()
 	realToken := uuid.New().String()
 
-	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, DedupKey: &key, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, Dedup: jobdedup.Handoff(key), CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	stage := &model.JobStage{ID: stageID, JobID: jobID, StageIndex: 0, Status: model.JobStageStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	step := &model.JobStep{ID: stepID, JobID: jobID, StageID: stageID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusRunning, LockedBy: &realToken, MaxAttempts: 3, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 
-	if _, _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage}, []*model.JobStep{step}); err != nil {
+	if _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage}, []*model.JobStep{step}); err != nil {
 		t.Fatalf("CreateJobWithDedup: %v", err)
 	}
 
@@ -254,13 +255,13 @@ func TestFinishStepAndAdvance_HardFail(t *testing.T) {
 	step1ID := uuid.New().String()
 	token := uuid.New().String()
 
-	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, DedupKey: &key, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, Dedup: jobdedup.Handoff(key), CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	stage0 := &model.JobStage{ID: stage0ID, JobID: jobID, StageIndex: 0, Status: model.JobStageStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	stage1 := &model.JobStage{ID: stage1ID, JobID: jobID, StageIndex: 1, Status: model.JobStageStatusBlocked, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	step0 := &model.JobStep{ID: step0ID, JobID: jobID, StageID: stage0ID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusRunning, LockedBy: &token, MaxAttempts: 3, ContinueOnFailure: false, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	step1 := &model.JobStep{ID: step1ID, JobID: jobID, StageID: stage1ID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusBlocked, MaxAttempts: 3, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 
-	if _, _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage0, stage1}, []*model.JobStep{step0, step1}); err != nil {
+	if _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage0, stage1}, []*model.JobStep{step0, step1}); err != nil {
 		t.Fatalf("CreateJobWithDedup: %v", err)
 	}
 
@@ -304,11 +305,11 @@ func TestFinishStepAndAdvance_JobAlreadyTerminal(t *testing.T) {
 	token := uuid.New().String()
 
 	// Job starts as canceled
-	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusCanceled, DedupKey: &key, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusCanceled, Dedup: jobdedup.Handoff(key), CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	stage := &model.JobStage{ID: stageID, JobID: jobID, StageIndex: 0, Status: model.JobStageStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	step := &model.JobStep{ID: stepID, JobID: jobID, StageID: stageID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusRunning, LockedBy: &token, MaxAttempts: 3, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 
-	if _, _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage}, []*model.JobStep{step}); err != nil {
+	if _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage}, []*model.JobStep{step}); err != nil {
 		t.Fatalf("CreateJobWithDedup: %v", err)
 	}
 
@@ -337,11 +338,11 @@ func TestFinishStepAndAdvance_ContinueOnFailure_LastStage(t *testing.T) {
 	stepID := uuid.New().String()
 	token := uuid.New().String()
 
-	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, DedupKey: &key, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, Dedup: jobdedup.Handoff(key), CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	stage := &model.JobStage{ID: stageID, JobID: jobID, StageIndex: 0, Status: model.JobStageStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	step := &model.JobStep{ID: stepID, JobID: jobID, StageID: stageID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusRunning, LockedBy: &token, MaxAttempts: 3, ContinueOnFailure: true, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 
-	if _, _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage}, []*model.JobStep{step}); err != nil {
+	if _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage}, []*model.JobStep{step}); err != nil {
 		t.Fatalf("CreateJobWithDedup: %v", err)
 	}
 
@@ -379,13 +380,13 @@ func TestClaimNextJobSteps_SkipsBlockedStages(t *testing.T) {
 	step1ID := uuid.New().String()
 	now := time.Now()
 
-	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, DedupKey: &key, CreatedAt: now, UpdatedAt: now}
+	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, Dedup: jobdedup.Handoff(key), CreatedAt: now, UpdatedAt: now}
 	stage0 := &model.JobStage{ID: stage0ID, JobID: jobID, StageIndex: 0, Status: model.JobStageStatusActive, CreatedAt: now, UpdatedAt: now}
 	stage1 := &model.JobStage{ID: stage1ID, JobID: jobID, StageIndex: 1, Status: model.JobStageStatusBlocked, CreatedAt: now, UpdatedAt: now}
 	step0 := &model.JobStep{ID: step0ID, JobID: jobID, StageID: stage0ID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusPending, NextRunAt: &now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
 	step1 := &model.JobStep{ID: step1ID, JobID: jobID, StageID: stage1ID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusPending, NextRunAt: &now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
 
-	if _, _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage0, stage1}, []*model.JobStep{step0, step1}); err != nil {
+	if _, err := s.CreateJobWithDedup(job, []*model.JobStage{stage0, stage1}, []*model.JobStep{step0, step1}); err != nil {
 		t.Fatalf("CreateJobWithDedup: %v", err)
 	}
 
@@ -428,7 +429,7 @@ func TestFinishStepAndAdvance_StageTransitions(t *testing.T) {
 	token0 := uuid.New().String()
 	now := time.Now()
 
-	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, DedupKey: &key, CreatedAt: now, UpdatedAt: now}
+	job := &model.Job{ID: jobID, Type: "test", Status: model.JobStatusRunning, Dedup: jobdedup.Handoff(key), CreatedAt: now, UpdatedAt: now}
 	stages := []*model.JobStage{
 		{ID: stage0ID, JobID: jobID, StageIndex: 0, Status: model.JobStageStatusActive, CreatedAt: now, UpdatedAt: now},
 		{ID: stage1ID, JobID: jobID, StageIndex: 1, Status: model.JobStageStatusBlocked, CreatedAt: now, UpdatedAt: now},
@@ -440,7 +441,7 @@ func TestFinishStepAndAdvance_StageTransitions(t *testing.T) {
 		{ID: step2ID, JobID: jobID, StageID: stage2ID, StepIndex: 0, StepType: "test", Status: model.JobStepStatusBlocked, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
 	}
 
-	if _, _, err := s.CreateJobWithDedup(job, stages, steps); err != nil {
+	if _, err := s.CreateJobWithDedup(job, stages, steps); err != nil {
 		t.Fatalf("CreateJobWithDedup: %v", err)
 	}
 

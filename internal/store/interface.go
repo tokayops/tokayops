@@ -125,15 +125,14 @@ type StoreInterface interface {
 
 	// Jobs (Phase 2)
 	//
-	// CreateJobWithDedup reports whether the job was inserted: false means an
-	// active job already held the dedup key and its ID came back instead. A
-	// caller that counts notifications actually sent needs that answer, and
-	// comparing the returned ID against the proposed one would be inferring it
-	// from a string match when the insert already knows.
-	CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (id string, created bool, err error)
+	// CreateJobWithDedup reports whether the job was inserted: false means the
+	// identity was already claimed under its own policy and nothing was
+	// written. A caller that counts notifications actually sent needs that
+	// answer. The existing job's ID is not returned, because no caller ever
+	// read it.
+	CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (created bool, err error)
 	EnsureEscalationJob(agID string, job *model.Job, stages []*model.JobStage, steps []*model.JobStep, snapshot *model.EscalationPolicySnapshot) (bool, error)
 	GetJobByID(id string) (*model.Job, error)
-	GetJobByDedupKey(dedupKey string) (*model.Job, error)
 	GetJobStepByID(stepID string) (*model.JobStep, error)
 	ClaimNextJobSteps(limit int, duration time.Duration) ([]*model.JobStep, error)
 	UpdateJobStepIfOwned(step *model.JobStep, leaseToken string) (bool, error)

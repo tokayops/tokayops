@@ -8,6 +8,7 @@ import (
 
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/dispatcher/builders"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
@@ -72,7 +73,7 @@ func TestResolutionFlow(t *testing.T) {
 	}
 
 	// 2. Verify Job Created
-	job, err := s.GetJobByDedupKey("resolve_ag_res")
+	job, err := s.FindJobByIdentity(jobdedup.Resolution("ag_res"))
 	if err != nil {
 		t.Fatalf("Failed to find resolution job: %v", err)
 	}
@@ -182,7 +183,7 @@ func TestUnknownExecutor_FailsJob(t *testing.T) {
 	d := mustNewDispatcher(t, s, &config.Config{})
 
 	leaseToken := "lease-unknown"
-	job := &model.Job{ID: "job_u", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job_u", Status: model.JobStatusRunning, Dedup: testJobIdentity("job_u")}
 	step := &model.JobStep{
 		ID:        "step_u",
 		JobID:     "job_u",
@@ -225,7 +226,7 @@ func TestJobCompletion_Succeeds(t *testing.T) {
 	// Step 1: Running -> Succeeds -> Job Succeeded.
 
 	leaseToken := "lease-completion"
-	job := &model.Job{ID: "job_done", Status: model.JobStatusRunning, CurrentStage: 1}
+	job := &model.Job{ID: "job_done", Status: model.JobStatusRunning, CurrentStage: 1, Dedup: testJobIdentity("job_done")}
 	step0 := &model.JobStep{ID: "s0", JobID: "job_done", StageID: "stage-0", StepIndex: 0, Status: model.JobStepStatusSucceeded}
 	step1 := &model.JobStep{
 		ID:        "s1",
@@ -274,7 +275,7 @@ func TestJobFailure_MaxRetries(t *testing.T) {
 	d := mustNewDispatcher(t, s, &config.Config{})
 
 	leaseToken := "lease-fail"
-	job := &model.Job{ID: "job_fail", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job_fail", Status: model.JobStatusRunning, Dedup: testJobIdentity("job_fail")}
 	step := &model.JobStep{
 		ID:           "s_fail",
 		JobID:        "job_fail",

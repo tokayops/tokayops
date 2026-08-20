@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/integrations"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
@@ -1825,11 +1826,34 @@ func (m *MockStore) CountAdmins() (int, error) {
 }
 
 // Jobs Mocks (Phase 2)
-// NOTE: We add a map to store jobs for testing
-func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// Initialize maps if needed (hack for existing tests)
+
+// dedupClaimHeld is the mock's whole model of the two partial indexes, and the
+// reason it is one function is that the store has one insert point: a rule
+// written twice is a rule that drifts, which is exactly how the mock used to
+// disagree with the database.
+//
+// Identity is (namespace, key). Scope decides which existing rows count:
+// forever means any job ever admitted under that identity, while_active means
+// only one that has not finished.
+func (m *MockStore) dedupClaimHeld(spec *jobdedup.Spec) bool {
+	for _, existing := range m.jobs {
+		if existing.Dedup == nil {
+			continue
+		}
+		if existing.Dedup.Namespace != spec.Namespace || existing.Dedup.Key != spec.Key {
+			continue
+		}
+		if spec.Scope == jobdedup.ScopeForever {
+			return true
+		}
+		if existing.Status == model.JobStatusPending || existing.Status == model.JobStatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MockStore) initJobMaps() {
 	if m.jobs == nil {
 		m.jobs = make(map[string]*model.Job)
 	}
@@ -1839,22 +1863,11 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 	if m.jobSteps == nil {
 		m.jobSteps = make(map[string]*model.JobStep)
 	}
+}
 
-	// Implement dedup: check if job with same dedup_key exists and is pending/running
-	if job.DedupKey != nil {
-		for _, existing := range m.jobs {
-			if existing.DedupKey != nil && *existing.DedupKey == *job.DedupKey {
-				if existing.Status == model.JobStatusPending || existing.Status == model.JobStatusRunning {
-					// Dedup: return existing job ID, nothing was created
-					return existing.ID, false, nil
-				}
-			}
-		}
-	}
-
+func (m *MockStore) storeJob(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) {
 	jobCopy := *job
 	m.jobs[job.ID] = &jobCopy
-
 	for _, stage := range stages {
 		stageCopy := *stage
 		m.jobStages[stage.ID] = &stageCopy
@@ -1863,7 +1876,22 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 		stepCopy := *step
 		m.jobSteps[step.ID] = &stepCopy
 	}
-	return job.ID, true, nil
+}
+
+func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.initJobMaps()
+
+	if err := job.Dedup.Validate(); err != nil {
+		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
+	}
+	if m.dedupClaimHeld(job.Dedup) {
+		return false, nil
+	}
+
+	m.storeJob(job, stages, steps)
+	return true, nil
 }
 
 // EnsureEscalationJob atomically transitions an AG from new/processing → processing
@@ -1896,25 +1924,21 @@ func (m *MockStore) EnsureEscalationJob(agID string, job *model.Job, stages []*m
 	ag.Status = model.AlertGroupStatusProcessing
 	ag.UpdatedAt = time.Now()
 
-	// Dedup: check if ANY escalation job exists for this AG (any status)
-	for _, existing := range m.jobs {
-		if existing.AlertGroupID != nil && *existing.AlertGroupID == agID && existing.Type == "escalation" {
-			// Escalation already exists (any status) — don't create duplicate
-			return false, nil
-		}
+	// The job must be the escalation OF THIS group, by both columns that say
+	// so - the one cancellation addresses and the one dedup claims.
+	if job.AlertGroupID == nil || *job.AlertGroupID != agID {
+		return false, fmt.Errorf("job.AlertGroupID must match agID")
+	}
+	if job.Dedup == nil || job.Dedup.Namespace != jobdedup.NamespaceEscalation || job.Dedup.Key != agID {
+		return false, fmt.Errorf("job dedup identity must be the escalation of %s", agID)
 	}
 
-	// Create job + stages + steps
-	jobCopy := *job
-	m.jobs[job.ID] = &jobCopy
-	for _, stage := range stages {
-		stageCopy := *stage
-		m.jobStages[stage.ID] = &stageCopy
+	// An escalation is claimed forever, so a job of any status is the answer.
+	if m.dedupClaimHeld(job.Dedup) {
+		return false, nil
 	}
-	for _, step := range steps {
-		stepCopy := *step
-		m.jobSteps[step.ID] = &stepCopy
-	}
+
+	m.storeJob(job, stages, steps)
 
 	// Save snapshot
 	if snapshot != nil {
@@ -1944,32 +1968,43 @@ func (m *MockStore) GetJobByID(id string) (*model.Job, error) {
 	return nil, sql.ErrNoRows
 }
 
-func (m *MockStore) GetJobByDedupKey(dedupKey string) (*model.Job, error) {
+// FindJobByIdentity is a test helper: the engine creates jobs internally, so a
+// test never learns their IDs and has to ask by identity instead.
+//
+// It is not a method the interface grew. The store used to expose a lookup by
+// dedup key that no production code ever called, and renaming that into a lookup
+// by identity would have kept a contract with no product - so the lookup lives
+// here, on the double, where the only callers are.
+func (m *MockStore) FindJobByIdentity(spec *jobdedup.Spec) (*model.Job, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var latest *model.Job
 	for _, j := range m.jobs {
-		if j.DedupKey != nil && *j.DedupKey == dedupKey {
-			if latest == nil || j.CreatedAt.After(latest.CreatedAt) {
-				latest = j
-			}
+		if j.Dedup == nil || j.Dedup.Namespace != spec.Namespace || j.Dedup.Key != spec.Key {
+			continue
+		}
+		if latest == nil || j.CreatedAt.After(latest.CreatedAt) {
+			latest = j
 		}
 	}
-	if latest != nil {
-		jobCopy := *latest
-		return &jobCopy, nil
+	if latest == nil {
+		return nil, sql.ErrNoRows
 	}
-	return nil, sql.ErrNoRows
+	jobCopy := *latest
+	return &jobCopy, nil
 }
 
-// MarkJobSucceeded is a test helper to mark a job as succeeded by dedup key
-func (m *MockStore) MarkJobSucceeded(dedupKey string) {
+// MarkJobSucceeded is a test helper for ageing a job the engine created
+// internally, so the test never sees its ID. It takes the identity a producer
+// would build rather than a bare string: a raw key in a test is the same guess
+// about namespaces that the model exists to remove.
+func (m *MockStore) MarkJobSucceeded(spec *jobdedup.Spec) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	for _, j := range m.jobs {
-		if j.DedupKey != nil && *j.DedupKey == dedupKey {
+		if j.Dedup != nil && j.Dedup.Namespace == spec.Namespace && j.Dedup.Key == spec.Key {
 			j.Status = model.JobStatusSucceeded
 			return
 		}

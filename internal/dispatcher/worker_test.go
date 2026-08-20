@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tokayops/tokayops/internal/config"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -59,6 +60,13 @@ func (m *MockProvider) Permalink(d *model.NotificationDelivery) string {
 	return ""
 }
 
+// testJobIdentity gives a fixture job an identity. Tests about the step
+// machinery do not care which family a job belongs to, and handoff is the
+// family whose keys are opaque strings - borrowing it claims the least.
+func testJobIdentity(jobID string) *jobdedup.Spec {
+	return jobdedup.Handoff("test:" + jobID)
+}
+
 func TestProcessStep_SlackSuccess(t *testing.T) {
 	s := store.NewMockStore()
 	cfg := &config.Config{
@@ -85,9 +93,9 @@ func TestProcessStep_SlackSuccess(t *testing.T) {
 	// Seed Job (Required for processStep lookup)
 	leaseToken := "lease-slack-success"
 	job := &model.Job{
-		ID:       "job1",
-		DedupKey: strPtr("dk1"),
-		Status:   model.JobStatusRunning,
+		ID:     "job1",
+		Dedup:  jobdedup.Escalation("ag1"),
+		Status: model.JobStatusRunning,
 	}
 	// Prepare Step
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
@@ -136,7 +144,7 @@ func TestProcessStep_Retry(t *testing.T) {
 
 	// Seed Job
 	leaseToken := "lease-retry"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -210,7 +218,7 @@ func TestProcessStep_Firehose(t *testing.T) {
 
 	// Seed Job
 	leaseToken := "lease-firehose"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -252,7 +260,7 @@ func TestProcessStep_MaxRetries(t *testing.T) {
 
 	s.CreateAlertGroup(&model.AlertGroup{ID: "ag1"})
 	leaseToken := "lease-max-retries"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -293,7 +301,7 @@ func TestProcessStep_Canceled(t *testing.T) {
 	s.CreateAlertGroup(&model.AlertGroup{ID: "ag1"})
 	// Job is Canceled
 	leaseToken := "lease-canceled"
-	job := &model.Job{ID: "job1", Status: model.JobStatusCanceled}
+	job := &model.Job{ID: "job1", Status: model.JobStatusCanceled, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -369,7 +377,7 @@ func TestProcessStep_TransientError(t *testing.T) {
 	stages := []*model.JobStage{
 		{ID: "stage-0", JobID: "job1", StageIndex: 0, Status: model.JobStageStatusActive},
 	}
-	realStore.CreateJobWithDedup(&model.Job{ID: "job1", Status: model.JobStatusRunning}, stages, []*model.JobStep{step})
+	realStore.CreateJobWithDedup(&model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}, stages, []*model.JobStep{step})
 
 	d.processStep(context.Background(), step)
 
@@ -404,7 +412,7 @@ func TestFailStep_ContinueOnFailure_HasNextStep(t *testing.T) {
 
 	// Create job with TWO steps: firehose (index 0) + dm (index 1)
 	leaseToken := "lease-cof-next"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
@@ -474,7 +482,7 @@ func TestFailStep_ContinueOnFailure_NoNextStep(t *testing.T) {
 
 	// Create job with ONLY one step (firehose) - simulates firehose-only job
 	leaseToken := "lease-cof-no-next"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes, _ := json.Marshal(stepData)
 
@@ -526,7 +534,7 @@ func TestFailStep_Default(t *testing.T) {
 
 	// Create job with two steps, but first step has ContinueOnFailure=false (default)
 	leaseToken := "lease-default-fail"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U2", ProviderName: "slack"}
@@ -616,7 +624,7 @@ func TestContinueOnFailure_UnlockRetrySuccess(t *testing.T) {
 
 	// Create job with TWO steps (each in its own stage)
 	leaseToken := "lease-unlock-retry"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
@@ -692,7 +700,7 @@ func TestContinueOnFailure_UnlockRetryExhausted(t *testing.T) {
 
 	// Create job with TWO steps (each in its own stage)
 	leaseToken := "lease-retry-exhaust"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
@@ -745,14 +753,14 @@ type JobCountingStoreWrapper struct {
 	JobsCreated int
 }
 
-func (w *JobCountingStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
+func (w *JobCountingStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
 	// Call real implementation
-	id, created, err := w.StoreInterface.CreateJobWithDedup(job, stages, steps)
+	created, err := w.StoreInterface.CreateJobWithDedup(job, stages, steps)
 	if created {
 		// Only count if THIS job was actually created (not deduped to existing)
 		w.JobsCreated++
 	}
-	return id, created, err
+	return created, err
 }
 
 // TestProcessAcknowledgedAlertGroups_NoDuplicateJobs_WithJobCompletion tests that
@@ -805,7 +813,7 @@ func TestProcessAcknowledgedAlertGroups_NoDuplicateJobs_WithJobCompletion(t *tes
 
 	// Simulate job completion: mark job as succeeded in the mock store
 	// This simulates what happens between loop iterations when the job executes
-	realStore.MarkJobSucceeded("update_ack_ag1")
+	realStore.MarkJobSucceeded(jobdedup.AckUpdate("ag1"))
 
 	// Second iteration: should skip because succeeded job exists
 	d.ProcessAcknowledgedAlertGroups(ctx)
@@ -855,16 +863,15 @@ func TestProcessAcknowledgedAlertGroups_CancelsEscalationJob(t *testing.T) {
 	}
 	s.UpsertNotificationDelivery(delivery)
 
-	// Create an active escalation job (simulating ongoing escalation).
-	// alert_group_id is what cancellation addresses; the dedup key is carried
-	// too, exactly as the escalation builder does it.
-	escalationDedupKey := "test_dedup_key" // Same as ag.DedupKey
+	// Create an active escalation job (simulating ongoing escalation), shaped
+	// like the builder's: cancellation addresses alert_group_id, and the dedup
+	// identity is that same group.
 	escalationAGID := ag.ID
 	escalationJob := &model.Job{
 		ID:           "escalation_job_1",
 		Type:         "escalation",
 		Status:       model.JobStatusRunning,
-		DedupKey:     &escalationDedupKey,
+		Dedup:        jobdedup.Escalation(ag.ID),
 		AlertGroupID: &escalationAGID,
 	}
 	escalationStep := &model.JobStep{
@@ -1136,10 +1143,10 @@ type FailingCreateJobStoreWrapper struct {
 	FailCount int
 }
 
-func (f *FailingCreateJobStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
+func (f *FailingCreateJobStoreWrapper) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (bool, error) {
 	if f.FailCount > 0 {
 		f.FailCount--
-		return "", false, errors.New("transient db error")
+		return false, errors.New("transient db error")
 	}
 	return f.StoreInterface.CreateJobWithDedup(job, stages, steps)
 }
@@ -1194,7 +1201,7 @@ func TestProcessAcknowledgedAlertGroups_TransientJobCreationError_ShouldRetry(t 
 	d.ProcessAcknowledgedAlertGroups(ctx)
 
 	// Verify job was created on retry
-	job, _ := realStore.GetJobByDedupKey("update_ack_ag_transient")
+	job, _ := realStore.FindJobByIdentity(jobdedup.AckUpdate("ag_transient"))
 	if job == nil {
 		t.Error("Expected update job to be created on retry")
 	}
@@ -1500,7 +1507,7 @@ func TestProcessAcknowledgedAlertGroups_TransientBuildError_ShouldRetry(t *testi
 	d.ProcessAcknowledgedAlertGroups(ctx)
 
 	// Verify job was created on retry
-	job, _ := realStore.GetJobByDedupKey("update_ack_ag_build_transient")
+	job, _ := realStore.FindJobByIdentity(jobdedup.AckUpdate("ag_build_transient"))
 	if job == nil {
 		t.Error("Expected update job to be created on retry after transient Build error")
 	}
@@ -1541,7 +1548,7 @@ func TestRegression_CompleteStep_UnlockFailure(t *testing.T) {
 
 	// Create job with TWO steps (each in its own stage)
 	leaseToken := "lease-regression"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning}
+	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
 	stepData0 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
 	dataBytes0, _ := json.Marshal(stepData0)
 	stepData1 := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U2", ProviderName: "slack"}
@@ -1773,7 +1780,7 @@ func TestProcessAlertUpdates_CreatesUpdateJob(t *testing.T) {
 	d.ProcessAlertUpdates(ctx)
 
 	// Verify: job was created
-	job, err := s.GetJobByDedupKey("update_alert_ag_update")
+	job, err := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_update"))
 	if err != nil {
 		t.Fatalf("Job not found: %v", err)
 	}
@@ -1884,7 +1891,7 @@ func TestProcessAlertUpdates_ClearsFlagOnDedupHit(t *testing.T) {
 	d.ProcessAlertUpdates(ctx)
 
 	// Verify first job was created and flag cleared
-	job, _ := s.GetJobByDedupKey("update_alert_ag_dedup")
+	job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_dedup"))
 	if job == nil {
 		t.Fatal("Expected job to be created on first run")
 	}
@@ -1895,7 +1902,7 @@ func TestProcessAlertUpdates_ClearsFlagOnDedupHit(t *testing.T) {
 	// Re-set flag (simulating new alerts arriving while job is still pending)
 	s.SetSlackUpdatePending("ag_dedup", true)
 
-	// Second run — job is still pending, so CreateJobWithDedup returns (existingID, nil) = dedup hit
+	// Second run — job is still pending, so CreateJobWithDedup reports created=false
 	d.ProcessAlertUpdates(ctx)
 
 	// Verify: flag cleared even though no new job was created (dedup hit)
@@ -1905,7 +1912,7 @@ func TestProcessAlertUpdates_ClearsFlagOnDedupHit(t *testing.T) {
 	}
 
 	// Verify: still the same job (dedup returned existing, didn't create new)
-	jobAfter, _ := s.GetJobByDedupKey("update_alert_ag_dedup")
+	jobAfter, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_dedup"))
 	if jobAfter == nil {
 		t.Fatal("Expected job to still exist")
 	}
@@ -1947,7 +1954,7 @@ func TestProcessAlertUpdates_HandlesTriggeredGroups(t *testing.T) {
 	d.ProcessAlertUpdates(ctx)
 
 	// Verify: job created for triggered group
-	job, _ := s.GetJobByDedupKey("update_alert_ag_triggered")
+	job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_triggered"))
 	if job == nil {
 		t.Fatal("Expected alert update job to be created for triggered group")
 	}
@@ -1994,7 +2001,7 @@ func TestProcessAlertUpdates_HandlesAcknowledgedGroups(t *testing.T) {
 	d.ProcessAlertUpdates(ctx)
 
 	// Verify: job created for acknowledged group
-	job, _ := s.GetJobByDedupKey("update_alert_ag_acked")
+	job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_acked"))
 	if job == nil {
 		t.Fatal("Expected alert update job to be created for acknowledged group")
 	}

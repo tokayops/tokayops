@@ -15,6 +15,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/dispatcher/builders"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -299,8 +300,8 @@ func TestEngine_FirehoseCreation(t *testing.T) {
 
 	eng.ProcessNewAlertGroups(context.Background())
 
-	// Firehose is now step 0 in the unified escalation job (dedup key = ag.DedupKey)
-	job, err := s.GetJobByDedupKey("dk_fire")
+	// Firehose is now step 0 in the unified escalation job
+	job, err := s.FindJobByIdentity(jobdedup.Escalation("ag_fire"))
 	if err != nil {
 		t.Fatalf("Escalation job not found: %v", err)
 	}
@@ -376,7 +377,7 @@ func TestEngine_ReconcileStaleProcessing(t *testing.T) {
 	}
 
 	// Verify: a job should now exist for this AG
-	job, err := s.GetJobByDedupKey("dk-orphan")
+	job, err := s.FindJobByIdentity(jobdedup.Escalation("ag-orphan"))
 	if err != nil {
 		t.Fatalf("Job lookup failed: %v", err)
 	}
@@ -459,7 +460,7 @@ func TestEngine_ScheduleRecreation_OnCallConsistency(t *testing.T) {
 	}
 
 	// 2. Verify job step targets the same user
-	job, err := s.GetJobByDedupKey("dk-stale-engine")
+	job, err := s.FindJobByIdentity(jobdedup.Escalation("ag-stale-engine"))
 	if err != nil || job == nil {
 		t.Fatalf("Job not found: %v", err)
 	}
@@ -524,7 +525,7 @@ func TestEngine_StaleProcessing_WithSucceededJob_NotReconciled(t *testing.T) {
 	job, stages, steps, snapshot, _ := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	// Create job directly (bypassing engine) and mark as succeeded
 	s.CreateJobWithDedup(job, stages, steps)
-	s.MarkJobSucceeded(ag.DedupKey)
+	s.MarkJobSucceeded(jobdedup.Escalation(ag.ID))
 	// Save snapshot so we can verify it's not overwritten
 	s.UpdateAlertGroupPolicy(ag.ID, snapshot.PolicyID, snapshot)
 
@@ -700,7 +701,7 @@ func TestEnsureEscalationJob_SkipsSucceededJob(t *testing.T) {
 	eng.ProcessNewAlertGroups(context.Background())
 
 	// Verify job was created
-	job, err := s.GetJobByDedupKey("dk-succeeded-skip")
+	job, err := s.FindJobByIdentity(jobdedup.Escalation("ag-succeeded-skip"))
 	if err != nil {
 		t.Fatalf("Job not found: %v", err)
 	}
@@ -709,7 +710,7 @@ func TestEnsureEscalationJob_SkipsSucceededJob(t *testing.T) {
 	}
 
 	// Mark job as succeeded
-	s.MarkJobSucceeded("dk-succeeded-skip")
+	s.MarkJobSucceeded(jobdedup.Escalation("ag-succeeded-skip"))
 
 	// Force AG back to new to re-trigger processing
 	s.UpdateAlertGroupStatus("ag-succeeded-skip", model.AlertGroupStatusNew)
@@ -959,7 +960,7 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 	}
 	snapshotUser := updated.OnCallSnapshot.L1Users[0].ID
 
-	job, err := s.GetJobByDedupKey(ag.DedupKey)
+	job, err := s.FindJobByIdentity(jobdedup.Escalation(ag.ID))
 	if err != nil || job == nil {
 		t.Fatalf("job not found: %v", err)
 	}
@@ -1042,7 +1043,7 @@ func TestEngine_OnCallReadFailure_DefersEverything(t *testing.T) {
 		t.Errorf("the fallback schedule was read %d times after a failed team read, want 0", proj.scheduleCalls)
 	}
 
-	job, err := s.GetJobByDedupKey(ag.DedupKey)
+	job, err := s.FindJobByIdentity(jobdedup.Escalation(ag.ID))
 	if err == nil && job != nil {
 		t.Errorf("job %s was committed on an unknown roster - nothing would ever rebuild it", job.ID)
 	}
@@ -1090,7 +1091,7 @@ func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
 	deferralsBefore := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
 	engine.ProcessNewAlertGroups(context.Background())
 
-	if job, _ := s.GetJobByDedupKey(ag.DedupKey); job != nil {
+	if job, _ := s.FindJobByIdentity(jobdedup.Escalation(ag.ID)); job != nil {
 		t.Fatalf("first tick committed job %s although the roster was unknown", job.ID)
 	}
 	deferralsAfterFirst := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
@@ -1100,7 +1101,7 @@ func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
 
 	engine.ProcessNewAlertGroups(context.Background())
 
-	job, err := s.GetJobByDedupKey(ag.DedupKey)
+	job, err := s.FindJobByIdentity(jobdedup.Escalation(ag.ID))
 	if err != nil || job == nil {
 		t.Fatalf("second tick built no job although the projection answered: %v", err)
 	}

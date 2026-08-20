@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
@@ -887,8 +888,28 @@ func TestTransitionAlertGroupStatus_WrongFromStatus(t *testing.T) {
 // EnsureEscalationJob Integration Tests
 // ===================================================================================
 
-func makeTestJob(dedupKey string, agIDs ...string) (*model.Job, []*model.JobStage, []*model.JobStep, *model.EscalationPolicySnapshot) {
-	dk := dedupKey
+// findEscalationJob is the local answer to "which job is this group's
+// escalation". The store used to expose a lookup by dedup key; nothing in
+// production ever called it, so it went away with the model rather than being
+// renamed into a lookup by identity nobody would call either.
+func findEscalationJob(t *testing.T, s *Store, agID string) *model.Job {
+	t.Helper()
+	var jobID string
+	err := s.GetDB().QueryRow(
+		`SELECT id FROM jobs WHERE type = 'escalation' AND alert_group_id = $1`, agID).Scan(&jobID)
+	if err != nil {
+		t.Fatalf("no escalation job for alert group %s: %v", agID, err)
+	}
+	job, err := s.GetJobByID(jobID)
+	if err != nil {
+		t.Fatalf("GetJobByID(%s): %v", jobID, err)
+	}
+	return job
+}
+
+// makeTestJob builds an escalation job the way the real builder does: its
+// identity is the alert group, which is also what cancellation addresses.
+func makeTestJob(agID string) (*model.Job, []*model.JobStage, []*model.JobStep, *model.EscalationPolicySnapshot) {
 	now := time.Now()
 	jobID := uuid.New().String()
 	stageID := uuid.New().String()
@@ -898,13 +919,11 @@ func makeTestJob(dedupKey string, agIDs ...string) (*model.Job, []*model.JobStag
 		ID:           jobID,
 		Type:         "escalation",
 		Status:       model.JobStatusPending,
-		DedupKey:     &dk,
+		Dedup:        jobdedup.Escalation(agID),
+		AlertGroupID: &agID,
 		CurrentStage: 0,
 		CreatedAt:    now,
 		UpdatedAt:    now,
-	}
-	if len(agIDs) > 0 {
-		job.AlertGroupID = &agIDs[0]
 	}
 	stages := []*model.JobStage{
 		{
@@ -943,8 +962,7 @@ func TestEnsureEscalationJob_CreatesJobAndSnapshot(t *testing.T) {
 	s := setupTestDB(t)
 
 	agID := createTestTeamAndAG(t, s, "team-ensure-create", model.AlertGroupStatusNew)
-	ag, _ := s.GetAlertGroupByID(agID)
-	job, stages, steps, snapshot := makeTestJob(ag.DedupKey, agID)
+	job, stages, steps, snapshot := makeTestJob(agID)
 
 	created, err := s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
 	if err != nil {
@@ -973,10 +991,7 @@ func TestEnsureEscalationJob_CreatesJobAndSnapshot(t *testing.T) {
 	}
 
 	// Verify job exists
-	fetchedJob, err := s.GetJobByDedupKey(ag.DedupKey)
-	if err != nil {
-		t.Fatalf("GetJobByDedupKey failed: %v", err)
-	}
+	fetchedJob := findEscalationJob(t, s, agID)
 	if fetchedJob.Type != "escalation" {
 		t.Errorf("Expected job type 'escalation', got '%s'", fetchedJob.Type)
 	}
@@ -986,10 +1001,9 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	s := setupTestDB(t)
 
 	agID := createTestTeamAndAG(t, s, "team-ensure-dedup", model.AlertGroupStatusNew)
-	ag, _ := s.GetAlertGroupByID(agID)
 
 	// First call — creates job with V1 snapshot
-	job1, stages1, steps1, snapshot1 := makeTestJob(ag.DedupKey, agID)
+	job1, stages1, steps1, snapshot1 := makeTestJob(agID)
 	snapshot1.Steps[0].TargetID = "UserV1"
 
 	created, err := s.EnsureEscalationJob(agID, job1, stages1, steps1, snapshot1)
@@ -1004,7 +1018,7 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	s.UpdateAlertGroupStatus(agID, model.AlertGroupStatusNew)
 
 	// Second call — same dedup_key, V2 snapshot
-	job2, stages2, steps2, snapshot2 := makeTestJob(ag.DedupKey, agID)
+	job2, stages2, steps2, snapshot2 := makeTestJob(agID)
 	snapshot2.Steps[0].TargetID = "UserV2"
 
 	created, err = s.EnsureEscalationJob(agID, job2, stages2, steps2, snapshot2)
@@ -1031,7 +1045,6 @@ func TestEnsureEscalationJob_UserWins_ConcurrentAck(t *testing.T) {
 	// Start AG in "processing" so both EnsureEscalationJob and AckAlertGroupAtomic
 	// can legitimately operate on it — this is the real race window.
 	agID := createTestTeamAndAG(t, s, "team-ensure-race-ack", model.AlertGroupStatusProcessing)
-	ag, _ := s.GetAlertGroupByID(agID)
 
 	const iterations = 20
 	for i := 0; i < iterations; i++ {
@@ -1057,7 +1070,7 @@ func TestEnsureEscalationJob_UserWins_ConcurrentAck(t *testing.T) {
 		// Goroutine 2: engine ensures escalation job
 		go func() {
 			defer wg.Done()
-			job, stages, steps, snapshot := makeTestJob(ag.DedupKey, agID)
+			job, stages, steps, snapshot := makeTestJob(agID)
 			ensureCreated, ensureErr = s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
 		}()
 
@@ -1110,7 +1123,6 @@ func TestEnsureEscalationJob_ConcurrentRace(t *testing.T) {
 	s := setupTestDB(t)
 
 	agID := createTestTeamAndAG(t, s, "team-ensure-concurrent", model.AlertGroupStatusNew)
-	ag, _ := s.GetAlertGroupByID(agID)
 
 	const goroutines = 5
 	var wg sync.WaitGroup
@@ -1122,7 +1134,7 @@ func TestEnsureEscalationJob_ConcurrentRace(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			job, stages, steps, snapshot := makeTestJob(ag.DedupKey, agID)
+			job, stages, steps, snapshot := makeTestJob(agID)
 			created, err := s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
 			results[idx] = created
 			errs[idx] = err
@@ -1156,8 +1168,7 @@ func TestEnsureEscalationJob_BlockedBySucceededJob(t *testing.T) {
 	s := setupTestDB(t)
 
 	agID := createTestTeamAndAG(t, s, "team-blocked-succeeded", model.AlertGroupStatusNew)
-	ag, _ := s.GetAlertGroupByID(agID)
-	job, stages, steps, snapshot := makeTestJob(ag.DedupKey, agID)
+	job, stages, steps, snapshot := makeTestJob(agID)
 	// Set AlertGroupID on the job
 	job.AlertGroupID = &agID
 
@@ -1180,7 +1191,7 @@ func TestEnsureEscalationJob_BlockedBySucceededJob(t *testing.T) {
 	s.UpdateAlertGroupStatus(agID, model.AlertGroupStatusNew)
 
 	// Second call — should be blocked by the unique index (succeeded job exists)
-	job2, stages2, steps2, snapshot2 := makeTestJob(ag.DedupKey, agID)
+	job2, stages2, steps2, snapshot2 := makeTestJob(agID)
 	job2.AlertGroupID = &agID
 
 	created, err = s.EnsureEscalationJob(agID, job2, stages2, steps2, snapshot2)
@@ -1221,9 +1232,10 @@ func TestGetNewAlertGroups_SkipsAGWithEscalationJob(t *testing.T) {
 	now := time.Now()
 	jobID := uuid.New().String()
 	_, err = s.GetDB().Exec(`
-		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id, current_stage, created_at, updated_at, finished_at)
-		VALUES ($1, 'escalation', 'succeeded', '{}', $2, $3, 0, $4, $4, $4)`,
-		jobID, ag.DedupKey, agID, now)
+		INSERT INTO jobs (id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
+			alert_group_id, current_stage, created_at, updated_at, finished_at)
+		VALUES ($1, 'escalation', 'succeeded', '{}', 'escalation', $2, 'forever', $2, 0, $3, $3, $3)`,
+		jobID, agID, now)
 	if err != nil {
 		t.Fatalf("Failed to create succeeded job: %v", err)
 	}
@@ -1850,7 +1862,7 @@ func jobStatuses(t *testing.T, s *Store, jobID string) (string, []string, []stri
 func seedEscalation(t *testing.T, s *Store, teamID string) (agID, jobID string) {
 	t.Helper()
 	agID = createTestTeamAndAG(t, s, teamID, model.AlertGroupStatusProcessing)
-	job, stages, steps, snapshot := makeTestJob("key-"+agID, agID)
+	job, stages, steps, snapshot := makeTestJob(agID)
 	created, err := s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
 	if err != nil || !created {
 		t.Fatalf("EnsureEscalationJob(%s) = %v, %v", agID, created, err)
@@ -1936,11 +1948,11 @@ func TestCancelEscalationJob_LeavesOtherJobTypesAlone(t *testing.T) {
 	agID, escalationJob := seedEscalation(t, s, "team-cancel-types")
 
 	resolutionJob := uuid.New().String()
-	resolveKey := "resolve_" + agID
 	if _, err := s.GetDB().Exec(`
-		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id, current_stage, created_at, updated_at)
-		VALUES ($1, 'resolution', 'pending', '{}', $2, $3, 0, NOW(), NOW())`,
-		resolutionJob, resolveKey, agID); err != nil {
+		INSERT INTO jobs (id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
+			alert_group_id, current_stage, created_at, updated_at)
+		VALUES ($1, 'resolution', 'pending', '{}', 'resolution', $2, 'while_active', $3, 0, NOW(), NOW())`,
+		resolutionJob, "resolve_"+agID, agID); err != nil {
 		t.Fatalf("seed resolution job: %v", err)
 	}
 
@@ -1970,36 +1982,20 @@ func TestCancelEscalationJobByAlertGroupID_NoActiveJob(t *testing.T) {
 // only that job's stages and steps leaves the rest half-cancelled - jobs marked
 // canceled with children still pending, which the worker would happily claim.
 //
-// Today idx_one_escalation_per_ag admits a single escalation row per alert
-// group, so the case is unreachable in production and the defect would be
-// invisible. Epic 11 Sprint 2B replaces that index with namespace-scoped ones
-// and makes two live rows legal, so the test builds that schema now: it drops
-// the index, and puts it back.
+// The dedup model admits one escalation per alert group, so a second row of the
+// same identity cannot exist. A row with no identity at all can: that is the
+// shape a historical job takes when the upgrade could not classify it, and
+// nothing stops it from being active and pointing at this group. It is exactly
+// the second match the predicate has to reach.
 func TestCancelEscalationJob_ReachesChildrenOfEveryMatch(t *testing.T) {
 	s := setupTestDB(t)
 	agID, firstJob := seedEscalation(t, s, "team-cancel-many")
 
-	if _, err := s.GetDB().Exec(`DROP INDEX idx_one_escalation_per_ag`); err != nil {
-		t.Fatalf("drop the one-escalation index: %v", err)
-	}
-	t.Cleanup(func() {
-		// The rows this test adds violate the index, and it cannot be recreated
-		// over them - the extra escalation goes first, whatever happened above.
-		if _, err := s.GetDB().Exec(`DELETE FROM jobs WHERE alert_group_id = $1 AND id <> $2`,
-			agID, firstJob); err != nil {
-			t.Errorf("drop the extra escalation: %v", err)
-		}
-		if _, err := s.GetDB().Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_escalation_per_ag
-			ON jobs(alert_group_id) WHERE type = 'escalation' AND alert_group_id IS NOT NULL`); err != nil {
-			t.Errorf("restore the one-escalation index: %v", err)
-		}
-	})
-
 	secondJob, secondStage, secondStep := uuid.New().String(), uuid.New().String(), uuid.New().String()
 	if _, err := s.GetDB().Exec(`
-		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id, current_stage, created_at, updated_at)
-		VALUES ($1, 'escalation', 'pending', '{}', $2, $3, 0, NOW(), NOW())`,
-		secondJob, "escalation:"+agID, agID); err != nil {
+		INSERT INTO jobs (id, type, status, payload, alert_group_id, current_stage, created_at, updated_at)
+		VALUES ($1, 'escalation', 'pending', '{}', $2, 0, NOW(), NOW())`,
+		secondJob, agID); err != nil {
 		t.Fatalf("seed the second escalation: %v", err)
 	}
 	if _, err := s.GetDB().Exec(`

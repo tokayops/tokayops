@@ -238,7 +238,13 @@ func (s *Store) InitDB() error {
 		type TEXT NOT NULL,
 		status TEXT NOT NULL,
 		payload TEXT NOT NULL DEFAULT '{}',
+		-- Identity and policy: (dedup_namespace, dedup_key) names the work,
+		-- dedup_scope says how long that name is exclusive. All three or none;
+		-- the uniqueness rules themselves live with the migration that
+		-- introduces them (job_dedup_migration.go).
+		dedup_namespace TEXT,
 		dedup_key TEXT,
+		dedup_scope TEXT,
 		alert_group_id TEXT,
 		current_stage INTEGER DEFAULT 0,
 		error TEXT,
@@ -248,9 +254,6 @@ func (s *Store) InitDB() error {
 		canceled_at TIMESTAMPTZ
 	);
 
-	DROP INDEX IF EXISTS idx_active_jobs_dedup;
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_active_jobs_dedup ON jobs(dedup_key)
-	WHERE status IN ('pending', 'running');
 	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 
 	-- Job Stages (Phase 2: sequential execution groups within a job)
@@ -373,31 +376,29 @@ func (s *Store) InitDB() error {
 			ALTER TABLE jobs ADD COLUMN alert_group_id TEXT;
 		END IF;
 
-		-- 9b. Drop unique index before backfill (backfill creates temporary duplicates)
-		DROP INDEX IF EXISTS idx_one_escalation_per_ag;
-
-		-- 9c. Backfill alert_group_id from payload for all NULL rows
-		UPDATE jobs SET alert_group_id = payload::jsonb->>'alert_group_id'
-		WHERE type = 'escalation' AND alert_group_id IS NULL
-		  AND payload::jsonb->>'alert_group_id' IS NOT NULL;
-
-		-- 9d. Dedup: keep only latest escalation job per AG, nullify older dupes
-		WITH ranked AS (
-			SELECT id,
-			       ROW_NUMBER() OVER (PARTITION BY alert_group_id ORDER BY created_at DESC) as rn
-			FROM jobs
-			WHERE type = 'escalation' AND alert_group_id IS NOT NULL
-		)
-		UPDATE jobs SET alert_group_id = NULL
-		FROM ranked
-		WHERE jobs.id = ranked.id AND ranked.rn > 1;
-
-		-- 9e. Recreate unique index (after dedup guarantees no conflicts)
-		CREATE UNIQUE INDEX idx_one_escalation_per_ag
-		ON jobs(alert_group_id) WHERE type = 'escalation' AND alert_group_id IS NOT NULL;
+		-- 9b. Filling alert_group_id and keeping one escalation row per group
+		-- used to happen here, around a unique index this block dropped and
+		-- recreated on every start. Both moved into the one-shot job dedup
+		-- migration: recreating that index after the model exists would put
+		-- back the rule the model replaced.
 	END $$;
 	`
 	if _, err := s.db.Exec(migrationQuery); err != nil {
+		return err
+	}
+
+	// Job dedup model, in three steps whose order is part of the design:
+	// the policy reference table first, because the migration's foreign key
+	// needs its rows; the one-shot migration second; the sweep for legacy
+	// indexes last, since on a first run it would otherwise remove the
+	// guarantees the migration itself leans on.
+	if err := s.syncJobDedupPolicies(); err != nil {
+		return err
+	}
+	if err := s.migrateJobDedupModel(); err != nil {
+		return err
+	}
+	if err := s.dropLegacyJobDedupIndexes(); err != nil {
 		return err
 	}
 
@@ -1372,18 +1373,16 @@ func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Aler
 // cancellation depend on a uniqueness index rather than on the query, and it
 // would break silently the moment a job's identity changed.
 //
-// Every returned id is collected rather than the first one. Today
-// idx_one_escalation_per_ag admits at most one such row, so a single Scan would
-// look correct - and would quietly stop being correct in Epic 11 Sprint 2B,
-// which replaces that index with namespace-scoped ones and makes two live rows
-// of different namespace versions legal. Cancelling the jobs but only one job's
-// children is the kind of half-done state this function exists to prevent.
+// Every returned id is collected rather than the first one. The dedup model
+// admits one escalation per alert group, so a single Scan would look correct -
+// and would quietly stop being correct the moment a second namespace is allowed
+// to fill alert_group_id. Cancelling the jobs but only one job's children is the
+// kind of half-done state this function exists to prevent.
 //
 // type = 'escalation' is a schema predicate here, not a statement about
-// families: it matches the predicate of idx_one_escalation_per_ag, which is what
-// provides today's "one escalation per alert group". It does not make
-// alert_group_id an escalation-only column - nothing stops another type from
-// filling it, which is precisely why the type predicate is written out.
+// families. It does not make alert_group_id an escalation-only column - nothing
+// stops another type from filling it, which is precisely why the type predicate
+// is written out.
 func cancelEscalationJobByAlertGroupIDTx(tx *sql.Tx, alertGroupID string) error {
 	rows, err := tx.Query(`
 		UPDATE jobs SET status='canceled', canceled_at=NOW(), finished_at=NOW(), updated_at=NOW()

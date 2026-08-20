@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
@@ -133,7 +134,6 @@ func (b *EscalationJobBuilder) Build(ctx context.Context, ag *model.AlertGroup, 
 	}
 
 	jobID := uuid.New().String()
-	dedupKey := ag.DedupKey
 	now := time.Now()
 
 	snapshot := &model.EscalationPolicySnapshot{
@@ -145,10 +145,13 @@ func (b *EscalationJobBuilder) Build(ctx context.Context, ag *model.AlertGroup, 
 
 	agID := ag.ID
 	job := &model.Job{
-		ID:           jobID,
-		Type:         "escalation",
-		Status:       model.JobStatusPending,
-		DedupKey:     &dedupKey,
+		ID:     jobID,
+		Type:   "escalation",
+		Status: model.JobStatusPending,
+		// The alert group, not the alert. ag.DedupKey names the ALERT, and a
+		// group is recreated under it after every resolve - claiming it forever
+		// would swallow the escalation of every repeat incident.
+		Dedup:        jobdedup.Escalation(ag.ID),
 		AlertGroupID: &agID,
 		CurrentStage: 0,
 		CreatedAt:    now,

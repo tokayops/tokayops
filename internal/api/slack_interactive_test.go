@@ -21,6 +21,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/dispatcher"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/slackcard"
 	"github.com/tokayops/tokayops/internal/store"
@@ -1533,13 +1534,11 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		// An escalation job shaped like the real one: cancellation addresses it by
 		// alert group, so alert_group_id is what makes this a job the escalation
 		// builder would actually have produced.
-		ag, _ := s.GetAlertGroupByID(agID)
-		dedupKey := ag.DedupKey
 		jobAGID := agID
 		jobID := "job-esc-" + agID
 		s.CreateJobWithDedup(&model.Job{
 			ID:           jobID,
-			DedupKey:     &dedupKey,
+			Dedup:        jobdedup.Escalation(agID),
 			AlertGroupID: &jobAGID,
 			Type:         "escalation",
 			Status:       model.JobStatusPending,
@@ -1570,13 +1569,11 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		captured := newCapturedEphemeral()
 		api.respondEphemeral = captured.post
 
-		ag, _ := s.GetAlertGroupByID(agID)
-		dedupKey := ag.DedupKey
 		jobAGID := agID
 		jobID := "job-esc-resolve-" + agID
 		s.CreateJobWithDedup(&model.Job{
 			ID:           jobID,
-			DedupKey:     &dedupKey,
+			Dedup:        jobdedup.Escalation(agID),
 			AlertGroupID: &jobAGID,
 			Type:         "escalation",
 			Status:       model.JobStatusPending,

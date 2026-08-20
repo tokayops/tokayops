@@ -3,6 +3,7 @@ package store
 import (
 	"testing"
 
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
@@ -18,14 +19,13 @@ func TestMockStore_CancelEscalationCascade(t *testing.T) {
 	s := NewMockStore()
 
 	agID := "ag-mock-cancel"
-	dedupKey := "key-" + agID // deliberately not the alert group id
 	jobID := "job-mock-cancel"
 
 	job := &model.Job{
 		ID:           jobID,
 		Type:         "escalation",
 		Status:       model.JobStatusPending,
-		DedupKey:     &dedupKey,
+		Dedup:        jobdedup.Escalation(agID),
 		AlertGroupID: &agID,
 	}
 	stages := []*model.JobStage{
@@ -36,7 +36,7 @@ func TestMockStore_CancelEscalationCascade(t *testing.T) {
 		{ID: "step-pending", JobID: jobID, StageID: "stage-active", Status: model.JobStepStatusPending},
 		{ID: "step-blocked", JobID: jobID, StageID: "stage-blocked", StepIndex: 1, Status: model.JobStepStatusBlocked},
 	}
-	if _, _, err := s.CreateJobWithDedup(job, stages, steps); err != nil {
+	if _, err := s.CreateJobWithDedup(job, stages, steps); err != nil {
 		t.Fatalf("CreateJobWithDedup: %v", err)
 	}
 

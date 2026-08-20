@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -172,14 +173,13 @@ func TestAck_CancelsEscalation(t *testing.T) {
 	// A pending escalation job shaped like the real one: cancellation addresses
 	// it by alert group, so a fixture without alert_group_id would be a job the
 	// escalation builder never produces.
-	dedupKey := "dedup-ag-cancel"
 	agID := "ag-cancel"
 	s.CreateJobWithDedup(&model.Job{
 		ID:           "job-ag-cancel",
 		Type:         "escalation",
 		Status:       model.JobStatusPending,
 		Payload:      json.RawMessage("{}"),
-		DedupKey:     &dedupKey,
+		Dedup:        jobdedup.Escalation(agID),
 		AlertGroupID: &agID,
 	}, nil, nil)
 
@@ -192,7 +192,7 @@ func TestAck_CancelsEscalation(t *testing.T) {
 	}
 
 	// Verify job was cancelled
-	job, err := s.GetJobByDedupKey(dedupKey)
+	job, err := s.FindJobByIdentity(jobdedup.Escalation(agID))
 	if err != nil || job == nil {
 		t.Fatalf("escalation job not found after ack: %v", err)
 	}
