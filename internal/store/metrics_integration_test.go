@@ -21,7 +21,7 @@ func TestGetMetricsSnapshot_ActiveAlertGroups(t *testing.T) {
 	// Create 2 firing + 1 resolved AG
 	createAG := func(id string, severity string, status model.AlertGroupStatus) {
 		ag := &model.AlertGroup{
-			ID: id, DedupKey: "dk-" + id, Status: status,
+			ID: id, AlertKey: "dk-" + id, Status: status,
 			TeamID: teamID, TeamNameSnapshot: "Metrics Team", Severity: severity,
 			CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}

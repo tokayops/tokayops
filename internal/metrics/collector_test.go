@@ -15,20 +15,20 @@ func TestBusinessCollector_ActiveAlertGroups(t *testing.T) {
 
 	// Create alert groups in various states
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: "ag1", DedupKey: "k1", TeamID: "devops", Severity: "critical",
+		ID: "ag1", AlertKey: "k1", TeamID: "devops", Severity: "critical",
 		Status: model.AlertGroupStatusTriggered,
 	})
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: "ag2", DedupKey: "k2", TeamID: "devops", Severity: "critical",
+		ID: "ag2", AlertKey: "k2", TeamID: "devops", Severity: "critical",
 		Status: model.AlertGroupStatusNew,
 	})
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: "ag3", DedupKey: "k3", TeamID: "devops", Severity: "warning",
+		ID: "ag3", AlertKey: "k3", TeamID: "devops", Severity: "warning",
 		Status: model.AlertGroupStatusAcknowledged,
 	})
 	// Resolved — should NOT count
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: "ag4", DedupKey: "k4", TeamID: "devops", Severity: "critical",
+		ID: "ag4", AlertKey: "k4", TeamID: "devops", Severity: "critical",
 		Status: model.AlertGroupStatusResolved,
 	})
 
@@ -88,23 +88,23 @@ func TestBusinessCollector_AlertGroupsByStatus(t *testing.T) {
 
 	// Create alert groups in various statuses
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: "ag1", DedupKey: "k1", TeamID: "devops", Severity: "critical",
+		ID: "ag1", AlertKey: "k1", TeamID: "devops", Severity: "critical",
 		Status: model.AlertGroupStatusTriggered,
 	})
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: "ag2", DedupKey: "k2", TeamID: "devops", Severity: "critical",
+		ID: "ag2", AlertKey: "k2", TeamID: "devops", Severity: "critical",
 		Status: model.AlertGroupStatusTriggered,
 	})
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: "ag3", DedupKey: "k3", TeamID: "devops", Severity: "critical",
+		ID: "ag3", AlertKey: "k3", TeamID: "devops", Severity: "critical",
 		Status: model.AlertGroupStatusAcknowledged,
 	})
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: "ag4", DedupKey: "k4", TeamID: "devops", Severity: "critical",
+		ID: "ag4", AlertKey: "k4", TeamID: "devops", Severity: "critical",
 		Status: model.AlertGroupStatusResolved,
 	})
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: "ag5", DedupKey: "k5", TeamID: "devops", Severity: "warning",
+		ID: "ag5", AlertKey: "k5", TeamID: "devops", Severity: "warning",
 		Status: model.AlertGroupStatusNew,
 	})
 

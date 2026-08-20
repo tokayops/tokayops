@@ -2,9 +2,9 @@ package dispatcher
 
 import (
 	"sort"
-	"strings"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -27,7 +27,7 @@ const (
 // and a schedule with a single group crosses a boundary every shift with the
 // same people on it - both would look like a handoff if a timestamp were in
 // here. The moment of activation is still needed, but for the other question:
-// see occurrenceKey.
+// see occurrenceOf.
 //
 // Source and GroupID are both present because the user set alone is ambiguous:
 // the group [alice] and an override putting alice on duty name the same person
@@ -56,7 +56,7 @@ type observation struct {
 	// on duty: the override revision when an override names the person, the
 	// schedule revision otherwise.
 	//
-	// It is provenance, not identity, and it belongs only to the occurrence key.
+	// It is provenance, not identity, and it belongs only to the occurrence.
 	// AssignmentStart alone cannot carry it: editing an override leaves
 	// valid_from where it was, so swapping the stand-in out and back produces
 	// the same composition at the same instant twice, and the second - real -
@@ -112,11 +112,6 @@ func (c composition) equal(other composition) bool {
 		}
 	}
 	return true
-}
-
-// key is the composition as one string, for the dedup key.
-func (c composition) key() string {
-	return c.Source + "|" + c.GroupID + "|" + strings.Join(c.UserIDs, ",")
 }
 
 // clone detaches the user slice. A composition is kept in the cache across
@@ -188,17 +183,16 @@ func addedUsers(prev, next []string) []string {
 	return out
 }
 
-// occurrenceKey identifies one notification, which is not the same question the
+// occurrenceOf names the notification, which is not the same question the
 // composition answers.
 //
 // A composition recurs: a rotation A -> B -> C comes back to A, and an edit
-// [B] -> [B,D] -> [B] -> [B,D] comes back to [B,D]. If the earlier job were
-// still pending or running, the second - entirely legitimate - notification
-// would be swallowed by the unique index on dedup_key. So the key carries three
-// things beyond the composition:
+// [B] -> [B,D] -> [B] -> [B,D] comes back to [B,D]. Both returns are real news
+// for whoever came on duty, so the occurrence carries three things beyond the
+// composition:
 //
-//   - the kind, without which a lingering added_to_active_shift would suppress
-//     the handoff that follows it;
+//   - the kind, without which an added_to_active_shift would suppress the
+//     handoff that follows it;
 //   - the moment the assignment took effect, which is what separates two turns
 //     of the same rotation;
 //   - the revision that put the composition on duty, which is what separates two
@@ -212,17 +206,19 @@ func addedUsers(prev, next []string) []string {
 // The moment lives here and not in the composition on purpose: put it there and
 // a schedule with one group would DM its members at every shift boundary.
 //
-// Two instances derive this from the same rows, so they derive the same key -
-// which is what lets the dedup key stop the second job.
-func occurrenceKey(kind, scheduleID string, next observation) string {
-	return strings.Join([]string{
-		kind,
-		scheduleID,
-		next.Composition.key(),
-		// Nano, not seconds: timestamps are stored to microsecond resolution,
-		// and a truncating format would merge two activations inside the same
-		// second into one key.
-		next.AssignmentStart.UTC().Format(time.RFC3339Nano),
-		next.RevisionID,
-	}, ":")
+// Two instances derive these parts from the same rows, so they derive the same
+// identity - which is what lets one of the two jobs be refused. How the parts
+// become a key is jobdedup's business, and deliberately not spelled here: the
+// claim it takes is held forever, so its encoding belongs with the policy that
+// says so.
+func occurrenceOf(kind, scheduleID string, next observation) jobdedup.Occurrence {
+	return jobdedup.Occurrence{
+		Kind:            kind,
+		ScheduleID:      scheduleID,
+		Source:          next.Composition.Source,
+		GroupID:         next.Composition.GroupID,
+		UserIDs:         next.Composition.UserIDs,
+		AssignmentStart: next.AssignmentStart,
+		RevisionID:      next.RevisionID,
+	}
 }

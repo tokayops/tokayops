@@ -141,7 +141,7 @@ func TestHandleWebhook(t *testing.T) {
 		}
 
 		// Verify DB
-		ag, err := s.GetActiveAlertGroup("g1")
+		ag, err := s.GetActiveAlertGroupByAlertKey("g1")
 		if err != nil || ag == nil {
 			t.Fatal("Alert group not created in store")
 		}
@@ -170,7 +170,7 @@ func TestHandleWebhook(t *testing.T) {
 		resolved, _ := s.GetResolvedAlertGroups()
 		found := false
 		for _, r := range resolved {
-			if r.DedupKey == "g1" {
+			if r.AlertKey == "g1" {
 				found = true
 				break
 			}
@@ -215,7 +215,7 @@ func TestSeverityNormalization(t *testing.T) {
 				t.Fatalf("Expected 200, got %d. Body: %s", rec.Code, rec.Body.String())
 			}
 
-			ag, err := s.GetActiveAlertGroup(groupKey)
+			ag, err := s.GetActiveAlertGroupByAlertKey(groupKey)
 			if err != nil || ag == nil {
 				t.Fatalf("Alert group not found for key %s", groupKey)
 			}
@@ -234,7 +234,7 @@ func TestEmptyDedupKeyRejected(t *testing.T) {
 	e := echo.New()
 	ing.RegisterRoutes(e)
 
-	// groupKey empty, fingerprint empty → dedupKey empty → should be rejected
+	// groupKey empty, fingerprint empty → alertKey empty → should be rejected
 	payload := `{"status":"firing","groupKey":"","alerts":[{"status":"firing","labels":{"alertname":"Test"},"fingerprint":""}],"commonLabels":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret123", strings.NewReader(payload))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
@@ -242,7 +242,7 @@ func TestEmptyDedupKeyRejected(t *testing.T) {
 	e.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
-		t.Errorf("Expected 400 for empty dedupKey, got %d. Body: %s", rec.Code, rec.Body.String())
+		t.Errorf("Expected 400 for empty alertKey, got %d. Body: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -265,13 +265,20 @@ func TestMergeIntoGroup_PreservesAcknowledgedStatus(t *testing.T) {
 		t.Fatalf("Step 1 failed: %d %s", rec1.Code, rec1.Body.String())
 	}
 
-	ag, _ := s.GetActiveAlertGroup("ack-test")
+	ag, _ := s.GetActiveAlertGroupByAlertKey("ack-test")
 	if ag == nil {
 		t.Fatal("Alert group not created")
 	}
 
-	// Step 2: Simulate ack → set status to acknowledged
-	s.UpdateAlertGroupAcknowledged(ag.ID, "user1")
+	// Step 2: Simulate ack → set status to acknowledged, the way an ack
+	// actually happens: the engine admits the group, then the transition
+	// applies. Acking straight from "new" is refused, as it is in production.
+	if err := s.SetAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing); err != nil {
+		t.Fatalf("UpdateAlertGroupStatus: %v", err)
+	}
+	if changed, err := s.AckAlertGroupAtomic(ag.ID, "user1", nil, nil); err != nil || !changed {
+		t.Fatalf("AckAlertGroupAtomic: changed=%v err=%v", changed, err)
+	}
 	ag, _ = s.GetAlertGroupByID(ag.ID)
 	if ag.Status != model.AlertGroupStatusAcknowledged {
 		t.Fatalf("Expected acknowledged, got %s", ag.Status)
@@ -313,13 +320,13 @@ func TestMergeIntoGroup_SetsSlackUpdatePending(t *testing.T) {
 		t.Fatalf("Step 1 failed: %d %s", rec1.Code, rec1.Body.String())
 	}
 
-	ag, _ := s.GetActiveAlertGroup("update-test")
+	ag, _ := s.GetActiveAlertGroupByAlertKey("update-test")
 	if ag == nil {
 		t.Fatal("Alert group not created")
 	}
 
 	// Simulate engine processing → status = processing
-	s.UpdateAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing)
+	s.SetAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing)
 
 	// Verify flag is NOT set before merge
 	ag, _ = s.GetAlertGroupByID(ag.ID)
@@ -366,7 +373,7 @@ func TestAlertRefire(t *testing.T) {
 		t.Fatalf("Step 1 failed: expected 200/Created, got %d/%s", rec1.Code, rec1.Body.String())
 	}
 
-	ag, _ := s.GetActiveAlertGroup("refire-test")
+	ag, _ := s.GetActiveAlertGroupByAlertKey("refire-test")
 	if ag == nil {
 		t.Fatal("Alert group not created")
 	}
@@ -397,7 +404,7 @@ func TestAlertRefire(t *testing.T) {
 	// Step 3: Re-fire the same alert
 	// First we need to re-activate the alert group (since it was resolved)
 	ag.Status = model.AlertGroupStatusProcessing
-	s.UpdateAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing)
+	s.SetAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing)
 
 	payload3 := `{"status":"firing","groupKey":"refire-test","alerts":[{"status":"firing","labels":{"alertname":"HighCPU","team":"devops"},"fingerprint":"fp1"}]}`
 	req3 := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=test-secret", strings.NewReader(payload3))
@@ -520,7 +527,7 @@ func TestNewGroup_ExcludesResolvedAlerts(t *testing.T) {
 		t.Fatalf("Expected 'Created', got %q", rec.Body.String())
 	}
 
-	ag, err := s.GetActiveAlertGroup("filter-test")
+	ag, err := s.GetActiveAlertGroupByAlertKey("filter-test")
 	if err != nil || ag == nil {
 		t.Fatal("Alert group not found")
 	}
@@ -572,7 +579,7 @@ func TestCreatePath_AtomicTimelineAndOutbox(t *testing.T) {
 	}
 
 	// Find the created AG
-	ag, err := s.GetActiveAlertGroup("atomic-test-group")
+	ag, err := s.GetActiveAlertGroupByAlertKey("atomic-test-group")
 	if err != nil || ag == nil {
 		t.Fatal("Alert group not created in store")
 	}
@@ -687,7 +694,7 @@ func TestResolveCreatesOutboxEvent(t *testing.T) {
 
 	// Create a firing AG
 	ag := &model.AlertGroup{
-		ID: "ag-outbox-resolve", DedupKey: "outbox-resolve-group",
+		ID: "ag-outbox-resolve", AlertKey: "outbox-resolve-group",
 		Status: model.AlertGroupStatusTriggered, TeamID: "devops", TeamNameSnapshot: "DevOps",
 		Severity:  "critical",
 		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
@@ -733,7 +740,7 @@ func TestResolveFromNewStatus(t *testing.T) {
 	seedDefaultTeams(s)
 
 	ag := &model.AlertGroup{
-		ID: "ag-new-resolve", DedupKey: "new-resolve-group",
+		ID: "ag-new-resolve", AlertKey: "new-resolve-group",
 		Status: model.AlertGroupStatusNew, TeamID: "devops", TeamNameSnapshot: "DevOps",
 		Severity:  "warning",
 		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},

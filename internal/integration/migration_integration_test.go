@@ -26,7 +26,7 @@ func TestMigration_Idempotent(t *testing.T) {
 	agID := uuid.New().String()
 	ag := &model.AlertGroup{
 		ID:               agID,
-		DedupKey:         "migration-dedup",
+		AlertKey:         "migration-dedup",
 		Status:           model.AlertGroupStatusNew,
 		Title:            "Migration Test Alert",
 		TeamID:           team.ID,

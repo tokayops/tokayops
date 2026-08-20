@@ -10,10 +10,8 @@ import (
 // This allows for mocking in tests.
 type StoreInterface interface {
 	// Alert Groups (renamed from Incidents)
-	GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error)
+	GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error)
 	CreateAlertGroup(ag *model.AlertGroup) error
-	UpdateAlertGroupStatus(id string, status model.AlertGroupStatus) error
-	UpdateAlertGroupAcknowledged(id string, acknowledgedBy string) error
 	UpdateAlertGroupPolicy(id string, policyID string, snapshot *model.EscalationPolicySnapshot) error
 	UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResult) error
 	UpdateAlertGroupAlerts(id string, alerts []model.Alert) error
@@ -22,7 +20,13 @@ type StoreInterface interface {
 	GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error)
 	GetResolvedAlertGroups() ([]*model.AlertGroup, error)
 	MarkAckProcessed(agID string) error
-	SetSlackUpdatePending(id string, pending bool) error
+	// The two halves of one gate, and they are not symmetrical. It is raised by
+	// the write that changes the group - in the same statement, so no crash can
+	// separate the alert from the fact that the message is stale - and lowered
+	// for one version, which is how a producer avoids clearing away a change
+	// that arrived while it worked.
+	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
+	ClearSlackUpdate(id string, observedGeneration int64) (bool, error)
 	GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error)
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
 	GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset int) ([]*model.AlertGroup, int, error)
@@ -139,7 +143,6 @@ type StoreInterface interface {
 	FinishStepAndAdvance(stepID string, leaseToken string, outcome model.JobStepStatus, result string, stepError string) (model.AdvanceResult, error)
 	CancelEscalationJobByAlertGroupID(alertGroupID string) error
 	ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error
-	GetJobsByIDs(ids []string) (map[string]*model.Job, error)
 	FailJob(jobID string, errorMsg string) error
 
 	// Escalation Policies (Phase 4)

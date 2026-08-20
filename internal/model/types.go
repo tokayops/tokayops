@@ -38,8 +38,19 @@ const (
 // AlertGroup represents aggregated alerts from Alertmanager (technical entity).
 // This is the main working entity for Phase 2.
 type AlertGroup struct {
-	ID       string           `json:"id"`        // UUID
-	DedupKey string           `json:"dedup_key"` // groupKey from Alertmanager (fingerprint)
+	ID string `json:"id"` // UUID
+	// AlertKey is what the alerting system calls the alert this group is
+	// about: Alertmanager's group key, or a single alert's fingerprint. It
+	// names the ALERT, not this incident - the same key comes back every time
+	// the same thing breaks, and each time it opens a new group with a new ID.
+	//
+	// It is not the identity of any background work. Jobs declare that through
+	// jobdedup, and an escalation that once keyed itself by this string paged
+	// nobody for the second incident.
+	//
+	// The JSON name is the one this field has always had, and stays: it is
+	// what the API, the webhooks and the UI already read.
+	AlertKey string           `json:"dedup_key"`
 	Status   AlertGroupStatus `json:"status"`
 	Title    string           `json:"title"` // Derived from Alert Labels/Annotations
 
@@ -69,6 +80,16 @@ type AlertGroup struct {
 	// Slack Update Tracking
 	SlackUpdatePending bool `json:"slack_update_pending,omitempty"` // Set when alerts change; cleared after Slack update job created
 
+	// SlackUpdateGeneration counts the times the flag above was raised, and is
+	// what lets the producer lower it without losing an alert that arrived
+	// while it worked: it clears the flag only if the generation it read is
+	// still the current one.
+	//
+	// Not part of the group as the API presents it - it is the token of an
+	// internal gate, and a reader outside this repository can do nothing with
+	// it but be confused.
+	SlackUpdateGeneration int64 `json:"-"`
+
 	// External Link to Alertmanager Source (for clickable titles)
 	ExternalURL string `json:"external_url,omitempty"`
 
@@ -88,7 +109,7 @@ type AlertGroup struct {
 // pre-computed alert counts instead.
 type AlertGroupSummary struct {
 	ID             string           `json:"id"`
-	DedupKey       string           `json:"dedup_key"`
+	AlertKey       string           `json:"dedup_key"`
 	Status         AlertGroupStatus `json:"status"`
 	Title          string           `json:"title"`
 	TeamID         string           `json:"team_id"`

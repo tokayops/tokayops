@@ -81,10 +81,10 @@ func setupScheduleAPI(t *testing.T) (*API, *store.MockStore, *echo.Echo, *schedu
 	return api, s, e, env
 }
 
-func createTestAlertGroup(t *testing.T, s store.StoreInterface, id, dedupKey string, status model.AlertGroupStatus) *model.AlertGroup {
+func createTestAlertGroup(t *testing.T, s store.StoreInterface, id, alertKey string, status model.AlertGroupStatus) *model.AlertGroup {
 	ag := &model.AlertGroup{
 		ID:               id,
-		DedupKey:         dedupKey,
+		AlertKey:         alertKey,
 		Status:           status,
 		Title:            "Test Alert Group",
 		TeamID:           "devops",
@@ -616,7 +616,7 @@ func TestAckAlertGroup_AlreadyAcked_NoTeamLookup(t *testing.T) {
 
 	// AG already acknowledged — service short-circuits, no team lookup needed
 	ag := &model.AlertGroup{
-		ID: "ag-ack-noop", DedupKey: "dedup-ack-noop",
+		ID: "ag-ack-noop", AlertKey: "dedup-ack-noop",
 		Status: model.AlertGroupStatusAcknowledged, Title: "Test",
 		TeamID: "nonexistent-team", TeamNameSnapshot: "Ghost Team", Severity: "critical",
 	}
@@ -638,7 +638,7 @@ func TestResolveAlertGroup_AlreadyClosed_NoTeamLookup(t *testing.T) {
 
 	// AG already closed — service short-circuits, no team lookup needed
 	ag := &model.AlertGroup{
-		ID: "ag-res-noop", DedupKey: "dedup-res-noop",
+		ID: "ag-res-noop", AlertKey: "dedup-res-noop",
 		Status: model.AlertGroupStatusClosed, Title: "Test",
 		TeamID: "nonexistent-team", TeamNameSnapshot: "Ghost Team", Severity: "critical",
 	}
@@ -1023,7 +1023,7 @@ func TestPaginationMeta(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		ag := &model.AlertGroup{
 			ID:       fmt.Sprintf("pg-%d", i),
-			DedupKey: fmt.Sprintf("dedup-pg-%d", i),
+			AlertKey: fmt.Sprintf("dedup-pg-%d", i),
 			Status:   model.AlertGroupStatusNew,
 			Title:    fmt.Sprintf("Alert %d", i),
 			TeamID:   "devops",

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 )
 
 // preModelJobsDDL puts the jobs table back the way it was before the dedup
@@ -43,14 +44,14 @@ func newPreModelDB(t *testing.T) *Store {
 
 // seedPreModelJob writes a job the way the old code wrote them: a dedup key and
 // nothing that says what the key means.
-func seedPreModelJob(t *testing.T, s *Store, jobType, status, dedupKey string, alertGroupID *string) string {
+func seedPreModelJob(t *testing.T, s *Store, jobType, status, alertKey string, alertGroupID *string) string {
 	t.Helper()
 	id := uuid.New().String()
 	if _, err := s.db.Exec(`
 		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id,
 			current_stage, created_at, updated_at)
 		VALUES ($1, $2, $3, '{}', $4, $5, 0, $6, $6)`,
-		id, jobType, status, dedupKey, alertGroupID, time.Now()); err != nil {
+		id, jobType, status, alertKey, alertGroupID, time.Now()); err != nil {
 		t.Fatalf("seed a pre-model %s job: %v", jobType, err)
 	}
 	return id
@@ -241,8 +242,11 @@ func TestJobDedupPolicies_ReachADatabaseAlreadyMigrated(t *testing.T) {
 		t.Fatalf("InitDB: %v", err)
 	}
 
-	// Stand in for "this release knows a namespace the database has not seen".
-	if _, err := s.db.Exec(`DELETE FROM job_dedup_policies WHERE namespace = 'handoff'`); err != nil {
+	// Not a stand-in any more: handoff_occurrence is exactly this case, a
+	// namespace this release introduces into databases whose migration ran
+	// releases ago.
+	if _, err := s.db.Exec(
+		`DELETE FROM job_dedup_policies WHERE namespace = 'handoff_occurrence'`); err != nil {
 		t.Fatalf("remove a policy: %v", err)
 	}
 
@@ -252,11 +256,69 @@ func TestJobDedupPolicies_ReachADatabaseAlreadyMigrated(t *testing.T) {
 
 	var scope string
 	if err := s.db.QueryRow(
-		`SELECT scope FROM job_dedup_policies WHERE namespace = 'handoff'`).Scan(&scope); err != nil {
+		`SELECT scope FROM job_dedup_policies WHERE namespace = 'handoff_occurrence'`).Scan(&scope); err != nil {
 		t.Fatalf("the namespace never reached the table: %v", err)
 	}
-	if scope != "while_active" {
-		t.Errorf("handoff seeded as %q", scope)
+	if scope != "forever" {
+		t.Errorf("handoff_occurrence seeded as %q", scope)
+	}
+}
+
+// TestJobDedupPolicies_HistoryOfARenamedFamilyStaysReadable: when a family takes
+// a new name, the old one keeps its rows - and a row nothing can read is a row
+// that stops a worker.
+//
+// This is the whole cost of the rename, and the reason the old namespace stays
+// declared with no constructor: jobs are never deleted, so every release from
+// here on has to be able to read a handover written before the occurrence had a
+// name of its own.
+func TestJobDedupPolicies_HistoryOfARenamedFamilyStaysReadable(t *testing.T) {
+	s := newThrowawayDB(t)
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+
+	for _, want := range []struct{ namespace, scope string }{
+		{"handoff", "while_active"},
+		{"handoff_occurrence", "forever"},
+	} {
+		var scope string
+		if err := s.db.QueryRow(
+			`SELECT scope FROM job_dedup_policies WHERE namespace = $1`, want.namespace).Scan(&scope); err != nil {
+			t.Fatalf("policy %s: %v", want.namespace, err)
+		}
+		if scope != want.scope {
+			t.Errorf("policy %s is %q, want %q", want.namespace, scope, want.scope)
+		}
+	}
+
+	// A handover written by the previous release: the old name, the old key,
+	// finished long ago.
+	jobID := uuid.New().String()
+	const legacyKey = "handoff:sched-1:2026-01-05T11:00:00Z"
+	if _, err := s.db.Exec(`
+		INSERT INTO jobs (id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
+			current_stage, created_at, updated_at)
+		VALUES ($1, 'handoff_notify', 'succeeded', '{}', 'handoff', $2, 'while_active', 0, NOW(), NOW())`,
+		jobID, legacyKey); err != nil {
+		t.Fatalf("seed a job of the previous release: %v", err)
+	}
+
+	job, err := s.GetJobByID(jobID)
+	if err != nil {
+		t.Fatalf("a job written by the previous release cannot be read: %v", err)
+	}
+	if job.Dedup == nil {
+		t.Fatal("the row came back without the identity it holds")
+	}
+	if got := string(job.Dedup.Namespace()); got != "handoff" {
+		t.Errorf("namespace = %q, want handoff - history is not reinterpreted", got)
+	}
+	if job.Dedup.Key() != legacyKey {
+		t.Errorf("key = %q, want the key it was written with", job.Dedup.Key())
+	}
+	if job.Dedup.Scope() != "while_active" {
+		t.Errorf("scope = %q, want the policy it was written under", job.Dedup.Scope())
 	}
 }
 
@@ -363,7 +425,10 @@ func TestJobDedupModel_ConcurrentFirstStart(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM job_dedup_policies`).Scan(&policies); err != nil {
 		t.Fatalf("count policies: %v", err)
 	}
-	if policies != 5 {
-		t.Errorf("job_dedup_policies has %d rows, want the 5 the code declares", policies)
+	// Counted against the registry rather than against a number written here:
+	// a release that adds a family should not have to remember this test, and
+	// what is asked is that concurrent starts seed each family once.
+	if want := len(jobdedup.Policies()); policies != want {
+		t.Errorf("job_dedup_policies has %d rows, want the %d the code declares", policies, want)
 	}
 }

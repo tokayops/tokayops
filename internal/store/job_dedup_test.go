@@ -16,10 +16,16 @@ import (
 // One table rather than two suites, because the double drifting from the
 // database is not hypothetical - it is what the previous sprint found, and a
 // rule written out twice is a rule that drifts again.
-// The forever policy is not in this table: escalation is the only namespace
-// that carries it, and an escalation cannot be admitted through this door at
-// all (see TestJobDedup_EscalationIsNotAdmittedByTheGeneralDoor). Its guarantee
-// is exercised where it is real, through EnsureEscalationJob.
+//
+// Both policies are here now. Escalation is still absent - it holds forever but
+// cannot be admitted through this door at all (see
+// TestJobDedup_EscalationIsNotAdmittedByTheGeneralDoor), so its guarantee is
+// exercised through EnsureEscalationJob - and the handover occurrence takes its
+// place: forever, and admitted here like anything else.
+//
+// Every terminal status appears, not only success: what a while_active identity
+// promises is that the work can happen again once the job is out of flight,
+// however it left, and what a forever identity promises is that it cannot.
 var jobDedupCases = []struct {
 	name        string
 	first       *jobdedup.Spec
@@ -49,6 +55,20 @@ var jobDedupCases = []struct {
 		wantCreated: true,
 	},
 	{
+		name:        "while_active admits the work again after a failed job",
+		first:       jobdedup.AckUpdate("ag-failed"),
+		firstEnds:   model.JobStatusFailed,
+		second:      jobdedup.AckUpdate("ag-failed"),
+		wantCreated: true,
+	},
+	{
+		name:        "while_active admits the work again after a canceled job",
+		first:       jobdedup.AckUpdate("ag-canceled"),
+		firstEnds:   model.JobStatusCanceled,
+		second:      jobdedup.AckUpdate("ag-canceled"),
+		wantCreated: true,
+	},
+	{
 		// Unreachable before this sprint: one index over dedup_key alone made
 		// two families sharing a string collide, whichever families they were.
 		name:        "the same key in another namespace is other work",
@@ -57,6 +77,63 @@ var jobDedupCases = []struct {
 		second:      mustSpec("resolution", "shared-key", "while_active"),
 		wantCreated: true,
 	},
+	{
+		name:        "forever refuses a second job while the first is running",
+		first:       testOccurrence("sched-forever-active"),
+		firstEnds:   model.JobStatusPending,
+		second:      testOccurrence("sched-forever-active"),
+		wantCreated: false,
+	},
+	{
+		// The point of the policy, and of bug 13: the occurrence was announced
+		// once, and a second instance noticing it later is not a second
+		// occurrence.
+		name:        "forever refuses the work again after the job succeeded",
+		first:       testOccurrence("sched-forever-done"),
+		firstEnds:   model.JobStatusSucceeded,
+		second:      testOccurrence("sched-forever-done"),
+		wantCreated: false,
+	},
+	{
+		name:        "forever refuses the work again after the job failed",
+		first:       testOccurrence("sched-forever-failed"),
+		firstEnds:   model.JobStatusFailed,
+		second:      testOccurrence("sched-forever-failed"),
+		wantCreated: false,
+	},
+	{
+		name:        "forever refuses the work again after the job was canceled",
+		first:       testOccurrence("sched-forever-canceled"),
+		firstEnds:   model.JobStatusCanceled,
+		second:      testOccurrence("sched-forever-canceled"),
+		wantCreated: false,
+	},
+	{
+		name:        "another occurrence of the same schedule is other work",
+		first:       testOccurrence("sched-two-turns"),
+		firstEnds:   model.JobStatusSucceeded,
+		second:      testOccurrenceAt("sched-two-turns", 24*time.Hour),
+		wantCreated: true,
+	},
+}
+
+// testOccurrence is one handover as the notifier would name it. The parts are
+// fixed except the schedule, so two calls with the same schedule are the same
+// occurrence and two with different ones are not.
+func testOccurrence(scheduleID string) *jobdedup.Spec {
+	return testOccurrenceAt(scheduleID, 0)
+}
+
+func testOccurrenceAt(scheduleID string, after time.Duration) *jobdedup.Spec {
+	return jobdedup.HandoffOccurrence(jobdedup.Occurrence{
+		Kind:            "handoff",
+		ScheduleID:      scheduleID,
+		Source:          "rotation",
+		GroupID:         "g-a",
+		UserIDs:         []string{"u-alice"},
+		AssignmentStart: time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC).Add(after),
+		RevisionID:      "rev-1",
+	})
 }
 
 func strPtr(s string) *string { return &s }
@@ -117,8 +194,8 @@ func TestJobDedupRules_MockStore(t *testing.T) {
 			if created, err := s.CreateJobWithDedup(first, nil, nil); err != nil || !created {
 				t.Fatalf("first insert: created=%v err=%v", created, err)
 			}
-			if tc.firstEnds == model.JobStatusSucceeded {
-				s.MarkJobSucceeded(tc.first)
+			if tc.firstEnds != model.JobStatusPending {
+				s.MarkJobFinished(tc.first, tc.firstEnds)
 			}
 
 			created, err := s.CreateJobWithDedup(dedupTestJob(tc.second), nil, nil)
@@ -215,13 +292,11 @@ func TestEscalationIdentityIsTheGroupNotTheAlert(t *testing.T) {
 
 	// The incident is resolved, and the same alert fires again: a new group
 	// under the very same dedup key.
-	if err := s.UpdateAlertGroupStatus(firstAG, model.AlertGroupStatusResolved); err != nil {
-		t.Fatalf("resolve the first group: %v", err)
-	}
+	forceAlertGroupStatus(t, s, firstAG, model.AlertGroupStatusResolved)
 	secondAG := uuid.New().String()
 	if err := s.CreateAlertGroup(&model.AlertGroup{
 		ID:               secondAG,
-		DedupKey:         ag.DedupKey,
+		AlertKey:         ag.AlertKey,
 		Status:           model.AlertGroupStatusNew,
 		TeamID:           teamID,
 		TeamNameSnapshot: teamID,
@@ -407,7 +482,7 @@ func TestJobDedup_EscalationRefusedForAnActedOnGroupChangesNothing(t *testing.T)
 		agID := "ag-acted-on"
 		m := NewMockStore()
 		if err := m.CreateAlertGroup(&model.AlertGroup{
-			ID: agID, DedupKey: "k-" + agID, Status: model.AlertGroupStatusAcknowledged,
+			ID: agID, AlertKey: "k-" + agID, Status: model.AlertGroupStatusAcknowledged,
 		}); err != nil {
 			t.Fatalf("CreateAlertGroup: %v", err)
 		}

@@ -60,15 +60,15 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	}
 
 	// 1. Deduplication (GroupKey)
-	dedupKey := payload.GroupKey
-	if dedupKey == "" {
+	alertKey := payload.GroupKey
+	if alertKey == "" {
 		if len(payload.Alerts) > 0 {
-			dedupKey = payload.Alerts[0].Fingerprint
+			alertKey = payload.Alerts[0].Fingerprint
 		} else {
 			return c.String(http.StatusBadRequest, "No alerts or groupKey")
 		}
 	}
-	if dedupKey == "" {
+	if alertKey == "" {
 		return c.String(http.StatusBadRequest, "Empty dedup key: groupKey and fingerprint both missing")
 	}
 
@@ -84,13 +84,13 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	severity = strings.ToLower(severity)
 
 	metrics.AlertsReceivedTotal.WithLabelValues(teamID, severity).Inc()
-	log.Printf("Ingester: Group %s (Team: %s, Sev: %s, Alerts: %d)", dedupKey, teamID, severity, len(payload.Alerts))
+	log.Printf("Ingester: Group %s (Team: %s, Sev: %s, Alerts: %d)", alertKey, teamID, severity, len(payload.Alerts))
 
 	// 3. Find Active Alert Group
-	active, err := i.store.GetActiveAlertGroup(dedupKey)
+	active, err := i.store.GetActiveAlertGroupByAlertKey(alertKey)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		// Real DB error (not "not found") — return 500 so Alertmanager retries
-		log.Printf("Ingester: DB error looking up group %s: %v", dedupKey, err)
+		log.Printf("Ingester: DB error looking up group %s: %v", alertKey, err)
 		return c.String(http.StatusInternalServerError, "DB lookup failed")
 	}
 	if active != nil {
@@ -111,7 +111,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 
 	ag := &model.AlertGroup{
 		ID:          uuid.New().String(),
-		DedupKey:    dedupKey,
+		AlertKey:    alertKey,
 		Status:      model.AlertGroupStatusNew,
 		Title:       i.generateTitle(&payload),
 		TeamID:      teamID,
@@ -187,10 +187,10 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		isDuplicateKey := (errors.As(err, &pqErr) && pqErr.Code == "23505") ||
 			strings.Contains(err.Error(), "duplicate key")
 		if isDuplicateKey {
-			log.Printf("Ingester: Duplicate key for %s, retrying as merge", dedupKey)
-			active, retryErr := i.store.GetActiveAlertGroup(dedupKey)
+			log.Printf("Ingester: Duplicate key for %s, retrying as merge", alertKey)
+			active, retryErr := i.store.GetActiveAlertGroupByAlertKey(alertKey)
 			if retryErr != nil {
-				log.Printf("Ingester: Retry lookup failed for %s: %v", dedupKey, retryErr)
+				log.Printf("Ingester: Retry lookup failed for %s: %v", alertKey, retryErr)
 				return c.String(http.StatusInternalServerError, "Failed to persist")
 			}
 			if active != nil {
@@ -287,17 +287,18 @@ func (i *Ingester) mergeIntoGroup(c echo.Context, active *model.AlertGroup, inco
 	}
 
 	log.Printf("Ingester: Updating alert group %s (Partial State)", active.ID)
-	if err := i.store.UpdateAlertGroupAlerts(active.ID, active.Alerts); err != nil {
+
+	// The alerts and the "this message is out of date" gate go down in one
+	// write. Two writes had a gap in them, and a process that stopped there
+	// left the alert recorded with the gate down - after which Alertmanager
+	// repeating the payload merges nothing and never raises it again.
+	//
+	// Don't regress status - the ingester only records alerts. Status
+	// transitions are owned by the engine (new->processing) and by user
+	// actions (ack/resolve).
+	if err := i.store.UpdateAlertGroupAlertsAndRaiseSlackUpdate(active.ID, active.Alerts); err != nil {
 		log.Printf("Ingester: Failed to update alerts for %s: %v", active.ID, err)
 		return c.String(http.StatusInternalServerError, "Failed to update alerts")
-	}
-
-	// Don't regress status — ingester only updates alerts data and flags Slack update.
-	// Status transitions are owned by engine (new→processing) and user actions (ack/resolve).
-
-	// Flag Slack message for update (picked up by alertUpdateProcessingLoop)
-	if err := i.store.SetSlackUpdatePending(active.ID, true); err != nil {
-		log.Printf("Ingester: Failed to set slack update pending for %s: %v", active.ID, err)
 	}
 
 	// Timeline events only after successful store writes (avoids duplicates on AM retry)
