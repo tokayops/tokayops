@@ -536,6 +536,10 @@ func (d *Dispatcher) ProcessAlertUpdates(ctx context.Context) {
 			//
 			// There is no cheaper proof available, so no proof is claimed. The
 			// cost is bounded: the group leaves this queue when it is resolved.
+			// If it ever shows up in measurements, the queue can select on a
+			// delivery that supports updates instead - the gate stays up either
+			// way, so the alert is safe with or without that filter. Until it
+			// does show up, one rule fewer.
 			continue
 		}
 		if err != nil {

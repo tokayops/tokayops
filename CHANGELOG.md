@@ -59,8 +59,7 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   in between kept the alert and dropped the mark; and a notification that
   appeared while the update was being prepared was taken as proof that no update
   was needed. An alert and the mark are now recorded together, and the mark is
-  cleared only for a change an update actually carried - or once the escalation
-  can no longer send anything to update at all.
+  cleared only once an update job has accepted that change.
 - An alert no longer loses its page when the on-call state cannot be read. A
   policy step aimed at a schedule used to escalate to nobody if the read failed
   at that moment, and nothing retried it, so the person on duty was never told.
