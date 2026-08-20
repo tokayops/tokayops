@@ -73,6 +73,11 @@ type countingProjection struct {
 	err   error
 	calls int
 
+	// errUntilCall makes err transient: reads up to and including this call
+	// fail, later ones answer. Zero means err (if set) is permanent, which is
+	// what most tests want.
+	errUntilCall int
+
 	// byID is what a read of a schedule BY ID would answer, and scheduleCalls
 	// counts those reads - the fallback path a failed team read must not take.
 	byID          map[string]schedulerender.OnCall
@@ -81,7 +86,7 @@ type countingProjection struct {
 
 func (c *countingProjection) CurrentTeamOnCallNow(ctx context.Context, teamID string) (schedulerender.TeamOnCall, error) {
 	c.calls++
-	if c.err != nil {
+	if c.err != nil && (c.errUntilCall == 0 || c.calls <= c.errUntilCall) {
 		return schedulerender.TeamOnCall{}, c.err
 	}
 	if c.calls > 1 && c.then != nil {

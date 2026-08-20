@@ -120,7 +120,7 @@ func (s *Service) CurrentOnCallForAll(ctx context.Context, at time.Time) (BulkOn
 		for _, root := range roots {
 			onCall, rev, err := onCallOfRoot(ctx, view, root, at)
 			if err != nil {
-				reason, ok := failureReason(err)
+				reason, ok := FailureReasonOf(err)
 				if !ok {
 					return err
 				}
@@ -157,12 +157,27 @@ func (s *Service) CurrentOnCallForAll(ctx context.Context, at time.Time) (BulkOn
 	return out, nil
 }
 
-// failureReason classifies an error as damage to one schedule, or declines to.
+// FailureReasonOf classifies an error as damage to one schedule, or declines to.
 //
 // Classification is by sentinel, never by message: the reasons are a closed set
 // and a text match would silently reclassify itself the next time someone
 // rewords an error.
-func failureReason(err error) (ProjectionFailureReason, bool) {
+//
+// It is exported because the distinction it draws is one every consumer of the
+// projection has to make, not one only the bulk path cares about: damage to
+// stored data will still be there on the next attempt, while a read that failed
+// may not be. A consumer classifying for itself would be this switch written
+// twice, and two copies of it would disagree - the same reason ProjectionFailure
+// says the renderer assigns the reason.
+//
+// A NEW KIND OF DAMAGE MUST GET A CASE HERE, and this is no longer only about
+// the label on a metric. The escalation builder branches on this answer: damage
+// degrades a schedule step to a marker and lets the rest of the policy deliver,
+// while everything else defers the whole escalation for the next tick to retry.
+// Damage that arrives without a case is read as "the read failed", so the retry
+// never succeeds and the alerts of that team reach nobody at all - not even the
+// channel - for as long as the data stays broken.
+func FailureReasonOf(err error) (ProjectionFailureReason, bool) {
 	switch {
 	case errors.Is(err, scheduleconfig.ErrSnapshotDecode):
 		return FailureSnapshotDecode, true

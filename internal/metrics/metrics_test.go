@@ -27,6 +27,7 @@ func TestAllMetricsRegistered(t *testing.T) {
 		{"notification_errors_total", descFromCounterVec(NotificationErrorsTotal)},
 		{"engine_runs_total", descFromCounter(EngineRunsTotal)},
 		{"engine_alert_groups_picked_total", descFromCounter(EngineAlertGroupsPickedTotal)},
+		{"engine_escalation_build_deferrals_total", descFromCounter(EngineEscalationBuildDeferralsTotal)},
 		{"alert_group_resolution_duration_seconds", descFromHistogramVec(AlertGroupResolutionDuration)},
 		{"handoff_warmup_not_complete_total", descFromCounter(HandoffWarmupNotComplete)},
 		{"alert_group_ack_duration_seconds", descFromHistogramVec(AlertGroupAckDuration)},

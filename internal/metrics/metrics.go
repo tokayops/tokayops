@@ -77,6 +77,20 @@ var (
 		Name: "engine_alert_groups_picked_total",
 		Help: "Total number of alert groups picked up by the engine.",
 	})
+
+	// EngineEscalationBuildDeferralsTotal counts escalation builds abandoned
+	// because the on-call recipients could not be resolved. The alert group
+	// stays "new" and every following tick tries again.
+	//
+	// It counts deferrals, not alert groups, and the Help says so because the
+	// difference is a factor of the tick rate: one group waiting through a
+	// minute of trouble increments this sixty times. A rate over it answers
+	// "did this happen recently", never "how many are waiting now" - that
+	// question belongs to a query over alert_groups, not to a counter.
+	EngineEscalationBuildDeferralsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "engine_escalation_build_deferrals_total",
+		Help: "Escalation builds deferred because the on-call recipients could not be resolved. One alert group increments this on every retry, so this counts deferrals, not distinct alert groups.",
+	})
 )
 
 // Tier 5 — Handoff notifier
@@ -195,6 +209,7 @@ func init() {
 	// Tier 4
 	prometheus.MustRegister(EngineRunsTotal)
 	prometheus.MustRegister(EngineAlertGroupsPickedTotal)
+	prometheus.MustRegister(EngineEscalationBuildDeferralsTotal)
 
 	// Tier 5
 	prometheus.MustRegister(HandoffWarmupNotComplete)
