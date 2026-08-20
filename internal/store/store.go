@@ -1175,7 +1175,7 @@ func insertOutboxEventTx(tx *sql.Tx, event *model.OutboxEvent) error {
 // Timeline event and status update happen in a single transaction.
 // Returns (true, nil) if the ack was applied, (false, nil) if the alert group
 // was not in 'processing' or 'triggered' status (idempotent/race loser), or (false, err) on failure.
-func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -1227,10 +1227,8 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	}
 
 	// 4. Cancel escalation job (same TX)
-	if dedupKey != "" {
-		if err := cancelJobByDedupKeyTx(tx, dedupKey); err != nil {
-			return false, err
-		}
+	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
+		return false, err
 	}
 
 	return true, tx.Commit()
@@ -1240,7 +1238,7 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 // Timeline event and status update happen in a single transaction.
 // Returns (true, nil) if the resolve was applied, (false, nil) if the alert group
 // was not in 'processing', 'triggered', or 'acknowledged' status, or (false, err) on failure.
-func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -1292,10 +1290,8 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	}
 
 	// 4. Cancel escalation job (same TX)
-	if dedupKey != "" {
-		if err := cancelJobByDedupKeyTx(tx, dedupKey); err != nil {
-			return false, err
-		}
+	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
+		return false, err
 	}
 
 	return true, tx.Commit()
@@ -1305,7 +1301,7 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 // Used by the ingester when all incoming alerts are resolved (auto-resolve).
 // Allows transition from new/processing/triggered/acknowledged → resolved.
 // Returns (true, nil) if applied, (false, nil) if already resolved (idempotent).
-func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -1360,35 +1356,71 @@ func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Aler
 	}
 
 	// 4. Cancel escalation job
-	if dedupKey != "" {
-		if err := cancelJobByDedupKeyTx(tx, dedupKey); err != nil {
-			return false, err
-		}
+	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
+		return false, err
 	}
 
 	return true, tx.Commit()
 }
 
-// cancelJobByDedupKeyTx cancels an active escalation job and its pending steps within the given transaction.
-func cancelJobByDedupKeyTx(tx *sql.Tx, dedupKey string) error {
-	var jobID string
-	err := tx.QueryRow(`
+// cancelEscalationJobByAlertGroupIDTx cancels the escalation jobs of one alert
+// group, with their stages and their steps.
+//
+// It addresses them by what the caller means - this group's escalation - and not
+// by the dedup key, which is how this was written before. The key is a string
+// whose namespace each builder invents; addressing by it made the correctness of
+// cancellation depend on a uniqueness index rather than on the query, and it
+// would break silently the moment a job's identity changed.
+//
+// Every returned id is collected rather than the first one. Today
+// idx_one_escalation_per_ag admits at most one such row, so a single Scan would
+// look correct - and would quietly stop being correct in Epic 11 Sprint 2B,
+// which replaces that index with namespace-scoped ones and makes two live rows
+// of different namespace versions legal. Cancelling the jobs but only one job's
+// children is the kind of half-done state this function exists to prevent.
+//
+// type = 'escalation' is a schema predicate here, not a statement about
+// families: it matches the predicate of idx_one_escalation_per_ag, which is what
+// provides today's "one escalation per alert group". It does not make
+// alert_group_id an escalation-only column - nothing stops another type from
+// filling it, which is precisely why the type predicate is written out.
+func cancelEscalationJobByAlertGroupIDTx(tx *sql.Tx, alertGroupID string) error {
+	rows, err := tx.Query(`
 		UPDATE jobs SET status='canceled', canceled_at=NOW(), finished_at=NOW(), updated_at=NOW()
-		WHERE dedup_key=$1 AND status IN ('pending','running')
-		RETURNING id`, dedupKey).Scan(&jobID)
-	if err == sql.ErrNoRows {
-		return nil
-	}
+		WHERE type='escalation' AND alert_group_id=$1 AND status IN ('pending','running')
+		RETURNING id`, alertGroupID)
 	if err != nil {
 		return err
 	}
+	var jobIDs []string
+	for rows.Next() {
+		var jobID string
+		if err := rows.Scan(&jobID); err != nil {
+			rows.Close()
+			return err
+		}
+		jobIDs = append(jobIDs, jobID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	// Closed before the next statement, not deferred: lib/pq serves one
+	// statement at a time per connection, and the transaction has more to do.
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(jobIDs) == 0 {
+		return nil
+	}
+
 	_, err = tx.Exec(`UPDATE job_stages SET status='canceled', updated_at=NOW()
-		WHERE job_id=$1 AND status IN ('active','blocked')`, jobID)
+		WHERE job_id = ANY($1) AND status IN ('active','blocked')`, pq.Array(jobIDs))
 	if err != nil {
 		return err
 	}
 	_, err = tx.Exec(`UPDATE job_steps SET status='canceled', updated_at=NOW()
-		WHERE job_id=$1 AND status IN ('pending','blocked','retry')`, jobID)
+		WHERE job_id = ANY($1) AND status IN ('pending','blocked','retry')`, pq.Array(jobIDs))
 	return err
 }
 

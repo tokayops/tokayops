@@ -1382,10 +1382,16 @@ func TestPipeline_EscalationUnlinked(t *testing.T) {
 	waitForJobStatus(t, env.S, "test_unlinked_1", model.JobStatusFailed)
 }
 
-// TestPipeline_CancelDuringExecution tests the real ack-driven cancellation path:
-// AckAlertGroupAtomic transitions AG → acknowledged, then ProcessAcknowledgedAlertGroups
-// cancels the escalation job via CancelJobByDedupKey. The DM step (stage 1) has a delay,
-// so it's still blocked/pending when ack fires — verifying cancel reaches pending stages.
+// TestPipeline_CancelDuringExecution tests the real ack-driven cancellation path.
+//
+// The cancellation happens inside AckAlertGroupAtomic itself, in the same
+// transaction as the status change - not in the ProcessAcknowledgedAlertGroups
+// pass that follows, whose own cancel is a second, idempotent one. The comment
+// used to credit the later pass, which made this test look like it covered a
+// path it does not.
+//
+// The DM step (stage 1) has a delay, so it is still blocked/pending when ack
+// fires - which is what verifies that cancel reaches pending stages.
 func TestPipeline_CancelDuringExecution(t *testing.T) {
 	env := setupIntegrationTest(t)
 
@@ -1441,7 +1447,7 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetActiveAlertGroup: %v", err)
 	}
-	changed, err := env.S.AckAlertGroupAtomic(ag.ID, "test-user", nil, nil, ag.DedupKey)
+	changed, err := env.S.AckAlertGroupAtomic(ag.ID, "test-user", nil, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic: %v", err)
 	}
@@ -1453,7 +1459,8 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	cancel()
 	time.Sleep(200 * time.Millisecond) // let goroutine drain
 
-	// Run the ack processing — this calls CancelJobByDedupKey internally
+	// Run the ack processing. Its own cancel is the second, idempotent one: the
+	// job was already cancelled inside AckAlertGroupAtomic above.
 	ackCtx := context.Background()
 	env.Disp.ProcessAcknowledgedAlertGroups(ackCtx)
 

@@ -550,7 +550,7 @@ func TestAckAlertGroupAtomic_Success(t *testing.T) {
 	agID := createTestTeamAndAG(t, s, "team-atomic-ack", model.AlertGroupStatusTriggered)
 
 	meta := map[string]string{"source": "slack"}
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", meta, nil, "")
+	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", meta, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic failed: %v", err)
 	}
@@ -597,7 +597,7 @@ func TestAckAlertGroupAtomic_AlreadyAcked(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-atomic-ack2", model.AlertGroupStatusAcknowledged)
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil, "")
+	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic failed: %v", err)
 	}
@@ -622,7 +622,7 @@ func TestAckAlertGroupAtomic_Resolved(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-atomic-ack3", model.AlertGroupStatusResolved)
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil, "")
+	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic failed: %v", err)
 	}
@@ -637,7 +637,7 @@ func TestResolveAlertGroupAtomic_FromTriggered(t *testing.T) {
 	agID := createTestTeamAndAG(t, s, "team-atomic-res1", model.AlertGroupStatusTriggered)
 
 	meta := map[string]string{"source": "slack"}
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", meta, nil, "")
+	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", meta, nil)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic failed: %v", err)
 	}
@@ -679,7 +679,7 @@ func TestResolveAlertGroupAtomic_FromAcknowledged(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-atomic-res2", model.AlertGroupStatusAcknowledged)
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil, "")
+	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic failed: %v", err)
 	}
@@ -701,7 +701,7 @@ func TestResolveAlertGroupAtomic_AlreadyResolved(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-atomic-res3", model.AlertGroupStatusResolved)
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil, "")
+	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic failed: %v", err)
 	}
@@ -725,7 +725,7 @@ func TestAckAtomicConcurrent(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			changed, err := s.AckAlertGroupAtomic(agID, "User"+uuid.New().String()[:4], nil, nil, "")
+			changed, err := s.AckAlertGroupAtomic(agID, "User"+uuid.New().String()[:4], nil, nil)
 			winners[idx] = changed
 			errs[idx] = err
 		}(i)
@@ -772,7 +772,7 @@ func TestAckAlertGroupAtomic_FromProcessing(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-ack-proc", model.AlertGroupStatusProcessing)
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil, "")
+	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic failed: %v", err)
 	}
@@ -808,7 +808,7 @@ func TestResolveAlertGroupAtomic_FromProcessing(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-res-proc", model.AlertGroupStatusProcessing)
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil, "")
+	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic failed: %v", err)
 	}
@@ -1038,7 +1038,7 @@ func TestEnsureEscalationJob_UserWins_ConcurrentAck(t *testing.T) {
 		// Reset AG to processing for each iteration
 		s.UpdateAlertGroupStatus(agID, model.AlertGroupStatusProcessing)
 		// Cancel any existing active job so dedup doesn't interfere
-		s.CancelJobByDedupKey(ag.DedupKey)
+		s.CancelEscalationJobByAlertGroupID(agID)
 
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -1051,7 +1051,7 @@ func TestEnsureEscalationJob_UserWins_ConcurrentAck(t *testing.T) {
 		// Goroutine 1: user acks the AG
 		go func() {
 			defer wg.Done()
-			ackChanged, ackErr = s.AckAlertGroupAtomic(agID, "UserWins", nil, nil, "")
+			ackChanged, ackErr = s.AckAlertGroupAtomic(agID, "UserWins", nil, nil)
 		}()
 
 		// Goroutine 2: engine ensures escalation job
@@ -1336,7 +1336,7 @@ func TestAckAlertGroupAtomic_OutboxEvent(t *testing.T) {
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, outboxEvent, "")
+	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, outboxEvent)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic: %v", err)
 	}
@@ -1398,7 +1398,7 @@ func TestAckAlertGroupAtomic_NoOutboxWhenNotChanged(t *testing.T) {
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, outboxEvent, "")
+	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, outboxEvent)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic: %v", err)
 	}
@@ -1448,7 +1448,7 @@ func TestResolveAlertGroupAtomic_OutboxEvent(t *testing.T) {
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, outboxEvent, "")
+	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, outboxEvent)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic: %v", err)
 	}
@@ -1502,7 +1502,7 @@ func TestResolveAlertGroupAtomic_NoOutboxWhenNotChanged(t *testing.T) {
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, outboxEvent, "")
+	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, outboxEvent)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic: %v", err)
 	}
@@ -1549,7 +1549,7 @@ func TestAckAtomicConcurrent_WithOutbox(t *testing.T) {
 				Actor:        actor,
 				Payload:      payload,
 			}
-			changed, err := s.AckAlertGroupAtomic(agID, actor, nil, oe, "")
+			changed, err := s.AckAlertGroupAtomic(agID, actor, nil, oe)
 			winners[idx] = changed
 			errs[idx] = err
 		}(i)
@@ -1637,7 +1637,7 @@ func TestResolveAlertGroupWithAlertsAtomic_FromNew(t *testing.T) {
 		Payload:      []byte(`{"event":"alert_group.resolved"}`),
 	}
 
-	changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, resolvedAlerts, timelineEvents, outboxEvent, dedupKey)
+	changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, resolvedAlerts, timelineEvents, outboxEvent)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupWithAlertsAtomic: %v", err)
 	}
@@ -1702,7 +1702,7 @@ func TestResolveAlertGroupWithAlertsAtomic_AlreadyResolved(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-resolve-idem", model.AlertGroupStatusResolved)
 
-	changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, nil, nil, nil, "")
+	changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupWithAlertsAtomic: %v", err)
 	}
@@ -1800,4 +1800,224 @@ func TestSeed_AlertGroupHasTeamNameSnapshot(t *testing.T) {
 			t.Errorf("AG %s: TeamNameSnapshot = TeamID %q, expected resolved team name", ag.ID, ag.TeamID)
 		}
 	}
+}
+
+// ===================================================================================
+// Escalation cancellation by alert group (Epic 11 Sprint 1)
+//
+// Cancellation used to address the job by its raw dedup key, which made its
+// correctness depend on a uniqueness index rather than on the query. These tests
+// pin what it addresses now.
+//
+// They lean on createTestTeamAndAG setting DedupKey = "key-" + agID: the two are
+// deliberately different, so a query that went back to matching on dedup_key
+// while being handed an alert group id would find nothing and redden every
+// positive case below.
+// ===================================================================================
+
+// jobStatuses reads back a job with its stages and steps.
+func jobStatuses(t *testing.T, s *Store, jobID string) (string, []string, []string) {
+	t.Helper()
+
+	var jobStatus string
+	if err := s.GetDB().QueryRow(`SELECT status FROM jobs WHERE id = $1`, jobID).Scan(&jobStatus); err != nil {
+		t.Fatalf("read job %s: %v", jobID, err)
+	}
+
+	read := func(query string) []string {
+		rows, err := s.GetDB().Query(query, jobID)
+		if err != nil {
+			t.Fatalf("read children of %s: %v", jobID, err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var st string
+			if err := rows.Scan(&st); err != nil {
+				t.Fatalf("scan status: %v", err)
+			}
+			out = append(out, st)
+		}
+		return out
+	}
+	return jobStatus,
+		read(`SELECT status FROM job_stages WHERE job_id = $1`),
+		read(`SELECT status FROM job_steps WHERE job_id = $1`)
+}
+
+// seedEscalation puts an alert group into processing with a live escalation job,
+// the way the engine does.
+func seedEscalation(t *testing.T, s *Store, teamID string) (agID, jobID string) {
+	t.Helper()
+	agID = createTestTeamAndAG(t, s, teamID, model.AlertGroupStatusProcessing)
+	job, stages, steps, snapshot := makeTestJob("key-"+agID, agID)
+	created, err := s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
+	if err != nil || !created {
+		t.Fatalf("EnsureEscalationJob(%s) = %v, %v", agID, created, err)
+	}
+	return agID, job.ID
+}
+
+func requireCanceledThrough(t *testing.T, s *Store, jobID string) {
+	t.Helper()
+	jobStatus, stages, steps := jobStatuses(t, s, jobID)
+	if jobStatus != string(model.JobStatusCanceled) {
+		t.Errorf("job %s = %s, want canceled", jobID, jobStatus)
+	}
+	for _, st := range stages {
+		if st != string(model.JobStageStatusCanceled) {
+			t.Errorf("stage of %s = %s, want canceled", jobID, st)
+		}
+	}
+	for _, st := range steps {
+		if st != string(model.JobStepStatusCanceled) {
+			t.Errorf("step of %s = %s, want canceled", jobID, st)
+		}
+	}
+}
+
+func TestAckAlertGroupAtomic_CancelsEscalationOfItsGroup(t *testing.T) {
+	s := setupTestDB(t)
+	agID, jobID := seedEscalation(t, s, "team-cancel-ack")
+
+	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil)
+	if err != nil || !changed {
+		t.Fatalf("AckAlertGroupAtomic = %v, %v", changed, err)
+	}
+	requireCanceledThrough(t, s, jobID)
+}
+
+func TestResolveAlertGroupAtomic_CancelsEscalationOfItsGroup(t *testing.T) {
+	s := setupTestDB(t)
+	agID, jobID := seedEscalation(t, s, "team-cancel-resolve")
+
+	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil)
+	if err != nil || !changed {
+		t.Fatalf("ResolveAlertGroupAtomic = %v, %v", changed, err)
+	}
+	requireCanceledThrough(t, s, jobID)
+}
+
+func TestResolveAlertGroupWithAlertsAtomic_CancelsEscalationOfItsGroup(t *testing.T) {
+	s := setupTestDB(t)
+	agID, jobID := seedEscalation(t, s, "team-cancel-resolve-alerts")
+
+	changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, nil, nil, nil)
+	if err != nil || !changed {
+		t.Fatalf("ResolveAlertGroupWithAlertsAtomic = %v, %v", changed, err)
+	}
+	requireCanceledThrough(t, s, jobID)
+}
+
+// TestCancelEscalationJob_LeavesAnotherGroupAlone: cancellation names one alert
+// group, and a query that stopped naming it would take the whole table with it.
+func TestCancelEscalationJob_LeavesAnotherGroupAlone(t *testing.T) {
+	s := setupTestDB(t)
+	acked, ackedJob := seedEscalation(t, s, "team-cancel-mine")
+	_, otherJob := seedEscalation(t, s, "team-cancel-theirs")
+
+	if err := s.CancelEscalationJobByAlertGroupID(acked); err != nil {
+		t.Fatalf("CancelEscalationJobByAlertGroupID: %v", err)
+	}
+
+	requireCanceledThrough(t, s, ackedJob)
+	if status, _, _ := jobStatuses(t, s, otherJob); status != string(model.JobStatusPending) {
+		t.Errorf("another group's escalation = %s, want pending", status)
+	}
+}
+
+// TestCancelEscalationJob_LeavesOtherJobTypesAlone: the type predicate.
+//
+// Production does not put alert_group_id on resolution jobs today, so the row is
+// inserted directly - the point is the predicate, not the scenario. It stops
+// being hypothetical the moment another family gains that column.
+func TestCancelEscalationJob_LeavesOtherJobTypesAlone(t *testing.T) {
+	s := setupTestDB(t)
+	agID, escalationJob := seedEscalation(t, s, "team-cancel-types")
+
+	resolutionJob := uuid.New().String()
+	resolveKey := "resolve_" + agID
+	if _, err := s.GetDB().Exec(`
+		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id, current_stage, created_at, updated_at)
+		VALUES ($1, 'resolution', 'pending', '{}', $2, $3, 0, NOW(), NOW())`,
+		resolutionJob, resolveKey, agID); err != nil {
+		t.Fatalf("seed resolution job: %v", err)
+	}
+
+	if err := s.CancelEscalationJobByAlertGroupID(agID); err != nil {
+		t.Fatalf("CancelEscalationJobByAlertGroupID: %v", err)
+	}
+
+	requireCanceledThrough(t, s, escalationJob)
+	if status, _, _ := jobStatuses(t, s, resolutionJob); status != string(model.JobStatusPending) {
+		t.Errorf("resolution job of the same group = %s, want pending", status)
+	}
+}
+
+func TestCancelEscalationJobByAlertGroupID_NoActiveJob(t *testing.T) {
+	s := setupTestDB(t)
+	agID := createTestTeamAndAG(t, s, "team-cancel-none", model.AlertGroupStatusTriggered)
+
+	if err := s.CancelEscalationJobByAlertGroupID(agID); err != nil {
+		t.Errorf("cancelling with no active escalation = %v, want nil", err)
+	}
+}
+
+// TestCancelEscalationJob_ReachesChildrenOfEveryMatch: cancellation must not
+// stop at the first job it cancelled.
+//
+// The UPDATE cancels every matching row, so reading one id back and cancelling
+// only that job's stages and steps leaves the rest half-cancelled - jobs marked
+// canceled with children still pending, which the worker would happily claim.
+//
+// Today idx_one_escalation_per_ag admits a single escalation row per alert
+// group, so the case is unreachable in production and the defect would be
+// invisible. Epic 11 Sprint 2B replaces that index with namespace-scoped ones
+// and makes two live rows legal, so the test builds that schema now: it drops
+// the index, and puts it back.
+func TestCancelEscalationJob_ReachesChildrenOfEveryMatch(t *testing.T) {
+	s := setupTestDB(t)
+	agID, firstJob := seedEscalation(t, s, "team-cancel-many")
+
+	if _, err := s.GetDB().Exec(`DROP INDEX idx_one_escalation_per_ag`); err != nil {
+		t.Fatalf("drop the one-escalation index: %v", err)
+	}
+	t.Cleanup(func() {
+		// The rows this test adds violate the index, and it cannot be recreated
+		// over them - the extra escalation goes first, whatever happened above.
+		if _, err := s.GetDB().Exec(`DELETE FROM jobs WHERE alert_group_id = $1 AND id <> $2`,
+			agID, firstJob); err != nil {
+			t.Errorf("drop the extra escalation: %v", err)
+		}
+		if _, err := s.GetDB().Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_escalation_per_ag
+			ON jobs(alert_group_id) WHERE type = 'escalation' AND alert_group_id IS NOT NULL`); err != nil {
+			t.Errorf("restore the one-escalation index: %v", err)
+		}
+	})
+
+	secondJob, secondStage, secondStep := uuid.New().String(), uuid.New().String(), uuid.New().String()
+	if _, err := s.GetDB().Exec(`
+		INSERT INTO jobs (id, type, status, payload, dedup_key, alert_group_id, current_stage, created_at, updated_at)
+		VALUES ($1, 'escalation', 'pending', '{}', $2, $3, 0, NOW(), NOW())`,
+		secondJob, "escalation:"+agID, agID); err != nil {
+		t.Fatalf("seed the second escalation: %v", err)
+	}
+	if _, err := s.GetDB().Exec(`
+		INSERT INTO job_stages (id, job_id, stage_index, status, created_at, updated_at)
+		VALUES ($1, $2, 0, 'active', NOW(), NOW())`, secondStage, secondJob); err != nil {
+		t.Fatalf("seed its stage: %v", err)
+	}
+	if _, err := s.GetDB().Exec(`
+		INSERT INTO job_steps (id, job_id, stage_id, step_index, step_type, status, data, max_attempts, created_at, updated_at)
+		VALUES ($1, $2, $3, 0, 'dm', 'pending', '{}', 3, NOW(), NOW())`,
+		secondStep, secondJob, secondStage); err != nil {
+		t.Fatalf("seed its step: %v", err)
+	}
+
+	if err := s.CancelEscalationJobByAlertGroupID(agID); err != nil {
+		t.Fatalf("CancelEscalationJobByAlertGroupID: %v", err)
+	}
+
+	requireCanceledThrough(t, s, firstJob)
+	requireCanceledThrough(t, s, secondJob)
 }

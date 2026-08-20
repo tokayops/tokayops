@@ -340,7 +340,7 @@ type concurrentResolveStore struct {
 	*store.MockStore
 }
 
-func (s *concurrentResolveStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (s *concurrentResolveStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
 	// Simulate: another request resolved the AG between our read and this call
 	return false, nil
 }

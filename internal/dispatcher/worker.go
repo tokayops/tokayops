@@ -383,10 +383,8 @@ func (d *Dispatcher) ProcessAcknowledgedAlertGroups(ctx context.Context) {
 
 	for _, ag := range alertGroups {
 		// 1. Cancel any active escalation jobs - user acknowledged, no more escalation needed
-		if ag.DedupKey != "" {
-			if err := d.store.CancelJobByDedupKey(ag.DedupKey); err != nil {
-				log.Printf("JobController: Failed to cancel escalation for acknowledged AG %s: %v", ag.ID, err)
-			}
+		if err := d.store.CancelEscalationJobByAlertGroupID(ag.ID); err != nil {
+			log.Printf("JobController: Failed to cancel escalation for acknowledged AG %s: %v", ag.ID, err)
 		}
 
 		// 2. Create update job to update Slack message to yellow
@@ -457,7 +455,7 @@ func (d *Dispatcher) ProcessResolvedAlertGroups(ctx context.Context) {
 
 	for _, ag := range alertGroups {
 		// 1. Cancel any active escalation jobs
-		if err := d.store.CancelJobByDedupKey(ag.DedupKey); err != nil {
+		if err := d.store.CancelEscalationJobByAlertGroupID(ag.ID); err != nil {
 			log.Printf("JobController: Failed to cancel jobs for resolved AG %s: %v", ag.ID, err)
 		}
 

@@ -63,7 +63,7 @@ func (s *Service) Ack(alertGroupID string, actor Actor, meta map[string]string) 
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.store.AckAlertGroupAtomic(alertGroupID, actor.Name, meta, outboxEvent, ag.DedupKey)
+	changed, err := s.store.AckAlertGroupAtomic(alertGroupID, actor.Name, meta, outboxEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +112,7 @@ func (s *Service) Resolve(alertGroupID string, actor Actor, meta map[string]stri
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.store.ResolveAlertGroupAtomic(alertGroupID, actor.Name, meta, outboxEvent, ag.DedupKey)
+	changed, err := s.store.ResolveAlertGroupAtomic(alertGroupID, actor.Name, meta, outboxEvent)
 	if err != nil {
 		return nil, err
 	}

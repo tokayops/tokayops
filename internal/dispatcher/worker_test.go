@@ -855,13 +855,17 @@ func TestProcessAcknowledgedAlertGroups_CancelsEscalationJob(t *testing.T) {
 	}
 	s.UpsertNotificationDelivery(delivery)
 
-	// Create an active escalation job (simulating ongoing escalation)
+	// Create an active escalation job (simulating ongoing escalation).
+	// alert_group_id is what cancellation addresses; the dedup key is carried
+	// too, exactly as the escalation builder does it.
 	escalationDedupKey := "test_dedup_key" // Same as ag.DedupKey
+	escalationAGID := ag.ID
 	escalationJob := &model.Job{
-		ID:       "escalation_job_1",
-		Type:     "escalation",
-		Status:   model.JobStatusRunning,
-		DedupKey: &escalationDedupKey,
+		ID:           "escalation_job_1",
+		Type:         "escalation",
+		Status:       model.JobStatusRunning,
+		DedupKey:     &escalationDedupKey,
+		AlertGroupID: &escalationAGID,
 	}
 	escalationStep := &model.JobStep{
 		ID:        "step1",

@@ -656,7 +656,7 @@ func (m *MockStore) TouchAlertGroup(id string) error {
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -689,12 +689,12 @@ func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string
 
 	m.insertOutboxEvent(outboxEvent)
 
-	m.cancelJobByDedupKeyLocked(dedupKey)
+	m.cancelEscalationJobByAlertGroupIDLocked(id)
 
 	return true, nil
 }
 
-func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -727,12 +727,12 @@ func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]st
 
 	m.insertOutboxEvent(outboxEvent)
 
-	m.cancelJobByDedupKeyLocked(dedupKey)
+	m.cancelEscalationJobByAlertGroupIDLocked(id)
 
 	return true, nil
 }
 
-func (m *MockStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (m *MockStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -764,20 +764,44 @@ func (m *MockStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.
 	}
 
 	m.insertOutboxEvent(outboxEvent)
-	m.cancelJobByDedupKeyLocked(dedupKey)
+	m.cancelEscalationJobByAlertGroupIDLocked(id)
 
 	return true, nil
 }
 
-// cancelJobByDedupKeyLocked cancels jobs matching dedupKey. Caller must hold m.mu.
-func (m *MockStore) cancelJobByDedupKeyLocked(dedupKey string) {
-	if dedupKey == "" {
+// cancelEscalationJobByAlertGroupIDLocked cancels one alert group's escalation
+// job, its active stages and its pending steps. Caller must hold m.mu.
+//
+// One helper, because there is one cancellation. Before Epic 11 the mock held
+// three different answers to the same question: the transitions cancelled the
+// job alone, the public method cancelled the job and its stages, and neither
+// touched steps - while the real store cancelled all three. A double that
+// disagrees with the store is a test that proves the wrong thing.
+func (m *MockStore) cancelEscalationJobByAlertGroupIDLocked(alertGroupID string) {
+	if alertGroupID == "" {
 		return
 	}
 	for _, job := range m.jobs {
-		if job.DedupKey != nil && *job.DedupKey == dedupKey {
-			if job.Status == model.JobStatusPending || job.Status == model.JobStatusRunning {
-				job.Status = model.JobStatusCanceled
+		if job.Type != "escalation" || job.AlertGroupID == nil || *job.AlertGroupID != alertGroupID {
+			continue
+		}
+		if job.Status != model.JobStatusPending && job.Status != model.JobStatusRunning {
+			continue
+		}
+		job.Status = model.JobStatusCanceled
+
+		for _, stage := range m.jobStages {
+			if stage.JobID == job.ID &&
+				(stage.Status == model.JobStageStatusActive || stage.Status == model.JobStageStatusBlocked) {
+				stage.Status = model.JobStageStatusCanceled
+			}
+		}
+		for _, step := range m.jobSteps {
+			if step.JobID == job.ID &&
+				(step.Status == model.JobStepStatusPending ||
+					step.Status == model.JobStepStatusBlocked ||
+					step.Status == model.JobStepStatusRetry) {
+				step.Status = model.JobStepStatusCanceled
 			}
 		}
 	}
@@ -2141,27 +2165,14 @@ func (m *MockStore) FinishStepAndAdvance(stepID string, leaseToken string, outco
 
 	return model.AdvanceUnlockedNextStage, nil
 }
-func (m *MockStore) CancelJobByDedupKey(dedupKey string) error {
+func (m *MockStore) CancelEscalationJobByAlertGroupID(alertGroupID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for _, job := range m.jobs {
-		if job.DedupKey != nil && *job.DedupKey == dedupKey {
-			if job.Status == model.JobStatusPending || job.Status == model.JobStatusRunning {
-				job.Status = model.JobStatusCanceled
-				// Cancel active/blocked stages
-				for _, stage := range m.jobStages {
-					if stage.JobID == job.ID {
-						if stage.Status == model.JobStageStatusActive || stage.Status == model.JobStageStatusBlocked {
-							stage.Status = model.JobStageStatusCanceled
-						}
-					}
-				}
-			}
-		}
-	}
+	m.cancelEscalationJobByAlertGroupIDLocked(alertGroupID)
 	return nil
 }
+
 func (m *MockStore) ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error {
 	return nil
 }
