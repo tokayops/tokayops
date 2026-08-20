@@ -306,7 +306,7 @@ func (n *HandoffNotifier) createHandoffJob(sc schedulerender.ScheduleOnCall, kin
 	job := &model.Job{
 		ID:     uuid.New().String(),
 		Status: model.JobStatusPending,
-		Dedup:  jobdedup.Handoff(occurrenceKey(kind, sc.ScheduleID, next)),
+		Dedup:  jobdedup.HandoffOccurrence(occurrenceOf(kind, sc.ScheduleID, next)),
 		// Stamped like every other job builder does. Left unset - as it was
 		// before - the row lands at year zero, and anything ordering jobs by
 		// creation time sees notifications in an order that has nothing to do

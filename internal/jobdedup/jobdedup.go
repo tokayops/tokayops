@@ -41,7 +41,22 @@ const (
 	NamespaceAckUpdate   Namespace = "ack_update"
 	NamespaceAlertUpdate Namespace = "alert_update"
 	NamespaceResolution  Namespace = "resolution"
-	NamespaceHandoff     Namespace = "handoff"
+
+	// NamespaceHandoff is history and has no constructor. Handover
+	// notifications are written under NamespaceHandoffOccurrence below; this
+	// name owns the rows written before they were identified by the occurrence
+	// they announce, under the policy those rows were written with.
+	//
+	// It stays declared because the registry is how a row is read: an unknown
+	// namespace makes the row unreadable, jobs are not deleted, and a
+	// while_active row that has finished holds no claim anyone needs to
+	// reclaim - so there is nothing to migrate and nothing to gain by
+	// forgetting the name.
+	NamespaceHandoff Namespace = "handoff"
+
+	// NamespaceHandoffOccurrence identifies a handover by the occurrence it
+	// announces, and holds that identity forever.
+	NamespaceHandoffOccurrence Namespace = "handoff_occurrence"
 )
 
 // Policy is everything a namespace determines: how long its identities are
@@ -77,7 +92,12 @@ var policies = map[Namespace]determined{
 	NamespaceAckUpdate:   {ScopeWhileActive, "update"},
 	NamespaceAlertUpdate: {ScopeWhileActive, "update"},
 	NamespaceResolution:  {ScopeWhileActive, "resolution"},
-	NamespaceHandoff:     {ScopeWhileActive, "handoff_notify"},
+
+	// Both handover families carry the same job type and differ in what a row
+	// of theirs claims: the first for as long as the job runs, the second for
+	// good. That is exactly why they are two names.
+	NamespaceHandoff:           {ScopeWhileActive, "handoff_notify"},
+	NamespaceHandoffOccurrence: {ScopeForever, "handoff_notify"},
 }
 
 // Policies returns every known namespace with what it determines, ordered by
@@ -178,6 +198,11 @@ func Escalation(alertGroupID string) *Spec {
 }
 
 // AckUpdate identifies the message update that follows an acknowledgement.
+//
+// The prefix is one-to-one with the alert group ID and predates the model. It
+// stays: the namespace is what says which family this is, so the prefix says
+// nothing twice - but rewriting it would give one identity two spellings under
+// one name, for as long as any job written with the old one is still running.
 func AckUpdate(alertGroupID string) *Spec {
 	return mustSpec(NamespaceAckUpdate, "update_ack_"+alertGroupID)
 }
@@ -190,14 +215,4 @@ func AlertUpdate(alertGroupID string) *Spec {
 // Resolution identifies the message update that follows a resolve.
 func Resolution(alertGroupID string) *Spec {
 	return mustSpec(NamespaceResolution, "resolve_"+alertGroupID)
-}
-
-// Handoff identifies one on-call handover notification.
-//
-// The prefixes above and this key keep the encoding they had before the model
-// existed. Sprint 3 decides each family's identity for real; rewriting the
-// strings here would mean reading the same history two different ways in two
-// releases.
-func Handoff(occurrenceKey string) *Spec {
-	return mustSpec(NamespaceHandoff, occurrenceKey)
 }

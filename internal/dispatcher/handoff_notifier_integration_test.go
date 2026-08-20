@@ -150,7 +150,7 @@ func (e *handoffEnv) warmUp() {
 
 type notifyJob struct {
 	id       string
-	dedupKey string
+	alertKey string
 	status   string
 }
 
@@ -168,7 +168,7 @@ func (e *handoffEnv) handoffJobs() []notifyJob {
 	var out []notifyJob
 	for rows.Next() {
 		var j notifyJob
-		if err := rows.Scan(&j.id, &j.dedupKey, &j.status); err != nil {
+		if err := rows.Scan(&j.id, &j.alertKey, &j.status); err != nil {
 			e.t.Fatalf("scan job: %v", err)
 		}
 		out = append(out, j)
@@ -286,10 +286,10 @@ func TestHandoffNotifierRepeatedCompositionIsNotDeduped(t *testing.T) {
 		if j.status != string(model.JobStatusPending) {
 			t.Errorf("job %s is %s; the test needs them pending for dedup to be live", j.id, j.status)
 		}
-		if seen[j.dedupKey] {
-			t.Errorf("duplicate dedup key %q", j.dedupKey)
+		if seen[j.alertKey] {
+			t.Errorf("duplicate dedup key %q", j.alertKey)
 		}
-		seen[j.dedupKey] = true
+		seen[j.alertKey] = true
 	}
 	// The first and third handoffs put the same group on duty, so their keys
 	// differ only in the moment of activation.
@@ -323,8 +323,8 @@ func TestHandoffNotifierEditedGroupIsNotDeduped(t *testing.T) {
 	if len(jobs) != 2 {
 		t.Fatalf("%d jobs, want one per addition: %+v", len(jobs), jobs)
 	}
-	if jobs[0].dedupKey == jobs[1].dedupKey {
-		t.Fatalf("both additions produced the dedup key %q", jobs[0].dedupKey)
+	if jobs[0].alertKey == jobs[1].alertKey {
+		t.Fatalf("both additions produced the dedup key %q", jobs[0].alertKey)
 	}
 	for _, j := range jobs {
 		if got := env.stepTargets(j.id)["slack"]; got != "S_B" {
@@ -365,6 +365,67 @@ func TestHandoffNotifierTwoInstancesCreateOneJob(t *testing.T) {
 
 	if jobs := env.handoffJobs(); len(jobs) != 1 {
 		t.Fatalf("%d jobs from two instances, want 1: %+v", len(jobs), jobs)
+	}
+}
+
+// TestHandoffNotifierSecondInstanceAfterTheJobFinished is bug 13.
+//
+// The test above ticks the two instances back to back, while the first job is
+// still pending - which is the window the old rule covered, and the reason the
+// bug survived a test suite. The instances of a real deployment tick on
+// unrelated phases, a minute apart, and the job they race over lives for a
+// second or two. By the time the second instance looks, the first job is done:
+// under a while_active rule its claim is gone, the identity is free again, and
+// whoever came on call is told twice.
+//
+// What makes the second DM wrong is not that it is a duplicate message but that
+// the occurrence it announces already happened. That is the statement the
+// forever policy makes, and this is where it is tested.
+func TestHandoffNotifierSecondInstanceAfterTheJobFinished(t *testing.T) {
+	env := setupHandoffEnv(t)
+	env.save(dailyConfig(
+		group(handoffGroupA, "U_A"),
+		group(handoffGroupB, "U_B"),
+	))
+
+	second := NewHandoffNotifier(env.s, env.renderer, staticDmProviders{"slack"}, time.Minute)
+
+	env.warmUp()
+	if !second.checkAll(context.Background()) {
+		t.Fatal("second instance failed to warm up")
+	}
+	second.cacheMu.Lock()
+	second.warmedUp = true
+	second.cacheMu.Unlock()
+
+	// The first instance detects the handover and its job runs to completion.
+	env.now = env.now.Add(24 * time.Hour)
+	if !env.notifier.checkAll(context.Background()) {
+		t.Fatal("first instance tick failed")
+	}
+	jobs := env.handoffJobs()
+	if len(jobs) != 1 {
+		t.Fatalf("%d jobs from the first instance, want 1: %+v", len(jobs), jobs)
+	}
+	if _, err := env.s.GetDB().Exec(
+		`UPDATE jobs SET status = 'succeeded', finished_at = NOW() WHERE id = $1`, jobs[0].id); err != nil {
+		t.Fatalf("finish the job: %v", err)
+	}
+
+	// Only now does the other instance tick. The DM has been delivered; this
+	// instance has no way of knowing that except through the claim in the
+	// table.
+	if !second.checkAll(context.Background()) {
+		t.Fatal("second instance tick failed")
+	}
+
+	after := env.handoffJobs()
+	if len(after) != 1 {
+		t.Fatalf("%d jobs after the second instance ticked, want 1 - the occurrence was announced already: %+v",
+			len(after), after)
+	}
+	if after[0].id != jobs[0].id {
+		t.Errorf("job %s replaced by %s", jobs[0].id, after[0].id)
 	}
 }
 
@@ -579,8 +640,8 @@ func TestHandoffNotifierEditedOverrideIsNotDeduped(t *testing.T) {
 	if len(jobs) != 4 {
 		t.Fatalf("%d jobs over four activations, want 4: %+v", len(jobs), jobs)
 	}
-	if jobs[1].dedupKey == jobs[3].dedupKey {
-		t.Fatalf("both activations of U_C share the dedup key %q; the second was suppressed", jobs[1].dedupKey)
+	if jobs[1].alertKey == jobs[3].alertKey {
+		t.Fatalf("both activations of U_C share the dedup key %q; the second was suppressed", jobs[1].alertKey)
 	}
 	for _, j := range jobs {
 		if j.status != string(model.JobStatusPending) {

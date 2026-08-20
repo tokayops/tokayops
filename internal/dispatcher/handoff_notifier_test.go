@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -85,7 +86,7 @@ func (m *mockNotifierStore) CreateJobWithDedup(job *model.Job, _ []*model.JobSta
 	return true, nil
 }
 
-func (m *mockNotifierStore) dedupKeys() []string {
+func (m *mockNotifierStore) alertKeys() []string {
 	var out []string
 	for _, j := range m.jobs {
 		if j.job.Dedup != nil {
@@ -195,8 +196,14 @@ func TestNotifierNaturalHandoff(t *testing.T) {
 	if got := env.targets(); strings.Join(got, ",") != "U-CAROL" {
 		t.Fatalf("notified %v, want carol alone - bob was already on call", got)
 	}
-	if spec := env.jobs()[0].job.Dedup; spec == nil || !strings.HasPrefix(spec.Key(), kindHandoff+":sched-1:") {
-		t.Fatalf("dedup spec = %+v, want a handoff key for sched-1", spec)
+	// The identity is the occurrence, so it is compared against the occurrence
+	// rather than read: the key is a digest, and asking what it starts with
+	// would only pin the schedule it names.
+	want := jobdedup.HandoffOccurrence(occurrenceOf(kindHandoff, "sched-1",
+		observe(rotationDuty("sched-1", "g-b", "bob", "carol"))))
+	if spec := env.jobs()[0].job.Dedup; spec == nil ||
+		spec.Namespace() != want.Namespace() || spec.Key() != want.Key() {
+		t.Fatalf("dedup spec = %+v, want the handoff occurrence of sched-1 (%s)", spec, want.Key())
 	}
 }
 
@@ -211,8 +218,10 @@ func TestNotifierAddedToActiveShift(t *testing.T) {
 	if got := env.targets(); strings.Join(got, ",") != "U-DAVE" {
 		t.Fatalf("notified %v, want dave alone", got)
 	}
-	if spec := env.jobs()[0].job.Dedup; spec == nil || !strings.HasPrefix(spec.Key(), kindAddedToActiveShift+":") {
-		t.Fatalf("dedup spec = %+v, want an added_to_active_shift key", spec)
+	want := jobdedup.HandoffOccurrence(occurrenceOf(kindAddedToActiveShift, "sched-1",
+		observe(rotationDuty("sched-1", "g-b", "bob", "dave"))))
+	if spec := env.jobs()[0].job.Dedup; spec == nil || spec.Key() != want.Key() {
+		t.Fatalf("dedup spec = %+v, want the added_to_active_shift occurrence (%s)", spec, want.Key())
 	}
 	if msg := env.message(); !strings.Contains(msg, "added to the on-call shift in progress") {
 		t.Fatalf("message does not announce joining a shift in progress:\n%s", msg)
@@ -498,7 +507,7 @@ func TestNotifierSecondInstanceCountsOneNotification(t *testing.T) {
 
 	// The other instance got there first and its job is still pending.
 	next := observe(rotationDuty("sched-1", "g-b", "bob"))
-	env.store.dedupHits[occurrenceKey(kindHandoff, "sched-1", next)] = true
+	env.store.dedupHits[occKey(kindHandoff, "sched-1", next)] = true
 
 	before := counterValue(t, metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kindHandoff))
 	env.tick(rotationDuty("sched-1", "g-b", "bob"))
@@ -603,15 +612,20 @@ func TestNotifierKindsDoNotSuppressEachOther(t *testing.T) {
 	env.notifier.cacheMu.Unlock()
 	env.tick(added)
 
-	keys := env.store.dedupKeys()
+	keys := env.store.alertKeys()
 	if len(keys) != 2 {
 		t.Fatalf("created %d jobs, want one per kind: %v", len(keys), keys)
 	}
 	if keys[0] == keys[1] {
 		t.Fatalf("both kinds produced the dedup key %q", keys[0])
 	}
-	if !strings.HasPrefix(keys[0], kindAddedToActiveShift+":") || !strings.HasPrefix(keys[1], kindHandoff+":") {
-		t.Fatalf("dedup keys do not carry their kinds: %v", keys)
+	// Which key belongs to which kind, stated rather than inferred from the
+	// spelling: the kind is inside the digest, not in front of it.
+	if want := occKey(kindAddedToActiveShift, "sched-1", observe(added)); keys[0] != want {
+		t.Errorf("first job keyed %q, want the added_to_active_shift occurrence %q", keys[0], want)
+	}
+	if want := occKey(kindHandoff, "sched-1", observe(added)); keys[1] != want {
+		t.Errorf("second job keyed %q, want the handoff occurrence %q", keys[1], want)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	_ "github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/config"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 var testStore *Store
@@ -44,6 +45,21 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	os.Exit(code)
+}
+
+// forceAlertGroupStatus puts a group into a status whatever it is in now.
+//
+// The store has no such method any more, on purpose: production moves a group
+// with TransitionAlertGroupStatus, which states what it expected to find.
+// Fixtures that rewind a group to set up the next assertion have nothing to
+// state, so they say it in SQL here rather than keeping an unconditional setter
+// in the contract.
+func forceAlertGroupStatus(t *testing.T, s *Store, id string, status model.AlertGroupStatus) {
+	t.Helper()
+	if _, err := s.db.Exec(
+		`UPDATE alert_groups SET status = $1, updated_at = NOW() WHERE id = $2`, status, id); err != nil {
+		t.Fatalf("force alert group %s to %s: %v", id, status, err)
+	}
 }
 
 // setupTestDB cleans up the database for a fresh test run

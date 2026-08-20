@@ -271,10 +271,10 @@ func (s *Store) seedAlertGroups() error {
 
 	now := time.Now()
 	for i, ag := range alertGroups {
-		dedupKey := fmt.Sprintf("seed-%s-%d", ag.Title, i)
+		alertKey := fmt.Sprintf("seed-%s-%d", ag.Title, i)
 
 		// Check if already exists
-		existing, _ := s.GetActiveAlertGroup(dedupKey)
+		existing, _ := s.GetActiveAlertGroupByAlertKey(alertKey)
 		if existing != nil {
 			continue
 		}
@@ -291,7 +291,7 @@ func (s *Store) seedAlertGroups() error {
 
 		alertGroup := &model.AlertGroup{
 			ID:               uuid.New().String(),
-			DedupKey:         dedupKey,
+			AlertKey:         alertKey,
 			Status:           ag.Status,
 			Title:            ag.Title,
 			TeamID:           ag.TeamID,

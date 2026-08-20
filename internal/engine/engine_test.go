@@ -66,7 +66,7 @@ func TestProcessNewAlertGroups(t *testing.T) {
 	// Seed a NEW alert group
 	ag := &model.AlertGroup{
 		ID:        "ag-1",
-		DedupKey:  "dedup-1",
+		AlertKey:  "dedup-1",
 		Status:    model.AlertGroupStatusNew,
 		TeamID:    "devops",
 		Severity:  "critical",
@@ -81,7 +81,7 @@ func TestProcessNewAlertGroups(t *testing.T) {
 	e.ProcessNewAlertGroups(context.Background())
 
 	// Verify State
-	updated, err := s.GetActiveAlertGroup("dedup-1")
+	updated, err := s.GetActiveAlertGroupByAlertKey("dedup-1")
 	if err != nil {
 		t.Errorf("Failed to fetch updated alert group: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestPolicySnapshot_Versioning(t *testing.T) {
 	// 3. Process AG 1 (should get V1)
 	ag1 := &model.AlertGroup{
 		ID:       "ag1",
-		DedupKey: "dk-ag1",
+		AlertKey: "dk-ag1",
 		Status:   model.AlertGroupStatusNew,
 		TeamID:   teamID,
 		Severity: "info",
@@ -212,7 +212,7 @@ func TestPolicySnapshot_Versioning(t *testing.T) {
 	// 5. Process AG 2 (should get V2)
 	ag2 := &model.AlertGroup{
 		ID:       "ag2",
-		DedupKey: "dk-ag2",
+		AlertKey: "dk-ag2",
 		Status:   model.AlertGroupStatusNew,
 		TeamID:   teamID,
 		Severity: "info",
@@ -266,7 +266,7 @@ func TestEngine_BuildFailure_AGStaysNew(t *testing.T) {
 
 	ag := &model.AlertGroup{
 		ID:       "ag-build-fail",
-		DedupKey: "dedup-build-fail",
+		AlertKey: "dedup-build-fail",
 		Status:   model.AlertGroupStatusNew,
 		TeamID:   teamID,
 		Severity: "info",
@@ -295,7 +295,7 @@ func TestEngine_FirehoseCreation(t *testing.T) {
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	// Create AG (Critical) - no policy, firehose only
-	ag := &model.AlertGroup{ID: "ag_fire", Severity: "critical", DedupKey: "dk_fire", Status: model.AlertGroupStatusNew}
+	ag := &model.AlertGroup{ID: "ag_fire", Severity: "critical", AlertKey: "dk_fire", Status: model.AlertGroupStatusNew}
 	s.CreateAlertGroup(ag)
 
 	eng.ProcessNewAlertGroups(context.Background())
@@ -353,7 +353,7 @@ func TestEngine_ReconcileStaleProcessing(t *testing.T) {
 	// Simulate crash scenario: AG is in "processing" with stale updated_at, no job exists
 	ag := &model.AlertGroup{
 		ID:        "ag-orphan",
-		DedupKey:  "dk-orphan",
+		AlertKey:  "dk-orphan",
 		Status:    model.AlertGroupStatusProcessing,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -433,7 +433,7 @@ func TestEngine_ScheduleRecreation_OnCallConsistency(t *testing.T) {
 	// Create alert group
 	ag := &model.AlertGroup{
 		ID:        "ag-stale-engine",
-		DedupKey:  "dk-stale-engine",
+		AlertKey:  "dk-stale-engine",
 		Status:    model.AlertGroupStatusNew,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -510,7 +510,7 @@ func TestEngine_StaleProcessing_WithSucceededJob_NotReconciled(t *testing.T) {
 	// AG in processing with stale updated_at
 	ag := &model.AlertGroup{
 		ID:        "ag-succeeded-noop",
-		DedupKey:  "dk-succeeded-noop",
+		AlertKey:  "dk-succeeded-noop",
 		Status:    model.AlertGroupStatusProcessing,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -562,7 +562,7 @@ func TestEnsureEscalationJob_SkipsAckedAG(t *testing.T) {
 	// Create AG already acknowledged
 	ag := &model.AlertGroup{
 		ID:        "ag-acked",
-		DedupKey:  "dk-acked",
+		AlertKey:  "dk-acked",
 		Status:    model.AlertGroupStatusAcknowledged,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -620,7 +620,7 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	// Create AG
 	ag := &model.AlertGroup{
 		ID:        "ag-dedup",
-		DedupKey:  "dk-dedup",
+		AlertKey:  "dk-dedup",
 		Status:    model.AlertGroupStatusNew,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -653,7 +653,7 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	})
 
 	// Force AG back to "new" to re-trigger processing
-	s.UpdateAlertGroupStatus("ag-dedup", model.AlertGroupStatusNew)
+	s.SetAlertGroupStatus("ag-dedup", model.AlertGroupStatusNew)
 
 	// Second call — job already exists (dedup), snapshot should NOT be overwritten
 	eng.ProcessNewAlertGroups(context.Background())
@@ -688,7 +688,7 @@ func TestEnsureEscalationJob_SkipsSucceededJob(t *testing.T) {
 	// Create AG in "new"
 	ag := &model.AlertGroup{
 		ID:        "ag-succeeded-skip",
-		DedupKey:  "dk-succeeded-skip",
+		AlertKey:  "dk-succeeded-skip",
 		Status:    model.AlertGroupStatusNew,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -715,7 +715,7 @@ func TestEnsureEscalationJob_SkipsSucceededJob(t *testing.T) {
 	s.MarkJobSucceeded(jobdedup.Escalation("ag-succeeded-skip"))
 
 	// Force AG back to new to re-trigger processing
-	s.UpdateAlertGroupStatus("ag-succeeded-skip", model.AlertGroupStatusNew)
+	s.SetAlertGroupStatus("ag-succeeded-skip", model.AlertGroupStatusNew)
 
 	// Second run — should NOT create a new job (DB invariant: 1 escalation per AG)
 	eng.ProcessNewAlertGroups(context.Background())
@@ -742,7 +742,7 @@ func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 	staleTime := time.Now().Add(-60 * time.Second)
 	ag := &model.AlertGroup{
 		ID:        "ag-stale-touch",
-		DedupKey:  "dk-stale-touch",
+		AlertKey:  "dk-stale-touch",
 		Status:    model.AlertGroupStatusProcessing,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -787,7 +787,7 @@ func TestEngine_OnCallSnapshot_OverrideCarriesSource(t *testing.T) {
 	teamID := "team-override"
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Override Team"})
 	ag := &model.AlertGroup{
-		ID: "ag-override", DedupKey: "dk-override", TeamID: teamID, Severity: "info",
+		ID: "ag-override", AlertKey: "dk-override", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -826,7 +826,7 @@ func TestEngine_OnCallSnapshot_NoSchedule_IsEmptyNotAnError(t *testing.T) {
 	teamID := "team-scheduleless"
 	s.CreateTeam(&model.Team{ID: teamID, Name: "No Schedule"})
 	ag := &model.AlertGroup{
-		ID: "ag-no-sched", DedupKey: "dk-no-sched", TeamID: teamID, Severity: "info",
+		ID: "ag-no-sched", AlertKey: "dk-no-sched", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -855,7 +855,7 @@ func TestEngine_OnCallSnapshot_DeletedSchedule_IsEmpty(t *testing.T) {
 	teamID := "team-deleted-sched"
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Deleted Schedule"})
 	ag := &model.AlertGroup{
-		ID: "ag-deleted-sched", DedupKey: "dk-deleted-sched", TeamID: teamID, Severity: "info",
+		ID: "ag-deleted-sched", AlertKey: "dk-deleted-sched", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -887,7 +887,7 @@ func TestEngine_OnCallSnapshot_L2IsRecorded(t *testing.T) {
 	teamID := "team-l2"
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Two Layers"})
 	ag := &model.AlertGroup{
-		ID: "ag-l2", DedupKey: "dk-l2", TeamID: teamID, Severity: "info",
+		ID: "ag-l2", AlertKey: "dk-l2", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -936,7 +936,7 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Handoff Race", DefaultPolicyID: policyID})
 
 	ag := &model.AlertGroup{
-		ID: "ag-handoff-race", DedupKey: "dk-handoff-race", TeamID: teamID, Severity: "info",
+		ID: "ag-handoff-race", AlertKey: "dk-handoff-race", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -1017,7 +1017,7 @@ func TestEngine_OnCallReadFailure_DefersEverything(t *testing.T) {
 	})
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Unreadable", DefaultPolicyID: policyID})
 	ag := &model.AlertGroup{
-		ID: "ag-unreadable", DedupKey: "dk-unreadable", TeamID: teamID, Severity: "info",
+		ID: "ag-unreadable", AlertKey: "dk-unreadable", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -1077,7 +1077,7 @@ func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
 	})
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Recovers", DefaultPolicyID: policyID})
 	ag := &model.AlertGroup{
-		ID: "ag-recovers", DedupKey: "dk-recovers", TeamID: teamID, Severity: "info",
+		ID: "ag-recovers", AlertKey: "dk-recovers", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -1151,7 +1151,7 @@ func TestEngine_DeferredTick_NamesTheBatchOnceAndNothingPerGroup(t *testing.T) {
 	s.CreateTeam(&model.Team{ID: "team-batch", Name: "Batch", DefaultPolicyID: policyID})
 	for _, id := range []string{"ag-first", "ag-second"} {
 		s.CreateAlertGroup(&model.AlertGroup{
-			ID: id, DedupKey: "dk-" + id, TeamID: "team-batch", Severity: "info",
+			ID: id, AlertKey: "dk-" + id, TeamID: "team-batch", Severity: "info",
 			Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		})
 	}

@@ -107,7 +107,15 @@ func (s *Store) InitDB() error {
 	-- Alert Groups table (renamed from incidents)
 	CREATE TABLE IF NOT EXISTS alert_groups (
 		id TEXT PRIMARY KEY,
-		dedup_key TEXT NOT NULL,
+		-- What the alerting system calls this alert: the group key Alertmanager
+		-- sends, or the fingerprint of a single alert. It names the ALERT and
+		-- not this row - the same key comes back every time the same thing
+		-- breaks, and each time it is a new incident with a new id.
+		--
+		-- Not to be confused with jobs.dedup_key, which names a piece of
+		-- background work. Confusing the two is how an escalation once came to
+		-- be identified by the alert instead of by the incident.
+		alert_key TEXT NOT NULL,
 		status TEXT NOT NULL,
 		title TEXT,
 		
@@ -143,9 +151,21 @@ func (s *Store) InitDB() error {
 		IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'alert_groups' AND column_name = 'oncall_snapshot') THEN
 			ALTER TABLE alert_groups ADD COLUMN oncall_snapshot JSONB;
 		END IF;
+		-- dedup_key -> alert_key. Two different identities were spelled the
+		-- same way in one schema: the alert this group is about, and the work
+		-- a job claims. The index below follows the column, so nothing else
+		-- has to change here.
+		IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'alert_groups' AND column_name = 'dedup_key')
+		   AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'alert_groups' AND column_name = 'alert_key') THEN
+			ALTER TABLE alert_groups RENAME COLUMN dedup_key TO alert_key;
+		END IF;
 	END $$;
 	
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_active_alert_groups ON alert_groups(dedup_key) WHERE status NOT IN ('resolved', 'closed');
+	-- One live incident per alert: while a group is open, another one for the
+	-- same alert key cannot be created, and once it is resolved or closed the
+	-- key is free for the next time the same thing breaks. This index is that
+	-- rule; nothing else states it.
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_active_alert_groups ON alert_groups(alert_key) WHERE status NOT IN ('resolved', 'closed');
 	CREATE INDEX IF NOT EXISTS idx_alert_groups_status ON alert_groups(status);
 	CREATE INDEX IF NOT EXISTS idx_alert_groups_team_id ON alert_groups(team_id);
 
@@ -368,6 +388,14 @@ func (s *Store) InitDB() error {
 		-- 8. Add slack_update_pending flag for tracking when Slack messages need updating
 		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_pending') THEN
 			ALTER TABLE alert_groups ADD COLUMN slack_update_pending BOOLEAN NOT NULL DEFAULT FALSE;
+		END IF;
+
+		-- 8. The version of the flag above. Raising the flag increments it, and
+		-- the producer clears the flag only for the version it read, so an
+		-- alert that arrives while the update job is being created keeps the
+		-- flag up instead of being cleared away with it.
+		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_generation') THEN
+			ALTER TABLE alert_groups ADD COLUMN slack_update_generation BIGINT NOT NULL DEFAULT 0;
 		END IF;
 
 		-- 9. Add alert_group_id column to jobs table
@@ -911,9 +939,10 @@ func (s *Store) InitDB() error {
 
 // alertGroupColumns is the standard SELECT clause for alert_groups.
 // All query functions should use this to ensure consistent column ordering.
-const alertGroupColumns = `id, dedup_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step,
+const alertGroupColumns = `id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step,
 	external_url, alerts_data, policy_snapshot, oncall_snapshot,
-	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, ack_processed_at, slack_update_pending`
+	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, ack_processed_at,
+	slack_update_pending, slack_update_generation`
 
 // alertGroupScanner is an interface for scanning rows (works with *sql.Row and *sql.Rows).
 type alertGroupScanner interface {
@@ -929,12 +958,12 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	var alertsData, policySnapshot, oncallSnapshot, acknowledgedBy, resolvedBy sql.NullString
 
 	err := scanner.Scan(
-		&ag.ID, &ag.DedupKey, &ag.Status, &ag.Title,
+		&ag.ID, &ag.AlertKey, &ag.Status, &ag.Title,
 		&teamID, &teamNameSnapshot, &severity, &policyID, &ag.CurrentStep,
 		&externalURL, &alertsData,
 		&policySnapshot, &oncallSnapshot,
 		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt, &acknowledgedBy, &resolvedBy, &ackProcessedAt,
-		&ag.SlackUpdatePending,
+		&ag.SlackUpdatePending, &ag.SlackUpdateGeneration,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -973,12 +1002,15 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	return &ag, nil
 }
 
-func (s *Store) GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error) {
+// GetActiveAlertGroupByAlertKey finds the incident currently open for an alert,
+// if there is one. A resolved or closed group is not it: the same alert firing
+// again is the next incident, not this one.
+func (s *Store) GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error) {
 	query := `SELECT ` + alertGroupColumns + `
 			  FROM alert_groups
-			  WHERE dedup_key = $1 AND status NOT IN ($2, $3)`
+			  WHERE alert_key = $1 AND status NOT IN ($2, $3)`
 
-	row := s.db.QueryRow(query, dedupKey, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed)
+	row := s.db.QueryRow(query, alertKey, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed)
 	ag, err := scanAlertGroupRow(row)
 	if err != nil {
 		return nil, err
@@ -998,7 +1030,7 @@ func (s *Store) CreateAlertGroup(ag *model.AlertGroup) error {
 		snapshotJson, _ = json.Marshal(ag.PolicySnapshot)
 	}
 
-	query := `INSERT INTO alert_groups (id, dedup_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at)
+	query := `INSERT INTO alert_groups (id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at)
 			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`
 
 	var snapshotVal sql.NullString
@@ -1006,7 +1038,7 @@ func (s *Store) CreateAlertGroup(ag *model.AlertGroup) error {
 		snapshotVal = sql.NullString{String: string(snapshotJson), Valid: true}
 	}
 
-	_, err := s.db.Exec(query, ag.ID, ag.DedupKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep, ag.ExternalURL, string(alertsJson), snapshotVal, ag.AcknowledgedBy, ag.ResolvedBy, ag.CreatedAt, ag.UpdatedAt)
+	_, err := s.db.Exec(query, ag.ID, ag.AlertKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep, ag.ExternalURL, string(alertsJson), snapshotVal, ag.AcknowledgedBy, ag.ResolvedBy, ag.CreatedAt, ag.UpdatedAt)
 	return err
 }
 
@@ -1030,9 +1062,9 @@ func (s *Store) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*m
 		snapshotVal = sql.NullString{String: string(snapshotJson), Valid: true}
 	}
 	_, err = tx.Exec(
-		`INSERT INTO alert_groups (id, dedup_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at)
+		`INSERT INTO alert_groups (id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-		ag.ID, ag.DedupKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep,
+		ag.ID, ag.AlertKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep,
 		ag.ExternalURL, string(alertsJson), snapshotVal,
 		ag.AcknowledgedBy, ag.ResolvedBy, ag.CreatedAt, ag.UpdatedAt,
 	)
@@ -1066,22 +1098,15 @@ func (s *Store) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*m
 	return tx.Commit()
 }
 
-func (s *Store) UpdateAlertGroupStatus(id string, status model.AlertGroupStatus) error {
-	query := `UPDATE alert_groups SET status = $1, updated_at = $2 WHERE id = $3`
-
-	if status == model.AlertGroupStatusResolved {
-		query = `UPDATE alert_groups SET status = $1, updated_at = $2, resolved_at = $3 WHERE id = $4`
-		_, err := s.db.Exec(query, status, time.Now(), time.Now(), id)
-		return err
-	}
-
-	_, err := s.db.Exec(query, status, time.Now(), id)
-	return err
-}
-
-// TransitionAlertGroupStatus conditionally updates status only if the current status
-// matches fromStatus (CAS semantics). Returns (true, nil) if the row was updated,
-// (false, nil) if the current status did not match, or (false, err) on DB error.
+// TransitionAlertGroupStatus moves a group from one status to another and
+// reports whether it was in the status the caller expected.
+//
+// It is the only way this store changes a group's status, and the condition is
+// the point: an assignment - "set this group to closed" - cannot say what it
+// assumed about the group it is closing, so a stale read or a mistaken ID ends
+// an incident nobody has finished. Producers gate their work on status
+// (`ProcessResolvedAlertGroups` closes what it has told everyone about), and a
+// gate that can be lowered from any state is not a gate.
 func (s *Store) TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error) {
 	now := time.Now()
 	res, err := s.db.Exec(
@@ -1096,13 +1121,6 @@ func (s *Store) TransitionAlertGroupStatus(id string, fromStatus, toStatus model
 		return false, err
 	}
 	return rows > 0, nil
-}
-
-func (s *Store) UpdateAlertGroupAcknowledged(id string, acknowledgedBy string) error {
-	// Clear ack_processed_at to allow re-processing on re-ack (retry scenario)
-	query := `UPDATE alert_groups SET status = $1, acknowledged_by = $2, ack_processed_at = NULL, updated_at = $3 WHERE id = $4`
-	_, err := s.db.Exec(query, model.AlertGroupStatusAcknowledged, acknowledgedBy, time.Now(), id)
-	return err
 }
 
 func (s *Store) UpdateAlertGroupPolicy(id string, policyID string, snapshot *model.EscalationPolicySnapshot) error {
@@ -1754,11 +1772,43 @@ func (s *Store) MarkAckProcessed(agID string) error {
 	return err
 }
 
-func (s *Store) SetSlackUpdatePending(id string, pending bool) error {
+// RaiseSlackUpdate records that the group's alerts changed and its message has
+// to be re-rendered. Unconditional and monotonic: every raise is a new version
+// of the request, and ClearSlackUpdate below can only answer one of them.
+func (s *Store) RaiseSlackUpdate(id string) error {
 	_, err := s.db.Exec(`
-		UPDATE alert_groups SET slack_update_pending = $1, updated_at = $2 WHERE id = $3
-	`, pending, time.Now(), id)
+		UPDATE alert_groups
+		   SET slack_update_pending = TRUE,
+		       slack_update_generation = slack_update_generation + 1,
+		       updated_at = $1
+		 WHERE id = $2
+	`, time.Now(), id)
 	return err
+}
+
+// ClearSlackUpdate lowers the gate for the version the caller read, and reports
+// whether it did.
+//
+// The condition is the whole point. Admitting the update job and lowering the
+// gate are two transactions, and an alert that lands between them raises the
+// flag again; clearing it unconditionally - as this did while it was one
+// setter with a boolean - throws that alert away, and the message never shows
+// it. A false answer is not a failure: it means the work has to be done again,
+// and the next tick does it.
+func (s *Store) ClearSlackUpdate(id string, observedGeneration int64) (bool, error) {
+	res, err := s.db.Exec(`
+		UPDATE alert_groups
+		   SET slack_update_pending = FALSE, updated_at = $1
+		 WHERE id = $2 AND slack_update_generation = $3
+	`, time.Now(), id, observedGeneration)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 func (s *Store) GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error) {
@@ -1882,7 +1932,7 @@ func (s *Store) GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset 
 // alertGroupSummaryColumns selects lightweight fields for list views,
 // skipping heavy JSONB columns (alerts_data, policy_snapshot)
 // and computing alert counts from alerts_data inline.
-const alertGroupSummaryColumns = `id, dedup_key, status, title, team_id, severity, current_step,
+const alertGroupSummaryColumns = `id, alert_key, status, title, team_id, severity, current_step,
 	oncall_snapshot, external_url, acknowledged_by, resolved_by,
 	created_at, updated_at, resolved_at,
 	jsonb_array_length(COALESCE(alerts_data::jsonb, '[]'::jsonb)),
@@ -1894,7 +1944,7 @@ func scanAlertGroupSummaryRow(scanner alertGroupScanner) (*model.AlertGroupSumma
 	var teamID, severity, externalURL, oncallSnapshot, acknowledgedBy, resolvedBy sql.NullString
 
 	err := scanner.Scan(
-		&ag.ID, &ag.DedupKey, &ag.Status, &ag.Title,
+		&ag.ID, &ag.AlertKey, &ag.Status, &ag.Title,
 		&teamID, &severity, &ag.CurrentStep,
 		&oncallSnapshot, &externalURL, &acknowledgedBy, &resolvedBy,
 		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt,

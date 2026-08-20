@@ -18,6 +18,17 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   is left running. Take a database backup first, as always, and do not start an
   older image against the upgraded database afterwards - downgrading is not
   supported.
+- The column that carries an alert's own key is renamed at startup
+  (`alert_groups.dedup_key` becomes `alert_key`); the rename is instant, touches
+  no data, and the name every API response, webhook and page uses is unchanged.
+  An older instance started against the upgraded database now fails on any read
+  of an alert group rather than quietly failing to create jobs - louder, and
+  still a reason to stop every instance first.
+- While a mixture of versions is running, the "you are now on-call" message is
+  the part that suffers first: the two versions recognise a handover
+  differently, so one shift change can be announced twice and another not at
+  all. This is the same instruction as above - stop every instance - said for
+  the case where escalations are not what you notice.
 - The upgrade refuses to run while a job it cannot classify is still executing,
   and names the job in the message. That job either finishes or is cancelled,
   and the upgrade is started again. The alternative would be to let it run on
@@ -35,6 +46,18 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   the previous one. An escalation is now identified by its alert group rather
   than by the alert fingerprint, which several groups share over time as the
   same alert fires, resolves and fires again.
+- Coming on call is announced once, however many instances of TokayOps are
+  running. Whether the second instance was told depended on how quickly the
+  first one's notification finished: a shift change noticed a moment later was a
+  second direct message to the same people. A handover notification is now
+  identified by the shift change it announces, and that identity is kept for
+  good rather than for as long as the notification takes to send.
+- An alert that arrives while a message update is already on its way is no
+  longer left out of that message. The flag that says "this alert group's
+  message is out of date" used to be cleared by whichever update ran next, even
+  when that update had been built before the alert arrived - so the alert waited
+  for the next one, which may never come. The flag now comes down only for the
+  changes that were actually handed to an update.
 - An alert no longer loses its page when the on-call state cannot be read. A
   policy step aimed at a schedule used to escalate to nobody if the read failed
   at that moment, and nothing retried it, so the person on duty was never told.

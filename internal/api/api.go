@@ -540,7 +540,7 @@ func (a *API) CreateManualAlertGroup(c echo.Context) error {
 
 	ag := &model.AlertGroup{
 		ID:               uuid.New().String(),
-		DedupKey:         "manual:" + uuid.New().String(),
+		AlertKey:         "manual:" + uuid.New().String(),
 		Status:           model.AlertGroupStatusNew,
 		Title:            title,
 		TeamID:           teamID,

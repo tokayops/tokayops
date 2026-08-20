@@ -164,7 +164,7 @@ func TestTelegramWebhook_CallbackAcks(t *testing.T) {
 	}
 	agID := "ag-tg-" + fmt.Sprintf("%d", time.Now().UnixNano())
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: agID, DedupKey: "dk-" + agID, Status: model.AlertGroupStatusTriggered,
+		ID: agID, AlertKey: "dk-" + agID, Status: model.AlertGroupStatusTriggered,
 		Title: "Test Alert", TeamID: "devops", TeamNameSnapshot: "DevOps", Severity: "critical",
 		CreatedAt: time.Now().Add(-time.Minute), UpdatedAt: time.Now(),
 	})
@@ -191,7 +191,7 @@ func TestTelegramWebhook_CallbackUnlinked(t *testing.T) {
 
 	agID := "ag-unlinked"
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: agID, DedupKey: "dk-" + agID, Status: model.AlertGroupStatusTriggered,
+		ID: agID, AlertKey: "dk-" + agID, Status: model.AlertGroupStatusTriggered,
 		Title: "T", TeamID: "devops", Severity: "critical", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	})
 

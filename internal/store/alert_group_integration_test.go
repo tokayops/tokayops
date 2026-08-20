@@ -26,10 +26,10 @@ func TestAlertGroupLifecycle(t *testing.T) {
 
 	// 2. Create AlertGroup
 	agID := uuid.New().String()
-	dedupKey := "key-cpu-high-1"
+	alertKey := "key-cpu-high-1"
 	ag := &model.AlertGroup{
 		ID:               agID,
-		DedupKey:         dedupKey,
+		AlertKey:         alertKey,
 		Status:           model.AlertGroupStatusNew,
 		Title:            "High CPU Usage",
 		TeamID:           teamID,
@@ -63,12 +63,10 @@ func TestAlertGroupLifecycle(t *testing.T) {
 	}
 
 	// 4. Update Status
-	if err := s.UpdateAlertGroupStatus(agID, model.AlertGroupStatusAcknowledged); err != nil {
-		t.Fatalf("UpdateAlertGroupStatus failed: %v", err)
-	}
+	forceAlertGroupStatus(t, s, agID, model.AlertGroupStatusAcknowledged)
 
 	// 5. Verify Update
-	fetchedAfterUpdate, err := s.GetActiveAlertGroup(dedupKey)
+	fetchedAfterUpdate, err := s.GetActiveAlertGroupByAlertKey(alertKey)
 	if err != nil {
 		t.Fatalf("GetActiveAlertGroup failed: %v", err)
 	}
@@ -90,7 +88,7 @@ func TestGetProcessingAlertGroups(t *testing.T) {
 	createAG := func(id, status string) {
 		ag := &model.AlertGroup{
 			ID:               id,
-			DedupKey:         "key-" + id,
+			AlertKey:         "key-" + id,
 			Status:           model.AlertGroupStatus(status),
 			TeamID:           teamID,
 			TeamNameSnapshot: "SRE",
@@ -139,7 +137,7 @@ func TestMarkAckProcessed_Integration(t *testing.T) {
 	agID := uuid.New().String()
 	ag := &model.AlertGroup{
 		ID:               agID,
-		DedupKey:         "key-ack-" + agID,
+		AlertKey:         "key-ack-" + agID,
 		Status:           model.AlertGroupStatusAcknowledged,
 		TeamID:           teamID,
 		TeamNameSnapshot: "Ack Test",
@@ -192,7 +190,7 @@ func TestGetAcknowledgedAlertGroups_FiltersProcessed_Integration(t *testing.T) {
 	createAG := func(id string) {
 		ag := &model.AlertGroup{
 			ID:               id,
-			DedupKey:         "key-" + id,
+			AlertKey:         "key-" + id,
 			Status:           model.AlertGroupStatusAcknowledged,
 			TeamID:           teamID,
 			TeamNameSnapshot: "Filter Test",
@@ -238,73 +236,76 @@ func TestGetAcknowledgedAlertGroups_FiltersProcessed_Integration(t *testing.T) {
 	}
 }
 
-// TestReAck_ShouldClearAckProcessedAt_Integration tests that re-acknowledging
-// an AG clears ack_processed_at to allow retry
+// TestAckGateIsRaisedOncePerGroup: the ack update gate is lowered by the
+// producer and raised only by an acknowledgement - and a group is acknowledged
+// once, ever.
 //
-// ISSUE: UpdateAlertGroupAcknowledged doesn't clear ack_processed_at
-func TestReAck_ShouldClearAckProcessedAt_Integration(t *testing.T) {
+// That is what makes the ack update the one family whose gate can be lowered
+// without checking whether anything happened meanwhile: there is no second ack
+// to lose. The guard lives in the transition itself, which only applies from
+// processing or triggered, so this test asks the transition rather than the
+// column.
+func TestAckGateIsRaisedOncePerGroup(t *testing.T) {
 	s := setupTestDB(t)
 
-	// Setup
-	teamID := "team-reack-test"
-	if err := s.CreateTeam(&model.Team{ID: teamID, Name: "ReAck Test", CreatedAt: time.Now()}); err != nil {
+	teamID := "team-ack-once"
+	if err := s.CreateTeam(&model.Team{ID: teamID, Name: "Ack Once", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 
 	agID := uuid.New().String()
-	ag := &model.AlertGroup{
+	if err := s.CreateAlertGroup(&model.AlertGroup{
 		ID:               agID,
-		DedupKey:         "key-reack-" + agID,
+		AlertKey:         "key-ack-once-" + agID,
 		Status:           model.AlertGroupStatusTriggered,
 		TeamID:           teamID,
-		TeamNameSnapshot: "ReAck Test",
+		TeamNameSnapshot: "Ack Once",
 		CreatedAt:        time.Now(),
 		UpdatedAt:        time.Now(),
-	}
-	if err := s.CreateAlertGroup(ag); err != nil {
+	}); err != nil {
 		t.Fatalf("CreateAlertGroup failed: %v", err)
 	}
 
-	// First ack
-	if err := s.UpdateAlertGroupAcknowledged(agID, "user1"); err != nil {
-		t.Fatalf("First ack failed: %v", err)
+	waiting := func() bool {
+		t.Helper()
+		ags, err := s.GetAcknowledgedAlertGroups()
+		if err != nil {
+			t.Fatalf("GetAcknowledgedAlertGroups: %v", err)
+		}
+		for _, ag := range ags {
+			if ag.ID == agID {
+				return true
+			}
+		}
+		return false
 	}
 
-	// Mark as processed
+	changed, err := s.AckAlertGroupAtomic(agID, "user1", nil, nil)
+	if err != nil || !changed {
+		t.Fatalf("first ack: changed=%v err=%v", changed, err)
+	}
+	if !waiting() {
+		t.Fatal("the acknowledged group is not waiting for its update")
+	}
+
 	if err := s.MarkAckProcessed(agID); err != nil {
 		t.Fatalf("MarkAckProcessed failed: %v", err)
 	}
-
-	// Verify it's processed
-	fetched, _ := s.GetAlertGroupByID(agID)
-	if fetched.AckProcessedAt == nil {
-		t.Log("Note: GetAlertGroupByID may not select ack_processed_at - checking via GetAcknowledgedAlertGroups instead")
+	if waiting() {
+		t.Fatal("the group is still waiting after its update was created")
 	}
 
-	// Verify AG is NOT in GetAcknowledgedAlertGroups (it's processed)
-	ags, _ := s.GetAcknowledgedAlertGroups()
-	for _, ag := range ags {
-		if ag.ID == agID {
-			t.Fatal("Setup error: processed AG should not be in GetAcknowledgedAlertGroups")
-		}
+	// A second acknowledgement of the same group does not apply, so the gate
+	// stays down and no second update is ever owed.
+	changed, err = s.AckAlertGroupAtomic(agID, "user2", nil, nil)
+	if err != nil {
+		t.Fatalf("second ack: %v", err)
 	}
-
-	// Re-ack (user wants to retry)
-	if err := s.UpdateAlertGroupAcknowledged(agID, "user2"); err != nil {
-		t.Fatalf("Re-ack failed: %v", err)
+	if changed {
+		t.Error("an acknowledged group was acknowledged again")
 	}
-
-	// AG should now be in GetAcknowledgedAlertGroups again (ack_processed_at cleared)
-	ags, _ = s.GetAcknowledgedAlertGroups()
-	found := false
-	for _, ag := range ags {
-		if ag.ID == agID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("Re-acked AG should be returned by GetAcknowledgedAlertGroups - UpdateAlertGroupAcknowledged should clear ack_processed_at!")
+	if waiting() {
+		t.Error("the ack gate went back up for a group that was already acknowledged")
 	}
 }
 
@@ -320,7 +321,7 @@ func createTestTeamAndAG(t *testing.T, s *Store, teamID string, agStatus model.A
 	agID := uuid.New().String()
 	ag := &model.AlertGroup{
 		ID:               agID,
-		DedupKey:         "key-" + agID,
+		AlertKey:         "key-" + agID,
 		Status:           agStatus,
 		TeamID:           teamID,
 		TeamNameSnapshot: teamID,
@@ -348,7 +349,7 @@ func TestCreateAlertGroupAtomic_Success(t *testing.T) {
 	agID := uuid.New().String()
 	ag := &model.AlertGroup{
 		ID:               agID,
-		DedupKey:         "key-" + agID,
+		AlertKey:         "key-" + agID,
 		Status:           model.AlertGroupStatusNew,
 		Title:            "Test AG",
 		TeamID:           teamID,
@@ -498,7 +499,7 @@ func TestCreateAlertGroupAtomic_Rollback(t *testing.T) {
 	// Create first AG
 	agID := uuid.New().String()
 	ag := &model.AlertGroup{
-		ID: agID, DedupKey: "key-" + agID, Status: model.AlertGroupStatusNew,
+		ID: agID, AlertKey: "key-" + agID, Status: model.AlertGroupStatusNew,
 		Title: "First", TeamID: teamID, TeamNameSnapshot: teamID, Severity: "critical",
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
@@ -508,7 +509,7 @@ func TestCreateAlertGroupAtomic_Rollback(t *testing.T) {
 
 	// Try to create duplicate AG atomically — should fail on duplicate key
 	dupAG := &model.AlertGroup{
-		ID: agID, DedupKey: "key-dup", Status: model.AlertGroupStatusNew,
+		ID: agID, AlertKey: "key-dup", Status: model.AlertGroupStatusNew,
 		Title: "Dup", TeamID: teamID, TeamNameSnapshot: teamID, Severity: "warning",
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
@@ -1013,7 +1014,7 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	}
 
 	// Force AG back to "new" to allow re-processing
-	s.UpdateAlertGroupStatus(agID, model.AlertGroupStatusNew)
+	forceAlertGroupStatus(t, s, agID, model.AlertGroupStatusNew)
 
 	// Second call — same dedup_key, V2 snapshot
 	job2, stages2, steps2, snapshot2 := makeTestJob(agID)
@@ -1047,7 +1048,7 @@ func TestEnsureEscalationJob_UserWins_ConcurrentAck(t *testing.T) {
 	const iterations = 20
 	for i := 0; i < iterations; i++ {
 		// Reset AG to processing for each iteration
-		s.UpdateAlertGroupStatus(agID, model.AlertGroupStatusProcessing)
+		forceAlertGroupStatus(t, s, agID, model.AlertGroupStatusProcessing)
 		// Cancel any existing active job so dedup doesn't interfere
 		s.CancelEscalationJobByAlertGroupID(agID)
 
@@ -1186,7 +1187,7 @@ func TestEnsureEscalationJob_BlockedBySucceededJob(t *testing.T) {
 	}
 
 	// Force AG back to "new" to allow re-processing
-	s.UpdateAlertGroupStatus(agID, model.AlertGroupStatusNew)
+	forceAlertGroupStatus(t, s, agID, model.AlertGroupStatusNew)
 
 	// Second call — should be blocked by the unique index (succeeded job exists)
 	job2, stages2, steps2, snapshot2 := makeTestJob(agID)
@@ -1212,7 +1213,7 @@ func TestGetNewAlertGroups_SkipsAGWithEscalationJob(t *testing.T) {
 	// Create AG in stale processing with succeeded escalation job (via alert_group_id)
 	agID := uuid.New().String()
 	ag := &model.AlertGroup{
-		ID: agID, DedupKey: "dk-skip-" + agID, Status: model.AlertGroupStatusProcessing,
+		ID: agID, AlertKey: "dk-skip-" + agID, Status: model.AlertGroupStatusProcessing,
 		TeamID: teamID, TeamNameSnapshot: "Skip Test", CreatedAt: time.Now(), UpdatedAt: time.Now().Add(-60 * time.Second),
 	}
 	if err := s.CreateAlertGroup(ag); err != nil {
@@ -1261,22 +1262,22 @@ func TestGetNewAlertGroups_IncludesStaleProcessing(t *testing.T) {
 
 	// AG1: "new" — always returned
 	ag1 := &model.AlertGroup{
-		ID: "ag-new-1", DedupKey: "dk-new-1", Status: model.AlertGroupStatusNew,
+		ID: "ag-new-1", AlertKey: "dk-new-1", Status: model.AlertGroupStatusNew,
 		TeamID: teamID, TeamNameSnapshot: "Reconcile", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	// AG2: "processing" with fresh updated_at — should NOT be returned
 	ag2 := &model.AlertGroup{
-		ID: "ag-proc-fresh", DedupKey: "dk-proc-fresh", Status: model.AlertGroupStatusProcessing,
+		ID: "ag-proc-fresh", AlertKey: "dk-proc-fresh", Status: model.AlertGroupStatusProcessing,
 		TeamID: teamID, TeamNameSnapshot: "Reconcile", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	// AG3: "processing" with stale updated_at (> 30s ago) — should be returned
 	ag3 := &model.AlertGroup{
-		ID: "ag-proc-stale", DedupKey: "dk-proc-stale", Status: model.AlertGroupStatusProcessing,
+		ID: "ag-proc-stale", AlertKey: "dk-proc-stale", Status: model.AlertGroupStatusProcessing,
 		TeamID: teamID, TeamNameSnapshot: "Reconcile", CreatedAt: time.Now(), UpdatedAt: time.Now().Add(-60 * time.Second),
 	}
 	// AG4: "triggered" — should NOT be returned
 	ag4 := &model.AlertGroup{
-		ID: "ag-triggered", DedupKey: "dk-triggered", Status: model.AlertGroupStatusTriggered,
+		ID: "ag-triggered", AlertKey: "dk-triggered", Status: model.AlertGroupStatusTriggered,
 		TeamID: teamID, TeamNameSnapshot: "Reconcile", CreatedAt: time.Now(), UpdatedAt: time.Now().Add(-60 * time.Second),
 	}
 
@@ -1609,9 +1610,9 @@ func TestResolveAlertGroupWithAlertsAtomic_FromNew(t *testing.T) {
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Resolve Team", CreatedAt: time.Now()})
 
 	agID := uuid.New().String()
-	dedupKey := "dk-resolve-" + agID
+	alertKey := "dk-resolve-" + agID
 	ag := &model.AlertGroup{
-		ID: agID, DedupKey: dedupKey, Status: model.AlertGroupStatusNew,
+		ID: agID, AlertKey: alertKey, Status: model.AlertGroupStatusNew,
 		TeamID: teamID, TeamNameSnapshot: "Resolve Team", Severity: "warning",
 		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "CPU"}}},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
@@ -1737,7 +1738,7 @@ func TestMigration_OrphanedTeam_BackfillSnapshot(t *testing.T) {
 
 	agID := uuid.New().String()
 	ag := &model.AlertGroup{
-		ID: agID, DedupKey: "dk-orphan-" + agID, Status: model.AlertGroupStatusTriggered,
+		ID: agID, AlertKey: "dk-orphan-" + agID, Status: model.AlertGroupStatusTriggered,
 		TeamID: teamID, TeamNameSnapshot: "Doomed Team", Severity: "critical",
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
@@ -1819,7 +1820,7 @@ func TestSeed_AlertGroupHasTeamNameSnapshot(t *testing.T) {
 // correctness depend on a uniqueness index rather than on the query. These tests
 // pin what it addresses now.
 //
-// They lean on createTestTeamAndAG setting DedupKey = "key-" + agID: the two are
+// They lean on createTestTeamAndAG setting AlertKey = "key-" + agID: the two are
 // deliberately different, so a query that went back to matching on dedup_key
 // while being handed an alert group id would find nothing and redden every
 // positive case below.
@@ -2014,4 +2015,71 @@ func TestCancelEscalationJob_ReachesChildrenOfEveryMatch(t *testing.T) {
 
 	requireCanceledThrough(t, s, firstJob)
 	requireCanceledThrough(t, s, secondJob)
+}
+
+// TestAlertKeyRenameFromAnOlderSchema: a database written before the alert's
+// key had a name of its own is brought forward on the next start.
+//
+// A fresh database never exercises this - it is created with the column already
+// named - so the only way to test the migration is to put the old name back and
+// start again. What has to survive it is not the column alone: the rule that
+// there is one live incident per alert lives in a partial unique index over that
+// column, and an index that quietly stopped applying would let one alert open
+// two incidents.
+func TestAlertKeyRenameFromAnOlderSchema(t *testing.T) {
+	s := newThrowawayDB(t)
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+
+	if _, err := s.db.Exec(`ALTER TABLE alert_groups RENAME COLUMN alert_key TO dedup_key`); err != nil {
+		t.Fatalf("put the old schema back: %v", err)
+	}
+
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("InitDB against the older schema: %v", err)
+	}
+
+	var renamed bool
+	if err := s.db.QueryRow(`
+		SELECT EXISTS (SELECT 1 FROM information_schema.columns
+		 WHERE table_name = 'alert_groups' AND column_name = 'alert_key')`).Scan(&renamed); err != nil {
+		t.Fatalf("ask the catalog: %v", err)
+	}
+	if !renamed {
+		t.Fatal("the column was not brought forward")
+	}
+
+	// The rule the index is: one live group per alert key, and the key is free
+	// again once the group is resolved.
+	key := "alert-" + uuid.New().String()
+	first := uuid.New().String()
+	if err := s.CreateAlertGroup(&model.AlertGroup{
+		ID: first, AlertKey: key, Status: model.AlertGroupStatusProcessing,
+		Title: "first", Severity: "info",
+	}); err != nil {
+		t.Fatalf("create the first group: %v", err)
+	}
+	if err := s.CreateAlertGroup(&model.AlertGroup{
+		ID: uuid.New().String(), AlertKey: key, Status: model.AlertGroupStatusProcessing,
+		Title: "second", Severity: "info",
+	}); err == nil {
+		t.Fatal("a second live group was created for one alert; the index no longer applies")
+	}
+
+	forceAlertGroupStatus(t, s, first, model.AlertGroupStatusResolved)
+	if err := s.CreateAlertGroup(&model.AlertGroup{
+		ID: uuid.New().String(), AlertKey: key, Status: model.AlertGroupStatusProcessing,
+		Title: "next incident", Severity: "info",
+	}); err != nil {
+		t.Fatalf("the same alert firing again could not open a new incident: %v", err)
+	}
+
+	active, err := s.GetActiveAlertGroupByAlertKey(key)
+	if err != nil {
+		t.Fatalf("GetActiveAlertGroupByAlertKey: %v", err)
+	}
+	if active == nil || active.Title != "next incident" {
+		t.Fatalf("active group = %+v, want the new incident", active)
+	}
 }

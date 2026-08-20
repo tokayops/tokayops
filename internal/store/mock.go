@@ -131,12 +131,12 @@ func (m *MockStore) Close() error {
 // Alert Groups (renamed from Incidents)
 // ========================================
 
-func (m *MockStore) GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error) {
+func (m *MockStore) GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	for _, ag := range m.alertGroups {
-		if ag.DedupKey == dedupKey &&
+		if ag.AlertKey == alertKey &&
 			ag.Status != model.AlertGroupStatusResolved &&
 			ag.Status != model.AlertGroupStatusClosed {
 			return m.copyAlertGroup(ag), nil
@@ -193,7 +193,14 @@ func (m *MockStore) insertOutboxEvent(event *model.OutboxEvent) {
 	m.outboxEvents[event.ID] = event
 }
 
-func (m *MockStore) UpdateAlertGroupStatus(id string, status model.AlertGroupStatus) error {
+// SetAlertGroupStatus puts a group into a status whatever it is in now.
+//
+// A test fixture, deliberately absent from StoreInterface: production changes a
+// group's status through TransitionAlertGroupStatus, which has to say what it
+// expected to find. Tests that rewind a group to set up the next assertion have
+// no such expectation to state, and saying so here is better than keeping an
+// unconditional setter in the contract for their sake.
+func (m *MockStore) SetAlertGroupStatus(id string, status model.AlertGroupStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -204,20 +211,6 @@ func (m *MockStore) UpdateAlertGroupStatus(id string, status model.AlertGroupSta
 			now := time.Now()
 			ag.ResolvedAt = &now
 		}
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
-func (m *MockStore) UpdateAlertGroupAcknowledged(id string, acknowledgedBy string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if ag, ok := m.alertGroups[id]; ok {
-		ag.Status = model.AlertGroupStatusAcknowledged
-		ag.AcknowledgedBy = acknowledgedBy
-		ag.AckProcessedAt = nil // Clear to allow re-processing on re-ack
-		ag.UpdatedAt = time.Now()
 		return nil
 	}
 	return sql.ErrNoRows
@@ -589,7 +582,7 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 			}
 		}
 		filtered = append(filtered, &model.AlertGroupSummary{
-			ID: ag.ID, DedupKey: ag.DedupKey, Status: ag.Status, Title: ag.Title,
+			ID: ag.ID, AlertKey: ag.AlertKey, Status: ag.Status, Title: ag.Title,
 			TeamID: ag.TeamID, Severity: ag.Severity, CurrentStep: ag.CurrentStep,
 			OnCallSnapshot: ag.OnCallSnapshot, ExternalURL: ag.ExternalURL,
 			AcknowledgedBy: ag.AcknowledgedBy, ResolvedBy: ag.ResolvedBy,
@@ -838,16 +831,37 @@ func (m *MockStore) MarkAckProcessed(agID string) error {
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) SetSlackUpdatePending(id string, pending bool) error {
+// RaiseSlackUpdate mirrors the store: the flag and its generation move
+// together, in one place, so they cannot disagree.
+func (m *MockStore) RaiseSlackUpdate(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if ag, ok := m.alertGroups[id]; ok {
-		ag.SlackUpdatePending = pending
+		ag.SlackUpdatePending = true
+		ag.SlackUpdateGeneration++
 		ag.UpdatedAt = time.Now()
 		return nil
 	}
 	return sql.ErrNoRows
+}
+
+// ClearSlackUpdate mirrors the store's conditional clear, including the answer
+// it gives when a newer raise has overtaken the caller.
+func (m *MockStore) ClearSlackUpdate(id string, observedGeneration int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ag, ok := m.alertGroups[id]
+	if !ok {
+		return false, sql.ErrNoRows
+	}
+	if ag.SlackUpdateGeneration != observedGeneration {
+		return false, nil
+	}
+	ag.SlackUpdatePending = false
+	ag.UpdatedAt = time.Now()
+	return true, nil
 }
 
 func (m *MockStore) GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error) {
@@ -1835,7 +1849,15 @@ func (m *MockStore) CountAdmins() (int, error) {
 // Identity is (namespace, key). Scope decides which existing rows count:
 // forever means any job ever admitted under that identity, while_active means
 // only one that has not finished.
-func (m *MockStore) dedupClaimHeld(spec *jobdedup.Spec) bool {
+// A scope this build has no rule for is an error rather than a silent answer,
+// the same way the store refuses to insert without a conflict clause: the
+// dangerous reading here is "false", which admits the job and calls it
+// deduplicated.
+func (m *MockStore) dedupClaimHeld(spec *jobdedup.Spec) (bool, error) {
+	if spec.Scope() != jobdedup.ScopeWhileActive && spec.Scope() != jobdedup.ScopeForever {
+		return false, fmt.Errorf("scope %q has no uniqueness rule in this build", spec.Scope())
+	}
+
 	for _, existing := range m.jobs {
 		if existing.Dedup == nil {
 			continue
@@ -1844,13 +1866,13 @@ func (m *MockStore) dedupClaimHeld(spec *jobdedup.Spec) bool {
 			continue
 		}
 		if spec.Scope() == jobdedup.ScopeForever {
-			return true
+			return true, nil
 		}
 		if existing.Status == model.JobStatusPending || existing.Status == model.JobStatusRunning {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (m *MockStore) initJobMaps() {
@@ -1892,7 +1914,11 @@ func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 	}
 	job.Type = job.Dedup.JobType()
 
-	if m.dedupClaimHeld(job.Dedup) {
+	held, err := m.dedupClaimHeld(job.Dedup)
+	if err != nil {
+		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
+	}
+	if held {
 		return false, nil
 	}
 
@@ -1942,7 +1968,11 @@ func (m *MockStore) EnsureEscalationJob(agID string, job *model.Job, stages []*m
 	job.Type = job.Dedup.JobType()
 
 	// An escalation is claimed forever, so a job of any status is the answer.
-	if m.dedupClaimHeld(job.Dedup) {
+	held, err := m.dedupClaimHeld(job.Dedup)
+	if err != nil {
+		return false, fmt.Errorf("insert job %s: %w", job.ID, err)
+	}
+	if held {
 		return false, nil
 	}
 
@@ -1999,7 +2029,11 @@ func (m *MockStore) SeedEscalationJob(agID string, job *model.Job, stages []*mod
 	// "The way EnsureEscalationJob would have" includes refusing when the claim
 	// is already held: a double holding two escalations for one group is a
 	// state the database cannot represent.
-	if m.dedupClaimHeld(job.Dedup) {
+	held, err := m.dedupClaimHeld(job.Dedup)
+	if err != nil {
+		return fmt.Errorf("seed job %s: %w", job.ID, err)
+	}
+	if held {
 		return fmt.Errorf("seed job %s: the escalation of %s is already claimed", job.ID, agID)
 	}
 
@@ -2039,12 +2073,20 @@ func (m *MockStore) FindJobByIdentity(spec *jobdedup.Spec) (*model.Job, error) {
 // would build rather than a bare string: a raw key in a test is the same guess
 // about namespaces that the model exists to remove.
 func (m *MockStore) MarkJobSucceeded(spec *jobdedup.Spec) {
+	m.MarkJobFinished(spec, model.JobStatusSucceeded)
+}
+
+// MarkJobFinished is the same helper for the terminal statuses that are not
+// success. Which of them a job ended in is the whole question for a
+// while_active identity - it is free again - and equally the whole question for
+// a forever one, which is not.
+func (m *MockStore) MarkJobFinished(spec *jobdedup.Spec, status model.JobStatus) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	for _, j := range m.jobs {
 		if j.Dedup != nil && j.Dedup.Namespace() == spec.Namespace() && j.Dedup.Key() == spec.Key() {
-			j.Status = model.JobStatusSucceeded
+			j.Status = status
 			return
 		}
 	}
@@ -2250,10 +2292,6 @@ func (m *MockStore) CancelEscalationJobByAlertGroupID(alertGroupID string) error
 func (m *MockStore) ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error {
 	return nil
 }
-func (m *MockStore) GetJobsByIDs(ids []string) (map[string]*model.Job, error) {
-	return make(map[string]*model.Job), nil
-}
-
 func (m *MockStore) FailJob(jobID, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

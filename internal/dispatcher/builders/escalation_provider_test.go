@@ -23,7 +23,7 @@ func TestEscalationJobBuilder_SetsProviderName(t *testing.T) {
 		},
 	}
 	s.CreateEscalationPolicy(policy)
-	ag := &model.AlertGroup{ID: "ag-1", DedupKey: "d1", Status: model.AlertGroupStatusProcessing}
+	ag := &model.AlertGroup{ID: "ag-1", AlertKey: "d1", Status: model.AlertGroupStatusProcessing}
 	s.CreateAlertGroup(ag)
 
 	_, _, steps, _, err := buildFor(t, builder, proj, ag, "pol-1")

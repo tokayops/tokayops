@@ -14,7 +14,7 @@ func createAG(t *testing.T, s *store.MockStore, id string, status model.AlertGro
 	t.Helper()
 	ag := &model.AlertGroup{
 		ID:               id,
-		DedupKey:         "dedup-" + id,
+		AlertKey:         "dedup-" + id,
 		Status:           status,
 		Title:            "Test Alert",
 		TeamID:           "devops",

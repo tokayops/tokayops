@@ -44,7 +44,7 @@ func TestResolutionFlow(t *testing.T) {
 		ID:       "ag_res",
 		Status:   model.AlertGroupStatusResolved, // Ready for processing
 		PolicyID: "p1",
-		DedupKey: "dk_res",
+		AlertKey: "dk_res",
 		PolicySnapshot: &model.EscalationPolicySnapshot{
 			Name: "p1",
 			Steps: []*model.EscalationStepSnapshot{
@@ -139,7 +139,7 @@ func TestEscalationFlow_BuilderIntegration(t *testing.T) {
 	d.RegisterProvider("slack", mp)
 
 	// Create AG
-	ag := &model.AlertGroup{ID: "ag1", TeamID: "team1", Severity: "critical", DedupKey: "dk1"}
+	ag := &model.AlertGroup{ID: "ag1", TeamID: "team1", Severity: "critical", AlertKey: "dk1"}
 	s.CreateAlertGroup(ag)
 
 	// Build Job via Builder (now uses Store)

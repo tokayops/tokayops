@@ -34,7 +34,7 @@ func TestOutboxStore(t *testing.T) {
 		s.CreateTeam(&model.Team{ID: "test-team", Name: "Test"})
 		ag := &model.AlertGroup{
 			ID:               "ag-outbox-1",
-			DedupKey:         "dedup-outbox-1",
+			AlertKey:         "dedup-outbox-1",
 			Status:           model.AlertGroupStatusNew,
 			Title:            "Test AG",
 			TeamID:           "test-team",
@@ -80,7 +80,7 @@ func TestOutboxStore(t *testing.T) {
 		s.CreateTeam(&model.Team{ID: "test-team", Name: "Test"})
 		for i := 0; i < 3; i++ {
 			ag := &model.AlertGroup{
-				DedupKey:         "dedup-pend-" + string(rune('0'+i)),
+				AlertKey:         "dedup-pend-" + string(rune('0'+i)),
 				Status:           model.AlertGroupStatusNew,
 				Title:            "AG",
 				TeamID:           "test-team",
@@ -118,7 +118,7 @@ func TestOutboxStore(t *testing.T) {
 
 		s.CreateTeam(&model.Team{ID: "test-team", Name: "Test"})
 		ag := &model.AlertGroup{
-			DedupKey:         "dedup-upd",
+			AlertKey:         "dedup-upd",
 			Status:           model.AlertGroupStatusNew,
 			Title:            "AG",
 			TeamID:           "test-team",
@@ -151,7 +151,7 @@ func TestOutboxStore(t *testing.T) {
 
 		s.CreateTeam(&model.Team{ID: "test-team", Name: "Test"})
 		ag := &model.AlertGroup{
-			DedupKey:         "dedup-del",
+			AlertKey:         "dedup-del",
 			Status:           model.AlertGroupStatusNew,
 			Title:            "AG",
 			TeamID:           "test-team",
@@ -204,7 +204,7 @@ func TestOutboxStore(t *testing.T) {
 
 		s.CreateTeam(&model.Team{ID: "test-team", Name: "Test"})
 		ag := &model.AlertGroup{
-			DedupKey:         "dedup-dup",
+			AlertKey:         "dedup-dup",
 			Status:           model.AlertGroupStatusNew,
 			Title:            "AG",
 			TeamID:           "test-team",
@@ -250,7 +250,7 @@ func TestOutboxStore(t *testing.T) {
 
 		s.CreateTeam(&model.Team{ID: "test-team", Name: "Test"})
 		ag := &model.AlertGroup{
-			DedupKey:         "dedup-by-evt",
+			AlertKey:         "dedup-by-evt",
 			Status:           model.AlertGroupStatusNew,
 			Title:            "AG",
 			TeamID:           "test-team",
@@ -315,7 +315,7 @@ func TestOutboxStore(t *testing.T) {
 
 		for i := 0; i < 3; i++ {
 			ag := &model.AlertGroup{
-				DedupKey:         "dedup-by-int-" + string(rune('0'+i)),
+				AlertKey:         "dedup-by-int-" + string(rune('0'+i)),
 				Status:           model.AlertGroupStatusNew,
 				Title:            "AG",
 				TeamID:           "test-team",
@@ -354,7 +354,7 @@ func TestOutboxStore(t *testing.T) {
 
 		s.CreateTeam(&model.Team{ID: "test-team", Name: "Test"})
 		ag := &model.AlertGroup{
-			DedupKey:         "dedup-upd-del",
+			AlertKey:         "dedup-upd-del",
 			Status:           model.AlertGroupStatusNew,
 			Title:            "AG",
 			TeamID:           "test-team",
@@ -417,7 +417,7 @@ func TestCreateAlertGroupAtomic_Mock(t *testing.T) {
 	agID := "ag-atomic-mock"
 	ag := &model.AlertGroup{
 		ID:               agID,
-		DedupKey:         "key-atomic",
+		AlertKey:         "key-atomic",
 		Status:           model.AlertGroupStatusNew,
 		Title:            "Test AG",
 		TeamID:           "team-1",

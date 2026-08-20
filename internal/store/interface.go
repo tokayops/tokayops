@@ -10,10 +10,8 @@ import (
 // This allows for mocking in tests.
 type StoreInterface interface {
 	// Alert Groups (renamed from Incidents)
-	GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error)
+	GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error)
 	CreateAlertGroup(ag *model.AlertGroup) error
-	UpdateAlertGroupStatus(id string, status model.AlertGroupStatus) error
-	UpdateAlertGroupAcknowledged(id string, acknowledgedBy string) error
 	UpdateAlertGroupPolicy(id string, policyID string, snapshot *model.EscalationPolicySnapshot) error
 	UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResult) error
 	UpdateAlertGroupAlerts(id string, alerts []model.Alert) error
@@ -22,7 +20,12 @@ type StoreInterface interface {
 	GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error)
 	GetResolvedAlertGroups() ([]*model.AlertGroup, error)
 	MarkAckProcessed(agID string) error
-	SetSlackUpdatePending(id string, pending bool) error
+	// RaiseSlackUpdate and ClearSlackUpdate are the two halves of one gate, and
+	// they are not symmetrical: raising is unconditional and bumps the
+	// generation, clearing answers one generation and reports whether it was
+	// still current. A single setter with a boolean hid that.
+	RaiseSlackUpdate(id string) error
+	ClearSlackUpdate(id string, observedGeneration int64) (bool, error)
 	GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error)
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
 	GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset int) ([]*model.AlertGroup, int, error)
@@ -139,7 +142,6 @@ type StoreInterface interface {
 	FinishStepAndAdvance(stepID string, leaseToken string, outcome model.JobStepStatus, result string, stepError string) (model.AdvanceResult, error)
 	CancelEscalationJobByAlertGroupID(alertGroupID string) error
 	ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error
-	GetJobsByIDs(ids []string) (map[string]*model.Job, error)
 	FailJob(jobID string, errorMsg string) error
 
 	// Escalation Policies (Phase 4)

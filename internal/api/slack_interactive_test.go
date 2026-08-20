@@ -314,7 +314,7 @@ func TestSlackInteractiveHandler(t *testing.T) {
 		agID := "ag-slack-test-" + fmt.Sprintf("%d", time.Now().UnixNano())
 		s.CreateAlertGroup(&model.AlertGroup{
 			ID:               agID,
-			DedupKey:         "dedup-" + agID,
+			AlertKey:         "dedup-" + agID,
 			Status:           model.AlertGroupStatusTriggered,
 			Title:            "Test Alert",
 			TeamID:           "devops",
@@ -774,7 +774,7 @@ func setupErrorAPI(t *testing.T, es *errorStore) (*API, *echo.Echo, string) {
 	// Create a triggered alert group
 	agID := "ag-err-test-" + fmt.Sprintf("%d", time.Now().UnixNano())
 	es.CreateAlertGroup(&model.AlertGroup{
-		ID: agID, DedupKey: "dedup-" + agID,
+		ID: agID, AlertKey: "dedup-" + agID,
 		Status: model.AlertGroupStatusTriggered, Title: "Test Alert",
 		TeamID: "devops", TeamNameSnapshot: "DevOps", Severity: "critical",
 		CreatedAt: time.Now().Add(-5 * time.Minute), UpdatedAt: time.Now(),
@@ -882,7 +882,7 @@ func TestSlackInteractiveHandler_ErrorPaths(t *testing.T) {
 		api.respondEphemeral = captured.post
 
 		// Set AG to closed status (resolve will see changed=false)
-		es.MockStore.UpdateAlertGroupStatus(agID, model.AlertGroupStatusClosed)
+		es.MockStore.SetAlertGroupStatus(agID, model.AlertGroupStatusClosed)
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionResolveAlertGroup, agID, "U_DENIS")
 		rec := httptest.NewRecorder()
@@ -902,7 +902,7 @@ func TestSlackInteractiveHandler_ErrorPaths(t *testing.T) {
 		captured := newCapturedEphemeral()
 		api.respondEphemeral = captured.post
 
-		es.MockStore.UpdateAlertGroupStatus(agID, model.AlertGroupStatusAcknowledged)
+		es.MockStore.SetAlertGroupStatus(agID, model.AlertGroupStatusAcknowledged)
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec := httptest.NewRecorder()
@@ -922,7 +922,7 @@ func TestSlackInteractiveHandler_ErrorPaths(t *testing.T) {
 		captured := newCapturedEphemeral()
 		api.respondEphemeral = captured.post
 
-		es.MockStore.UpdateAlertGroupStatus(agID, model.AlertGroupStatusResolved)
+		es.MockStore.SetAlertGroupStatus(agID, model.AlertGroupStatusResolved)
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionResolveAlertGroup, agID, "U_DENIS")
 		rec := httptest.NewRecorder()
@@ -1096,7 +1096,7 @@ func TestSlackInteractiveEmailMatch(t *testing.T) {
 		agID := "ag-email-match-" + fmt.Sprintf("%d", time.Now().UnixNano())
 		s.CreateAlertGroup(&model.AlertGroup{
 			ID:               agID,
-			DedupKey:         "dedup-" + agID,
+			AlertKey:         "dedup-" + agID,
 			Status:           model.AlertGroupStatusTriggered,
 			Title:            "Test Alert",
 			TeamID:           "devops",
@@ -1352,7 +1352,7 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		agID := "ag-card-test-" + fmt.Sprintf("%d", time.Now().UnixNano())
 		s.CreateAlertGroup(&model.AlertGroup{
 			ID:               agID,
-			DedupKey:         "dedup-" + agID,
+			AlertKey:         "dedup-" + agID,
 			Status:           model.AlertGroupStatusTriggered,
 			Title:            "Test Alert",
 			TeamID:           "devops",

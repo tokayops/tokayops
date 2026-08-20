@@ -76,6 +76,12 @@ func insertJobTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*
 		payloadBytes = []byte("{}")
 	}
 
+	// One clause per policy, and a policy this build cannot aim at is refused
+	// rather than inserted. Falling through with an empty clause would insert
+	// the row with no uniqueness rule at all - the job would be admitted, look
+	// deduplicated, and be deduplicated by nothing, which is the defect this
+	// whole model exists to remove. A third scope has no index either, so
+	// nothing downstream would catch it.
 	var onConflict string
 	switch job.Dedup.Scope() {
 	case jobdedup.ScopeWhileActive:
@@ -84,6 +90,9 @@ func insertJobTx(tx *sql.Tx, job *model.Job, stages []*model.JobStage, steps []*
 	case jobdedup.ScopeForever:
 		onConflict = `ON CONFLICT (dedup_namespace, dedup_key)
 			WHERE dedup_scope = 'forever' DO NOTHING`
+	default:
+		return false, fmt.Errorf("insert job %s: scope %q has no uniqueness rule in this build",
+			job.ID, job.Dedup.Scope())
 	}
 
 	var jobID string
@@ -638,41 +647,6 @@ func (s *Store) ExtendStepLease(stepID string, leaseToken string, duration time.
 		return fmt.Errorf("step %s not found or lost lock", stepID)
 	}
 	return nil
-}
-
-// GetJobsByIDs fetches multiple jobs
-func (s *Store) GetJobsByIDs(ids []string) (map[string]*model.Job, error) {
-	rows, err := s.db.Query(`
-		SELECT id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
-		       alert_group_id, current_stage, error, created_at
-		FROM jobs WHERE id = ANY($1)`, pq.Array(ids))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := make(map[string]*model.Job)
-	for rows.Next() {
-		job := &model.Job{}
-		var payloadStr, statusStr string
-		var ns, key, scope sql.NullString
-		err := rows.Scan(
-			&job.ID, &job.Type, &statusStr, &payloadStr, &ns, &key, &scope,
-			&job.AlertGroupID, &job.CurrentStage,
-			&job.Error, &job.CreatedAt,
-		)
-		if err != nil {
-			return nil, err
-		}
-		job.Dedup, err = scanDedupSpec(job.ID, ns, key, scope)
-		if err != nil {
-			return nil, err
-		}
-		job.Status = model.JobStatus(statusStr)
-		job.Payload = json.RawMessage(payloadStr)
-		result[job.ID] = job
-	}
-	return result, nil
 }
 
 // FailJob marks a job as failed with an error message
