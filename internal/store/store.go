@@ -513,13 +513,12 @@ func (s *Store) InitDB() error {
 	// a row without one could only come from before the revision model, and the
 	// destructive upgrade removes those rather than carrying them forward.
 	//
-	// The three ALTERs below are the upgrade path and only the upgrade path. On
-	// a database created by this statement they are no-ops; on one that predates
-	// the revision model they add the columns NULLABLE and tighten nothing. That
-	// asymmetry is deliberate and load-bearing: InitDB runs before the `migrate`
-	// subcommand (cmd/tokayops/main.go), so a SET NOT NULL here would refuse to
-	// start the very binary whose reset repairs the situation. The tightening
-	// lives in that reset; RequireCutoverSchema refuses to serve until it ran.
+	// The three ALTERs below add the columns to a database that predates them,
+	// and are no-ops on one this statement created. They add NULLABLE and
+	// tighten nothing: a row without a history horizon could only come from
+	// before the revision model, and databases in that shape stopped being
+	// upgradable when the cutover code was removed - such a database has to be
+	// brought forward on an older release first.
 	//
 	// All range constraints use tstzrange over TIMESTAMPTZ columns.
 	revisionQuery := `

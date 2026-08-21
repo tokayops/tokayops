@@ -18,6 +18,12 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   is left running. Take a database backup first, as always, and do not start an
   older image against the upgraded database afterwards - downgrading is not
   supported.
+- **This version cannot upgrade a database that never went through the schedule
+  cutover.** The one-shot `tokayops migrate reset-schedules` command, and the
+  startup check that refused to serve until it had run, are both gone: every
+  supported installation completed that step releases ago. An older database
+  must be brought up on a release that still carries the command before it is
+  upgraded to this one.
 - The column that carries an alert's own key is renamed at startup
   (`alert_groups.dedup_key` becomes `alert_key`); the rename is instant, touches
   no data, and the name every API response, webhook and page uses is unchanged.

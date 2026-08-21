@@ -73,8 +73,8 @@ type HandoffNotifier struct {
 	// states, not two: no key at all means the schedule has not been observed
 	// in this process, a stored empty composition means it was observed with
 	// nobody on duty, and anything else is that composition. Conflating the
-	// first two either mass-mails everyone at cutover or goes silent after a
-	// delete and recreate.
+	// first two either mass-mails everyone on the next restart or goes silent
+	// after a delete and recreate.
 	//
 	// The values are stored by value rather than as pointers precisely so the
 	// three states are all the type can express: a nil pointer in here would be

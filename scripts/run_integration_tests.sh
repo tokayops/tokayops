@@ -21,8 +21,9 @@ set -e
 # Defaults
 AUTO_DB=true
 RUN_PATTERN=""
-# ./cmd/... too: the schedule cutover startup gate can only be tested by
-# running the binary, so its test lives beside main.
+# ./cmd/... too: the command dispatch refuses an unknown first argument before
+# it touches the database, and proving that means running the binary, so its
+# test lives beside main.
 PACKAGE="./internal/... ./cmd/..."
 OUTPUT_MODE="full"  # full, summary, failures
 VERBOSE="-v"
