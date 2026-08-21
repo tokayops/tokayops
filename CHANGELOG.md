@@ -71,6 +71,12 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   after 30 seconds, so a stalled connection stops holding the notification
   worker that made it, and on-call usergroup syncing keeps running instead of
   stopping until the next restart.
+- A mistyped or unrecognised command no longer starts the server. `tokayops
+  migrat`, or a command line that repeats the binary's own path because the
+  image already runs it, used to fall through and bring up a second full
+  instance - notifier, syncer and workers - beside the running one. The binary
+  now refuses, lists the commands it knows, and does so before it opens the
+  database.
 
 ### Added
 
