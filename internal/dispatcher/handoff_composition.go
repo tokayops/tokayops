@@ -126,9 +126,9 @@ func (c composition) clone() composition {
 //
 // prev nil means the schedule has never been observed in this process. That is
 // not a transition and produces nothing: the notifier announces changes, and a
-// schedule it has never seen has not changed. Without that rule the cutover
-// would DM every on-call person in the middle of the maintenance window, one
-// fan-out per schedule the operator recreates.
+// schedule it has never seen has not changed. Without that rule every restart
+// would DM every on-call person, one fan-out per schedule - and a maintenance
+// window in which schedules are recreated by hand would do it worst of all.
 //
 // A previously observed EMPTY composition is a different matter and does
 // notify: after a stretch with nobody on duty, coming on call is real news.

@@ -55,7 +55,7 @@ var (
 // check rather than derived from the switch below, which cannot be enumerated -
 // and kept honest by the default branch in that switch, which refuses anything
 // listed here that never got a case.
-var knownCommands = []string{"migrate", "seed", "migrate-slack-identities", "user", "team"}
+var knownCommands = []string{"seed", "migrate-slack-identities", "user", "team"}
 
 // checkCommand refuses a first argument that dispatches nowhere.
 //
@@ -126,17 +126,6 @@ func main() {
 
 	if err := st.InitDB(); err != nil {
 		log.Fatalf("Failed to init DB schema: %v", err)
-	}
-
-	// Offline schema migrations run right after InitDB, ahead of every
-	// runtime-only check below: they touch nothing that integration
-	// encryption or webhook networking configures, so a misconfigured
-	// integration must not be able to block one. Nothing further down starts
-	// either: HTTP, the scheduler and the background workers are all beyond
-	// this point.
-	if len(os.Args) > 1 && os.Args[1] == "migrate" {
-		runMigrate(st, os.Args[2:])
-		return
 	}
 
 	// Validate ENCRYPTION_KEY is set (required for integrations)
@@ -304,18 +293,6 @@ func main() {
 	}
 
 	// Normal Server Startup
-
-	// The schedule cutover has to have happened before anything serves.
-	//
-	// Deliberately here and not right after the `migrate` branch above: between
-	// the two sit `seed`, `user create`, `team create` and
-	// `migrate-slack-identities` - the tools an operator may well need on a
-	// database in the middle of a cutover window. None of them touches
-	// schedules, and gating them would turn one skipped step into a locked
-	// toolbox.
-	if err := st.RequireCutoverSchema(); err != nil {
-		log.Fatalf("Refusing to start: %v", err)
-	}
 
 	// Defence in depth, reported rather than enforced - see
 	// RevisionOverlapConstraintPresent for why this warns instead of refusing.
@@ -574,43 +551,6 @@ func main() {
 	defer shutdownCancel()
 	if err := internalSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Internal server shutdown error: %v", err)
-	}
-}
-
-// runMigrate dispatches the offline schema migration subcommands. Destructive
-// operations live here rather than behind a startup flag on purpose: they must
-// never be a variant of a normal start.
-func runMigrate(st *store.Store, args []string) {
-	if len(args) == 0 {
-		log.Fatal("Usage: tokayops migrate reset-schedules")
-	}
-	switch subCmd := args[0]; subCmd {
-	case "reset-schedules":
-		if len(args) > 1 {
-			log.Fatal("Usage: tokayops migrate reset-schedules")
-		}
-		res, err := st.ResetLegacySchedules()
-		if err != nil {
-			log.Fatalf("Schedule reset failed: %v", err)
-		}
-		// Three outcomes, three sentences. A database that had already been
-		// reset by an earlier release gets the physical cleanup and deletes
-		// nothing; saying "0 schedule(s) deleted" there would be true and
-		// thoroughly misleading in the one moment the output is read closely,
-		// because it reads as "there was nothing here" rather than "the live
-		// schedules were deliberately left alone".
-		switch {
-		case res.AlreadyApplied:
-			log.Println("Schedule cutover already complete - nothing to do.")
-		case res.RowsAlreadyReset:
-			log.Println("Legacy schedule schema removed and the history horizon tightened. " +
-				"The rows had already been reset by an earlier upgrade and were left untouched.")
-		default:
-			log.Printf("Schedule reset complete: %d schedule(s) deleted, legacy schema removed. "+
-				"Recreate schedules with the new binary running.", res.SchedulesDeleted)
-		}
-	default:
-		log.Fatalf("Unknown migrate command: %s", subCmd)
 	}
 }
 

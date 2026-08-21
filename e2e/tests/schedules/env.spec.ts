@@ -10,8 +10,8 @@ import { TeamFixtures } from '../../fixtures/team.fixture';
  * Both halves are gone now: `seed` no longer writes schedules and the endpoint
  * no longer exists, so the check could not fail for any reason and was removed
  * rather than left standing. A test that cannot fail is worse than none, it
- * occupies the place of a guarantee. The reset's own behaviour - guards,
- * idempotency, marker - is covered in store/legacy_reset_test.go.
+ * occupies the place of a guarantee. The reset itself is gone too, together
+ * with its tests: every installation is past it.
  *
  * Nothing here writes to seeded data. A spec that configured a seeded team
  * would pass once and then fail against its own leftovers - deleting a

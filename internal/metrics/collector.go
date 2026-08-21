@@ -4,7 +4,7 @@ import (
 	"log"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/tokayops/tokayops/internal/store"
+	"github.com/tokayops/tokayops/internal/model"
 )
 
 var (
@@ -47,7 +47,7 @@ var (
 
 // BusinessCollector queries the store on each Prometheus scrape.
 type BusinessCollector struct {
-	store store.StoreInterface
+	store metricsSource
 }
 
 func (c *BusinessCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -110,11 +110,18 @@ func (c *BusinessCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 // RegisterCollector registers the business metrics collector with the default Prometheus registry.
-func RegisterCollector(s store.StoreInterface) {
+// metricsSource is the store as this collector needs it: one snapshot of the
+// counts a scrape reports. Declared here rather than taken whole, so that what
+// the collector may read is the whole of what is written here.
+type metricsSource interface {
+	GetMetricsSnapshot() (*model.MetricsSnapshot, error)
+}
+
+func RegisterCollector(s metricsSource) {
 	prometheus.MustRegister(&BusinessCollector{store: s})
 }
 
 // RegisterCollectorWith registers the business metrics collector with the given registry.
-func RegisterCollectorWith(reg prometheus.Registerer, s store.StoreInterface) {
+func RegisterCollectorWith(reg prometheus.Registerer, s metricsSource) {
 	reg.MustRegister(&BusinessCollector{store: s})
 }

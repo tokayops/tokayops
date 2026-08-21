@@ -513,13 +513,12 @@ func (s *Store) InitDB() error {
 	// a row without one could only come from before the revision model, and the
 	// destructive upgrade removes those rather than carrying them forward.
 	//
-	// The three ALTERs below are the upgrade path and only the upgrade path. On
-	// a database created by this statement they are no-ops; on one that predates
-	// the revision model they add the columns NULLABLE and tighten nothing. That
-	// asymmetry is deliberate and load-bearing: InitDB runs before the `migrate`
-	// subcommand (cmd/tokayops/main.go), so a SET NOT NULL here would refuse to
-	// start the very binary whose reset repairs the situation. The tightening
-	// lives in that reset; RequireCutoverSchema refuses to serve until it ran.
+	// The three ALTERs below add the columns to a database that predates them,
+	// and are no-ops on one this statement created. They add NULLABLE and
+	// tighten nothing: a row without a history horizon could only come from
+	// before the revision model, and databases in that shape stopped being
+	// upgradable when the cutover code was removed - such a database has to be
+	// brought forward on an older release first.
 	//
 	// All range constraints use tstzrange over TIMESTAMPTZ columns.
 	revisionQuery := `
@@ -3061,8 +3060,8 @@ func (s *Store) queryPolicies(query string, args ...interface{}) ([]*model.Escal
 }
 
 // GetMetricsSnapshot returns all data needed by the Prometheus business metrics collector.
-func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
-	snap := &MetricsSnapshot{}
+func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
+	snap := &model.MetricsSnapshot{}
 
 	// 1. Active alert groups by team/severity
 	rows, err := s.db.Query(`
@@ -3074,7 +3073,7 @@ func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var c AlertGroupCount
+		var c model.AlertGroupCount
 		if err := rows.Scan(&c.TeamID, &c.Severity, &c.Count); err != nil {
 			return nil, err
 		}
@@ -3093,7 +3092,7 @@ func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	defer rows2.Close()
 	for rows2.Next() {
-		var c AlertGroupStatusCount
+		var c model.AlertGroupStatusCount
 		if err := rows2.Scan(&c.TeamID, &c.Severity, &c.Status, &c.Count); err != nil {
 			return nil, err
 		}
@@ -3160,7 +3159,7 @@ func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	defer rows3.Close()
 	for rows3.Next() {
-		var c StatusCount
+		var c model.StatusCount
 		if err := rows3.Scan(&c.Status, &c.Count); err != nil {
 			return nil, err
 		}
@@ -3177,7 +3176,7 @@ func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	defer rows4.Close()
 	for rows4.Next() {
-		var c StatusCount
+		var c model.StatusCount
 		if err := rows4.Scan(&c.Status, &c.Count); err != nil {
 			return nil, err
 		}

@@ -12,7 +12,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 const (
@@ -24,13 +23,37 @@ const (
 // Worker is the outbox delivery worker. It claims outbox events, fans them out
 // to subscriber generic_webhook integrations, delivers via HTTP, and retries.
 type Worker struct {
-	store    store.StoreInterface
+	store    outboxStore
 	sender   WebhookSender
 	workerID string
 }
 
 // New creates a new outbox delivery worker.
-func New(st store.StoreInterface, sender WebhookSender) *Worker {
+// outboxStore is the store as webhook delivery needs it: claim events under a
+// lease, fan them out to the integrations that subscribe, and record every
+// attempt.
+//
+// This is the only delivery component in the tree that already has all three -
+// a durable intent per (event, integration), an append-only attempt log, and a
+// lease over the work. What it does is the shape the notification side does not
+// have yet.
+type outboxStore interface {
+	ClaimOutboxEvents(workerID string, limit int, leaseDuration time.Duration) ([]*model.OutboxEvent, error)
+	ExtendOutboxEventLease(eventID, workerID string, until time.Time) (bool, error)
+	UpdateOutboxEventIfOwned(event *model.OutboxEvent, workerID string) (bool, error)
+	UpdateOutboxEvent(event *model.OutboxEvent) error
+	GetOutboxEventByID(id string) (*model.OutboxEvent, error)
+
+	GetIntegrationsByType(integrationType model.IntegrationType) ([]*model.Integration, error)
+
+	CreateOutboxDelivery(delivery *model.OutboxDelivery) error
+	UpdateOutboxDelivery(delivery *model.OutboxDelivery) error
+	GetOutboxDelivery(eventID, integrationID string) (*model.OutboxDelivery, error)
+	GetDeliveriesByEventID(eventID string) ([]*model.OutboxDelivery, error)
+	CreateDeliveryAttempt(attempt *model.DeliveryAttempt) error
+}
+
+func New(st outboxStore, sender WebhookSender) *Worker {
 	return &Worker{
 		store:    st,
 		sender:   sender,

@@ -14,7 +14,6 @@ import (
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 type AMPayload struct {
@@ -31,12 +30,32 @@ type WebhookSecretValidator interface {
 }
 
 type Ingester struct {
-	store           store.StoreInterface
+	store           alertIntake
 	cfg             *config.Config
 	secretValidator WebhookSecretValidator
 }
 
-func NewIngester(s store.StoreInterface, cfg *config.Config, secretValidator WebhookSecretValidator) *Ingester {
+// alertIntake is the store as the ingester needs it: find the incident an alert
+// belongs to, open one if there is none, and record what changed.
+//
+// Two of these are atomic on purpose. Creating a group writes the group, its
+// timeline and the webhook event in one commit; recording changed alerts raises
+// the "this message is out of date" mark in the same write as the alerts
+// themselves, so no interruption can keep the alert and drop the mark.
+type alertIntake interface {
+	GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error)
+	CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) error
+	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
+
+	// The resolved-group path syncs alerts without raising anything: the
+	// message is updated by the resolution, not by this write.
+	UpdateAlertGroupAlerts(id string, alerts []model.Alert) error
+	ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	AddTimelineEvent(e *model.TimelineEvent) error
+	GetTeamByID(id string) (*model.Team, error)
+}
+
+func NewIngester(s alertIntake, cfg *config.Config, secretValidator WebhookSecretValidator) *Ingester {
 	return &Ingester{store: s, cfg: cfg, secretValidator: secretValidator}
 }
 

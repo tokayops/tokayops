@@ -68,8 +68,8 @@ test-db-status:
 test-integration:
 	@./scripts/run_integration_tests.sh --failures
 
-# Order independence of the store package, which is where the schema-mutating
-# cutover tests live. Inside the runner so the database it starts is still up:
+# Order independence of the store package, which is where the tests that reshape
+# the schema live. Inside the runner so the database it starts is still up:
 # see the --shuffle comment in the script.
 #
 # Scoped to ./internal/store/... deliberately. The tree as a whole has never
@@ -103,19 +103,14 @@ test-dispatcher:
 e2e-install:
 	cd e2e && npm install && npx playwright install chromium firefox
 
-# Always from a fresh volume. The environment is built by seeding and then
-# resetting, and the reset records a marker that makes it a no-op afterwards -
-# so running this twice against a surviving database would re-seed the legacy
-# schedules and have nothing left to remove them. Starting clean is also what
-# e2e-test already assumed: it tears the stack down after every run.
+# Always from a fresh volume: e2e-test tears the stack down after every run, and
+# the seed below is written for an empty database rather than for whatever the
+# last run left behind.
 #
-# The database comes up alone, the CLI runs against it, and only then does the
-# application start. That order is the production cutover procedure, and the
-# reason to reproduce it is that `migrate reset-schedules` is no longer only
-# DML: it drops the pre-revision tables and tightens a column, taking ACCESS
-# EXCLUSIVE locks. The upgrade checklist requires every instance to be stopped
-# for exactly that reason, and the only automated rehearsal of the cutover we
-# have should not be rehearsing something the checklist forbids.
+# The database comes up alone, the CLI containers run against it, and only then
+# does the application start. Seeding before the first request is what makes the
+# state deterministic when Playwright connects; schedules are not seeded at all -
+# the setup project creates them through the API.
 e2e-up: e2e-down
 	docker compose -f docker-compose.e2e.yml up -d --wait e2e_db
 	$(MAKE) e2e-seed
@@ -140,21 +135,14 @@ e2e-wait:
 	docker compose -f docker-compose.e2e.yml logs tokay_app; \
 	exit 1
 
-# e2e-seed is the data half of the environment: the admin the suite logs in as,
-# the seeded teams, and the destructive reset.
+# e2e-seed is the data half of the environment: the admin the suite logs in as
+# and the seeded teams, policies and integrations.
 #
 # It is a target of its own so that CI calls it instead of keeping a copy of
-# these three commands. It used to keep one, and when Epic 10 Sprint 5.5 added
-# the reset below, the workflow's copy never got it - so `env.spec.ts` failed on
-# every branch in CI while every local run was green. One definition of the
-# environment, called from both places, is the only thing that stops that
-# happening again.
-#
-# The reset no longer has anything to delete - `seed` stopped writing schedules
-# when the legacy write path was removed - and it stays anyway, without `|| true`,
-# so a failure fails the environment. On every run it puts the real CLI against
-# the real schema and leaves the marker a database has after an upgrade, which is
-# the state the suite is supposed to run against.
+# these commands. It used to keep one, and when a step was added here the
+# workflow's copy never got it - so `env.spec.ts` failed on every branch in CI
+# while every local run was green. One definition of the environment, called
+# from both places, is the only thing that stops that happening again.
 #
 # These run as one-shot containers rather than `exec` into a running app,
 # because the application is deliberately not running yet - see e2e-up. Each
@@ -165,7 +153,6 @@ e2e-wait:
 e2e-seed:
 	docker compose -f docker-compose.e2e.yml run --rm --build tokay_cli user create admin@example.com 'Admin123!' 'Test Admin' || true
 	docker compose -f docker-compose.e2e.yml run --rm tokay_cli seed || true
-	docker compose -f docker-compose.e2e.yml run --rm tokay_cli migrate reset-schedules
 
 e2e-down:
 	docker compose -f docker-compose.e2e.yml down -v --remove-orphans

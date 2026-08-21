@@ -10,6 +10,7 @@ import (
 
 	"github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/metrics"
+	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -20,6 +21,14 @@ const cacheTTL = 1 * time.Hour
 type cacheEntry struct {
 	slackIDs  string // sorted comma-joined Slack user IDs
 	updatedAt time.Time
+}
+
+// identityLookup is the store as a sync needs it: where the people on duty can
+// be reached. One method, because that is all a sync touches - and a type of its
+// own, because the notifier takes a different set from the same store and each
+// says so where it is written.
+type identityLookup interface {
+	GetIdentitiesForUsers(userIDs []string) (map[string][]*model.ExternalIdentity, error)
 }
 
 // UsergroupSyncer synchronizes Slack usergroups with current on-call users.

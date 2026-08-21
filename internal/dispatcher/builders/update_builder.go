@@ -10,7 +10,6 @@ import (
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 // ErrNoUpdatableDeliveries indicates no deliveries need updating (not a failure)
@@ -18,10 +17,10 @@ var ErrNoUpdatableDeliveries = errors.New("no updatable deliveries")
 
 type UpdateJobBuilder struct {
 	Config *config.Config
-	Store  store.StoreInterface
+	Store  deliveryLookup
 }
 
-func NewUpdateJobBuilder(cfg *config.Config, s store.StoreInterface) (*UpdateJobBuilder, error) {
+func NewUpdateJobBuilder(cfg *config.Config, s deliveryLookup) (*UpdateJobBuilder, error) {
 	if s == nil {
 		return nil, errors.New("update builder requires store")
 	}

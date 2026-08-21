@@ -35,31 +35,29 @@ type onCallLister interface {
 	CurrentOnCallForAllNow(ctx context.Context) (schedulerender.BulkOnCall, error)
 }
 
-// The store side of a tick, named by role rather than taken whole.
+// notifierStore is the store side of a tick, named by role rather than taken
+// whole.
 //
 // The notifier used to hold a store.StoreInterface for these three methods,
 // which is a hundred-odd others it never calls - and its test double embedded
 // that interface, so nothing showed which three were real and a double that
 // implemented none of them still compiled.
-type teamDirectory interface {
+//
+// Three methods and one type, though, not three types: a part of a role becomes
+// a named interface of its own when something takes that part alone, the way
+// the syncer takes identityLookup from the same store. Named without a taker, a
+// role is one more jump for the reader and nothing else.
+type notifierStore interface {
+	// The team name is how the message addresses whoever reads it.
 	GetAllTeams() ([]*model.Team, error)
-}
 
-type identityLookup interface {
+	// Where the people coming on duty can be reached, per provider.
 	GetIdentitiesForUsers(userIDs []string) (map[string][]*model.ExternalIdentity, error)
-}
 
-type jobCreator interface {
+	// Admission. False means another instance announced this handover first,
+	// which is why the answer is a value and not an error.
 	CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
 		steps []*model.JobStep) (created bool, err error)
-}
-
-// notifierStore is the three roles together, so the constructor keeps taking
-// one argument and *store.Store still satisfies it structurally.
-type notifierStore interface {
-	teamDirectory
-	identityLookup
-	jobCreator
 }
 
 // HandoffNotifier detects on-call changes and creates notification jobs.
@@ -75,8 +73,8 @@ type HandoffNotifier struct {
 	// states, not two: no key at all means the schedule has not been observed
 	// in this process, a stored empty composition means it was observed with
 	// nobody on duty, and anything else is that composition. Conflating the
-	// first two either mass-mails everyone at cutover or goes silent after a
-	// delete and recreate.
+	// first two either mass-mails everyone on the next restart or goes silent
+	// after a delete and recreate.
 	//
 	// The values are stored by value rather than as pointers precisely so the
 	// three states are all the type can express: a nil pointer in here would be

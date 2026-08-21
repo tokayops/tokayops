@@ -34,20 +34,20 @@ func TestCheckCommand(t *testing.T) {
 		contains []string
 	}{
 		{name: "no arguments runs the server", args: []string{"tokayops"}},
-		{name: "a known command passes", args: []string{"tokayops", "migrate"}},
+		{name: "a known command passes", args: []string{"tokayops", "seed"}},
 		{name: "every listed command passes", args: []string{"tokayops", "migrate-slack-identities"}},
 		{
 			name:     "a typo is refused and named",
-			args:     []string{"tokayops", "migrat"},
+			args:     []string{"tokayops", "seeed"},
 			wantErr:  true,
-			contains: []string{`"migrat"`, "known commands", "migrate"},
+			contains: []string{`"seeed"`, "known commands", "seed"},
 		},
 		{
 			// The mistake this check exists for: ENTRYPOINT already runs the
 			// binary, so `docker compose run tokay /app/tokayops migrate` makes
 			// the path the command.
 			name:     "a path gets the entrypoint hint",
-			args:     []string{"tokayops", "/app/tokayops", "migrate"},
+			args:     []string{"tokayops", "/app/tokayops", "seed"},
 			wantErr:  true,
 			contains: []string{`"/app/tokayops"`, "the image already runs the binary"},
 		},
