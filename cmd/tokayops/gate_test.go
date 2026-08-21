@@ -95,16 +95,6 @@ func TestStartupGate(t *testing.T) {
 	})
 }
 
-func buildBinary(t *testing.T) string {
-	t.Helper()
-	bin := filepath.Join(t.TempDir(), "tokayops")
-	build := exec.Command("go", "build", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build the binary under test: %v\n%s", err, out)
-	}
-	return bin
-}
-
 // gateEnv is one throwaway database plus the environment that points the binary
 // at it.
 type gateEnv struct {

@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -49,7 +51,46 @@ var (
 // @description TokayOps API
 // @BasePath /
 
+// knownCommands are the first arguments main dispatches on. Kept beside the
+// check rather than derived from the switch below, which cannot be enumerated -
+// and kept honest by the default branch in that switch, which refuses anything
+// listed here that never got a case.
+var knownCommands = []string{"migrate", "seed", "migrate-slack-identities", "user", "team"}
+
+// checkCommand refuses a first argument that dispatches nowhere.
+//
+// It reads nothing and connects to nothing, which is why main calls it before
+// everything else. Left to the switch, the refusal would land after InitDB has
+// already taken ACCESS EXCLUSIVE locks on a live database - so a typo would
+// touch the schema of the installation it was meant not to disturb.
+//
+// No arguments means "run the server", as it always has.
+func checkCommand(args []string) error {
+	if len(args) < 2 {
+		return nil
+	}
+	cmd := args[1]
+	if slices.Contains(knownCommands, cmd) {
+		return nil
+	}
+
+	msg := fmt.Sprintf("unknown command %q\nknown commands: %s\nrun with no arguments to start the server",
+		cmd, strings.Join(knownCommands, ", "))
+	// The mistake that produced this check: the image already runs the binary
+	// (ENTRYPOINT), so repeating its path makes the path argument one, and the
+	// real command argument two.
+	if strings.Contains(cmd, "/") {
+		msg += "\nthat looks like a path rather than a command - the image already runs the binary, so pass only the command"
+	}
+	return errors.New(msg)
+}
+
 func main() {
+	// Arguments are checked before anything is loaded, connected to or migrated.
+	if err := checkCommand(os.Args); err != nil {
+		log.Fatal(err)
+	}
+
 	// 1. Load Config
 	cfgPath := os.Getenv("CONFIG_FILE")
 	if cfgPath == "" {
@@ -252,6 +293,13 @@ func main() {
 				return
 			}
 			log.Fatalf("Unknown team command: %s", subCmd)
+
+		default:
+			// Unreachable while knownCommands and these cases agree. It exists
+			// because they can stop agreeing: a name added to the list without a
+			// case here would otherwise fall out of the switch and start the
+			// server, which is the very defect the check above removes.
+			log.Fatalf("command %q is known but not dispatched - this is a bug", cmd)
 		}
 	}
 
