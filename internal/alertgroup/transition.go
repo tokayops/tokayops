@@ -6,7 +6,6 @@ import (
 
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 type TransitionOutcome string
@@ -28,10 +27,23 @@ type TransitionResult struct {
 }
 
 type Service struct {
-	store store.StoreInterface
+	store transitions
 }
 
-func NewService(s store.StoreInterface) *Service {
+// transitions is the store as this service needs it: read the group, and apply
+// one of the two single-winner transitions.
+//
+// The atomic calls are what this service exists for. Each of them carries the
+// status change, the timeline entry, the outbox event and the cancellation of
+// the escalation in one commit, so "acknowledged" and "nobody is being paged
+// any more" are one fact rather than two writes that can be interrupted.
+type transitions interface {
+	GetAlertGroupByID(id string) (*model.AlertGroup, error)
+	AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+}
+
+func NewService(s transitions) *Service {
 	return &Service{store: s}
 }
 

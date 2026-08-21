@@ -5,7 +5,6 @@ import (
 	"database/sql"
 
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 // Action represents a permission action in the RBAC system.
@@ -87,11 +86,21 @@ func UserScope(userID string) Scope {
 
 // Checker provides RBAC permission checks.
 type Checker struct {
-	store store.StoreInterface
+	store directory
 }
 
 // NewChecker creates a new RBAC Checker.
-func NewChecker(s store.StoreInterface) *Checker {
+// directory is the store as an access check needs it: who the user is, and what
+// role they hold in a team. Two methods, and a check that needed a third would
+// be a different kind of check.
+type directory interface {
+	// GetActiveUserByID excludes erased users, which is what makes a soft
+	// delete terminal for authorization.
+	GetActiveUserByID(id string) (*model.User, error)
+	GetUserTeamRole(userID, teamID string) (model.TeamMemberRole, error)
+}
+
+func NewChecker(s directory) *Checker {
 	return &Checker{store: s}
 }
 

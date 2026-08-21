@@ -3061,8 +3061,8 @@ func (s *Store) queryPolicies(query string, args ...interface{}) ([]*model.Escal
 }
 
 // GetMetricsSnapshot returns all data needed by the Prometheus business metrics collector.
-func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
-	snap := &MetricsSnapshot{}
+func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
+	snap := &model.MetricsSnapshot{}
 
 	// 1. Active alert groups by team/severity
 	rows, err := s.db.Query(`
@@ -3074,7 +3074,7 @@ func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var c AlertGroupCount
+		var c model.AlertGroupCount
 		if err := rows.Scan(&c.TeamID, &c.Severity, &c.Count); err != nil {
 			return nil, err
 		}
@@ -3093,7 +3093,7 @@ func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	defer rows2.Close()
 	for rows2.Next() {
-		var c AlertGroupStatusCount
+		var c model.AlertGroupStatusCount
 		if err := rows2.Scan(&c.TeamID, &c.Severity, &c.Status, &c.Count); err != nil {
 			return nil, err
 		}
@@ -3160,7 +3160,7 @@ func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	defer rows3.Close()
 	for rows3.Next() {
-		var c StatusCount
+		var c model.StatusCount
 		if err := rows3.Scan(&c.Status, &c.Count); err != nil {
 			return nil, err
 		}
@@ -3177,7 +3177,7 @@ func (s *Store) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	defer rows4.Close()
 	for rows4.Next() {
-		var c StatusCount
+		var c model.StatusCount
 		if err := rows4.Scan(&c.Status, &c.Count); err != nil {
 			return nil, err
 		}

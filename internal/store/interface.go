@@ -184,42 +184,10 @@ type StoreInterface interface {
 	GetDeliveryAttempts(deliveryID string) ([]*model.DeliveryAttempt, error)
 
 	// Metrics
-	GetMetricsSnapshot() (*MetricsSnapshot, error)
+	GetMetricsSnapshot() (*model.MetricsSnapshot, error)
 
 	// Lifecycle
 	Close() error
-}
-
-// AlertGroupCount holds the count of active alert groups for a team/severity pair.
-type AlertGroupCount struct {
-	TeamID   string
-	Severity string
-	Count    int
-}
-
-// AlertGroupStatusCount holds the count of alert groups for a team/severity/status triple.
-type AlertGroupStatusCount struct {
-	TeamID   string
-	Severity string
-	Status   string
-	Count    int
-}
-
-// StatusCount holds a count for a single status value.
-type StatusCount struct {
-	Status string
-	Count  int
-}
-
-// MetricsSnapshot holds all data needed by the Prometheus collector.
-type MetricsSnapshot struct {
-	ActiveAlertGroups        []AlertGroupCount
-	AlertGroupsByStatus      []AlertGroupStatusCount
-	TeamsWithoutOnCall       int
-	TeamsWithPermanentOnCall int
-	TeamsWithoutPolicy       int
-	OutboxEventsByStatus     []StatusCount
-	OutboxDeliveriesByStatus []StatusCount
 }
 
 // Ensure Store implements StoreInterface

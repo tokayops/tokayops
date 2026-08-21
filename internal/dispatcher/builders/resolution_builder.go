@@ -9,15 +9,20 @@ import (
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 type ResolutionJobBuilder struct {
 	Config *config.Config
-	Store  store.StoreInterface
+	Store  deliveryLookup
 }
 
-func NewResolutionJobBuilder(cfg *config.Config, s store.StoreInterface) *ResolutionJobBuilder {
+// deliveryLookup is the store as a message update needs it: what this group has
+// already sent, since an update can only edit what exists.
+type deliveryLookup interface {
+	ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error)
+}
+
+func NewResolutionJobBuilder(cfg *config.Config, s deliveryLookup) *ResolutionJobBuilder {
 	return &ResolutionJobBuilder{Config: cfg, Store: s}
 }
 

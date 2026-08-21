@@ -12,7 +12,6 @@ import (
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 // OnCallProjection is the slice of the schedule projection the builder needs.
@@ -43,7 +42,7 @@ var ErrOnCallResolutionUnavailable = errors.New("on-call recipients could not be
 
 // EscalationJobBuilder builds escalation jobs from Store-based policies
 type EscalationJobBuilder struct {
-	Store  store.StoreInterface
+	Store  policyLookup
 	OnCall OnCallProjection
 	Config *config.Config // for firehose channel config
 }
@@ -78,7 +77,14 @@ type onCallResolver struct {
 	byID map[string]scheduleResolution
 }
 
-func NewEscalationJobBuilder(s store.StoreInterface, oncall OnCallProjection, cfg *config.Config) *EscalationJobBuilder {
+// policyLookup is the store as an escalation build needs it: the policy this
+// group is escalated by, and the people its steps name.
+type policyLookup interface {
+	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
+	GetUsersByIDs(ids []string) ([]*model.User, error)
+}
+
+func NewEscalationJobBuilder(s policyLookup, oncall OnCallProjection, cfg *config.Config) *EscalationJobBuilder {
 	return &EscalationJobBuilder{Store: s, OnCall: oncall, Config: cfg}
 }
 

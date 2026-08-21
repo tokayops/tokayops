@@ -13,7 +13,6 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 // onCallProjection is what the engine needs from the schedule projection.
@@ -32,7 +31,7 @@ type onCallProjection interface {
 }
 
 type Engine struct {
-	store      store.StoreInterface
+	store      escalationStore
 	oncall     onCallProjection
 	escBuilder *builders.EscalationJobBuilder
 }
@@ -45,7 +44,31 @@ type Engine struct {
 // The builder is built once, here, rather than per alert group. It holds no
 // state between builds - what one build remembers lives for that build - so a
 // shared instance is the same object the loop was allocating each time round.
-func NewEngine(s store.StoreInterface, oncall onCallProjection, cfg *config.Config) *Engine {
+// escalationStore is the store as the escalation engine needs it: find the
+// groups nobody has been paged for, learn who to page, and admit the escalation.
+//
+// EnsureEscalationJob is the one that carries the boundary. It is not "insert a
+// job": in one commit it moves the group to processing, stores the policy
+// snapshot the escalation will be executed against, and admits the job under its
+// forever claim. Split into separate calls, a crash between them leaves a group
+// that looks handled and is not.
+type escalationStore interface {
+	GetNewAlertGroups() ([]*model.AlertGroup, error)
+	TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error)
+	UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResult) error
+	GetTeamByID(id string) (*model.Team, error)
+	GetUsersByIDs(ids []string) ([]*model.User, error)
+
+	// Passed down to the escalation builder, which needs the policy this group
+	// is escalated by. Listed here because the engine hands its own store to
+	// it: whatever the builder may read, the engine may read.
+	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
+
+	EnsureEscalationJob(agID string, job *model.Job, stages []*model.JobStage,
+		steps []*model.JobStep, snapshot *model.EscalationPolicySnapshot) (bool, error)
+}
+
+func NewEngine(s escalationStore, oncall onCallProjection, cfg *config.Config) *Engine {
 	// cfg is not kept: the only thing the engine did with it was hand it to the
 	// builder, which now holds it.
 	return &Engine{

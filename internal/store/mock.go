@@ -2545,11 +2545,11 @@ func (m *MockStore) GetAPITokenByID(id string) (*model.APIToken, error) {
 }
 
 // GetMetricsSnapshot returns mock metrics data.
-func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
+func (m *MockStore) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	snap := &MetricsSnapshot{}
+	snap := &model.MetricsSnapshot{}
 
 	// Active alert groups
 	counts := make(map[string]map[string]int) // team -> severity -> count
@@ -2564,7 +2564,7 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	for team, sevMap := range counts {
 		for sev, count := range sevMap {
-			snap.ActiveAlertGroups = append(snap.ActiveAlertGroups, AlertGroupCount{
+			snap.ActiveAlertGroups = append(snap.ActiveAlertGroups, model.AlertGroupCount{
 				TeamID: team, Severity: sev, Count: count,
 			})
 		}
@@ -2584,7 +2584,7 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	for team, sevMap := range statusCounts {
 		for sev, statMap := range sevMap {
 			for status, count := range statMap {
-				snap.AlertGroupsByStatus = append(snap.AlertGroupsByStatus, AlertGroupStatusCount{
+				snap.AlertGroupsByStatus = append(snap.AlertGroupsByStatus, model.AlertGroupStatusCount{
 					TeamID: team, Severity: sev, Status: status, Count: count,
 				})
 			}
@@ -2612,7 +2612,7 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 		evtCounts[string(e.Status)]++
 	}
 	for status, count := range evtCounts {
-		snap.OutboxEventsByStatus = append(snap.OutboxEventsByStatus, StatusCount{Status: status, Count: count})
+		snap.OutboxEventsByStatus = append(snap.OutboxEventsByStatus, model.StatusCount{Status: status, Count: count})
 	}
 
 	// Outbox deliveries by status
@@ -2621,7 +2621,7 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 		delCounts[string(d.Status)]++
 	}
 	for status, count := range delCounts {
-		snap.OutboxDeliveriesByStatus = append(snap.OutboxDeliveriesByStatus, StatusCount{Status: status, Count: count})
+		snap.OutboxDeliveriesByStatus = append(snap.OutboxDeliveriesByStatus, model.StatusCount{Status: status, Count: count})
 	}
 
 	return snap, nil
