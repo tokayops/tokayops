@@ -119,3 +119,195 @@ type Leased struct {
 	LeaseToken  string
 	LockedUntil time.Time
 }
+
+// BeginAttemptRequest is a worker asking to make one call, with everything it
+// resolved before asking.
+//
+// Preparation happens outside the transaction and outside the domain: an
+// address is looked up, credentials are read, the provider's configuration is
+// checked. What arrives here is the ANSWER, because the transaction that opens
+// an attempt must not be waiting on anything but the database.
+type BeginAttemptRequest struct {
+	IntentID   string
+	LeaseToken string
+	WorkerID   string
+
+	Preparation PreparationOutcome
+
+	// BoundEndpoint is the provider's own address for this recipient, resolved
+	// once when the effect is opened and frozen for as long as it is being
+	// attempted: a retry after doubt must not go to a number somebody changed
+	// in between.
+	BoundEndpoint string
+	ProviderKey   string
+	AttemptKind   AttemptKind
+	Operation     Operation
+
+	// ErrorClass and Summary describe a preparation that failed, and are what
+	// the journal keeps instead of an attempt.
+	ErrorClass string
+	Summary    string
+}
+
+// BeginOutcome is what happened when a worker asked to start.
+type BeginOutcome string
+
+const (
+	// BeginStarted: the attempt exists and the network may be called.
+	BeginStarted BeginOutcome = "started"
+
+	// BeginPreparedPermanent: nothing was sent and nothing will be until
+	// somebody changes a configuration. The refusal is recorded as proof that
+	// no call was made.
+	BeginPreparedPermanent BeginOutcome = "prepared_permanent"
+
+	// BeginPreparedRetry: nothing was sent this time.
+	BeginPreparedRetry BeginOutcome = "prepared_retry"
+
+	// BeginLeaseLost: somebody else holds this commitment now.
+	BeginLeaseLost BeginOutcome = "lease_lost"
+
+	// BeginIntentFinalized: it was withdrawn or finished while the worker was
+	// preparing.
+	BeginIntentFinalized BeginOutcome = "intent_finalized"
+
+	// BeginUncertain: an attempt of this worker's own lease already exists, so
+	// the reply to a previous begin was lost. The network is NOT authorised a
+	// second time: after a restart nobody can prove whether the provider was
+	// called, and recovery closing it as ambiguous is the conservative answer.
+	BeginUncertain BeginOutcome = "uncertain_begin"
+
+	BeginNotFound BeginOutcome = "not_found"
+)
+
+// BeginAttemptResult is what the worker needs to make the call: the attempt it
+// is making, and the content to render, which comes from the domain rather than
+// from the live alert group.
+type BeginAttemptResult struct {
+	Outcome   BeginOutcome
+	AttemptID string
+	AttemptNo int
+
+	GenerationNo    int
+	AppliedRevision int64
+	Snapshot        keys.RenderSnapshot
+	Payload         json.RawMessage
+
+	// CompletionFingerprintVersion is stamped here, not when the attempt is
+	// finished: an attempt can outlive a deployment, and the encoder that
+	// closes it has to be the one that opened it.
+	CompletionFingerprintVersion int
+
+	Intent Intent
+}
+
+// FinalizeRequest closes one attempt with what is known about it.
+type FinalizeRequest struct {
+	AttemptID  string
+	LeaseToken string
+
+	// Completion is the conclusion in the form its fingerprint is taken over.
+	// It is what tells a repeat of this call from a different one.
+	Completion keys.Completion
+
+	// Receipt is the provider's coordinates, stored on the attempt and on the
+	// commitment. Kept on the attempt as well because a later generation clears
+	// the commitment's copy, and the address of a message that really was sent
+	// must not disappear with it.
+	Receipt json.RawMessage
+
+	Summary string
+
+	// AttemptIsFinal says this attempt applied the last revision the commitment
+	// will ever have.
+	AttemptIsFinal bool
+}
+
+// FinalizeOutcome is the answer to closing an attempt.
+type FinalizeOutcome string
+
+const (
+	// FinalizeFinalized: this call's result is now the commitment's.
+	FinalizeFinalized FinalizeOutcome = "finalized"
+
+	// FinalizeIdempotentRepeat: the same conclusion was already recorded. The
+	// normal answer to a lost commit reply.
+	FinalizeIdempotentRepeat FinalizeOutcome = "idempotent_repeat"
+
+	// FinalizeConflict: a DIFFERENT conclusion was already recorded for this
+	// attempt. One of the two is wrong, and overwriting would hide which.
+	FinalizeConflict FinalizeOutcome = "conflict"
+
+	// FinalizeLeaseLost: somebody else closed this attempt - usually recovery,
+	// after the worker was presumed dead. A genuine late result is kept as an
+	// observation rather than thrown away.
+	FinalizeLeaseLost FinalizeOutcome = "lease_lost"
+
+	FinalizeNotFound FinalizeOutcome = "not_found"
+)
+
+// FinalizeResult says what the commitment did as a result.
+type FinalizeResult struct {
+	Outcome FinalizeOutcome
+	To      Status
+	Row     string
+
+	// ObservationRecorded is set when a late result was kept for an attempt
+	// somebody else had already closed.
+	ObservationRecorded bool
+}
+
+// ResolveAmbiguityRequest is a person deciding what a stuck commitment does.
+type ResolveAmbiguityRequest struct {
+	IntentID string
+	Decision Decision
+	Actor    string
+	Reason   string
+
+	// AcceptedDuplicateRisk is the operator saying, on the record, that a
+	// second message may exist. Required for a new effect after an attempt
+	// whose fate is unknown.
+	AcceptedDuplicateRisk bool
+
+	// ResourceLossConfirmed is the operator saying the previous external object
+	// is definitely gone, which is the other way a new effect is allowed.
+	ResourceLossConfirmed bool
+
+	// NewExpiresAt is required to revive something that expired: without a new
+	// deadline the first claim would expire it again.
+	NewExpiresAt *time.Time
+}
+
+// ResolveOutcome is the answer to an operator's decision.
+type ResolveOutcome string
+
+const (
+	ResolveResolved ResolveOutcome = "resolved"
+
+	// ResolveAlreadyResolved: somebody - another operator, or an
+	// acknowledgement - got there first. The current state comes back with it.
+	ResolveAlreadyResolved ResolveOutcome = "already_resolved"
+
+	// ResolveInvalidDecision: the decision does not apply to this commitment.
+	ResolveInvalidDecision ResolveOutcome = "invalid_decision"
+
+	// ResolveBusinessClosed: the alert this commitment belongs to is over.
+	// Reviving a page for a closed incident is not a delivery anybody wants.
+	ResolveBusinessClosed ResolveOutcome = "business_closed"
+
+	ResolveNotFound ResolveOutcome = "not_found"
+)
+
+// ResolveAmbiguityResult is where the commitment ended up.
+type ResolveAmbiguityResult struct {
+	Outcome ResolveOutcome
+	Status  Status
+	Row     string
+}
+
+// StatusCount is how many commitments of a family are in one status, for the
+// health signals that watch the queue rather than any single delivery.
+type StatusCount struct {
+	Status Status
+	Count  int
+}

@@ -350,10 +350,21 @@ func addTimelineTx(ctx context.Context, tx *sql.Tx, alertGroupID string,
 func appendIntentEventTx(ctx context.Context, tx *sql.Tx,
 	intentID string, seq int, kind, reason, actor string) error {
 
+	// seq 0 means "whatever comes next": the caller of a lifecycle event knows
+	// what happened, not how many things happened before it.
+	sequence := any(seq)
+	if seq <= 0 {
+		sequence = nil
+	}
+
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO outbound_intent_events (id, intent_id, seq, kind, reason, actor)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		uuid.New().String(), intentID, seq, kind, nilIfEmpty(reason), nilIfEmpty(actor))
+		VALUES ($1, $2,
+		        COALESCE($3::int,
+		                 (SELECT COALESCE(max(seq), 0) + 1
+		                  FROM outbound_intent_events WHERE intent_id = $2)),
+		        $4, $5, $6)`,
+		uuid.New().String(), intentID, sequence, kind, nilIfEmpty(reason), nilIfEmpty(actor))
 	if err != nil {
 		return fmt.Errorf("record %s for commitment %s: %w", kind, intentID, err)
 	}
@@ -454,4 +465,282 @@ func (s *Store) ListIntentsByAlertGroup(ctx context.Context, alertGroupID string
 		}
 	}
 	return out, nil
+}
+
+// nextEventSeq asks appendIntentEventTx to take the next number in this
+// commitment's own history.
+const nextEventSeq = 0
+
+// transitionWrite is one decided transition plus the values the effects need.
+type transitionWrite struct {
+	Intent     outbound.Intent
+	Transition outbound.Transition
+	Backoff    time.Duration
+	// AppliedRevision is the revision the settled attempt was applying, which
+	// is not the same as the one desired now: the desired state may have moved
+	// while the attempt was in flight, and recording that as applied would
+	// claim the card shows something it does not.
+	AppliedRevision int64
+	// AttemptIsFinal says the settled attempt applied the last revision this
+	// commitment will ever have, which is what makes an editable card done
+	// rather than merely up to date.
+	AttemptIsFinal bool
+	Receipt        json.RawMessage
+	NewExpires     *time.Time
+	Actor          string
+	Reason         string
+}
+
+// applyTransitionTx writes what the machine decided, and nothing else.
+//
+// One statement rather than a branch per effect: every field the transition can
+// touch is written in the same UPDATE, so a commitment cannot end up half moved
+// - a status changed with a lease still held, or a retry scheduled for
+// something that is no longer pending.
+func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error {
+	e := w.Transition.Effects
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE outbound_intents SET
+			status = $2,
+			lease_token  = CASE WHEN $3 THEN NULL ELSE lease_token END,
+			locked_until = CASE WHEN $3 THEN NULL ELSE locked_until END,
+			worker_id    = CASE WHEN $3 THEN NULL ELSE worker_id END,
+			current_attempt_id = CASE WHEN $4 THEN NULL ELSE current_attempt_id END,
+			cancellation_requested = CASE WHEN $5 THEN FALSE ELSE cancellation_requested END,
+			generation_no = generation_no + CASE WHEN $6 THEN 1 ELSE 0 END,
+			attempts_in_generation = CASE WHEN $6 THEN 0 ELSE attempts_in_generation END,
+			bound_endpoint = CASE WHEN $6 THEN NULL ELSE bound_endpoint END,
+			create_key     = CASE WHEN $6 THEN NULL ELSE create_key END,
+			receipt = CASE
+				WHEN $6 THEN NULL
+				WHEN $7 AND $8::jsonb IS NOT NULL THEN $8::jsonb
+				ELSE receipt END,
+			failure_streak = CASE
+				WHEN $9  THEN 0
+				WHEN $10 THEN failure_streak + 1
+				ELSE failure_streak END,
+			next_attempt_at = CASE
+				WHEN $11 THEN now() + make_interval(secs => $12)
+				WHEN $13 THEN now()
+				ELSE next_attempt_at END,
+			applied_revision = CASE WHEN $14 THEN $15 ELSE applied_revision END,
+			final_revision_applied = CASE
+				WHEN $14 AND $16 THEN TRUE ELSE final_revision_applied END,
+			accepted_duplicate_risk = CASE WHEN $17 THEN TRUE ELSE accepted_duplicate_risk END,
+			expires_at = COALESCE($18, expires_at),
+			updated_at = now()
+		WHERE id = $1`,
+		w.Intent.ID, string(w.Transition.To),
+		e.ClearLease, e.ClearCurrentAttempt, e.ConsumeCancellation,
+		e.NewGeneration,
+		e.StoreReceipt, nullableJSON(w.Receipt),
+		e.ResetFailureStreak, e.BumpFailureStreak,
+		e.ScheduleRetry, w.Backoff.Seconds(), e.ScheduleNow,
+		e.ApplyRevision, w.AppliedRevision, w.AttemptIsFinal, e.RecordDuplicateRisk,
+		w.NewExpires,
+	); err != nil {
+		return fmt.Errorf("apply %s to commitment %s: %w", w.Transition.Row, w.Intent.ID, err)
+	}
+
+	return appendTransitionEventTx(ctx, tx, w)
+}
+
+// appendTransitionEventTx records the lifecycle events a transition produces -
+// the ones that are not attempts and therefore have no place in the attempt
+// journal.
+func appendTransitionEventTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error {
+	e := w.Transition.Effects
+
+	if e.NewGeneration {
+		if err := appendIntentEventTx(ctx, tx, w.Intent.ID, nextEventSeq,
+			"generation_opened", w.Reason, w.Actor); err != nil {
+			return err
+		}
+	}
+	if e.RecordDuplicateRisk {
+		if err := appendIntentEventTx(ctx, tx, w.Intent.ID, nextEventSeq,
+			"duplicate_risk_accepted",
+			"a message may already have been delivered", w.Actor); err != nil {
+			return err
+		}
+	}
+	if w.Transition.To == outbound.StatusCanceled {
+		return appendIntentEventTx(ctx, tx, w.Intent.ID, nextEventSeq,
+			"canceled", w.Reason, w.Actor)
+	}
+	return nil
+}
+
+// groupEffectsTx writes what a transition means for the alert group: its
+// history, and the one status move a delivery is allowed to make.
+func groupEffectsTx(ctx context.Context, tx *sql.Tx, alertGroupID string,
+	transition outbound.Transition) error {
+
+	if message, eventType, ok := timelineFor(transition); ok {
+		if err := addTimelineTx(ctx, tx, alertGroupID, eventType, message, "system"); err != nil {
+			return err
+		}
+	}
+
+	if transition.Effects.TriggerGroup {
+		// Conditional on purpose: an acknowledgement that arrived while this
+		// send was in flight has already moved the group, and a delivery must
+		// not move it back.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE alert_groups SET status = $2, updated_at = now()
+			WHERE id = $1 AND status = $3`,
+			alertGroupID, model.AlertGroupStatusTriggered, model.AlertGroupStatusProcessing,
+		); err != nil {
+			return fmt.Errorf("move the group to triggered: %w", err)
+		}
+	}
+	return nil
+}
+
+// timelineFor turns a transition into the line the alert's history gets. The
+// wording of a success is deliberate: "sent" and "assumed delivered" are
+// different claims, and only one of them is about the world.
+func timelineFor(t outbound.Transition) (string, model.TimelineEventType, bool) {
+	switch t.Effects.Timeline {
+	case outbound.TimelineSent:
+		return "Notification sent", model.TimelineEventNotificationSent, true
+	case outbound.TimelineDelivered:
+		return "Notification delivered", model.TimelineEventNotificationSent, true
+	case outbound.TimelineAssumedAccepted:
+		return "Notification assumed delivered: the provider never confirmed, and the risk was accepted",
+			model.TimelineEventNotificationSent, true
+	case outbound.TimelineSentAlongsideAck:
+		return "Notification went out at the same moment the alert was acknowledged",
+			model.TimelineEventNotificationSent, true
+	case outbound.TimelineFailed:
+		return "Notification failed permanently", model.TimelineEventNotificationFailed, true
+	case outbound.TimelineExpired:
+		return "A notification expired before it could be sent",
+			model.TimelineEventNotificationFailed, true
+	case outbound.TimelineCanceled:
+		return "A notification was withdrawn", model.TimelineEventNotificationFailed, true
+	case outbound.TimelineLeaseLost:
+		return "A notification was interrupted mid-flight; whether it arrived is unknown",
+			model.TimelineEventNotificationFailed, true
+	default:
+		return "", "", false
+	}
+}
+
+// lockAlertGroupTx takes the group's row, and always before any commitment of
+// it. Every transaction that can write to a group takes them in this order,
+// which is what keeps acknowledgement and delivery from deadlocking.
+func lockAlertGroupTx(ctx context.Context, tx *sql.Tx, alertGroupID string) error {
+	var id string
+	err := tx.QueryRowContext(ctx,
+		`SELECT id FROM alert_groups WHERE id = $1 FOR UPDATE`, alertGroupID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock alert group %s: %w", alertGroupID, err)
+	}
+	return nil
+}
+
+// setLockTimeoutTx bounds how long a point mutation waits for a row somebody
+// else holds. Waiting longer than the lease it is protecting would mean
+// applying a decision that has already been handed to another worker; a
+// timeout, by contrast, is a retry of a mutation that classifies itself.
+func setLockTimeoutTx(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx,
+		fmt.Sprintf("SET LOCAL lock_timeout = '%dms'",
+			outbound.NotificationLockTimeout.Milliseconds()))
+	return err
+}
+
+// lockIntentTx takes one commitment and reads it as the domain sees it,
+// together with whether its own deadline has passed as of this transaction's
+// clock.
+func lockIntentTx(ctx context.Context, tx *sql.Tx, id string) (*outbound.Intent, bool, error) {
+	var (
+		intent    outbound.Intent
+		groupID   sql.NullString
+		applied   sql.NullInt64
+		expiresAt sql.NullTime
+		receipt   []byte
+		expired   bool
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT id, COALESCE(alert_group_id, ''), provider, form, completion_mode,
+		       ambiguity_policy, status, generation_no, attempts_in_generation,
+		       failure_streak, desired_revision, applied_revision,
+		       final_revision_applied, receipt, cancellation_requested,
+		       accepted_duplicate_risk, not_before, next_attempt_at, expires_at,
+		       (expires_at IS NOT NULL AND expires_at <= now())
+		FROM outbound_intents WHERE id = $1 FOR UPDATE`, id).Scan(
+		&intent.ID, &groupID, &intent.Provider, &intent.Form, &intent.CompletionMode,
+		&intent.AmbiguityPolicy, &intent.Status, &intent.GenerationNo,
+		&intent.AttemptsInGeneration, &intent.FailureStreak, &intent.DesiredRevision,
+		&applied, &intent.FinalRevisionApplied, &receipt, &intent.CancellationRequested,
+		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt,
+		&expiresAt, &expired)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("lock commitment %s: %w", id, err)
+	}
+
+	intent.AlertGroupID = groupID.String
+	if applied.Valid {
+		value := applied.Int64
+		intent.AppliedRevision = &value
+	}
+	if expiresAt.Valid {
+		at := expiresAt.Time
+		intent.ExpiresAt = &at
+	}
+	intent.HasReceipt = len(receipt) > 0
+	return &intent, expired, nil
+}
+
+// nextAttemptNoTx is the next number in this commitment's journal, taken under
+// the lock the caller already holds. It orders the journal: two records written
+// in one transaction share a timestamp, and "the last attempt" has to mean
+// something.
+func nextAttemptNoTx(ctx context.Context, tx *sql.Tx, intentID string) (int, error) {
+	var next int
+	err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(max(attempt_no), 0) + 1 FROM outbound_attempts WHERE intent_id = $1`,
+		intentID).Scan(&next)
+	if err != nil {
+		return 0, fmt.Errorf("number the next journal record of %s: %w", intentID, err)
+	}
+	return next, nil
+}
+
+// lockedSnapshotTx reads the state an attempt will render from.
+//
+// From the domain's own table, never from the live alert group: a retry has to
+// send what was accepted, and two instances have to send the same thing.
+func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (keys.RenderSnapshot, int64, error) {
+	var raw []byte
+	var revision int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT snapshot, revision FROM outbound_group_snapshots WHERE alert_group_id = $1`,
+		alertGroupID).Scan(&raw, &revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return keys.RenderSnapshot{}, 0, outboundContractf(
+			"alert group %s has commitments but no state for them to render from", alertGroupID)
+	}
+	if err != nil {
+		return keys.RenderSnapshot{}, 0, err
+	}
+
+	var snapshot keys.RenderSnapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		// A stored snapshot that no longer canonicalises is refused rather than
+		// rendered: the message it would produce is not the one its key
+		// describes.
+		return keys.RenderSnapshot{}, 0, outboundContractf(
+			"the stored state of %s cannot be read back: %v", alertGroupID, err)
+	}
+	return snapshot, revision, nil
 }

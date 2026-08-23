@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -1247,6 +1248,14 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 		return false, err
 	}
 
+	// 5. Withdraw what the group still owes. In the same commit as the status
+	// change, because "acknowledged" and "nobody is being paged any more" are
+	// one fact: split in two, a crash between them pages somebody for an alert
+	// that is already being handled.
+	if err := cancelIntentsTx(context.Background(), tx, id, "the alert was acknowledged", actor); err != nil {
+		return false, err
+	}
+
 	return true, tx.Commit()
 }
 
@@ -1307,6 +1316,14 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 
 	// 4. Cancel escalation job (same TX)
 	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
+		return false, err
+	}
+
+	// 5. Withdraw what the group still owes. In the same commit as the status
+	// change, because "acknowledged" and "nobody is being paged any more" are
+	// one fact: split in two, a crash between them pages somebody for an alert
+	// that is already being handled.
+	if err := cancelIntentsTx(context.Background(), tx, id, "the alert was resolved", actor); err != nil {
 		return false, err
 	}
 
@@ -1373,6 +1390,13 @@ func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Aler
 
 	// 4. Cancel escalation job
 	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
+		return false, err
+	}
+
+	// 5. Withdraw what the group still owes: the alerts resolved themselves,
+	// and paging somebody about them now would be paging them about nothing.
+	if err := cancelIntentsTx(context.Background(), tx, id,
+		"every alert in the group resolved", "system"); err != nil {
 		return false, err
 	}
 
