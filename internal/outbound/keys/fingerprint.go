@@ -93,6 +93,11 @@ type TimingSpec struct {
 	At     time.Time
 }
 
+// Validate reports whether this spec is one the grammar can encode. Exported
+// because the admission gate has to refuse a malformed deadline before it
+// becomes durable, and re-stating the rule there would be a second copy of it.
+func (t TimingSpec) Validate() error { return t.validate() }
+
 func (t TimingSpec) validate() error {
 	switch t.Kind {
 	case TimingRelativeToAdmission:
