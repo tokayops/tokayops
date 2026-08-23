@@ -431,7 +431,7 @@ const outboundIntentColumns = `
 	       final_revision_applied, receipt, cancellation_requested,
 	       accepted_duplicate_risk, not_before, next_attempt_at, expires_at,
 	       create_key IS NOT NULL, payload_schema_version,
-	       provider_key_codec_version,
+	       provider_key_codec_version, payload,
 	       COALESCE(expires_at <= now(), FALSE)`
 
 // scanIntent turns one row of outboundIntentColumns into a commitment, and is
@@ -444,6 +444,7 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		applied        sql.NullInt64
 		expiresAt      sql.NullTime
 		receipt        []byte
+		payload        []byte
 		deadlinePassed bool
 	)
 	if err := row.Scan(
@@ -454,7 +455,7 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		&applied, &intent.FinalRevisionApplied, &receipt, &intent.CancellationRequested,
 		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt, &expiresAt,
 		&intent.GenerationBound, &intent.PayloadSchemaVersion,
-		&intent.ProviderKeyCodecVersion, &deadlinePassed); err != nil {
+		&intent.ProviderKeyCodecVersion, &payload, &deadlinePassed); err != nil {
 		return nil, false, err
 	}
 
@@ -468,6 +469,9 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		intent.ExpiresAt = &at
 	}
 	intent.HasReceipt = len(receipt) > 0
+	if len(payload) > 0 {
+		intent.Payload = json.RawMessage(payload)
+	}
 	return &intent, deadlinePassed, nil
 }
 

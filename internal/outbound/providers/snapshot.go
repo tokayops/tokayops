@@ -101,13 +101,10 @@ func ViewOf(view GroupView) keys.SnapshotInput {
 func alertSnapshot(alert model.Alert) keys.AlertSnapshot {
 	out := keys.AlertSnapshot{
 		Fingerprint: alert.Fingerprint,
-		Status:      keys.AlertFiring,
+		Status:      alertStatus(alert.Status),
 		StartsAt:    alert.StartsAt,
 		AlertName:   alert.Labels["alertname"],
 		Severity:    alert.Labels["severity"],
-	}
-	if alert.Status == model.AlertStatusResolved {
-		out.Status = keys.AlertResolved
 	}
 
 	out.SlackUser = optional(alert.Labels["slack_user"])
@@ -170,6 +167,21 @@ func RenderableOf(view GroupView) keys.SnapshotInput {
 		if in.Timeline[i].CreatedAt.IsZero() {
 			in.Timeline[i].CreatedAt = fallback
 		}
+		if !keys.KnownTimelineEventType(in.Timeline[i].Type) {
+			in.Timeline[i].Type = keys.EventNote
+		}
+	}
+
+	// A vocabulary this build does not share is a card that still has to be
+	// drawn. Admission refuses the same values, because there the substitution
+	// would be recorded as what was accepted.
+	if !keys.KnownGroupStatus(in.Status) {
+		in.Status = keys.GroupProcessing
+	}
+	for i := range in.Alerts {
+		if !keys.KnownAlertStatus(in.Alerts[i].Status) {
+			in.Alerts[i].Status = keys.AlertFiring
+		}
 	}
 	return in
 }
@@ -177,6 +189,11 @@ func RenderableOf(view GroupView) keys.SnapshotInput {
 // groupStatus maps the live status, with "being resolved right now" beating
 // whatever the row still says: the resolve path renders the closing card before
 // the status change is visible.
+//
+// A status this build does not know is carried across verbatim rather than
+// turned into "processing". It then fails admission, which is the point: a
+// substitution here would send a message about a state the alert was never in,
+// under a digest saying that is what was accepted.
 func groupStatus(status model.AlertGroupStatus, isResolved bool) keys.GroupStatus {
 	if isResolved {
 		return keys.GroupResolved
@@ -195,7 +212,20 @@ func groupStatus(status model.AlertGroupStatus, isResolved bool) keys.GroupStatu
 	case model.AlertGroupStatusClosed:
 		return keys.GroupClosed
 	default:
-		return keys.GroupProcessing
+		return keys.GroupStatus(status)
+	}
+}
+
+// alertStatus maps what an alert is doing, and carries an unknown value across
+// rather than calling it firing: "firing" is a claim about the world.
+func alertStatus(status model.AlertStatus) keys.AlertStatus {
+	switch status {
+	case model.AlertStatusFiring:
+		return keys.AlertFiring
+	case model.AlertStatusResolved:
+		return keys.AlertResolved
+	default:
+		return keys.AlertStatus(status)
 	}
 }
 
@@ -217,10 +247,10 @@ func timelineType(eventType model.TimelineEventType) keys.TimelineEventType {
 		return keys.EventNotificationFailed
 	case model.TimelineEventStatusChange:
 		return keys.EventStatusChange
-	default:
-		// Including model.TimelineEventNote, which is the same thing: something
-		// a person or the system said about the alert.
+	case model.TimelineEventNote:
 		return keys.EventNote
+	default:
+		return keys.TimelineEventType(eventType)
 	}
 }
 

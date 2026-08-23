@@ -108,3 +108,40 @@ func TestTheProcessZoneNeverReachesASnapshot(t *testing.T) {
 		t.Fatalf("the frozen state is not admissible: %v", err)
 	}
 }
+
+// TestAVocabularyThisBuildDoesNotShare. The two doors differ here as well: a
+// status nobody declared is refused at admission, because a substitution would
+// be recorded as what was accepted - a message about a state the alert was
+// never in, under a digest saying otherwise. The card still gets drawn.
+func TestAVocabularyThisBuildDoesNotShare(t *testing.T) {
+	group := liveGroup()
+	group.Status = model.AlertGroupStatus("quarantined")
+	group.Alerts[0].Status = model.AlertStatus("flapping")
+	group.TimelineEvents[0].Type = model.TimelineEventType("annotated")
+	view := GroupView{Group: group, Zone: "UTC"}
+
+	if _, err := SnapshotOf(view); err == nil {
+		t.Fatal("a producer admitted a state this build cannot name")
+	}
+
+	// Faithful: what it could not map is carried across rather than replaced,
+	// which is what makes admission able to see it.
+	faithful := ViewOf(view)
+	if faithful.Status != keys.GroupStatus("quarantined") {
+		t.Fatalf("the unknown status became %q before anybody could refuse it", faithful.Status)
+	}
+
+	renderable := RenderableOf(view)
+	if renderable.Status != keys.GroupProcessing {
+		t.Fatalf("the card cannot be drawn: status is %q", renderable.Status)
+	}
+	if renderable.Alerts[0].Status != keys.AlertFiring {
+		t.Fatalf("the alert is %q", renderable.Alerts[0].Status)
+	}
+	if renderable.Timeline[0].Type != keys.EventNote {
+		t.Fatalf("the event is %q", renderable.Timeline[0].Type)
+	}
+	if _, err := keys.NewRenderSnapshot(renderable); err != nil {
+		t.Fatalf("the renderable state is still not renderable: %v", err)
+	}
+}

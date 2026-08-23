@@ -118,9 +118,15 @@ func handlerFor(api *slackAPI) *Handler {
 		}}
 }
 
-// TestOneAttemptIsOneCall is the promise the journal rests on: what an attempt
-// records as possibly-having-happened is one external effect, not three.
-func TestOneAttemptIsOneCall(t *testing.T) {
+// TestAnAttemptEndsWhenTheCardExists.
+//
+// One call, and the handler returns. Anything done after the card exists but
+// before the attempt is closed - a permalink, a message in its thread - widens
+// the window where a crash leaves a delivered message beside an attempt that
+// says it might not have been. Recovery closes that as ambiguous and the retry
+// posts a second card, so the window is not something to handle carefully; it
+// is something to not open.
+func TestAnAttemptEndsWhenTheCardExists(t *testing.T) {
 	api := newSlackAPI(t)
 	handler := handlerFor(api)
 
@@ -133,18 +139,20 @@ func TestOneAttemptIsOneCall(t *testing.T) {
 		t.Fatalf("the call answered %+v", result)
 	}
 
-	// The card, then the timeline in its thread. The thread post is enrichment
-	// AFTER the message exists, which is why it is allowed to be a second call.
-	if len(api.posts) != 2 {
-		t.Fatalf("the attempt made %d posts", len(api.posts))
+	if len(api.posts) != 1 {
+		t.Fatalf("the attempt made %d posts; the second one is another message, "+
+			"and another message is another commitment", len(api.posts))
 	}
 	if api.posts[0]["channel"] != "C0001" {
 		t.Fatalf("the card went to %v", api.posts[0]["channel"])
 	}
-	if api.posts[1]["thread_ts"] != "1700000000.000100" {
-		t.Fatalf("the timeline was not posted in the card's thread: %v", api.posts[1])
+	if api.permalks != 0 {
+		t.Fatalf("the attempt made %d permalink calls after the card already existed",
+			api.permalks)
 	}
 
+	// What proves the acceptance is the coordinates, and they are recorded the
+	// moment they arrive.
 	if !result.Receipt.Recorded() {
 		t.Fatal("the message was accepted and nothing says where it is")
 	}
@@ -155,33 +163,8 @@ func TestOneAttemptIsOneCall(t *testing.T) {
 	if err := json.Unmarshal(result.Receipt.Raw(), &data); err != nil {
 		t.Fatalf("read the receipt: %v", err)
 	}
-	if data.Permalink == "" || data.TimelineTimestamp == "" {
-		t.Fatalf("the enrichment was not recorded: %+v", data)
-	}
-}
-
-// TestEnrichmentCannotFailAnAttempt. The message exists; calling the attempt
-// failed because a permalink could not be fetched would send it again.
-func TestEnrichmentCannotFailAnAttempt(t *testing.T) {
-	api := newSlackAPI(t)
-	api.answer = func(path string, _ map[string]any) map[string]any {
-		if strings.HasSuffix(path, "chat.getPermalink") {
-			return map[string]any{"ok": false, "error": "channel_not_found"}
-		}
-		return nil
-	}
-	handler := handlerFor(api)
-
-	result, err := handler.ExecuteAttempt(context.Background(),
-		handlerCall(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"}, true))
-	if err != nil {
-		t.Fatalf("a failed permalink failed the attempt: %v", err)
-	}
-	if result.Status != "ok" || !result.Receipt.Recorded() {
-		t.Fatalf("the delivery was lost with the enrichment: %+v", result)
-	}
-	if !strings.Contains(result.Summary, "no permalink") {
-		t.Fatalf("the journal says nothing about what failed: %q", result.Summary)
+	if data.ChannelID != "C0001" || data.Timestamp != "1700000000.000100" {
+		t.Fatalf("the receipt holds %+v", data)
 	}
 }
 
@@ -201,6 +184,9 @@ func TestADirectMessageIsOneCallToo(t *testing.T) {
 
 	if len(api.posts) != 1 {
 		t.Fatalf("a direct message made %d posts", len(api.posts))
+	}
+	if api.permalks != 0 {
+		t.Fatal("a direct message fetched a permalink nobody reads")
 	}
 	if api.posts[0]["channel"] != "U0001" {
 		t.Fatalf("the message went to %v rather than the user", api.posts[0]["channel"])
@@ -267,10 +253,8 @@ func TestPreparationRefusesWhatCannotBeSent(t *testing.T) {
 
 	t.Run("a channel needs nothing resolved", func(t *testing.T) {
 		handler := NewHandler(&mockTokenSource{token: "tok"}, linked)
-		prepared := handler.Prepare(context.Background(), outbound.Intent{
-			TargetKind: keys.TargetChannel, TargetRef: "C0001",
-			PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
-		})
+		prepared := handler.Prepare(context.Background(),
+			intentFor(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"}))
 		if prepared.Outcome() != outbound.PreparationReady {
 			t.Fatalf("a channel send was refused: %+v", prepared)
 		}
@@ -278,10 +262,8 @@ func TestPreparationRefusesWhatCannotBeSent(t *testing.T) {
 
 	t.Run("a person is looked up every attempt", func(t *testing.T) {
 		handler := NewHandler(&mockTokenSource{token: "tok"}, linked)
-		prepared := handler.Prepare(context.Background(), outbound.Intent{
-			TargetKind: keys.TargetUser, TargetRef: "user-1",
-			PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
-		})
+		prepared := handler.Prepare(context.Background(),
+			intentFor(t, keys.Target{Kind: keys.TargetUser, Ref: "user-1"}))
 		if prepared.Outcome() != outbound.PreparationReady {
 			t.Fatalf("a linked person was refused: %+v", prepared)
 		}
@@ -296,10 +278,8 @@ func TestPreparationRefusesWhatCannotBeSent(t *testing.T) {
 			func(context.Context, string, string) (string, error) {
 				return "", providers.ErrNotLinked
 			})
-		prepared := handler.Prepare(context.Background(), outbound.Intent{
-			TargetKind: keys.TargetUser, TargetRef: "user-1",
-			PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
-		})
+		prepared := handler.Prepare(context.Background(),
+			intentFor(t, keys.Target{Kind: keys.TargetUser, Ref: "user-1"}))
 		if prepared.Outcome() != outbound.PreparationPermanent {
 			t.Fatalf("an unlinked person was %s", prepared.Outcome())
 		}
@@ -310,10 +290,8 @@ func TestPreparationRefusesWhatCannotBeSent(t *testing.T) {
 			func(context.Context, string, string) (string, error) {
 				return "", errors.New("database is down")
 			})
-		prepared := handler.Prepare(context.Background(), outbound.Intent{
-			TargetKind: keys.TargetUser, TargetRef: "user-1",
-			PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
-		})
+		prepared := handler.Prepare(context.Background(),
+			intentFor(t, keys.Target{Kind: keys.TargetUser, Ref: "user-1"}))
 		if prepared.Outcome() != outbound.PreparationTransient {
 			t.Fatalf("a failing lookup was %s", prepared.Outcome())
 		}
@@ -321,10 +299,8 @@ func TestPreparationRefusesWhatCannotBeSent(t *testing.T) {
 
 	t.Run("an installation with no Slack", func(t *testing.T) {
 		handler := NewHandler(&mockTokenSource{token: ""}, linked)
-		prepared := handler.Prepare(context.Background(), outbound.Intent{
-			TargetKind: keys.TargetChannel, TargetRef: "C0001",
-			PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
-		})
+		prepared := handler.Prepare(context.Background(),
+			intentFor(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"}))
 		if prepared.Outcome() != outbound.PreparationPermanent {
 			t.Fatalf("a missing integration was %s", prepared.Outcome())
 		}
@@ -332,12 +308,60 @@ func TestPreparationRefusesWhatCannotBeSent(t *testing.T) {
 
 	t.Run("a payload this build cannot render", func(t *testing.T) {
 		handler := NewHandler(&mockTokenSource{token: "tok"}, linked)
-		prepared := handler.Prepare(context.Background(), outbound.Intent{
-			TargetKind: keys.TargetChannel, TargetRef: "C0001",
-			PayloadSchemaVersion: 99,
-		})
-		if prepared.Outcome() != outbound.PreparationPermanent {
-			t.Fatalf("an unreadable payload was %s", prepared.Outcome())
+		aged := intentFor(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"})
+		aged.PayloadSchemaVersion = 99
+		if got := handler.Prepare(context.Background(), aged).Outcome(); got != outbound.PreparationPermanent {
+			t.Fatalf("a payload schema this build cannot read was %s", got)
 		}
 	})
+}
+
+// intentFor is a commitment as the store hands one to preparation: the target
+// it names, and the payload it was admitted with.
+func intentFor(t *testing.T, target keys.Target) outbound.Intent {
+	t.Helper()
+	payload, err := json.Marshal(keys.EscalationPayloadV1{
+		Slot: keys.Slot{Kind: keys.SlotFirehose}, Target: target, Interactive: true,
+	})
+	if err != nil {
+		t.Fatalf("build the payload: %v", err)
+	}
+	return outbound.Intent{
+		ID: "intent-1", Provider: "slack",
+		TargetKind: target.Kind, TargetRef: target.Ref,
+		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
+		Payload:              payload,
+	}
+}
+
+// TestAPayloadNobodyCanReadStopsBeforeTheNetwork.
+//
+// Read inside the call instead, a corrupt payload becomes an attempt that never
+// touched the network: recorded as a call whose fate is unknown, retried on the
+// family's backoff, and repeated for as long as the commitment lives. It is a
+// refusal, and refusals leave proof instead of doubt.
+func TestAPayloadNobodyCanReadStopsBeforeTheNetwork(t *testing.T) {
+	handler := NewHandler(&mockTokenSource{token: "tok"}, nil)
+
+	for name, payload := range map[string][]byte{
+		"nothing at all":             nil,
+		"truncated json":             []byte(`{"target":{"kind":"chan`),
+		"a target nobody has":        []byte(`{"slot":{"kind":"firehose"},"target":{"kind":"carrier_pigeon","ref":"x"}}`),
+		"a target with no recipient": []byte(`{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":""}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			intent := intentFor(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"})
+			intent.Payload = payload
+
+			prepared := handler.Prepare(context.Background(), intent)
+			if prepared.Outcome() != outbound.PreparationPermanent {
+				t.Fatalf("an unreadable payload was %s, which retries forever",
+					prepared.Outcome())
+			}
+			request := prepared.Request("intent-1", "token-1", "worker-1")
+			if request.ErrorClass != "payload_unreadable" || request.Summary == "" {
+				t.Fatalf("the refusal says %q/%q", request.ErrorClass, request.Summary)
+			}
+		})
+	}
 }

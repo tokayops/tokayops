@@ -67,7 +67,10 @@ func refusal(outcome PreparationOutcome, class, summary string) Preparation {
 	if class == "" {
 		class = "unstated"
 	}
-	return Preparation{outcome: outcome, errorClass: class, summary: summary}
+	// Truncated here for the same reason a conclusion is: the journal keeps
+	// what a refusal said, and a limit that lives at one call site is a limit
+	// the next caller does not have.
+	return Preparation{outcome: outcome, errorClass: class, summary: truncate(summary)}
 }
 
 // Outcome is which of the three this is.

@@ -52,10 +52,16 @@ func NewHandler(tokens TokenSource, identity providers.IdentityLookup) *Handler 
 // two attempts would otherwise deliver the same message to two different
 // people with nothing to say which one got it.
 func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.Preparation {
-	if intent.PayloadSchemaVersion != (keys.EscalationPayloadV1{}).SchemaVersion() {
-		return outbound.Impossible("payload_schema_unsupported",
-			fmt.Sprintf("this build does not render payload schema %d",
-				intent.PayloadSchemaVersion))
+	// The payload is read HERE, before anything opens an attempt.
+	//
+	// Read inside the call instead, an unreadable payload becomes a network
+	// attempt that never touched the network: recorded as a call whose fate is
+	// unknown, retried on the family's backoff, and repeated for as long as the
+	// commitment lives. Refused here it is what it actually is - a
+	// deterministic refusal with a record saying so, and a commitment that
+	// stops where a person can see it.
+	if _, err := payloadOf(intent.PayloadSchemaVersion, intent.Payload); err != nil {
+		return outbound.Impossible("payload_unreadable", err.Error())
 	}
 	if h.tokens == nil || h.tokens.GetSlackToken() == "" {
 		return outbound.Impossible("integration_missing",
@@ -96,12 +102,20 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 // preparatory call, no second place to fail before the effect, and no
 // classification of its own.
 //
-// Everything after the message exists is enrichment - the permalink, the
-// timeline in the thread - and runs in what is left of the attempt's budget.
-// Its failure is recorded in the summary and changes nothing: the message is
-// already out, and calling that attempt failed would send it twice.
+// It returns the moment Slack answers, and that is the whole point. Anything
+// done after the card exists but before the attempt is closed widens the window
+// where a crash leaves a message that was delivered and an attempt that says it
+// might not have been - which recovery closes as ambiguous, and the retry posts
+// the card a second time. Error handling does not help: the danger is the
+// process dying, not the call failing.
+//
+// So the permalink is not fetched and the timeline is not posted in the card's
+// thread. The permalink has no reader in this build - a direct message links to
+// the alert in TokayOps, not to a card - and the timeline post is not
+// enrichment at all: it is a SECOND message, which is a second external effect
+// and belongs to a commitment of its own. Sprint 2 adds it as one.
 func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbound.Result, error) {
-	payload, err := escalationPayload(call)
+	payload, err := payloadOf(call.PayloadSchemaVersion, call.Payload)
 	if err != nil {
 		// Nothing was sent, and nothing will be until the payload is readable.
 		// It is reported as an ordinary refusal rather than a permanent one
@@ -144,44 +158,17 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 		return result, nil
 	}
 
-	data := Data{ChannelID: channelID, Timestamp: timestamp}
-	var notes []string
-
-	// The permalink, for whoever reads the delivery later.
-	if link, err := client.GetPermalinkContext(ctx, &slackapi.PermalinkParameters{
-		Channel: channelID, Ts: timestamp,
-	}); err != nil {
-		notes = append(notes, "no permalink: "+err.Error())
-	} else {
-		data.Permalink = link
-	}
-
-	// The timeline in the card's thread, for a channel card only: a direct
-	// message has no thread anybody reads.
-	if payload.Target.Kind == keys.TargetChannel {
-		if timeline := RenderTimeline(state); timeline != "" {
-			_, threadTS, err := client.PostMessageContext(ctx, channelID,
-				slackapi.MsgOptionText(timeline, false),
-				slackapi.MsgOptionTS(timestamp),
-			)
-			if err != nil {
-				notes = append(notes, "no timeline thread: "+err.Error())
-			} else {
-				data.TimelineTimestamp = threadTS
-			}
-		}
-	}
-
-	raw, err := json.Marshal(data)
+	raw, err := json.Marshal(Data{ChannelID: channelID, Timestamp: timestamp})
 	if err != nil {
-		notes = append(notes, "the coordinates could not be recorded: "+err.Error())
-	} else if receipt, err := outbound.NewReceipt(channelID+"/"+timestamp, raw); err != nil {
-		notes = append(notes, "the coordinates could not be recorded: "+err.Error())
-	} else {
-		result.Receipt = receipt
+		result.Summary = "the coordinates could not be recorded: " + err.Error()
+		return result, nil
 	}
-
-	result.Summary = strings.Join(notes, "; ")
+	receipt, err := outbound.NewReceipt(channelID+"/"+timestamp, raw)
+	if err != nil {
+		result.Summary = "the coordinates could not be recorded: " + err.Error()
+		return result, nil
+	}
+	result.Receipt = receipt
 	return result, nil
 }
 
@@ -257,16 +244,19 @@ func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1) s
 	return strings.Join(lines, "\n")
 }
 
-// escalationPayload reads the commitment's payload under the schema it says it
-// is in, rather than under today's.
-func escalationPayload(call outbound.Call) (keys.EscalationPayloadV1, error) {
+// payloadOf reads a commitment's payload under the schema it says it is in,
+// rather than under today's.
+func payloadOf(schemaVersion int, raw []byte) (keys.EscalationPayloadV1, error) {
 	var payload keys.EscalationPayloadV1
-	if call.PayloadSchemaVersion != payload.SchemaVersion() {
-		return payload, fmt.Errorf("slack: payload schema %d is not one this build renders",
-			call.PayloadSchemaVersion)
+	if schemaVersion != payload.SchemaVersion() {
+		return payload, fmt.Errorf("payload schema %d is not one this build renders",
+			schemaVersion)
 	}
-	if err := json.Unmarshal(call.Payload, &payload); err != nil {
-		return payload, fmt.Errorf("slack: the payload cannot be read: %w", err)
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return payload, fmt.Errorf("the payload cannot be read: %w", err)
+	}
+	if err := payload.Target.Validate(); err != nil {
+		return payload, err
 	}
 	return payload, nil
 }

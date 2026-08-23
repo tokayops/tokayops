@@ -146,6 +146,23 @@ func (e TimelineEventSnapshot) encode() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// KnownGroupStatus, KnownAlertStatus and KnownTimelineEventType are the closed
+// sets, asked from outside.
+//
+// A caller that maps its own vocabulary into this one has to be able to tell
+// whether a value survived that mapping, or it ends up quietly substituting -
+// and a snapshot whose status was silently turned into "processing" is a
+// message about a state the alert was never in.
+func KnownGroupStatus(status GroupStatus) bool { return groupStatuses[status] }
+
+// KnownAlertStatus reports whether an alert status is one this protocol knows.
+func KnownAlertStatus(status AlertStatus) bool { return alertStatuses[status] }
+
+// KnownTimelineEventType reports whether an event type is one this protocol knows.
+func KnownTimelineEventType(eventType TimelineEventType) bool {
+	return timelineEventTypes[eventType]
+}
+
 // SnapshotInput is the state a message is rendered from, as a producer supplies
 // it: everything a card or a direct message shows, and nothing else.
 //

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -217,10 +218,8 @@ func TestPreparationResolvesAPersonEveryAttempt(t *testing.T) {
 	handler := NewHandler(&mockTelegramTokenSource{token: "tok"},
 		func(context.Context, string, string) (string, error) { return "5551", nil })
 
-	prepared := handler.Prepare(context.Background(), outbound.Intent{
-		TargetKind: keys.TargetUser, TargetRef: "user-1",
-		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
-	})
+	prepared := handler.Prepare(context.Background(),
+		intentFor(t, keys.Target{Kind: keys.TargetUser, Ref: "user-1"}))
 	if prepared.Outcome() != outbound.PreparationReady {
 		t.Fatalf("a linked person was refused: %+v", prepared)
 	}
@@ -232,10 +231,125 @@ func TestPreparationResolvesAPersonEveryAttempt(t *testing.T) {
 		func(context.Context, string, string) (string, error) {
 			return "", providers.ErrNotLinked
 		})
-	if got := unlinked.Prepare(context.Background(), outbound.Intent{
-		TargetKind: keys.TargetUser, TargetRef: "user-1",
-		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
-	}).Outcome(); got != outbound.PreparationPermanent {
+	if got := unlinked.Prepare(context.Background(),
+		intentFor(t, keys.Target{Kind: keys.TargetUser, Ref: "user-1"})).Outcome(); got != outbound.PreparationPermanent {
 		t.Fatalf("an unlinked person was %s", got)
+	}
+}
+
+// TestTheBotTokenNeverReachesTheJournal.
+//
+// The Bot API puts the token in the path, and net/http puts the whole address
+// into every transport error it returns. Those errors are written into a
+// delivery's summary, which is a durable row people read - so one unreachable
+// Telegram host would write the installation's bot token into the journal,
+// where it would stay. Truncation does not help: the token is at the front.
+func TestTheBotTokenNeverReachesTheJournal(t *testing.T) {
+	const token = "0000000000:SECRET-BOT-TOKEN-DO-NOT-STORE"
+
+	// A port that was listening a moment ago and is not any more.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	handler := NewHandler(&mockTelegramTokenSource{token: token}, nil,
+		WithHandlerBaseURL("http://"+address))
+
+	result, err := handler.ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.TargetChannel, true))
+	if err == nil {
+		t.Fatal("a dead address answered")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("the token is in the error the worker logs: %v", err)
+	}
+	if strings.Contains(result.Summary, token) {
+		t.Fatalf("the token is in the summary the journal keeps: %q", result.Summary)
+	}
+
+	// And the cause survives, because what the cause IS decides whether the
+	// message might have gone out.
+	if result.Evidence != outbound.DefinitelyNotSent {
+		t.Fatalf("a refused connection was classified %q", result.Evidence)
+	}
+}
+
+func intentFor(t *testing.T, target keys.Target) outbound.Intent {
+	t.Helper()
+	payload, err := json.Marshal(keys.EscalationPayloadV1{
+		Slot: keys.Slot{Kind: keys.SlotFirehose}, Target: target, Interactive: true,
+	})
+	if err != nil {
+		t.Fatalf("build the payload: %v", err)
+	}
+	return outbound.Intent{
+		ID: "intent-1", Provider: "telegram",
+		TargetKind: target.Kind, TargetRef: target.Ref,
+		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
+		Payload:              payload,
+	}
+}
+
+// TestAPayloadNobodyCanReadStopsBeforeTheNetwork: the same rule as the other
+// channel, because the cost is the same - an attempt that never touched the
+// network, retried for as long as the commitment lives.
+func TestAPayloadNobodyCanReadStopsBeforeTheNetwork(t *testing.T) {
+	handler := NewHandler(&mockTelegramTokenSource{token: "tok"}, nil)
+
+	intent := intentFor(t, keys.Target{Kind: keys.TargetChannel, Ref: "-1001"})
+	intent.Payload = []byte(`{"target":{"kind":"chan`)
+
+	prepared := handler.Prepare(context.Background(), intent)
+	if prepared.Outcome() != outbound.PreparationPermanent {
+		t.Fatalf("an unreadable payload was %s, which retries forever", prepared.Outcome())
+	}
+	if got := prepared.Request("i", "t", "w").ErrorClass; got != "payload_unreadable" {
+		t.Fatalf("the refusal says %q", got)
+	}
+}
+
+// TestADirectMessageIsPlainText.
+//
+// The card is HTML this package built and escaped. A direct message is
+// somebody's own words: marking those as HTML makes an ordinary "a < b", or an
+// unclosed tag in an operator's note, unsendable - the message fails to go out
+// for the shape of its text, which is not something the delivery can fix by
+// retrying.
+func TestADirectMessageIsPlainText(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	override := "disk on db-1 is at 95% <check the graph> & escalate"
+	payload, err := json.Marshal(keys.EscalationPayloadV1{
+		Slot:            keys.Slot{Kind: keys.SlotPolicy, Index: 1},
+		Target:          keys.Target{Kind: keys.TargetUser, Ref: "user-1"},
+		MessageOverride: &override,
+		Interactive:     true,
+	})
+	if err != nil {
+		t.Fatalf("build the payload: %v", err)
+	}
+
+	call := handlerCall(t, keys.TargetUser, true)
+	call.Payload = payload
+	call.Endpoint = "5551"
+	if _, err := handler.ExecuteAttempt(context.Background(), call); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	sent := api.calls[0]
+	if got, _ := sent["text"].(string); got != override {
+		t.Fatalf("the message was rewritten: %q", got)
+	}
+	if mode, marked := sent["parse_mode"]; marked {
+		t.Fatalf("a person's own words were sent as %v", mode)
+	}
+	if _, hasKeyboard := sent["reply_markup"]; hasKeyboard {
+		t.Fatal("a direct message carried buttons")
 	}
 }

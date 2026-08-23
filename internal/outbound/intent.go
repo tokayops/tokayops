@@ -11,6 +11,7 @@
 package outbound
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -204,6 +205,13 @@ type Intent struct {
 	// reach the provider under two different keys.
 	PayloadSchemaVersion    int
 	ProviderKeyCodecVersion int
+
+	// Payload is what the channel was asked to send, frozen at admission. It
+	// travels with the commitment rather than only with an attempt because
+	// preparation has to be able to refuse one it cannot read: decided after
+	// the attempt is open, an unreadable payload is a network attempt that
+	// never happened, recorded as one, retried forever.
+	Payload json.RawMessage
 
 	DesiredRevision      int64
 	AppliedRevision      *int64

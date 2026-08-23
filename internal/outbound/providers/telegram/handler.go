@@ -54,10 +54,16 @@ func WithHandlerBaseURL(u string) HandlerOption {
 // only difference between the two targets is where the id comes from: the
 // commitment itself, or the identity somebody linked.
 func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.Preparation {
-	if intent.PayloadSchemaVersion != (keys.EscalationPayloadV1{}).SchemaVersion() {
-		return outbound.Impossible("payload_schema_unsupported",
-			fmt.Sprintf("this build does not render payload schema %d",
-				intent.PayloadSchemaVersion))
+	// The payload is read HERE, before anything opens an attempt.
+	//
+	// Read inside the call instead, an unreadable payload becomes a network
+	// attempt that never touched the network: recorded as a call whose fate is
+	// unknown, retried on the family's backoff, and repeated for as long as the
+	// commitment lives. Refused here it is what it actually is - a
+	// deterministic refusal with a record saying so, and a commitment that
+	// stops where a person can see it.
+	if _, err := payloadOf(intent.PayloadSchemaVersion, intent.Payload); err != nil {
+		return outbound.Impossible("payload_unreadable", err.Error())
 	}
 	if h.tokens == nil || h.tokens.GetTelegramToken() == "" {
 		return outbound.Impossible("integration_missing",
@@ -93,7 +99,7 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 // else. Telegram has no thread and no permalink, so there is no enrichment
 // either - what comes back is already the whole receipt.
 func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbound.Result, error) {
-	payload, err := escalationPayload(call)
+	payload, err := payloadOf(call.PayloadSchemaVersion, call.Payload)
 	if err != nil {
 		return outbound.Result{
 			Evidence: outbound.DefinitelyNotSent,
@@ -115,12 +121,26 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 	state := call.State.Content()
 	body := map[string]interface{}{
 		"chat_id":                  call.Endpoint,
-		"text":                     messageFor(state, payload),
 		"disable_web_page_preview": true,
-		"parse_mode":               "HTML",
 	}
-	if keyboard := KeyboardFor(state, payload.Interactive); keyboard != nil {
-		body["reply_markup"] = keyboard
+
+	// A card is HTML this package built and escaped; a direct message is
+	// somebody's own words, sent as they are. Marking free text as HTML makes a
+	// perfectly ordinary "a < b" or an unclosed tag unsendable - the message
+	// fails to go out for the shape of its text, which is not a delivery
+	// failure anybody can act on.
+	//
+	// A direct message carries no keyboard either: buttons belong on the card
+	// in a channel, which is where an acknowledgement is visible to everybody
+	// the alert was raised for.
+	if payload.Target.Kind == keys.TargetUser {
+		body["text"] = directMessage(state, payload)
+	} else {
+		body["text"] = RenderCard(state)
+		body["parse_mode"] = "HTML"
+		if keyboard := KeyboardFor(state, payload.Interactive); keyboard != nil {
+			body["reply_markup"] = keyboard
+		}
 	}
 
 	answer, err := callBotAPI(ctx, h.client, h.baseURL, token, "sendMessage", body)
@@ -218,14 +238,26 @@ func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Outcome, strin
 	return "", "", false
 }
 
-// messageFor is what goes out: the escalation's own words for a person, the
-// card for a chat.
-func messageFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1) string {
-	if payload.Target.Kind == keys.TargetUser &&
-		payload.MessageOverride != nil && *payload.MessageOverride != "" {
+// directMessage is what a person is told, in plain text.
+//
+// Built from this commitment alone: the escalation's own words if it has any,
+// and otherwise what the snapshot says, with the link to the alert in TokayOps.
+// Nothing here reads a neighbouring delivery - a permalink that exists on the
+// retry and not on the first attempt is two different messages under one key.
+func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1) string {
+	if payload.MessageOverride != nil && *payload.MessageOverride != "" {
 		return *payload.MessageOverride
 	}
-	return RenderCard(state)
+
+	status := providers.ResolveStatus(state)
+	lines := []string{status.Title}
+	if state.Severity != "" {
+		lines = append(lines, "Severity: "+state.Severity)
+	}
+	if state.GroupURL != nil && *state.GroupURL != "" {
+		lines = append(lines, *state.GroupURL)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // statusOf packs Telegram's answer into one string, because that is what a
@@ -234,16 +266,19 @@ func statusOf(answer *tgResponse) string {
 	return fmt.Sprintf("%d:%s", answer.ErrorCode, answer.Description)
 }
 
-// escalationPayload reads the commitment's payload under the schema it says it
-// is in, rather than under today's.
-func escalationPayload(call outbound.Call) (keys.EscalationPayloadV1, error) {
+// payloadOf reads a commitment's payload under the schema it says it is in,
+// rather than under today's.
+func payloadOf(schemaVersion int, raw []byte) (keys.EscalationPayloadV1, error) {
 	var payload keys.EscalationPayloadV1
-	if call.PayloadSchemaVersion != payload.SchemaVersion() {
-		return payload, fmt.Errorf("telegram: payload schema %d is not one this build renders",
-			call.PayloadSchemaVersion)
+	if schemaVersion != payload.SchemaVersion() {
+		return payload, fmt.Errorf("payload schema %d is not one this build renders",
+			schemaVersion)
 	}
-	if err := json.Unmarshal(call.Payload, &payload); err != nil {
-		return payload, fmt.Errorf("telegram: the payload cannot be read: %w", err)
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return payload, fmt.Errorf("the payload cannot be read: %w", err)
+	}
+	if err := payload.Target.Validate(); err != nil {
+		return payload, err
 	}
 	return payload, nil
 }

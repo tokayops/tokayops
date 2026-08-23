@@ -102,12 +102,30 @@ func EvidenceOf(err error) outbound.Evidence {
 		errors.Is(err, syscall.ENETUNREACH) {
 		return outbound.DefinitelyNotSent
 	}
+	// The handshake. A certificate that does not verify is the commonest one
+	// and it arrives as tls.CertificateVerificationError; the x509 errors below
+	// are the ones a caller doing its own verification can still surface, and
+	// they are VALUES rather than pointers - matched as pointers, as the
+	// previous version did, none of them ever fired and every expired
+	// certificate was recorded as a message that might have been delivered.
+	var verification *tls.CertificateVerificationError
+	if errors.As(err, &verification) {
+		return outbound.DefinitelyNotSent
+	}
 	var recordHeader tls.RecordHeaderError
 	if errors.As(err, &recordHeader) {
 		return outbound.DefinitelyNotSent
 	}
-	var certificate *x509.CertificateInvalidError
-	if errors.As(err, &certificate) {
+	var unknownAuthority x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthority) {
+		return outbound.DefinitelyNotSent
+	}
+	var hostname x509.HostnameError
+	if errors.As(err, &hostname) {
+		return outbound.DefinitelyNotSent
+	}
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &invalid) {
 		return outbound.DefinitelyNotSent
 	}
 	var op *net.OpError

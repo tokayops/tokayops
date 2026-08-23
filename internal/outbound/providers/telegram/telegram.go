@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -174,7 +176,7 @@ func callBotAPI(ctx context.Context, client *http.Client, baseURL, token, method
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("telegram %s: request failed: %w", method, err)
+		return nil, fmt.Errorf("telegram %s: request failed: %w", method, withoutURL(err))
 	}
 	defer resp.Body.Close()
 
@@ -187,6 +189,26 @@ func callBotAPI(ctx context.Context, client *http.Client, baseURL, token, method
 		return nil, fmt.Errorf("telegram %s: decode response (status %d): %w", method, resp.StatusCode, err)
 	}
 	return &tgr, nil
+}
+
+// withoutURL strips the address from a transport error and keeps everything
+// else about it.
+//
+// The bot token is IN that address - the Bot API puts it in the path - and
+// net/http puts the address into every error it returns. Those errors end up in
+// a delivery's summary, which is a durable row that people read: without this,
+// one unreachable Telegram host writes the installation's bot token into the
+// journal, where it stays.
+//
+// The cause is kept and still unwraps, because what the cause IS - a refused
+// connection, a failed handshake, a timeout - is what decides whether the
+// message might have gone out.
+func withoutURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err
+	}
+	return err
 }
 
 // sendMessage posts a message and returns its message_id. parseMode "" sends

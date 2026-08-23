@@ -210,6 +210,12 @@ type Target struct {
 	Ref string
 }
 
+// Validate is the same check the grammar applies at admission, exported
+// because a channel reading a STORED payload has to be able to make it: a row
+// written by a build with a wider set of targets must be refused rather than
+// half understood.
+func (t Target) Validate() error { return t.validate() }
+
 func (t Target) validate() error {
 	switch t.Kind {
 	case TargetChannel, TargetUser:
