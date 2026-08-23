@@ -929,6 +929,13 @@ func (s *Store) InitDB() error {
 		return err
 	}
 
+	// Outbound delivery: the tables an outgoing commitment lives in. Last,
+	// because two of them reference alert_groups, and under their own lock -
+	// see outbound_schema.go.
+	if err := s.applyOutboundSchema(); err != nil {
+		return err
+	}
+
 	return nil
 }
 

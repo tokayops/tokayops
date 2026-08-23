@@ -73,6 +73,12 @@ func setupTestDB(t *testing.T) *Store {
 	// Truncate all tables to ensure clean state
 	// Order matters due to foreign keys if CASCADE is not used (but we use CASCADE here for safety)
 	tables := []string{
+		"outbound_intent_events",
+		"outbound_attempt_observations",
+		"outbound_attempts",
+		"outbound_intents",
+		"outbound_group_snapshots",
+		"outbound_batches",
 		"event_outbox_deliveries",
 		"event_outbox",
 		"notification_deliveries",

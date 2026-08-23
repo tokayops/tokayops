@@ -65,6 +65,12 @@ func TruncateTables(t testing.TB, s *store.Store) {
 	t.Helper()
 
 	tables := []string{
+		"outbound_intent_events",
+		"outbound_attempt_observations",
+		"outbound_attempts",
+		"outbound_intents",
+		"outbound_group_snapshots",
+		"outbound_batches",
 		"event_outbox_delivery_attempts",
 		"event_outbox_deliveries",
 		"event_outbox",
