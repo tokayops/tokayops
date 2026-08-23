@@ -170,9 +170,17 @@ const (
 // Intent is a commitment as the domain reasons about it. It carries no
 // database concerns: the store maps rows onto it and back.
 type Intent struct {
-	ID              string
-	AlertGroupID    string
-	Provider        string
+	ID           string
+	AlertGroupID string
+	Provider     string
+	// TargetKind and TargetRef are the recipient as THIS system names them - a
+	// channel by its provider id, a person by their user id here. Turning the
+	// second into an address the provider knows is preparation's job, and it is
+	// redone on every attempt: an identity relinked between two attempts of one
+	// effect must not move the message, which is why the address the effect is
+	// bound to wins over whatever preparation resolves.
+	TargetKind      TargetKind
+	TargetRef       string
 	Form            Form
 	CompletionMode  CompletionMode
 	AmbiguityPolicy AmbiguityPolicy

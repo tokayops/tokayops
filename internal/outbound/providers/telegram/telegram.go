@@ -154,11 +154,18 @@ type tgResponse struct {
 // It never logs the URL (which contains the token). No retry (v1 decision) —
 // transient failures bubble up to the step-level retry.
 func (t *Provider) callBotAPI(ctx context.Context, client *http.Client, token, method string, body map[string]interface{}) (*tgResponse, error) {
+	return callBotAPI(ctx, client, t.baseURL, token, method, body)
+}
+
+// callBotAPI is the transport itself, shared by the provider and the handler so
+// there is one place that knows how a Bot API call is made and how its envelope
+// is read.
+func callBotAPI(ctx context.Context, client *http.Client, baseURL, token, method string, body map[string]interface{}) (*tgResponse, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("telegram %s: marshal body: %w", method, err)
 	}
-	url := t.baseURL + "/bot" + token + "/" + method
+	url := baseURL + "/bot" + token + "/" + method
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("telegram %s: build request: %w", method, err)
