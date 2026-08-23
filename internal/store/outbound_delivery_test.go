@@ -1099,7 +1099,11 @@ func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
 			status, desired_revision, attempts_in_generation, not_before, next_attempt_at)
 		SELECT gen_random_uuid()::text, $1, 'backlog-' || g, $2, 'escalation', 1,
 		       'slack', 'channel', 'C' || g, $3, 'editable', 'on_acceptance',
-		       'retry', 1, '{}'::jsonb, 1,
+		       'retry', 1,
+		       jsonb_build_object(
+			       'slot', jsonb_build_object('kind', 'firehose', 'index', 0),
+			       'target', jsonb_build_object('kind', 'channel', 'ref', 'C' || g),
+			       'interactive', true), 1,
 		       'pending', 0, CASE WHEN g % 10 = 0 THEN 1 ELSE 0 END,
 		       now() - interval '3 hours', now() - make_interval(secs => g)
 		FROM generate_series(1, 5000) g`, batchID, testFamily, agID); err != nil {

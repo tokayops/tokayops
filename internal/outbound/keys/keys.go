@@ -154,9 +154,13 @@ const (
 // Index belongs to the policy variant only, and a firehose slot carrying one is
 // refused rather than ignored: a value the encoding drops is a value the caller
 // believes is part of the identity, and the two beliefs would differ in silence.
+// The JSON spelling is part of the stored shape rather than an accident of Go's
+// defaults: the payload is a row somebody reads, a constraint compares against
+// the columns beside it, and a field that quietly changed name would break both
+// silently. TestThePayloadIsStoredUnderTheseNames pins it.
 type Slot struct {
-	Kind  SlotKind
-	Index int
+	Kind  SlotKind `json:"kind"`
+	Index int      `json:"index"`
 }
 
 func (s Slot) validate() error {
@@ -203,18 +207,12 @@ const (
 // independently supplied copies would let a commitment be deduplicated as one
 // delivery and executed as another.
 type Target struct {
-	Kind TargetKind
+	Kind TargetKind `json:"kind"`
 	// Ref is the recipient as this system names them - a user id, a channel id
 	// - never the address the provider will be handed. That address belongs to
 	// the attempt and can change without changing what was promised.
-	Ref string
+	Ref string `json:"ref"`
 }
-
-// Validate is the same check the grammar applies at admission, exported
-// because a channel reading a STORED payload has to be able to make it: a row
-// written by a build with a wider set of targets must be refused rather than
-// half understood.
-func (t Target) Validate() error { return t.validate() }
 
 func (t Target) validate() error {
 	switch t.Kind {

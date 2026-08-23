@@ -32,7 +32,7 @@ func NewHandler(tokens TokenSource, identity providers.IdentityLookup, opts ...H
 		tokens:   tokens,
 		identity: identity,
 		baseURL:  telegramDefaultBaseURL,
-		client:   &http.Client{Timeout: telegramHTTPTimeout},
+		client:   effectClient(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -62,8 +62,20 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// commitment lives. Refused here it is what it actually is - a
 	// deterministic refusal with a record saying so, and a commitment that
 	// stops where a person can see it.
-	if _, err := payloadOf(intent.PayloadSchemaVersion, intent.Payload); err != nil {
+	payload, err := keys.DecodeEscalationPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
+	if err != nil {
 		return outbound.Impossible("payload_unreadable", err.Error())
+	}
+
+	// The commitment names a recipient twice: in its own columns, which decide
+	// WHERE this goes, and in the payload, which decides WHAT is written. A row
+	// where those two disagree would send a person's private message to the
+	// channel named in the columns - a leak, not a mangled journal entry - so
+	// the two are compared before anything is resolved.
+	if payload.Target.Kind != intent.TargetKind || payload.Target.Ref != intent.TargetRef {
+		return outbound.Impossible("target_mismatch", fmt.Sprintf(
+			"the commitment is addressed to %s %q and its message is written for %s %q",
+			intent.TargetKind, intent.TargetRef, payload.Target.Kind, payload.Target.Ref))
 	}
 	if h.tokens == nil || h.tokens.GetTelegramToken() == "" {
 		return outbound.Impossible("integration_missing",
@@ -99,7 +111,7 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 // else. Telegram has no thread and no permalink, so there is no enrichment
 // either - what comes back is already the whole receipt.
 func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbound.Result, error) {
-	payload, err := payloadOf(call.PayloadSchemaVersion, call.Payload)
+	payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
 	if err != nil {
 		return outbound.Result{
 			Evidence: outbound.DefinitelyNotSent,
@@ -264,21 +276,4 @@ func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1) s
 // completion fingerprint is taken over and what the classification reads.
 func statusOf(answer *tgResponse) string {
 	return fmt.Sprintf("%d:%s", answer.ErrorCode, answer.Description)
-}
-
-// payloadOf reads a commitment's payload under the schema it says it is in,
-// rather than under today's.
-func payloadOf(schemaVersion int, raw []byte) (keys.EscalationPayloadV1, error) {
-	var payload keys.EscalationPayloadV1
-	if schemaVersion != payload.SchemaVersion() {
-		return payload, fmt.Errorf("payload schema %d is not one this build renders",
-			schemaVersion)
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return payload, fmt.Errorf("the payload cannot be read: %w", err)
-	}
-	if err := payload.Target.Validate(); err != nil {
-		return payload, err
-	}
-	return payload, nil
 }

@@ -75,9 +75,16 @@ func TestAnAnswerIsNotATransportFailure(t *testing.T) {
 }
 
 // dialError produces a real failure to reach an address.
+//
+// With Proxy: nil rather than the default transport: a machine with HTTP_PROXY
+// set would reach the proxy instead, and the test would be measuring how the
+// proxy reports a name it cannot resolve rather than what this rule classifies.
 func dialError(t *testing.T, address string) error {
 	t.Helper()
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
 	_, err := client.Get(address)
 	if err == nil {
 		t.Fatalf("%s answered", address)
@@ -109,7 +116,7 @@ func tlsError(t *testing.T) error {
 
 	client := &http.Client{
 		Timeout:   5 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{}},
+		Transport: &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{}},
 	}
 	_, err := client.Get(server.URL)
 	if err == nil {
@@ -133,7 +140,10 @@ func timeoutError(t *testing.T) error {
 	}))
 	t.Cleanup(server.Close)
 
-	client := &http.Client{Timeout: 50 * time.Millisecond}
+	client := &http.Client{
+		Timeout:   50 * time.Millisecond,
+		Transport: &http.Transport{Proxy: nil},
+	}
 	_, err := client.Get(server.URL)
 	if err == nil {
 		t.Fatal("a hanging server answered")

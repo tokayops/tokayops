@@ -42,7 +42,21 @@ const HTTPTimeout = 30 * time.Second
 // can prove the option reaches the client in milliseconds instead of thirty
 // seconds; opts is what lets that test point the client at a server of its own.
 func NewClient(token string, timeout time.Duration, opts ...slackapi.Option) *slackapi.Client {
-	return slackapi.New(token, append(opts, slackapi.OptionHTTPClient(&http.Client{Timeout: timeout}))...)
+	return slackapi.New(token, append(opts,
+		slackapi.OptionHTTPClient(&http.Client{
+			Timeout: timeout,
+			// Redirects are not followed, and that is about the journal rather
+			// than about Slack. A provider that accepted the POST and answered
+			// 3xx would send the client somewhere else; if THAT hop fails to
+			// resolve or handshake, the error looks exactly like a request
+			// that never left - and the retry it earns posts a second message.
+			// Stopping at the first response keeps the proof honest: a 3xx is
+			// an answer from the provider, and an answer nobody recognises is
+			// doubt.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}))...)
 }
 
 // TokenSource provides dynamic token and config lookup

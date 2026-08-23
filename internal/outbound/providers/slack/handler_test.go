@@ -348,6 +348,11 @@ func TestAPayloadNobodyCanReadStopsBeforeTheNetwork(t *testing.T) {
 		"truncated json":             []byte(`{"target":{"kind":"chan`),
 		"a target nobody has":        []byte(`{"slot":{"kind":"firehose"},"target":{"kind":"carrier_pigeon","ref":"x"}}`),
 		"a target with no recipient": []byte(`{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":""}}`),
+		"a slot nobody has":          []byte(`{"slot":{"kind":"whenever"},"target":{"kind":"channel","ref":"C0001"}}`),
+		// A build that knows more than this one wrote an instruction here. It
+		// is refused rather than dropped: rendering the rest would carry out
+		// half of what was admitted.
+		"a field this build does not know": []byte(`{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C0001"},"quiet_hours":true}`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			intent := intentFor(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"})
@@ -361,6 +366,90 @@ func TestAPayloadNobodyCanReadStopsBeforeTheNetwork(t *testing.T) {
 			request := prepared.Request("intent-1", "token-1", "worker-1")
 			if request.ErrorClass != "payload_unreadable" || request.Summary == "" {
 				t.Fatalf("the refusal says %q/%q", request.ErrorClass, request.Summary)
+			}
+		})
+	}
+}
+
+// TestARedirectIsAnAnswerNotADeadEnd.
+//
+// The provider accepted the POST and answered 3xx. Followed, the client would
+// go somewhere else, and if THAT hop cannot resolve or handshake the error is
+// indistinguishable from a request that never left - so the attempt would be
+// called a clean failure and the retry would post a second card. The first
+// answer is the one that counts, and an answer nobody recognises is doubt.
+func TestARedirectIsAnAnswerNotADeadEnd(t *testing.T) {
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The message may already exist at this point; all we know is that
+		// Slack answered by pointing somewhere.
+		http.Redirect(w, r, "https://tokay.invalid./chat.postMessage", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirected.Close)
+
+	handler := &Handler{
+		tokens: &mockTokenSource{token: "tok"},
+		newClient: func(token string) *slackapi.Client {
+			return NewClient(token, HTTPTimeout, slackapi.OptionAPIURL(redirected.URL+"/"))
+		},
+	}
+
+	result, err := handler.ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"}, true))
+	if err == nil {
+		t.Fatal("a redirect was taken for a delivery")
+	}
+	if result.Evidence == outbound.DefinitelyNotSent {
+		t.Fatalf("a message that may exist was recorded as never sent: %+v", result)
+	}
+
+	concluded, _ := outbound.Conclude(handler, result, err)
+	if concluded.Outcome() == outbound.OutcomeRetryableRejection {
+		t.Fatal("the attempt was called a clean failure, so the retry posts a second card")
+	}
+	if concluded.Outcome() != outbound.OutcomeAmbiguous {
+		t.Fatalf("a redirect concluded %q", concluded.Outcome())
+	}
+}
+
+// TestACommitmentAddressedTwiceHasToAgree.
+//
+// The commitment names its recipient in its own columns, which decide where the
+// message goes, and again in the payload, which decides what is written. A row
+// where those disagree does not produce a mangled journal entry: it delivers
+// what was composed for a person into the channel named beside it.
+func TestACommitmentAddressedTwiceHasToAgree(t *testing.T) {
+	handler := NewHandler(&mockTokenSource{token: "tok"},
+		func(context.Context, string, string) (string, error) { return "U0001", nil })
+
+	cases := map[string]struct {
+		column keys.Target
+		inside keys.Target
+	}{
+		"a private message addressed to a channel": {
+			column: keys.Target{Kind: keys.TargetChannel, Ref: "C0001"},
+			inside: keys.Target{Kind: keys.TargetUser, Ref: "user-1"},
+		},
+		"a card addressed to a person": {
+			column: keys.Target{Kind: keys.TargetUser, Ref: "user-1"},
+			inside: keys.Target{Kind: keys.TargetChannel, Ref: "C0001"},
+		},
+		"the right kind, the wrong recipient": {
+			column: keys.Target{Kind: keys.TargetChannel, Ref: "C0001"},
+			inside: keys.Target{Kind: keys.TargetChannel, Ref: "C9999"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			intent := intentFor(t, tc.inside)
+			intent.TargetKind, intent.TargetRef = tc.column.Kind, tc.column.Ref
+
+			prepared := handler.Prepare(context.Background(), intent)
+			if prepared.Outcome() != outbound.PreparationPermanent {
+				t.Fatalf("a commitment that disagrees with itself was %s", prepared.Outcome())
+			}
+			if got := prepared.Request("i", "t", "w").ErrorClass; got != "target_mismatch" {
+				t.Fatalf("the refusal says %q", got)
 			}
 		})
 	}

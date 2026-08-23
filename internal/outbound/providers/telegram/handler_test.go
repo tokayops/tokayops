@@ -353,3 +353,29 @@ func TestADirectMessageIsPlainText(t *testing.T) {
 		t.Fatal("a direct message carried buttons")
 	}
 }
+
+// TestARedirectIsAnAnswerNotADeadEnd is the same rule for the other channel:
+// what answered the POST decides, not where it pointed.
+func TestARedirectIsAnAnswerNotADeadEnd(t *testing.T) {
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://tokay.invalid./bot0/sendMessage", http.StatusFound)
+	}))
+	t.Cleanup(redirected.Close)
+
+	handler := NewHandler(&mockTelegramTokenSource{token: "tok"}, nil,
+		WithHandlerBaseURL(redirected.URL))
+
+	result, err := handler.ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.TargetChannel, true))
+	if err == nil {
+		t.Fatal("a redirect was taken for a delivery")
+	}
+	if result.Evidence == outbound.DefinitelyNotSent {
+		t.Fatalf("a message that may exist was recorded as never sent: %+v", result)
+	}
+
+	concluded, _ := outbound.Conclude(handler, result, err)
+	if concluded.Outcome() != outbound.OutcomeAmbiguous {
+		t.Fatalf("a redirect concluded %q", concluded.Outcome())
+	}
+}

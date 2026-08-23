@@ -3,6 +3,7 @@ package keys
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"time"
 )
 
@@ -183,6 +184,43 @@ type EscalationPayloadV1 struct {
 // SchemaVersion is the payload schema this shape belongs to. It is stored on
 // the commitment, so a later schema is readable rather than guessed at.
 func (p EscalationPayloadV1) SchemaVersion() int { return 1 }
+
+// DecodeEscalationPayloadV1 reads a STORED payload, and is the only way to do
+// it.
+//
+// Strict on both halves, because both halves have already gone wrong somewhere
+// else. Unknown fields are refused rather than dropped: a payload written by a
+// build that knows more than this one would otherwise be rendered as if the
+// extra instruction was not there. And the closed sets are checked rather than
+// assumed valid because they were validated at ADMISSION, by a different build,
+// possibly years ago - what is on the row now is what decides what goes out.
+func DecodeEscalationPayloadV1(schemaVersion int, raw []byte) (EscalationPayloadV1, error) {
+	var payload EscalationPayloadV1
+	if schemaVersion != payload.SchemaVersion() {
+		return payload, contractf("payload schema %d is not one this build renders",
+			schemaVersion)
+	}
+	if len(raw) == 0 {
+		return payload, contractf("a commitment with no payload")
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return payload, contractf("the payload cannot be read: %v", err)
+	}
+	if decoder.More() {
+		return payload, contractf("the payload has more than one value in it")
+	}
+
+	if err := payload.Slot.validate(); err != nil {
+		return payload, err
+	}
+	if err := payload.Target.validate(); err != nil {
+		return payload, err
+	}
+	return payload, nil
+}
 
 func (p EscalationPayloadV1) encode(buf *bytes.Buffer) error {
 	if err := p.Target.validate(); err != nil {

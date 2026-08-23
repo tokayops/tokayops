@@ -138,9 +138,25 @@ func (t *Provider) getClient() (*http.Client, string, error) {
 			log.Printf("Provider: Token changed, recreating client")
 		}
 		t.cachedToken = token
-		t.client = &http.Client{Timeout: telegramHTTPTimeout}
+		t.client = effectClient()
 	}
 	return t.client, token, nil
+}
+
+// effectClient is the client every call that can create a message goes through.
+//
+// It does not follow redirects, and that is about the journal rather than about
+// Telegram. A provider that accepted the POST and answered 3xx would send the
+// client somewhere else; if that hop fails to resolve or handshake, the error
+// looks exactly like a request that never left - and the retry it earns sends a
+// second message. Stopping at the first response keeps the proof honest.
+func effectClient() *http.Client {
+	return &http.Client{
+		Timeout: telegramHTTPTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 // tgResponse is the Bot API envelope. Result is left raw because editMessageText
@@ -184,6 +200,15 @@ func callBotAPI(ctx context.Context, client *http.Client, baseURL, token, method
 	if err != nil {
 		return nil, fmt.Errorf("telegram %s: read response: %w", method, err)
 	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		// An answer, and one nobody here recognises: the request reached
+		// Telegram and what it did with it is unknown.
+		return &tgResponse{
+			ErrorCode:   resp.StatusCode,
+			Description: "redirected, which this build does not follow",
+		}, nil
+	}
+
 	var tgr tgResponse
 	if err := json.Unmarshal(raw, &tgr); err != nil {
 		return nil, fmt.Errorf("telegram %s: decode response (status %d): %w", method, resp.StatusCode, err)

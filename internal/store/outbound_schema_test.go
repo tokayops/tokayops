@@ -133,7 +133,9 @@ func (i intentFixture) insert(s *Store) error {
 		VALUES ($1, $2, $3, 'notification', 'escalation',
 			 1, 'slack', 'channel', 'C123', $4,
 			 'editable', 'on_acceptance', 'retry', 1,
-			 '{}'::jsonb, 1, $5, $6,
+			 '{"slot":{"kind":"firehose","index":0},
+			   "target":{"kind":"channel","ref":"C123"},
+			   "interactive":true}'::jsonb, 1, $5, $6,
 			 $7, $8, $9,
 			 $10, $11, $12,
 			 now(), now())`,
@@ -949,5 +951,49 @@ func TestOutboundIndexesAreDeclaredOnce(t *testing.T) {
 		if !seen {
 			t.Errorf("%s is declared in the schema but missing from the database", name)
 		}
+	}
+}
+
+// TestACommitmentCannotBeAddressedTwoWays. The columns decide where a message
+// goes and the payload decides what is written, so a row where they disagree
+// delivers what was composed for one person into the channel named beside it.
+// A channel refuses such a row before it sends; the point of this rule is that
+// nobody can write one.
+func TestACommitmentCannotBeAddressedTwoWays(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+	batch := newBatch(agID).mustInsert(t, s)
+
+	insert := func(targetKind, targetRef, payload string) error {
+		_, err := s.db.Exec(`
+			INSERT INTO outbound_intents (
+				id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
+				provider, target_kind, target_ref, alert_group_id, form, completion_mode,
+				ambiguity_policy, payload_schema_version, payload,
+				provider_key_codec_version, status, desired_revision, not_before,
+				next_attempt_at)
+			VALUES ($1, $2, $1, 'notification', 'escalation', 1,
+			        'slack', $3, $4, $5, 'editable', 'on_acceptance',
+			        'retry', 1, $6::jsonb, 1, 'pending', 0, now(), now())`,
+			uuid.New().String(), batch.ID, targetKind, targetRef, agID, payload)
+		return err
+	}
+
+	if err := insert("channel", "C0001",
+		`{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C0001"},"interactive":true}`,
+	); err != nil {
+		t.Fatalf("a commitment that agrees with itself was refused: %v", err)
+	}
+
+	for name, mismatch := range map[string]string{
+		"a private message addressed to a channel": `{"slot":{"kind":"firehose"},"target":{"kind":"user","ref":"user-1"},"interactive":true}`,
+		"the right kind, the wrong recipient":      `{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C9999"},"interactive":true}`,
+		"a payload with no target at all":          `{"slot":{"kind":"firehose"},"interactive":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := insert("channel", "C0001", mismatch); err == nil {
+				t.Fatal("the database accepted a commitment addressed two ways")
+			}
+		})
 	}
 }

@@ -193,7 +193,25 @@ CREATE TABLE IF NOT EXISTS outbound_intents (
 		CHECK (status <> 'sending' OR lease_token IS NOT NULL),
 	CONSTRAINT outbound_intents_counters_nonneg
 		CHECK (attempts_in_generation >= 0 AND failure_streak >= 0
-			AND generation_no >= 0)
+			AND generation_no >= 0),
+	-- The recipient is named twice: in the columns above, which decide WHERE a
+	-- message goes, and inside the payload, which decides WHAT is written. A row
+	-- where the two disagree does not produce a confusing journal entry - it
+	-- delivers what was composed for one person into the channel named beside
+	-- it. A channel compares them before it sends; this makes the row
+	-- impossible to write in the first place.
+	--
+	-- Scoped to the shape it knows: another kind, or a later payload schema,
+	-- brings its own rule rather than being silently exempt from this one.
+	CONSTRAINT outbound_intents_payload_addresses_the_target CHECK (
+		key_kind <> 'escalation' OR payload_schema_version <> 1
+		-- IS NOT DISTINCT FROM, not =: a payload with no target at all yields
+		-- NULL, and a CHECK that evaluates to NULL is satisfied. Written with
+		-- =, the one row that names its recipient only once would be the one
+		-- row this rule let through.
+		OR (payload #>> '{target,kind}' IS NOT DISTINCT FROM target_kind
+			AND payload #>> '{target,ref}' IS NOT DISTINCT FROM target_ref)
+	)
 );
 
 CREATE TABLE IF NOT EXISTS outbound_attempts (

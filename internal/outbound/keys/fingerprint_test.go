@@ -2,6 +2,7 @@ package keys
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -538,5 +539,34 @@ func TestCompletionRefusesWhatItCannotIdentify(t *testing.T) {
 				t.Fatalf("expected a contract violation, got: %v", err)
 			}
 		})
+	}
+}
+
+// TestThePayloadIsStoredUnderTheseNames pins the JSON spelling of a stored
+// payload.
+//
+// It is not a formatting preference. The row is compared against the columns
+// beside it by a database constraint - the commitment names its recipient
+// twice, and a mismatch delivers a private message into a channel - and that
+// constraint reads these paths. A field renamed by adding or dropping a tag
+// would make the comparison silently vacuous.
+func TestThePayloadIsStoredUnderTheseNames(t *testing.T) {
+	override := "call Nina"
+	raw, err := json.Marshal(EscalationPayloadV1{
+		Slot:            Slot{Kind: SlotPolicy, Index: 2},
+		Target:          Target{Kind: TargetChannel, Ref: "C0001"},
+		MessageOverride: &override,
+		Interactive:     true,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	const want = `{"slot":{"kind":"policy","index":2},` +
+		`"target":{"kind":"channel","ref":"C0001"},` +
+		`"message_override":"call Nina","interactive":true}`
+	if string(raw) != want {
+		t.Fatalf("a stored payload now reads\n  %s\nand the constraint over it expects\n  %s",
+			raw, want)
 	}
 }
