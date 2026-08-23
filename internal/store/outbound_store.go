@@ -27,8 +27,9 @@ import (
 //     takes them in that order, which is what keeps acknowledgement and delivery
 //     from deadlocking against each other.
 
-// The two ways this package refuses, and the line between them is which of the
-// two things is wrong: the row, or the binary reading it.
+// The two ways this package refuses. They are disjoint on purpose - neither
+// wraps the other - because they have opposite consequences and a caller has to
+// be able to tell them apart in whichever order it asks.
 //
 // ErrOutboundContract is a valid row this build cannot handle - written under a
 // protocol version it does not know, or needing a call it does not make - and
@@ -41,7 +42,7 @@ func outboundContractf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrOutboundContract, fmt.Sprintf(format, args...))
 }
 
-// ErrUndeliverable is the other half: the row itself is broken, for every build
+// ErrUndeliverable is the other one: the row itself is broken, for every build
 // and forever. The state a commitment renders from is gone, or no longer
 // produces the digest its keys were computed over, or describes another alert.
 //
@@ -50,11 +51,14 @@ func outboundContractf(format string, args ...any) error {
 // deadline allows, so this one ends the commitment where a person can see it -
 // see refuseAttempt. Nothing that could become readable again after a
 // deployment belongs here.
+//
+// It is NOT a contract violation as well. A handler that asked about the
+// contract first would read a broken row as an incompatible build and leave the
+// commitment circling, which is the failure both of these exist to name.
 var ErrUndeliverable = errors.New("store: this commitment cannot produce a call")
 
 func undeliverablef(format string, args ...any) error {
-	return fmt.Errorf("%w: %w: %s", ErrOutboundContract, ErrUndeliverable,
-		fmt.Sprintf(format, args...))
+	return fmt.Errorf("%w: %s", ErrUndeliverable, fmt.Sprintf(format, args...))
 }
 
 // SubmitEscalationBatch admits an escalation: the claim, its commitments, the

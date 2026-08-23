@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -89,5 +90,30 @@ func TestBeginRefusesAnEffectItCannotWrite(t *testing.T) {
 		if err := beginEffectsUnderstood(effects); err == nil {
 			t.Errorf("starting an attempt silently swallowed %s", name)
 		}
+	}
+}
+
+// TestTheTwoRefusalsDoNotOverlap. The store refuses in two ways with opposite
+// consequences: one ends the commitment, the other leaves it for a build that
+// can serve it. A caller decides which by asking, and if an error answered yes
+// to both then whichever question it asked first would decide the fate of the
+// commitment - the reader, not the fault.
+func TestTheTwoRefusalsDoNotOverlap(t *testing.T) {
+	broken := undeliverablef("the state of %s no longer matches its digest", "ag-1")
+	if !errors.Is(broken, ErrUndeliverable) {
+		t.Fatal("a broken row does not say so")
+	}
+	if errors.Is(broken, ErrOutboundContract) {
+		t.Fatal("a broken row also reads as a build that cannot handle a good one, " +
+			"so a caller checking the contract first would leave it circling the queue")
+	}
+
+	behind := outboundContractf("schema version %d is not one this build renders", 2)
+	if !errors.Is(behind, ErrOutboundContract) {
+		t.Fatal("a build that cannot handle a row does not say so")
+	}
+	if errors.Is(behind, ErrUndeliverable) {
+		t.Fatal("a build that is behind also reads as a broken row, " +
+			"so one old instance could end work the rest of the fleet can do")
 	}
 }

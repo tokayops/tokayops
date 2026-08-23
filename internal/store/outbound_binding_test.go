@@ -950,12 +950,17 @@ func TestAWithdrawalDoesNotNeedTheState(t *testing.T) {
 	}
 
 	// Assuming it arrived is a claim about a message that state composed, so
-	// it stops here.
-	if _, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
+	// it stops here - and it stops as a broken row, not as a build that cannot
+	// read a good one.
+	_, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
 		IntentID: intentID, Decision: outbound.DecisionAssumeAccepted,
 		Actor: "nina", Reason: "the recipient said so",
-	}); !errors.Is(err, ErrOutboundContract) {
+	})
+	if !errors.Is(err, ErrUndeliverable) {
 		t.Fatalf("a delivery was assumed against state nobody can read: %v", err)
+	}
+	if errors.Is(err, ErrOutboundContract) {
+		t.Fatalf("a broken row also reads as an incompatible build: %v", err)
 	}
 
 	result := resolve(t, s, outbound.ResolveAmbiguityRequest{
