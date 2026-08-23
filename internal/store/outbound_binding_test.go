@@ -234,15 +234,6 @@ func TestStateThatNoLongerMatchesItsKeyIsRefused(t *testing.T) {
 			}
 		},
 	}, {
-		name: "it was written by a build this one cannot read",
-		corrupt: func(t *testing.T, s *Store, agID string) {
-			if _, err := s.db.Exec(`
-				UPDATE outbound_group_snapshots SET snapshot_schema_version = $2
-				WHERE alert_group_id = $1`, agID, keys.RenderSnapshotSchemaV1+1); err != nil {
-				t.Fatalf("age the schema: %v", err)
-			}
-		},
-	}, {
 		name: "it describes another alert",
 		corrupt: func(t *testing.T, s *Store, agID string) {
 			foreign := outboundSnapshot(t, outboundGroup(t, s), "elsewhere")
@@ -657,34 +648,84 @@ func TestTheCallIsDecidedByTheRecord(t *testing.T) {
 			t.Fatalf("give the commitment an object: %v", err)
 		}
 
-		result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		written := countJournalRows(t, s, intentID)
+		_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 			Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
 		})
-		if err != nil {
-			t.Fatalf("begin: %v", err)
+		if !errors.Is(err, ErrOutboundContract) {
+			t.Fatalf("a second object was created for the same commitment: %v", err)
 		}
-		if result.Outcome != outbound.BeginPreparedPermanent {
-			t.Fatalf("a call this build cannot make answered %q", result.Outcome)
+		// It stops THIS build, not the work. The commitment is untouched: a
+		// build that can change an object will find it exactly as it was, and
+		// this one has no business ending it.
+		if errors.Is(err, ErrUndeliverable) {
+			t.Fatal("a call this build cannot make was recorded as a broken commitment")
 		}
-		if got := statusOf(t, s, intentID); got != outbound.StatusPermanentFailed {
-			t.Fatalf("the commitment is %s", got)
+		if got := statusOf(t, s, intentID); got != outbound.StatusPending {
+			t.Fatalf("the commitment is %s after a build that could not serve it looked at it", got)
 		}
-
-		var kind, operation, class string
-		if err := s.db.QueryRow(`
-			SELECT attempt_kind, operation, COALESCE(error_class, '')
-			FROM outbound_attempts WHERE intent_id = $1`, intentID).
-			Scan(&kind, &operation, &class); err != nil {
-			t.Fatalf("read the refusal: %v", err)
-		}
-		if kind != string(outbound.AttemptMutation) || class != "unsupported_operation" {
-			t.Fatalf("the refusal reads as %s/%s (%s)", kind, operation, class)
-		}
-		if started := attemptsStarted(t, s, intentID); started != 0 {
-			t.Fatalf("%d calls were made for a commitment nothing could be sent for", started)
+		if got := countJournalRows(t, s, intentID); got != written {
+			t.Fatalf("the refusal wrote %d rows about a call nobody decided to make",
+				got-written)
 		}
 	})
+}
+
+// countJournalRows counts everything written about a commitment: the calls, the
+// refusals, and the events. A build that cannot serve a commitment adds none of
+// them - the count is the same after it looked as before.
+func countJournalRows(t *testing.T, s *Store, intentID string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`
+		SELECT (SELECT count(*) FROM outbound_attempts WHERE intent_id = $1)
+		     + (SELECT count(*) FROM outbound_intent_events WHERE intent_id = $1)`,
+		intentID).Scan(&n); err != nil {
+		t.Fatalf("count the journal: %v", err)
+	}
+	return n
+}
+
+// TestStateFromANewerBuildWaitsRatherThanEnds. A snapshot version this build
+// does not know is not a broken alert - the instance that wrote it renders it
+// perfectly well. Ending the commitment here would let one instance left behind
+// by a deployment destroy work the rest of the fleet can do.
+func TestStateFromANewerBuildWaitsRatherThanEnds(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+	intentID := admitOne(t, s, agID)[0]
+
+	if _, err := s.db.Exec(`
+		UPDATE outbound_group_snapshots SET snapshot_schema_version = $2
+		WHERE alert_group_id = $1`, agID, keys.RenderSnapshotSchemaV1+1); err != nil {
+		t.Fatalf("write the state under a later schema: %v", err)
+	}
+
+	token := claimOne(t, s, intentID)
+	written := countJournalRows(t, s, intentID)
+	_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+		Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
+	})
+	if !errors.Is(err, ErrOutboundContract) {
+		t.Fatalf("state this build cannot read was rendered anyway: %v", err)
+	}
+	if errors.Is(err, ErrUndeliverable) {
+		t.Fatal("a deployment that is behind was reported as a broken commitment")
+	}
+
+	// Nothing moved, and nothing was written: the next build to look at this
+	// commitment finds the same one this build refused.
+	if got := statusOf(t, s, intentID); got != outbound.StatusPending {
+		t.Fatalf("the commitment is %s", got)
+	}
+	if got := countJournalRows(t, s, intentID); got != written {
+		t.Fatalf("the refusal left %d new rows in the journal", got-written)
+	}
+	if hasTimeline(t, s, agID, "failed permanently") {
+		t.Fatal("the alert was told a notification failed because one instance was old")
+	}
 }
 
 // attemptsStarted counts the records that mean the network may have been

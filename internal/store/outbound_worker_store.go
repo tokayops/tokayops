@@ -452,15 +452,13 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	// What the call has to be, decided before anything is written and from the
 	// commitment alone. A refusal is recorded under the same shape: the journal
 	// says which call did not happen.
-	plan := planAttempt(*intent)
+	plan, err := planAttempt(*intent)
+	if err != nil {
+		return outbound.BeginAttemptResult{}, err
+	}
 
 	if req.Preparation != outbound.PreparationReady {
 		return s.recordPreparation(ctx, tx, req, *intent, plan)
-	}
-
-	if !plan.Supported {
-		return s.refuseAttempt(ctx, tx, req, *intent, plan, "unsupported_operation",
-			fmt.Sprintf("a %s is needed and this build does not make one", plan.Kind))
 	}
 
 	stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
@@ -594,12 +592,6 @@ func beginEffectsUnderstood(e outbound.Effects) error {
 type plannedAttempt struct {
 	Kind      outbound.AttemptKind
 	Operation outbound.Operation
-
-	// Supported says this build can actually make the call. When it cannot,
-	// the fields above still describe the call that was needed - which is what
-	// the refusal records, and what tells whoever reads it later why nothing
-	// went out.
-	Supported bool
 }
 
 // planAttempt decides the shape of the next call.
@@ -609,22 +601,28 @@ type plannedAttempt struct {
 // here at all - it comes from the state the attempt renders, read under the
 // same lock, so the content and the key that names it cannot disagree.
 //
-// It answers for calls this build cannot make as well, and that is the point:
-// a refusal has to be able to say WHICH call was needed. What Sprint 2 adds is
-// the ability to make one, and the choice between an update and a resolve -
-// which is a question about the stored state, not about the worker.
-func planAttempt(intent outbound.Intent) plannedAttempt {
+// Changing an object that already exists is not something this build does, and
+// it stops the caller rather than the commitment. Nothing in this build brings
+// a commitment that has a receipt back into the queue, so the only way to be
+// here is a deployment that is behind - and ending perfectly good work because
+// this instance is the wrong one to do it is exactly the mistake the two error
+// kinds above exist to keep apart.
+//
+// What Sprint 2 adds is the call itself and the choice between an update and a
+// resolve, which is a question about the stored state - is this the last
+// revision? - and so can only be answered after that state has been read and
+// proved. Recording a guess here would put a call in the journal that the
+// system never decided to make.
+func planAttempt(intent outbound.Intent) (plannedAttempt, error) {
 	if intent.HasReceipt {
-		return plannedAttempt{
-			Kind:      outbound.AttemptMutation,
-			Operation: outbound.OperationUpdate,
-		}
+		return plannedAttempt{}, outboundContractf(
+			"commitment %s needs a change to an object that already exists, "+
+				"and this build only creates them", intent.ID)
 	}
 	return plannedAttempt{
 		Kind:      outbound.AttemptCreate,
 		Operation: outbound.OperationSend,
-		Supported: true,
-	}
+	}, nil
 }
 
 // boundEffect is the external identity one attempt will use: where it goes and

@@ -27,23 +27,29 @@ import (
 //     takes them in that order, which is what keeps acknowledgement and delivery
 //     from deadlocking against each other.
 
-// ErrOutboundContract is a statement the schema or the grammar does not have -
-// a stored row written by a protocol version this build cannot read, or an
-// invariant that should have been impossible. It is never retryable.
+// The two ways this package refuses, and the line between them is which of the
+// two things is wrong: the row, or the binary reading it.
+//
+// ErrOutboundContract is a valid row this build cannot handle - written under a
+// protocol version it does not know, or needing a call it does not make - and
+// an invariant that should have been impossible. It stops the caller and
+// changes nothing: the same row read by the build it was written for is fine,
+// and an old instance must not be able to end work a new format created.
 var ErrOutboundContract = errors.New("store: outbound contract violation")
 
 func outboundContractf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrOutboundContract, fmt.Sprintf(format, args...))
 }
 
-// ErrUndeliverable marks a contract violation that belongs to ONE commitment
-// and that no amount of retrying will change: the state it renders from cannot
-// be read back, or the call it needs is not one this build makes.
+// ErrUndeliverable is the other half: the row itself is broken, for every build
+// and forever. The state a commitment renders from is gone, or no longer
+// produces the digest its keys were computed over, or describes another alert.
 //
-// It is separate from the rest because it has a different consequence. A
-// violation of the schema or of the grammar is a broken deployment and has to
-// stop the caller; this one is a broken row, and stopping the caller over it
-// would hand the same commitment out of the queue forever.
+// The consequence differs because the cause does. Stopping the caller over a
+// broken row would hand the same row out of the queue for as long as its
+// deadline allows, so this one ends the commitment where a person can see it -
+// see refuseAttempt. Nothing that could become readable again after a
+// deployment belongs here.
 var ErrUndeliverable = errors.New("store: this commitment cannot produce a call")
 
 func undeliverablef(format string, args ...any) error {
@@ -769,6 +775,9 @@ type storedSnapshot struct {
 // group and the revision say the row is about the right thing: a snapshot moved
 // between groups, or one revision stored under another's number, would be a
 // message about the wrong alert with a key that says it is about the right one.
+//
+// The first refusal is about this build and leaves the commitment alone; the
+// other three are about the row and end it.
 func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (storedSnapshot, error) {
 	var (
 		raw           []byte
@@ -789,8 +798,12 @@ func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (sto
 		return storedSnapshot{}, err
 	}
 
+	// A version this build does not know is a deployment that is behind, not a
+	// broken alert: the instance that wrote it renders it perfectly well. It
+	// stops here and changes nothing, so the work waits for a build that can
+	// do it instead of being ended by one that cannot.
 	if schemaVersion != keys.RenderSnapshotSchemaV1 {
-		return storedSnapshot{}, undeliverablef(
+		return storedSnapshot{}, outboundContractf(
 			"the state of %s was written under schema version %d, which this build cannot render",
 			alertGroupID, schemaVersion)
 	}
