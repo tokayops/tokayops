@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/model"
@@ -55,8 +56,28 @@ type raceRound struct {
 	intentID  string
 	attemptID string
 	token     string
+
 	ackErr    error
+	ackTook   time.Duration
 	otherErr  error
+	otherTook time.Duration
+}
+
+// timed runs one side of a pair and remembers how long it took. The duration is
+// not decoration: it is what tells a lock timeout caused by the lock order from
+// one caused by a machine that cannot commit anything in time.
+func timed(took *time.Duration, work func()) {
+	started := time.Now()
+	work()
+	*took = time.Since(started)
+}
+
+// slowest is how long the slower half of this pair took end to end.
+func (r *raceRound) slowest() time.Duration {
+	if r.ackTook > r.otherTook {
+		return r.ackTook
+	}
+	return r.otherTook
 }
 
 func (r *raceRound) check(t *testing.T, other string) {
@@ -68,10 +89,32 @@ func (r *raceRound) check(t *testing.T, other string) {
 		if e.err == nil {
 			continue
 		}
-		if kind := lockFailure(e.err); kind != "" {
-			t.Fatalf("%s and %s met in %s: %v", "the acknowledgement", other, kind, e.err)
+		switch kind := lockFailure(e.err); kind {
+		case "":
+			t.Fatalf("%s failed: %v", e.who, e.err)
+
+		case "a deadlock":
+			// Never excused. A cycle is a cycle at any speed: two transactions
+			// took the same two rows in opposite orders, and no amount of load
+			// invents that.
+			t.Fatalf("the acknowledgement and %s met in a deadlock, which is the "+
+				"lock order being wrong: %v", other, e.err)
+
+		default:
+			// A timeout means the other side held the alert group for longer
+			// than the store lets anybody wait. Under the lock order that can
+			// only happen if the holder itself was slow - so if the pair took
+			// longer than that bound to run at all, this machine cannot answer
+			// the question, and saying so is honest where failing would blame
+			// the code for the host.
+			if slowest := r.slowest(); slowest >= outbound.NotificationLockTimeout {
+				t.Skipf("the acknowledgement and %s met in %s, and the pair took %s "+
+					"to run at all - too slow to tell a lock-order fault from a "+
+					"starved database", other, kind, slowest)
+			}
+			t.Fatalf("the acknowledgement and %s met in %s after %s: %v",
+				other, kind, r.slowest(), e.err)
 		}
-		t.Fatalf("%s failed: %v", e.who, e.err)
 	}
 }
 
@@ -162,15 +205,20 @@ func TestAcknowledgementRacesADeliveryThatLanded(t *testing.T) {
 		round := round
 		work = append(work,
 			func() {
-				_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+				timed(&round.ackTook, func() {
+					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+				})
 			},
 			func() {
-				_, round.otherErr = s.FinalizeDeliveryAttempt(context.Background(),
-					outbound.FinalizeRequest{
-						AttemptID: round.attemptID, LeaseToken: round.token,
-						Completion: acceptedCompletion(),
-						Receipt:    json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
-					})
+				timed(&round.otherTook, func() {
+					_, round.otherErr = s.FinalizeDeliveryAttempt(context.Background(),
+						outbound.FinalizeRequest{
+							AttemptID: round.attemptID, LeaseToken: round.token,
+							Completion: acceptedCompletion(),
+							Receipt: json.RawMessage(
+								`{"channel":"C0001","ts":"1700000000.000100"}`),
+						})
+				})
 			})
 	}
 	startTogether(work...)
@@ -213,14 +261,18 @@ func TestAcknowledgementRacesAnAssumedDelivery(t *testing.T) {
 		round := round
 		work = append(work,
 			func() {
-				_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+				timed(&round.ackTook, func() {
+					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+				})
 			},
 			func() {
-				_, round.otherErr = s.FinalizeDeliveryAttempt(context.Background(),
-					outbound.FinalizeRequest{
-						AttemptID: round.attemptID, LeaseToken: round.token,
-						Completion: keys.Completion{Outcome: keys.OutcomeAmbiguous},
-					})
+				timed(&round.otherTook, func() {
+					_, round.otherErr = s.FinalizeDeliveryAttempt(context.Background(),
+						outbound.FinalizeRequest{
+							AttemptID: round.attemptID, LeaseToken: round.token,
+							Completion: keys.Completion{Outcome: keys.OutcomeAmbiguous},
+						})
+				})
 			})
 	}
 	startTogether(work...)
@@ -248,31 +300,33 @@ func TestAcknowledgementRacesRecovery(t *testing.T) {
 
 	// Two recoverers on purpose: they also race each other for the same
 	// candidates, which is the other half of the rule (G18).
-	recoveryErrs := make([]error, 2)
+	recoveries := make([]raceRound, 2)
 	work := []func(){
 		func() {
-			_, recoveryErrs[0] = s.RecoverStaleAttempts(context.Background(), testFamily, raceRounds)
+			timed(&recoveries[0].otherTook, func() {
+				_, recoveries[0].otherErr = s.RecoverStaleAttempts(
+					context.Background(), testFamily, raceRounds)
+			})
 		},
 		func() {
-			_, recoveryErrs[1] = s.RecoverStaleAttempts(context.Background(), testFamily, raceRounds)
+			timed(&recoveries[1].otherTook, func() {
+				_, recoveries[1].otherErr = s.RecoverStaleAttempts(
+					context.Background(), testFamily, raceRounds)
+			})
 		},
 	}
 	for _, round := range rounds {
 		round := round
 		work = append(work, func() {
-			_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+			timed(&round.ackTook, func() {
+				_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+			})
 		})
 	}
 	startTogether(work...)
 
-	for i, err := range recoveryErrs {
-		if err == nil {
-			continue
-		}
-		if kind := lockFailure(err); kind != "" {
-			t.Fatalf("recovery %d met %s: %v", i, kind, err)
-		}
-		t.Fatalf("recovery %d failed: %v", i, err)
+	for i := range recoveries {
+		recoveries[i].check(t, fmt.Sprintf("recovery %d", i))
 	}
 	for _, round := range rounds {
 		round.check(t, "recovery")

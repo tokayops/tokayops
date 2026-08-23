@@ -794,8 +794,10 @@ func TestStateNobodyCanReadEndsTheCommitment(t *testing.T) {
 
 	// It is out of the queue, and out of it for good.
 	makeDue(t, s, intentID)
-	leased, err := s.ClaimDueIntents(context.Background(), testFamily, "slack",
-		outbound.ClaimAny, 10, outbound.NotificationLease)
+	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimAny,
+		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}

@@ -135,14 +135,14 @@ func (s *Store) DueSnapshot(ctx context.Context, family string) ([]outbound.Prov
 // Every claim mints a NEW token. That is the fencing: a worker that comes back
 // from the dead still holds the old one, and every mutation it attempts is
 // compared against the token the row carries now.
-func (s *Store) ClaimDueIntents(ctx context.Context, family, provider string,
-	phase outbound.ClaimPhase, limit int, lease time.Duration) ([]outbound.Leased, error) {
+func (s *Store) ClaimDueIntents(ctx context.Context,
+	req outbound.ClaimRequest) ([]outbound.Leased, error) {
 
-	if limit <= 0 {
+	if req.Limit <= 0 {
 		return nil, nil
 	}
 
-	freshOnly := phase == outbound.ClaimFirstAttempts
+	freshOnly := req.Phase == outbound.ClaimFirstAttempts
 	rows, err := s.db.QueryContext(ctx, `
 		UPDATE outbound_intents i
 		SET lease_token = gen_random_uuid()::text,
@@ -162,7 +162,8 @@ func (s *Store) ClaimDueIntents(ctx context.Context, family, provider string,
 		) due
 		WHERE i.id = due.id
 		RETURNING i.id, i.lease_token, i.locked_until`,
-		family, provider, freshOnly, limit, lease.Seconds(), workerIDOf(ctx))
+		req.Family, req.Provider, freshOnly, req.Limit, req.Lease.Seconds(),
+		nilIfEmpty(req.WorkerID))
 	if err != nil {
 		return nil, fmt.Errorf("claim due work: %w", err)
 	}
@@ -199,22 +200,6 @@ func (s *Store) ClaimDueIntents(ctx context.Context, family, provider string,
 		})
 	}
 	return out, nil
-}
-
-// workerIDContextKey carries the identity of the process that is claiming. It
-// is audit only - the lease is the token, never the name.
-type workerIDContextKey struct{}
-
-// WithWorkerID labels the claims made under this context.
-func WithWorkerID(ctx context.Context, workerID string) context.Context {
-	return context.WithValue(ctx, workerIDContextKey{}, workerID)
-}
-
-func workerIDOf(ctx context.Context) any {
-	if id, ok := ctx.Value(workerIDContextKey{}).(string); ok && id != "" {
-		return id
-	}
-	return nil
 }
 
 // RecoverStaleAttempts closes the attempts whose worker never came back.

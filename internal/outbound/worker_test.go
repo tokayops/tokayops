@@ -1,0 +1,492 @@
+package outbound
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+)
+
+// What the worker is responsible for is arithmetic and order: it takes exactly
+// the work it can run, in an order that serves everybody, and it records what
+// happened even while it is being shut down. The tests drive tick() and serve()
+// directly rather than the ticker - a test that waits for a real second is a
+// test that eventually flakes, and none of these are about the clock.
+
+type fakeStore struct {
+	mu sync.Mutex
+
+	due      []ProviderDue
+	claimErr error
+	beginOut BeginAttemptResult
+	beginErr error
+
+	// available is how many rows each provider really has left to give, which
+	// is what makes an undershoot possible: the aggregate says one thing and
+	// the claim finds another.
+	available map[string]int
+
+	claims    []ClaimRequest
+	begins    []BeginAttemptRequest
+	finalized []FinalizeRequest
+	expiries  int
+	recovers  int
+	nextID    int
+}
+
+func newFakeStore() *fakeStore {
+	return &fakeStore{
+		available: map[string]int{},
+		beginOut: BeginAttemptResult{
+			Outcome:              BeginStarted,
+			AttemptKind:          AttemptCreate,
+			Operation:            OperationSend,
+			BoundEndpoint:        "C-bound",
+			ProviderKey:          "create-key",
+			AppliedRevision:      3,
+			PayloadSchemaVersion: 1,
+			Payload:              json.RawMessage(`{"text":"disk will fill"}`),
+		},
+	}
+}
+
+func (f *fakeStore) ExpireDueIntents(context.Context, string, int) ([]Expired, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.expiries++
+	return nil, nil
+}
+
+func (f *fakeStore) RecoverStaleAttempts(context.Context, string, int) ([]Recovered, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recovers++
+	return nil, nil
+}
+
+func (f *fakeStore) DueSnapshot(context.Context, string) ([]ProviderDue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.due, nil
+}
+
+func (f *fakeStore) ClaimDueIntents(_ context.Context, req ClaimRequest) ([]Leased, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.claims = append(f.claims, req)
+	if f.claimErr != nil {
+		return nil, f.claimErr
+	}
+
+	give := req.Limit
+	if left, tracked := f.available[req.Provider]; tracked && left < give {
+		give = left
+	}
+	if give < 0 {
+		give = 0
+	}
+	if _, tracked := f.available[req.Provider]; tracked {
+		f.available[req.Provider] -= give
+	}
+
+	leased := make([]Leased, 0, give)
+	for i := 0; i < give; i++ {
+		f.nextID++
+		leased = append(leased, Leased{
+			Intent: Intent{
+				ID: fmt.Sprintf("intent-%d", f.nextID), Provider: req.Provider,
+				Status: StatusPending, AlertGroupID: "ag-1",
+			},
+			LeaseToken:  fmt.Sprintf("token-%d", f.nextID),
+			LockedUntil: time.Now().Add(req.Lease),
+		})
+	}
+	return leased, nil
+}
+
+func (f *fakeStore) BeginAttempt(_ context.Context,
+	req BeginAttemptRequest) (BeginAttemptResult, error) {
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.begins = append(f.begins, req)
+	if f.beginErr != nil {
+		return BeginAttemptResult{}, f.beginErr
+	}
+	if req.Preparation != PreparationReady {
+		return BeginAttemptResult{Outcome: BeginPreparedRetry}, nil
+	}
+	out := f.beginOut
+	out.AttemptID = "attempt-for-" + req.IntentID
+	return out, nil
+}
+
+func (f *fakeStore) FinalizeDeliveryAttempt(ctx context.Context,
+	req FinalizeRequest) (FinalizeResult, error) {
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return FinalizeResult{}, err
+	}
+	f.finalized = append(f.finalized, req)
+	return FinalizeResult{Outcome: FinalizeFinalized}, nil
+}
+
+func (f *fakeStore) counts() (claimed, begun, finalized int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.claims), len(f.begins), len(f.finalized)
+}
+
+// fakeChannel is one provider that does what the test tells it to.
+type fakeChannel struct {
+	mu sync.Mutex
+
+	preparation Preparation
+	result      Result
+	execErr     error
+	outcome     Outcome
+	class       string
+
+	// block holds ExecuteAttempt until it is closed, which is how the tests
+	// look at a worker with attempts genuinely in flight.
+	block chan struct{}
+
+	calls []Call
+}
+
+func newFakeChannel() *fakeChannel {
+	return &fakeChannel{
+		preparation: Ready("C-proposed"),
+		result: Result{
+			Evidence: ProviderResponse, Status: "ok",
+			ReceiptRef: "C-bound/1700000000.000100",
+			Receipt:    json.RawMessage(`{"channel":"C-bound","ts":"1700000000.000100"}`),
+		},
+		outcome: OutcomeAccepted,
+	}
+}
+
+func (c *fakeChannel) Prepare(context.Context, Intent) Preparation {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.preparation
+}
+
+func (c *fakeChannel) ExecuteAttempt(ctx context.Context, call Call) (Result, error) {
+	c.mu.Lock()
+	block := c.block
+	c.calls = append(c.calls, call)
+	result, err := c.result, c.execErr
+	c.mu.Unlock()
+
+	if block != nil {
+		<-block
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		return Result{}, errors.New("an attempt was made with no deadline")
+	}
+	return result, err
+}
+
+func (c *fakeChannel) Classify(Result, error) (Outcome, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.outcome, c.class
+}
+
+func (c *fakeChannel) made() []Call {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]Call(nil), c.calls...)
+}
+
+func testWorker(store outboundStore, channels map[string]Channel) *Worker {
+	w := NewWorker(store, "worker-1", channels)
+	return w
+}
+
+// TestATickTakesOnlyWhatItCanRun is the rule the first design got wrong. A
+// claim for more than there are slots is a lease sitting in a local queue while
+// it expires - and an expired lease means somebody else redoes a call that may
+// already have gone out.
+func TestATickTakesOnlyWhatItCanRun(t *testing.T) {
+	store := newFakeStore()
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 100, ClaimableFresh: 100}}
+	store.available["slack"] = 100
+
+	channel := newFakeChannel()
+	channel.block = make(chan struct{})
+	w := testWorker(store, map[string]Channel{"slack": channel})
+
+	w.tick(context.Background())
+
+	if got := int(w.inflight.Load()); got != NotificationPoolSize {
+		t.Fatalf("the tick started %d attempts for a pool of %d", got, NotificationPoolSize)
+	}
+	claimed, _, _ := store.counts()
+	if claimed == 0 {
+		t.Fatal("nothing was claimed")
+	}
+	total := 0
+	store.mu.Lock()
+	for _, c := range store.claims {
+		total += c.Limit
+	}
+	store.mu.Unlock()
+	if total > NotificationPoolSize {
+		t.Fatalf("the tick asked for %d rows with %d slots", total, NotificationPoolSize)
+	}
+
+	// A second tick while they are all still running takes nothing at all.
+	before := len(store.claims)
+	w.tick(context.Background())
+	if len(store.claims) != before {
+		t.Fatalf("a full pool still went to the queue: %d claims", len(store.claims)-before)
+	}
+
+	// And the housekeeping ran on both ticks: it is mostly about work other
+	// instances abandoned, and a busy pool is no reason to stop looking.
+	if store.expiries != 2 || store.recovers != 2 {
+		t.Fatalf("housekeeping ran %d/%d times in two ticks", store.expiries, store.recovers)
+	}
+
+	close(channel.block)
+	w.running.Wait()
+}
+
+// TestWorkNobodyHereCanDoIsLeftAlone. What this instance was configured with is
+// not a property of the commitment: taking a Slack page on an instance with no
+// Slack channel would hold the lease until it expired and deliver nothing.
+func TestWorkNobodyHereCanDoIsLeftAlone(t *testing.T) {
+	store := newFakeStore()
+	store.due = []ProviderDue{
+		{Provider: "slack", ClaimableDue: 5, ClaimableFresh: 5},
+		{Provider: "telegram", ClaimableDue: 5, ClaimableFresh: 5},
+	}
+	store.available["telegram"] = 5
+
+	w := testWorker(store, map[string]Channel{"telegram": newFakeChannel()})
+	w.tick(context.Background())
+	w.running.Wait()
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, claim := range store.claims {
+		if claim.Provider != "telegram" {
+			t.Fatalf("claimed %s work on an instance that cannot send it", claim.Provider)
+		}
+	}
+	if len(store.claims) == 0 {
+		t.Fatal("the provider this instance does serve was not claimed either")
+	}
+}
+
+// TestAnAttemptIsMadeFromWhatTheStoreSaid: the address, the key and the
+// revision come back from BeginAttempt, and the handler is told those - not the
+// address it proposed a moment earlier.
+func TestAnAttemptIsMadeFromWhatTheStoreSaid(t *testing.T) {
+	store := newFakeStore()
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
+	store.available["slack"] = 1
+
+	channel := newFakeChannel()
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	w.tick(context.Background())
+	w.running.Wait()
+
+	calls := channel.made()
+	if len(calls) != 1 {
+		t.Fatalf("%d calls were made", len(calls))
+	}
+	call := calls[0]
+	if call.Endpoint != "C-bound" || call.ProviderKey != "create-key" {
+		t.Fatalf("the call went to %q under %q", call.Endpoint, call.ProviderKey)
+	}
+	if call.Revision != 3 {
+		t.Fatalf("the call carried revision %d", call.Revision)
+	}
+	if call.AttemptKind != AttemptCreate || call.Operation != OperationSend {
+		t.Fatalf("the call is a %s/%s", call.AttemptKind, call.Operation)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.begins) != 1 || store.begins[0].BoundEndpoint != "C-proposed" {
+		t.Fatalf("the store was asked with %+v", store.begins)
+	}
+	if len(store.finalized) != 1 {
+		t.Fatalf("%d results were recorded", len(store.finalized))
+	}
+	recorded := store.finalized[0]
+	if recorded.Completion.Outcome != OutcomeAccepted {
+		t.Fatalf("the result was recorded as %q", recorded.Completion.Outcome)
+	}
+	if recorded.Completion.AppliedRevision != nil {
+		t.Fatal("the worker told the store which revision the attempt applied")
+	}
+	if len(recorded.Receipt) == 0 {
+		t.Fatal("the coordinates the provider returned were not recorded")
+	}
+}
+
+// TestARefusedPreparationNeverReachesTheProvider. The refusal is recorded - it
+// is the proof that no call happened - and the provider is not touched.
+func TestARefusedPreparationNeverReachesTheProvider(t *testing.T) {
+	store := newFakeStore()
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
+	store.available["slack"] = 1
+
+	channel := newFakeChannel()
+	channel.preparation = Impossible("identity_not_linked", "nobody has linked this user")
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	w.tick(context.Background())
+	w.running.Wait()
+
+	if calls := channel.made(); len(calls) != 0 {
+		t.Fatalf("%d calls were made after a preparation that refused", len(calls))
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.begins) != 1 {
+		t.Fatalf("%d attempts were opened", len(store.begins))
+	}
+	asked := store.begins[0]
+	if asked.Preparation != PreparationPermanent || asked.ErrorClass != "identity_not_linked" {
+		t.Fatalf("the refusal was reported as %+v", asked)
+	}
+	if len(store.finalized) != 0 {
+		t.Fatal("a call that never happened was finalised")
+	}
+}
+
+// TestAStoppingWorkerStillRecordsWhatHappened is the whole reason the recording
+// runs on its own context. A shutdown that cancelled it would throw away a
+// result the provider had already accepted - and the retry that follows is the
+// duplicate page this domain exists to avoid.
+func TestAStoppingWorkerStillRecordsWhatHappened(t *testing.T) {
+	store := newFakeStore()
+	channel := newFakeChannel()
+	channel.block = make(chan struct{})
+
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	ctx, stop := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.serve(ctx, Leased{
+			Intent:     Intent{ID: "intent-1", Provider: "slack", Status: StatusPending},
+			LeaseToken: "token-1",
+		})
+	}()
+
+	// The worker is told to stop while the call is in flight.
+	for {
+		if len(channel.made()) > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stop()
+	close(channel.block)
+	<-done
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.finalized) != 1 {
+		t.Fatal("the result of a call made before the shutdown was thrown away")
+	}
+	if store.finalized[0].Completion.Outcome != OutcomeAccepted {
+		t.Fatalf("it was recorded as %q", store.finalized[0].Completion.Outcome)
+	}
+}
+
+// TestAnUndershotClaimIsOfferedToSomebodyElse. The aggregate is a moment old by
+// the time the claim runs, and another instance may have taken the rows in
+// between. The slots it could not fill go back into the pool rather than idling
+// until the next tick.
+func TestAnUndershotClaimIsOfferedToSomebodyElse(t *testing.T) {
+	store := newFakeStore()
+	store.due = []ProviderDue{
+		{Provider: "slack", ClaimableDue: 50, ClaimableFresh: 50},
+		{Provider: "telegram", ClaimableDue: 50, ClaimableFresh: 50},
+	}
+	// Slack's backlog is gone by the time the claim arrives; Telegram's is real.
+	store.available["slack"] = 0
+	store.available["telegram"] = 50
+
+	channel := newFakeChannel()
+	channel.block = make(chan struct{})
+	w := testWorker(store, map[string]Channel{"slack": channel, "telegram": channel})
+	w.tick(context.Background())
+
+	// An equal split would have run four. The redistribution is what fills the
+	// rest; the last slot may still be spent asking the empty provider, and a
+	// pass that comes back with nothing is where the loop is meant to stop.
+	if got := int(w.inflight.Load()); got < NotificationPoolSize-1 {
+		t.Fatalf("the tick ran %d attempts of a pool of %d while one provider had "+
+			"nothing and the other had plenty", got, NotificationPoolSize)
+	}
+	for _, claim := range store.claims {
+		if claim.Provider == "telegram" {
+			continue
+		}
+		if claim.Limit > NotificationPoolSize/2 {
+			t.Fatalf("the empty provider was offered %d slots", claim.Limit)
+		}
+	}
+
+	close(channel.block)
+	w.running.Wait()
+}
+
+// TestAQueueThatCannotGiveAnythingEndsTheTick: when nothing can be claimed at
+// all, the pass stops instead of asking again forever.
+func TestAQueueThatCannotGiveAnythingEndsTheTick(t *testing.T) {
+	store := newFakeStore()
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 50, ClaimableFresh: 50}}
+	store.available["slack"] = 0
+
+	w := testWorker(store, map[string]Channel{"slack": newFakeChannel()})
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		w.tick(context.Background())
+	}()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the tick kept asking a queue that had nothing to give")
+	}
+	if got := int(w.inflight.Load()); got != 0 {
+		t.Fatalf("%d attempts started from an empty queue", got)
+	}
+}
+
+// TestAWorkerStopsWhenItIsTold. Nothing in flight, so the only thing being
+// proved is that stopping is not a wait for the shutdown deadline.
+func TestAWorkerStopsWhenItIsTold(t *testing.T) {
+	w := testWorker(newFakeStore(), map[string]Channel{"slack": newFakeChannel()})
+
+	ctx, stop := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		w.Run(ctx)
+	}()
+
+	stop()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a worker with nothing in flight waited to be told twice")
+	}
+}

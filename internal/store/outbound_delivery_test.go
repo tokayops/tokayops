@@ -48,8 +48,10 @@ func admitOne(t *testing.T, s *Store, agID string,
 func claimOne(t *testing.T, s *Store, intentID string) string {
 	t.Helper()
 
-	leased, err := s.ClaimDueIntents(context.Background(), testFamily, "slack",
-		outbound.ClaimAny, 10, outbound.NotificationLease)
+	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimAny,
+		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -251,8 +253,10 @@ func TestClaimMintsAFreshTokenAndSkipsHeldWork(t *testing.T) {
 	first := claimOne(t, s, intentID)
 
 	// Still held: a second claim finds nothing.
-	leased, err := s.ClaimDueIntents(context.Background(), testFamily, "slack",
-		outbound.ClaimAny, 10, outbound.NotificationLease)
+	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimAny,
+		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -286,8 +290,10 @@ func TestClaimSplitsWorkBetweenWorkers(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			claims[i], errs[i] = s.ClaimDueIntents(context.Background(), testFamily, "slack",
-				outbound.ClaimAny, 4, outbound.NotificationLease)
+			claims[i], errs[i] = s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+				Family: testFamily, Provider: "slack", Phase: outbound.ClaimAny,
+				Limit: 4, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+			})
 		}(i)
 	}
 	close(start)
@@ -325,8 +331,10 @@ func TestClaimPrefersFirstAttempts(t *testing.T) {
 		t.Fatalf("age the retry: %v", err)
 	}
 
-	leased, err := s.ClaimDueIntents(context.Background(), testFamily, "slack",
-		outbound.ClaimFirstAttempts, 10, outbound.NotificationLease)
+	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimFirstAttempts,
+		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}

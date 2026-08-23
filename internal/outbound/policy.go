@@ -16,6 +16,11 @@ import (
 // person; what a policy gets to say is how often it may knock, which is the
 // difference between a promise and a counter that gives up at eight.
 
+// FamilyNotification is the execution partition paging runs in. Claims are
+// taken per family so a backlog of one kind of delivery cannot delay another,
+// and it is the only family with a worker in this build.
+const FamilyNotification = "notification"
+
 const (
 	// NotificationLease is how long a claim holds a commitment. Comfortably
 	// longer than one attempt so a worker that is merely slow does not have its
@@ -48,6 +53,18 @@ const (
 	// waited longer than the lease it is protecting would be applying a
 	// decision that has already been reassigned.
 	NotificationLockTimeout = 3 * time.Second
+
+	// NotificationPrepareDeadline bounds resolving an address, credentials and
+	// configuration. That is local work measured in milliseconds; the deadline
+	// is here so a dependency that hangs costs one slot for five seconds
+	// rather than for the length of a lease.
+	NotificationPrepareDeadline = 5 * time.Second
+
+	// NotificationRecordDeadline bounds the two database calls that open and
+	// close an attempt. Longer than the lock timeout above, so a contended row
+	// is refused by the rule that knows why rather than by a cancelled
+	// context, and far shorter than the lease.
+	NotificationRecordDeadline = 10 * time.Second
 )
 
 const (

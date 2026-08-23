@@ -113,6 +113,21 @@ const (
 	ClaimAny ClaimPhase = "any"
 )
 
+// ClaimRequest is one instance asking for work: which partition, which
+// provider, which half of its queue, and how much of it.
+//
+// WorkerID is audit only - who took the row, for a human reading the journal.
+// What actually proves ownership is the token the claim mints, and nothing
+// anywhere compares names.
+type ClaimRequest struct {
+	Family   string
+	Provider string
+	Phase    ClaimPhase
+	Limit    int
+	Lease    time.Duration
+	WorkerID string
+}
+
 // Leased is a commitment this worker now holds, with the token that proves it.
 type Leased struct {
 	Intent      Intent
