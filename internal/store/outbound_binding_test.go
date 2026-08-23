@@ -99,7 +99,6 @@ func TestTheGenerationBindsTheEffectOnce(t *testing.T) {
 	second, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 		IntentID: intentID, LeaseToken: retryToken, WorkerID: "worker-2",
 		Preparation: outbound.PreparationReady, BoundEndpoint: "C9999",
-		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
 	})
 	if err != nil {
 		t.Fatalf("begin the retry: %v", err)
@@ -160,7 +159,6 @@ func TestANewGenerationBindsAgain(t *testing.T) {
 	second, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 		IntentID: intentID, LeaseToken: token, WorkerID: "worker-2",
 		Preparation: outbound.PreparationReady, BoundEndpoint: "C7777",
-		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
 	})
 	if err != nil {
 		t.Fatalf("begin the new generation: %v", err)
@@ -191,7 +189,6 @@ func TestARefusedPreparationDoesNotConsumeTheBinding(t *testing.T) {
 	refused, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 		Preparation: outbound.PreparationTransient, ErrorClass: "rate_limited",
-		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
 	})
 	if err != nil {
 		t.Fatalf("record the refusal: %v", err)
@@ -287,7 +284,6 @@ func TestStateThatNoLongerMatchesItsKeyIsRefused(t *testing.T) {
 			_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 				IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 				Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
-				AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
 			})
 			if !errors.Is(err, ErrOutboundContract) {
 				t.Fatalf("the send went ahead on state that does not match its key: %v", err)
@@ -305,7 +301,7 @@ func TestStateThatNoLongerMatchesItsKeyIsRefused(t *testing.T) {
 func TestFinalizeBelievesTheAttemptRatherThanTheWorker(t *testing.T) {
 	s := setupTestDB(t)
 
-	t.Run("a revision the attempt never applied", func(t *testing.T) {
+	t.Run("a result that names the revision it applied", func(t *testing.T) {
 		agID := outboundGroup(t, s)
 		intentID := admitOne(t, s, agID)[0]
 		token := claimOne(t, s, intentID)
@@ -319,7 +315,7 @@ func TestFinalizeBelievesTheAttemptRatherThanTheWorker(t *testing.T) {
 			AttemptID: begun.AttemptID, LeaseToken: token, Completion: completion,
 		})
 		if !errors.Is(err, ErrOutboundContract) {
-			t.Fatalf("a card was marked as showing revision 7: %v", err)
+			t.Fatalf("a worker got to say which revision its message carried: %v", err)
 		}
 		if got := statusOf(t, s, intentID); got != outbound.StatusSending {
 			t.Fatalf("the refused result still moved the commitment to %s", got)
@@ -332,6 +328,33 @@ func TestFinalizeBelievesTheAttemptRatherThanTheWorker(t *testing.T) {
 		}
 		if applied.Valid {
 			t.Fatalf("the commitment now claims to show revision %d", applied.Int64)
+		}
+	})
+
+	t.Run("a result that says nothing about the revision", func(t *testing.T) {
+		// The other half of the same rule: the store fills the revision in
+		// from the attempt, so the commitment ends up recording what was
+		// actually rendered rather than nothing at all.
+		agID := outboundGroup(t, s)
+		intentID := admitOne(t, s, agID, dmCommitment("U0001"))[0]
+		token := claimOne(t, s, intentID)
+		begun := beginOne(t, s, intentID, token)
+
+		if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+			AttemptID: begun.AttemptID, LeaseToken: token, Completion: acceptedCompletion(),
+			Receipt: json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
+		}); err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+		var applied sql.NullInt64
+		if err := s.db.QueryRow(
+			`SELECT applied_revision FROM outbound_intents WHERE id = $1`, intentID).
+			Scan(&applied); err != nil {
+			t.Fatalf("read the applied revision: %v", err)
+		}
+		if !applied.Valid || applied.Int64 != begun.AppliedRevision {
+			t.Fatalf("the commitment records revision %v, the attempt carried %d",
+				applied, begun.AppliedRevision)
 		}
 	})
 
@@ -439,7 +462,6 @@ func TestTheJournalAnswersWhatHappened(t *testing.T) {
 	if _, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 		Preparation: outbound.PreparationTransient, ErrorClass: "rate_limited",
-		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
 	}); err != nil {
 		t.Fatalf("record the refusal: %v", err)
 	}
@@ -546,4 +568,212 @@ func hasTimeline(t *testing.T, s *Store, agID, fragment string) bool {
 		t.Fatalf("read the history: %v", err)
 	}
 	return n > 0
+}
+
+// TestTheCallIsDecidedByTheRecord. What a call IS - create or change, which
+// operation, which revision - is not something a worker gets to state. All
+// three come from what the commitment already has, and the worker is told what
+// to do rather than asked.
+func TestTheCallIsDecidedByTheRecord(t *testing.T) {
+	s := setupTestDB(t)
+
+	t.Run("nothing sent yet means a create", func(t *testing.T) {
+		agID := outboundGroup(t, s)
+		intentID := admitOne(t, s, agID)[0]
+		token := claimOne(t, s, intentID)
+		begun := beginOne(t, s, intentID, token)
+
+		if begun.AttemptKind != outbound.AttemptCreate ||
+			begun.Operation != outbound.OperationSend {
+			t.Fatalf("the worker was told to make a %s/%s", begun.AttemptKind, begun.Operation)
+		}
+
+		var (
+			kind      string
+			operation string
+			revision  int64
+		)
+		if err := s.db.QueryRow(`
+			SELECT attempt_kind, operation, applied_revision
+			FROM outbound_attempts WHERE id = $1`, begun.AttemptID).
+			Scan(&kind, &operation, &revision); err != nil {
+			t.Fatalf("read the attempt: %v", err)
+		}
+		if kind != string(outbound.AttemptCreate) || operation != string(outbound.OperationSend) {
+			t.Fatalf("the journal records a %s/%s", kind, operation)
+		}
+
+		// The revision is the one in the state that was rendered, which is
+		// also the one the key was computed over. Nothing else can name it.
+		if revision != begun.AppliedRevision {
+			t.Fatalf("the attempt carries revision %d and reports %d",
+				revision, begun.AppliedRevision)
+		}
+		var stored int64
+		if err := s.db.QueryRow(
+			`SELECT revision FROM outbound_group_snapshots WHERE alert_group_id = $1`, agID).
+			Scan(&stored); err != nil {
+			t.Fatalf("read the state: %v", err)
+		}
+		if revision != stored {
+			t.Fatalf("the attempt applies revision %d against state at %d", revision, stored)
+		}
+	})
+
+	t.Run("a refusal is recorded under the same shape", func(t *testing.T) {
+		agID := outboundGroup(t, s)
+		intentID := admitOne(t, s, agID)[0]
+		token := claimOne(t, s, intentID)
+
+		if _, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+			Preparation: outbound.PreparationTransient, ErrorClass: "rate_limited",
+		}); err != nil {
+			t.Fatalf("record the refusal: %v", err)
+		}
+
+		var kind, operation string
+		if err := s.db.QueryRow(`
+			SELECT attempt_kind, operation FROM outbound_attempts WHERE intent_id = $1`,
+			intentID).Scan(&kind, &operation); err != nil {
+			t.Fatalf("read the refusal: %v", err)
+		}
+		// It says which call did not happen - and it has to, because the
+		// operator's guards read this column later.
+		if kind != string(outbound.AttemptCreate) || operation != string(outbound.OperationSend) {
+			t.Fatalf("the refusal was recorded as a %s/%s", kind, operation)
+		}
+	})
+
+	t.Run("an object that already exists is not created again", func(t *testing.T) {
+		agID := outboundGroup(t, s)
+		intentID := admitOne(t, s, agID)[0]
+		token := claimOne(t, s, intentID)
+
+		// A card that has already been posted. Changing one is a call this
+		// build does not make, and the refusal has to be loud rather than a
+		// second create at the same address.
+		if _, err := s.db.Exec(
+			`UPDATE outbound_intents SET receipt = $2::jsonb WHERE id = $1`,
+			intentID, `{"channel":"C0001","ts":"1700000000.000100"}`); err != nil {
+			t.Fatalf("give the commitment an object: %v", err)
+		}
+
+		_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+			Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
+		})
+		if !errors.Is(err, ErrOutboundContract) {
+			t.Fatalf("a second object was created for the same commitment: %v", err)
+		}
+		if got := countAttempts(t, s, intentID); got != 0 {
+			t.Fatalf("the refusal left %d attempts behind", got)
+		}
+	})
+}
+
+// TestALateResultIsKeptAsTheAttemptHadIt. A worker that comes back after
+// recovery gave up on it may be carrying the only evidence that a message
+// exists. What is kept is that evidence, completed from the attempt's own
+// record - and it has to be complete, because there is nothing else left to
+// reconstruct it from.
+func TestALateResultIsKeptAsTheAttemptHadIt(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+	intentID := admitOne(t, s, agID)[0]
+
+	token := claimOne(t, s, intentID)
+	begun := beginOne(t, s, intentID, token)
+	expireLease(t, s, intentID)
+	if _, err := s.RecoverStaleAttempts(context.Background(), testFamily, 10); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	late := outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token,
+		Completion: acceptedCompletion(),
+		Receipt:    json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
+		Summary:    "ok",
+	}
+	result, err := s.FinalizeDeliveryAttempt(context.Background(), late)
+	if err != nil {
+		t.Fatalf("finalize late: %v", err)
+	}
+	if result.Outcome != outbound.FinalizeLeaseLost || !result.ObservationRecorded {
+		t.Fatalf("the late result was answered %q, recorded=%v",
+			result.Outcome, result.ObservationRecorded)
+	}
+
+	// The same result again is the same fact, not a second one.
+	repeat, err := s.FinalizeDeliveryAttempt(context.Background(), late)
+	if err != nil {
+		t.Fatalf("repeat the late result: %v", err)
+	}
+	if !repeat.ObservationRecorded {
+		t.Fatal("a repeated late result stopped being kept")
+	}
+
+	journal, err := s.IntentJournal(context.Background(), intentID)
+	if err != nil {
+		t.Fatalf("read the journal: %v", err)
+	}
+	if len(journal.Observations) != 1 {
+		t.Fatalf("the same late result was kept %d times", len(journal.Observations))
+	}
+
+	kept := journal.Observations[0]
+	attempt := journal.Attempts[0]
+	if kept.AttemptID != begun.AttemptID || kept.Outcome != outbound.OutcomeAccepted {
+		t.Fatalf("the late result is %+v", kept)
+	}
+	// The revision is the attempt's, not something the worker supplied: it
+	// supplied none, and a message with no revision cannot be reconciled with
+	// the card it belongs to.
+	if kept.AppliedRevision == nil || *kept.AppliedRevision != *attempt.AppliedRevision {
+		t.Fatalf("the late result carries revision %v, the attempt applied %v",
+			kept.AppliedRevision, attempt.AppliedRevision)
+	}
+	if kept.CompletionFingerprintVersion != attempt.CompletionFingerprintVersion {
+		t.Fatalf("the late result was encoded under protocol %d, the attempt under %d",
+			kept.CompletionFingerprintVersion, attempt.CompletionFingerprintVersion)
+	}
+	if len(kept.Receipt) == 0 || kept.Summary != "ok" {
+		t.Fatalf("the late result lost what proves the message exists: %+v", kept)
+	}
+	if kept.ObservedAt.IsZero() {
+		t.Fatal("the late result does not say when it arrived")
+	}
+}
+
+// TestAWithdrawalDoesNotNeedTheState. Cancelling claims nothing and sends
+// nothing. State that cannot be read has to stop a send - it must never trap a
+// commitment whose one remaining option is to be called off.
+func TestAWithdrawalDoesNotNeedTheState(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+	intentID := stuckInReview(t, s, agID)
+
+	if _, err := s.db.Exec(`
+		UPDATE outbound_group_snapshots
+		SET snapshot = jsonb_set(snapshot, '{title}', '"a different alert"')
+		WHERE alert_group_id = $1`, agID); err != nil {
+		t.Fatalf("corrupt the state: %v", err)
+	}
+
+	// Assuming it arrived is a claim about a message that state composed, so
+	// it stops here.
+	if _, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
+		IntentID: intentID, Decision: outbound.DecisionAssumeAccepted,
+		Actor: "nina", Reason: "the recipient said so",
+	}); !errors.Is(err, ErrOutboundContract) {
+		t.Fatalf("a delivery was assumed against state nobody can read: %v", err)
+	}
+
+	result := resolve(t, s, outbound.ResolveAmbiguityRequest{
+		IntentID: intentID, Decision: outbound.DecisionCancel,
+		Reason: "the incident was handled another way",
+	})
+	if result.Outcome != outbound.ResolveResolved || result.Status != outbound.StatusCanceled {
+		t.Fatalf("withdrawing answered %q into %s", result.Outcome, result.Status)
+	}
 }

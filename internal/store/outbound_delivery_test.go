@@ -71,8 +71,6 @@ func beginOne(t *testing.T, s *Store, intentID, token string) outbound.BeginAtte
 		WorkerID:      "worker-1",
 		Preparation:   outbound.PreparationReady,
 		BoundEndpoint: "C0001",
-		AttemptKind:   outbound.AttemptCreate,
-		Operation:     outbound.OperationSend,
 	})
 	if err != nil {
 		t.Fatalf("begin an attempt: %v", err)
@@ -91,12 +89,12 @@ func expireLease(t *testing.T, s *Store, intentID string) {
 	}
 }
 
+// acceptedCompletion is what a worker is allowed to say: the provider took it,
+// and here is what it called the message. Which revision that message carried
+// is not the worker's to state - the store fills it in from the attempt.
 func acceptedCompletion() keys.Completion {
 	receipt := "C0001/1700000000.000100"
-	revision := int64(0)
-	return keys.Completion{
-		Outcome: keys.OutcomeAccepted, ReceiptRef: &receipt, AppliedRevision: &revision,
-	}
+	return keys.Completion{Outcome: keys.OutcomeAccepted, ReceiptRef: &receipt}
 }
 
 func statusOf(t *testing.T, s *Store, intentID string) outbound.Status {
@@ -424,8 +422,7 @@ func TestBeginRefusesWhatItCannotAuthorise(t *testing.T) {
 
 		result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 			IntentID: intentID, LeaseToken: "a token from a previous life",
-			Preparation: outbound.PreparationReady, AttemptKind: outbound.AttemptCreate,
-			Operation: outbound.OperationSend,
+			Preparation: outbound.PreparationReady,
 		})
 		if err != nil {
 			t.Fatalf("begin: %v", err)
@@ -468,8 +465,7 @@ func TestBeginRefusesWhatItCannotAuthorise(t *testing.T) {
 
 		result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 			IntentID: intentID, LeaseToken: token,
-			Preparation: outbound.PreparationReady, AttemptKind: outbound.AttemptCreate,
-			Operation: outbound.OperationSend,
+			Preparation: outbound.PreparationReady,
 		})
 		if err != nil {
 			t.Fatalf("begin: %v", err)
@@ -517,8 +513,7 @@ func TestPreparationRefusalsLeaveProofRatherThanDoubt(t *testing.T) {
 
 			result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 				IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
-				Preparation: tc.preparation, AttemptKind: outbound.AttemptCreate,
-				Operation: outbound.OperationSend, ErrorClass: "identity_not_linked",
+				Preparation: tc.preparation, ErrorClass: "identity_not_linked",
 			})
 			if err != nil {
 				t.Fatalf("begin: %v", err)

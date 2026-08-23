@@ -191,8 +191,12 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	// it arrived" is a statement about a message that was already composed, and
 	// recording today's revision instead would claim a card shows something it
 	// never showed.
+	//
+	// Only the decisions that need the state read it. A withdrawal claims
+	// nothing and sends nothing, and state nobody can read must not be able to
+	// trap a commitment whose one remaining option is to be called off.
 	final := false
-	if intent.GroupBound() {
+	if intent.GroupBound() && decisionNeedsState(req.Decision, intent.Form) {
 		stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
 		if err != nil {
 			return outbound.ResolveAmbiguityResult{}, err
@@ -258,6 +262,26 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	return outbound.ResolveAmbiguityResult{
 		Outcome: outbound.ResolveResolved, Status: transition.To, Row: transition.Row,
 	}, nil
+}
+
+// decisionNeedsState says whether a decision has to look at the state the
+// commitment renders from.
+func decisionNeedsState(decision outbound.Decision, form outbound.Form) bool {
+	switch decision {
+	case outbound.DecisionAssumeAccepted:
+		// It claims a message arrived. Which revision that message carried,
+		// and whether it was the last one, are facts of the state - not of the
+		// person deciding.
+		return true
+	case outbound.DecisionRetryCurrentGeneration:
+		// A card that is going to be sent again has to be aimed at where the
+		// alert is now. A one-shot has nothing to re-aim.
+		return form == outbound.FormEditable
+	default:
+		// cancel sends nothing; retry_new_generation reads the state when the
+		// attempt it leads to is opened, not now.
+		return false
+	}
 }
 
 // decisionIsStale asks whether the alert this commitment belongs to has moved

@@ -449,12 +449,16 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{Outcome: outbound.BeginLeaseLost}, nil
 	}
 
-	if req.Preparation != outbound.PreparationReady {
-		return s.recordPreparation(ctx, tx, req, *intent)
+	// What the call has to be, decided before anything is written and from the
+	// commitment alone. A refusal is recorded under the same shape: the journal
+	// says which call did not happen.
+	plan, err := planAttempt(*intent)
+	if err != nil {
+		return outbound.BeginAttemptResult{}, err
 	}
 
-	if err := validateAttemptShape(req); err != nil {
-		return outbound.BeginAttemptResult{}, err
+	if req.Preparation != outbound.PreparationReady {
+		return s.recordPreparation(ctx, tx, req, *intent, plan)
 	}
 
 	stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
@@ -474,7 +478,8 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{}, err
 	}
 
-	effect, err := bindGenerationTx(ctx, tx, *intent, req, transition.Effects.OpenGeneration)
+	effect, err := bindGenerationTx(ctx, tx, *intent, req.BoundEndpoint,
+		transition.Effects.OpenGeneration)
 	if err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
@@ -509,8 +514,8 @@ func (s *Store) BeginAttempt(ctx context.Context,
 			request_fingerprint, lease_token, worker_id, started_at,
 			completion_fingerprint_version)
 		VALUES ($1, $2, $3, 'attempt', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), $14)`,
-		attemptID, req.IntentID, attemptNo, intent.GenerationNo, string(req.AttemptKind),
-		string(req.Operation), stored.Revision, intent.Provider, effect.Endpoint,
+		attemptID, req.IntentID, attemptNo, intent.GenerationNo, string(plan.Kind),
+		string(plan.Operation), stored.Revision, intent.Provider, effect.Endpoint,
 		effect.ProviderKey, stored.Snapshot.Digest(), req.LeaseToken,
 		nilIfEmpty(req.WorkerID), fingerprintVersion,
 	); err != nil {
@@ -543,6 +548,8 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		AttemptID:                    attemptID,
 		AttemptNo:                    attemptNo,
 		GenerationNo:                 intent.GenerationNo,
+		AttemptKind:                  plan.Kind,
+		Operation:                    plan.Operation,
 		BoundEndpoint:                effect.Endpoint,
 		ProviderKey:                  effect.ProviderKey,
 		AppliedRevision:              stored.Revision,
@@ -573,6 +580,39 @@ func beginEffectsUnderstood(e outbound.Effects) error {
 	return nil
 }
 
+// plannedAttempt is what a call has to be. Every field of it is derived from
+// the commitment's own state, which is what makes the identity of the effect
+// something the system decides rather than something a worker reports.
+type plannedAttempt struct {
+	Kind      outbound.AttemptKind
+	Operation outbound.Operation
+}
+
+// planAttempt decides the shape of the next call.
+//
+// The rule is the receipt. Nothing out there yet means a create; an object that
+// already exists is changed, never created a second time. The revision is not
+// here at all - it comes from the state the attempt renders, read under the
+// same lock, so the content and the key that names it cannot disagree.
+//
+// Changing an existing object is refused for now, and deliberately so: nothing
+// in this build brings a commitment that already has a receipt back into the
+// queue, so the branch would be code no test could reach. What Sprint 2 adds
+// here is the choice between an update and a resolve, which is a question
+// about the stored state (is this the last revision?) and not about the
+// worker.
+func planAttempt(intent outbound.Intent) (plannedAttempt, error) {
+	if intent.HasReceipt {
+		return plannedAttempt{}, outboundContractf(
+			"commitment %s already has an external object, and this build only creates them",
+			intent.ID)
+	}
+	return plannedAttempt{
+		Kind:      outbound.AttemptCreate,
+		Operation: outbound.OperationSend,
+	}, nil
+}
+
 // boundEffect is the external identity one attempt will use: where it goes and
 // under what key the provider may deduplicate it.
 type boundEffect struct {
@@ -591,19 +631,12 @@ type boundEffect struct {
 // got it. So the worker's freshly resolved address is a proposal, and a bound
 // generation ignores it.
 func bindGenerationTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
-	req outbound.BeginAttemptRequest, opening bool) (boundEffect, error) {
-
-	var storedEndpoint, storedKey sql.NullString
-	if err := tx.QueryRowContext(ctx,
-		`SELECT bound_endpoint, create_key FROM outbound_intents WHERE id = $1`,
-		req.IntentID).Scan(&storedEndpoint, &storedKey); err != nil {
-		return boundEffect{}, err
-	}
+	proposed string, opening bool) (boundEffect, error) {
 
 	if opening {
-		if req.BoundEndpoint == "" {
+		if proposed == "" {
 			return boundEffect{}, outboundContractf(
-				"opening an effect for %s with no address to send to", req.IntentID)
+				"opening an effect for %s with no address to send to", intent.ID)
 		}
 		key, err := keys.CreateKey(intent.ID, intent.GenerationNo, intent.ProviderKeyCodecVersion)
 		if err != nil {
@@ -611,59 +644,23 @@ func bindGenerationTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
 		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE outbound_intents SET bound_endpoint = $2, create_key = $3
-			WHERE id = $1`, req.IntentID, req.BoundEndpoint, key); err != nil {
-			return boundEffect{}, fmt.Errorf("bind the effect of %s: %w", req.IntentID, err)
+			WHERE id = $1`, intent.ID, proposed, key); err != nil {
+			return boundEffect{}, fmt.Errorf("bind the effect of %s: %w", intent.ID, err)
 		}
-		return boundEffect{Endpoint: req.BoundEndpoint, ProviderKey: key}, nil
+		return boundEffect{Endpoint: proposed, ProviderKey: key}, nil
 	}
 
-	if !storedEndpoint.Valid || storedEndpoint.String == "" {
+	var storedEndpoint, storedKey sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT bound_endpoint, create_key FROM outbound_intents WHERE id = $1`,
+		intent.ID).Scan(&storedEndpoint, &storedKey); err != nil {
+		return boundEffect{}, err
+	}
+	if !storedEndpoint.Valid || storedEndpoint.String == "" || !storedKey.Valid {
 		return boundEffect{}, outboundContractf(
-			"commitment %s has a bound effect with no address", req.IntentID)
+			"commitment %s has a bound effect with no address or no key", intent.ID)
 	}
-
-	switch req.AttemptKind {
-	case outbound.AttemptCreate:
-		if !storedKey.Valid {
-			return boundEffect{}, outboundContractf(
-				"commitment %s has a bound effect with no key", req.IntentID)
-		}
-		return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: storedKey.String}, nil
-
-	case outbound.AttemptMutation:
-		// A change to an existing object is keyed by the revision it applies,
-		// not by the generation: revisions are monotonic across the whole
-		// commitment, so applying one twice is the same key twice and the
-		// provider can refuse it.
-		key, err := keys.MutationKey(intent.ID, req.Operation, req.Revision,
-			intent.ProviderKeyCodecVersion)
-		if err != nil {
-			return boundEffect{}, err
-		}
-		return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: key}, nil
-
-	default:
-		return boundEffect{}, outboundContractf("attempt kind %q", req.AttemptKind)
-	}
-}
-
-// validateAttemptShape refuses a request the journal could not describe.
-func validateAttemptShape(req outbound.BeginAttemptRequest) error {
-	switch req.AttemptKind {
-	case outbound.AttemptCreate, outbound.AttemptMutation:
-	default:
-		return outboundContractf("attempt kind %q is not one this build makes", req.AttemptKind)
-	}
-	switch req.Operation {
-	case outbound.OperationSend, outbound.OperationUpdate, outbound.OperationResolve,
-		outbound.OperationDeliver:
-	default:
-		return outboundContractf("operation %q is not one this build performs", req.Operation)
-	}
-	if req.Revision < 0 {
-		return outboundContractf("revision %d is negative", req.Revision)
-	}
-	return nil
+	return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: storedKey.String}, nil
 }
 
 // recordPreparation writes the proof that no call was made.
@@ -672,7 +669,8 @@ func validateAttemptShape(req outbound.BeginAttemptRequest) error {
 // network might have been reached, and inventing that doubt would turn a
 // provable refusal into a possible duplicate.
 func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
-	req outbound.BeginAttemptRequest, intent outbound.Intent) (outbound.BeginAttemptResult, error) {
+	req outbound.BeginAttemptRequest, intent outbound.Intent,
+	plan plannedAttempt) (outbound.BeginAttemptResult, error) {
 
 	transition, err := outbound.Decide(outbound.Input{
 		Intent:      intent,
@@ -700,8 +698,8 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 			operation, provider, worker_id, finished_at, outcome, error_class,
 			response_summary, finish_reason)
 		VALUES ($1, $2, $3, 'preparation', $4, $5, $6, $7, $8, now(), $9, $10, $11, 'preparation')`,
-		recordID, req.IntentID, attemptNo, intent.GenerationNo, string(req.AttemptKind),
-		string(req.Operation), intent.Provider, nilIfEmpty(req.WorkerID),
+		recordID, req.IntentID, attemptNo, intent.GenerationNo, string(plan.Kind),
+		string(plan.Operation), intent.Provider, nilIfEmpty(req.WorkerID),
 		outcome, nilIfEmpty(req.ErrorClass), nilIfEmpty(req.Summary),
 	); err != nil {
 		return outbound.BeginAttemptResult{}, fmt.Errorf("record the refusal: %w", err)
@@ -746,6 +744,17 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 // stored on the attempt, which nothing rewrites.
 func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	req outbound.FinalizeRequest) (outbound.FinalizeResult, error) {
+
+	// A result says what the provider answered, never which revision it was
+	// answering about. That is the attempt's own record, and a caller allowed
+	// to restate it could file a real reply against a revision the message
+	// never carried - including one that arrives long after recovery closed
+	// the attempt, where nothing is left to contradict it.
+	if req.Completion.AppliedRevision != nil {
+		return outbound.FinalizeResult{}, outboundContractf(
+			"a result for attempt %s names the revision it applied; only the attempt does that",
+			req.AttemptID)
+	}
 
 	// Read before the transaction: both are immutable, and the lock order
 	// depends on them.
@@ -825,11 +834,21 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		return outbound.FinalizeResult{Outcome: outbound.FinalizeLeaseLost}, nil
 	}
 
+	// The result is completed from the attempt's own row before anything is
+	// computed from it: the revision it applied is a fact of the record, and
+	// putting it in here is what makes the fingerprint, the observation and the
+	// commitment's own state describe the same thing.
+	completion := req.Completion
+	if attemptRevision.Valid {
+		applied := attemptRevision.Int64
+		completion.AppliedRevision = &applied
+	}
+
 	// Only now the fingerprint, and under the protocol the ATTEMPT was opened
 	// with rather than today's. An attempt can outlive a deployment, and a
 	// repeat compared across two protocols would read as a conflict - the one
 	// answer that turns a lost commit reply into an incident.
-	fingerprint, err := req.Completion.Fingerprint(attemptVersion)
+	fingerprint, err := completion.Fingerprint(attemptVersion)
 	if err != nil {
 		return outbound.FinalizeResult{}, err
 	}
@@ -852,7 +871,14 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 			// A genuine late result from the worker that owned this attempt.
 			// It may be the only evidence that the effect happened, so it is
 			// kept - durably, not as a log line.
-			recorded, err := recordObservationTx(ctx, tx, req, fingerprint, attemptVersion)
+			recorded, err := recordObservationTx(ctx, tx, observation{
+				AttemptID:   req.AttemptID,
+				Completion:  completion,
+				Receipt:     req.Receipt,
+				Summary:     req.Summary,
+				Fingerprint: fingerprint,
+				Version:     attemptVersion,
+			})
 			if err != nil {
 				return outbound.FinalizeResult{}, err
 			}
@@ -875,16 +901,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 			"attempt %s is open but its commitment points elsewhere", req.AttemptID)
 	}
 
-	// What the attempt applied is what the ATTEMPT says it applied. A worker
-	// that could name the revision could mark a card as showing something it
-	// never showed; one that could declare an attempt final could retire a card
-	// the alert is still using.
 	applied := attemptRevision.Int64
-	if req.Completion.AppliedRevision != nil && *req.Completion.AppliedRevision != applied {
-		return outbound.FinalizeResult{}, outboundContractf(
-			"attempt %s applied revision %d, its result claims %d",
-			req.AttemptID, applied, *req.Completion.AppliedRevision)
-	}
 
 	// Whether that revision was the LAST one is a property of the stored state
 	// too. Only a success needs the answer: the one doubtful outcome that
@@ -903,7 +920,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	transition, err := outbound.Decide(outbound.Input{
 		Intent:          *intent,
 		Trigger:         outbound.TriggerFinishAttempt,
-		Outcome:         req.Completion.Outcome,
+		Outcome:         completion.Outcome,
 		AttemptRevision: applied,
 		AttemptIsFinal:  final,
 	})
@@ -917,8 +934,8 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		    receipt = $5, response_summary = $6, finish_reason = 'worker',
 		    completion_fingerprint = $7
 		WHERE id = $1 AND finished_at IS NULL`,
-		req.AttemptID, string(req.Completion.Outcome), req.Completion.ErrorClass,
-		req.Completion.ProviderStatus, nullableJSON(req.Receipt), nilIfEmpty(req.Summary),
+		req.AttemptID, string(completion.Outcome), completion.ErrorClass,
+		completion.ProviderStatus, nullableJSON(req.Receipt), nilIfEmpty(req.Summary),
 		fingerprint,
 	); err != nil {
 		return outbound.FinalizeResult{}, fmt.Errorf("close the attempt: %w", err)
@@ -944,26 +961,38 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	}, nil
 }
 
+// observation is a late result on its way to being kept: the conclusion as the
+// record has it, and the fingerprint of exactly that.
+type observation struct {
+	AttemptID   string
+	Completion  keys.Completion
+	Receipt     json.RawMessage
+	Summary     string
+	Fingerprint []byte
+	Version     int
+}
+
 // recordObservationTx keeps a late result for an attempt somebody else closed.
 //
 // Identity is the attempt and the kind; the fingerprint is content. Two
 // contradicting late results are a conflict rather than two truths, and the
 // first one stands.
-func recordObservationTx(ctx context.Context, tx *sql.Tx,
-	req outbound.FinalizeRequest, fingerprint []byte, version int) (bool, error) {
-
+//
+// What is stored is the completion as canonicalised from the attempt, so the
+// row and the fingerprint that indexes it cannot describe two different things.
+func recordObservationTx(ctx context.Context, tx *sql.Tx, o observation) (bool, error) {
 	var storedPrint []byte
 	err := tx.QueryRowContext(ctx, `
 		SELECT completion_fingerprint FROM outbound_attempt_observations
-		WHERE attempt_id = $1 AND observation_kind = 'late_finalize'`, req.AttemptID).
+		WHERE attempt_id = $1 AND observation_kind = 'late_finalize'`, o.AttemptID).
 		Scan(&storedPrint)
 	switch {
 	case err == nil:
-		if bytes.Equal(storedPrint, fingerprint) {
+		if bytes.Equal(storedPrint, o.Fingerprint) {
 			return true, nil
 		}
 		return false, outboundContractf(
-			"two different late results for attempt %s", req.AttemptID)
+			"two different late results for attempt %s", o.AttemptID)
 	case errors.Is(err, sql.ErrNoRows):
 	default:
 		return false, err
@@ -975,11 +1004,11 @@ func recordObservationTx(ctx context.Context, tx *sql.Tx,
 			receipt, applied_revision, provider_result_detail, response_summary,
 			completion_fingerprint, completion_fingerprint_version)
 		VALUES ($1, $2, 'late_finalize', $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		uuid.New().String(), req.AttemptID, string(req.Completion.Outcome),
-		req.Completion.ErrorClass, req.Completion.ProviderStatus,
-		nullableJSON(req.Receipt), req.Completion.AppliedRevision,
-		detailOf(req.Completion.ProviderResultDetail), nilIfEmpty(req.Summary),
-		fingerprint, version,
+		uuid.New().String(), o.AttemptID, string(o.Completion.Outcome),
+		o.Completion.ErrorClass, o.Completion.ProviderStatus,
+		nullableJSON(o.Receipt), o.Completion.AppliedRevision,
+		detailOf(o.Completion.ProviderResultDetail), nilIfEmpty(o.Summary),
+		o.Fingerprint, o.Version,
 	); err != nil {
 		return false, fmt.Errorf("keep the late result: %w", err)
 	}

@@ -336,3 +336,67 @@ func assertAssumedOrWithdrawn(t *testing.T, s *Store, round *raceRound) {
 		t.Fatalf("a doubtful delivery under assume_accepted ended as %s", got)
 	}
 }
+
+// TestTheJournalIsOneInstant. The journal is what somebody reads when they are
+// trying to establish what really happened, so it must never show a state the
+// system was never in: a commitment still sending next to the attempt that
+// already finished it. Four separate reads would show exactly that, at some
+// rate nobody can predict, and only under load.
+func TestTheJournalIsOneInstant(t *testing.T) {
+	s := setupTestDB(t)
+
+	rounds := make([]*raceRound, raceRounds)
+	for i := range rounds {
+		rounds[i] = inFlight(t, s, dmCommitment(fmt.Sprintf("U%04d", i)))
+	}
+
+	torn := make([]string, len(rounds))
+	var work []func()
+	for i, round := range rounds {
+		i, round := i, round
+		work = append(work,
+			func() {
+				_, round.otherErr = s.FinalizeDeliveryAttempt(context.Background(),
+					outbound.FinalizeRequest{
+						AttemptID: round.attemptID, LeaseToken: round.token,
+						Completion: acceptedCompletion(),
+						Receipt:    json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
+					})
+			},
+			func() {
+				// Read until the delivery has landed, and check every answer
+				// on the way: the two halves have to move together.
+				for attempt := 0; attempt < 2000; attempt++ {
+					journal, err := s.IntentJournal(context.Background(), round.intentID)
+					if err != nil {
+						round.ackErr = err
+						return
+					}
+					if len(journal.Attempts) == 0 {
+						continue
+					}
+					finished := journal.Attempts[len(journal.Attempts)-1].FinishedAt != nil
+					sending := journal.Intent.Status == outbound.StatusSending
+					if finished && sending {
+						torn[i] = "the attempt is closed and the commitment is still sending"
+						return
+					}
+					if !finished && !sending {
+						torn[i] = "the commitment moved on while its attempt is still open"
+						return
+					}
+					if finished {
+						return
+					}
+				}
+			})
+	}
+	startTogether(work...)
+
+	for i, round := range rounds {
+		round.check(t, "the delivery")
+		if torn[i] != "" {
+			t.Fatalf("the journal answered from two different moments: %s", torn[i])
+		}
+	}
+}

@@ -390,9 +390,9 @@ func intentIDsOfBatch(ctx context.Context, tx *sql.Tx, batchID string) ([]string
 	return ids, rows.Err()
 }
 
-// outboundIntentColumns is read by both the plain read and the locking one, so
-// the domain cannot end up seeing a different commitment depending on which
-// door it came through.
+// outboundIntentColumns is read by every door into a commitment - the plain
+// read, the locking one and the journal - so the domain cannot end up seeing a
+// different commitment depending on which one it came through.
 //
 // The last column is the only computed one: whether the deadline has passed as
 // of this statement's clock. It is asked of the database rather than compared
@@ -408,33 +408,27 @@ const outboundIntentColumns = `
 	       provider_key_codec_version,
 	       COALESCE(expires_at <= now(), FALSE)`
 
-// GetIntent reads one commitment as the domain sees it.
-func (s *Store) GetIntent(ctx context.Context, id string) (*outbound.Intent, error) {
+// scanIntent turns one row of outboundIntentColumns into a commitment, and is
+// the only place that mapping exists: two readers that disagreed about it would
+// hand the domain two different commitments from the same row.
+func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, error) {
 	var (
-		intent    outbound.Intent
-		groupID   sql.NullString
-		applied   sql.NullInt64
-		expiresAt sql.NullTime
-		receipt   []byte
-		// The plain read has no use for the deadline: nothing decided from it
-		// would still be true by the time the caller acted on it. It is read
-		// and dropped so both doors can share one column list.
+		intent         outbound.Intent
+		groupID        sql.NullString
+		applied        sql.NullInt64
+		expiresAt      sql.NullTime
+		receipt        []byte
 		deadlinePassed bool
 	)
-	err := s.db.QueryRowContext(ctx, outboundIntentColumns+
-		` FROM outbound_intents WHERE id = $1`, id).Scan(
+	if err := row.Scan(
 		&intent.ID, &groupID, &intent.Provider, &intent.Form, &intent.CompletionMode,
 		&intent.AmbiguityPolicy, &intent.Status, &intent.GenerationNo,
 		&intent.AttemptsInGeneration, &intent.FailureStreak, &intent.DesiredRevision,
 		&applied, &intent.FinalRevisionApplied, &receipt, &intent.CancellationRequested,
 		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt, &expiresAt,
 		&intent.GenerationBound, &intent.PayloadSchemaVersion,
-		&intent.ProviderKeyCodecVersion, &deadlinePassed)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
+		&intent.ProviderKeyCodecVersion, &deadlinePassed); err != nil {
+		return nil, false, err
 	}
 
 	intent.AlertGroupID = groupID.String
@@ -447,7 +441,20 @@ func (s *Store) GetIntent(ctx context.Context, id string) (*outbound.Intent, err
 		intent.ExpiresAt = &at
 	}
 	intent.HasReceipt = len(receipt) > 0
-	return &intent, nil
+	return &intent, deadlinePassed, nil
+}
+
+// GetIntent reads one commitment as the domain sees it.
+func (s *Store) GetIntent(ctx context.Context, id string) (*outbound.Intent, error) {
+	intent, _, err := scanIntent(s.db.QueryRowContext(ctx, outboundIntentColumns+
+		` FROM outbound_intents WHERE id = $1`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return intent, nil
 }
 
 // ListIntentsByAlertGroup reads a group's commitments in key order - what the
@@ -699,41 +706,15 @@ func setLockTimeoutTx(ctx context.Context, tx *sql.Tx) error {
 // together with whether its own deadline has passed as of this transaction's
 // clock.
 func lockIntentTx(ctx context.Context, tx *sql.Tx, id string) (*outbound.Intent, bool, error) {
-	var (
-		intent    outbound.Intent
-		groupID   sql.NullString
-		applied   sql.NullInt64
-		expiresAt sql.NullTime
-		receipt   []byte
-		expired   bool
-	)
-	err := tx.QueryRowContext(ctx, outboundIntentColumns+
-		` FROM outbound_intents WHERE id = $1 FOR UPDATE`, id).Scan(
-		&intent.ID, &groupID, &intent.Provider, &intent.Form, &intent.CompletionMode,
-		&intent.AmbiguityPolicy, &intent.Status, &intent.GenerationNo,
-		&intent.AttemptsInGeneration, &intent.FailureStreak, &intent.DesiredRevision,
-		&applied, &intent.FinalRevisionApplied, &receipt, &intent.CancellationRequested,
-		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt,
-		&expiresAt, &intent.GenerationBound, &intent.PayloadSchemaVersion,
-		&intent.ProviderKeyCodecVersion, &expired)
+	intent, expired, err := scanIntent(tx.QueryRowContext(ctx, outboundIntentColumns+
+		` FROM outbound_intents WHERE id = $1 FOR UPDATE`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("lock commitment %s: %w", id, err)
 	}
-
-	intent.AlertGroupID = groupID.String
-	if applied.Valid {
-		value := applied.Int64
-		intent.AppliedRevision = &value
-	}
-	if expiresAt.Valid {
-		at := expiresAt.Time
-		intent.ExpiresAt = &at
-	}
-	intent.HasReceipt = len(receipt) > 0
-	return &intent, expired, nil
+	return intent, expired, nil
 }
 
 // nextAttemptNoTx is the next number in this commitment's journal, taken under
@@ -825,17 +806,48 @@ func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (sto
 
 // IntentJournal reads everything known about one commitment, in the order it
 // happened.
+//
+// One repeatable-read transaction, and read-only. Four separate reads would be
+// four different instants: with a delivery finishing between them the answer
+// could hold a commitment that is still sending and the attempt that finished
+// it, which is not a state the system was ever in - and this is the read people
+// reach for precisely when they are trying to establish what really happened.
 func (s *Store) IntentJournal(ctx context.Context, intentID string) (*outbound.Journal, error) {
-	intent, err := s.GetIntent(ctx, intentID)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
 	if err != nil {
 		return nil, err
 	}
-	if intent == nil {
+	defer tx.Rollback()
+
+	intent, _, err := scanIntent(tx.QueryRowContext(ctx, outboundIntentColumns+
+		` FROM outbound_intents WHERE id = $1`, intentID))
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	journal := &outbound.Journal{Intent: *intent}
 
-	attempts, err := s.db.QueryContext(ctx, `
+	if journal.Attempts, err = journalAttemptsTx(ctx, tx, intentID); err != nil {
+		return nil, err
+	}
+	if journal.Observations, err = journalObservationsTx(ctx, tx, intentID); err != nil {
+		return nil, err
+	}
+	if journal.Events, err = journalEventsTx(ctx, tx, intentID); err != nil {
+		return nil, err
+	}
+	return journal, tx.Commit()
+}
+
+func journalAttemptsTx(ctx context.Context, tx *sql.Tx,
+	intentID string) ([]outbound.AttemptRecord, error) {
+
+	rows, err := tx.QueryContext(ctx, `
 		SELECT id, attempt_no, record_kind, generation_no, attempt_kind, operation,
 		       provider, COALESCE(bound_endpoint, ''), COALESCE(provider_key, ''),
 		       applied_revision, started_at, finished_at, COALESCE(outcome, ''),
@@ -846,9 +858,10 @@ func (s *Store) IntentJournal(ctx context.Context, intentID string) (*outbound.J
 	if err != nil {
 		return nil, fmt.Errorf("read the journal of %s: %w", intentID, err)
 	}
-	defer attempts.Close()
+	defer rows.Close()
 
-	for attempts.Next() {
+	var attempts []outbound.AttemptRecord
+	for rows.Next() {
 		var (
 			record   outbound.AttemptRecord
 			revision sql.NullInt64
@@ -856,7 +869,7 @@ func (s *Store) IntentJournal(ctx context.Context, intentID string) (*outbound.J
 			finished sql.NullTime
 			receipt  []byte
 		)
-		if err := attempts.Scan(&record.ID, &record.AttemptNo, &record.RecordKind,
+		if err := rows.Scan(&record.ID, &record.AttemptNo, &record.RecordKind,
 			&record.GenerationNo, &record.AttemptKind, &record.Operation, &record.Provider,
 			&record.BoundEndpoint, &record.ProviderKey, &revision, &started, &finished,
 			&record.Outcome, &record.ErrorClass, &record.ProviderStatus, &receipt,
@@ -879,57 +892,72 @@ func (s *Store) IntentJournal(ctx context.Context, intentID string) (*outbound.J
 			at := finished.Time
 			record.FinishedAt = &at
 		}
-		journal.Attempts = append(journal.Attempts, record)
+		attempts = append(attempts, record)
 	}
-	if err := attempts.Err(); err != nil {
-		return nil, err
-	}
+	return attempts, rows.Err()
+}
 
-	observations, err := s.db.QueryContext(ctx, `
-		SELECT o.attempt_id, o.observation_kind, o.outcome, o.receipt,
-		       COALESCE(o.response_summary, '')
+func journalObservationsTx(ctx context.Context, tx *sql.Tx,
+	intentID string) ([]outbound.Observation, error) {
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT o.attempt_id, o.observation_kind, o.observed_at, o.outcome,
+		       COALESCE(o.error_class, ''), COALESCE(o.provider_status, ''),
+		       COALESCE(o.provider_result_detail, ''), o.applied_revision, o.receipt,
+		       COALESCE(o.response_summary, ''),
+		       COALESCE(o.completion_fingerprint_version, 0)
 		FROM outbound_attempt_observations o
 		JOIN outbound_attempts a ON a.id = o.attempt_id
 		WHERE a.intent_id = $1 ORDER BY a.attempt_no, o.observed_at`, intentID)
 	if err != nil {
 		return nil, fmt.Errorf("read the late results of %s: %w", intentID, err)
 	}
-	defer observations.Close()
+	defer rows.Close()
 
-	for observations.Next() {
+	var observations []outbound.Observation
+	for rows.Next() {
 		var (
-			o       outbound.Observation
-			receipt []byte
+			o        outbound.Observation
+			revision sql.NullInt64
+			receipt  []byte
 		)
-		if err := observations.Scan(&o.AttemptID, &o.Kind, &o.Outcome, &receipt,
-			&o.Summary); err != nil {
+		if err := rows.Scan(&o.AttemptID, &o.Kind, &o.ObservedAt, &o.Outcome,
+			&o.ErrorClass, &o.ProviderStatus, &o.ProviderResultDetail, &revision,
+			&receipt, &o.Summary, &o.CompletionFingerprintVersion); err != nil {
 			return nil, err
+		}
+		if revision.Valid {
+			value := revision.Int64
+			o.AppliedRevision = &value
 		}
 		if len(receipt) > 0 {
 			o.Receipt = json.RawMessage(receipt)
 		}
-		journal.Observations = append(journal.Observations, o)
+		observations = append(observations, o)
 	}
-	if err := observations.Err(); err != nil {
-		return nil, err
-	}
+	return observations, rows.Err()
+}
 
-	events, err := s.db.QueryContext(ctx, `
+func journalEventsTx(ctx context.Context, tx *sql.Tx,
+	intentID string) ([]outbound.IntentEvent, error) {
+
+	rows, err := tx.QueryContext(ctx, `
 		SELECT seq, kind, COALESCE(reason, ''), COALESCE(actor, ''),
 		       COALESCE(from_status, ''), COALESCE(to_status, '')
 		FROM outbound_intent_events WHERE intent_id = $1 ORDER BY seq`, intentID)
 	if err != nil {
 		return nil, fmt.Errorf("read the events of %s: %w", intentID, err)
 	}
-	defer events.Close()
+	defer rows.Close()
 
-	for events.Next() {
+	var events []outbound.IntentEvent
+	for rows.Next() {
 		var e outbound.IntentEvent
-		if err := events.Scan(&e.Seq, &e.Kind, &e.Reason, &e.Actor,
+		if err := rows.Scan(&e.Seq, &e.Kind, &e.Reason, &e.Actor,
 			&e.FromStatus, &e.ToStatus); err != nil {
 			return nil, err
 		}
-		journal.Events = append(journal.Events, e)
+		events = append(events, e)
 	}
-	return journal, events.Err()
+	return events, rows.Err()
 }

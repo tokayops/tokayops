@@ -140,17 +140,21 @@ type BeginAttemptRequest struct {
 	// doubt must not go to a number somebody changed in between, and the worker
 	// is not the one who gets to decide that.
 	BoundEndpoint string
-	AttemptKind   AttemptKind
-	Operation     Operation
-	// Revision is the revision this attempt applies. It is checked against the
-	// state the commitment is actually about rather than trusted.
-	Revision int64
 
 	// ErrorClass and Summary describe a preparation that failed, and are what
 	// the journal keeps instead of an attempt.
 	ErrorClass string
 	Summary    string
 }
+
+// What the attempt IS - create or change, which operation, which revision - is
+// not in the request and cannot be. All three follow from what the commitment
+// already has: an object that exists is changed rather than created, and the
+// revision is the one in the state the key was computed over. A worker that
+// could name them could send the content of one revision under the identity of
+// another, and the provider would deduplicate the two as one message.
+//
+// The store decides them under the lock and tells the worker in the result.
 
 // BeginOutcome is what happened when a worker asked to start.
 type BeginOutcome string
@@ -192,12 +196,21 @@ type BeginAttemptResult struct {
 	AttemptNo int
 
 	GenerationNo int
+
+	// AttemptKind and Operation say what this call has to be. They are decided
+	// from the commitment's own state, not asked for.
+	AttemptKind AttemptKind
+	Operation   Operation
+
 	// BoundEndpoint and ProviderKey are the ones the effect is bound to, which
 	// may not be the ones proposed: within one generation the address and the
 	// key are what they were when it opened. The worker sends to these.
 	BoundEndpoint string
 	ProviderKey   string
 
+	// AppliedRevision is the revision of the state below, and the one the
+	// attempt is recorded as applying. The worker never names it: it renders
+	// the snapshot it is given and reports what the provider said.
 	AppliedRevision int64
 	Snapshot        keys.RenderSnapshot
 	Payload         json.RawMessage
@@ -349,12 +362,25 @@ type AttemptRecord struct {
 
 // Observation is a result that arrived for an attempt somebody else had already
 // closed - usually a worker returning after recovery gave up on it.
+//
+// It carries everything the attempt's own conclusion would have carried. A
+// message that may have been delivered is reconstructed from this and nothing
+// else: a summary of it would leave whoever is deciding what to do about the
+// alert guessing at exactly the part that matters.
 type Observation struct {
-	AttemptID string
-	Kind      string
-	Outcome   Outcome
-	Receipt   json.RawMessage
-	Summary   string
+	AttemptID  string
+	Kind       string
+	ObservedAt time.Time
+
+	Outcome              Outcome
+	ErrorClass           string
+	ProviderStatus       string
+	ProviderResultDetail string
+	AppliedRevision      *int64
+	Receipt              json.RawMessage
+	Summary              string
+
+	CompletionFingerprintVersion int
 }
 
 // IntentEvent is one thing that happened to a commitment without a network call
