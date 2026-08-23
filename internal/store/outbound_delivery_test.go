@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func claimOne(t *testing.T, s *Store, intentID string) string {
 	t.Helper()
 
 	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
-		Family: testFamily, Provider: "slack", Phase: outbound.ClaimAny,
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimRetriesFirst,
 		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
 	})
 	if err != nil {
@@ -91,12 +92,40 @@ func expireLease(t *testing.T, s *Store, intentID string) {
 	}
 }
 
-// acceptedCompletion is what a worker is allowed to say: the provider took it,
-// and here is what it called the message. Which revision that message carried
-// is not the worker's to state - the store fills it in from the attempt.
-func acceptedCompletion() keys.Completion {
-	receipt := "C0001/1700000000.000100"
-	return keys.Completion{Outcome: keys.OutcomeAccepted, ReceiptRef: &receipt}
+// accepted is what a worker is allowed to say: the provider took it, and here
+// is the message it made. Which revision that message carried is not the
+// worker's to state - the store fills it in from the attempt.
+//
+// Built through the domain, like production does, so a test cannot express a
+// request production cannot.
+func accepted() outbound.Conclusion {
+	return conclusion(outbound.ConclusionInput{
+		Outcome: outbound.OutcomeAccepted,
+		Status:  "ok",
+		Receipt: receiptOf("C0001/1700000000.000100",
+			`{"channel":"C0001","ts":"1700000000.000100"}`),
+	})
+}
+
+// concluded is any other answer: nothing was made, so there is nothing to show.
+func concluded(outcome outbound.Outcome, class string) outbound.Conclusion {
+	return conclusion(outbound.ConclusionInput{Outcome: outcome, Class: class})
+}
+
+func conclusion(in outbound.ConclusionInput) outbound.Conclusion {
+	built, err := outbound.NewConclusion(in)
+	if err != nil {
+		panic(err)
+	}
+	return built
+}
+
+func receiptOf(ref, raw string) outbound.Receipt {
+	receipt, err := outbound.NewReceipt(ref, json.RawMessage(raw))
+	if err != nil {
+		panic(err)
+	}
+	return receipt
 }
 
 func statusOf(t *testing.T, s *Store, intentID string) outbound.Status {
@@ -155,8 +184,7 @@ func TestDeliveryHappyPath(t *testing.T) {
 	result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 		AttemptID:  begun.AttemptID,
 		LeaseToken: token,
-		Completion: acceptedCompletion(),
-		Receipt:    json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
+		Conclusion: accepted(),
 	})
 	if err != nil {
 		t.Fatalf("finalize: %v", err)
@@ -207,8 +235,7 @@ func TestAnEditableCardSettlesIdleRatherThanDone(t *testing.T) {
 	begun := beginOne(t, s, intentID, token)
 
 	result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
-		AttemptID: begun.AttemptID, LeaseToken: token, Completion: acceptedCompletion(),
-		Receipt: json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
+		AttemptID: begun.AttemptID, LeaseToken: token, Conclusion: accepted(),
 	})
 	if err != nil {
 		t.Fatalf("finalize: %v", err)
@@ -232,7 +259,7 @@ func TestAnEditableCardSettlesIdleRatherThanDone(t *testing.T) {
 	otherAttempt := beginOne(t, s, other, otherToken)
 	final, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 		AttemptID: otherAttempt.AttemptID, LeaseToken: otherToken,
-		Completion: acceptedCompletion(),
+		Conclusion: accepted(),
 	})
 	if err != nil {
 		t.Fatalf("finalize: %v", err)
@@ -254,7 +281,7 @@ func TestClaimMintsAFreshTokenAndSkipsHeldWork(t *testing.T) {
 
 	// Still held: a second claim finds nothing.
 	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
-		Family: testFamily, Provider: "slack", Phase: outbound.ClaimAny,
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimRetriesFirst,
 		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
 	})
 	if err != nil {
@@ -291,7 +318,7 @@ func TestClaimSplitsWorkBetweenWorkers(t *testing.T) {
 			defer wg.Done()
 			<-start
 			claims[i], errs[i] = s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
-				Family: testFamily, Provider: "slack", Phase: outbound.ClaimAny,
+				Family: testFamily, Provider: "slack", Phase: outbound.ClaimRetriesFirst,
 				Limit: 4, Lease: outbound.NotificationLease, WorkerID: "worker-1",
 			})
 		}(i)
@@ -340,6 +367,75 @@ func TestClaimPrefersFirstAttempts(t *testing.T) {
 	}
 	if len(leased) != 1 || leased[0].Intent.ID != ids[1] {
 		t.Fatalf("the first-attempt claim took %d commitments, and not the untried one", len(leased))
+	}
+}
+
+// TestARetryIsReachedPastAnOlderBacklog is the guarantee the scheduler thinks
+// it has, checked against the SQL that has to provide it.
+//
+// A hundred pages admitted two hours ago and never attempted are OLDER than a
+// retry that failed an hour ago. Ordered by due time alone, the share the
+// scheduler sets aside for retries is spent on those pages instead, and under a
+// steady stream of new work the retry is never sent at all - the promise to
+// keep trying stops being one, silently, in the one place nobody looks.
+func TestARetryIsReachedPastAnOlderBacklog(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+
+	commitments := make([]keys.EscalationCommitment, 4)
+	for i := range commitments {
+		commitments[i] = channelCommitment(fmt.Sprintf("C%04d", i), 0)
+	}
+	intents := admitOne(t, s, agID, commitments...)
+
+	// Everything is overdue by two hours; one of them has been attempted, and
+	// its own retry is only an hour old - the newest row of the lot.
+	if _, err := s.db.Exec(
+		`UPDATE outbound_intents SET next_attempt_at = now() - interval '2 hours'
+		 WHERE alert_group_id = $1`, agID); err != nil {
+		t.Fatalf("age the queue: %v", err)
+	}
+	retried := intents[len(intents)-1]
+	if _, err := s.db.Exec(`
+		UPDATE outbound_intents
+		SET attempts_in_generation = 1, failure_streak = 1,
+		    next_attempt_at = now() - interval '1 hour'
+		WHERE id = $1`, retried); err != nil {
+		t.Fatalf("age the retry: %v", err)
+	}
+
+	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimRetriesFirst,
+		Limit: 1, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(leased) != 1 {
+		t.Fatalf("the claim took %d commitments", len(leased))
+	}
+	if leased[0].Intent.ID != retried {
+		t.Fatalf("the one slot reserved for retries went to %s, an untried commitment "+
+			"that happens to be older", leased[0].Intent.ID)
+	}
+
+	// And when there is no retry to reach, the same claim does not idle: the
+	// slot goes to whatever is due.
+	fallback, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimRetriesFirst,
+		Limit: 2, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
+	if err != nil {
+		t.Fatalf("claim again: %v", err)
+	}
+	if len(fallback) != 2 {
+		t.Fatalf("with no retries left the claim took %d of the 2 slots it had",
+			len(fallback))
+	}
+	for _, l := range fallback {
+		if l.Intent.AttemptsInGeneration != 0 {
+			t.Fatalf("%s was claimed twice", l.Intent.ID)
+		}
 	}
 }
 
@@ -631,8 +727,7 @@ func TestRecoveryAndFinalizeCannotBothWin(t *testing.T) {
 
 		result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 			AttemptID: begun.AttemptID, LeaseToken: token,
-			Completion: acceptedCompletion(),
-			Receipt:    json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
+			Conclusion: accepted(),
 		})
 		if err != nil {
 			t.Fatalf("finalize: %v", err)
@@ -663,7 +758,7 @@ func TestRecoveryAndFinalizeCannotBothWin(t *testing.T) {
 
 		if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 			AttemptID: begun.AttemptID, LeaseToken: token,
-			Completion: acceptedCompletion(),
+			Conclusion: accepted(),
 		}); err != nil {
 			t.Fatalf("finalize: %v", err)
 		}
@@ -730,7 +825,7 @@ func TestFinalizeClassifiesEveryWayItCanBeCalled(t *testing.T) {
 		begun := beginOne(t, s, intentID, token)
 
 		request := outbound.FinalizeRequest{
-			AttemptID: begun.AttemptID, LeaseToken: token, Completion: acceptedCompletion(),
+			AttemptID: begun.AttemptID, LeaseToken: token, Conclusion: accepted(),
 		}
 		if _, err := s.FinalizeDeliveryAttempt(context.Background(), request); err != nil {
 			t.Fatalf("finalize: %v", err)
@@ -751,14 +846,14 @@ func TestFinalizeClassifiesEveryWayItCanBeCalled(t *testing.T) {
 		begun := beginOne(t, s, intentID, token)
 
 		if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
-			AttemptID: begun.AttemptID, LeaseToken: token, Completion: acceptedCompletion(),
+			AttemptID: begun.AttemptID, LeaseToken: token, Conclusion: accepted(),
 		}); err != nil {
 			t.Fatalf("finalize: %v", err)
 		}
 
 		other, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 			AttemptID: begun.AttemptID, LeaseToken: token,
-			Completion: keys.Completion{Outcome: keys.OutcomeAmbiguous},
+			Conclusion: concluded(outbound.OutcomeAmbiguous, "no_response"),
 		})
 		if err != nil {
 			t.Fatalf("finalize: %v", err)
@@ -776,7 +871,7 @@ func TestFinalizeClassifiesEveryWayItCanBeCalled(t *testing.T) {
 
 		result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 			AttemptID: begun.AttemptID, LeaseToken: "somebody else's token",
-			Completion: acceptedCompletion(),
+			Conclusion: accepted(),
 		})
 		if err != nil {
 			t.Fatalf("finalize: %v", err)
@@ -795,7 +890,7 @@ func TestFinalizeClassifiesEveryWayItCanBeCalled(t *testing.T) {
 	t.Run("an attempt nobody has", func(t *testing.T) {
 		result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 			AttemptID: "00000000-0000-0000-0000-000000000000", LeaseToken: "t",
-			Completion: acceptedCompletion(),
+			Conclusion: accepted(),
 		})
 		if err != nil {
 			t.Fatalf("finalize: %v", err)
@@ -805,49 +900,13 @@ func TestFinalizeClassifiesEveryWayItCanBeCalled(t *testing.T) {
 		}
 	})
 
-	// The rungs above are climbed before anything the caller SAID is read. A
-	// request can be malformed and unauthorised at the same time, and answering
-	// the malformed part first would tell a stranger which attempts exist.
-	overreaching := func() keys.Completion {
-		revision := int64(0)
-		completion := acceptedCompletion()
-		completion.AppliedRevision = &revision
-		return completion
-	}
-
-	t.Run("an attempt nobody has, from a caller claiming too much", func(t *testing.T) {
-		result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
-			AttemptID: "00000000-0000-0000-0000-000000000000", LeaseToken: "t",
-			Completion: overreaching(),
-		})
-		if err != nil {
-			t.Fatalf("finalizing nothing was refused for its content: %v", err)
-		}
-		if result.Outcome != outbound.FinalizeNotFound {
-			t.Fatalf("finalizing nothing answered %q", result.Outcome)
-		}
-	})
-
-	t.Run("a stranger claiming too much", func(t *testing.T) {
-		agID := outboundGroup(t, s)
-		intentID := admitOne(t, s, agID)[0]
-		token := claimOne(t, s, intentID)
-		begun := beginOne(t, s, intentID, token)
-
-		result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
-			AttemptID: begun.AttemptID, LeaseToken: "somebody else's token",
-			Completion: overreaching(),
-		})
-		if err != nil {
-			t.Fatalf("a stranger's request was refused for its content: %v", err)
-		}
-		if result.Outcome != outbound.FinalizeLeaseLost {
-			t.Fatalf("a stranger's conclusion answered %q", result.Outcome)
-		}
-		if statusOf(t, s, intentID) != outbound.StatusSending {
-			t.Fatal("a stranger's conclusion moved the commitment")
-		}
-	})
+	// The rungs above are climbed before anything the caller SAID is read, and
+	// the two cases that used to prove it - an unknown attempt and a stranger's
+	// token, each carrying a malformed result - can no longer be written: a
+	// conclusion is built by the domain, and the shapes they relied on are
+	// unrepresentable. What survives is where the checks sit in
+	// FinalizeDeliveryAttempt, after the token gate, and the domain tests that
+	// nobody can build those shapes at all.
 }
 
 // TestAcknowledgementMeetsADeliveryInFlight is what the domain exists to make
@@ -895,7 +954,7 @@ func TestAcknowledgementMeetsADeliveryInFlight(t *testing.T) {
 
 		result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 			AttemptID: begun.AttemptID, LeaseToken: token,
-			Completion: keys.Completion{Outcome: keys.OutcomeRetryableRejection},
+			Conclusion: concluded(outbound.OutcomeRetryableRejection, "rate_limited"),
 		})
 		if err != nil {
 			t.Fatalf("finalize: %v", err)
@@ -917,8 +976,7 @@ func TestAcknowledgementMeetsADeliveryInFlight(t *testing.T) {
 
 		result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 			AttemptID: begun.AttemptID, LeaseToken: token,
-			Completion: acceptedCompletion(),
-			Receipt:    json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
+			Conclusion: accepted(),
 		})
 		if err != nil {
 			t.Fatalf("finalize: %v", err)
@@ -940,7 +998,7 @@ func TestAcknowledgementMeetsADeliveryInFlight(t *testing.T) {
 
 		if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 			AttemptID: begun.AttemptID, LeaseToken: token,
-			Completion: keys.Completion{Outcome: keys.OutcomeRetryableRejection},
+			Conclusion: concluded(outbound.OutcomeRetryableRejection, "rate_limited"),
 		}); err != nil {
 			t.Fatalf("finalize: %v", err)
 		}

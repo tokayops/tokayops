@@ -30,7 +30,7 @@ func stuckInReview(t *testing.T, s *Store, agID string) string {
 
 	if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 		AttemptID: begun.AttemptID, LeaseToken: token,
-		Completion: keys.Completion{Outcome: keys.OutcomeAmbiguous},
+		Conclusion: concluded(outbound.OutcomeAmbiguous, "no_response"),
 	}); err != nil {
 		t.Fatalf("finalize as ambiguous: %v", err)
 	}

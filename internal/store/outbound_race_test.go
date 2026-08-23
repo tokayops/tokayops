@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -175,6 +174,52 @@ func oneOf(t *testing.T, got []string, want ...string) string {
 	return ""
 }
 
+// heat is how one round's two halves are started.
+//
+// The rounds run one at a time - twelve at once stops being a lock-order test
+// and becomes a load test - and with both sides released at the same instant
+// the same one wins every time: the acknowledgement's transaction is shorter to
+// begin, so it reaches the alert group first in every round, and the other
+// order is never exercised at all. So the order is varied deliberately, and
+// both orders have to produce a legal end state.
+type heat int
+
+const (
+	together heat = iota
+	ackFirst
+	otherFirst
+)
+
+// headStart is long enough to be first to the row and far too short to be
+// finished with it, so the two transactions still overlap.
+const headStart = 5 * time.Millisecond
+
+func (h heat) start(ack, other func()) {
+	switch h {
+	case ackFirst:
+		startStaggered(ack, other)
+	case otherFirst:
+		startStaggered(other, ack)
+	default:
+		startTogether(ack, other)
+	}
+}
+
+func startStaggered(first, second func()) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		first()
+	}()
+	time.Sleep(headStart)
+	go func() {
+		defer wg.Done()
+		second()
+	}()
+	wg.Wait()
+}
+
 // startTogether runs every piece of work at the same instant and waits for all
 // of them.
 func startTogether(work ...func()) {
@@ -202,15 +247,10 @@ func TestAcknowledgementRacesADeliveryThatLanded(t *testing.T) {
 	s := setupTestDB(t)
 	measuringLockOrder(t, s)
 
-	rounds := make([]*raceRound, raceRounds)
-	for i := range rounds {
-		rounds[i] = inFlight(t, s, dmCommitment(fmt.Sprintf("U%04d", i)))
-	}
+	for i := 0; i < raceRounds; i++ {
+		round := inFlight(t, s, dmCommitment(fmt.Sprintf("U%04d", i)))
 
-	var work []func()
-	for _, round := range rounds {
-		round := round
-		work = append(work,
+		heat(i%3).start(
 			func() {
 				timed(&round.ackTook, func() {
 					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
@@ -221,16 +261,10 @@ func TestAcknowledgementRacesADeliveryThatLanded(t *testing.T) {
 					_, round.otherErr = s.FinalizeDeliveryAttempt(context.Background(),
 						outbound.FinalizeRequest{
 							AttemptID: round.attemptID, LeaseToken: round.token,
-							Completion: acceptedCompletion(),
-							Receipt: json.RawMessage(
-								`{"channel":"C0001","ts":"1700000000.000100"}`),
+							Conclusion: accepted(),
 						})
 				})
 			})
-	}
-	startTogether(work...)
-
-	for _, round := range rounds {
 		round.check(t, "the delivery")
 
 		// The message went out, so the commitment is done whichever
@@ -257,17 +291,12 @@ func TestAcknowledgementRacesAnAssumedDelivery(t *testing.T) {
 	s := setupTestDB(t)
 	measuringLockOrder(t, s)
 
-	rounds := make([]*raceRound, raceRounds)
-	for i := range rounds {
+	for i := 0; i < raceRounds; i++ {
 		commitment := dmCommitment(fmt.Sprintf("U%04d", i))
 		commitment.AmbiguityPolicy = keys.PolicyAssumeAccepted
-		rounds[i] = inFlight(t, s, commitment)
-	}
+		round := inFlight(t, s, commitment)
 
-	var work []func()
-	for _, round := range rounds {
-		round := round
-		work = append(work,
+		heat(i%3).start(
 			func() {
 				timed(&round.ackTook, func() {
 					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
@@ -278,14 +307,10 @@ func TestAcknowledgementRacesAnAssumedDelivery(t *testing.T) {
 					_, round.otherErr = s.FinalizeDeliveryAttempt(context.Background(),
 						outbound.FinalizeRequest{
 							AttemptID: round.attemptID, LeaseToken: round.token,
-							Completion: keys.Completion{Outcome: keys.OutcomeAmbiguous},
+							Conclusion: concluded(outbound.OutcomeAmbiguous, "no_response"),
 						})
 				})
 			})
-	}
-	startTogether(work...)
-
-	for _, round := range rounds {
 		round.check(t, "the doubtful result")
 		assertAssumedOrWithdrawn(t, s, round)
 	}
@@ -295,50 +320,49 @@ func TestAcknowledgementRacesAnAssumedDelivery(t *testing.T) {
 // process that cleans up after a worker that never came back. Recovery has
 // nobody waiting on it, so a deadlock here would be found later, in the shape
 // of an alert that says nothing happened.
+//
+// Two recoverers on purpose: they also race each other for the same candidate,
+// which is the other half of the rule (G18).
 func TestAcknowledgementRacesRecovery(t *testing.T) {
 	s := setupTestDB(t)
 	measuringLockOrder(t, s)
 
-	rounds := make([]*raceRound, raceRounds)
-	for i := range rounds {
+	for i := 0; i < raceRounds; i++ {
 		commitment := dmCommitment(fmt.Sprintf("U%04d", i))
 		commitment.AmbiguityPolicy = keys.PolicyAssumeAccepted
-		rounds[i] = inFlight(t, s, commitment)
-		expireLease(t, s, rounds[i].intentID)
-	}
+		round := inFlight(t, s, commitment)
+		expireLease(t, s, round.intentID)
 
-	// Two recoverers on purpose: they also race each other for the same
-	// candidates, which is the other half of the rule (G18).
-	recoveries := make([]raceRound, 2)
-	work := []func(){
-		func() {
-			timed(&recoveries[0].otherTook, func() {
-				_, recoveries[0].otherErr = s.RecoverStaleAttempts(
-					context.Background(), testFamily, raceRounds)
+		recoveries := make([]raceRound, 2)
+		heat(i%3).start(
+			func() {
+				timed(&round.ackTook, func() {
+					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+				})
+			},
+			// The two recoverers start together whichever way round this heat
+			// runs: their race with each other is the other half of the rule,
+			// and it is the same race in both orders.
+			func() {
+				startTogether(
+					func() {
+						timed(&recoveries[0].otherTook, func() {
+							_, recoveries[0].otherErr = s.RecoverStaleAttempts(
+								context.Background(), testFamily, raceRounds)
+						})
+					},
+					func() {
+						timed(&recoveries[1].otherTook, func() {
+							_, recoveries[1].otherErr = s.RecoverStaleAttempts(
+								context.Background(), testFamily, raceRounds)
+						})
+					})
 			})
-		},
-		func() {
-			timed(&recoveries[1].otherTook, func() {
-				_, recoveries[1].otherErr = s.RecoverStaleAttempts(
-					context.Background(), testFamily, raceRounds)
-			})
-		},
-	}
-	for _, round := range rounds {
-		round := round
-		work = append(work, func() {
-			timed(&round.ackTook, func() {
-				_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
-			})
-		})
-	}
-	startTogether(work...)
 
-	for i := range recoveries {
-		recoveries[i].check(t, fmt.Sprintf("recovery %d", i))
-	}
-	for _, round := range rounds {
 		round.check(t, "recovery")
+		for j := range recoveries {
+			recoveries[j].check(t, fmt.Sprintf("recovery %d", j))
+		}
 		assertAssumedOrWithdrawn(t, s, round)
 	}
 }
@@ -409,28 +433,24 @@ func TestTheJournalIsOneInstant(t *testing.T) {
 	s := setupTestDB(t)
 	measuringLockOrder(t, s)
 
-	rounds := make([]*raceRound, raceRounds)
-	for i := range rounds {
-		rounds[i] = inFlight(t, s, dmCommitment(fmt.Sprintf("U%04d", i)))
-	}
+	for i := 0; i < raceRounds; i++ {
+		round := inFlight(t, s, dmCommitment(fmt.Sprintf("U%04d", i)))
+		torn := ""
 
-	torn := make([]string, len(rounds))
-	var work []func()
-	for i, round := range rounds {
-		i, round := i, round
-		work = append(work,
+		startTogether(
 			func() {
-				_, round.otherErr = s.FinalizeDeliveryAttempt(context.Background(),
-					outbound.FinalizeRequest{
-						AttemptID: round.attemptID, LeaseToken: round.token,
-						Completion: acceptedCompletion(),
-						Receipt:    json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
-					})
+				timed(&round.otherTook, func() {
+					_, round.otherErr = s.FinalizeDeliveryAttempt(context.Background(),
+						outbound.FinalizeRequest{
+							AttemptID: round.attemptID, LeaseToken: round.token,
+							Conclusion: accepted(),
+						})
+				})
 			},
 			func() {
 				// Read until the delivery has landed, and check every answer
 				// on the way: the two halves have to move together.
-				for attempt := 0; attempt < 2000; attempt++ {
+				for attempt := 0; attempt < journalReads; attempt++ {
 					journal, err := s.IntentJournal(context.Background(), round.intentID)
 					if err != nil {
 						round.ackErr = err
@@ -442,11 +462,11 @@ func TestTheJournalIsOneInstant(t *testing.T) {
 					finished := journal.Attempts[len(journal.Attempts)-1].FinishedAt != nil
 					sending := journal.Intent.Status == outbound.StatusSending
 					if finished && sending {
-						torn[i] = "the attempt is closed and the commitment is still sending"
+						torn = "the attempt is closed and the commitment is still sending"
 						return
 					}
 					if !finished && !sending {
-						torn[i] = "the commitment moved on while its attempt is still open"
+						torn = "the commitment moved on while its attempt is still open"
 						return
 					}
 					if finished {
@@ -454,13 +474,16 @@ func TestTheJournalIsOneInstant(t *testing.T) {
 					}
 				}
 			})
-	}
-	startTogether(work...)
 
-	for i, round := range rounds {
 		round.check(t, "the delivery")
-		if torn[i] != "" {
-			t.Fatalf("the journal answered from two different moments: %s", torn[i])
+		if torn != "" {
+			t.Fatalf("the journal answered from two different moments: %s", torn)
 		}
 	}
 }
+
+// journalReads bounds the polling above. It is a loop against another
+// transaction, not a load test: enough attempts to catch the commit in the
+// middle, few enough that a slow machine is not asked to serve thousands of
+// them.
+const journalReads = 200

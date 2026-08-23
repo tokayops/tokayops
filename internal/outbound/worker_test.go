@@ -359,13 +359,13 @@ func TestAnAttemptIsMadeFromWhatTheStoreSaid(t *testing.T) {
 		t.Fatalf("%d results were recorded", len(store.finalized))
 	}
 	recorded := store.finalized[0]
-	if recorded.Completion.Outcome != OutcomeAccepted {
-		t.Fatalf("the result was recorded as %q", recorded.Completion.Outcome)
+	if recorded.Conclusion.Outcome() != OutcomeAccepted {
+		t.Fatalf("the result was recorded as %q", recorded.Conclusion.Outcome())
 	}
-	if recorded.Completion.AppliedRevision != nil {
+	if recorded.Conclusion.Completion().AppliedRevision != nil {
 		t.Fatal("the worker told the store which revision the attempt applied")
 	}
-	if len(recorded.Receipt) == 0 {
+	if len(recorded.Conclusion.Receipt()) == 0 {
 		t.Fatal("the coordinates the provider returned were not recorded")
 	}
 }
@@ -425,12 +425,12 @@ func TestTheWorkerDoesNotLetAChannelClassifyASilence(t *testing.T) {
 		t.Fatalf("%d results were recorded", len(store.finalized))
 	}
 	recorded := store.finalized[0]
-	if recorded.Completion.Outcome != OutcomeAmbiguous {
+	if recorded.Conclusion.Outcome() != OutcomeAmbiguous {
 		t.Fatalf("a request that may have gone out was recorded as %q",
-			recorded.Completion.Outcome)
+			recorded.Conclusion.Outcome())
 	}
 	// And the account of it survives, which is all the journal will have.
-	if recorded.Summary == "" {
+	if recorded.Conclusion.Summary() == "" {
 		t.Fatal("nothing was recorded about why the call ended")
 	}
 }
@@ -472,8 +472,8 @@ func TestAStoppingWorkerStillRecordsWhatHappened(t *testing.T) {
 	if len(store.finalized) != 1 {
 		t.Fatal("the result of a call made before the shutdown was thrown away")
 	}
-	if store.finalized[0].Completion.Outcome != OutcomeAccepted {
-		t.Fatalf("it was recorded as %q", store.finalized[0].Completion.Outcome)
+	if store.finalized[0].Conclusion.Outcome() != OutcomeAccepted {
+		t.Fatalf("it was recorded as %q", store.finalized[0].Conclusion.Outcome())
 	}
 }
 

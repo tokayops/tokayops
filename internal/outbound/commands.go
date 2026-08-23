@@ -108,9 +108,15 @@ const (
 	// admitted page does not queue behind a pile of old retries.
 	ClaimFirstAttempts ClaimPhase = "first_attempts"
 
-	// ClaimAny takes whatever is due. Retries are guaranteed a share of every
-	// claim, or a steady stream of new work would starve them for good.
-	ClaimAny ClaimPhase = "any"
+	// ClaimRetriesFirst takes the commitments that have already been attempted
+	// before the ones that have not, and falls back to untried work rather
+	// than idling when there are no retries.
+	//
+	// The order is the guarantee. Sorted by due time alone, a hundred fresh
+	// pages two hours late sit ahead of one retry that is an hour late, and
+	// under a steady stream of new work that retry is never sent at all - the
+	// promise to keep trying quietly stops being one.
+	ClaimRetriesFirst ClaimPhase = "retries_first"
 )
 
 // ClaimRequest is one instance asking for work: which partition, which
@@ -246,17 +252,19 @@ type FinalizeRequest struct {
 	AttemptID  string
 	LeaseToken string
 
-	// Completion is the conclusion in the form its fingerprint is taken over.
-	// It is what tells a repeat of this call from a different one.
-	Completion keys.Completion
-
-	// Receipt is the provider's coordinates, stored on the attempt and on the
-	// commitment. Kept on the attempt as well because a later generation clears
-	// the commitment's copy, and the address of a message that really was sent
-	// must not disappear with it.
-	Receipt json.RawMessage
-
-	Summary string
+	// Conclusion is what the attempt concluded: the answer its fingerprint is
+	// taken over, the coordinates of whatever the provider made, and the
+	// account for the journal - as one value.
+	//
+	// One value because they are one fact. Carried separately, an acceptance
+	// could arrive beside an empty receipt: the commitment settles as done with
+	// nothing stored, and the next revision of the alert, finding no receipt,
+	// makes a second message beside the one that already exists.
+	//
+	// The coordinates are kept on the attempt as well as on the commitment,
+	// because a later generation clears the commitment's copy and the address
+	// of a message that really was sent must not disappear with it.
+	Conclusion Conclusion
 }
 
 // FinalizeOutcome is the answer to closing an attempt.

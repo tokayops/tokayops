@@ -34,14 +34,18 @@ type Preparer interface {
 
 // Ready is the preparation of a call that may go ahead.
 //
-// With no address it is not ready at all, whatever the caller meant: an empty
-// endpoint is an identity nobody linked, and that is a refusal with a name
-// rather than a send to nowhere.
+// An empty address is NOT turned into a refusal here, and the difference
+// matters. "This recipient has no address" is a fact about the world and a
+// preparer says it with Impossible("identity_not_linked", ...), which ends the
+// commitment. "Ready, and I forgot the address" is a bug in the adapter, and
+// the store refuses it as a contract violation that changes nothing - so the
+// work waits for a build that resolves addresses properly instead of being
+// ended by one that does not.
+//
+// The same mistake had two different fates depending on which layer noticed it
+// first. Now it has one, and it lives in the store where the refusal is
+// already written.
 func Ready(endpoint string) Preparation {
-	if endpoint == "" {
-		return Impossible("no_address",
-			"the recipient resolved to no address on this provider")
-	}
 	return Preparation{outcome: PreparationReady, endpoint: endpoint}
 }
 

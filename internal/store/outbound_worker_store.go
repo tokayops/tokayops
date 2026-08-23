@@ -156,7 +156,14 @@ func (s *Store) ClaimDueIntents(ctx context.Context,
 			  AND (expires_at IS NULL OR expires_at > now())
 			  AND (locked_until IS NULL OR locked_until <= now())
 			  AND (NOT $3::boolean OR attempts_in_generation = 0)
-			ORDER BY next_attempt_at, id
+			-- Retries before untried work, each half by how long it has
+			-- waited. FALSE sorts first, so a commitment that has already been
+			-- attempted comes before one that has not - which is what makes
+			-- the share the scheduler reserves for retries actually reach
+			-- them. Without it, a backlog of fresh work that is older than the
+			-- retries takes that share too, and the oldest retry never goes
+			-- out at all.
+			ORDER BY (attempts_in_generation = 0), next_attempt_at, id
 			LIMIT $4
 			FOR UPDATE SKIP LOCKED
 		) due
@@ -788,9 +795,12 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 
 	// The group is locked first by anything that could end up writing to it: a
 	// success, or doubt that a policy turns into one.
+	concluded := req.Conclusion.Completion()
+	receipt := req.Conclusion.Receipt()
+
 	lockGroup := groupID != "" &&
-		(req.Completion.Outcome == keys.OutcomeAccepted ||
-			(req.Completion.Outcome == keys.OutcomeAmbiguous && policy == outbound.PolicyAssumeAccepted))
+		(concluded.Outcome == keys.OutcomeAccepted ||
+			(concluded.Outcome == keys.OutcomeAmbiguous && policy == outbound.PolicyAssumeAccepted))
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -825,14 +835,16 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		currentAttempt  sql.NullString
 		intentToken     sql.NullString
 	)
+	var attemptKind string
 	if err := tx.QueryRowContext(ctx, `
 		SELECT a.lease_token, a.finished_at, a.finish_reason, a.completion_fingerprint,
 		       a.applied_revision, COALESCE(a.completion_fingerprint_version, 0),
-		       i.current_attempt_id, i.lease_token
+		       a.attempt_kind, i.current_attempt_id, i.lease_token
 		FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
 		WHERE a.id = $1`, req.AttemptID).
 		Scan(&attemptToken, &finishedAt, &finishReason, &storedPrint,
-			&attemptRevision, &attemptVersion, &currentAttempt, &intentToken); err != nil {
+			&attemptRevision, &attemptVersion, &attemptKind, &currentAttempt,
+			&intentToken); err != nil {
 		return outbound.FinalizeResult{}, err
 	}
 
@@ -856,17 +868,38 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	// found and a stranger's token is a lost lease, whatever else their request
 	// contains. Reading their claims first would answer a question about the
 	// content of a request nobody has established the right to make.
-	if req.Completion.AppliedRevision != nil {
+	if concluded.AppliedRevision != nil {
 		return outbound.FinalizeResult{}, outboundContractf(
 			"a result for attempt %s names the revision it applied; only the attempt does that",
 			req.AttemptID)
+	}
+
+	// What the result says about the object has to match what the attempt was.
+	// The domain builds these together, so a mismatch here is a caller that
+	// assembled its own - and the state it would produce is the one nothing
+	// recovers from: a commitment settled as delivered with no coordinates,
+	// which the next revision reads as "never sent" and creates a second
+	// message for.
+	//
+	// Only a create is held to it. A change to an object that already exists
+	// keeps the receipt the commitment already has, and Sprint 2 will need
+	// exactly that.
+	if (concluded.ReceiptRef != nil) != (len(receipt) > 0) {
+		return outbound.FinalizeResult{}, outboundContractf(
+			"the result of attempt %s names an object it did not record, or records "+
+				"one it will not name", req.AttemptID)
+	}
+	if concluded.Outcome == keys.OutcomeAccepted &&
+		attemptKind == string(outbound.AttemptCreate) && len(receipt) == 0 {
+		return outbound.FinalizeResult{}, outboundContractf(
+			"attempt %s created something and did not say what", req.AttemptID)
 	}
 
 	// The result is completed from the attempt's own row before anything is
 	// computed from it: the revision it applied is a fact of the record, and
 	// putting it in here is what makes the fingerprint, the observation and the
 	// commitment's own state describe the same thing.
-	completion := req.Completion
+	completion := concluded
 	if attemptRevision.Valid {
 		applied := attemptRevision.Int64
 		completion.AppliedRevision = &applied
@@ -902,8 +935,8 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 			recorded, err := recordObservationTx(ctx, tx, observation{
 				AttemptID:   req.AttemptID,
 				Completion:  completion,
-				Receipt:     req.Receipt,
-				Summary:     req.Summary,
+				Receipt:     receipt,
+				Summary:     req.Conclusion.Summary(),
 				Fingerprint: fingerprint,
 				Version:     attemptVersion,
 			})
@@ -937,7 +970,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	// only for one-shot messages - and a one-shot has no later revision to be
 	// waiting for.
 	final := false
-	if intent.GroupBound() && req.Completion.Outcome == keys.OutcomeAccepted {
+	if intent.GroupBound() && concluded.Outcome == keys.OutcomeAccepted {
 		stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
 		if err != nil {
 			return outbound.FinalizeResult{}, err
@@ -963,7 +996,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		    completion_fingerprint = $7
 		WHERE id = $1 AND finished_at IS NULL`,
 		req.AttemptID, string(completion.Outcome), completion.ErrorClass,
-		completion.ProviderStatus, nullableJSON(req.Receipt), nilIfEmpty(req.Summary),
+		completion.ProviderStatus, nullableJSON(receipt), nilIfEmpty(req.Conclusion.Summary()),
 		fingerprint,
 	); err != nil {
 		return outbound.FinalizeResult{}, fmt.Errorf("close the attempt: %w", err)
@@ -975,7 +1008,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		Backoff:         outbound.Backoff(intent.FailureStreak + 1),
 		AppliedRevision: applied,
 		AttemptIsFinal:  final,
-		Receipt:         req.Receipt,
+		Receipt:         receipt,
 		Actor:           "worker",
 	}); err != nil {
 		return outbound.FinalizeResult{}, err

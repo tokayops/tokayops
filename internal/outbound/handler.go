@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -62,6 +63,11 @@ type Receipt struct {
 
 // NewReceipt is the only way to make one, and it refuses anything that is not a
 // whole answer.
+//
+// The bytes are copied in and copied out. A value that shared a slice with the
+// buffer a handler decoded from would change under the journal the first time
+// somebody reused that buffer - and the message it names is the one thing
+// nothing else in the system can reconstruct.
 func NewReceipt(ref string, raw json.RawMessage) (Receipt, error) {
 	if ref == "" {
 		return Receipt{}, fmt.Errorf("outbound: a receipt with nothing to call the message by")
@@ -72,7 +78,7 @@ func NewReceipt(ref string, raw json.RawMessage) (Receipt, error) {
 	if !json.Valid(raw) {
 		return Receipt{}, fmt.Errorf("outbound: the receipt for %q is not valid JSON", ref)
 	}
-	return Receipt{ref: ref, raw: raw}, nil
+	return Receipt{ref: ref, raw: bytes.Clone(raw)}, nil
 }
 
 // Ref is the stable name the message is known by, and what the conclusion is
@@ -80,7 +86,7 @@ func NewReceipt(ref string, raw json.RawMessage) (Receipt, error) {
 func (r Receipt) Ref() string { return r.ref }
 
 // Raw is what gets stored, and the domain never looks inside it.
-func (r Receipt) Raw() json.RawMessage { return r.raw }
+func (r Receipt) Raw() json.RawMessage { return bytes.Clone(r.raw) }
 
 // Recorded says the provider told us where the message is.
 func (r Receipt) Recorded() bool { return r.ref != "" && len(r.raw) > 0 }
@@ -167,6 +173,75 @@ const (
 	BreachAcceptanceWithoutReceipt Breach = "acceptance_without_receipt"
 )
 
+// Conclusion is what one attempt concluded: the answer the protocol
+// fingerprints and the object the provider made, as ONE value.
+//
+// They were two arguments once, and the pair could be assembled wrong - an
+// acceptance naming a message beside a receipt of nothing. The store took it,
+// the commitment settled as done with no receipt stored, and the next revision
+// of the alert, finding none, would have created a second message beside the
+// one that already existed. The invariant only holds if the halves cannot be
+// carried separately.
+type Conclusion struct {
+	completion keys.Completion
+	receipt    Receipt
+	summary    string
+}
+
+// ConclusionInput is what a conclusion is made of.
+type ConclusionInput struct {
+	Outcome Outcome
+	Class   string
+	Status  string
+	Receipt Receipt
+	Summary string
+}
+
+// NewConclusion states what an attempt concluded, and refuses the states the
+// domain has no meaning for: an outcome nobody declared, and an acceptance with
+// nothing to show for it.
+func NewConclusion(in ConclusionInput) (Conclusion, error) {
+	switch in.Outcome {
+	case OutcomeAccepted, OutcomeRetryableRejection, OutcomePermanentRejection,
+		OutcomeAmbiguous:
+	default:
+		return Conclusion{}, fmt.Errorf("outbound: %q is not an outcome an attempt has",
+			in.Outcome)
+	}
+	if in.Outcome == OutcomeAccepted && !in.Receipt.Recorded() {
+		return Conclusion{}, fmt.Errorf(
+			"outbound: an acceptance with no receipt is a message nothing can find again")
+	}
+
+	completion := keys.Completion{Outcome: in.Outcome}
+	if in.Class != "" {
+		class := in.Class
+		completion.ErrorClass = &class
+	}
+	if in.Status != "" {
+		status := in.Status
+		completion.ProviderStatus = &status
+	}
+	if in.Receipt.Recorded() {
+		ref := in.Receipt.Ref()
+		completion.ReceiptRef = &ref
+	}
+	return Conclusion{completion: completion, receipt: in.Receipt, summary: in.Summary}, nil
+}
+
+// Completion is what the protocol fingerprints.
+func (c Conclusion) Completion() keys.Completion { return c.completion }
+
+// Receipt is what gets stored about the object, and it is present exactly when
+// the completion names one.
+func (c Conclusion) Receipt() json.RawMessage { return c.receipt.Raw() }
+
+// Summary is the short account for the journal.
+func (c Conclusion) Summary() string { return c.summary }
+
+// Outcome is what the attempt concluded.
+func (c Conclusion) Outcome() Outcome { return c.completion.Outcome }
+
 // Conclude is the only path from what a handler saw to what the store records,
 // and the handler is asked exactly one question along the way.
 //
@@ -175,31 +250,34 @@ const (
 // out to be a clean failure, and the retry would be a second page with nothing
 // in the journal to explain it. The rules that cost a page when they are wrong
 // do not belong in the part of the system that a new channel adds.
-func Conclude(h Handler, res Result) (keys.Completion, Breach) {
+func Conclude(h Handler, res Result, err error) (Conclusion, Breach) {
 	outcome, class, breach := classify(h, res)
 
 	// An acceptance has to say what it made. "Yes, and I will not tell you
 	// where" leaves a message nothing can find, update or resolve - and leaves
 	// the commitment looking unsent, so the next revision would make a second
 	// one beside it.
-	if outcome == OutcomeAccepted && !res.Receipt.Recorded() {
+	receipt := res.Receipt
+	if outcome == OutcomeAccepted && !receipt.Recorded() {
 		outcome, class, breach = OutcomeAmbiguous,
 			string(BreachAcceptanceWithoutReceipt), BreachAcceptanceWithoutReceipt
 	}
 
-	completion := keys.Completion{Outcome: outcome}
-	if class != "" {
-		completion.ErrorClass = &class
+	concluded, buildErr := NewConclusion(ConclusionInput{
+		Outcome: outcome, Class: class, Status: res.Status,
+		Receipt: receipt, Summary: Summarise(res.Summary, err),
+	})
+	if buildErr != nil {
+		// Unreachable through the fold above, which already refuses everything
+		// the constructor does - and if a rule is ever added to one and not the
+		// other, doubt is the answer that costs least.
+		concluded, _ = NewConclusion(ConclusionInput{
+			Outcome: OutcomeAmbiguous, Class: string(BreachUnknownOutcome),
+			Status: res.Status, Summary: Summarise(res.Summary, err),
+		})
+		return concluded, BreachUnknownOutcome
 	}
-	if res.Status != "" {
-		status := res.Status
-		completion.ProviderStatus = &status
-	}
-	if res.Receipt.Recorded() {
-		ref := res.Receipt.Ref()
-		completion.ReceiptRef = &ref
-	}
-	return completion, breach
+	return concluded, breach
 }
 
 // classify folds one result into an outcome. The two silent cases never reach

@@ -186,13 +186,13 @@ func (w *Worker) claim(ctx context.Context, free int, tick uint64) []Leased {
 		got := 0
 		for _, provider := range sortedProviders(shares) {
 			limit := shares[provider]
-			first, any := splitPhases(limit, fresh[provider],
+			first, retries := splitPhases(limit, fresh[provider],
 				demand[provider]-fresh[provider], tick)
 
 			for _, phase := range []struct {
 				kind  ClaimPhase
 				limit int
-			}{{ClaimFirstAttempts, first}, {ClaimAny, any}} {
+			}{{ClaimFirstAttempts, first}, {ClaimRetriesFirst, retries}} {
 				if phase.limit == 0 {
 					continue
 				}
@@ -301,23 +301,21 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 	})
 	cancelAttempt()
 
-	completion, breach := Conclude(channel, result)
+	concluded, breach := Conclude(channel, result, execErr)
 	if breach != BreachNone {
 		// Not fatal to the delivery - the conclusion above is already the safe
 		// one - but a channel that does this is wrong, and silence here would
 		// keep it wrong.
 		log.Printf("outbound worker %s: %s broke its contract on attempt %s (%s); "+
 			"recorded as %s", w.workerID, leased.Intent.Provider, begun.AttemptID,
-			breach, completion.Outcome)
+			breach, concluded.Outcome())
 	}
 
 	finalizeCtx, cancelFinalize := recording(detached)
 	recorded, err := w.store.FinalizeDeliveryAttempt(finalizeCtx, FinalizeRequest{
 		AttemptID:  begun.AttemptID,
 		LeaseToken: leased.LeaseToken,
-		Completion: completion,
-		Receipt:    result.Receipt.Raw(),
-		Summary:    Summarise(result.Summary, execErr),
+		Conclusion: concluded,
 	})
 	cancelFinalize()
 	if err != nil {

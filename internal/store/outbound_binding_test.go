@@ -289,36 +289,11 @@ func TestStateThatNoLongerMatchesItsKeyIsRefused(t *testing.T) {
 func TestFinalizeBelievesTheAttemptRatherThanTheWorker(t *testing.T) {
 	s := setupTestDB(t)
 
-	t.Run("a result that names the revision it applied", func(t *testing.T) {
-		agID := outboundGroup(t, s)
-		intentID := admitOne(t, s, agID)[0]
-		token := claimOne(t, s, intentID)
-		begun := beginOne(t, s, intentID, token)
-
-		claimed := int64(7)
-		completion := acceptedCompletion()
-		completion.AppliedRevision = &claimed
-
-		_, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
-			AttemptID: begun.AttemptID, LeaseToken: token, Completion: completion,
-		})
-		if !errors.Is(err, ErrOutboundContract) {
-			t.Fatalf("a worker got to say which revision its message carried: %v", err)
-		}
-		if got := statusOf(t, s, intentID); got != outbound.StatusSending {
-			t.Fatalf("the refused result still moved the commitment to %s", got)
-		}
-		var applied sql.NullInt64
-		if err := s.db.QueryRow(
-			`SELECT applied_revision FROM outbound_intents WHERE id = $1`, intentID).
-			Scan(&applied); err != nil {
-			t.Fatalf("read the applied revision: %v", err)
-		}
-		if applied.Valid {
-			t.Fatalf("the commitment now claims to show revision %d", applied.Int64)
-		}
-	})
-
+	// A result that NAMES the revision it applied has no test here any more,
+	// and that is the point: a conclusion is built by the domain and there is
+	// no way to put a revision in one. The store still refuses it, as the
+	// boundary it is - see FinalizeDeliveryAttempt - and what proves nobody can
+	// send it is TestAConclusionCannotNameARevision in the domain.
 	t.Run("a result that says nothing about the revision", func(t *testing.T) {
 		// The other half of the same rule: the store fills the revision in
 		// from the attempt, so the commitment ends up recording what was
@@ -329,8 +304,7 @@ func TestFinalizeBelievesTheAttemptRatherThanTheWorker(t *testing.T) {
 		begun := beginOne(t, s, intentID, token)
 
 		if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
-			AttemptID: begun.AttemptID, LeaseToken: token, Completion: acceptedCompletion(),
-			Receipt: json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
+			AttemptID: begun.AttemptID, LeaseToken: token, Conclusion: accepted(),
 		}); err != nil {
 			t.Fatalf("finalize: %v", err)
 		}
@@ -362,7 +336,7 @@ func TestFinalizeBelievesTheAttemptRatherThanTheWorker(t *testing.T) {
 		}
 
 		_, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
-			AttemptID: begun.AttemptID, LeaseToken: token, Completion: acceptedCompletion(),
+			AttemptID: begun.AttemptID, LeaseToken: token, Conclusion: accepted(),
 		})
 		if !errors.Is(err, keys.ErrContract) {
 			t.Fatalf("the result was compared across two protocols: %v", err)
@@ -466,8 +440,7 @@ func TestTheJournalAnswersWhatHappened(t *testing.T) {
 	// The worker comes back after recovery gave up on it, and what it says is
 	// kept: it may be the only evidence the message arrived.
 	late, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
-		AttemptID: begun.AttemptID, LeaseToken: sendToken, Completion: acceptedCompletion(),
-		Receipt: json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
+		AttemptID: begun.AttemptID, LeaseToken: sendToken, Conclusion: accepted(),
 	})
 	if err != nil {
 		t.Fatalf("finalize late: %v", err)
@@ -795,7 +768,7 @@ func TestStateNobodyCanReadEndsTheCommitment(t *testing.T) {
 	// It is out of the queue, and out of it for good.
 	makeDue(t, s, intentID)
 	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
-		Family: testFamily, Provider: "slack", Phase: outbound.ClaimAny,
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimRetriesFirst,
 		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
 	})
 	if err != nil {
@@ -882,9 +855,11 @@ func TestALateResultIsKeptAsTheAttemptHadIt(t *testing.T) {
 
 	late := outbound.FinalizeRequest{
 		AttemptID: begun.AttemptID, LeaseToken: token,
-		Completion: acceptedCompletion(),
-		Receipt:    json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`),
-		Summary:    "ok",
+		Conclusion: conclusion(outbound.ConclusionInput{
+			Outcome: outbound.OutcomeAccepted, Status: "ok", Summary: "ok",
+			Receipt: receiptOf("C0001/1700000000.000100",
+				`{"channel":"C0001","ts":"1700000000.000100"}`),
+		}),
 	}
 	result, err := s.FinalizeDeliveryAttempt(context.Background(), late)
 	if err != nil {

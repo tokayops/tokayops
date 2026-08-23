@@ -95,11 +95,10 @@ func shareSlots(free int, demand map[string]int, tick uint64) map[string]int {
 // tick to tick, because a guarantee that evaporates exactly when the pool is
 // tight is not a guarantee.
 //
-// The retry share is claimed as "anything due", not as "retries only": the
-// store hands out the oldest due work first, which is what makes the share
-// reach the commitments that have been waiting longest instead of whatever
-// happens to be at hand.
-func splitPhases(limit, fresh, retries int, tick uint64) (first, any int) {
+// The second share is claimed retries-first rather than retries-only: it is
+// meant to reach the older queue, and when that queue is empty the slots go to
+// whatever is due instead of idling.
+func splitPhases(limit, fresh, retries int, tick uint64) (first, rest int) {
 	switch {
 	case limit <= 0:
 		return 0, 0
