@@ -133,7 +133,7 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	}
 	defer tx.Rollback()
 
-	if err := setLockTimeoutTx(ctx, tx); err != nil {
+	if err := setLockTimeoutTx(ctx, tx, s.lockTimeout); err != nil {
 		return outbound.ResolveAmbiguityResult{}, err
 	}
 

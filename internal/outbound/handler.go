@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
@@ -10,11 +11,12 @@ import (
 // What a channel has to be able to do, and nothing more.
 //
 // Two methods, because there are exactly two questions the domain cannot answer
-// for a provider: make the call, and say what the answer means in its own
-// dialect. Everything else - whether a call may be made at all, which revision
-// it carries, what happens to the commitment afterwards - is the domain's, and
-// a handler that could decide any of it could deliver a message the system
-// never agreed to send.
+// for a provider: make the call, and say what its own answer means in its own
+// dialect. Everything else - what a silence means, what an unrecognised answer
+// means, whether an acceptance is worth believing - is decided here, once, for
+// every channel there will ever be. A handler that could decide those could
+// turn a page nobody received into a success, and no reviewer of a new channel
+// would notice.
 //
 // Reconcile and ReduceProviderEvent are deliberately absent. Nothing in this
 // build can perform either, and an interface method with no implementation is a
@@ -45,6 +47,44 @@ const (
 	ProviderResponse Evidence = "provider_response"
 )
 
+// Receipt is where a message ended up: the name the object is known by, and the
+// whole of what the provider said about it.
+//
+// One value with no halves, because the halves are both dangerous. A reference
+// with nothing stored leaves a commitment that looks unsent to the next
+// revision, which would create a SECOND message beside the one that exists. A
+// stored blob with no reference cannot be fingerprinted, so a repeated result
+// reads as a contradiction.
+type Receipt struct {
+	ref string
+	raw json.RawMessage
+}
+
+// NewReceipt is the only way to make one, and it refuses anything that is not a
+// whole answer.
+func NewReceipt(ref string, raw json.RawMessage) (Receipt, error) {
+	if ref == "" {
+		return Receipt{}, fmt.Errorf("outbound: a receipt with nothing to call the message by")
+	}
+	if len(raw) == 0 {
+		return Receipt{}, fmt.Errorf("outbound: a receipt for %q with nothing recorded", ref)
+	}
+	if !json.Valid(raw) {
+		return Receipt{}, fmt.Errorf("outbound: the receipt for %q is not valid JSON", ref)
+	}
+	return Receipt{ref: ref, raw: raw}, nil
+}
+
+// Ref is the stable name the message is known by, and what the conclusion is
+// fingerprinted over.
+func (r Receipt) Ref() string { return r.ref }
+
+// Raw is what gets stored, and the domain never looks inside it.
+func (r Receipt) Raw() json.RawMessage { return r.raw }
+
+// Recorded says the provider told us where the message is.
+func (r Receipt) Recorded() bool { return r.ref != "" && len(r.raw) > 0 }
+
 // Result is what one call produced.
 type Result struct {
 	Evidence Evidence
@@ -52,16 +92,11 @@ type Result struct {
 	// Status is the provider's own code for what happened, when it answered.
 	Status string
 
-	// ReceiptRef is the stable name of the object the provider made, in one
-	// string: it is what the conclusion is fingerprinted over, so a repeat of
-	// the same result has to spell it the same way.
-	ReceiptRef string
+	// Receipt is set when the provider returned coordinates. Absent otherwise,
+	// including for an acceptance - which is then not believed.
+	Receipt Receipt
 
-	// Receipt is the whole of what came back about that object - the shape
-	// differs per provider, and the domain never looks inside it.
-	Receipt json.RawMessage
-
-	// Summary is a short, truncated account for the journal (NFR-7).
+	// Summary is a short account for the journal.
 	Summary string
 }
 
@@ -72,10 +107,16 @@ type Handler interface {
 	// enrichment follows it - never the recording of what happened.
 	ExecuteAttempt(ctx context.Context, call Call) (Result, error)
 
-	// Classify says what the provider's answer means. It is called for every
-	// result, including the ones with no answer at all, and ClassifyTransport
-	// below is the part of that decision it must not make for itself.
-	Classify(res Result, err error) (Outcome, string)
+	// ClassifyResponse says what the provider's OWN answer means, and is asked
+	// nothing else: it is never called for a request that failed before an
+	// answer arrived, because what those mean does not vary by provider.
+	//
+	// The bool is the honest half of the contract. A status this build has
+	// never seen is not a failure to be guessed at - returning false hands it
+	// to the rule that knows what to do with an unknown, and a handler that
+	// guessed instead would be declaring an absence its documentation does not
+	// prove.
+	ClassifyResponse(res Result) (outcome Outcome, class string, known bool)
 }
 
 // Call is everything a handler needs to make one call, and deliberately not the
@@ -104,52 +145,48 @@ type Call struct {
 	PayloadSchemaVersion int
 }
 
-// ClassifyTransport answers for everything that is not a provider's answer, and
-// a handler must not answer differently.
-//
-// The two cases it covers are the ones a provider cannot know about - its own
-// message never reached it - and they are also the two where a wrong answer is
-// most expensive. It returns false only for a real answer, which is where the
-// provider's dialect begins.
-func ClassifyTransport(res Result) (Outcome, string, bool) {
-	switch res.Evidence {
-	case DefinitelyNotSent:
-		// Proof of absence: nothing happened, so trying again costs nothing.
-		return OutcomeRetryableRejection, "transport_refused", true
-	case PossiblySent:
-		// The expensive honest answer. Calling this retryable would assert an
-		// absence nobody established, and a retry would then be a duplicate
-		// nobody could explain.
-		return OutcomeAmbiguous, "no_response", true
-	default:
-		return "", "", false
-	}
-}
+// Breach names a way a handler broke its contract. None of them stops a
+// delivery - the safe answer is recorded either way - but every one of them
+// means a channel is wrong, and a system that swallowed them would keep
+// delivering slightly incorrect answers forever.
+type Breach string
 
-// UnknownStatus is the default rule of the capability matrix, and it outranks
-// every line in it: a rejection may only be declared where the provider's own
-// documentation proves the effect did not happen. Everything else that comes
-// back from a request that went out is doubt.
-//
-// Getting this backwards is how a page is lost: "unknown code, probably a
-// failure, retry later" quietly discards a message that was delivered, or
-// fails a commitment that was never attempted.
-func UnknownStatus(status string) (Outcome, string) {
-	if status == "" {
-		return OutcomeAmbiguous, "unknown_response"
-	}
-	return OutcomeAmbiguous, "unknown_status"
-}
+const (
+	BreachNone Breach = ""
 
-// Conclude turns a handler's answer into the conclusion the store records, and
-// enforces the one thing a provider is not allowed to get wrong.
+	// BreachUnknownEvidence: the handler did not say what it could prove.
+	BreachUnknownEvidence Breach = "unknown_evidence"
+
+	// BreachUnknownOutcome: the handler classified an answer as something this
+	// domain does not have, or as a withdrawal, which is not a provider's to
+	// declare.
+	BreachUnknownOutcome Breach = "unknown_outcome"
+
+	// BreachAcceptanceWithoutReceipt: the provider said yes and would not say
+	// what it made.
+	BreachAcceptanceWithoutReceipt Breach = "acceptance_without_receipt"
+)
+
+// Conclude is the only path from what a handler saw to what the store records,
+// and the handler is asked exactly one question along the way.
 //
-// An acceptance has to come with the coordinates that prove it. "Yes, and I
-// will not tell you what I made" is not a delivery: the message cannot be
-// found, updated, resolved or shown to anybody afterwards. It is recorded as
-// doubt, and the breach is reported so it can be counted - a provider that does
-// this is broken, and the system that hid it would be too.
-func Conclude(res Result, outcome Outcome, class string) (keys.Completion, bool) {
+// It exists as one function because the alternative was tried: with the handler
+// classifying everything, a channel could declare a request that may have gone
+// out to be a clean failure, and the retry would be a second page with nothing
+// in the journal to explain it. The rules that cost a page when they are wrong
+// do not belong in the part of the system that a new channel adds.
+func Conclude(h Handler, res Result) (keys.Completion, Breach) {
+	outcome, class, breach := classify(h, res)
+
+	// An acceptance has to say what it made. "Yes, and I will not tell you
+	// where" leaves a message nothing can find, update or resolve - and leaves
+	// the commitment looking unsent, so the next revision would make a second
+	// one beside it.
+	if outcome == OutcomeAccepted && !res.Receipt.Recorded() {
+		outcome, class, breach = OutcomeAmbiguous,
+			string(BreachAcceptanceWithoutReceipt), BreachAcceptanceWithoutReceipt
+	}
+
 	completion := keys.Completion{Outcome: outcome}
 	if class != "" {
 		completion.ErrorClass = &class
@@ -158,16 +195,78 @@ func Conclude(res Result, outcome Outcome, class string) (keys.Completion, bool)
 		status := res.Status
 		completion.ProviderStatus = &status
 	}
-	if res.ReceiptRef != "" {
-		ref := res.ReceiptRef
+	if res.Receipt.Recorded() {
+		ref := res.Receipt.Ref()
 		completion.ReceiptRef = &ref
 	}
+	return completion, breach
+}
 
-	if outcome == OutcomeAccepted && res.ReceiptRef == "" {
-		completion.Outcome = OutcomeAmbiguous
-		broken := "acceptance_without_coordinates"
-		completion.ErrorClass = &broken
-		return completion, true
+// classify folds one result into an outcome. The two silent cases never reach
+// the handler; the third is the only one it is asked about.
+func classify(h Handler, res Result) (Outcome, string, Breach) {
+	switch res.Evidence {
+	case DefinitelyNotSent:
+		// Proof of absence: nothing happened, so trying again costs nothing.
+		return OutcomeRetryableRejection, "transport_refused", BreachNone
+
+	case PossiblySent:
+		// The expensive honest answer. Calling this retryable would assert an
+		// absence nobody established, and the retry would then be a duplicate
+		// nobody could explain.
+		return OutcomeAmbiguous, "no_response", BreachNone
+
+	case ProviderResponse:
+		outcome, class, known := h.ClassifyResponse(res)
+		if !known {
+			outcome, class := unknownStatus(res.Status)
+			return outcome, class, BreachNone
+		}
+		switch outcome {
+		case OutcomeAccepted, OutcomeRetryableRejection, OutcomePermanentRejection,
+			OutcomeAmbiguous:
+			return outcome, class, BreachNone
+		default:
+			// Including a withdrawal: a provider does not get to say that
+			// somebody changed their mind.
+			return OutcomeAmbiguous, string(BreachUnknownOutcome), BreachUnknownOutcome
+		}
+
+	default:
+		// A handler that will not say what it could prove has told us nothing
+		// about the message, and nothing is doubt.
+		return OutcomeAmbiguous, string(BreachUnknownEvidence), BreachUnknownEvidence
 	}
-	return completion, false
+}
+
+// unknownStatus is the default rule of the capability matrix, and it outranks
+// every line in it: a rejection may only be declared where the provider's own
+// documentation proves the effect did not happen. Everything else that comes
+// back from a request that went out is doubt.
+//
+// Getting this backwards is how a page is lost: "unknown code, probably a
+// failure, retry later" quietly discards a message that was delivered, or fails
+// a commitment that was never attempted.
+func unknownStatus(status string) (Outcome, string) {
+	if status == "" {
+		return OutcomeAmbiguous, "unknown_response"
+	}
+	return OutcomeAmbiguous, "unknown_status"
+}
+
+// SummaryLimit is how much of an account of a call is kept (NFR-7). Enough to
+// recognise what happened, not enough to make the journal a log sink.
+const SummaryLimit = 500
+
+// Summarise is what the journal keeps about a call: the handler's own account,
+// or the error if it did not give one, truncated.
+func Summarise(summary string, err error) string {
+	if summary == "" && err != nil {
+		summary = err.Error()
+	}
+	runes := []rune(summary)
+	if len(runes) <= SummaryLimit {
+		return summary
+	}
+	return string(runes[:SummaryLimit]) + "..."
 }

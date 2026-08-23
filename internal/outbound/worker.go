@@ -207,8 +207,17 @@ func (w *Worker) claim(ctx context.Context, free int, tick uint64) []Leased {
 				taken = append(taken, leased...)
 				got += len(leased)
 				remaining -= len(leased)
+
+				// Offered is offered, whether or not it produced rows. A
+				// first-attempt share that came back short means those rows
+				// are gone - somebody else has them - and counting only what
+				// arrived would leave the next pass splitting slots towards a
+				// queue that is already empty, while the retries beside it
+				// wait with the pool half idle.
 				if phase.kind == ClaimFirstAttempts {
-					fresh[provider] -= len(leased)
+					if fresh[provider] -= phase.limit; fresh[provider] < 0 {
+						fresh[provider] = 0
+					}
 				}
 			}
 
@@ -292,11 +301,14 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 	})
 	cancelAttempt()
 
-	outcome, class := channel.Classify(result, execErr)
-	completion, broken := Conclude(result, outcome, class)
-	if broken {
-		log.Printf("outbound worker %s: %s accepted %s without saying what it made; "+
-			"recorded as ambiguous", w.workerID, leased.Intent.Provider, begun.AttemptID)
+	completion, breach := Conclude(channel, result)
+	if breach != BreachNone {
+		// Not fatal to the delivery - the conclusion above is already the safe
+		// one - but a channel that does this is wrong, and silence here would
+		// keep it wrong.
+		log.Printf("outbound worker %s: %s broke its contract on attempt %s (%s); "+
+			"recorded as %s", w.workerID, leased.Intent.Provider, begun.AttemptID,
+			breach, completion.Outcome)
 	}
 
 	finalizeCtx, cancelFinalize := recording(detached)
@@ -304,8 +316,8 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 		AttemptID:  begun.AttemptID,
 		LeaseToken: leased.LeaseToken,
 		Completion: completion,
-		Receipt:    result.Receipt,
-		Summary:    result.Summary,
+		Receipt:    result.Receipt.Raw(),
+		Summary:    Summarise(result.Summary, execErr),
 	})
 	cancelFinalize()
 	if err != nil {

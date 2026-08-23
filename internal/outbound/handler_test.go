@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -12,23 +13,63 @@ import (
 // cost is asymmetric: what a silent transport means, and what an answer nobody
 // recognises means.
 
-// TestSilenceIsClassifiedByWhatItProves. A request that never left can be
+// wilfulHandler is a channel that answers however the test tells it to,
+// including in ways the contract forbids. Every one of these is a mistake a new
+// channel could plausibly make, and the point of the fold is that none of them
+// can turn into a delivered page or a discarded one.
+type wilfulHandler struct {
+	outcome Outcome
+	class   string
+	known   bool
+	asked   int
+}
+
+func (h *wilfulHandler) ExecuteAttempt(context.Context, Call) (Result, error) {
+	return Result{}, nil
+}
+
+func (h *wilfulHandler) ClassifyResponse(Result) (Outcome, string, bool) {
+	h.asked++
+	return h.outcome, h.class, h.known
+}
+
+// TestSilenceIsNotTheHandlersToClassify. A request that never left can be
 // retried for free. A request that may have gone out cannot: calling that a
 // failure asserts an absence nobody established, and the retry becomes a second
 // message with nothing in the record to explain it.
-func TestSilenceIsClassifiedByWhatItProves(t *testing.T) {
-	refused, class, decided := ClassifyTransport(Result{Evidence: DefinitelyNotSent})
-	if !decided || refused != OutcomeRetryableRejection {
-		t.Fatalf("a request that never left is %q (%q)", refused, class)
+//
+// Neither depends on the provider, so neither is asked of it - the whole reason
+// this fold exists is that a channel could get them wrong and nobody reviewing
+// that channel would see a page go missing.
+func TestSilenceIsNotTheHandlersToClassify(t *testing.T) {
+	cases := []struct {
+		evidence Evidence
+		want     Outcome
+	}{
+		{DefinitelyNotSent, OutcomeRetryableRejection},
+		{PossiblySent, OutcomeAmbiguous},
 	}
 
-	unknown, class, decided := ClassifyTransport(Result{Evidence: PossiblySent})
-	if !decided || unknown != OutcomeAmbiguous {
-		t.Fatalf("a request that may have arrived is %q (%q)", unknown, class)
-	}
+	for _, tc := range cases {
+		t.Run(string(tc.evidence), func(t *testing.T) {
+			// The handler tries to say the opposite of the rule.
+			handler := &wilfulHandler{outcome: OutcomePermanentRejection, known: true}
+			if tc.want == OutcomePermanentRejection {
+				handler.outcome = OutcomeAccepted
+			}
 
-	if _, _, decided := ClassifyTransport(Result{Evidence: ProviderResponse}); decided {
-		t.Fatal("the domain answered for a provider's own reply")
+			completion, breach := Conclude(handler, Result{Evidence: tc.evidence})
+			if completion.Outcome != tc.want {
+				t.Fatalf("%s was concluded as %q, want %q",
+					tc.evidence, completion.Outcome, tc.want)
+			}
+			if handler.asked != 0 {
+				t.Fatal("the provider was asked what its own silence meant")
+			}
+			if breach != BreachNone {
+				t.Fatalf("a well behaved silence was reported as %q", breach)
+			}
+		})
 	}
 }
 
@@ -37,14 +78,58 @@ func TestSilenceIsClassifiedByWhatItProves(t *testing.T) {
 // the provider's documentation proves the effect did not happen.
 func TestAnAnswerNobodyRecognisesIsDoubt(t *testing.T) {
 	for _, status := range []string{"", "teapot", "some_new_code_slack_added"} {
-		outcome, class := UnknownStatus(status)
-		if outcome != OutcomeAmbiguous {
-			t.Fatalf("status %q was classified %q (%q); an unrecognised answer is doubt",
-				status, outcome, class)
+		// A handler that does not recognise a status says so rather than
+		// guessing, and what it half-said is discarded.
+		handler := &wilfulHandler{outcome: OutcomePermanentRejection, class: "guessed"}
+		completion, breach := Conclude(handler,
+			Result{Evidence: ProviderResponse, Status: status})
+
+		if completion.Outcome != OutcomeAmbiguous {
+			t.Fatalf("status %q was concluded as %q; an unrecognised answer is doubt",
+				status, completion.Outcome)
 		}
-		if class == "" {
-			t.Fatalf("status %q was classified without a reason", status)
+		if completion.ErrorClass == nil || *completion.ErrorClass == "guessed" {
+			t.Fatalf("status %q kept the guess the handler did not stand behind", status)
 		}
+		if breach != BreachNone {
+			t.Fatalf("a handler admitting it does not know is not a breach: %q", breach)
+		}
+	}
+}
+
+// TestAHandlerCannotInventAnOutcome. The outcomes are a closed set and a
+// withdrawal is not a provider's to declare - somebody changing their mind is
+// not something Slack can observe.
+func TestAHandlerCannotInventAnOutcome(t *testing.T) {
+	for _, outcome := range []Outcome{"delivered_probably", OutcomeCanceled, ""} {
+		handler := &wilfulHandler{outcome: outcome, class: "whatever", known: true}
+		completion, breach := Conclude(handler,
+			Result{Evidence: ProviderResponse, Status: "ok"})
+
+		if completion.Outcome != OutcomeAmbiguous {
+			t.Fatalf("a handler answering %q produced %q", outcome, completion.Outcome)
+		}
+		if breach != BreachUnknownOutcome {
+			t.Fatalf("a handler answering %q was reported as %q", outcome, breach)
+		}
+	}
+}
+
+// TestAHandlerThatWillNotSayWhatItProved gets the safe answer and is reported.
+// A result with no evidence has told us nothing about the message, and nothing
+// is doubt.
+func TestAHandlerThatWillNotSayWhatItProved(t *testing.T) {
+	handler := &wilfulHandler{outcome: OutcomeAccepted, known: true}
+	completion, breach := Conclude(handler, Result{Status: "ok"})
+
+	if completion.Outcome != OutcomeAmbiguous {
+		t.Fatalf("a result with no evidence was concluded as %q", completion.Outcome)
+	}
+	if breach != BreachUnknownEvidence {
+		t.Fatalf("it was reported as %q", breach)
+	}
+	if handler.asked != 0 {
+		t.Fatal("a result with no evidence was still handed to the provider")
 	}
 }
 
@@ -53,27 +138,29 @@ func TestAnAnswerNobodyRecognisesIsDoubt(t *testing.T) {
 // It is recorded as doubt, and the provider's breach is reported rather than
 // absorbed.
 func TestAnAcceptanceHasToSayWhatItMade(t *testing.T) {
-	completion, broken := Conclude(Result{
-		Evidence: ProviderResponse, Status: "ok",
-	}, OutcomeAccepted, "")
-	if !broken {
-		t.Fatal("an acceptance with no coordinates was taken at its word")
+	accepting := &wilfulHandler{outcome: OutcomeAccepted, known: true}
+
+	bare, breach := Conclude(accepting, Result{Evidence: ProviderResponse, Status: "ok"})
+	if breach != BreachAcceptanceWithoutReceipt {
+		t.Fatalf("an acceptance with no receipt was reported as %q", breach)
 	}
-	if completion.Outcome != OutcomeAmbiguous {
-		t.Fatalf("it was recorded as %q", completion.Outcome)
+	if bare.Outcome != OutcomeAmbiguous {
+		t.Fatalf("it was recorded as %q", bare.Outcome)
 	}
-	if completion.ErrorClass == nil || *completion.ErrorClass == "" {
+	if bare.ErrorClass == nil || *bare.ErrorClass == "" {
 		t.Fatal("the breach was recorded without saying what it was")
 	}
 
-	whole, broken := Conclude(Result{
-		Evidence:   ProviderResponse,
-		Status:     "ok",
-		ReceiptRef: "C0001/1700000000.000100",
-		Receipt:    json.RawMessage(`{"channel":"C0001"}`),
-	}, OutcomeAccepted, "")
-	if broken {
-		t.Fatal("a complete acceptance was reported as a breach")
+	receipt, err := NewReceipt("C0001/1700000000.000100",
+		json.RawMessage(`{"channel":"C0001","ts":"1700000000.000100"}`))
+	if err != nil {
+		t.Fatalf("build a receipt: %v", err)
+	}
+	whole, breach := Conclude(accepting, Result{
+		Evidence: ProviderResponse, Status: "ok", Receipt: receipt,
+	})
+	if breach != BreachNone {
+		t.Fatalf("a complete acceptance was reported as %q", breach)
 	}
 	if whole.Outcome != OutcomeAccepted {
 		t.Fatalf("a complete acceptance became %q", whole.Outcome)
@@ -90,13 +177,52 @@ func TestAnAcceptanceHasToSayWhatItMade(t *testing.T) {
 	}
 }
 
+// TestAReceiptIsWholeOrNothing. Half a receipt is worse than none: a reference
+// with nothing stored leaves the commitment looking unsent, and the next
+// revision would create a SECOND message beside the one that exists.
+func TestAReceiptIsWholeOrNothing(t *testing.T) {
+	cases := map[string]struct {
+		ref string
+		raw json.RawMessage
+	}{
+		"nothing to call it by":      {"", json.RawMessage(`{"channel":"C0001"}`)},
+		"nothing recorded":           {"C0001/1700000000.000100", nil},
+		"an empty body":              {"C0001/1700000000.000100", json.RawMessage("")},
+		"something that is not JSON": {"C0001/1700000000.000100", json.RawMessage("{oops")},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			receipt, err := NewReceipt(tc.ref, tc.raw)
+			if err == nil {
+				t.Fatalf("half a receipt was accepted: %+v", receipt)
+			}
+			if receipt.Recorded() {
+				t.Fatal("the refused receipt still says it recorded something")
+			}
+		})
+	}
+
+	// And what a handler cannot build, it cannot smuggle past the fold: an
+	// acceptance carrying the zero value is doubt.
+	completion, breach := Conclude(&wilfulHandler{outcome: OutcomeAccepted, known: true},
+		Result{Evidence: ProviderResponse, Status: "ok", Receipt: Receipt{}})
+	if completion.Outcome != OutcomeAmbiguous || breach != BreachAcceptanceWithoutReceipt {
+		t.Fatalf("an acceptance with an empty receipt concluded %q (%q)",
+			completion.Outcome, breach)
+	}
+}
+
 // TestAConclusionCarriesWhatTheProviderSaid keeps the journal answerable: the
 // status and the reason are what somebody reads months later, and a conclusion
 // that dropped them would leave "ambiguous" with no story.
 func TestAConclusionCarriesWhatTheProviderSaid(t *testing.T) {
-	completion, _ := Conclude(Result{
+	handler := &wilfulHandler{
+		outcome: OutcomeRetryableRejection, class: "rate_limited", known: true,
+	}
+	completion, _ := Conclude(handler, Result{
 		Evidence: ProviderResponse, Status: "ratelimited",
-	}, OutcomeRetryableRejection, "rate_limited")
+	})
 
 	if completion.ProviderStatus == nil || *completion.ProviderStatus != "ratelimited" {
 		t.Fatalf("the provider's own code was dropped: %+v", completion.ProviderStatus)

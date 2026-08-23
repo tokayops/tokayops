@@ -32,6 +32,24 @@ import (
 
 const raceRounds = 12
 
+// raceLockTimeout is what these tests set the store's lock bound to.
+//
+// The production bound is a few seconds, which is right for production and
+// useless here: a machine with something else on it makes an ordinary
+// acknowledgement take longer than that, and the timeout that follows says
+// nothing about who took which row first - the question these tests exist to
+// ask. Raised to a minute, a timeout means something held an alert group for a
+// minute, and that is worth failing over whatever caused it.
+const raceLockTimeout = 60 * time.Second
+
+// measuringLockOrder raises the bound for one test and puts it back.
+func measuringLockOrder(t *testing.T, s *Store) {
+	t.Helper()
+	previous := s.lockTimeout
+	s.lockTimeout = raceLockTimeout
+	t.Cleanup(func() { s.lockTimeout = previous })
+}
+
 // lockFailure names the way concurrency broke, or returns "" if the error is
 // about something else.
 func lockFailure(err error) string {
@@ -89,32 +107,20 @@ func (r *raceRound) check(t *testing.T, other string) {
 		if e.err == nil {
 			continue
 		}
-		switch kind := lockFailure(e.err); kind {
-		case "":
-			t.Fatalf("%s failed: %v", e.who, e.err)
-
-		case "a deadlock":
-			// Never excused. A cycle is a cycle at any speed: two transactions
-			// took the same two rows in opposite orders, and no amount of load
-			// invents that.
-			t.Fatalf("the acknowledgement and %s met in a deadlock, which is the "+
-				"lock order being wrong: %v", other, e.err)
-
-		default:
-			// A timeout means the other side held the alert group for longer
-			// than the store lets anybody wait. Under the lock order that can
-			// only happen if the holder itself was slow - so if the pair took
-			// longer than that bound to run at all, this machine cannot answer
-			// the question, and saying so is honest where failing would blame
-			// the code for the host.
-			if slowest := r.slowest(); slowest >= outbound.NotificationLockTimeout {
-				t.Skipf("the acknowledgement and %s met in %s, and the pair took %s "+
-					"to run at all - too slow to tell a lock-order fault from a "+
-					"starved database", other, kind, slowest)
-			}
-			t.Fatalf("the acknowledgement and %s met in %s after %s: %v",
+		if kind := lockFailure(e.err); kind != "" {
+			// All three are failures, and none of them is excusable at the
+			// bound these tests run under. A deadlock is a cycle, which no
+			// amount of load invents. A timeout means somebody held the alert
+			// group for a minute, which nothing here legitimately does.
+			//
+			// The duration is reported because it is the first thing to look
+			// at: a pair that took most of that minute says the machine was
+			// the problem, and one that took milliseconds says the lock order
+			// was.
+			t.Fatalf("the acknowledgement and %s met in %s; the pair took %s: %v",
 				other, kind, r.slowest(), e.err)
 		}
+		t.Fatalf("%s failed: %v", e.who, e.err)
 	}
 }
 
@@ -194,6 +200,7 @@ func startTogether(work ...func()) {
 // it.
 func TestAcknowledgementRacesADeliveryThatLanded(t *testing.T) {
 	s := setupTestDB(t)
+	measuringLockOrder(t, s)
 
 	rounds := make([]*raceRound, raceRounds)
 	for i := range rounds {
@@ -248,6 +255,7 @@ func TestAcknowledgementRacesADeliveryThatLanded(t *testing.T) {
 // takes the alert first, exactly like a success does.
 func TestAcknowledgementRacesAnAssumedDelivery(t *testing.T) {
 	s := setupTestDB(t)
+	measuringLockOrder(t, s)
 
 	rounds := make([]*raceRound, raceRounds)
 	for i := range rounds {
@@ -289,6 +297,7 @@ func TestAcknowledgementRacesAnAssumedDelivery(t *testing.T) {
 // of an alert that says nothing happened.
 func TestAcknowledgementRacesRecovery(t *testing.T) {
 	s := setupTestDB(t)
+	measuringLockOrder(t, s)
 
 	rounds := make([]*raceRound, raceRounds)
 	for i := range rounds {
@@ -398,6 +407,7 @@ func assertAssumedOrWithdrawn(t *testing.T, s *Store, round *raceRound) {
 // rate nobody can predict, and only under load.
 func TestTheJournalIsOneInstant(t *testing.T) {
 	s := setupTestDB(t)
+	measuringLockOrder(t, s)
 
 	rounds := make([]*raceRound, raceRounds)
 	for i := range rounds {

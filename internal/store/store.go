@@ -14,6 +14,7 @@ import (
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 )
 
 // activeUserCTE is the head of every statement that creates something owned by
@@ -75,6 +76,13 @@ var ErrLastAdmin = errors.New("store: cannot demote the last admin")
 
 type Store struct {
 	db *sql.DB
+
+	// lockTimeout is how long a point mutation waits for a row somebody else
+	// is holding. It is a field rather than the constant it is set from
+	// because a test that measures the lock ORDER has to be able to raise it:
+	// at three seconds, a loaded machine produces timeouts that say nothing
+	// about who took which row first.
+	lockTimeout time.Duration
 }
 
 func (s *Store) Close() error {
@@ -99,7 +107,7 @@ func NewStore(dsn string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, lockTimeout: outbound.NotificationLockTimeout}, nil
 }
 
 func (s *Store) InitDB() error {

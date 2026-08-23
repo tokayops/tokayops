@@ -34,12 +34,6 @@ const (
 	// already been told to redo.
 	NotificationAttemptDeadline = 25 * time.Second
 
-	// NotificationShutdownDeadline is how long a stopping worker waits for the
-	// attempts it holds. Longer than one attempt because the alternative is
-	// abandoning a call whose result is then unknowable - the expensive
-	// outcome, not the tidy one.
-	NotificationShutdownDeadline = 40 * time.Second
-
 	// NotificationPoolSize is how many attempts one instance runs at once, and
 	// therefore how many leases it may hold: a lease is only taken when a slot
 	// is free.
@@ -65,6 +59,19 @@ const (
 	// is refused by the rule that knows why rather than by a cancelled
 	// context, and far shorter than the lease.
 	NotificationRecordDeadline = 10 * time.Second
+
+	// NotificationShutdownDeadline is how long a stopping worker waits for the
+	// attempts it holds.
+	//
+	// Spelled as the sum of what one commitment can take rather than as a
+	// number, because a number drifts: written as forty seconds it was already
+	// shorter than the chain it was meant to cover, and a worker that walked
+	// away at forty would abandon a call whose answer had just arrived - the
+	// one outcome nobody can recover from afterwards. The slack is for the
+	// scheduling between the steps.
+	NotificationShutdownDeadline = NotificationPrepareDeadline +
+		NotificationRecordDeadline + NotificationAttemptDeadline +
+		NotificationRecordDeadline + 10*time.Second
 )
 
 const (

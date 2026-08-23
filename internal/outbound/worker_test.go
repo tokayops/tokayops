@@ -24,10 +24,12 @@ type fakeStore struct {
 	beginOut BeginAttemptResult
 	beginErr error
 
-	// available is how many rows each provider really has left to give, which
-	// is what makes an undershoot possible: the aggregate says one thing and
-	// the claim finds another.
-	available map[string]int
+	// available is what each provider's two queues really hold, which is what
+	// makes an undershoot possible: the aggregate says one thing and the claim
+	// finds another. They are separate because the store's two phases are:
+	// asking for first attempts cannot return a retry, and a claim for
+	// anything takes the oldest first, which is the retries.
+	available map[string]*queues
 
 	claims    []ClaimRequest
 	begins    []BeginAttemptRequest
@@ -37,9 +39,15 @@ type fakeStore struct {
 	nextID    int
 }
 
+// queues is one provider's work, split the way the store splits it.
+type queues struct {
+	fresh   int
+	retries int
+}
+
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		available: map[string]int{},
+		available: map[string]*queues{},
 		beginOut: BeginAttemptResult{
 			Outcome:              BeginStarted,
 			AttemptKind:          AttemptCreate,
@@ -83,14 +91,31 @@ func (f *fakeStore) ClaimDueIntents(_ context.Context, req ClaimRequest) ([]Leas
 	}
 
 	give := req.Limit
-	if left, tracked := f.available[req.Provider]; tracked && left < give {
-		give = left
+	if have, tracked := f.available[req.Provider]; tracked {
+		switch req.Phase {
+		case ClaimFirstAttempts:
+			if give > have.fresh {
+				give = have.fresh
+			}
+			have.fresh -= give
+		default:
+			// Oldest first, which is the retries, and whatever is left of the
+			// share comes from the untried work.
+			taken := give
+			if taken > have.retries {
+				taken = have.retries
+			}
+			have.retries -= taken
+			rest := give - taken
+			if rest > have.fresh {
+				rest = have.fresh
+			}
+			have.fresh -= rest
+			give = taken + rest
+		}
 	}
 	if give < 0 {
 		give = 0
-	}
-	if _, tracked := f.available[req.Provider]; tracked {
-		f.available[req.Provider] -= give
 	}
 
 	leased := make([]Leased, 0, give)
@@ -152,6 +177,7 @@ type fakeChannel struct {
 	execErr     error
 	outcome     Outcome
 	class       string
+	known       bool
 
 	// block holds ExecuteAttempt until it is closed, which is how the tests
 	// look at a worker with attempts genuinely in flight.
@@ -165,11 +191,20 @@ func newFakeChannel() *fakeChannel {
 		preparation: Ready("C-proposed"),
 		result: Result{
 			Evidence: ProviderResponse, Status: "ok",
-			ReceiptRef: "C-bound/1700000000.000100",
-			Receipt:    json.RawMessage(`{"channel":"C-bound","ts":"1700000000.000100"}`),
+			Receipt: mustReceipt("C-bound/1700000000.000100",
+				`{"channel":"C-bound","ts":"1700000000.000100"}`),
 		},
 		outcome: OutcomeAccepted,
+		known:   true,
 	}
+}
+
+func mustReceipt(ref, raw string) Receipt {
+	receipt, err := NewReceipt(ref, json.RawMessage(raw))
+	if err != nil {
+		panic(err)
+	}
+	return receipt
 }
 
 func (c *fakeChannel) Prepare(context.Context, Intent) Preparation {
@@ -194,10 +229,10 @@ func (c *fakeChannel) ExecuteAttempt(ctx context.Context, call Call) (Result, er
 	return result, err
 }
 
-func (c *fakeChannel) Classify(Result, error) (Outcome, string) {
+func (c *fakeChannel) ClassifyResponse(Result) (Outcome, string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.outcome, c.class
+	return c.outcome, c.class, c.known
 }
 
 func (c *fakeChannel) made() []Call {
@@ -218,7 +253,7 @@ func testWorker(store outboundStore, channels map[string]Channel) *Worker {
 func TestATickTakesOnlyWhatItCanRun(t *testing.T) {
 	store := newFakeStore()
 	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 100, ClaimableFresh: 100}}
-	store.available["slack"] = 100
+	store.available["slack"] = &queues{fresh: 100}
 
 	channel := newFakeChannel()
 	channel.block = make(chan struct{})
@@ -269,7 +304,7 @@ func TestWorkNobodyHereCanDoIsLeftAlone(t *testing.T) {
 		{Provider: "slack", ClaimableDue: 5, ClaimableFresh: 5},
 		{Provider: "telegram", ClaimableDue: 5, ClaimableFresh: 5},
 	}
-	store.available["telegram"] = 5
+	store.available["telegram"] = &queues{fresh: 5}
 
 	w := testWorker(store, map[string]Channel{"telegram": newFakeChannel()})
 	w.tick(context.Background())
@@ -293,7 +328,7 @@ func TestWorkNobodyHereCanDoIsLeftAlone(t *testing.T) {
 func TestAnAttemptIsMadeFromWhatTheStoreSaid(t *testing.T) {
 	store := newFakeStore()
 	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
-	store.available["slack"] = 1
+	store.available["slack"] = &queues{fresh: 1}
 
 	channel := newFakeChannel()
 	w := testWorker(store, map[string]Channel{"slack": channel})
@@ -340,7 +375,7 @@ func TestAnAttemptIsMadeFromWhatTheStoreSaid(t *testing.T) {
 func TestARefusedPreparationNeverReachesTheProvider(t *testing.T) {
 	store := newFakeStore()
 	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
-	store.available["slack"] = 1
+	store.available["slack"] = &queues{fresh: 1}
 
 	channel := newFakeChannel()
 	channel.preparation = Impossible("identity_not_linked", "nobody has linked this user")
@@ -363,6 +398,40 @@ func TestARefusedPreparationNeverReachesTheProvider(t *testing.T) {
 	}
 	if len(store.finalized) != 0 {
 		t.Fatal("a call that never happened was finalised")
+	}
+}
+
+// TestTheWorkerDoesNotLetAChannelClassifyASilence is the fold seen from
+// outside. The channel here is one that would call a request that may have gone
+// out a clean success - the mistake that turns a page nobody received into a
+// delivery - and the worker never gives it the chance.
+func TestTheWorkerDoesNotLetAChannelClassifyASilence(t *testing.T) {
+	store := newFakeStore()
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
+	store.available["slack"] = &queues{fresh: 1}
+
+	channel := newFakeChannel()
+	channel.result = Result{Evidence: PossiblySent}
+	channel.execErr = errors.New("read tcp: i/o timeout")
+	channel.outcome, channel.known = OutcomeAccepted, true
+
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	w.tick(context.Background())
+	w.running.Wait()
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.finalized) != 1 {
+		t.Fatalf("%d results were recorded", len(store.finalized))
+	}
+	recorded := store.finalized[0]
+	if recorded.Completion.Outcome != OutcomeAmbiguous {
+		t.Fatalf("a request that may have gone out was recorded as %q",
+			recorded.Completion.Outcome)
+	}
+	// And the account of it survives, which is all the journal will have.
+	if recorded.Summary == "" {
+		t.Fatal("nothing was recorded about why the call ended")
 	}
 }
 
@@ -419,8 +488,8 @@ func TestAnUndershotClaimIsOfferedToSomebodyElse(t *testing.T) {
 		{Provider: "telegram", ClaimableDue: 50, ClaimableFresh: 50},
 	}
 	// Slack's backlog is gone by the time the claim arrives; Telegram's is real.
-	store.available["slack"] = 0
-	store.available["telegram"] = 50
+	store.available["slack"] = &queues{}
+	store.available["telegram"] = &queues{fresh: 50}
 
 	channel := newFakeChannel()
 	channel.block = make(chan struct{})
@@ -447,12 +516,40 @@ func TestAnUndershotClaimIsOfferedToSomebodyElse(t *testing.T) {
 	w.running.Wait()
 }
 
+// TestAFreshShareThatCameBackEmptyDoesNotMaskTheRetries.
+//
+// The aggregate said five untried and five waiting. Between the aggregate and
+// the claim another instance took every untried one - so the share reserved for
+// them comes back with nothing, and the question is what the next pass believes.
+// Counting only the rows that arrived leaves the tick convinced there are still
+// five untried, so it splits the remaining slots towards an empty queue again
+// and again, while the retries sit there and the pool runs at a third of its
+// capacity.
+func TestAFreshShareThatCameBackEmptyDoesNotMaskTheRetries(t *testing.T) {
+	store := newFakeStore()
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 10, ClaimableFresh: 5}}
+	store.available["slack"] = &queues{fresh: 0, retries: 5}
+
+	channel := newFakeChannel()
+	channel.block = make(chan struct{})
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	w.tick(context.Background())
+
+	if got := int(w.inflight.Load()); got != 5 {
+		t.Fatalf("the tick took %d of the 5 commitments that were actually there, "+
+			"with %d slots free", got, NotificationPoolSize)
+	}
+
+	close(channel.block)
+	w.running.Wait()
+}
+
 // TestAQueueThatCannotGiveAnythingEndsTheTick: when nothing can be claimed at
 // all, the pass stops instead of asking again forever.
 func TestAQueueThatCannotGiveAnythingEndsTheTick(t *testing.T) {
 	store := newFakeStore()
 	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 50, ClaimableFresh: 50}}
-	store.available["slack"] = 0
+	store.available["slack"] = &queues{}
 
 	w := testWorker(store, map[string]Channel{"slack": newFakeChannel()})
 

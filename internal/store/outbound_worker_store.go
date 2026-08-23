@@ -268,7 +268,7 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 	}
 	defer tx.Rollback()
 
-	if err := setLockTimeoutTx(ctx, tx); err != nil {
+	if err := setLockTimeoutTx(ctx, tx, s.lockTimeout); err != nil {
 		return nil, err
 	}
 	if lockGroup {
@@ -389,7 +389,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	}
 	defer tx.Rollback()
 
-	if err := setLockTimeoutTx(ctx, tx); err != nil {
+	if err := setLockTimeoutTx(ctx, tx, s.lockTimeout); err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
 
@@ -798,7 +798,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	}
 	defer tx.Rollback()
 
-	if err := setLockTimeoutTx(ctx, tx); err != nil {
+	if err := setLockTimeoutTx(ctx, tx, s.lockTimeout); err != nil {
 		return outbound.FinalizeResult{}, err
 	}
 	if lockGroup {

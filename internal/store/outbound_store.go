@@ -720,10 +720,12 @@ func lockAlertGroupTx(ctx context.Context, tx *sql.Tx, alertGroupID string) erro
 // else holds. Waiting longer than the lease it is protecting would mean
 // applying a decision that has already been handed to another worker; a
 // timeout, by contrast, is a retry of a mutation that classifies itself.
-func setLockTimeoutTx(ctx context.Context, tx *sql.Tx) error {
+func setLockTimeoutTx(ctx context.Context, tx *sql.Tx, wait time.Duration) error {
+	if wait <= 0 {
+		wait = outbound.NotificationLockTimeout
+	}
 	_, err := tx.ExecContext(ctx,
-		fmt.Sprintf("SET LOCAL lock_timeout = '%dms'",
-			outbound.NotificationLockTimeout.Milliseconds()))
+		fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", wait.Milliseconds()))
 	return err
 }
 
