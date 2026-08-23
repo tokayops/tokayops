@@ -36,6 +36,21 @@ func outboundContractf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrOutboundContract, fmt.Sprintf(format, args...))
 }
 
+// ErrUndeliverable marks a contract violation that belongs to ONE commitment
+// and that no amount of retrying will change: the state it renders from cannot
+// be read back, or the call it needs is not one this build makes.
+//
+// It is separate from the rest because it has a different consequence. A
+// violation of the schema or of the grammar is a broken deployment and has to
+// stop the caller; this one is a broken row, and stopping the caller over it
+// would hand the same commitment out of the queue forever.
+var ErrUndeliverable = errors.New("store: this commitment cannot produce a call")
+
+func undeliverablef(format string, args ...any) error {
+	return fmt.Errorf("%w: %w: %s", ErrOutboundContract, ErrUndeliverable,
+		fmt.Sprintf(format, args...))
+}
+
 // SubmitEscalationBatch admits an escalation: the claim, its commitments, the
 // state they are about, and the policy the group was escalated by, in one
 // commit.
@@ -767,7 +782,7 @@ func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (sto
 		FROM outbound_group_snapshots WHERE alert_group_id = $1`,
 		alertGroupID).Scan(&raw, &revision, &schemaVersion, &digest, &final)
 	if errors.Is(err, sql.ErrNoRows) {
-		return storedSnapshot{}, outboundContractf(
+		return storedSnapshot{}, undeliverablef(
 			"alert group %s has commitments but no state for them to render from", alertGroupID)
 	}
 	if err != nil {
@@ -775,7 +790,7 @@ func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (sto
 	}
 
 	if schemaVersion != keys.RenderSnapshotSchemaV1 {
-		return storedSnapshot{}, outboundContractf(
+		return storedSnapshot{}, undeliverablef(
 			"the state of %s was written under schema version %d, which this build cannot render",
 			alertGroupID, schemaVersion)
 	}
@@ -785,18 +800,18 @@ func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (sto
 		// A stored snapshot that no longer canonicalises is refused rather than
 		// rendered: the message it would produce is not the one its key
 		// describes.
-		return storedSnapshot{}, outboundContractf(
+		return storedSnapshot{}, undeliverablef(
 			"the stored state of %s cannot be read back: %v", alertGroupID, err)
 	}
 
 	if !bytes.Equal(snapshot.Digest(), digest) {
-		return storedSnapshot{}, outboundContractf(
+		return storedSnapshot{}, undeliverablef(
 			"the stored state of %s no longer matches the digest its commitments were keyed against",
 			alertGroupID)
 	}
 	content := snapshot.Content()
 	if content.AlertGroupID != alertGroupID || content.Revision != revision {
-		return storedSnapshot{}, outboundContractf(
+		return storedSnapshot{}, undeliverablef(
 			"the state stored for %s at revision %d describes %s at revision %d",
 			alertGroupID, revision, content.AlertGroupID, content.Revision)
 	}

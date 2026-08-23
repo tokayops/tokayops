@@ -796,6 +796,50 @@ func TestFinalizeClassifiesEveryWayItCanBeCalled(t *testing.T) {
 			t.Fatalf("finalizing nothing answered %q", result.Outcome)
 		}
 	})
+
+	// The rungs above are climbed before anything the caller SAID is read. A
+	// request can be malformed and unauthorised at the same time, and answering
+	// the malformed part first would tell a stranger which attempts exist.
+	overreaching := func() keys.Completion {
+		revision := int64(0)
+		completion := acceptedCompletion()
+		completion.AppliedRevision = &revision
+		return completion
+	}
+
+	t.Run("an attempt nobody has, from a caller claiming too much", func(t *testing.T) {
+		result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+			AttemptID: "00000000-0000-0000-0000-000000000000", LeaseToken: "t",
+			Completion: overreaching(),
+		})
+		if err != nil {
+			t.Fatalf("finalizing nothing was refused for its content: %v", err)
+		}
+		if result.Outcome != outbound.FinalizeNotFound {
+			t.Fatalf("finalizing nothing answered %q", result.Outcome)
+		}
+	})
+
+	t.Run("a stranger claiming too much", func(t *testing.T) {
+		agID := outboundGroup(t, s)
+		intentID := admitOne(t, s, agID)[0]
+		token := claimOne(t, s, intentID)
+		begun := beginOne(t, s, intentID, token)
+
+		result, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+			AttemptID: begun.AttemptID, LeaseToken: "somebody else's token",
+			Completion: overreaching(),
+		})
+		if err != nil {
+			t.Fatalf("a stranger's request was refused for its content: %v", err)
+		}
+		if result.Outcome != outbound.FinalizeLeaseLost {
+			t.Fatalf("a stranger's conclusion answered %q", result.Outcome)
+		}
+		if statusOf(t, s, intentID) != outbound.StatusSending {
+			t.Fatal("a stranger's conclusion moved the commitment")
+		}
+	})
 }
 
 // TestAcknowledgementMeetsADeliveryInFlight is what the domain exists to make

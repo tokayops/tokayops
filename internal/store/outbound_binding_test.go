@@ -50,16 +50,6 @@ func countEvents(t *testing.T, s *Store, intentID, kind string) int {
 	return n
 }
 
-func countAttempts(t *testing.T, s *Store, intentID string) int {
-	t.Helper()
-	var n int
-	if err := s.db.QueryRow(
-		`SELECT count(*) FROM outbound_attempts WHERE intent_id = $1`, intentID).Scan(&n); err != nil {
-		t.Fatalf("count the attempts: %v", err)
-	}
-	return n
-}
-
 // TestTheGenerationBindsTheEffectOnce is the invariant the generation exists
 // for. A retry of a call that may have happened has to reach the same place
 // under the same key - if the recipient was relinked in between, following the
@@ -224,6 +214,9 @@ func TestARefusedPreparationDoesNotConsumeTheBinding(t *testing.T) {
 // produces that digest, or describes something else entirely, rendering it
 // would send a message the key does not describe - and the provider would
 // happily deduplicate the two as one.
+//
+// Each of these is a refusal that ends the commitment, because none of them
+// heals: what the key names is gone, and no retry brings it back.
 func TestStateThatNoLongerMatchesItsKeyIsRefused(t *testing.T) {
 	s := setupTestDB(t)
 
@@ -281,15 +274,19 @@ func TestStateThatNoLongerMatchesItsKeyIsRefused(t *testing.T) {
 			token := claimOne(t, s, intentID)
 			tc.corrupt(t, s, agID)
 
-			_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+			result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 				IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 				Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
 			})
-			if !errors.Is(err, ErrOutboundContract) {
-				t.Fatalf("the send went ahead on state that does not match its key: %v", err)
+			if err != nil {
+				t.Fatalf("begin: %v", err)
 			}
-			if got := countAttempts(t, s, intentID); got != 0 {
-				t.Fatalf("the refusal still left %d attempts behind", got)
+			if result.Outcome != outbound.BeginPreparedPermanent {
+				t.Fatalf("the send answered %q on state that does not match its key",
+					result.Outcome)
+			}
+			if started := attemptsStarted(t, s, intentID); started != 0 {
+				t.Fatalf("the refusal still left %d calls behind", started)
 			}
 		})
 	}
@@ -651,25 +648,176 @@ func TestTheCallIsDecidedByTheRecord(t *testing.T) {
 		token := claimOne(t, s, intentID)
 
 		// A card that has already been posted. Changing one is a call this
-		// build does not make, and the refusal has to be loud rather than a
-		// second create at the same address.
+		// build does not make, so nothing is sent - and the record says which
+		// call was needed rather than quietly creating a second object at the
+		// same address.
 		if _, err := s.db.Exec(
 			`UPDATE outbound_intents SET receipt = $2::jsonb WHERE id = $1`,
 			intentID, `{"channel":"C0001","ts":"1700000000.000100"}`); err != nil {
 			t.Fatalf("give the commitment an object: %v", err)
 		}
 
-		_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 			Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
 		})
-		if !errors.Is(err, ErrOutboundContract) {
-			t.Fatalf("a second object was created for the same commitment: %v", err)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
 		}
-		if got := countAttempts(t, s, intentID); got != 0 {
-			t.Fatalf("the refusal left %d attempts behind", got)
+		if result.Outcome != outbound.BeginPreparedPermanent {
+			t.Fatalf("a call this build cannot make answered %q", result.Outcome)
+		}
+		if got := statusOf(t, s, intentID); got != outbound.StatusPermanentFailed {
+			t.Fatalf("the commitment is %s", got)
+		}
+
+		var kind, operation, class string
+		if err := s.db.QueryRow(`
+			SELECT attempt_kind, operation, COALESCE(error_class, '')
+			FROM outbound_attempts WHERE intent_id = $1`, intentID).
+			Scan(&kind, &operation, &class); err != nil {
+			t.Fatalf("read the refusal: %v", err)
+		}
+		if kind != string(outbound.AttemptMutation) || class != "unsupported_operation" {
+			t.Fatalf("the refusal reads as %s/%s (%s)", kind, operation, class)
+		}
+		if started := attemptsStarted(t, s, intentID); started != 0 {
+			t.Fatalf("%d calls were made for a commitment nothing could be sent for", started)
 		}
 	})
+}
+
+// attemptsStarted counts the records that mean the network may have been
+// reached. A refusal writes a row too, and the difference between the two is
+// the whole point of the journal.
+func attemptsStarted(t *testing.T, s *Store, intentID string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM outbound_attempts WHERE intent_id = $1 AND record_kind = 'attempt'`,
+		intentID).Scan(&n); err != nil {
+		t.Fatalf("count the calls: %v", err)
+	}
+	return n
+}
+
+// TestStateNobodyCanReadEndsTheCommitment. An unreadable snapshot stops a send,
+// and it has to stop the commitment with it.
+//
+// Left pending, it would be claimed, refused, backed off and claimed again for
+// as long as the deadline allows - and the one door that could withdraw it, an
+// operator decision, opens only for a commitment that has stopped moving. The
+// delivery that cannot happen has to end somewhere a person can see it.
+func TestStateNobodyCanReadEndsTheCommitment(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+	intentID := admitOne(t, s, agID)[0]
+
+	if _, err := s.db.Exec(`
+		UPDATE outbound_group_snapshots
+		SET snapshot = jsonb_set(snapshot, '{title}', '"a different alert"')
+		WHERE alert_group_id = $1`, agID); err != nil {
+		t.Fatalf("corrupt the state: %v", err)
+	}
+
+	token := claimOne(t, s, intentID)
+	result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+		Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
+	})
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if result.Outcome != outbound.BeginPreparedPermanent {
+		t.Fatalf("a send against unreadable state answered %q", result.Outcome)
+	}
+	if got := statusOf(t, s, intentID); got != outbound.StatusPermanentFailed {
+		t.Fatalf("the commitment is %s and will be handed out again", got)
+	}
+	if started := attemptsStarted(t, s, intentID); started != 0 {
+		t.Fatal("a call was recorded for a message that was never composed")
+	}
+
+	var class, summary string
+	if err := s.db.QueryRow(`
+		SELECT COALESCE(error_class, ''), COALESCE(response_summary, '')
+		FROM outbound_attempts WHERE intent_id = $1`, intentID).Scan(&class, &summary); err != nil {
+		t.Fatalf("read the refusal: %v", err)
+	}
+	if class != "state_unreadable" || summary == "" {
+		t.Fatalf("the refusal says %q/%q", class, summary)
+	}
+	if !hasTimeline(t, s, agID, "failed permanently") {
+		t.Fatal("the alert says nothing about a notification that will never arrive")
+	}
+
+	// It is out of the queue, and out of it for good.
+	makeDue(t, s, intentID)
+	leased, err := s.ClaimDueIntents(context.Background(), testFamily, "slack",
+		outbound.ClaimAny, 10, outbound.NotificationLease)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	for _, l := range leased {
+		if l.Intent.ID == intentID {
+			t.Fatal("a commitment nothing can be sent for was handed out again")
+		}
+	}
+
+	// And a person can still call it off.
+	if result := resolve(t, s, outbound.ResolveAmbiguityRequest{
+		IntentID: intentID, Decision: outbound.DecisionCancel,
+		Reason: "the alert data is broken; handled by hand",
+	}); result.Status != outbound.StatusCanceled {
+		t.Fatalf("withdrawing it answered %q into %s", result.Outcome, result.Status)
+	}
+}
+
+// TestARetryIntoUnreadableStateStillEnds is the same rule reached the other
+// way: a person deciding to retry does not have to know whether the state can
+// still be rendered, because the attempt that cannot be made ends the
+// commitment rather than starting a loop.
+func TestARetryIntoUnreadableStateStillEnds(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+	intentID := stuckInReview(t, s, agID)
+
+	if _, err := s.db.Exec(`
+		UPDATE outbound_group_snapshots
+		SET snapshot = jsonb_set(snapshot, '{title}', '"a different alert"')
+		WHERE alert_group_id = $1`, agID); err != nil {
+		t.Fatalf("corrupt the state: %v", err)
+	}
+
+	if result := resolve(t, s, outbound.ResolveAmbiguityRequest{
+		IntentID: intentID, Decision: outbound.DecisionRetryCurrentGeneration,
+		Reason: "the provider is back",
+	}); result.Status != outbound.StatusPending {
+		t.Fatalf("the retry answered %q into %s", result.Outcome, result.Status)
+	}
+
+	token := claimOne(t, s, intentID)
+	result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+		Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
+	})
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if result.Outcome != outbound.BeginPreparedPermanent {
+		t.Fatalf("the retry answered %q", result.Outcome)
+	}
+	if got := statusOf(t, s, intentID); got != outbound.StatusPermanentFailed {
+		t.Fatalf("the retried commitment is %s", got)
+	}
+
+	// The operator door is open again, which is the whole point.
+	if result := resolve(t, s, outbound.ResolveAmbiguityRequest{
+		IntentID: intentID, Decision: outbound.DecisionCancel,
+		Reason: "nothing more to try",
+	}); result.Status != outbound.StatusCanceled {
+		t.Fatalf("withdrawing it answered %q into %s", result.Outcome, result.Status)
+	}
 }
 
 // TestALateResultIsKeptAsTheAttemptHadIt. A worker that comes back after

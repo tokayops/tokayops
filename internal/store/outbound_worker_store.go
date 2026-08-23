@@ -452,17 +452,22 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	// What the call has to be, decided before anything is written and from the
 	// commitment alone. A refusal is recorded under the same shape: the journal
 	// says which call did not happen.
-	plan, err := planAttempt(*intent)
-	if err != nil {
-		return outbound.BeginAttemptResult{}, err
-	}
+	plan := planAttempt(*intent)
 
 	if req.Preparation != outbound.PreparationReady {
 		return s.recordPreparation(ctx, tx, req, *intent, plan)
 	}
 
+	if !plan.Supported {
+		return s.refuseAttempt(ctx, tx, req, *intent, plan, "unsupported_operation",
+			fmt.Sprintf("a %s is needed and this build does not make one", plan.Kind))
+	}
+
 	stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
 	if err != nil {
+		if errors.Is(err, ErrUndeliverable) {
+			return s.refuseAttempt(ctx, tx, req, *intent, plan, "state_unreadable", err.Error())
+		}
 		return outbound.BeginAttemptResult{}, err
 	}
 
@@ -481,6 +486,9 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	effect, err := bindGenerationTx(ctx, tx, *intent, req.BoundEndpoint,
 		transition.Effects.OpenGeneration)
 	if err != nil {
+		if errors.Is(err, ErrUndeliverable) {
+			return s.refuseAttempt(ctx, tx, req, *intent, plan, "binding_lost", err.Error())
+		}
 		return outbound.BeginAttemptResult{}, err
 	}
 
@@ -586,6 +594,12 @@ func beginEffectsUnderstood(e outbound.Effects) error {
 type plannedAttempt struct {
 	Kind      outbound.AttemptKind
 	Operation outbound.Operation
+
+	// Supported says this build can actually make the call. When it cannot,
+	// the fields above still describe the call that was needed - which is what
+	// the refusal records, and what tells whoever reads it later why nothing
+	// went out.
+	Supported bool
 }
 
 // planAttempt decides the shape of the next call.
@@ -595,22 +609,22 @@ type plannedAttempt struct {
 // here at all - it comes from the state the attempt renders, read under the
 // same lock, so the content and the key that names it cannot disagree.
 //
-// Changing an existing object is refused for now, and deliberately so: nothing
-// in this build brings a commitment that already has a receipt back into the
-// queue, so the branch would be code no test could reach. What Sprint 2 adds
-// here is the choice between an update and a resolve, which is a question
-// about the stored state (is this the last revision?) and not about the
-// worker.
-func planAttempt(intent outbound.Intent) (plannedAttempt, error) {
+// It answers for calls this build cannot make as well, and that is the point:
+// a refusal has to be able to say WHICH call was needed. What Sprint 2 adds is
+// the ability to make one, and the choice between an update and a resolve -
+// which is a question about the stored state, not about the worker.
+func planAttempt(intent outbound.Intent) plannedAttempt {
 	if intent.HasReceipt {
-		return plannedAttempt{}, outboundContractf(
-			"commitment %s already has an external object, and this build only creates them",
-			intent.ID)
+		return plannedAttempt{
+			Kind:      outbound.AttemptMutation,
+			Operation: outbound.OperationUpdate,
+		}
 	}
 	return plannedAttempt{
 		Kind:      outbound.AttemptCreate,
 		Operation: outbound.OperationSend,
-	}, nil
+		Supported: true,
+	}
 }
 
 // boundEffect is the external identity one attempt will use: where it goes and
@@ -657,10 +671,36 @@ func bindGenerationTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
 		return boundEffect{}, err
 	}
 	if !storedEndpoint.Valid || storedEndpoint.String == "" || !storedKey.Valid {
-		return boundEffect{}, outboundContractf(
+		return boundEffect{}, undeliverablef(
 			"commitment %s has a bound effect with no address or no key", intent.ID)
 	}
 	return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: storedKey.String}, nil
+}
+
+// refuseAttempt ends a commitment the store itself cannot deliver.
+//
+// It is the same answer a worker gives when it finds the configuration broken -
+// no call was made, and none will be until somebody changes something - and it
+// is recorded the same way, because it is the same fact. What differs is only
+// who found out.
+//
+// Leaving the commitment pending would be worse than the failure it is
+// refusing. The queue would hand out the same broken row forever, and the one
+// door that could withdraw it - an operator decision - opens only for a
+// commitment that has stopped moving. A delivery that cannot happen has to end
+// somewhere a person can see it, and permanent_failed is that place.
+//
+// The error is not returned: it is written down. A caller told "the state of
+// this alert is corrupt" can do nothing with that, while the journal entry, the
+// status and the line in the alert's history reach the people who can.
+func (s *Store) refuseAttempt(ctx context.Context, tx *sql.Tx,
+	req outbound.BeginAttemptRequest, intent outbound.Intent, plan plannedAttempt,
+	class, detail string) (outbound.BeginAttemptResult, error) {
+
+	req.Preparation = outbound.PreparationPermanent
+	req.ErrorClass = class
+	req.Summary = detail
+	return s.recordPreparation(ctx, tx, req, intent, plan)
 }
 
 // recordPreparation writes the proof that no call was made.
@@ -745,17 +785,6 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	req outbound.FinalizeRequest) (outbound.FinalizeResult, error) {
 
-	// A result says what the provider answered, never which revision it was
-	// answering about. That is the attempt's own record, and a caller allowed
-	// to restate it could file a real reply against a revision the message
-	// never carried - including one that arrives long after recovery closed
-	// the attempt, where nothing is left to contradict it.
-	if req.Completion.AppliedRevision != nil {
-		return outbound.FinalizeResult{}, outboundContractf(
-			"a result for attempt %s names the revision it applied; only the attempt does that",
-			req.AttemptID)
-	}
-
 	// Read before the transaction: both are immutable, and the lock order
 	// depends on them.
 	var (
@@ -832,6 +861,22 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 			return outbound.FinalizeResult{}, err
 		}
 		return outbound.FinalizeResult{Outcome: outbound.FinalizeLeaseLost}, nil
+	}
+
+	// Only now is what the caller SAID looked at, and the first thing looked at
+	// is whether it said something it has no standing to say. A result reports
+	// what the provider answered, never which revision it was answering about:
+	// that is the attempt's own record, and a caller allowed to restate it
+	// could file a real reply against a revision the message never carried.
+	//
+	// The order is the ladder's, not convenience: an unknown attempt is not
+	// found and a stranger's token is a lost lease, whatever else their request
+	// contains. Reading their claims first would answer a question about the
+	// content of a request nobody has established the right to make.
+	if req.Completion.AppliedRevision != nil {
+		return outbound.FinalizeResult{}, outboundContractf(
+			"a result for attempt %s names the revision it applied; only the attempt does that",
+			req.AttemptID)
 	}
 
 	// The result is completed from the attempt's own row before anything is
