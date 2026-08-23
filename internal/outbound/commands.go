@@ -134,14 +134,17 @@ type BeginAttemptRequest struct {
 
 	Preparation PreparationOutcome
 
-	// BoundEndpoint is the provider's own address for this recipient, resolved
-	// once when the effect is opened and frozen for as long as it is being
-	// attempted: a retry after doubt must not go to a number somebody changed
-	// in between.
+	// BoundEndpoint is the provider's own address for this recipient, as the
+	// worker resolved it now. It is a PROPOSAL: if the effect is already bound
+	// to an address, that one wins and comes back in the result. A retry after
+	// doubt must not go to a number somebody changed in between, and the worker
+	// is not the one who gets to decide that.
 	BoundEndpoint string
-	ProviderKey   string
 	AttemptKind   AttemptKind
 	Operation     Operation
+	// Revision is the revision this attempt applies. It is checked against the
+	// state the commitment is actually about rather than trusted.
+	Revision int64
 
 	// ErrorClass and Summary describe a preparation that failed, and are what
 	// the journal keeps instead of an attempt.
@@ -188,10 +191,19 @@ type BeginAttemptResult struct {
 	AttemptID string
 	AttemptNo int
 
-	GenerationNo    int
+	GenerationNo int
+	// BoundEndpoint and ProviderKey are the ones the effect is bound to, which
+	// may not be the ones proposed: within one generation the address and the
+	// key are what they were when it opened. The worker sends to these.
+	BoundEndpoint string
+	ProviderKey   string
+
 	AppliedRevision int64
 	Snapshot        keys.RenderSnapshot
 	Payload         json.RawMessage
+	// PayloadSchemaVersion says which shape the payload is in, so a handler
+	// reads it rather than assuming the current one.
+	PayloadSchemaVersion int
 
 	// CompletionFingerprintVersion is stamped here, not when the attempt is
 	// finished: an attempt can outlive a deployment, and the encoder that
@@ -217,10 +229,6 @@ type FinalizeRequest struct {
 	Receipt json.RawMessage
 
 	Summary string
-
-	// AttemptIsFinal says this attempt applied the last revision the commitment
-	// will ever have.
-	AttemptIsFinal bool
 }
 
 // FinalizeOutcome is the answer to closing an attempt.
@@ -310,4 +318,65 @@ type ResolveAmbiguityResult struct {
 type StatusCount struct {
 	Status Status
 	Count  int
+}
+
+// AttemptRecord is one line of the journal: a network call, or the proof that
+// one was refused before it could be made.
+type AttemptRecord struct {
+	ID           string
+	AttemptNo    int
+	RecordKind   RecordKind
+	GenerationNo int
+	AttemptKind  AttemptKind
+	Operation    Operation
+
+	Provider      string
+	BoundEndpoint string
+	ProviderKey   string
+
+	AppliedRevision *int64
+	StartedAt       *time.Time
+	FinishedAt      *time.Time
+	Outcome         Outcome
+	ErrorClass      string
+	ProviderStatus  string
+	Receipt         json.RawMessage
+	Summary         string
+	FinishReason    string
+
+	CompletionFingerprintVersion int
+}
+
+// Observation is a result that arrived for an attempt somebody else had already
+// closed - usually a worker returning after recovery gave up on it.
+type Observation struct {
+	AttemptID string
+	Kind      string
+	Outcome   Outcome
+	Receipt   json.RawMessage
+	Summary   string
+}
+
+// IntentEvent is one thing that happened to a commitment without a network call
+// being involved.
+type IntentEvent struct {
+	Seq        int
+	Kind       string
+	Reason     string
+	Actor      string
+	FromStatus string
+	ToStatus   string
+}
+
+// Journal is everything the system knows about one commitment: what it is, what
+// was attempted, what came back late, and what people did to it.
+//
+// It exists as one read because that is the question anybody actually asks - of
+// a delivery that did not arrive, of an audit, of a support request - and
+// answering it from three separate calls invites answering it from two.
+type Journal struct {
+	Intent       Intent
+	Attempts     []AttemptRecord
+	Observations []Observation
+	Events       []IntentEvent
 }

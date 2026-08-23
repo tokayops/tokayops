@@ -182,6 +182,21 @@ type Intent struct {
 	AttemptsInGeneration int
 	FailureStreak        int
 
+	// GenerationBound says the current external effect has an address and a
+	// provider key of its own. It is a fact rather than a count: a refusal that
+	// never reached the provider also adds a journal record, and deriving
+	// "already bound" from the number of records would skip the binding of the
+	// first call that actually happens.
+	GenerationBound bool
+
+	// PayloadSchemaVersion and ProviderKeyCodecVersion travel with the
+	// commitment for its whole life. A handler reads the first to know which
+	// shape it was given; the second is what a provider key is spelled with,
+	// and it may not change between generations or the same revision would
+	// reach the provider under two different keys.
+	PayloadSchemaVersion    int
+	ProviderKeyCodecVersion int
+
 	DesiredRevision      int64
 	AppliedRevision      *int64
 	FinalRevisionApplied bool

@@ -390,6 +390,24 @@ func intentIDsOfBatch(ctx context.Context, tx *sql.Tx, batchID string) ([]string
 	return ids, rows.Err()
 }
 
+// outboundIntentColumns is read by both the plain read and the locking one, so
+// the domain cannot end up seeing a different commitment depending on which
+// door it came through.
+//
+// The last column is the only computed one: whether the deadline has passed as
+// of this statement's clock. It is asked of the database rather than compared
+// in Go, because the process clock is not the one the leases are written
+// against.
+const outboundIntentColumns = `
+	SELECT id, COALESCE(alert_group_id, ''), provider, form, completion_mode,
+	       ambiguity_policy, status, generation_no, attempts_in_generation,
+	       failure_streak, desired_revision, applied_revision,
+	       final_revision_applied, receipt, cancellation_requested,
+	       accepted_duplicate_risk, not_before, next_attempt_at, expires_at,
+	       create_key IS NOT NULL, payload_schema_version,
+	       provider_key_codec_version,
+	       COALESCE(expires_at <= now(), FALSE)`
+
 // GetIntent reads one commitment as the domain sees it.
 func (s *Store) GetIntent(ctx context.Context, id string) (*outbound.Intent, error) {
 	var (
@@ -398,19 +416,20 @@ func (s *Store) GetIntent(ctx context.Context, id string) (*outbound.Intent, err
 		applied   sql.NullInt64
 		expiresAt sql.NullTime
 		receipt   []byte
+		// The plain read has no use for the deadline: nothing decided from it
+		// would still be true by the time the caller acted on it. It is read
+		// and dropped so both doors can share one column list.
+		deadlinePassed bool
 	)
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, COALESCE(alert_group_id, ''), provider, form, completion_mode,
-		       ambiguity_policy, status, generation_no, attempts_in_generation,
-		       failure_streak, desired_revision, applied_revision,
-		       final_revision_applied, receipt, cancellation_requested,
-		       accepted_duplicate_risk, not_before, next_attempt_at, expires_at
-		FROM outbound_intents WHERE id = $1`, id).Scan(
+	err := s.db.QueryRowContext(ctx, outboundIntentColumns+
+		` FROM outbound_intents WHERE id = $1`, id).Scan(
 		&intent.ID, &groupID, &intent.Provider, &intent.Form, &intent.CompletionMode,
 		&intent.AmbiguityPolicy, &intent.Status, &intent.GenerationNo,
 		&intent.AttemptsInGeneration, &intent.FailureStreak, &intent.DesiredRevision,
 		&applied, &intent.FinalRevisionApplied, &receipt, &intent.CancellationRequested,
-		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt, &expiresAt)
+		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt, &expiresAt,
+		&intent.GenerationBound, &intent.PayloadSchemaVersion,
+		&intent.ProviderKeyCodecVersion, &deadlinePassed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -491,12 +510,15 @@ type transitionWrite struct {
 	Reason         string
 }
 
-// applyTransitionTx writes what the machine decided, and nothing else.
+// applyTransitionTx writes everything a transition means, in one call.
 //
-// One statement rather than a branch per effect: every field the transition can
-// touch is written in the same UPDATE, so a commitment cannot end up half moved
-// - a status changed with a lease still held, or a retry scheduled for
-// something that is no longer pending.
+// One door on purpose. The effects of a transition are not only the
+// commitment's own row: a success moves the alert group out of processing, and
+// every ending writes a line in the alert's history. When those lived at the
+// call sites, two of the three call sites forgot them - and the one that forgot
+// the group left an alert saying nobody had been paged while the delivery said
+// otherwise. A caller that can apply half a transition will eventually apply
+// half a transition.
 func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error {
 	e := w.Transition.Effects
 
@@ -543,7 +565,13 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 		return fmt.Errorf("apply %s to commitment %s: %w", w.Transition.Row, w.Intent.ID, err)
 	}
 
-	return appendTransitionEventTx(ctx, tx, w)
+	if err := appendTransitionEventTx(ctx, tx, w); err != nil {
+		return err
+	}
+	if !w.Intent.GroupBound() {
+		return nil
+	}
+	return groupEffectsTx(ctx, tx, w.Intent.AlertGroupID, w.Transition)
 }
 
 // appendTransitionEventTx records the lifecycle events a transition produces -
@@ -553,8 +581,12 @@ func appendTransitionEventTx(ctx context.Context, tx *sql.Tx, w transitionWrite)
 	e := w.Transition.Effects
 
 	if e.NewGeneration {
+		// The decision to start over, which is not the same fact as the
+		// binding of the effect that follows it: this one abandons whatever
+		// the previous generation may have created, and is recorded even if no
+		// attempt is ever made afterwards.
 		if err := appendIntentEventTx(ctx, tx, w.Intent.ID, nextEventSeq,
-			"generation_opened", w.Reason, w.Actor); err != nil {
+			"generation_started", w.Reason, w.Actor); err != nil {
 			return err
 		}
 	}
@@ -598,11 +630,19 @@ func groupEffectsTx(ctx context.Context, tx *sql.Tx, alertGroupID string,
 	return nil
 }
 
-// timelineFor turns a transition into the line the alert's history gets. The
-// wording of a success is deliberate: "sent" and "assumed delivered" are
-// different claims, and only one of them is about the world.
+// timelineFor turns a transition into the line the alert's history gets.
 func timelineFor(t outbound.Transition) (string, model.TimelineEventType, bool) {
-	switch t.Effects.Timeline {
+	return timelineLine(t.Effects.Timeline)
+}
+
+// timelineLine is the wording of every effect, in one place. Set-based paths
+// that end many commitments at once cannot ask the machine per row, and this is
+// what keeps them saying the same thing it would have said.
+//
+// The wording of a success is deliberate: "sent" and "assumed delivered" are
+// different claims, and only one of them is about the world.
+func timelineLine(kind outbound.TimelineKind) (string, model.TimelineEventType, bool) {
+	switch kind {
 	case outbound.TimelineSent:
 		return "Notification sent", model.TimelineEventNotificationSent, true
 	case outbound.TimelineDelivered:
@@ -667,20 +707,15 @@ func lockIntentTx(ctx context.Context, tx *sql.Tx, id string) (*outbound.Intent,
 		receipt   []byte
 		expired   bool
 	)
-	err := tx.QueryRowContext(ctx, `
-		SELECT id, COALESCE(alert_group_id, ''), provider, form, completion_mode,
-		       ambiguity_policy, status, generation_no, attempts_in_generation,
-		       failure_streak, desired_revision, applied_revision,
-		       final_revision_applied, receipt, cancellation_requested,
-		       accepted_duplicate_risk, not_before, next_attempt_at, expires_at,
-		       (expires_at IS NOT NULL AND expires_at <= now())
-		FROM outbound_intents WHERE id = $1 FOR UPDATE`, id).Scan(
+	err := tx.QueryRowContext(ctx, outboundIntentColumns+
+		` FROM outbound_intents WHERE id = $1 FOR UPDATE`, id).Scan(
 		&intent.ID, &groupID, &intent.Provider, &intent.Form, &intent.CompletionMode,
 		&intent.AmbiguityPolicy, &intent.Status, &intent.GenerationNo,
 		&intent.AttemptsInGeneration, &intent.FailureStreak, &intent.DesiredRevision,
 		&applied, &intent.FinalRevisionApplied, &receipt, &intent.CancellationRequested,
 		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt,
-		&expiresAt, &expired)
+		&expiresAt, &intent.GenerationBound, &intent.PayloadSchemaVersion,
+		&intent.ProviderKeyCodecVersion, &expired)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -716,22 +751,52 @@ func nextAttemptNoTx(ctx context.Context, tx *sql.Tx, intentID string) (int, err
 	return next, nil
 }
 
-// lockedSnapshotTx reads the state an attempt will render from.
+// storedSnapshot is the state a revision is rendered from, as it came back out
+// of the database and after it has been proved to be the same thing that went
+// in.
+type storedSnapshot struct {
+	Snapshot keys.RenderSnapshot
+	Revision int64
+	Final    bool
+}
+
+// lockedSnapshotTx reads the state an attempt will render from, and checks that
+// it is still what was admitted.
 //
 // From the domain's own table, never from the live alert group: a retry has to
 // send what was accepted, and two instances have to send the same thing.
-func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (keys.RenderSnapshot, int64, error) {
-	var raw []byte
-	var revision int64
+//
+// Four checks, and none of them is defensive programming. The schema version
+// says whether this build can read the row at all. The digest says the content
+// is the content the commitments were keyed against - a row edited by hand
+// would otherwise be sent under the identity of the admission it replaced. The
+// group and the revision say the row is about the right thing: a snapshot moved
+// between groups, or one revision stored under another's number, would be a
+// message about the wrong alert with a key that says it is about the right one.
+func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (storedSnapshot, error) {
+	var (
+		raw           []byte
+		revision      int64
+		schemaVersion int
+		digest        []byte
+		final         bool
+	)
 	err := tx.QueryRowContext(ctx, `
-		SELECT snapshot, revision FROM outbound_group_snapshots WHERE alert_group_id = $1`,
-		alertGroupID).Scan(&raw, &revision)
+		SELECT snapshot, revision, snapshot_schema_version, snapshot_digest, final
+		FROM outbound_group_snapshots WHERE alert_group_id = $1`,
+		alertGroupID).Scan(&raw, &revision, &schemaVersion, &digest, &final)
 	if errors.Is(err, sql.ErrNoRows) {
-		return keys.RenderSnapshot{}, 0, outboundContractf(
+		return storedSnapshot{}, outboundContractf(
 			"alert group %s has commitments but no state for them to render from", alertGroupID)
 	}
 	if err != nil {
-		return keys.RenderSnapshot{}, 0, err
+		return storedSnapshot{}, err
+	}
+
+	if schemaVersion != keys.RenderSnapshotSchemaV1 {
+		return storedSnapshot{}, outboundContractf(
+			"the state of %s was written under schema version %d, which this build cannot render",
+			alertGroupID, schemaVersion)
 	}
 
 	var snapshot keys.RenderSnapshot
@@ -739,8 +804,132 @@ func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (key
 		// A stored snapshot that no longer canonicalises is refused rather than
 		// rendered: the message it would produce is not the one its key
 		// describes.
-		return keys.RenderSnapshot{}, 0, outboundContractf(
+		return storedSnapshot{}, outboundContractf(
 			"the stored state of %s cannot be read back: %v", alertGroupID, err)
 	}
-	return snapshot, revision, nil
+
+	if !bytes.Equal(snapshot.Digest(), digest) {
+		return storedSnapshot{}, outboundContractf(
+			"the stored state of %s no longer matches the digest its commitments were keyed against",
+			alertGroupID)
+	}
+	content := snapshot.Content()
+	if content.AlertGroupID != alertGroupID || content.Revision != revision {
+		return storedSnapshot{}, outboundContractf(
+			"the state stored for %s at revision %d describes %s at revision %d",
+			alertGroupID, revision, content.AlertGroupID, content.Revision)
+	}
+
+	return storedSnapshot{Snapshot: snapshot, Revision: revision, Final: final}, nil
+}
+
+// IntentJournal reads everything known about one commitment, in the order it
+// happened.
+func (s *Store) IntentJournal(ctx context.Context, intentID string) (*outbound.Journal, error) {
+	intent, err := s.GetIntent(ctx, intentID)
+	if err != nil {
+		return nil, err
+	}
+	if intent == nil {
+		return nil, nil
+	}
+	journal := &outbound.Journal{Intent: *intent}
+
+	attempts, err := s.db.QueryContext(ctx, `
+		SELECT id, attempt_no, record_kind, generation_no, attempt_kind, operation,
+		       provider, COALESCE(bound_endpoint, ''), COALESCE(provider_key, ''),
+		       applied_revision, started_at, finished_at, COALESCE(outcome, ''),
+		       COALESCE(error_class, ''), COALESCE(provider_status, ''), receipt,
+		       COALESCE(response_summary, ''), COALESCE(finish_reason, ''),
+		       COALESCE(completion_fingerprint_version, 0)
+		FROM outbound_attempts WHERE intent_id = $1 ORDER BY attempt_no`, intentID)
+	if err != nil {
+		return nil, fmt.Errorf("read the journal of %s: %w", intentID, err)
+	}
+	defer attempts.Close()
+
+	for attempts.Next() {
+		var (
+			record   outbound.AttemptRecord
+			revision sql.NullInt64
+			started  sql.NullTime
+			finished sql.NullTime
+			receipt  []byte
+		)
+		if err := attempts.Scan(&record.ID, &record.AttemptNo, &record.RecordKind,
+			&record.GenerationNo, &record.AttemptKind, &record.Operation, &record.Provider,
+			&record.BoundEndpoint, &record.ProviderKey, &revision, &started, &finished,
+			&record.Outcome, &record.ErrorClass, &record.ProviderStatus, &receipt,
+			&record.Summary, &record.FinishReason,
+			&record.CompletionFingerprintVersion); err != nil {
+			return nil, err
+		}
+		if len(receipt) > 0 {
+			record.Receipt = json.RawMessage(receipt)
+		}
+		if revision.Valid {
+			value := revision.Int64
+			record.AppliedRevision = &value
+		}
+		if started.Valid {
+			at := started.Time
+			record.StartedAt = &at
+		}
+		if finished.Valid {
+			at := finished.Time
+			record.FinishedAt = &at
+		}
+		journal.Attempts = append(journal.Attempts, record)
+	}
+	if err := attempts.Err(); err != nil {
+		return nil, err
+	}
+
+	observations, err := s.db.QueryContext(ctx, `
+		SELECT o.attempt_id, o.observation_kind, o.outcome, o.receipt,
+		       COALESCE(o.response_summary, '')
+		FROM outbound_attempt_observations o
+		JOIN outbound_attempts a ON a.id = o.attempt_id
+		WHERE a.intent_id = $1 ORDER BY a.attempt_no, o.observed_at`, intentID)
+	if err != nil {
+		return nil, fmt.Errorf("read the late results of %s: %w", intentID, err)
+	}
+	defer observations.Close()
+
+	for observations.Next() {
+		var (
+			o       outbound.Observation
+			receipt []byte
+		)
+		if err := observations.Scan(&o.AttemptID, &o.Kind, &o.Outcome, &receipt,
+			&o.Summary); err != nil {
+			return nil, err
+		}
+		if len(receipt) > 0 {
+			o.Receipt = json.RawMessage(receipt)
+		}
+		journal.Observations = append(journal.Observations, o)
+	}
+	if err := observations.Err(); err != nil {
+		return nil, err
+	}
+
+	events, err := s.db.QueryContext(ctx, `
+		SELECT seq, kind, COALESCE(reason, ''), COALESCE(actor, ''),
+		       COALESCE(from_status, ''), COALESCE(to_status, '')
+		FROM outbound_intent_events WHERE intent_id = $1 ORDER BY seq`, intentID)
+	if err != nil {
+		return nil, fmt.Errorf("read the events of %s: %w", intentID, err)
+	}
+	defer events.Close()
+
+	for events.Next() {
+		var e outbound.IntentEvent
+		if err := events.Scan(&e.Seq, &e.Kind, &e.Reason, &e.Actor,
+			&e.FromStatus, &e.ToStatus); err != nil {
+			return nil, err
+		}
+		journal.Events = append(journal.Events, e)
+	}
+	return journal, events.Err()
 }

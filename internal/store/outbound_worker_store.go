@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
@@ -73,10 +72,15 @@ func (s *Store) ExpireDueIntents(ctx context.Context, family string, limit int) 
 			"the deadline passed before anything was sent", ""); err != nil {
 			return nil, err
 		}
+		// Set-based, so the machine cannot be asked per row - but the alert
+		// still hears exactly what T20 says it hears.
 		if e.AlertGroupID != "" {
-			if err := addTimelineTx(ctx, tx, e.AlertGroupID,
-				model.TimelineEventNotificationFailed,
-				"A notification expired before it could be sent", "system"); err != nil {
+			message, eventType, ok := timelineLine(outbound.TimelineExpired)
+			if !ok {
+				return nil, outboundContractf("an expiry has no wording for the alert")
+			}
+			if err := addTimelineTx(ctx, tx, e.AlertGroupID, eventType, message,
+				"system"); err != nil {
 				return nil, err
 			}
 		}
@@ -315,23 +319,33 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 	// else is decided: a deadline that arrives in the same moment must not be
 	// able to erase the fact that somebody may have received a message.
 	var attemptRevision sql.NullInt64
+	var attemptVersion int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT applied_revision, COALESCE(completion_fingerprint_version, 0)
+		FROM outbound_attempts WHERE id = $1`, attemptID).
+		Scan(&attemptRevision, &attemptVersion); err != nil {
+		return nil, err
+	}
+
+	// Closed under the protocol the attempt was opened with: the worker that
+	// may yet come back will compute its own conclusion the same way, and the
+	// two have to be comparable.
+	conclusion, err := leaseLostFingerprint(attemptVersion)
+	if err != nil {
+		return nil, err
+	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE outbound_attempts
 		SET finished_at = now(), outcome = 'ambiguous', finish_reason = 'lease_lost',
 		    error_class = 'lease_lost',
 		    completion_fingerprint = $2
-		WHERE id = $1 AND finished_at IS NULL`, attemptID, leaseLostFingerprint())
+		WHERE id = $1 AND finished_at IS NULL`, attemptID, conclusion)
 	if err != nil {
 		return nil, fmt.Errorf("close the abandoned attempt: %w", err)
 	}
 	if affected, _ := res.RowsAffected(); affected == 0 {
 		// Somebody closed it between the scan and the lock.
 		return nil, nil
-	}
-	if err := tx.QueryRowContext(ctx,
-		`SELECT applied_revision FROM outbound_attempts WHERE id = $1`, attemptID).
-		Scan(&attemptRevision); err != nil {
-		return nil, err
 	}
 
 	transition, err := outbound.Decide(outbound.Input{
@@ -366,18 +380,12 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 
 // leaseLostFingerprint is the conclusion recovery records: an ambiguous outcome
 // and nothing else known about it.
-func leaseLostFingerprint() []byte {
+func leaseLostFingerprint(version int) ([]byte, error) {
 	class := "lease_lost"
-	sum, err := (keys.Completion{
+	return (keys.Completion{
 		Outcome:    keys.OutcomeAmbiguous,
 		ErrorClass: &class,
-	}).Fingerprint(keys.CurrentCompletionFingerprintVersion())
-	if err != nil {
-		// The inputs are constants; a failure here is a broken build, not a
-		// runtime condition.
-		panic(fmt.Sprintf("outbound: the lease-lost conclusion cannot be fingerprinted: %v", err))
-	}
-	return sum
+	}).Fingerprint(version)
 }
 
 // BeginAttempt opens one attempt, or records why none was made.
@@ -445,15 +453,12 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return s.recordPreparation(ctx, tx, req, *intent)
 	}
 
-	snapshot, revision, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
-	if err != nil {
+	if err := validateAttemptShape(req); err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
 
-	var payload json.RawMessage
-	if err := tx.QueryRowContext(ctx,
-		`SELECT payload FROM outbound_intents WHERE id = $1`, req.IntentID).
-		Scan(&payload); err != nil {
+	stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+	if err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
 
@@ -463,6 +468,21 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		Preparation: outbound.PreparationReady,
 	})
 	if err != nil {
+		return outbound.BeginAttemptResult{}, err
+	}
+	if err := beginEffectsUnderstood(transition.Effects); err != nil {
+		return outbound.BeginAttemptResult{}, err
+	}
+
+	effect, err := bindGenerationTx(ctx, tx, *intent, req, transition.Effects.OpenGeneration)
+	if err != nil {
+		return outbound.BeginAttemptResult{}, err
+	}
+
+	var payload json.RawMessage
+	if err := tx.QueryRowContext(ctx,
+		`SELECT payload FROM outbound_intents WHERE id = $1`, req.IntentID).
+		Scan(&payload); err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
 
@@ -477,6 +497,11 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	// The attempt first, then the commitment that points at it: the composite
 	// foreign key insists the target exists, and this is the order that
 	// satisfies it without deferring anything.
+	//
+	// The attempt records the address and key it will ACTUALLY use, which are
+	// the generation's, not the ones this worker proposed. Recording the
+	// proposal would leave a journal claiming a message went somewhere it
+	// never went.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO outbound_attempts (
 			id, intent_id, attempt_no, record_kind, generation_no, attempt_kind,
@@ -485,8 +510,8 @@ func (s *Store) BeginAttempt(ctx context.Context,
 			completion_fingerprint_version)
 		VALUES ($1, $2, $3, 'attempt', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), $14)`,
 		attemptID, req.IntentID, attemptNo, intent.GenerationNo, string(req.AttemptKind),
-		string(req.Operation), revision, intent.Provider, nilIfEmpty(req.BoundEndpoint),
-		nilIfEmpty(req.ProviderKey), snapshot.Digest(), req.LeaseToken,
+		string(req.Operation), stored.Revision, intent.Provider, effect.Endpoint,
+		effect.ProviderKey, stored.Snapshot.Digest(), req.LeaseToken,
 		nilIfEmpty(req.WorkerID), fingerprintVersion,
 	); err != nil {
 		return outbound.BeginAttemptResult{}, fmt.Errorf("open the attempt: %w", err)
@@ -496,18 +521,14 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		UPDATE outbound_intents
 		SET status = 'sending', current_attempt_id = $2,
 		    attempts_in_generation = attempts_in_generation + 1,
-		    bound_endpoint = COALESCE(bound_endpoint, $3),
-		    create_key = COALESCE(create_key, $4),
 		    updated_at = now()
-		WHERE id = $1`,
-		req.IntentID, attemptID, nilIfEmpty(req.BoundEndpoint), nilIfEmpty(req.ProviderKey),
-	); err != nil {
+		WHERE id = $1`, req.IntentID, attemptID); err != nil {
 		return outbound.BeginAttemptResult{}, fmt.Errorf("mark the commitment as sending: %w", err)
 	}
 
 	if transition.Effects.OpenGeneration {
 		if err := appendIntentEventTx(ctx, tx, req.IntentID, nextEventSeq,
-			"generation_opened", "the external effect was bound to an address",
+			"effect_bound", "the address and key of this generation are settled",
 			req.WorkerID); err != nil {
 			return outbound.BeginAttemptResult{}, err
 		}
@@ -522,12 +543,127 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		AttemptID:                    attemptID,
 		AttemptNo:                    attemptNo,
 		GenerationNo:                 intent.GenerationNo,
-		AppliedRevision:              revision,
-		Snapshot:                     snapshot,
+		BoundEndpoint:                effect.Endpoint,
+		ProviderKey:                  effect.ProviderKey,
+		AppliedRevision:              stored.Revision,
+		Snapshot:                     stored.Snapshot,
 		Payload:                      payload,
+		PayloadSchemaVersion:         intent.PayloadSchemaVersion,
 		CompletionFingerprintVersion: fingerprintVersion,
 		Intent:                       *intent,
 	}, nil
+}
+
+// beginEffectsUnderstood refuses a transition asking for something this path
+// cannot write.
+//
+// Opening an attempt is not a status change: it inserts the journal row, points
+// the commitment at it and counts it, none of which the shared writer can
+// express - so this is the one path that applies its own transition, and the
+// one place an effect could be dropped without anybody noticing. If T4 ever
+// grows a second effect, this says so loudly instead of sending a message with
+// half a rule applied.
+func beginEffectsUnderstood(e outbound.Effects) error {
+	rest := e
+	rest.OpenGeneration = false
+	if rest != (outbound.Effects{}) {
+		return outboundContractf(
+			"starting an attempt cannot write the effects %+v this transition asks for", rest)
+	}
+	return nil
+}
+
+// boundEffect is the external identity one attempt will use: where it goes and
+// under what key the provider may deduplicate it.
+type boundEffect struct {
+	Endpoint    string
+	ProviderKey string
+}
+
+// bindGenerationTx settles the address and the key of the current external
+// effect - once, when it opens - and hands back what every later attempt of
+// that effect must reuse.
+//
+// This is the invariant the whole generation exists for. A retry after a doubtful
+// call must ask the provider to create the SAME thing at the SAME address: if a
+// recipient's identity was relinked in between, sending to the new address would
+// deliver twice, to two different people, with nobody able to tell which one
+// got it. So the worker's freshly resolved address is a proposal, and a bound
+// generation ignores it.
+func bindGenerationTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
+	req outbound.BeginAttemptRequest, opening bool) (boundEffect, error) {
+
+	var storedEndpoint, storedKey sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT bound_endpoint, create_key FROM outbound_intents WHERE id = $1`,
+		req.IntentID).Scan(&storedEndpoint, &storedKey); err != nil {
+		return boundEffect{}, err
+	}
+
+	if opening {
+		if req.BoundEndpoint == "" {
+			return boundEffect{}, outboundContractf(
+				"opening an effect for %s with no address to send to", req.IntentID)
+		}
+		key, err := keys.CreateKey(intent.ID, intent.GenerationNo, intent.ProviderKeyCodecVersion)
+		if err != nil {
+			return boundEffect{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE outbound_intents SET bound_endpoint = $2, create_key = $3
+			WHERE id = $1`, req.IntentID, req.BoundEndpoint, key); err != nil {
+			return boundEffect{}, fmt.Errorf("bind the effect of %s: %w", req.IntentID, err)
+		}
+		return boundEffect{Endpoint: req.BoundEndpoint, ProviderKey: key}, nil
+	}
+
+	if !storedEndpoint.Valid || storedEndpoint.String == "" {
+		return boundEffect{}, outboundContractf(
+			"commitment %s has a bound effect with no address", req.IntentID)
+	}
+
+	switch req.AttemptKind {
+	case outbound.AttemptCreate:
+		if !storedKey.Valid {
+			return boundEffect{}, outboundContractf(
+				"commitment %s has a bound effect with no key", req.IntentID)
+		}
+		return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: storedKey.String}, nil
+
+	case outbound.AttemptMutation:
+		// A change to an existing object is keyed by the revision it applies,
+		// not by the generation: revisions are monotonic across the whole
+		// commitment, so applying one twice is the same key twice and the
+		// provider can refuse it.
+		key, err := keys.MutationKey(intent.ID, req.Operation, req.Revision,
+			intent.ProviderKeyCodecVersion)
+		if err != nil {
+			return boundEffect{}, err
+		}
+		return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: key}, nil
+
+	default:
+		return boundEffect{}, outboundContractf("attempt kind %q", req.AttemptKind)
+	}
+}
+
+// validateAttemptShape refuses a request the journal could not describe.
+func validateAttemptShape(req outbound.BeginAttemptRequest) error {
+	switch req.AttemptKind {
+	case outbound.AttemptCreate, outbound.AttemptMutation:
+	default:
+		return outboundContractf("attempt kind %q is not one this build makes", req.AttemptKind)
+	}
+	switch req.Operation {
+	case outbound.OperationSend, outbound.OperationUpdate, outbound.OperationResolve,
+		outbound.OperationDeliver:
+	default:
+		return outboundContractf("operation %q is not one this build performs", req.Operation)
+	}
+	if req.Revision < 0 {
+		return outboundContractf("revision %d is negative", req.Revision)
+	}
+	return nil
 }
 
 // recordPreparation writes the proof that no call was made.
@@ -611,11 +747,6 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	req outbound.FinalizeRequest) (outbound.FinalizeResult, error) {
 
-	fingerprint, err := req.Completion.Fingerprint(keys.CurrentCompletionFingerprintVersion())
-	if err != nil {
-		return outbound.FinalizeResult{}, err
-	}
-
 	// Read before the transaction: both are immutable, and the lock order
 	// depends on them.
 	var (
@@ -626,7 +757,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		               FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
 		               WHERE a.id = $1`
 	)
-	err = s.db.QueryRowContext(ctx, attemptFind, req.AttemptID).Scan(&intentID, &groupID, &policy)
+	err := s.db.QueryRowContext(ctx, attemptFind, req.AttemptID).Scan(&intentID, &groupID, &policy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return outbound.FinalizeResult{Outcome: outbound.FinalizeNotFound}, nil
 	}
@@ -664,20 +795,23 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	}
 
 	var (
-		attemptToken   sql.NullString
-		finishedAt     sql.NullTime
-		finishReason   sql.NullString
-		storedPrint    []byte
-		currentAttempt sql.NullString
-		intentToken    sql.NullString
+		attemptToken    sql.NullString
+		finishedAt      sql.NullTime
+		finishReason    sql.NullString
+		storedPrint     []byte
+		attemptRevision sql.NullInt64
+		attemptVersion  int
+		currentAttempt  sql.NullString
+		intentToken     sql.NullString
 	)
 	if err := tx.QueryRowContext(ctx, `
 		SELECT a.lease_token, a.finished_at, a.finish_reason, a.completion_fingerprint,
+		       a.applied_revision, COALESCE(a.completion_fingerprint_version, 0),
 		       i.current_attempt_id, i.lease_token
 		FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
 		WHERE a.id = $1`, req.AttemptID).
 		Scan(&attemptToken, &finishedAt, &finishReason, &storedPrint,
-			&currentAttempt, &intentToken); err != nil {
+			&attemptRevision, &attemptVersion, &currentAttempt, &intentToken); err != nil {
 		return outbound.FinalizeResult{}, err
 	}
 
@@ -689,6 +823,15 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 			return outbound.FinalizeResult{}, err
 		}
 		return outbound.FinalizeResult{Outcome: outbound.FinalizeLeaseLost}, nil
+	}
+
+	// Only now the fingerprint, and under the protocol the ATTEMPT was opened
+	// with rather than today's. An attempt can outlive a deployment, and a
+	// repeat compared across two protocols would read as a conflict - the one
+	// answer that turns a lost commit reply into an incident.
+	fingerprint, err := req.Completion.Fingerprint(attemptVersion)
+	if err != nil {
+		return outbound.FinalizeResult{}, err
 	}
 
 	if finishedAt.Valid {
@@ -709,7 +852,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 			// A genuine late result from the worker that owned this attempt.
 			// It may be the only evidence that the effect happened, so it is
 			// kept - durably, not as a log line.
-			recorded, err := recordObservationTx(ctx, tx, req, fingerprint)
+			recorded, err := recordObservationTx(ctx, tx, req, fingerprint, attemptVersion)
 			if err != nil {
 				return outbound.FinalizeResult{}, err
 			}
@@ -732,12 +875,37 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 			"attempt %s is open but its commitment points elsewhere", req.AttemptID)
 	}
 
+	// What the attempt applied is what the ATTEMPT says it applied. A worker
+	// that could name the revision could mark a card as showing something it
+	// never showed; one that could declare an attempt final could retire a card
+	// the alert is still using.
+	applied := attemptRevision.Int64
+	if req.Completion.AppliedRevision != nil && *req.Completion.AppliedRevision != applied {
+		return outbound.FinalizeResult{}, outboundContractf(
+			"attempt %s applied revision %d, its result claims %d",
+			req.AttemptID, applied, *req.Completion.AppliedRevision)
+	}
+
+	// Whether that revision was the LAST one is a property of the stored state
+	// too. Only a success needs the answer: the one doubtful outcome that
+	// settles a commitment here is assume_accepted, which the machine allows
+	// only for one-shot messages - and a one-shot has no later revision to be
+	// waiting for.
+	final := false
+	if intent.GroupBound() && req.Completion.Outcome == keys.OutcomeAccepted {
+		stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+		if err != nil {
+			return outbound.FinalizeResult{}, err
+		}
+		final = stored.Final && stored.Revision == applied
+	}
+
 	transition, err := outbound.Decide(outbound.Input{
 		Intent:          *intent,
 		Trigger:         outbound.TriggerFinishAttempt,
 		Outcome:         req.Completion.Outcome,
-		AttemptRevision: revisionOf(req.Completion.AppliedRevision),
-		AttemptIsFinal:  req.AttemptIsFinal,
+		AttemptRevision: applied,
+		AttemptIsFinal:  final,
 	})
 	if err != nil {
 		return outbound.FinalizeResult{}, err
@@ -760,22 +928,12 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		Intent:          *intent,
 		Transition:      transition,
 		Backoff:         outbound.Backoff(intent.FailureStreak + 1),
-		AppliedRevision: revisionOf(req.Completion.AppliedRevision),
-		AttemptIsFinal:  req.AttemptIsFinal,
+		AppliedRevision: applied,
+		AttemptIsFinal:  final,
 		Receipt:         req.Receipt,
 		Actor:           "worker",
 	}); err != nil {
 		return outbound.FinalizeResult{}, err
-	}
-
-	// The alert group learns about the delivery in the same commit, including
-	// its first successful send moving it out of processing. Split in two, a
-	// crash between them would leave a group that looks unpaged and a delivery
-	// that says otherwise.
-	if intent.GroupBound() {
-		if err := groupEffectsTx(ctx, tx, intent.AlertGroupID, transition); err != nil {
-			return outbound.FinalizeResult{}, err
-		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -792,7 +950,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 // contradicting late results are a conflict rather than two truths, and the
 // first one stands.
 func recordObservationTx(ctx context.Context, tx *sql.Tx,
-	req outbound.FinalizeRequest, fingerprint []byte) (bool, error) {
+	req outbound.FinalizeRequest, fingerprint []byte, version int) (bool, error) {
 
 	var storedPrint []byte
 	err := tx.QueryRowContext(ctx, `
@@ -821,7 +979,7 @@ func recordObservationTx(ctx context.Context, tx *sql.Tx,
 		req.Completion.ErrorClass, req.Completion.ProviderStatus,
 		nullableJSON(req.Receipt), req.Completion.AppliedRevision,
 		detailOf(req.Completion.ProviderResultDetail), nilIfEmpty(req.Summary),
-		fingerprint, keys.CurrentCompletionFingerprintVersion(),
+		fingerprint, version,
 	); err != nil {
 		return false, fmt.Errorf("keep the late result: %w", err)
 	}
@@ -833,11 +991,4 @@ func detailOf(detail *keys.ProviderResultDetail) any {
 		return nil
 	}
 	return string(*detail)
-}
-
-func revisionOf(v *int64) int64 {
-	if v == nil {
-		return 0
-	}
-	return *v
 }

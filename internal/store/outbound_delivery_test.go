@@ -71,7 +71,6 @@ func beginOne(t *testing.T, s *Store, intentID, token string) outbound.BeginAtte
 		WorkerID:      "worker-1",
 		Preparation:   outbound.PreparationReady,
 		BoundEndpoint: "C0001",
-		ProviderKey:   "create-key-1",
 		AttemptKind:   outbound.AttemptCreate,
 		Operation:     outbound.OperationSend,
 	})
@@ -219,12 +218,21 @@ func TestAnEditableCardSettlesIdleRatherThanDone(t *testing.T) {
 	}
 
 	// And the final revision of an alert - its resolution - is what ends it.
-	other := admitOne(t, s, outboundGroup(t, s))[0]
+	// Which revision that is comes from the stored state, not from the worker:
+	// a worker that could declare an attempt final could retire a card the
+	// alert is still using.
+	otherGroup := outboundGroup(t, s)
+	other := admitOne(t, s, otherGroup)[0]
+	if _, err := s.db.Exec(
+		`UPDATE outbound_group_snapshots SET final = TRUE WHERE alert_group_id = $1`,
+		otherGroup); err != nil {
+		t.Fatalf("mark the state as final: %v", err)
+	}
 	otherToken := claimOne(t, s, other)
 	otherAttempt := beginOne(t, s, other, otherToken)
 	final, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 		AttemptID: otherAttempt.AttemptID, LeaseToken: otherToken,
-		Completion: acceptedCompletion(), AttemptIsFinal: true,
+		Completion: acceptedCompletion(),
 	})
 	if err != nil {
 		t.Fatalf("finalize: %v", err)
@@ -596,9 +604,14 @@ func TestRecoveryClosesAbandonedAttempts(t *testing.T) {
 	}
 }
 
-// TestRecoveryAndFinalizeCannotBothWin is the race between a worker coming back
-// and the recovery that gave up on it. Whoever takes the row first decides; the
+// TestRecoveryAndFinalizeCannotBothWin is a worker coming back to an attempt
+// the recovery already gave up on. Whoever takes the row first decides; the
 // other is told, and a genuine late result is kept rather than dropped.
+//
+// Both orders are played out here one after the other, which is what pins the
+// OUTCOME of each. That the two cannot interleave into a deadlock is a
+// different claim, and it is made where it can actually be observed:
+// outbound_race_test.go.
 func TestRecoveryAndFinalizeCannotBothWin(t *testing.T) {
 	s := setupTestDB(t)
 
@@ -790,9 +803,11 @@ func TestFinalizeClassifiesEveryWayItCanBeCalled(t *testing.T) {
 	})
 }
 
-// TestAcknowledgementMeetsADeliveryInFlight is the race the domain exists to
-// make boring: whatever order the two arrive in, the alert ends up
-// acknowledged and nobody is paged twice.
+// TestAcknowledgementMeetsADeliveryInFlight is what the domain exists to make
+// boring: whatever order the two arrive in, the alert ends up acknowledged and
+// nobody is paged twice. Sequential on purpose - each subtest fixes one order
+// and states what it must produce. The concurrent version, where the two
+// transactions really overlap, is in outbound_race_test.go.
 func TestAcknowledgementMeetsADeliveryInFlight(t *testing.T) {
 	s := setupTestDB(t)
 

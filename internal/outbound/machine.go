@@ -187,7 +187,11 @@ func decidePreparation(in Input) (Transition, error) {
 		return Transition{
 			To: StatusSending,
 			Effects: Effects{
-				OpenGeneration: in.Intent.AttemptsInGeneration == 0,
+				// Bound by the FACT, not by the count of journal records: a
+				// preparation that never reached the provider adds a record
+				// too, and counting those would skip the binding of the first
+				// call that really happens.
+				OpenGeneration: !in.Intent.GenerationBound,
 			},
 			Row: "T4",
 		}, nil

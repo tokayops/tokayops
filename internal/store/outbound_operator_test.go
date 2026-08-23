@@ -163,7 +163,7 @@ func TestOperatorDecisionsThatApply(t *testing.T) {
 		if err := s.db.QueryRow(`
 			SELECT count(*) FROM outbound_intent_events
 			WHERE intent_id = $1 AND kind IN ('operator_decision', 'duplicate_risk_accepted',
-			                                  'generation_opened')`, intentID).Scan(&events); err != nil {
+			                                  'generation_started')`, intentID).Scan(&events); err != nil {
 			t.Fatalf("count the audit: %v", err)
 		}
 		if events < 3 {

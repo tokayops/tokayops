@@ -180,17 +180,48 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 		}, nil
 	}
 
-	lastKind, ambiguous, err := lastAttemptFactsTx(ctx, tx, req.IntentID, intent.GenerationNo)
+	facts, err := lastAttemptFactsTx(ctx, tx, req.IntentID, intent.GenerationNo)
 	if err != nil {
 		return outbound.ResolveAmbiguityResult{}, err
+	}
+
+	// What an assumed delivery would be assuming: the revision the doubtful
+	// attempt was applying, and whether that revision was the last one. Taken
+	// from the attempt and the stored state, never from the operator - "assume
+	// it arrived" is a statement about a message that was already composed, and
+	// recording today's revision instead would claim a card shows something it
+	// never showed.
+	final := false
+	if intent.GroupBound() {
+		stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+		if err != nil {
+			return outbound.ResolveAmbiguityResult{}, err
+		}
+		final = stored.Final && stored.Revision == facts.Revision
+
+		// An editable card being brought back to life has to aim at the state
+		// the group is in NOW, or it would reapply a revision from before the
+		// alert moved on.
+		if intent.Form == outbound.FormEditable &&
+			req.Decision == outbound.DecisionRetryCurrentGeneration &&
+			stored.Revision != intent.DesiredRevision {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE outbound_intents SET desired_revision = $2 WHERE id = $1`,
+				req.IntentID, stored.Revision); err != nil {
+				return outbound.ResolveAmbiguityResult{}, err
+			}
+			intent.DesiredRevision = stored.Revision
+		}
 	}
 
 	transition, err := outbound.Decide(outbound.Input{
 		Intent:                *intent,
 		Trigger:               outbound.TriggerOperator,
 		Decision:              req.Decision,
-		LastAttemptKind:       lastKind,
-		AmbiguousInGeneration: ambiguous,
+		AttemptRevision:       facts.Revision,
+		AttemptIsFinal:        final,
+		LastAttemptKind:       facts.Kind,
+		AmbiguousInGeneration: facts.Ambiguous,
 		AcceptedDuplicateRisk: req.AcceptedDuplicateRisk,
 		ResourceLossConfirmed: req.ResourceLossConfirmed,
 		NewExpiryProvided:     req.NewExpiresAt != nil,
@@ -207,7 +238,8 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	if err := applyTransitionTx(ctx, tx, transitionWrite{
 		Intent:          *intent,
 		Transition:      transition,
-		AppliedRevision: intent.DesiredRevision,
+		AppliedRevision: facts.Revision,
+		AttemptIsFinal:  final,
 		NewExpires:      req.NewExpiresAt,
 		Actor:           req.Actor,
 		Reason:          req.Reason,
@@ -218,12 +250,6 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	if err := appendIntentEventTx(ctx, tx, req.IntentID, nextEventSeq, "operator_decision",
 		fmt.Sprintf("%s: %s", req.Decision, req.Reason), req.Actor); err != nil {
 		return outbound.ResolveAmbiguityResult{}, err
-	}
-
-	if intent.GroupBound() {
-		if err := groupEffectsTx(ctx, tx, intent.AlertGroupID, transition); err != nil {
-			return outbound.ResolveAmbiguityResult{}, err
-		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -272,22 +298,39 @@ func decisionIsStale(intent outbound.Intent, decision outbound.Decision, groupSt
 	return true, nil
 }
 
-// lastAttemptFactsTx reads what the operator's guards need: what the last
-// attempt was trying to do, and whether anything in this generation ended in
-// doubt.
+// attemptFacts is what the operator's guards and an assumed delivery need to
+// know about the journal: what the last attempt was doing, which revision it
+// was applying, and whether anything in this generation ended in doubt.
+type attemptFacts struct {
+	Kind      outbound.AttemptKind
+	Revision  int64
+	Ambiguous bool
+}
+
+// lastAttemptFactsTx reads them, for the CURRENT generation only.
+//
+// Every one of these facts is about the effect being decided on now. An
+// abandoned generation's create attempt would answer "yes, something exists"
+// about an object this generation never made, and its revision would name a
+// message this one never sent.
 //
 // The last attempt is chosen by its number rather than by its timestamp: two
 // records written in one transaction share a clock reading, and "the last one"
 // has to be an answer rather than a coin toss.
 func lastAttemptFactsTx(ctx context.Context, tx *sql.Tx, intentID string,
-	generation int) (outbound.AttemptKind, bool, error) {
+	generation int) (attemptFacts, error) {
 
-	var kind sql.NullString
+	var (
+		kind     sql.NullString
+		revision sql.NullInt64
+	)
 	err := tx.QueryRowContext(ctx, `
-		SELECT attempt_kind FROM outbound_attempts
-		WHERE intent_id = $1 ORDER BY attempt_no DESC LIMIT 1`, intentID).Scan(&kind)
+		SELECT attempt_kind, applied_revision FROM outbound_attempts
+		WHERE intent_id = $1 AND generation_no = $2
+		ORDER BY attempt_no DESC LIMIT 1`, intentID, generation).
+		Scan(&kind, &revision)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return "", false, err
+		return attemptFacts{}, err
 	}
 
 	var ambiguous bool
@@ -296,10 +339,14 @@ func lastAttemptFactsTx(ctx context.Context, tx *sql.Tx, intentID string,
 			SELECT 1 FROM outbound_attempts
 			WHERE intent_id = $1 AND generation_no = $2 AND outcome = 'ambiguous')`,
 		intentID, generation).Scan(&ambiguous); err != nil {
-		return "", false, err
+		return attemptFacts{}, err
 	}
 
-	return outbound.AttemptKind(kind.String), ambiguous, nil
+	return attemptFacts{
+		Kind:      outbound.AttemptKind(kind.String),
+		Revision:  revision.Int64,
+		Ambiguous: ambiguous,
+	}, nil
 }
 
 // OutboundSnapshot is what the health signals read: how many commitments are in

@@ -459,6 +459,17 @@ func TestDecideOverTheWholeInputSpace(t *testing.T) {
 
 		e := got.Effects
 
+		// An effect is opened exactly when the commitment has none. Opening a
+		// second one would ask the provider to create a second object, at a
+		// second address, under a second key - and nobody could say afterwards
+		// which of them the recipient saw.
+		if e.OpenGeneration && in.Intent.GenerationBound {
+			t.Fatalf("a bound effect was opened again: %+v", in)
+		}
+		if got.To == StatusSending && !e.OpenGeneration && !in.Intent.GenerationBound {
+			t.Fatalf("a call was authorised with no address bound to send to: %+v", in)
+		}
+
 		// A commitment nobody is allowed to leave was left.
 		if in.Intent.Status.Terminal() && in.Trigger != TriggerOperator {
 			t.Fatalf("%s was left by %s", in.Intent.Status, in.Trigger)
@@ -523,11 +534,13 @@ func TestDecideOverTheWholeInputSpace(t *testing.T) {
 
 	for _, status := range allStatuses {
 		for _, prep := range allPreparation {
-			check(Input{
-				Intent:      Intent{Status: status},
-				Trigger:     TriggerPreparation,
-				Preparation: prep,
-			})
+			for _, bound := range bothWays {
+				check(Input{
+					Intent:      Intent{Status: status, GenerationBound: bound},
+					Trigger:     TriggerPreparation,
+					Preparation: prep,
+				})
+			}
 		}
 	}
 
