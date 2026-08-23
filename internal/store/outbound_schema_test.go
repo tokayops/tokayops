@@ -894,13 +894,14 @@ func TestOutboundSchemaSurvivesConcurrentFirstStart(t *testing.T) {
 // constraint states an identity, the index looks like it states a lookup, and
 // both end up over the same columns. The rule is therefore stated as a set: an
 // index on these tables is either the one a constraint brought with it, or one
-// of the seven declared here.
+// of the seven declared here - and an index the schema replaced has to be gone
+// from the database, not merely absent from the file.
 func TestOutboundIndexesAreDeclaredOnce(t *testing.T) {
 	s := setupTestDB(t)
 
 	declared := map[string]bool{
 		"idx_outbound_batches_group_admission": false,
-		"idx_outbound_intents_due":             false,
+		"idx_outbound_intents_claim":           false,
 		"idx_outbound_intents_first_attempt":   false,
 		"idx_outbound_intents_expiring":        false,
 		"idx_outbound_intents_stale":           false,

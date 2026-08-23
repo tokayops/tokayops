@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -436,6 +439,37 @@ func TestARetryIsReachedPastAnOlderBacklog(t *testing.T) {
 		if l.Intent.AttemptsInGeneration != 0 {
 			t.Fatalf("%s was claimed twice", l.Intent.ID)
 		}
+	}
+}
+
+// TestAClaimForNothingThisBuildTakesIsRefused. The phases are a closed set, and
+// the wrong default is silent: an unrecognised phase treated as "anything due"
+// hands out leases for work the caller did not ask for, and the caller finds
+// out by delivering it.
+func TestAClaimForNothingThisBuildTakesIsRefused(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+	intentID := admitOne(t, s, agID)[0]
+
+	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: testFamily, Provider: "slack", Phase: "whatever_comes",
+		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
+	if !errors.Is(err, ErrOutboundContract) {
+		t.Fatalf("a phase nobody declared was served: %v", err)
+	}
+	if len(leased) != 0 {
+		t.Fatalf("%d commitments were leased anyway", len(leased))
+	}
+
+	var token sql.NullString
+	if err := s.db.QueryRow(
+		`SELECT lease_token FROM outbound_intents WHERE id = $1`, intentID).
+		Scan(&token); err != nil {
+		t.Fatalf("read the commitment: %v", err)
+	}
+	if token.Valid {
+		t.Fatal("the refused claim still took a lease")
 	}
 }
 
@@ -1033,5 +1067,73 @@ func TestBackoffGrowsWithTheStreak(t *testing.T) {
 		if !within(got, base) {
 			t.Errorf("failure %d waits %s, want about %s", streak, got, base)
 		}
+	}
+}
+
+// TestTheClaimReadsTheQueueThroughTheIndex is the difference between a rule
+// that holds and a rule that holds until it matters.
+//
+// The claim asks for four rows in a particular order. If the index cannot
+// produce that order, PostgreSQL reads every due row of the provider and sorts
+// it - which is invisible on the empty queue every other test runs against, and
+// is exactly the queue an outage does not leave behind. The plan is asserted on
+// a backlog big enough for the planner to have a choice.
+func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+	seed := admitOne(t, s, agID)[0]
+
+	var batchID string
+	if err := s.db.QueryRow(
+		`SELECT batch_id FROM outbound_intents WHERE id = $1`, seed).Scan(&batchID); err != nil {
+		t.Fatalf("read the batch: %v", err)
+	}
+
+	// A backlog of an outage: thousands due, most of them never attempted, and
+	// the retries scattered through it.
+	if _, err := s.db.Exec(`
+		INSERT INTO outbound_intents (
+			id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
+			provider, target_kind, target_ref, alert_group_id, form, completion_mode,
+			ambiguity_policy, payload_schema_version, payload, provider_key_codec_version,
+			status, desired_revision, attempts_in_generation, not_before, next_attempt_at)
+		SELECT gen_random_uuid()::text, $1, 'backlog-' || g, $2, 'escalation', 1,
+		       'slack', 'channel', 'C' || g, $3, 'editable', 'on_acceptance',
+		       'retry', 1, '{}'::jsonb, 1,
+		       'pending', 0, CASE WHEN g % 10 = 0 THEN 1 ELSE 0 END,
+		       now() - interval '3 hours', now() - make_interval(secs => g)
+		FROM generate_series(1, 5000) g`, batchID, testFamily, agID); err != nil {
+		t.Fatalf("build the backlog: %v", err)
+	}
+	if _, err := s.db.Exec(`ANALYZE outbound_intents`); err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	for _, phase := range []outbound.ClaimPhase{
+		outbound.ClaimFirstAttempts, outbound.ClaimRetriesFirst,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			statement, err := claimStatement(phase)
+			if err != nil {
+				t.Fatalf("build the claim: %v", err)
+			}
+
+			var plan string
+			if err := s.db.QueryRow("EXPLAIN (FORMAT JSON) "+statement,
+				testFamily, "slack", 4, outbound.NotificationLease.Seconds(),
+				"worker-1").Scan(&plan); err != nil {
+				t.Fatalf("explain the claim: %v", err)
+			}
+
+			if strings.Contains(plan, `"Node Type": "Seq Scan"`) {
+				t.Errorf("the claim reads the whole table:\n%s", plan)
+			}
+			if strings.Contains(plan, `"Node Type": "Sort"`) {
+				t.Errorf("the claim sorts the backlog to take four rows:\n%s", plan)
+			}
+			if !strings.Contains(plan, `"Node Type": "Index Scan"`) {
+				t.Errorf("the claim does not walk an index at all:\n%s", plan)
+			}
+		})
 	}
 }

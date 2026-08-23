@@ -142,34 +142,13 @@ func (s *Store) ClaimDueIntents(ctx context.Context,
 		return nil, nil
 	}
 
-	freshOnly := req.Phase == outbound.ClaimFirstAttempts
-	rows, err := s.db.QueryContext(ctx, `
-		UPDATE outbound_intents i
-		SET lease_token = gen_random_uuid()::text,
-		    locked_until = statement_timestamp() + make_interval(secs => $5),
-		    worker_id = $6,
-		    updated_at = now()
-		FROM (
-			SELECT id FROM outbound_intents
-			WHERE delivery_family = $1 AND provider = $2 AND status = 'pending'
-			  AND next_attempt_at <= now()
-			  AND (expires_at IS NULL OR expires_at > now())
-			  AND (locked_until IS NULL OR locked_until <= now())
-			  AND (NOT $3::boolean OR attempts_in_generation = 0)
-			-- Retries before untried work, each half by how long it has
-			-- waited. FALSE sorts first, so a commitment that has already been
-			-- attempted comes before one that has not - which is what makes
-			-- the share the scheduler reserves for retries actually reach
-			-- them. Without it, a backlog of fresh work that is older than the
-			-- retries takes that share too, and the oldest retry never goes
-			-- out at all.
-			ORDER BY (attempts_in_generation = 0), next_attempt_at, id
-			LIMIT $4
-			FOR UPDATE SKIP LOCKED
-		) due
-		WHERE i.id = due.id
-		RETURNING i.id, i.lease_token, i.locked_until`,
-		req.Family, req.Provider, freshOnly, req.Limit, req.Lease.Seconds(),
+	statement, err := claimStatement(req.Phase)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.QueryContext(ctx, statement,
+		req.Family, req.Provider, req.Limit, req.Lease.Seconds(),
 		nilIfEmpty(req.WorkerID))
 	if err != nil {
 		return nil, fmt.Errorf("claim due work: %w", err)
@@ -207,6 +186,57 @@ func (s *Store) ClaimDueIntents(ctx context.Context,
 		})
 	}
 	return out, nil
+}
+
+// claimStatement is the claim for one phase.
+//
+// Two statements rather than one with a flag, because the flag is what stops
+// the planner: a predicate hidden behind a parameter cannot be matched to an
+// index, so the one statement that served both phases had to read and sort the
+// whole due set of a provider to answer either of them. Spelled separately,
+// each phase is a plain index scan.
+//
+// The phases are a closed set and an unrecognised one is refused rather than
+// quietly treated as the broader of the two: handing out leases for work the
+// caller did not ask for is not a default anybody would choose on purpose.
+func claimStatement(phase outbound.ClaimPhase) (string, error) {
+	const shape = `
+		UPDATE outbound_intents i
+		SET lease_token = gen_random_uuid()::text,
+		    locked_until = statement_timestamp() + make_interval(secs => $4),
+		    worker_id = $5,
+		    updated_at = now()
+		FROM (
+			SELECT id FROM outbound_intents
+			WHERE delivery_family = $1 AND provider = $2 AND status = 'pending'
+			  AND next_attempt_at <= now()
+			  AND (expires_at IS NULL OR expires_at > now())
+			  AND (locked_until IS NULL OR locked_until <= now())
+			  %s
+			ORDER BY %s
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		) due
+		WHERE i.id = due.id
+		RETURNING i.id, i.lease_token, i.locked_until`
+
+	switch phase {
+	case outbound.ClaimFirstAttempts:
+		return fmt.Sprintf(shape,
+			"AND attempts_in_generation = 0", "next_attempt_at, id"), nil
+
+	case outbound.ClaimRetriesFirst:
+		// FALSE sorts first, so a commitment that has already been attempted
+		// comes before one that has not - which is what makes the share the
+		// scheduler reserves for retries actually reach them. Without it, a
+		// backlog of untried work that is older than the retries takes that
+		// share too, and the oldest retry never goes out at all.
+		return fmt.Sprintf(shape,
+			"", "(attempts_in_generation = 0), next_attempt_at, id"), nil
+
+	default:
+		return "", outboundContractf("claim phase %q is not one this build takes", phase)
+	}
 }
 
 // RecoverStaleAttempts closes the attempts whose worker never came back.

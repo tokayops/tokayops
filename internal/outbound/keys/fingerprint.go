@@ -420,3 +420,35 @@ func (c Completion) Fingerprint(version int) ([]byte, error) {
 	sum := sha256.Sum256(material.Bytes())
 	return sum[:], nil
 }
+
+// Clone is a completion with none of its pointers shared.
+//
+// Every optional field here is a pointer, so passing one of these by value
+// hands out the insides as well: the receiver can empty the receipt reference
+// or move the revision of a completion somebody else is about to fingerprint.
+// The values are small and the copy is cheap; the alternative is a value object
+// that is not one.
+func (c Completion) Clone() Completion {
+	clone := Completion{Outcome: c.Outcome}
+	if c.ErrorClass != nil {
+		value := *c.ErrorClass
+		clone.ErrorClass = &value
+	}
+	if c.ProviderStatus != nil {
+		value := *c.ProviderStatus
+		clone.ProviderStatus = &value
+	}
+	if c.ReceiptRef != nil {
+		value := *c.ReceiptRef
+		clone.ReceiptRef = &value
+	}
+	if c.AppliedRevision != nil {
+		value := *c.AppliedRevision
+		clone.AppliedRevision = &value
+	}
+	if c.ProviderResultDetail != nil {
+		value := *c.ProviderResultDetail
+		clone.ProviderResultDetail = &value
+	}
+	return clone
+}

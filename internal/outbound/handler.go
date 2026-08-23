@@ -226,11 +226,23 @@ func NewConclusion(in ConclusionInput) (Conclusion, error) {
 		ref := in.Receipt.Ref()
 		completion.ReceiptRef = &ref
 	}
-	return Conclusion{completion: completion, receipt: in.Receipt, summary: in.Summary}, nil
+	return Conclusion{
+		completion: completion,
+		receipt:    in.Receipt,
+		// Truncated here rather than by the caller: this is the only door into
+		// a conclusion, and a limit that lives at one call site is a limit the
+		// next caller does not have.
+		summary: truncate(in.Summary),
+	}, nil
 }
 
 // Completion is what the protocol fingerprints.
-func (c Conclusion) Completion() keys.Completion { return c.completion }
+//
+// A copy, down to the pointers. The struct is full of them, and handing out the
+// originals would let a caller empty the receipt reference of a conclusion the
+// store is about to fingerprint - leaving a message recorded under a name that
+// is no longer the one it was accepted as.
+func (c Conclusion) Completion() keys.Completion { return c.completion.Clone() }
 
 // Receipt is what gets stored about the object, and it is present exactly when
 // the completion names one.
@@ -337,11 +349,15 @@ func unknownStatus(status string) (Outcome, string) {
 const SummaryLimit = 500
 
 // Summarise is what the journal keeps about a call: the handler's own account,
-// or the error if it did not give one, truncated.
+// or the error if it did not give one.
 func Summarise(summary string, err error) string {
 	if summary == "" && err != nil {
-		summary = err.Error()
+		return err.Error()
 	}
+	return summary
+}
+
+func truncate(summary string) string {
 	runes := []rune(summary)
 	if len(runes) <= SummaryLimit {
 		return summary

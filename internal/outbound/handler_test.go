@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -310,5 +311,65 @@ func TestAReceiptDoesNotChangeUnderTheJournal(t *testing.T) {
 	}
 	if got := string(receipt.Raw()); got != kept {
 		t.Fatalf("the receipt changed under whoever read it: %s", got)
+	}
+}
+
+// TestAConclusionCannotBeEditedFromOutside. The completion is a struct of
+// pointers, so handing one out hands out its insides too - and a caller who
+// emptied the receipt reference would leave the store fingerprinting a message
+// under a name it was never accepted as, beside a receipt that still holds the
+// real one.
+func TestAConclusionCannotBeEditedFromOutside(t *testing.T) {
+	concluded, err := NewConclusion(ConclusionInput{
+		Outcome: OutcomeAccepted,
+		Class:   "none",
+		Status:  "ok",
+		Receipt: mustReceipt("C0001/1700000000.000100", `{"channel":"C0001"}`),
+		Summary: "posted",
+	})
+	if err != nil {
+		t.Fatalf("build a conclusion: %v", err)
+	}
+
+	handed := concluded.Completion()
+	*handed.ReceiptRef = ""
+	*handed.ErrorClass = "edited"
+	*handed.ProviderStatus = "edited"
+
+	after := concluded.Completion()
+	if after.ReceiptRef == nil || *after.ReceiptRef != "C0001/1700000000.000100" {
+		t.Fatalf("the conclusion now names %v", after.ReceiptRef)
+	}
+	if *after.ErrorClass != "none" || *after.ProviderStatus != "ok" {
+		t.Fatalf("the conclusion was edited through what it handed out: %+v", after)
+	}
+
+	// Two readers do not share insides either.
+	first, second := concluded.Completion(), concluded.Completion()
+	if first.ReceiptRef == second.ReceiptRef {
+		t.Fatal("two readers were given the same pointer")
+	}
+}
+
+// TestASummaryIsTruncatedWhereverItComesFrom. The limit is the journal's, not
+// one caller's, so it lives in the one door into a conclusion.
+func TestASummaryIsTruncatedWhereverItComesFrom(t *testing.T) {
+	long := strings.Repeat("é", SummaryLimit*2)
+
+	direct, err := NewConclusion(ConclusionInput{
+		Outcome: OutcomeAmbiguous, Class: "no_response", Summary: long,
+	})
+	if err != nil {
+		t.Fatalf("build a conclusion: %v", err)
+	}
+	if runes := []rune(direct.Summary()); len(runes) > SummaryLimit+3 {
+		t.Fatalf("a summary of %d runes was kept whole", len(runes))
+	}
+
+	folded, _ := Conclude(&wilfulHandler{}, Result{
+		Evidence: PossiblySent, Summary: long,
+	}, nil)
+	if runes := []rune(folded.Summary()); len(runes) > SummaryLimit+3 {
+		t.Fatalf("the fold kept %d runes", len(runes))
 	}
 }

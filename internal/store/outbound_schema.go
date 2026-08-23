@@ -320,9 +320,17 @@ CREATE TABLE IF NOT EXISTS outbound_intent_events (
 -- Claims: by family and provider, oldest due first. The provider is in the
 -- predicate because the pool is shared and one provider's backlog must not be
 -- able to take every slot.
-CREATE INDEX IF NOT EXISTS idx_outbound_intents_due
-	ON outbound_intents (delivery_family, provider, next_attempt_at, id)
+-- The order is the claim's own: already attempted first (FALSE sorts before
+-- TRUE), then oldest due. The expression is in the index because the claim
+-- sorts by it, and without that PostgreSQL has to read and sort every due row
+-- of the family to answer a LIMIT of four - which is fine until the outage that
+-- makes the queue long, and useless exactly then.
+CREATE INDEX IF NOT EXISTS idx_outbound_intents_claim
+	ON outbound_intents
+		(delivery_family, provider, (attempts_in_generation = 0), next_attempt_at, id)
 	WHERE status = 'pending';
+-- Superseded by the index above, which has the same leading columns.
+DROP INDEX IF EXISTS idx_outbound_intents_due;
 -- The same claim, restricted to deliveries nobody has tried yet, so a new page
 -- does not queue behind a pile of old retries.
 CREATE INDEX IF NOT EXISTS idx_outbound_intents_first_attempt

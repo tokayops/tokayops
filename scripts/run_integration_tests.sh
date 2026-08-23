@@ -95,11 +95,15 @@ else
     fi
 fi
 
-# Build test command
-TEST_CMD="go test -p 1 -tags=integration $VERBOSE"
+# Build test command.
+#
+# -count=1 always, not only when shuffling. Go caches a test result by the
+# source and the environment, and neither of those mentions the database - so a
+# freshly created, empty instance answers with the results of the last one, and
+# the gate reports "(cached)" for tests that never ran against it.
+TEST_CMD="go test -p 1 -count=1 -tags=integration $VERBOSE"
 if $SHUFFLE; then
-    # -count=1 with it: a cached result was produced in some other order.
-    TEST_CMD="$TEST_CMD -shuffle=on -count=1"
+    TEST_CMD="$TEST_CMD -shuffle=on"
 fi
 if [ -n "$RUN_PATTERN" ]; then
     TEST_CMD="$TEST_CMD -run $RUN_PATTERN"

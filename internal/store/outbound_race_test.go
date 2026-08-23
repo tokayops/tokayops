@@ -14,7 +14,21 @@ import (
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
-// The lock-order rule under real concurrency.
+// The lock-order rule under real concurrency, and what that can and cannot
+// prove.
+//
+// A concurrent test shows that two transactions which write to the same alert
+// cannot deadlock or wait each other out - that is the rule, and it can only be
+// observed by running them at once. What it CANNOT show is what each order
+// produces: nothing here decides which of the two reaches the alert first, and
+// a test that asserted one particular ending would be asserting the scheduling
+// of the machine it ran on. Twice in this file's history it did exactly that
+// and passed for the wrong reason.
+//
+// So the two questions are asked separately. These tests race, and accept
+// either legal ending. The ...InEitherOrder tests below settle the order by
+// letting the first transaction commit before the second begins, and assert
+// exactly what that order has to produce.
 //
 // Acknowledgement and delivery both write to an alert group and to the
 // commitments under it. If one of them took the group first and the other took
@@ -174,52 +188,6 @@ func oneOf(t *testing.T, got []string, want ...string) string {
 	return ""
 }
 
-// heat is how one round's two halves are started.
-//
-// The rounds run one at a time - twelve at once stops being a lock-order test
-// and becomes a load test - and with both sides released at the same instant
-// the same one wins every time: the acknowledgement's transaction is shorter to
-// begin, so it reaches the alert group first in every round, and the other
-// order is never exercised at all. So the order is varied deliberately, and
-// both orders have to produce a legal end state.
-type heat int
-
-const (
-	together heat = iota
-	ackFirst
-	otherFirst
-)
-
-// headStart is long enough to be first to the row and far too short to be
-// finished with it, so the two transactions still overlap.
-const headStart = 5 * time.Millisecond
-
-func (h heat) start(ack, other func()) {
-	switch h {
-	case ackFirst:
-		startStaggered(ack, other)
-	case otherFirst:
-		startStaggered(other, ack)
-	default:
-		startTogether(ack, other)
-	}
-}
-
-func startStaggered(first, second func()) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		first()
-	}()
-	time.Sleep(headStart)
-	go func() {
-		defer wg.Done()
-		second()
-	}()
-	wg.Wait()
-}
-
 // startTogether runs every piece of work at the same instant and waits for all
 // of them.
 func startTogether(work ...func()) {
@@ -250,7 +218,7 @@ func TestAcknowledgementRacesADeliveryThatLanded(t *testing.T) {
 	for i := 0; i < raceRounds; i++ {
 		round := inFlight(t, s, dmCommitment(fmt.Sprintf("U%04d", i)))
 
-		heat(i%3).start(
+		startTogether(
 			func() {
 				timed(&round.ackTook, func() {
 					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
@@ -296,7 +264,7 @@ func TestAcknowledgementRacesAnAssumedDelivery(t *testing.T) {
 		commitment.AmbiguityPolicy = keys.PolicyAssumeAccepted
 		round := inFlight(t, s, commitment)
 
-		heat(i%3).start(
+		startTogether(
 			func() {
 				timed(&round.ackTook, func() {
 					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
@@ -334,15 +302,14 @@ func TestAcknowledgementRacesRecovery(t *testing.T) {
 		expireLease(t, s, round.intentID)
 
 		recoveries := make([]raceRound, 2)
-		heat(i%3).start(
+		startTogether(
 			func() {
 				timed(&round.ackTook, func() {
 					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
 				})
 			},
-			// The two recoverers start together whichever way round this heat
-			// runs: their race with each other is the other half of the rule,
-			// and it is the same race in both orders.
+			// The two recoverers start together with each other as well: their
+			// race for the same candidate is the other half of the rule.
 			func() {
 				startTogether(
 					func() {
@@ -487,3 +454,209 @@ func TestTheJournalIsOneInstant(t *testing.T) {
 // middle, few enough that a slow machine is not asked to serve thousands of
 // them.
 const journalReads = 200
+
+// TestAnAcknowledgementAndADeliveryInEitherOrder is G10 with the order decided.
+// The message went out either way; what differs is what the alert's history is
+// allowed to say about it.
+func TestAnAcknowledgementAndADeliveryInEitherOrder(t *testing.T) {
+	s := setupTestDB(t)
+
+	t.Run("the acknowledgement lands first", func(t *testing.T) {
+		round := inFlight(t, s, dmCommitment("U0001"))
+
+		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+			t.Fatalf("acknowledge: %v", err)
+		}
+		result, err := s.FinalizeDeliveryAttempt(context.Background(),
+			outbound.FinalizeRequest{
+				AttemptID: round.attemptID, LeaseToken: round.token,
+				Conclusion: accepted(),
+			})
+		if err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+
+		if result.To != outbound.StatusSucceeded {
+			t.Fatalf("a message that really went out became %s", result.To)
+		}
+		if got := groupStatusOf(t, s, round.groupID); got != model.AlertGroupStatusAcknowledged {
+			t.Fatalf("the alert is %s after a send that arrived behind the ack", got)
+		}
+		// The wording is the honest one for this order: it went out at the
+		// moment somebody was already handling the alert.
+		oneOf(t, timelineMessages(t, s, round.groupID, model.TimelineEventNotificationSent),
+			"Notification went out at the same moment the alert was acknowledged")
+	})
+
+	t.Run("the delivery lands first", func(t *testing.T) {
+		round := inFlight(t, s, dmCommitment("U0002"))
+
+		result, err := s.FinalizeDeliveryAttempt(context.Background(),
+			outbound.FinalizeRequest{
+				AttemptID: round.attemptID, LeaseToken: round.token,
+				Conclusion: accepted(),
+			})
+		if err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+		if result.To != outbound.StatusSucceeded {
+			t.Fatalf("the delivery became %s", result.To)
+		}
+		// The delivery moved the alert out of processing, which is the whole
+		// point of paging somebody.
+		if got := groupStatusOf(t, s, round.groupID); got != model.AlertGroupStatusTriggered {
+			t.Fatalf("the alert is %s after its notification landed", got)
+		}
+
+		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+			t.Fatalf("acknowledge: %v", err)
+		}
+		if got := groupStatusOf(t, s, round.groupID); got != model.AlertGroupStatusAcknowledged {
+			t.Fatalf("the alert is %s after being acknowledged", got)
+		}
+		oneOf(t, timelineMessages(t, s, round.groupID, model.TimelineEventNotificationSent),
+			"Notification sent")
+	})
+}
+
+// TestAnAcknowledgementAndADoubtfulResultInEitherOrder is G16 with the order
+// decided. This is the fork the domain exists to make explicit, so both sides
+// of it are asserted exactly rather than as "one of these two".
+func TestAnAcknowledgementAndADoubtfulResultInEitherOrder(t *testing.T) {
+	s := setupTestDB(t)
+
+	assumeAccepted := func(ref string) keys.EscalationCommitment {
+		commitment := dmCommitment(ref)
+		commitment.AmbiguityPolicy = keys.PolicyAssumeAccepted
+		return commitment
+	}
+
+	t.Run("the acknowledgement lands first", func(t *testing.T) {
+		round := inFlight(t, s, assumeAccepted("U0001"))
+
+		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+			t.Fatalf("acknowledge: %v", err)
+		}
+		result, err := s.FinalizeDeliveryAttempt(context.Background(),
+			outbound.FinalizeRequest{
+				AttemptID: round.attemptID, LeaseToken: round.token,
+				Conclusion: concluded(outbound.OutcomeAmbiguous, "no_response"),
+			})
+		if err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+
+		// Nothing is assumed about a message nobody is waiting for any more.
+		if result.To != outbound.StatusCanceled {
+			t.Fatalf("a doubtful result after an acknowledgement became %s", result.To)
+		}
+		if sent := timelineMessages(t, s, round.groupID,
+			model.TimelineEventNotificationSent); len(sent) != 0 {
+			t.Fatalf("the alert claims %v about a message nobody could confirm", sent)
+		}
+		if !containsString(timelineMessages(t, s, round.groupID,
+			model.TimelineEventNotificationFailed), "A notification was withdrawn") {
+			t.Fatal("the withdrawal is missing from the alert")
+		}
+		// The attempt keeps the doubt: it may have arrived.
+		var outcome string
+		if err := s.db.QueryRow(`SELECT outcome FROM outbound_attempts WHERE id = $1`,
+			round.attemptID).Scan(&outcome); err != nil {
+			t.Fatalf("read the attempt: %v", err)
+		}
+		if outcome != string(outbound.OutcomeAmbiguous) {
+			t.Fatalf("the withdrawn attempt reads as %q", outcome)
+		}
+	})
+
+	t.Run("the doubtful result lands first", func(t *testing.T) {
+		round := inFlight(t, s, assumeAccepted("U0002"))
+
+		result, err := s.FinalizeDeliveryAttempt(context.Background(),
+			outbound.FinalizeRequest{
+				AttemptID: round.attemptID, LeaseToken: round.token,
+				Conclusion: concluded(outbound.OutcomeAmbiguous, "no_response"),
+			})
+		if err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+		if result.To != outbound.StatusSucceeded {
+			t.Fatalf("assume_accepted produced %s", result.To)
+		}
+
+		// The assumption is visible as an assumption, and the risk is on the
+		// record.
+		oneOf(t, timelineMessages(t, s, round.groupID, model.TimelineEventNotificationSent),
+			"Notification assumed delivered: the provider never confirmed, "+
+				"and the risk was accepted")
+		var risk bool
+		if err := s.db.QueryRow(
+			`SELECT accepted_duplicate_risk FROM outbound_intents WHERE id = $1`,
+			round.intentID).Scan(&risk); err != nil {
+			t.Fatalf("read the risk flag: %v", err)
+		}
+		if !risk {
+			t.Fatal("a delivery nobody confirmed is recorded as if it were confirmed")
+		}
+
+		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+			t.Fatalf("acknowledge: %v", err)
+		}
+		if got := statusOf(t, s, round.intentID); got != outbound.StatusSucceeded {
+			t.Fatalf("the acknowledgement changed a settled commitment to %s", got)
+		}
+	})
+}
+
+// TestAnAcknowledgementAndRecoveryInEitherOrder is G15 with the order decided.
+func TestAnAcknowledgementAndRecoveryInEitherOrder(t *testing.T) {
+	s := setupTestDB(t)
+
+	stale := func(ref string) *raceRound {
+		commitment := dmCommitment(ref)
+		commitment.AmbiguityPolicy = keys.PolicyAssumeAccepted
+		round := inFlight(t, s, commitment)
+		expireLease(t, s, round.intentID)
+		return round
+	}
+
+	t.Run("the acknowledgement lands first", func(t *testing.T) {
+		round := stale("U0001")
+
+		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+			t.Fatalf("acknowledge: %v", err)
+		}
+		recovered, err := s.RecoverStaleAttempts(context.Background(), testFamily, 10)
+		if err != nil {
+			t.Fatalf("recover: %v", err)
+		}
+		if len(recovered) != 1 || recovered[0].To != outbound.StatusCanceled {
+			t.Fatalf("recovery after an acknowledgement produced %+v", recovered)
+		}
+		if got := statusOf(t, s, round.intentID); got != outbound.StatusCanceled {
+			t.Fatalf("the commitment is %s", got)
+		}
+	})
+
+	t.Run("recovery lands first", func(t *testing.T) {
+		round := stale("U0002")
+
+		recovered, err := s.RecoverStaleAttempts(context.Background(), testFamily, 10)
+		if err != nil {
+			t.Fatalf("recover: %v", err)
+		}
+		if len(recovered) != 1 || recovered[0].To != outbound.StatusSucceeded {
+			t.Fatalf("recovery under assume_accepted produced %+v", recovered)
+		}
+		if got := groupStatusOf(t, s, round.groupID); got != model.AlertGroupStatusTriggered {
+			t.Fatalf("the alert is %s after its only notification was assumed delivered", got)
+		}
+
+		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+			t.Fatalf("acknowledge: %v", err)
+		}
+		if got := statusOf(t, s, round.intentID); got != outbound.StatusSucceeded {
+			t.Fatalf("the acknowledgement changed a settled commitment to %s", got)
+		}
+	})
+}
