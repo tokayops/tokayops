@@ -145,8 +145,8 @@ func TestRegression_RenderMessageV2_Truncation(t *testing.T) {
 		Alerts:   alerts,
 	}
 
-	titleBlocks := provider.renderTitleBlocks(ag, false)
-	att := provider.renderBodyAttachment(ag, false)
+	titleBlocks := renderTitleBlocks(provider.freeze(ag, false))
+	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
 	body := alertsBlockText(t, att)
 
 	// Count bullet points (alert lines)
@@ -197,7 +197,7 @@ func TestRegression_RenderMessageV2_SmallGroup(t *testing.T) {
 		Alerts:   alerts,
 	}
 
-	att := provider.renderBodyAttachment(ag, false)
+	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
 	body := alertsBlockText(t, att)
 
 	// All 5 alerts should be rendered
@@ -243,7 +243,7 @@ func TestRegression_RenderMessageV2_SlackUsersMentionsPreserved(t *testing.T) {
 		Alerts:   alerts,
 	}
 
-	att := provider.renderBodyAttachment(ag, false)
+	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
 	body := alertsBlockText(t, att)
 
 	// slack_user mention from alert #12 should still be included
@@ -276,7 +276,7 @@ func TestRegression_RenderAlertSummaries_Truncation(t *testing.T) {
 		Alerts: alerts,
 	}
 
-	result := provider.renderAlertSummaries(ag)
+	result := renderAlertSummaries(provider.freeze(ag, false))
 
 	// Count summary lines (each starts with icon)
 	lines := strings.Split(result, "\n")
@@ -316,7 +316,7 @@ func TestRegression_RenderAlertSummaries_LongDescription(t *testing.T) {
 		},
 	}
 
-	result := provider.renderAlertSummaries(ag)
+	result := renderAlertSummaries(provider.freeze(ag, false))
 
 	// EXPECTED: description truncated to ~200 chars + "..."
 	// BUG (unfixed): full 500 chars rendered

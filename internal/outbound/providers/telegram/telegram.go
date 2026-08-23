@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
@@ -367,21 +368,29 @@ func (t *Provider) Permalink(d *model.NotificationDelivery) string {
 // when reply_markup is absent. Sending nil would strand live buttons on cards
 // posted before the switch was flipped.
 func (t *Provider) keyboardFor(ag *model.AlertGroup, isResolved bool) interface{} {
-	if t.selfURL == "" {
+	return KeyboardFor(t.freeze(ag, isResolved), t.interactive())
+}
+
+// KeyboardFor decides the keyboard from the snapshot and from whether this
+// delivery was admitted with buttons. Both are frozen: buttons that appear or
+// vanish between two attempts of one delivery are two different messages under
+// one key.
+func KeyboardFor(state keys.SnapshotInput, interactive bool) interface{} {
+	if state.GroupURL == nil || *state.GroupURL == "" {
 		return nil
 	}
-	if t.tokenSource == nil || !t.tokenSource.GetTelegramInteractive() {
+	if !interactive {
 		return emptyInlineKeyboard()
 	}
-	// A resolved card carries no buttons either way, so return early rather
-	// than pay for a team lookup that cannot change the answer.
-	if isResolved {
+	// A resolved card carries no buttons, and neither does one whose team
+	// TokayOps does not have: the button would answer nobody.
+	if state.Status == keys.GroupResolved || state.Status == keys.GroupClosed {
 		return emptyInlineKeyboard()
 	}
-	if !providers.TeamIsOnboarded(t.teamLookup, ag.TeamID) {
+	if !state.TeamOnboarded {
 		return emptyInlineKeyboard()
 	}
-	return ackResolveKeyboard(ag, isResolved)
+	return ackResolveKeyboard(state)
 }
 
 // emptyInlineKeyboard is a keyboard with no buttons, i.e. the payload that
@@ -394,15 +403,18 @@ func emptyInlineKeyboard() map[string]interface{} {
 // resolved card gets an empty keyboard (buttons removed); an active card gets
 // Resolve, plus Acknowledge when not yet acknowledged. callback_data is
 // "<prefix><agID>" — well within Telegram's 64-byte limit.
-func ackResolveKeyboard(ag *model.AlertGroup, isResolved bool) map[string]interface{} {
-	if isResolved {
-		return emptyInlineKeyboard()
-	}
+func ackResolveKeyboard(state keys.SnapshotInput) map[string]interface{} {
 	var row []map[string]string
-	if ag.Status != model.AlertGroupStatusAcknowledged {
-		row = append(row, map[string]string{"text": "✅ Acknowledge", "callback_data": model.TelegramCallbackAckPrefix + ag.ID})
+	if state.Status != keys.GroupAcknowledged {
+		row = append(row, map[string]string{
+			"text":          "✅ Acknowledge",
+			"callback_data": model.TelegramCallbackAckPrefix + state.AlertGroupID,
+		})
 	}
-	row = append(row, map[string]string{"text": "🟢 Resolve", "callback_data": model.TelegramCallbackResolvePrefix + ag.ID})
+	row = append(row, map[string]string{
+		"text":          "🟢 Resolve",
+		"callback_data": model.TelegramCallbackResolvePrefix + state.AlertGroupID,
+	})
 	return map[string]interface{}{"inline_keyboard": [][]map[string]string{row}}
 }
 
@@ -517,63 +529,91 @@ func (t *Provider) DeleteWebhook(ctx context.Context, token string) error {
 // html.EscapeString (covers & < > ' " — safe for both text and href attributes).
 // Telegram has no threads, so the card is a single self-contained message.
 func (t *Provider) renderCard(ag *model.AlertGroup, isResolved bool) string {
-	return assembleCard(t.cardBodyLines(ag, isResolved), t.cardFooter(ag), telegramMaxMessageLen)
+	return RenderCard(t.freeze(ag, isResolved))
+}
+
+// RenderCard draws the card from a snapshot and from nothing else. Telegram has
+// no threads, so it is a single self-contained message.
+func RenderCard(state keys.SnapshotInput) string {
+	return assembleCard(cardBodyLines(state), cardFooter(state), telegramMaxMessageLen)
+}
+
+// freeze takes the snapshot for the path that still starts from a live row,
+// reading the configuration, the team lookup and the process zone once - here -
+// rather than halfway through drawing a card.
+func (t *Provider) freeze(ag *model.AlertGroup, isResolved bool) keys.SnapshotInput {
+	onboarded := true
+	if t.interactive() && !isResolved && ag != nil {
+		onboarded = providers.TeamIsOnboarded(t.teamLookup, ag.TeamID)
+	}
+	return providers.RenderableOf(providers.GroupView{
+		Group:         ag,
+		IsResolved:    isResolved,
+		SelfURL:       t.selfURL,
+		TeamOnboarded: onboarded,
+		Zone:          providers.ProcessZone(),
+	})
+}
+
+func (t *Provider) interactive() bool {
+	return t.tokenSource != nil && t.tokenSource.GetTelegramInteractive()
 }
 
 // cardBodyLines returns the body as a slice of complete, individually-valid HTML
 // lines (balanced tags within each line). Truncation drops whole lines, so it can
 // never sever a tag or entity.
-func (t *Provider) cardBodyLines(ag *model.AlertGroup, isResolved bool) []string {
-	status := providers.ResolveStatus(ag, isResolved, providers.CountFiring(ag.Alerts))
+func cardBodyLines(state keys.SnapshotInput) []string {
+	status := providers.ResolveStatus(state)
 
 	titleText := html.EscapeString(status.Title)
-	if ag.ExternalURL != "" {
-		titleText = fmt.Sprintf(`<a href="%s">%s</a>`, html.EscapeString(ag.ExternalURL), html.EscapeString(status.Title))
+	if state.ExternalURL != nil && *state.ExternalURL != "" {
+		titleText = fmt.Sprintf(`<a href="%s">%s</a>`,
+			html.EscapeString(*state.ExternalURL), html.EscapeString(status.Title))
 	}
 	lines := []string{"<b>" + titleText + "</b>"}
 
 	if status.Actor != "" {
 		lines = append(lines, html.EscapeString(status.Actor))
 	}
-	lines = append(lines, "Severity: "+html.EscapeString(ag.Severity))
+	lines = append(lines, "Severity: "+html.EscapeString(state.Severity))
 	lines = append(lines, "Alerts:")
-	lines = append(lines, alertLines(ag)...)
+	lines = append(lines, alertLines(state)...)
 	return lines
 }
 
 // alertLines renders up to 10 alert bullets (HTML-escaped).
-func alertLines(ag *model.AlertGroup) []string {
+func alertLines(state keys.SnapshotInput) []string {
 	const maxAlerts = 10
-	if len(ag.Alerts) == 0 {
-		return []string{"• " + html.EscapeString(ag.Title)}
+	if len(state.Alerts) == 0 {
+		return []string{"• " + html.EscapeString(state.Title)}
 	}
 	var out []string
 	rendered := 0
-	for _, a := range ag.Alerts {
+	for _, a := range state.Alerts {
 		if rendered >= maxAlerts {
 			break
 		}
 		rendered++
-		name := html.EscapeString(a.Labels["alertname"])
-		if a.Status == model.AlertStatusFiring {
-			out = append(out, fmt.Sprintf("• 🔴 %s (Sev: %s)", name, html.EscapeString(a.Labels["severity"])))
+		name := html.EscapeString(a.AlertName)
+		if a.Status == keys.AlertFiring {
+			out = append(out, fmt.Sprintf("• 🔴 %s (Sev: %s)", name, html.EscapeString(a.Severity)))
 		} else {
 			out = append(out, fmt.Sprintf("• 🟢 %s (Resolved)", name))
 		}
 	}
-	if remaining := len(ag.Alerts) - maxAlerts; remaining > 0 {
+	if remaining := len(state.Alerts) - maxAlerts; remaining > 0 {
 		out = append(out, fmt.Sprintf("… and %d more alerts", remaining))
 	}
 	return out
 }
 
 // cardFooter returns the "Open in Tokay" deep-link footer as one complete HTML line.
-func (t *Provider) cardFooter(ag *model.AlertGroup) string {
-	if t.selfURL != "" {
-		url := fmt.Sprintf("%s/#/ops/alert-groups/%s", t.selfURL, ag.ID)
-		return fmt.Sprintf(`ID: <a href="%s">%s</a>`, html.EscapeString(url), html.EscapeString(ag.ID))
+func cardFooter(state keys.SnapshotInput) string {
+	if state.GroupURL != nil && *state.GroupURL != "" {
+		return fmt.Sprintf(`ID: <a href="%s">%s</a>`,
+			html.EscapeString(*state.GroupURL), html.EscapeString(state.AlertGroupID))
 	}
-	return "ID: " + html.EscapeString(ag.ID)
+	return "ID: " + html.EscapeString(state.AlertGroupID)
 }
 
 // assembleCard joins body lines + footer within the length limit WITHOUT

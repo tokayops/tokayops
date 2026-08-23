@@ -13,6 +13,7 @@ import (
 
 	slackapi "github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
@@ -269,7 +270,7 @@ func TestRenderTimeline(t *testing.T) {
 	ag1 := &model.AlertGroup{
 		TimelineEvents: nil,
 	}
-	timeline1 := provider.renderTimeline(ag1)
+	timeline1 := RenderTimeline(provider.freeze(ag1, false))
 	if timeline1 != "" {
 		t.Errorf("Expected empty timeline for no events, got: %s", timeline1)
 	}
@@ -291,7 +292,7 @@ func TestRenderTimeline(t *testing.T) {
 			},
 		},
 	}
-	timeline2 := provider.renderTimeline(ag2)
+	timeline2 := RenderTimeline(provider.freeze(ag2, false))
 	if !strings.Contains(timeline2, "📋 *Timeline:*") {
 		t.Errorf("Expected timeline header, got: %s", timeline2)
 	}
@@ -549,8 +550,8 @@ func TestRenderTitleAndBody_Triggered(t *testing.T) {
 		},
 	}
 
-	title := provider.renderTitleBlocks(ag, false)
-	att := provider.renderBodyAttachment(ag, false)
+	title := renderTitleBlocks(provider.freeze(ag, false))
+	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
 
 	// Color bar = red
 	if att.Color != "#FF0000" {
@@ -639,8 +640,8 @@ func TestRenderTitleAndBody_Acknowledged(t *testing.T) {
 		},
 	}
 
-	title := provider.renderTitleBlocks(ag, false)
-	att := provider.renderBodyAttachment(ag, false)
+	title := renderTitleBlocks(provider.freeze(ag, false))
+	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
 
 	if att.Color != "#FFA500" {
 		t.Errorf("expected orange color, got %s", att.Color)
@@ -680,8 +681,8 @@ func TestRenderTitleAndBody_Resolved(t *testing.T) {
 		},
 	}
 
-	title := provider.renderTitleBlocks(ag, true)
-	att := provider.renderBodyAttachment(ag, true)
+	title := renderTitleBlocks(provider.freeze(ag, true))
+	att := renderBodyAttachment(provider.freeze(ag, true), provider.interactive())
 
 	if att.Color != "#36a64f" {
 		t.Errorf("expected green color, got %s", att.Color)
@@ -722,7 +723,7 @@ func TestRenderTitleAndBody_WithMentions(t *testing.T) {
 		},
 	}
 
-	att := provider.renderBodyAttachment(ag, false)
+	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
 
 	// Severity section (block 0 in body attachment) should contain mentions
 	severityBlock := att.Blocks.BlockSet[0].(*slackapi.SectionBlock)
@@ -746,7 +747,7 @@ func TestRenderTitleAndBody_WithExternalURL(t *testing.T) {
 		},
 	}
 
-	title := provider.renderTitleBlocks(ag, false)
+	title := renderTitleBlocks(provider.freeze(ag, false))
 
 	titleBlock := title[0].(*slackapi.SectionBlock)
 	if !strings.Contains(titleBlock.Text.Text, "https://alertmanager.example.com/alerts/1") {
@@ -969,7 +970,7 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 		ID: "ag-trunc", Title: "TruncTest", Severity: "critical", Alerts: alerts,
 	}
 
-	att := provider.renderBodyAttachment(ag, false)
+	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
 
 	// Alerts section block (index 0 in body attachment) must be ≤ 3000 chars
 	alertsBlock := att.Blocks.BlockSet[0].(*slackapi.SectionBlock)
@@ -992,7 +993,7 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 	}
 
 	// buildAlertList itself should NOT truncate (v1 backward compat)
-	rawList := buildAlertList(alerts)
+	rawList := buildAlertList(provider.freeze(ag, false).Alerts)
 	if strings.Contains(rawList, "truncated") {
 		t.Error("buildAlertList should not truncate — that's renderBodyAttachment's job")
 	}
@@ -1119,7 +1120,9 @@ func TestSlack_TeamGate(t *testing.T) {
 				provider.teamLookup = tt.lookup.fn
 			}
 
-			att := provider.renderBodyAttachment(teamGateAlertGroup("payments"), tt.isResolved)
+			att := renderBodyAttachment(
+				provider.freeze(teamGateAlertGroup("payments"), tt.isResolved),
+				provider.interactive())
 
 			if got := findActionBlock(att) != nil; got != tt.wantButtons {
 				t.Errorf("buttons present = %v, want %v", got, tt.wantButtons)
@@ -1143,8 +1146,6 @@ func TestSlack_TeamGate(t *testing.T) {
 // The team label is free text off the alert and it lands inside a code span, so
 // a backtick would close that span early and a newline would split the block.
 func TestSlack_UnknownTeamNotice_SanitisesLabel(t *testing.T) {
-	provider := &Provider{selfURL: "https://tokay.example"}
-
 	tests := []struct {
 		name        string
 		teamID      string
@@ -1172,7 +1173,7 @@ func TestSlack_UnknownTeamNotice_SanitisesLabel(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := provider.unknownTeamNotice(tt.teamID)
+			got := unknownTeamNotice(noticeState(tt.teamID, "https://tokay.example"))
 			for _, want := range tt.wantPresent {
 				if !strings.Contains(got, want) {
 					t.Errorf("notice %q does not contain %q", got, want)
@@ -1188,7 +1189,7 @@ func TestSlack_UnknownTeamNotice_SanitisesLabel(t *testing.T) {
 
 	t.Run("a long label is capped", func(t *testing.T) {
 		long := strings.Repeat("x", maxTeamLabelLen*3)
-		got := provider.unknownTeamNotice(long)
+		got := unknownTeamNotice(noticeState(long, "https://tokay.example"))
 		if strings.Contains(got, long) {
 			t.Error("full oversized label was interpolated")
 		}
@@ -1210,13 +1211,28 @@ func TestSlack_UnknownTeamNotice_SanitisesLabel(t *testing.T) {
 	})
 
 	t.Run("the link is omitted without a selfURL", func(t *testing.T) {
-		withURL := (&Provider{selfURL: "https://tokay.example"}).unknownTeamNotice("payments")
+		withURL := unknownTeamNotice(noticeState("payments", "https://tokay.example"))
 		if !strings.Contains(withURL, "/#/cfg/teams|Set up the team>") {
 			t.Errorf("expected a setup link, got %q", withURL)
 		}
-		without := (&Provider{}).unknownTeamNotice("payments")
+		without := unknownTeamNotice(noticeState("payments", ""))
 		if strings.Contains(without, "Set up the team") {
 			t.Errorf("expected no link without selfURL, got %q", without)
 		}
 	})
+}
+
+// noticeState is the little of a snapshot the unknown-team notice reads: the
+// label the alert carried, and where a person would go to fix it.
+func noticeState(teamID, selfURL string) keys.SnapshotInput {
+	state := keys.SnapshotInput{AlertGroupID: "ag", Status: keys.GroupTriggered}
+	if teamID != "" {
+		label := teamID
+		state.TeamLabel = &label
+	}
+	if selfURL != "" {
+		setup := selfURL + "/#/cfg/teams"
+		state.TeamSetupURL = &setup
+	}
+	return state
 }

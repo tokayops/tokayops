@@ -1,0 +1,252 @@
+package providers
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
+)
+
+// Freezing a live alert group into the shape the channels render from.
+//
+// The channels draw a card from a snapshot and from nothing else, which is what
+// makes two attempts of one delivery produce the same bytes. The path that
+// still starts from a live row - the job executors, until they are gone - needs
+// somebody to take that snapshot, and this is it: everything that decides bytes
+// is resolved HERE, at one moment, rather than read again halfway through a
+// render.
+
+// GroupView is a live alert group plus the things around it that end up in the
+// message: where this instance lives, whether the alert's team is set up, and
+// which zone times are printed in.
+type GroupView struct {
+	Group      *model.AlertGroup
+	IsResolved bool
+
+	// SelfURL is this instance's base URL. The links built from it are frozen
+	// into the snapshot whole, because a link is part of a message and a
+	// relocated instance must not change a card that was already sent.
+	SelfURL string
+
+	TeamOnboarded bool
+
+	// Zone is an IANA name. Not a *time.Location and not the process's own
+	// zone: two instances in different zones rendering one snapshot have to
+	// produce the same message.
+	Zone string
+}
+
+// SnapshotOf freezes what a card is drawn from, canonical and validated - the
+// form a delivery is admitted and keyed under.
+func SnapshotOf(view GroupView) (keys.RenderSnapshot, error) {
+	return keys.NewRenderSnapshot(ViewOf(view))
+}
+
+// ViewOf is the same freeze without the validation: it puts the fields where a
+// renderer can find them and states nothing about whether they are admissible.
+// What it produces goes to SnapshotOf, which decides that.
+func ViewOf(view GroupView) keys.SnapshotInput {
+	if view.Group == nil {
+		return keys.SnapshotInput{Status: keys.GroupProcessing, DisplayTimezone: "UTC"}
+	}
+	group := view.Group
+
+	in := keys.SnapshotInput{
+		AlertGroupID:    group.ID,
+		Status:          groupStatus(group.Status, view.IsResolved),
+		Title:           group.Title,
+		Severity:        group.Severity,
+		TeamOnboarded:   view.TeamOnboarded,
+		DisplayTimezone: zoneName(view.Zone),
+	}
+	if group.TeamID != "" {
+		label := group.TeamID
+		in.TeamLabel = &label
+	}
+	if group.ExternalURL != "" {
+		external := group.ExternalURL
+		in.ExternalURL = &external
+	}
+	if group.AcknowledgedBy != "" {
+		by := group.AcknowledgedBy
+		in.AcknowledgedBy = &by
+	}
+	if group.ResolvedBy != "" {
+		by := group.ResolvedBy
+		in.ResolvedBy = &by
+	}
+	if view.SelfURL != "" {
+		groupURL := fmt.Sprintf("%s/#/ops/alert-groups/%s", view.SelfURL, group.ID)
+		teamSetupURL := view.SelfURL + "/#/cfg/teams"
+		in.GroupURL = &groupURL
+		in.TeamSetupURL = &teamSetupURL
+	}
+
+	for _, alert := range group.Alerts {
+		in.Alerts = append(in.Alerts, alertSnapshot(alert))
+	}
+	for _, event := range group.TimelineEvents {
+		if event == nil {
+			continue
+		}
+		in.Timeline = append(in.Timeline, timelineSnapshot(event))
+	}
+
+	return in
+}
+
+// alertSnapshot resolves the label-or-annotation fallbacks once, so a renderer
+// reads a field instead of guessing which map an operator put a URL in.
+func alertSnapshot(alert model.Alert) keys.AlertSnapshot {
+	out := keys.AlertSnapshot{
+		Fingerprint: alert.Fingerprint,
+		Status:      keys.AlertFiring,
+		StartsAt:    alert.StartsAt,
+		AlertName:   alert.Labels["alertname"],
+		Severity:    alert.Labels["severity"],
+	}
+	if alert.Status == model.AlertStatusResolved {
+		out.Status = keys.AlertResolved
+	}
+
+	out.SlackUser = optional(alert.Labels["slack_user"])
+	dashboard := alert.Annotations["dashboard"]
+	if dashboard == "" {
+		dashboard = alert.Labels["dashboard"]
+	}
+	out.DashboardURL = optional(dashboard)
+	out.RunbookURL = optional(alert.Annotations["runbook"])
+
+	description := alert.Annotations["description"]
+	if description == "" {
+		description = alert.Annotations["summary"]
+	}
+	out.Description = optional(description)
+	return out
+}
+
+func timelineSnapshot(event *model.TimelineEvent) keys.TimelineEventSnapshot {
+	return keys.TimelineEventSnapshot{
+		ID:        event.ID,
+		Type:      timelineType(event.Type),
+		Message:   event.Message,
+		Actor:     optional(event.Actor),
+		CreatedAt: event.CreatedAt,
+	}
+}
+
+// RenderableOf is the freeze for the path that renders a row that already
+// exists, and it cannot fail.
+//
+// That path has to draw a card from whatever the row holds - an alert nobody
+// fingerprinted, an event recorded without an id - because the message is owed
+// to somebody and sending nothing is not an answer to a data problem. So the
+// gaps are filled with something unique and obviously synthetic, and the whole
+// question is kept away from admission: a producer offering state like this is
+// refused by SnapshotOf, because a digest over unidentifiable alerts cannot say
+// what was sent.
+//
+// It exists for the executors, and it dies with them.
+func RenderableOf(view GroupView) keys.SnapshotInput {
+	in := ViewOf(view)
+
+	fallback := time.Unix(0, 0).UTC()
+	if view.Group != nil && !view.Group.CreatedAt.IsZero() {
+		fallback = view.Group.CreatedAt
+	}
+	for i := range in.Alerts {
+		if in.Alerts[i].Fingerprint == "" {
+			in.Alerts[i].Fingerprint = fmt.Sprintf("unfingerprinted-%d", i)
+		}
+		if in.Alerts[i].StartsAt.IsZero() {
+			in.Alerts[i].StartsAt = fallback
+		}
+	}
+	for i := range in.Timeline {
+		if in.Timeline[i].ID == "" {
+			in.Timeline[i].ID = fmt.Sprintf("unidentified-%d", i)
+		}
+		if in.Timeline[i].CreatedAt.IsZero() {
+			in.Timeline[i].CreatedAt = fallback
+		}
+	}
+	return in
+}
+
+// groupStatus maps the live status, with "being resolved right now" beating
+// whatever the row still says: the resolve path renders the closing card before
+// the status change is visible.
+func groupStatus(status model.AlertGroupStatus, isResolved bool) keys.GroupStatus {
+	if isResolved {
+		return keys.GroupResolved
+	}
+	switch status {
+	case model.AlertGroupStatusNew:
+		return keys.GroupNew
+	case model.AlertGroupStatusProcessing:
+		return keys.GroupProcessing
+	case model.AlertGroupStatusTriggered:
+		return keys.GroupTriggered
+	case model.AlertGroupStatusAcknowledged:
+		return keys.GroupAcknowledged
+	case model.AlertGroupStatusResolved:
+		return keys.GroupResolved
+	case model.AlertGroupStatusClosed:
+		return keys.GroupClosed
+	default:
+		return keys.GroupProcessing
+	}
+}
+
+func timelineType(eventType model.TimelineEventType) keys.TimelineEventType {
+	switch eventType {
+	case model.TimelineEventCreated:
+		return keys.EventCreated
+	case model.TimelineEventAlertAdded:
+		return keys.EventAlertAdded
+	case model.TimelineEventAlertResolved:
+		return keys.EventAlertResolved
+	case model.TimelineEventAcknowledged:
+		return keys.EventAcknowledged
+	case model.TimelineEventResolved:
+		return keys.EventResolved
+	case model.TimelineEventNotificationSent:
+		return keys.EventNotificationSent
+	case model.TimelineEventNotificationFailed:
+		return keys.EventNotificationFailed
+	case model.TimelineEventStatusChange:
+		return keys.EventStatusChange
+	default:
+		// Including model.TimelineEventNote, which is the same thing: something
+		// a person or the system said about the alert.
+		return keys.EventNote
+	}
+}
+
+// zoneName refuses "Local", which is not a zone but a question about the
+// machine asking. A snapshot that carried it would render differently on every
+// instance, which is the one thing it exists to prevent.
+func zoneName(zone string) string {
+	if zone == "" || zone == "Local" {
+		return "UTC"
+	}
+	if _, err := time.LoadLocation(zone); err != nil {
+		return "UTC"
+	}
+	return zone
+}
+
+// ProcessZone is the zone the legacy path prints times in: whatever this
+// process was told to use, and UTC when it was told nothing.
+//
+// It exists only for that path. Everything admitted through the outbound domain
+// carries the zone in its snapshot, decided once by whoever composed it.
+func ProcessZone() string { return zoneName(time.Local.String()) }
+
+func optional(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}

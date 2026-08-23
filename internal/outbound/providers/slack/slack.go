@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	slackapi "github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"github.com/tokayops/tokayops/internal/slackcard"
 )
@@ -93,13 +93,42 @@ func NewProvider(tokenSource TokenSource, selfURL string, teamLookup providers.T
 	}
 }
 
-// RenderCard returns the full card payload for Slack message rendering/replacement.
+// RenderCard returns the full card payload for Slack message
+// rendering/replacement.
+//
+// This is the path that still starts from a live row: it freezes the group into
+// a snapshot here and then renders from that, so the card is drawn by exactly
+// the same pure function the outbound handlers use. What differs is only where
+// the inputs came from.
 func (s *Provider) RenderCard(ag *model.AlertGroup, isResolved bool) slackcard.Card {
-	return slackcard.Card{
-		Text:       s.plainTitle(ag, isResolved),
-		Blocks:     s.renderTitleBlocks(ag, isResolved),
-		Attachment: s.renderBodyAttachment(ag, isResolved),
+	return Render(s.freeze(ag, isResolved), s.interactive())
+}
+
+// freeze takes the snapshot the renderers work from, reading the configuration,
+// the team lookup and the process zone once - at this instant - instead of
+// halfway through drawing a card.
+func (s *Provider) freeze(ag *model.AlertGroup, isResolved bool) keys.SnapshotInput {
+	onboarded := true
+	// Skipped unless it can change the card: a resolved card never carries
+	// buttons, and with interactivity off their absence is the administrator's
+	// decision rather than something to report - so neither state gets buttons
+	// OR the notice, and neither should pay a query for it, least of all while
+	// the database is the thing that is struggling.
+	if s.interactive() && !isResolved && ag != nil {
+		onboarded = providers.TeamIsOnboarded(s.teamLookup, ag.TeamID)
 	}
+
+	return providers.RenderableOf(providers.GroupView{
+		Group:         ag,
+		IsResolved:    isResolved,
+		SelfURL:       s.selfURL,
+		TeamOnboarded: onboarded,
+		Zone:          providers.ProcessZone(),
+	})
+}
+
+func (s *Provider) interactive() bool {
+	return s.tokenSource != nil && s.tokenSource.GetSlackInteractive()
 }
 
 // ErrNoToken is returned when Slack token is not configured
@@ -244,13 +273,13 @@ func (s *Provider) sendCard(ctx context.Context, targetID string, ag *model.Aler
 		return "", err
 	}
 
-	attachment := s.renderBodyAttachment(ag, false)
-	title := s.renderTitleBlocks(ag, false)
+	state := s.freeze(ag, false)
+	card := Render(state, s.interactive())
 
 	channelID, timestamp, err := client.PostMessageContext(ctx, targetID,
-		slackapi.MsgOptionText(s.plainTitle(ag, false), false),
-		slackapi.MsgOptionBlocks(title...),
-		slackapi.MsgOptionAttachments(attachment),
+		slackapi.MsgOptionText(card.Text, false),
+		slackapi.MsgOptionBlocks(card.Blocks...),
+		slackapi.MsgOptionAttachments(card.Attachment),
 	)
 	if err != nil {
 		return "", err
@@ -277,7 +306,7 @@ func (s *Provider) sendCard(ctx context.Context, targetID string, ag *model.Aler
 	log.Printf("Provider: Sent message to %s (ts: %s)", channelID, timestamp)
 
 	// Post Timeline to Thread (second message)
-	timelineText := s.renderTimeline(ag)
+	timelineText := RenderTimeline(state)
 	var timelineTS string
 	if timelineText != "" {
 		_, timelineTS, err = client.PostMessageContext(ctx, channelID,
@@ -316,19 +345,19 @@ func (s *Provider) Update(ctx context.Context, d *model.NotificationDelivery, ag
 	}
 
 	// 1. Update Main Message
-	attachment := s.renderBodyAttachment(ag, false)
-	title := s.renderTitleBlocks(ag, false)
+	state := s.freeze(ag, false)
+	card := Render(state, s.interactive())
 	_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, data.Timestamp,
-		slackapi.MsgOptionText(s.plainTitle(ag, false), false),
-		slackapi.MsgOptionBlocks(title...),
-		slackapi.MsgOptionAttachments(attachment),
+		slackapi.MsgOptionText(card.Text, false),
+		slackapi.MsgOptionBlocks(card.Blocks...),
+		slackapi.MsgOptionAttachments(card.Attachment),
 	)
 	if err != nil {
 		return "", err
 	}
 
 	// 2. Update/Create Timeline Thread
-	timelineText := s.renderTimeline(ag)
+	timelineText := RenderTimeline(state)
 	if timelineText != "" {
 		timelineTS := data.TimelineTimestamp
 		if timelineTS != "" {
@@ -383,20 +412,20 @@ func (s *Provider) Resolve(ctx context.Context, d *model.NotificationDelivery, a
 	}
 
 	// 2. Update Main Message (critical — user-visible)
-	attachment := s.renderBodyAttachment(ag, true)
-	title := s.renderTitleBlocks(ag, true)
+	state := s.freeze(ag, true)
+	card := Render(state, s.interactive())
 
 	_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, data.Timestamp,
-		slackapi.MsgOptionText(s.plainTitle(ag, true), false),
-		slackapi.MsgOptionBlocks(title...),
-		slackapi.MsgOptionAttachments(attachment),
+		slackapi.MsgOptionText(card.Text, false),
+		slackapi.MsgOptionBlocks(card.Blocks...),
+		slackapi.MsgOptionAttachments(card.Attachment),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update main message: %w", err)
 	}
 
 	// 3. Update Timeline Thread (Final state)
-	timelineText := s.renderTimeline(ag)
+	timelineText := RenderTimeline(state)
 	timelineTS := data.TimelineTimestamp
 	if timelineText != "" && timelineTS != "" {
 		_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, timelineTS,
@@ -424,365 +453,3 @@ func (s *Provider) Permalink(d *model.NotificationDelivery) string {
 }
 
 // providers.MessageStatus holds the resolved title and color for a Slack message.
-// collectMentions returns a mrkdwn string of Slack user/group mentions from all alerts.
-func collectMentions(alerts []model.Alert) string {
-	slackUsers := make(map[string]bool)
-	for _, a := range alerts {
-		if u := a.Labels["slack_user"]; u != "" {
-			slackUsers[u] = true
-		}
-	}
-	if len(slackUsers) == 0 {
-		return ""
-	}
-	var parts []string
-	for u := range slackUsers {
-		if strings.HasPrefix(u, "S") {
-			parts = append(parts, fmt.Sprintf("<!subteam^%s>", u))
-		} else {
-			parts = append(parts, fmt.Sprintf("<@%s>", u))
-		}
-	}
-	return strings.Join(parts, " ")
-}
-
-// buildAlertList returns a mrkdwn bullet list of alerts (max 10).
-func buildAlertList(alerts []model.Alert) string {
-	const maxAlerts = 10
-	alertList := ""
-	rendered := 0
-
-	for _, a := range alerts {
-		if rendered >= maxAlerts {
-			break
-		}
-		rendered++
-
-		dashURL := a.Annotations["dashboard"]
-		if dashURL == "" {
-			dashURL = a.Labels["dashboard"]
-		}
-		dashLink := ""
-		if dashURL != "" {
-			dashLink = fmt.Sprintf(" <%s|[dash]>", dashURL)
-		}
-
-		bookURL := a.Annotations["runbook"]
-		bookLink := ""
-		if bookURL != "" {
-			bookLink = fmt.Sprintf(" <%s|[runbook]>", bookURL)
-		}
-
-		if a.Status == model.AlertStatusFiring {
-			alertList += fmt.Sprintf("• 🔴 %s (Sev: %s)%s%s\n", a.Labels["alertname"], a.Labels["severity"], dashLink, bookLink)
-		} else {
-			alertList += fmt.Sprintf("• 🟢 %s (Resolved)%s%s\n", a.Labels["alertname"], dashLink, bookLink)
-		}
-	}
-	if remaining := len(alerts) - maxAlerts; remaining > 0 {
-		alertList += fmt.Sprintf("_... and %d more alerts_\n", remaining)
-	}
-	return alertList
-}
-
-// truncateText truncates s to fit within maxLen bytes (including suffix),
-// cutting at a newline boundary to avoid splitting mrkdwn constructs like <url|label>.
-func truncateText(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	const suffix = "\n_... truncated_\n"
-	if maxLen <= len(suffix) {
-		// Edge case: maxLen too small for suffix — hard-cut at rune boundary
-		runes := []rune(s)
-		for len(string(runes)) > maxLen {
-			runes = runes[:len(runes)-1]
-		}
-		return string(runes)
-	}
-	// Cut at last newline before the byte budget to keep lines intact
-	cutAt := maxLen - len(suffix)
-	body := s[:cutAt]
-	if idx := strings.LastIndex(body, "\n"); idx > 0 {
-		body = body[:idx]
-	}
-	return body + suffix
-}
-
-// maxTeamLabelLen bounds the alert's team label before it is put into a card.
-// The label is free text carried by the alert, and a section block has a hard
-// size limit; a team name longer than this is malformed anyway.
-const maxTeamLabelLen = 80
-
-// labelSanitizer neutralises the characters that would break out of the
-// notice's markup. The backtick closes the code span the label sits in and the
-// line breaks split the block; the other three are mrkdwn-significant. It runs
-// as a single pass, so nothing is escaped twice.
-var labelSanitizer = strings.NewReplacer(
-	"&", "&amp;",
-	"<", "&lt;",
-	">", "&gt;",
-	"`", "'",
-	"\r", " ",
-	"\n", " ",
-)
-
-// sanitizeTeamLabel makes an alert's team label safe to interpolate into card
-// mrkdwn. Truncation happens BEFORE escaping, so a cut can never sever an
-// entity and leave "&am" behind.
-func sanitizeTeamLabel(teamID string) string {
-	if r := []rune(teamID); len(r) > maxTeamLabelLen {
-		teamID = string(r[:maxTeamLabelLen]) + "…"
-	}
-	return labelSanitizer.Replace(teamID)
-}
-
-// unknownTeamNotice is what stands in for the action buttons when the alert
-// group names a team TokayOps does not have.
-func (s *Provider) unknownTeamNotice(teamID string) string {
-	notice := fmt.Sprintf(
-		"*⚠️ Unknown team `%s`*\nTokayOps has no such team, so this alert cannot be acknowledged or resolved from Slack.",
-		sanitizeTeamLabel(teamID),
-	)
-	if s.selfURL != "" {
-		notice += fmt.Sprintf(" <%s/#/cfg/teams|Set up the team>", s.selfURL)
-	}
-	return notice
-}
-
-// plainTitle returns the unformatted title for use as the top-level message
-// text (notification preview / accessibility fallback).
-func (s *Provider) plainTitle(ag *model.AlertGroup, isResolved bool) string {
-	firing := providers.CountFiring(ag.Alerts)
-	return providers.ResolveStatus(ag, isResolved, firing).Title
-}
-
-// renderTitleBlocks returns the title section as top-level blocks. Used as
-// both the in-channel header (above the colored attachment) and the unfurl
-// preview content — Slack message-link unfurls render only top-level blocks.
-func (s *Provider) renderTitleBlocks(ag *model.AlertGroup, isResolved bool) []slackapi.Block {
-	firing := providers.CountFiring(ag.Alerts)
-	status := providers.ResolveStatus(ag, isResolved, firing)
-
-	titleText := status.Title
-	if ag.ExternalURL != "" {
-		titleText = fmt.Sprintf("<%s|%s>", ag.ExternalURL, status.Title)
-	}
-	return []slackapi.Block{
-		slackapi.NewSectionBlock(
-			slackapi.NewTextBlockObject(slackapi.MarkdownType, "*"+titleText+"*", false, false),
-			nil, nil,
-		),
-	}
-}
-
-// renderBodyAttachment returns the colored attachment containing severity/alerts,
-// optional action buttons, and footer. The title is NOT included — it lives in
-// the top-level blocks (renderTitleBlocks) so Slack message-link unfurls can
-// preview it.
-func (s *Provider) renderBodyAttachment(ag *model.AlertGroup, isResolved bool) slackapi.Attachment {
-	firing := providers.CountFiring(ag.Alerts)
-	status := providers.ResolveStatus(ag, isResolved, firing)
-	mentions := collectMentions(ag.Alerts)
-
-	var blocks []slackapi.Block
-
-	// Severity + alerts
-	bodyText := ""
-	if mentions != "" {
-		bodyText = mentions + "\n\n"
-	}
-	bodyText += fmt.Sprintf("*Severity:* %s\n", ag.Severity)
-
-	alertList := buildAlertList(ag.Alerts)
-	if len(ag.Alerts) == 0 {
-		alertList = "• " + ag.Title
-	}
-	bodyText += "*Alerts:*\n" + alertList
-	bodyText = truncateText(bodyText, 3000)
-	blocks = append(blocks, slackapi.NewSectionBlock(
-		slackapi.NewTextBlockObject(slackapi.MarkdownType, bodyText, false, false),
-		nil, nil,
-	))
-
-	// Action buttons (conditional on status, interactive toggle and whether the
-	// alert group's team is onboarded at all).
-	//
-	// The lookup is skipped unless it can change the card. A resolved card never
-	// carries buttons, and with interactivity switched off their absence is the
-	// administrator's decision rather than a problem to report, so neither state
-	// gets buttons OR the notice - and neither should pay a query for it, least
-	// of all while the database is the thing that is struggling.
-	interactive := s.tokenSource != nil && s.tokenSource.GetSlackInteractive()
-	actionable := interactive && !isResolved
-	teamOnboarded := true
-	if actionable {
-		teamOnboarded = providers.TeamIsOnboarded(s.teamLookup, ag.TeamID)
-	}
-
-	showAck := actionable && teamOnboarded && ag.Status != model.AlertGroupStatusAcknowledged
-	showResolve := actionable && teamOnboarded
-
-	if showAck || showResolve {
-		blocks = append(blocks, slackapi.NewDividerBlock())
-
-		var buttons []slackapi.BlockElement
-		if showAck {
-			ackBtn := slackapi.NewButtonBlockElement(
-				model.SlackActionAckAlertGroup, ag.ID,
-				slackapi.NewTextBlockObject(slackapi.PlainTextType, "Acknowledge", true, false),
-			)
-			ackBtn.WithStyle(slackapi.StyleDanger)
-			buttons = append(buttons, ackBtn)
-		}
-		if showResolve {
-			resolveBtn := slackapi.NewButtonBlockElement(
-				model.SlackActionResolveAlertGroup, ag.ID,
-				slackapi.NewTextBlockObject(slackapi.PlainTextType, "Resolve", true, false),
-			)
-			buttons = append(buttons, resolveBtn)
-		}
-		blocks = append(blocks, slackapi.NewActionBlock("alert_actions", buttons...))
-	} else if actionable && !teamOnboarded {
-		// Where the buttons would have been, say why they are not there. The
-		// claim is deliberately limited to what the lookup proves: the team is
-		// absent, so nobody can act on this from Slack. It says nothing about
-		// escalation, because alert_groups.team_id has no foreign key and an
-		// escalation started before the team was deleted keeps running.
-		blocks = append(blocks, slackapi.NewDividerBlock())
-		blocks = append(blocks, slackapi.NewSectionBlock(
-			slackapi.NewTextBlockObject(slackapi.MarkdownType, s.unknownTeamNotice(ag.TeamID), false, false),
-			nil, nil,
-		))
-	}
-
-	// Context footer
-	var footerText string
-	if s.selfURL != "" {
-		footerText = fmt.Sprintf("ID: <%s/#/ops/alert-groups/%s|%s>", s.selfURL, ag.ID, ag.ID)
-	} else {
-		footerText = fmt.Sprintf("ID: %s", ag.ID)
-	}
-	blocks = append(blocks, slackapi.NewContextBlock("alert_footer",
-		slackapi.NewTextBlockObject(slackapi.MarkdownType, footerText, false, false),
-	))
-
-	return slackapi.Attachment{
-		Color:    status.Color,
-		Fallback: status.Title,
-		Blocks:   slackapi.Blocks{BlockSet: blocks},
-	}
-}
-
-// renderTimeline generates the combined summary + timeline message for Slack thread
-func (s *Provider) renderTimeline(ag *model.AlertGroup) string {
-	var sections []string
-
-	// Section 1: Alert Summaries (descriptions)
-	summarySection := s.renderAlertSummaries(ag)
-	if summarySection != "" {
-		sections = append(sections, summarySection)
-	}
-
-	// Section 2: Timeline (limit to last 20 events to avoid Slack message truncation)
-	const maxTimelineEvents = 20
-	if len(ag.TimelineEvents) > 0 {
-		events := ag.TimelineEvents
-		skippedCount := 0
-		if len(events) > maxTimelineEvents {
-			skippedCount = len(events) - maxTimelineEvents
-			events = events[skippedCount:] // Take last N events
-		}
-
-		var lines []string
-		if skippedCount > 0 {
-			lines = append(lines, fmt.Sprintf("... and %d earlier events", skippedCount))
-		}
-		for _, e := range events {
-			icon := getEventIcon(e.Type)
-			localTime := e.CreatedAt.Local()
-			_, offset := localTime.Zone()
-			offsetHours := offset / 3600
-			timeStr := fmt.Sprintf("[%s GMT%+d]", localTime.Format("15:04:05"), offsetHours)
-			line := fmt.Sprintf("%s %s %s", timeStr, icon, e.Message)
-			if e.Actor != "" && e.Actor != "system" {
-				line += " (by " + e.Actor + ")"
-			}
-			lines = append(lines, line)
-		}
-		sections = append(sections, "📋 *Timeline:*\n```\n"+strings.Join(lines, "\n")+"\n```")
-	}
-
-	if len(sections) == 0 {
-		return ""
-	}
-
-	return strings.Join(sections, "\n\n")
-}
-
-// renderAlertSummaries generates the alert descriptions section
-func (s *Provider) renderAlertSummaries(ag *model.AlertGroup) string {
-	const maxSummaries = 10
-	const maxDescLen = 200
-
-	var summaries []string
-	for _, a := range ag.Alerts {
-		if len(summaries) >= maxSummaries {
-			break
-		}
-
-		// Use Annotation['description'] or fallback to summary
-		sum := a.Annotations["description"]
-		if sum == "" {
-			sum = a.Annotations["summary"]
-		}
-		if sum == "" {
-			continue
-		}
-		if len([]rune(sum)) > maxDescLen {
-			sum = string([]rune(sum)[:maxDescLen]) + "..."
-		}
-
-		icon := "🔴"
-		if a.Status == model.AlertStatusResolved {
-			icon = "🟢"
-		}
-		// Format: 🔴 *AlertName*: Summary text
-		summaries = append(summaries, fmt.Sprintf("%s *%s*: %s", icon, a.Labels["alertname"], sum))
-	}
-
-	if len(summaries) == 0 {
-		return ""
-	}
-	result := "*Alert Details:*\n" + strings.Join(summaries, "\n")
-	if len(ag.Alerts) > maxSummaries {
-		result += fmt.Sprintf("\n_... and %d more alert details_", len(ag.Alerts)-maxSummaries)
-	}
-	return result
-}
-
-// getEventIcon returns an emoji icon for the event type
-func getEventIcon(eventType model.TimelineEventType) string {
-	switch eventType {
-	case model.TimelineEventCreated:
-		return "[NEW]"
-	case model.TimelineEventAlertAdded:
-		return "[+]"
-	case model.TimelineEventAlertResolved:
-		return "[-]"
-	case model.TimelineEventAcknowledged:
-		return "[ACK]"
-	case model.TimelineEventResolved:
-		return "[RESOLVED]"
-	case model.TimelineEventNotificationSent:
-		return "[->]"
-	case model.TimelineEventNotificationFailed:
-		return "[X]"
-	case model.TimelineEventNote:
-		return "[NOTE]"
-	case model.TimelineEventStatusChange:
-		return "[~]"
-	default:
-		return "[?]"
-	}
-}
