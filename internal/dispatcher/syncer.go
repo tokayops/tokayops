@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	"log"
 	"sort"
 	"strings"
@@ -137,7 +138,7 @@ func NewUsergroupSyncer(st identityLookup, oncall onCallLister, slackToken strin
 	return &UsergroupSyncer{
 		store:        st,
 		oncall:       oncall,
-		slackClient:  newSlackClient(slackToken, slackHTTPTimeout),
+		slackClient:  slackprovider.NewClient(slackToken, slackprovider.HTTPTimeout),
 		syncInterval: interval,
 		cache:        make(map[string]cacheEntry),
 	}

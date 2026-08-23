@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -144,7 +145,7 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 	}
 
 	// One shared provider instance for both send (dispatcher) and answerCallback (API).
-	tg := dispatcher.NewTelegramProvider(cache, "https://tokay.e2e", dispatcher.WithBaseURL(server.URL))
+	tg := telegramprovider.NewProvider(cache, "https://tokay.e2e", telegramprovider.WithBaseURL(server.URL))
 	disp.RegisterProvider("telegram", tg)
 	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
 		Name: "telegram", IntegrationType: model.IntegrationTypeTelegram, SupportedTargetKinds: []string{"dm", "channel"},

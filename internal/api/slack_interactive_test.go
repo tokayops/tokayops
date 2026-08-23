@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,7 +21,6 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/slack-go/slack"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/slackcard"
 	"github.com/tokayops/tokayops/internal/store"
@@ -78,7 +78,7 @@ func (m *testSlackMessenger) GetSlackUserIDByEmail(ctx context.Context, email st
 	if id, ok := m.slackIDs[email]; ok {
 		return id, nil
 	}
-	return "", dispatcher.ErrSlackUserNotFound
+	return "", slackprovider.ErrUserNotFound
 }
 
 func (m *testSlackMessenger) GetEmailBySlackID(ctx context.Context, slackUserID string) (string, error) {
@@ -88,7 +88,7 @@ func (m *testSlackMessenger) GetEmailBySlackID(ctx context.Context, slackUserID 
 	if email, ok := m.emails[slackUserID]; ok {
 		return email, nil
 	}
-	return "", dispatcher.ErrSlackUserNotFound
+	return "", slackprovider.ErrUserNotFound
 }
 
 // setupTestAPIWithCache creates an API with a pre-loaded IntegrationCache containing

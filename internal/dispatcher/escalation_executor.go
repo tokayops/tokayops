@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"log"
 	"time"
 
@@ -72,9 +73,9 @@ func (e *EscalationExecutor) Execute(ctx context.Context, job *model.Job, step *
 		// ProviderName="slack" for this branch; do not generalize without
 		// an explicit feature flag.
 		editable = true
-		providerPayload, execErr = provider.Send(ctx, NotificationRequest{
+		providerPayload, execErr = provider.Send(ctx, providers.NotificationRequest{
 			Kind:       "firehose",
-			Target:     NotificationTarget{Kind: "channel", ID: stepData.TargetID},
+			Target:     providers.NotificationTarget{Kind: "channel", ID: stepData.TargetID},
 			AlertGroup: ag,
 			Editable:   true,
 		})
@@ -112,9 +113,9 @@ func (e *EscalationExecutor) Execute(ctx context.Context, job *model.Job, step *
 			// supplies its own format (Epic 8).
 			msg = fmt.Sprintf("%s\nPrimary message: <%s|Open in Slack>", msg, permalink)
 		}
-		_, execErr = provider.Send(ctx, NotificationRequest{
+		_, execErr = provider.Send(ctx, providers.NotificationRequest{
 			Kind:     "dm",
-			Target:   NotificationTarget{Kind: "user", ID: targetID},
+			Target:   providers.NotificationTarget{Kind: "user", ID: targetID},
 			Message:  msg,
 			Editable: false,
 		})
@@ -132,9 +133,9 @@ func (e *EscalationExecutor) Execute(ctx context.Context, job *model.Job, step *
 		}
 	case "channel":
 		editable = true
-		providerPayload, execErr = provider.Send(ctx, NotificationRequest{
+		providerPayload, execErr = provider.Send(ctx, providers.NotificationRequest{
 			Kind:       "channel",
-			Target:     NotificationTarget{Kind: "channel", ID: stepData.TargetID},
+			Target:     providers.NotificationTarget{Kind: "channel", ID: stepData.TargetID},
 			AlertGroup: ag,
 			Editable:   true,
 		})

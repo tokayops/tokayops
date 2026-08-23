@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"testing"
 
 	"github.com/tokayops/tokayops/internal/model"
@@ -16,7 +17,7 @@ type mockHandoffProvider struct {
 	sendDMErr    error
 }
 
-func (m *mockHandoffProvider) Send(ctx context.Context, req NotificationRequest) (string, error) {
+func (m *mockHandoffProvider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
 	if req.Target.Kind == "user" {
 		m.sendDMCalled = true
 		m.lastUserID = req.Target.ID

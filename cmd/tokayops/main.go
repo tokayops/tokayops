@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
+	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
 	"log"
 	"net/http"
 	"net/url"
@@ -350,7 +352,7 @@ func main() {
 	// The concrete slackProvider instance is also used by the API layer (SlackMessenger
 	// + SlackCardRenderer below), so the dispatcher factory returns that same instance;
 	// the registry keys it by integration ID.
-	slackProvider := dispatcher.NewSlackProvider(integrationCache, cfg.Global.SelfURL, teamLookup)
+	slackProvider := slackprovider.NewProvider(integrationCache, cfg.Global.SelfURL, teamLookup)
 	disp.RegisterProviderFactory("slack", model.IntegrationTypeSlack, func(integ *model.Integration) (dispatcher.Provider, error) {
 		return slackProvider, nil
 	})
@@ -364,7 +366,7 @@ func main() {
 	// webhook + interactivity (which would need the provider in the API layer like
 	// slackProvider above) land in Sprint 3. The capability registration here is
 	// what makes telegram appear in the policy editor and handoff fan-out.
-	telegramProvider := dispatcher.NewTelegramProvider(integrationCache, cfg.Global.SelfURL, dispatcher.WithTeamLookup(teamLookup))
+	telegramProvider := telegramprovider.NewProvider(integrationCache, cfg.Global.SelfURL, telegramprovider.WithTeamLookup(teamLookup))
 	disp.RegisterProviderFactory("telegram", model.IntegrationTypeTelegram, func(integ *model.Integration) (dispatcher.Provider, error) {
 		return telegramProvider, nil
 	})

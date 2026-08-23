@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	"log"
 	"net/http"
 	"os"
@@ -16,7 +17,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/auth"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
@@ -470,7 +470,7 @@ func (a *API) tryLinkSlackUser(userID, email string) {
 
 	slackUserID, err := a.slack.GetSlackUserIDByEmail(ctx, email)
 	if err != nil {
-		if !errors.Is(err, dispatcher.ErrSlackUserNotFound) {
+		if !errors.Is(err, slackprovider.ErrUserNotFound) {
 			log.Printf("tryLinkSlackUser: slack lookup failed for user %s: %v", userID, err)
 		}
 		return

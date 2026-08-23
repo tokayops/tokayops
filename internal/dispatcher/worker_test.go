@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"strings"
 	"testing"
 
@@ -26,7 +27,7 @@ type MockProvider struct {
 
 var _ Provider = (*MockProvider)(nil)
 
-func (m *MockProvider) Send(ctx context.Context, req NotificationRequest) (string, error) {
+func (m *MockProvider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
 	if req.Target.Kind == "user" {
 		if m.SendDMFunc != nil {
 			return "", m.SendDMFunc(ctx, req.Target.ID, req.Message)

@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -522,7 +523,7 @@ type MockProvider struct {
 // assertions on SendDM (now unified into Send with Editable=false) keep
 // working. Editable=true returns a JSON payload that survives the delivery
 // round-trip; fire-and-forget DMs return an empty payload.
-func (m *MockProvider) Send(ctx context.Context, req dispatcher.NotificationRequest) (string, error) {
+func (m *MockProvider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
 	m.sentCount.Add(1)
 	m.mu.Lock()
 	m.sentTargets = append(m.sentTargets, req.Target.ID)

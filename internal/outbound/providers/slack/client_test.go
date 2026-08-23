@@ -1,4 +1,4 @@
-package dispatcher
+package slack
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/slack-go/slack"
+	slackapi "github.com/slack-go/slack"
 )
 
 // TestNewSlackClient_TimesOutOnAHangingServer: the client gives up on a call
@@ -44,7 +44,7 @@ func TestNewSlackClient_TimesOutOnAHangingServer(t *testing.T) {
 	defer server.Close()
 	defer close(hang)
 
-	client := newSlackClient("xoxb-test", timeout, slack.OptionAPIURL(server.URL+"/"))
+	client := NewClient("xoxb-test", timeout, slackapi.OptionAPIURL(server.URL+"/"))
 
 	// A context with no deadline of its own: the only thing that can end this
 	// call is the client's timeout, which is the point.

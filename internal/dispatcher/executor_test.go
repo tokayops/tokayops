@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	"strings"
 	"testing"
 	"time"
@@ -203,7 +204,7 @@ func TestExecutor_SlackDM_AppendsPrimaryPermalink(t *testing.T) {
 	}
 	s.CreateAlertGroup(ag)
 
-	slackData := SlackData{
+	slackData := slackprovider.Data{
 		ChannelID: "C123",
 		Timestamp: "123.456",
 		Permalink: "https://slack.example.com/archives/C123/p123456",
@@ -226,8 +227,8 @@ func TestExecutor_SlackDM_AppendsPrimaryPermalink(t *testing.T) {
 			return nil
 		},
 		PermalinkFunc: func(d *model.NotificationDelivery) string {
-			data, ok := parseSlackData(d.ProviderPayload)
-			if !ok {
+			var data slackprovider.Data
+			if err := json.Unmarshal([]byte(d.ProviderPayload), &data); err != nil {
 				return ""
 			}
 			return data.Permalink

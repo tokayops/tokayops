@@ -12,36 +12,21 @@ import (
 	"github.com/tokayops/tokayops/internal/dispatcher/builders"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
+	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
-// NotificationTarget identifies where a notification goes, in provider-agnostic
-// terms. ID is the provider-specific identifier (e.g. a Slack channel ID, or a
-// resolved Slack user ID for a DM).
-type NotificationTarget struct {
-	Kind string // "channel" | "user"
-	ID   string
-}
-
-// NotificationRequest is a typed send request covering both alert cards (have an
-// AlertGroup, no free-form Message) and free-form DMs/OTP/handoff (have a Message,
-// no AlertGroup). Providers MUST decide behaviour from Target.Kind, Editable,
-// AlertGroup and Message — NOT from Kind, which is for metrics/context only.
-type NotificationRequest struct {
-	Kind       string // step kind for metrics/context: slack_channel|slack_dm|firehose|otp|handoff
-	Target     NotificationTarget
-	Message    string            // free-form text (DM/OTP/handoff); empty for alert cards
-	AlertGroup *model.AlertGroup // optional; present for alert cards
-	Editable   bool              // true => updatable card (returns payload); false => fire-and-forget
-}
-
-// Provider interface defines notification provider operations.
+// Provider is what this package needs from a channel: the four calls the job
+// executors make. The channels live in internal/outbound/providers and know
+// nothing about jobs - this is the consumer's half of that boundary.
 //
 // Send returns an OPTIONAL provider payload that is persisted to
 // notification_deliveries.provider_payload and later handed back to Update/Resolve.
 // For fire-and-forget sends (Editable=false) an empty payload is valid.
 type Provider interface {
-	Send(ctx context.Context, req NotificationRequest) (string, error)
+	Send(ctx context.Context, req providers.NotificationRequest) (string, error)
 	Update(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) (string, error)
 	Resolve(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) error
 	Permalink(d *model.NotificationDelivery) string
@@ -274,8 +259,8 @@ func (d *Dispatcher) handleStepRetry(step *model.JobStep, err error) {
 // where retrying cannot help.
 func isPermanentError(err error) bool {
 	switch {
-	case errors.Is(err, ErrNoSlackToken),
-		errors.Is(err, ErrNoTelegramToken),
+	case errors.Is(err, slackprovider.ErrNoToken),
+		errors.Is(err, telegramprovider.ErrNoToken),
 		errors.Is(err, ErrIdentityNotLinked),
 		errors.Is(err, ErrUnknownProvider),
 		errors.Is(err, ErrProviderNotConfigured),

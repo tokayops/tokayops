@@ -1,4 +1,4 @@
-package dispatcher
+package telegram
 
 import (
 	"context"
@@ -10,9 +10,10 @@ import (
 	"testing"
 
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
-// mockTelegramTokenSource implements TelegramTokenSource for testing.
+// mockTelegramTokenSource implements TokenSource for testing.
 // interactiveOff is negated on purpose: the zero value has to mean "buttons on",
 // which is what every existing test that renders a card expects.
 type mockTelegramTokenSource struct {
@@ -62,19 +63,19 @@ func TestTelegram_SendUpdateResolve(t *testing.T) {
 	server := fakeBotAPI(t, 42, counts)
 	defer server.Close()
 
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL(server.URL))
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL(server.URL))
 	ctx := context.Background()
 	ag := testAlertGroup()
 
-	payload, err := p.Send(ctx, NotificationRequest{
-		Target:     NotificationTarget{Kind: "channel", ID: "@chan"},
+	payload, err := p.Send(ctx, providers.NotificationRequest{
+		Target:     providers.NotificationTarget{Kind: "channel", ID: "@chan"},
 		AlertGroup: ag,
 		Editable:   true,
 	})
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	data, ok := parseTelegramData(payload)
+	data, ok := parseData(payload)
 	if !ok || data.ChatID != "@chan" || data.MessageID != 42 {
 		t.Fatalf("payload = %q, parsed=%+v ok=%v", payload, data, ok)
 	}
@@ -96,9 +97,9 @@ func TestTelegram_Send_EmptyMessageID_Errors(t *testing.T) {
 	server := fakeBotAPI(t, 0, counts) // message_id 0 → editable contract violation
 	defer server.Close()
 
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
-	_, err := p.Send(context.Background(), NotificationRequest{
-		Target:     NotificationTarget{Kind: "channel", ID: "@chan"},
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
+	_, err := p.Send(context.Background(), providers.NotificationRequest{
+		Target:     providers.NotificationTarget{Kind: "channel", ID: "@chan"},
 		AlertGroup: testAlertGroup(),
 		Editable:   true,
 	})
@@ -112,9 +113,9 @@ func TestTelegram_SendDM_FireAndForget(t *testing.T) {
 	server := fakeBotAPI(t, 7, counts)
 	defer server.Close()
 
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
-	payload, err := p.Send(context.Background(), NotificationRequest{
-		Target:  NotificationTarget{Kind: "user", ID: "123456"},
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
+	payload, err := p.Send(context.Background(), providers.NotificationRequest{
+		Target:  providers.NotificationTarget{Kind: "user", ID: "123456"},
 		Message: "handoff: you are on call",
 	})
 	if err != nil {
@@ -129,16 +130,16 @@ func TestTelegram_SendDM_FireAndForget(t *testing.T) {
 }
 
 func TestTelegram_Send_Guards(t *testing.T) {
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL("http://unused.invalid"))
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL("http://unused.invalid"))
 	ctx := context.Background()
 
-	if _, err := p.Send(ctx, NotificationRequest{Target: NotificationTarget{Kind: "channel", ID: "@c"}}); err == nil {
+	if _, err := p.Send(ctx, providers.NotificationRequest{Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}}); err == nil {
 		t.Error("channel send with nil AlertGroup should error")
 	}
-	if _, err := p.Send(ctx, NotificationRequest{Target: NotificationTarget{Kind: "user", ID: "1"}}); err == nil {
+	if _, err := p.Send(ctx, providers.NotificationRequest{Target: providers.NotificationTarget{Kind: "user", ID: "1"}}); err == nil {
 		t.Error("user send with empty Message should error")
 	}
-	if _, err := p.Send(ctx, NotificationRequest{Target: NotificationTarget{Kind: "sms", ID: "1"}}); err == nil {
+	if _, err := p.Send(ctx, providers.NotificationRequest{Target: providers.NotificationTarget{Kind: "sms", ID: "1"}}); err == nil {
 		t.Error("unsupported target kind should error")
 	}
 }
@@ -149,7 +150,7 @@ func TestTelegram_UpdateResolve_InvalidPayload_NoHTTP(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
 	ctx := context.Background()
 	bad := &model.NotificationDelivery{ID: "del-x", ProviderPayload: `{"not":"valid"}`}
 
@@ -162,16 +163,16 @@ func TestTelegram_UpdateResolve_InvalidPayload_NoHTTP(t *testing.T) {
 }
 
 func TestTelegram_MissingToken_Permanent(t *testing.T) {
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: ""}, "", WithBaseURL("http://unused.invalid"))
+	p := NewProvider(&mockTelegramTokenSource{token: ""}, "", WithBaseURL("http://unused.invalid"))
 	ctx := context.Background()
 
-	_, err := p.Send(ctx, NotificationRequest{Target: NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true})
-	if !errors.Is(err, ErrNoTelegramToken) {
-		t.Errorf("channel send: got %v, want ErrNoTelegramToken", err)
+	_, err := p.Send(ctx, providers.NotificationRequest{Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true})
+	if !errors.Is(err, ErrNoToken) {
+		t.Errorf("channel send: got %v, want ErrNoToken", err)
 	}
-	if !isPermanentError(ErrNoTelegramToken) {
-		t.Error("ErrNoTelegramToken should be classified permanent")
-	}
+	// Whether the dispatcher treats that as permanent is the dispatcher's rule
+	// and is asserted there: a channel that classified its own errors for its
+	// caller would be two answers to one question.
 }
 
 func TestTelegram_EditNotModified_IsSuccess(t *testing.T) {
@@ -185,7 +186,7 @@ func TestTelegram_EditNotModified_IsSuccess(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
 	delivery := &model.NotificationDelivery{ID: "d", ProviderPayload: `{"chat_id":"@c","message_id":5}`}
 	if _, err := p.Update(context.Background(), delivery, testAlertGroup()); err != nil {
 		t.Errorf("'message is not modified' should be treated as success, got %v", err)
@@ -193,7 +194,7 @@ func TestTelegram_EditNotModified_IsSuccess(t *testing.T) {
 }
 
 func TestTelegram_RenderCard_HTMLEscaping(t *testing.T) {
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL("http://unused.invalid"))
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL("http://unused.invalid"))
 	ag := &model.AlertGroup{
 		ID:       `ag&"1`,
 		Title:    "T",
@@ -234,7 +235,7 @@ func TestTelegram_RenderCard_SafeTruncation(t *testing.T) {
 		}
 	}
 	ag := &model.AlertGroup{ID: "ag-big", Title: "Big", Severity: "critical", Alerts: alerts}
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL("http://unused.invalid"))
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL("http://unused.invalid"))
 
 	out := p.renderCard(ag, false)
 
@@ -252,7 +253,7 @@ func TestTelegram_RenderCard_SafeTruncation(t *testing.T) {
 }
 
 func TestTelegram_Permalink(t *testing.T) {
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL("http://unused.invalid"))
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL("http://unused.invalid"))
 
 	pub := &model.NotificationDelivery{ProviderPayload: `{"chat_id":"@mychan","message_id":42}`}
 	if got := p.Permalink(pub); got != "https://t.me/mychan/42" {
@@ -277,9 +278,9 @@ func TestTelegram_CardHasAckResolveKeyboard(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL(server.URL))
-	if _, err := p.Send(context.Background(), NotificationRequest{
-		Target: NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL(server.URL))
+	if _, err := p.Send(context.Background(), providers.NotificationRequest{
+		Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -314,12 +315,12 @@ func TestTelegram_InteractiveOff_UpdateClearsKeyboard(t *testing.T) {
 	defer server.Close()
 
 	src := &mockTelegramTokenSource{token: "tok"}
-	p := NewTelegramProvider(src, "https://tokay.example", WithBaseURL(server.URL))
+	p := NewProvider(src, "https://tokay.example", WithBaseURL(server.URL))
 	ctx := context.Background()
 	ag := testAlertGroup()
 
-	payload, err := p.Send(ctx, NotificationRequest{
-		Target: NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: ag, Editable: true,
+	payload, err := p.Send(ctx, providers.NotificationRequest{
+		Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: ag, Editable: true,
 	})
 	if err != nil {
 		t.Fatalf("Send: %v", err)
@@ -359,9 +360,9 @@ func TestTelegram_InteractiveOff_SendHasEmptyKeyboard(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok", interactiveOff: true}, "https://tokay.example", WithBaseURL(server.URL))
-	if _, err := p.Send(context.Background(), NotificationRequest{
-		Target: NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
+	p := NewProvider(&mockTelegramTokenSource{token: "tok", interactiveOff: true}, "https://tokay.example", WithBaseURL(server.URL))
+	if _, err := p.Send(context.Background(), providers.NotificationRequest{
+		Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -385,9 +386,9 @@ func TestTelegram_NoButtonsWithoutSelfURL(t *testing.T) {
 	defer server.Close()
 
 	// Empty selfURL ⇒ no public webhook possible ⇒ omit the (dead) keyboard.
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
-	if _, err := p.Send(context.Background(), NotificationRequest{
-		Target: NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
+	if _, err := p.Send(context.Background(), providers.NotificationRequest{
+		Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -409,7 +410,7 @@ func TestTelegram_AnswerCallback(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
 	if err := p.AnswerCallback(context.Background(), "cb1", "Acknowledged"); err != nil {
 		t.Fatalf("AnswerCallback: %v", err)
 	}
@@ -433,7 +434,7 @@ func TestTelegram_SetAndDeleteWebhook_ExplicitToken(t *testing.T) {
 
 	// tokenSource is intentionally a different token — webhook mgmt must use the
 	// EXPLICIT token argument, not the cached one.
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "CACHED"}, "", WithBaseURL(server.URL))
+	p := NewProvider(&mockTelegramTokenSource{token: "CACHED"}, "", WithBaseURL(server.URL))
 	if err := p.SetWebhook(context.Background(), "BOT1", "https://x/telegram/webhook", "sek"); err != nil {
 		t.Fatalf("SetWebhook: %v", err)
 	}
@@ -462,7 +463,7 @@ func TestTelegram_BotUsername_Caches(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewTelegramProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
+	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
 	for i := 0; i < 3; i++ {
 		u, err := p.BotUsername(context.Background())
 		if err != nil || u != "tokay_bot" {
@@ -533,11 +534,11 @@ func TestTelegram_TeamGate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opts := []TelegramOption{WithBaseURL("http://unused.invalid")}
+			opts := []Option{WithBaseURL("http://unused.invalid")}
 			if !tt.useNilHook {
 				opts = append(opts, WithTeamLookup(tt.lookup.fn))
 			}
-			p := NewTelegramProvider(
+			p := NewProvider(
 				&mockTelegramTokenSource{token: "tok", interactiveOff: !tt.interactive},
 				"https://tokay.example",
 				opts...,
@@ -566,4 +567,18 @@ func TestTelegram_TeamGate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// countingTeamLookup is a providers.TeamLookup that records how often it ran,
+// so a test can assert the lookup was skipped, not just that its answer was
+// ignored.
+type countingTeamLookup struct {
+	calls     int
+	onboarded bool
+	err       error
+}
+
+func (c *countingTeamLookup) fn(string) (bool, error) {
+	c.calls++
+	return c.onboarded, c.err
 }

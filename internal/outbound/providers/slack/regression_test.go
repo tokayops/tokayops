@@ -1,4 +1,4 @@
-package dispatcher
+package slack
 
 import (
 	"context"
@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/slack-go/slack"
+	slackapi "github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// TestRegression_Resolve_ErrorLeak verifies that SlackProvider.Resolve()
+// TestRegression_Resolve_ErrorLeak verifies that Provider.Resolve()
 // returns nil even when the timeline update fails.
 // Bug: return err on the last line leaked the timeline update error,
 // causing the resolution job step to fail permanently.
@@ -57,7 +57,7 @@ func TestRegression_Resolve_ErrorLeak(t *testing.T) {
 	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
 	ctx := context.Background()
 
-	data := SlackData{
+	data := Data{
 		ChannelID:         "C123",
 		Timestamp:         "100.200",
 		TimelineTimestamp: "100.300",
@@ -94,12 +94,12 @@ func TestRegression_Resolve_ErrorLeak(t *testing.T) {
 //	BlockSet[1] = divider (only if interactive buttons present)
 //	BlockSet[2] = action block (only if interactive)
 //	BlockSet[N-1] = context footer
-func alertsBlockText(t *testing.T, att slack.Attachment) string {
+func alertsBlockText(t *testing.T, att slackapi.Attachment) string {
 	t.Helper()
 	if len(att.Blocks.BlockSet) < 1 {
 		t.Fatalf("expected at least 1 block, got %d", len(att.Blocks.BlockSet))
 	}
-	sec, ok := att.Blocks.BlockSet[0].(*slack.SectionBlock)
+	sec, ok := att.Blocks.BlockSet[0].(*slackapi.SectionBlock)
 	if !ok {
 		t.Fatalf("block 0 is not SectionBlock, got %T", att.Blocks.BlockSet[0])
 	}
@@ -108,12 +108,12 @@ func alertsBlockText(t *testing.T, att slack.Attachment) string {
 
 // titleBlockText extracts the markdown text from the title blocks
 // returned by renderTitleBlocks.
-func titleBlockText(t *testing.T, blocks []slack.Block) string {
+func titleBlockText(t *testing.T, blocks []slackapi.Block) string {
 	t.Helper()
 	if len(blocks) < 1 {
 		t.Fatalf("expected at least 1 title block, got %d", len(blocks))
 	}
-	sec, ok := blocks[0].(*slack.SectionBlock)
+	sec, ok := blocks[0].(*slackapi.SectionBlock)
 	if !ok {
 		t.Fatalf("title block 0 is not SectionBlock, got %T", blocks[0])
 	}
@@ -124,7 +124,7 @@ func titleBlockText(t *testing.T, blocks []slack.Block) string {
 // truncates the alert list when there are more than 10 alerts.
 // Bug guard: no truncation → Slack message exceeds character limit → msg_too_long error.
 func TestRegression_RenderMessageV2_Truncation(t *testing.T) {
-	provider := &SlackProvider{}
+	provider := &Provider{}
 
 	// Create 15 alerts
 	alerts := make([]model.Alert, 15)
@@ -177,7 +177,7 @@ func TestRegression_RenderMessageV2_Truncation(t *testing.T) {
 
 // TestRegression_RenderMessageV2_SmallGroup verifies no truncation for small groups.
 func TestRegression_RenderMessageV2_SmallGroup(t *testing.T) {
-	provider := &SlackProvider{}
+	provider := &Provider{}
 
 	alerts := make([]model.Alert, 5)
 	for i := 0; i < 5; i++ {
@@ -221,7 +221,7 @@ func TestRegression_RenderMessageV2_SmallGroup(t *testing.T) {
 // TestRegression_RenderMessageV2_SlackUsersMentionsPreserved verifies that
 // slack_user mentions are collected from ALL alerts, not just the first 10.
 func TestRegression_RenderMessageV2_SlackUsersMentionsPreserved(t *testing.T) {
-	provider := &SlackProvider{}
+	provider := &Provider{}
 
 	alerts := make([]model.Alert, 12)
 	for i := 0; i < 12; i++ {
@@ -256,7 +256,7 @@ func TestRegression_RenderMessageV2_SlackUsersMentionsPreserved(t *testing.T) {
 // renderAlertSummaries() truncates both the number of summaries
 // and the description length.
 func TestRegression_RenderAlertSummaries_Truncation(t *testing.T) {
-	provider := &SlackProvider{}
+	provider := &Provider{}
 
 	alerts := make([]model.Alert, 15)
 	for i := 0; i < 15; i++ {
@@ -301,7 +301,7 @@ func TestRegression_RenderAlertSummaries_Truncation(t *testing.T) {
 // TestRegression_RenderAlertSummaries_LongDescription verifies that
 // very long alert descriptions are truncated.
 func TestRegression_RenderAlertSummaries_LongDescription(t *testing.T) {
-	provider := &SlackProvider{}
+	provider := &Provider{}
 
 	longDesc := strings.Repeat("x", 500) // 500 chars
 

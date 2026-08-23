@@ -1,4 +1,4 @@
-package dispatcher
+package telegram
 
 import (
 	"bytes"
@@ -14,10 +14,11 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
-// ErrNoTelegramToken is returned when the Telegram bot token is not configured.
-var ErrNoTelegramToken = fmt.Errorf("telegram integration not configured (no token)")
+// ErrNoToken is returned when the Telegram bot token is not configured.
+var ErrNoToken = fmt.Errorf("telegram integration not configured (no token)")
 
 const (
 	// telegramDefaultBaseURL is the public Bot API host; overridable in tests via WithBaseURL.
@@ -34,23 +35,23 @@ const (
 	telegramMaxMessageLen = 4096
 )
 
-// TelegramTokenSource provides the send-time Telegram settings (mirror of
+// TokenSource provides the send-time Telegram settings (mirror of
 // SlackTokenSource): the bot token and whether Ack/Resolve buttons are enabled.
 // The webhook secret token is intentionally NOT here - it is a webhook-verification
 // concern read off the concrete IntegrationCache, not a send-time concern.
-type TelegramTokenSource interface {
+type TokenSource interface {
 	GetTelegramToken() string
 	GetTelegramInteractive() bool
 }
 
-// TelegramProvider implements dispatcher.Provider against the Telegram Bot API
+// Provider implements dispatcher.Provider against the Telegram Bot API
 // using a raw net/http client (no third-party SDK) so the timeout and the test
 // base URL are fully under our control.
-type TelegramProvider struct {
-	tokenSource TelegramTokenSource
-	selfURL     string     // TokayOps base URL for deep links
-	teamLookup  TeamLookup // nil means "assume onboarded", see teamIsOnboarded
-	baseURL     string     // Bot API base; default telegramDefaultBaseURL, overridable in tests
+type Provider struct {
+	tokenSource TokenSource
+	selfURL     string               // TokayOps base URL for deep links
+	teamLookup  providers.TeamLookup // nil means "assume onboarded", see teamIsOnboarded
+	baseURL     string               // Bot API base; default telegramDefaultBaseURL, overridable in tests
 	mu          sync.Mutex
 	cachedToken string
 	client      *http.Client
@@ -59,15 +60,13 @@ type TelegramProvider struct {
 	cachedUsernameToken string
 }
 
-var _ Provider = (*TelegramProvider)(nil)
-
-// TelegramOption configures a TelegramProvider at construction.
-type TelegramOption func(*TelegramProvider)
+// Option configures a Provider at construction.
+type Option func(*Provider)
 
 // WithBaseURL overrides the Bot API base URL. The primary use is pointing tests
 // (including cross-package integration tests) at an httptest.Server.
-func WithBaseURL(u string) TelegramOption {
-	return func(p *TelegramProvider) {
+func WithBaseURL(u string) Option {
+	return func(p *Provider) {
 		if u != "" {
 			p.baseURL = strings.TrimRight(u, "/")
 		}
@@ -78,12 +77,12 @@ func WithBaseURL(u string) TelegramOption {
 // Telegram never posts a card for an unonboarded team today (that path is
 // firehose, which is Slack-only), so this exists to keep the two channels from
 // drifting apart if that ever changes.
-func WithTeamLookup(lookup TeamLookup) TelegramOption {
-	return func(p *TelegramProvider) { p.teamLookup = lookup }
+func WithTeamLookup(lookup providers.TeamLookup) Option {
+	return func(p *Provider) { p.teamLookup = lookup }
 }
 
-func NewTelegramProvider(tokenSource TelegramTokenSource, selfURL string, opts ...TelegramOption) *TelegramProvider {
-	p := &TelegramProvider{
+func NewProvider(tokenSource TokenSource, selfURL string, opts ...Option) *Provider {
+	p := &Provider{
 		tokenSource: tokenSource,
 		selfURL:     selfURL,
 		baseURL:     telegramDefaultBaseURL,
@@ -94,19 +93,19 @@ func NewTelegramProvider(tokenSource TelegramTokenSource, selfURL string, opts .
 	return p
 }
 
-// TelegramData is the opaque provider payload stored in a delivery row: the
+// Data is the opaque provider payload stored in a delivery row: the
 // coordinates needed to edit the message later. No timeline ts (Telegram v1 has
 // no threads) and no stored permalink (derived on demand in Permalink).
-type TelegramData struct {
+type Data struct {
 	ChatID    string `json:"chat_id"`
 	MessageID int    `json:"message_id"`
 }
 
-func parseTelegramData(raw string) (*TelegramData, bool) {
+func parseData(raw string) (*Data, bool) {
 	if raw == "" {
 		return nil, false
 	}
-	var data TelegramData
+	var data Data
 	if err := json.Unmarshal([]byte(raw), &data); err != nil {
 		return nil, false
 	}
@@ -118,14 +117,14 @@ func parseTelegramData(raw string) (*TelegramData, bool) {
 
 // getClient returns an HTTP client and the current bot token, recreating the
 // client if the token changed (so an API config edit applies after LoadAll
-// without a restart). Returns ErrNoTelegramToken if no token is configured.
-func (t *TelegramProvider) getClient() (*http.Client, string, error) {
+// without a restart). Returns ErrNoToken if no token is configured.
+func (t *Provider) getClient() (*http.Client, string, error) {
 	if t.tokenSource == nil {
-		return nil, "", ErrNoTelegramToken
+		return nil, "", ErrNoToken
 	}
 	token := t.tokenSource.GetTelegramToken()
 	if token == "" {
-		return nil, "", ErrNoTelegramToken
+		return nil, "", ErrNoToken
 	}
 
 	t.mu.Lock()
@@ -133,7 +132,7 @@ func (t *TelegramProvider) getClient() (*http.Client, string, error) {
 
 	if t.client == nil || t.cachedToken != token {
 		if t.client != nil && t.cachedToken != token {
-			log.Printf("TelegramProvider: Token changed, recreating client")
+			log.Printf("Provider: Token changed, recreating client")
 		}
 		t.cachedToken = token
 		t.client = &http.Client{Timeout: telegramHTTPTimeout}
@@ -153,7 +152,7 @@ type tgResponse struct {
 // callBotAPI POSTs a JSON body to a Bot API method and decodes the envelope.
 // It never logs the URL (which contains the token). No retry (v1 decision) —
 // transient failures bubble up to the step-level retry.
-func (t *TelegramProvider) callBotAPI(ctx context.Context, client *http.Client, token, method string, body map[string]interface{}) (*tgResponse, error) {
+func (t *Provider) callBotAPI(ctx context.Context, client *http.Client, token, method string, body map[string]interface{}) (*tgResponse, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("telegram %s: marshal body: %w", method, err)
@@ -185,7 +184,7 @@ func (t *TelegramProvider) callBotAPI(ctx context.Context, client *http.Client, 
 // sendMessage posts a message and returns its message_id. parseMode "" sends
 // plain text (no parse_mode); "HTML" enables HTML formatting. replyMarkup nil
 // omits the inline keyboard.
-func (t *TelegramProvider) sendMessage(ctx context.Context, client *http.Client, token, chatID, text, parseMode string, replyMarkup interface{}) (int, error) {
+func (t *Provider) sendMessage(ctx context.Context, client *http.Client, token, chatID, text, parseMode string, replyMarkup interface{}) (int, error) {
 	body := map[string]interface{}{
 		"chat_id":                  chatID,
 		"text":                     text,
@@ -217,7 +216,7 @@ func (t *TelegramProvider) sendMessage(ctx context.Context, client *http.Client,
 // modified" is treated as success (idempotent re-edit to identical content).
 // replyMarkup nil leaves the existing keyboard untouched; a non-nil value
 // (including an empty inline_keyboard) replaces it.
-func (t *TelegramProvider) editMessageText(ctx context.Context, client *http.Client, token, chatID string, messageID int, text string, replyMarkup interface{}) error {
+func (t *Provider) editMessageText(ctx context.Context, client *http.Client, token, chatID string, messageID int, text string, replyMarkup interface{}) error {
 	body := map[string]interface{}{
 		"chat_id":                  chatID,
 		"message_id":               messageID,
@@ -243,9 +242,9 @@ func (t *TelegramProvider) editMessageText(ctx context.Context, client *http.Cli
 
 // Send dispatches on the target kind: a "user" target is a fire-and-forget DM
 // (returns no payload), a "channel" target posts an editable alert card and
-// returns its TelegramData payload. Behaviour keys on Target.Kind — never on
+// returns its Data payload. Behaviour keys on Target.Kind — never on
 // req.Kind. An unknown kind is rejected rather than silently treated as a card.
-func (t *TelegramProvider) Send(ctx context.Context, req NotificationRequest) (string, error) {
+func (t *Provider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
 	switch req.Target.Kind {
 	case "user":
 		if req.Message == "" {
@@ -265,7 +264,7 @@ func (t *TelegramProvider) Send(ctx context.Context, req NotificationRequest) (s
 // sendDM sends a fire-and-forget plain-text DM. Not deliverable until Sprint 3
 // (linking): without a linked identity the dm step path returns
 // ErrIdentityNotLinked before reaching here. Returns no payload (Editable=false).
-func (t *TelegramProvider) sendDM(ctx context.Context, chatID, message string) error {
+func (t *Provider) sendDM(ctx context.Context, chatID, message string) error {
 	client, token, err := t.getClient()
 	if err != nil {
 		return err
@@ -277,8 +276,8 @@ func (t *TelegramProvider) sendDM(ctx context.Context, chatID, message string) e
 }
 
 // sendCard posts an alert-group card to a channel/group and returns the
-// TelegramData payload needed to edit it later.
-func (t *TelegramProvider) sendCard(ctx context.Context, chatID string, ag *model.AlertGroup) (string, error) {
+// Data payload needed to edit it later.
+func (t *Provider) sendCard(ctx context.Context, chatID string, ag *model.AlertGroup) (string, error) {
 	if ag == nil {
 		return "", fmt.Errorf("telegram: channel send requires an alert group")
 	}
@@ -298,18 +297,18 @@ func (t *TelegramProvider) sendCard(ctx context.Context, chatID string, ag *mode
 		return "", fmt.Errorf("telegram: sendMessage returned empty chat/message id (chat=%q id=%d)", chatID, messageID)
 	}
 
-	log.Printf("TelegramProvider: Sent message to %s (message_id: %d)", chatID, messageID)
+	log.Printf("Provider: Sent message to %s (message_id: %d)", chatID, messageID)
 
-	data := TelegramData{ChatID: chatID, MessageID: messageID}
+	data := Data{ChatID: chatID, MessageID: messageID}
 	bytes, _ := json.Marshal(data)
 	return string(bytes), nil
 }
 
-func (t *TelegramProvider) Update(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) (string, error) {
+func (t *Provider) Update(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) (string, error) {
 	if d == nil || d.ProviderPayload == "" {
 		return "", nil
 	}
-	data, ok := parseTelegramData(d.ProviderPayload)
+	data, ok := parseData(d.ProviderPayload)
 	if !ok {
 		return "", fmt.Errorf("telegram: invalid provider payload for delivery %s", d.ID)
 	}
@@ -324,11 +323,11 @@ func (t *TelegramProvider) Update(ctx context.Context, d *model.NotificationDeli
 	return d.ProviderPayload, nil
 }
 
-func (t *TelegramProvider) Resolve(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) error {
+func (t *Provider) Resolve(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) error {
 	if d == nil || d.ProviderPayload == "" {
 		return nil
 	}
-	data, ok := parseTelegramData(d.ProviderPayload)
+	data, ok := parseData(d.ProviderPayload)
 	if !ok {
 		return fmt.Errorf("telegram: invalid provider payload for delivery %s", d.ID)
 	}
@@ -341,11 +340,11 @@ func (t *TelegramProvider) Resolve(ctx context.Context, d *model.NotificationDel
 
 // Permalink returns a t.me link only for public targets (a chat addressed by
 // @username). Private chats/groups have no public permalink → "".
-func (t *TelegramProvider) Permalink(d *model.NotificationDelivery) string {
+func (t *Provider) Permalink(d *model.NotificationDelivery) string {
 	if d == nil {
 		return ""
 	}
-	data, ok := parseTelegramData(d.ProviderPayload)
+	data, ok := parseData(d.ProviderPayload)
 	if !ok {
 		return ""
 	}
@@ -367,7 +366,7 @@ func (t *TelegramProvider) Permalink(d *model.NotificationDelivery) string {
 // rather than nil, because editMessageText leaves the existing keyboard in place
 // when reply_markup is absent. Sending nil would strand live buttons on cards
 // posted before the switch was flipped.
-func (t *TelegramProvider) keyboardFor(ag *model.AlertGroup, isResolved bool) interface{} {
+func (t *Provider) keyboardFor(ag *model.AlertGroup, isResolved bool) interface{} {
 	if t.selfURL == "" {
 		return nil
 	}
@@ -379,7 +378,7 @@ func (t *TelegramProvider) keyboardFor(ag *model.AlertGroup, isResolved bool) in
 	if isResolved {
 		return emptyInlineKeyboard()
 	}
-	if !teamIsOnboarded(t.teamLookup, ag.TeamID) {
+	if !providers.TeamIsOnboarded(t.teamLookup, ag.TeamID) {
 		return emptyInlineKeyboard()
 	}
 	return ackResolveKeyboard(ag, isResolved)
@@ -409,7 +408,7 @@ func ackResolveKeyboard(ag *model.AlertGroup, isResolved bool) map[string]interf
 
 // AnswerCallback acknowledges a callback_query so the tapped button stops
 // spinning; text (optional) shows as a toast. Uses the current cached token.
-func (t *TelegramProvider) AnswerCallback(ctx context.Context, callbackQueryID, text string) error {
+func (t *Provider) AnswerCallback(ctx context.Context, callbackQueryID, text string) error {
 	client, token, err := t.getClient()
 	if err != nil {
 		return err
@@ -429,7 +428,7 @@ func (t *TelegramProvider) AnswerCallback(ctx context.Context, callbackQueryID, 
 }
 
 // SendText sends a plain-text message (used for the /start link confirmation).
-func (t *TelegramProvider) SendText(ctx context.Context, chatID, text string) error {
+func (t *Provider) SendText(ctx context.Context, chatID, text string) error {
 	client, token, err := t.getClient()
 	if err != nil {
 		return err
@@ -440,7 +439,7 @@ func (t *TelegramProvider) SendText(ctx context.Context, chatID, text string) er
 
 // BotUsername returns the bot's @username (via getMe), cached per token and
 // invalidated on token change. Used to build the t.me/<bot>?start=<token> link.
-func (t *TelegramProvider) BotUsername(ctx context.Context) (string, error) {
+func (t *Provider) BotUsername(ctx context.Context) (string, error) {
 	client, token, err := t.getClient()
 	if err != nil {
 		return "", err
@@ -478,9 +477,9 @@ func (t *TelegramProvider) BotUsername(ctx context.Context) (string, error) {
 // SetWebhook registers the webhook for the bot identified by an EXPLICIT token
 // (not the cached one), so the integration lifecycle can target the old vs new
 // bot precisely across enable/disable/token-rotation.
-func (t *TelegramProvider) SetWebhook(ctx context.Context, token, webhookURL, secretToken string) error {
+func (t *Provider) SetWebhook(ctx context.Context, token, webhookURL, secretToken string) error {
 	if token == "" {
-		return ErrNoTelegramToken
+		return ErrNoToken
 	}
 	body := map[string]interface{}{
 		"url":             webhookURL,
@@ -500,9 +499,9 @@ func (t *TelegramProvider) SetWebhook(ctx context.Context, token, webhookURL, se
 }
 
 // DeleteWebhook removes the webhook for the bot identified by an EXPLICIT token.
-func (t *TelegramProvider) DeleteWebhook(ctx context.Context, token string) error {
+func (t *Provider) DeleteWebhook(ctx context.Context, token string) error {
 	if token == "" {
-		return ErrNoTelegramToken
+		return ErrNoToken
 	}
 	tgr, err := t.callBotAPI(ctx, &http.Client{Timeout: telegramHTTPTimeout}, token, "deleteWebhook", map[string]interface{}{})
 	if err != nil {
@@ -517,33 +516,33 @@ func (t *TelegramProvider) DeleteWebhook(ctx context.Context, token string) erro
 // renderCard builds the HTML message body. Dynamic values are escaped with
 // html.EscapeString (covers & < > ' " — safe for both text and href attributes).
 // Telegram has no threads, so the card is a single self-contained message.
-func (t *TelegramProvider) renderCard(ag *model.AlertGroup, isResolved bool) string {
-	return assembleTelegramCard(t.cardBodyLines(ag, isResolved), t.cardFooter(ag), telegramMaxMessageLen)
+func (t *Provider) renderCard(ag *model.AlertGroup, isResolved bool) string {
+	return assembleCard(t.cardBodyLines(ag, isResolved), t.cardFooter(ag), telegramMaxMessageLen)
 }
 
 // cardBodyLines returns the body as a slice of complete, individually-valid HTML
 // lines (balanced tags within each line). Truncation drops whole lines, so it can
 // never sever a tag or entity.
-func (t *TelegramProvider) cardBodyLines(ag *model.AlertGroup, isResolved bool) []string {
-	status := resolveStatus(ag, isResolved, countFiring(ag.Alerts))
+func (t *Provider) cardBodyLines(ag *model.AlertGroup, isResolved bool) []string {
+	status := providers.ResolveStatus(ag, isResolved, providers.CountFiring(ag.Alerts))
 
-	titleText := html.EscapeString(status.title)
+	titleText := html.EscapeString(status.Title)
 	if ag.ExternalURL != "" {
-		titleText = fmt.Sprintf(`<a href="%s">%s</a>`, html.EscapeString(ag.ExternalURL), html.EscapeString(status.title))
+		titleText = fmt.Sprintf(`<a href="%s">%s</a>`, html.EscapeString(ag.ExternalURL), html.EscapeString(status.Title))
 	}
 	lines := []string{"<b>" + titleText + "</b>"}
 
-	if status.actor != "" {
-		lines = append(lines, html.EscapeString(status.actor))
+	if status.Actor != "" {
+		lines = append(lines, html.EscapeString(status.Actor))
 	}
 	lines = append(lines, "Severity: "+html.EscapeString(ag.Severity))
 	lines = append(lines, "Alerts:")
-	lines = append(lines, telegramAlertLines(ag)...)
+	lines = append(lines, alertLines(ag)...)
 	return lines
 }
 
-// telegramAlertLines renders up to 10 alert bullets (HTML-escaped).
-func telegramAlertLines(ag *model.AlertGroup) []string {
+// alertLines renders up to 10 alert bullets (HTML-escaped).
+func alertLines(ag *model.AlertGroup) []string {
 	const maxAlerts = 10
 	if len(ag.Alerts) == 0 {
 		return []string{"• " + html.EscapeString(ag.Title)}
@@ -569,7 +568,7 @@ func telegramAlertLines(ag *model.AlertGroup) []string {
 }
 
 // cardFooter returns the "Open in Tokay" deep-link footer as one complete HTML line.
-func (t *TelegramProvider) cardFooter(ag *model.AlertGroup) string {
+func (t *Provider) cardFooter(ag *model.AlertGroup) string {
 	if t.selfURL != "" {
 		url := fmt.Sprintf("%s/#/ops/alert-groups/%s", t.selfURL, ag.ID)
 		return fmt.Sprintf(`ID: <a href="%s">%s</a>`, html.EscapeString(url), html.EscapeString(ag.ID))
@@ -577,11 +576,11 @@ func (t *TelegramProvider) cardFooter(ag *model.AlertGroup) string {
 	return "ID: " + html.EscapeString(ag.ID)
 }
 
-// assembleTelegramCard joins body lines + footer within the length limit WITHOUT
+// assembleCard joins body lines + footer within the length limit WITHOUT
 // cutting any line. Whole pre-built lines are dropped from the end if needed (each
 // is valid HTML on its own), and the footer is always appended intact — so the
 // result never contains a dangling tag or partial entity.
-func assembleTelegramCard(lines []string, footer string, limit int) string {
+func assembleCard(lines []string, footer string, limit int) string {
 	const sep = "\n"
 	const trunc = "… (truncated)"
 	reserve := len(sep) + len(footer)

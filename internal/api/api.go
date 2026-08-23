@@ -38,7 +38,7 @@ type SlackCardRenderer interface {
 
 // TelegramAPI is the slice of the Telegram provider the API layer needs:
 // answering callbacks, the /start link confirmation, webhook lifecycle, and the
-// bot username for deep links. Satisfied by *dispatcher.TelegramProvider.
+// bot username for deep links. Satisfied by *telegram.Provider.
 type TelegramAPI interface {
 	AnswerCallback(ctx context.Context, callbackQueryID, text string) error
 	SendText(ctx context.Context, chatID, text string) error

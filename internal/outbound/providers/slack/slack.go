@@ -1,4 +1,4 @@
-package dispatcher
+package slack
 
 import (
 	"context"
@@ -11,15 +11,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/slack-go/slack"
+	slackapi "github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"github.com/tokayops/tokayops/internal/slackcard"
 )
 
-// ErrSlackUserNotFound means the email has no matching Slack account.
-var ErrSlackUserNotFound = errors.New("slack user not found")
+// ErrUserNotFound means the email has no matching Slack account.
+var ErrUserNotFound = errors.New("slack user not found")
 
-// slackHTTPTimeout bounds a single Slack API call.
+// HTTPTimeout bounds a single Slack API call.
 //
 // Without it slack-go keeps the &http.Client{} it builds itself, whose Timeout
 // is zero, so a black-holed connection is not a slow call but a permanent one.
@@ -32,51 +33,49 @@ var ErrSlackUserNotFound = errors.New("slack user not found")
 // sendCard makes three calls, so a step can still outlive the 60s job lease and
 // be re-claimed; and a timeout can fire on a request Slack already accepted,
 // which the retry then sends again. Both are accepted - see the register.
-const slackHTTPTimeout = 30 * time.Second
+const HTTPTimeout = 30 * time.Second
 
-// newSlackClient is the only place a Slack client is built, so the timeout
+// NewClient is the only place a Slack client is built, so the timeout
 // cannot be forgotten by the next caller that needs one.
 //
 // The timeout is a parameter rather than read from the constant here so a test
 // can prove the option reaches the client in milliseconds instead of thirty
 // seconds; opts is what lets that test point the client at a server of its own.
-func newSlackClient(token string, timeout time.Duration, opts ...slack.Option) *slack.Client {
-	return slack.New(token, append(opts, slack.OptionHTTPClient(&http.Client{Timeout: timeout}))...)
+func NewClient(token string, timeout time.Duration, opts ...slackapi.Option) *slackapi.Client {
+	return slackapi.New(token, append(opts, slackapi.OptionHTTPClient(&http.Client{Timeout: timeout}))...)
 }
 
-// SlackTokenSource provides dynamic token and config lookup
-type SlackTokenSource interface {
+// TokenSource provides dynamic token and config lookup
+type TokenSource interface {
 	GetSlackToken() string
 	GetSlackInteractive() bool
 }
 
-type SlackProvider struct {
-	tokenSource SlackTokenSource
-	selfURL     string     // TokayOps base URL for deep links
-	teamLookup  TeamLookup // nil means "assume onboarded", see teamIsOnboarded
+type Provider struct {
+	tokenSource TokenSource
+	selfURL     string               // TokayOps base URL for deep links
+	teamLookup  providers.TeamLookup // nil means "assume onboarded", see teamIsOnboarded
 	mu          sync.Mutex
 	cachedToken string
-	client      *slack.Client
+	client      *slackapi.Client
 }
 
-var _ Provider = (*SlackProvider)(nil)
-
-// SlackData is the opaque provider payload Slack stores in a delivery row. It
+// Data is the opaque provider payload Slack stores in a delivery row. It
 // holds the coordinates of the posted message (channel + timestamp), the timeline
 // thread timestamp, and a permalink for DM "Open in Slack" links.
-type SlackData struct {
+type Data struct {
 	ChannelID         string `json:"channel_id"`
 	Timestamp         string `json:"timestamp"`
 	TimelineTimestamp string `json:"timeline_ts,omitempty"`
 	Permalink         string `json:"permalink,omitempty"`
 }
 
-func parseSlackData(raw string) (*SlackData, bool) {
+func parseData(raw string) (*Data, bool) {
 	if raw == "" {
 		return nil, false
 	}
 
-	var data SlackData
+	var data Data
 	if err := json.Unmarshal([]byte(raw), &data); err != nil {
 		return nil, false
 	}
@@ -86,8 +85,8 @@ func parseSlackData(raw string) (*SlackData, bool) {
 	return &data, true
 }
 
-func NewSlackProvider(tokenSource SlackTokenSource, selfURL string, teamLookup TeamLookup) *SlackProvider {
-	return &SlackProvider{
+func NewProvider(tokenSource TokenSource, selfURL string, teamLookup providers.TeamLookup) *Provider {
+	return &Provider{
 		tokenSource: tokenSource,
 		selfURL:     selfURL,
 		teamLookup:  teamLookup,
@@ -95,7 +94,7 @@ func NewSlackProvider(tokenSource SlackTokenSource, selfURL string, teamLookup T
 }
 
 // RenderCard returns the full card payload for Slack message rendering/replacement.
-func (s *SlackProvider) RenderCard(ag *model.AlertGroup, isResolved bool) slackcard.Card {
+func (s *Provider) RenderCard(ag *model.AlertGroup, isResolved bool) slackcard.Card {
 	return slackcard.Card{
 		Text:       s.plainTitle(ag, isResolved),
 		Blocks:     s.renderTitleBlocks(ag, isResolved),
@@ -103,21 +102,21 @@ func (s *SlackProvider) RenderCard(ag *model.AlertGroup, isResolved bool) slackc
 	}
 }
 
-// ErrNoSlackToken is returned when Slack token is not configured
-var ErrNoSlackToken = fmt.Errorf("slack integration not configured (no token)")
+// ErrNoToken is returned when Slack token is not configured
+var ErrNoToken = fmt.Errorf("slack integration not configured (no token)")
 
 // (ErrNoSlackUserID was removed in Epic 7 Sprint 3 — the dispatcher-level
 // ErrIdentityNotLinked in identity.go covers it generically.)
 
 // getClient returns a Slack client, recreating it if the token changed.
 // Returns error if no token is configured or tokenSource is nil.
-func (s *SlackProvider) getClient() (*slack.Client, error) {
+func (s *Provider) getClient() (*slackapi.Client, error) {
 	if s.tokenSource == nil {
-		return nil, ErrNoSlackToken
+		return nil, ErrNoToken
 	}
 	token := s.tokenSource.GetSlackToken()
 	if token == "" {
-		return nil, ErrNoSlackToken
+		return nil, ErrNoToken
 	}
 
 	s.mu.Lock()
@@ -125,21 +124,21 @@ func (s *SlackProvider) getClient() (*slack.Client, error) {
 
 	if s.client == nil || s.cachedToken != token {
 		if s.client != nil && s.cachedToken != token {
-			log.Printf("SlackProvider: Token changed, recreating client")
+			log.Printf("Provider: Token changed, recreating client")
 		}
 		s.cachedToken = token
-		s.client = newSlackClient(token, slackHTTPTimeout)
+		s.client = NewClient(token, HTTPTimeout)
 	}
 	return s.client, nil
 }
 
 // SendDM is a thin convenience wrapper over Send for callers that hold a
-// concrete *SlackProvider and only need a fire-and-forget DM (internal/api OTP
+// concrete *Provider and only need a fire-and-forget DM (internal/api OTP
 // and integration handlers). It is NOT part of dispatcher.Provider.
-func (s *SlackProvider) SendDM(ctx context.Context, userID, message string) error {
-	_, err := s.Send(ctx, NotificationRequest{
+func (s *Provider) SendDM(ctx context.Context, userID, message string) error {
+	_, err := s.Send(ctx, providers.NotificationRequest{
 		Kind:     "slack_dm",
-		Target:   NotificationTarget{Kind: "user", ID: userID},
+		Target:   providers.NotificationTarget{Kind: "user", ID: userID},
 		Message:  message,
 		Editable: false,
 	})
@@ -147,13 +146,13 @@ func (s *SlackProvider) SendDM(ctx context.Context, userID, message string) erro
 }
 
 // sendDM opens a direct message channel with the user and sends a message.
-func (s *SlackProvider) sendDM(ctx context.Context, userID, message string) error {
+func (s *Provider) sendDM(ctx context.Context, userID, message string) error {
 	client, err := s.getClient()
 	if err != nil {
 		return err
 	}
 
-	params := &slack.OpenConversationParameters{
+	params := &slackapi.OpenConversationParameters{
 		Users: []string{userID},
 	}
 	channel, _, _, err := client.OpenConversationContext(ctx, params)
@@ -161,7 +160,7 @@ func (s *SlackProvider) sendDM(ctx context.Context, userID, message string) erro
 		return fmt.Errorf("failed to open conversation: %w", err)
 	}
 
-	_, _, err = client.PostMessageContext(ctx, channel.ID, slack.MsgOptionText(message, false))
+	_, _, err = client.PostMessageContext(ctx, channel.ID, slackapi.MsgOptionText(message, false))
 	if err != nil {
 		return fmt.Errorf("failed to send message: %w", err)
 	}
@@ -170,7 +169,7 @@ func (s *SlackProvider) sendDM(ctx context.Context, userID, message string) erro
 
 // GetSlackUserIDByEmail looks up a Slack user by email via the users.lookupByEmail API.
 // Returns the Slack user ID if found.
-func (s *SlackProvider) GetSlackUserIDByEmail(ctx context.Context, email string) (string, error) {
+func (s *Provider) GetSlackUserIDByEmail(ctx context.Context, email string) (string, error) {
 	client, err := s.getClient()
 	if err != nil {
 		return "", err
@@ -178,9 +177,9 @@ func (s *SlackProvider) GetSlackUserIDByEmail(ctx context.Context, email string)
 
 	user, err := client.GetUserByEmailContext(ctx, email)
 	if err != nil {
-		var slackErr slack.SlackErrorResponse
+		var slackErr slackapi.SlackErrorResponse
 		if errors.As(err, &slackErr) && slackErr.Err == "users_not_found" {
-			return "", ErrSlackUserNotFound
+			return "", ErrUserNotFound
 		}
 		return "", fmt.Errorf("slack users.lookupByEmail: %w", err)
 	}
@@ -190,7 +189,7 @@ func (s *SlackProvider) GetSlackUserIDByEmail(ctx context.Context, email string)
 
 // GetEmailBySlackID looks up a Slack user's email via the users.info API.
 // Returns the email if the user is found and has a profile email set.
-func (s *SlackProvider) GetEmailBySlackID(ctx context.Context, slackUserID string) (string, error) {
+func (s *Provider) GetEmailBySlackID(ctx context.Context, slackUserID string) (string, error) {
 	client, err := s.getClient()
 	if err != nil {
 		return "", err
@@ -198,9 +197,9 @@ func (s *SlackProvider) GetEmailBySlackID(ctx context.Context, slackUserID strin
 
 	user, err := client.GetUserInfoContext(ctx, slackUserID)
 	if err != nil {
-		var slackErr slack.SlackErrorResponse
+		var slackErr slackapi.SlackErrorResponse
 		if errors.As(err, &slackErr) && slackErr.Err == "user_not_found" {
-			return "", ErrSlackUserNotFound
+			return "", ErrUserNotFound
 		}
 		return "", fmt.Errorf("slack users.info: %w", err)
 	}
@@ -213,10 +212,10 @@ func (s *SlackProvider) GetEmailBySlackID(ctx context.Context, slackUserID strin
 
 // Send dispatches on the target kind: a "user" target is a fire-and-forget DM
 // (returns no payload), a "channel" target posts an editable alert card and
-// returns its SlackData payload. Behaviour keys on Target.Kind / AlertGroup /
+// returns its Data payload. Behaviour keys on Target.Kind / AlertGroup /
 // Message — never on req.Kind. An unknown kind is rejected rather than silently
 // treated as a channel card.
-func (s *SlackProvider) Send(ctx context.Context, req NotificationRequest) (string, error) {
+func (s *Provider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
 	switch req.Target.Kind {
 	case "user":
 		if req.Message == "" {
@@ -234,9 +233,9 @@ func (s *SlackProvider) Send(ctx context.Context, req NotificationRequest) (stri
 }
 
 // sendCard posts an alert-group card (title blocks + colored attachment) to a
-// channel, plus the timeline as a threaded reply, and returns the SlackData
+// channel, plus the timeline as a threaded reply, and returns the Data
 // payload needed to update/resolve it later.
-func (s *SlackProvider) sendCard(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
+func (s *Provider) sendCard(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
 	if ag == nil {
 		return "", fmt.Errorf("slack: channel send requires an alert group")
 	}
@@ -249,9 +248,9 @@ func (s *SlackProvider) sendCard(ctx context.Context, targetID string, ag *model
 	title := s.renderTitleBlocks(ag, false)
 
 	channelID, timestamp, err := client.PostMessageContext(ctx, targetID,
-		slack.MsgOptionText(s.plainTitle(ag, false), false),
-		slack.MsgOptionBlocks(title...),
-		slack.MsgOptionAttachments(attachment),
+		slackapi.MsgOptionText(s.plainTitle(ag, false), false),
+		slackapi.MsgOptionBlocks(title...),
+		slackapi.MsgOptionAttachments(attachment),
 	)
 	if err != nil {
 		return "", err
@@ -264,34 +263,34 @@ func (s *SlackProvider) sendCard(ctx context.Context, targetID string, ag *model
 
 	permalink := ""
 	if channelID != "" && timestamp != "" {
-		link, err := client.GetPermalinkContext(ctx, &slack.PermalinkParameters{
+		link, err := client.GetPermalinkContext(ctx, &slackapi.PermalinkParameters{
 			Channel: channelID,
 			Ts:      timestamp,
 		})
 		if err != nil {
-			log.Printf("SlackProvider: Failed to get permalink for %s: %v", channelID, err)
+			log.Printf("Provider: Failed to get permalink for %s: %v", channelID, err)
 		} else {
 			permalink = link
 		}
 	}
 
-	log.Printf("SlackProvider: Sent message to %s (ts: %s)", channelID, timestamp)
+	log.Printf("Provider: Sent message to %s (ts: %s)", channelID, timestamp)
 
 	// Post Timeline to Thread (second message)
 	timelineText := s.renderTimeline(ag)
 	var timelineTS string
 	if timelineText != "" {
 		_, timelineTS, err = client.PostMessageContext(ctx, channelID,
-			slack.MsgOptionText(timelineText, false),
-			slack.MsgOptionTS(timestamp),
+			slackapi.MsgOptionText(timelineText, false),
+			slackapi.MsgOptionTS(timestamp),
 		)
 		if err != nil {
-			log.Printf("SlackProvider: Failed to post timeline thread: %v", err)
+			log.Printf("Provider: Failed to post timeline thread: %v", err)
 		}
 	}
 
 	// Return data to be saved for updates
-	data := SlackData{
+	data := Data{
 		ChannelID:         channelID,
 		Timestamp:         timestamp,
 		TimelineTimestamp: timelineTS,
@@ -301,7 +300,7 @@ func (s *SlackProvider) sendCard(ctx context.Context, targetID string, ag *model
 	return string(bytes), nil
 }
 
-func (s *SlackProvider) Update(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) (string, error) {
+func (s *Provider) Update(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) (string, error) {
 	if d == nil || d.ProviderPayload == "" {
 		return "", nil
 	}
@@ -311,7 +310,7 @@ func (s *SlackProvider) Update(ctx context.Context, d *model.NotificationDeliver
 		return "", err
 	}
 
-	data, ok := parseSlackData(d.ProviderPayload)
+	data, ok := parseData(d.ProviderPayload)
 	if !ok {
 		return "", fmt.Errorf("slack: invalid provider payload for delivery %s", d.ID)
 	}
@@ -320,9 +319,9 @@ func (s *SlackProvider) Update(ctx context.Context, d *model.NotificationDeliver
 	attachment := s.renderBodyAttachment(ag, false)
 	title := s.renderTitleBlocks(ag, false)
 	_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, data.Timestamp,
-		slack.MsgOptionText(s.plainTitle(ag, false), false),
-		slack.MsgOptionBlocks(title...),
-		slack.MsgOptionAttachments(attachment),
+		slackapi.MsgOptionText(s.plainTitle(ag, false), false),
+		slackapi.MsgOptionBlocks(title...),
+		slackapi.MsgOptionAttachments(attachment),
 	)
 	if err != nil {
 		return "", err
@@ -335,21 +334,21 @@ func (s *SlackProvider) Update(ctx context.Context, d *model.NotificationDeliver
 		if timelineTS != "" {
 			// Update existing
 			_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, timelineTS,
-				slack.MsgOptionText(timelineText, false),
+				slackapi.MsgOptionText(timelineText, false),
 			)
 			if err != nil {
-				log.Printf("SlackProvider: Failed to update timeline: %v", err)
+				log.Printf("Provider: Failed to update timeline: %v", err)
 			}
 		} else {
 			// Create new
 			_, newTS, err := client.PostMessageContext(ctx, data.ChannelID,
-				slack.MsgOptionText(timelineText, false),
-				slack.MsgOptionTS(data.Timestamp),
+				slackapi.MsgOptionText(timelineText, false),
+				slackapi.MsgOptionTS(data.Timestamp),
 			)
 			if err == nil {
 				data.TimelineTimestamp = newTS
 			} else {
-				log.Printf("SlackProvider: Failed to create timeline: %v", err)
+				log.Printf("Provider: Failed to create timeline: %v", err)
 			}
 		}
 	}
@@ -359,7 +358,7 @@ func (s *SlackProvider) Update(ctx context.Context, d *model.NotificationDeliver
 	return string(bytes), nil
 }
 
-func (s *SlackProvider) Resolve(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) error {
+func (s *Provider) Resolve(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) error {
 	if d == nil || d.ProviderPayload == "" {
 		return nil
 	}
@@ -369,18 +368,18 @@ func (s *SlackProvider) Resolve(ctx context.Context, d *model.NotificationDelive
 		return err
 	}
 
-	data, ok := parseSlackData(d.ProviderPayload)
+	data, ok := parseData(d.ProviderPayload)
 	if !ok {
 		return fmt.Errorf("slack: invalid provider payload for delivery %s", d.ID)
 	}
 
 	// 1. Thread Reply
 	_, _, err = client.PostMessageContext(ctx, data.ChannelID,
-		slack.MsgOptionText("✅ Alert Group Resolved", false),
-		slack.MsgOptionTS(data.Timestamp),
+		slackapi.MsgOptionText("✅ Alert Group Resolved", false),
+		slackapi.MsgOptionTS(data.Timestamp),
 	)
 	if err != nil {
-		log.Printf("SlackProvider: Failed to send reply: %v", err)
+		log.Printf("Provider: Failed to send reply: %v", err)
 	}
 
 	// 2. Update Main Message (critical — user-visible)
@@ -388,9 +387,9 @@ func (s *SlackProvider) Resolve(ctx context.Context, d *model.NotificationDelive
 	title := s.renderTitleBlocks(ag, true)
 
 	_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, data.Timestamp,
-		slack.MsgOptionText(s.plainTitle(ag, true), false),
-		slack.MsgOptionBlocks(title...),
-		slack.MsgOptionAttachments(attachment),
+		slackapi.MsgOptionText(s.plainTitle(ag, true), false),
+		slackapi.MsgOptionBlocks(title...),
+		slackapi.MsgOptionAttachments(attachment),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update main message: %w", err)
@@ -401,10 +400,10 @@ func (s *SlackProvider) Resolve(ctx context.Context, d *model.NotificationDelive
 	timelineTS := data.TimelineTimestamp
 	if timelineText != "" && timelineTS != "" {
 		_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, timelineTS,
-			slack.MsgOptionText(timelineText, false),
+			slackapi.MsgOptionText(timelineText, false),
 		)
 		if err != nil {
-			log.Printf("SlackProvider: Failed to update final timeline: %v", err)
+			log.Printf("Provider: Failed to update final timeline: %v", err)
 		}
 	}
 
@@ -413,63 +412,18 @@ func (s *SlackProvider) Resolve(ctx context.Context, d *model.NotificationDelive
 
 // Permalink returns the stored permalink for a delivery, if any. It lets the
 // executor build "Open in Slack" links without parsing the provider payload.
-func (s *SlackProvider) Permalink(d *model.NotificationDelivery) string {
+func (s *Provider) Permalink(d *model.NotificationDelivery) string {
 	if d == nil {
 		return ""
 	}
-	data, ok := parseSlackData(d.ProviderPayload)
+	data, ok := parseData(d.ProviderPayload)
 	if !ok {
 		return ""
 	}
 	return data.Permalink
 }
 
-// messageStatus holds the resolved title and color for a Slack message.
-type messageStatus struct {
-	title string
-	color string
-	actor string // e.g. "✅ Resolved by Denis" — shown as separate line
-}
-
-// resolveStatus determines the title text and color bar based on alert group state.
-func resolveStatus(ag *model.AlertGroup, isResolved bool, firing int) messageStatus {
-	if isResolved {
-		s := messageStatus{
-			title: fmt.Sprintf("✅ Resolved: %s", ag.Title),
-			color: "#36a64f",
-		}
-		if ag.ResolvedBy != "" {
-			s.actor = fmt.Sprintf("✅ Resolved by %s", ag.ResolvedBy)
-		}
-		return s
-	}
-	if ag.Status == model.AlertGroupStatusAcknowledged {
-		s := messageStatus{
-			title: fmt.Sprintf("⏸️ Acknowledged: %s (%d Firing)", ag.Title, firing),
-			color: "#FFA500",
-		}
-		if ag.AcknowledgedBy != "" {
-			s.actor = fmt.Sprintf("⏸️ Acknowledged by %s", ag.AcknowledgedBy)
-		}
-		return s
-	}
-	return messageStatus{
-		title: fmt.Sprintf("🔥 Alert: %s (%d Firing)", ag.Title, firing),
-		color: "#FF0000",
-	}
-}
-
-// countFiring returns the number of firing alerts.
-func countFiring(alerts []model.Alert) int {
-	n := 0
-	for _, a := range alerts {
-		if a.Status == model.AlertStatusFiring {
-			n++
-		}
-	}
-	return n
-}
-
+// providers.MessageStatus holds the resolved title and color for a Slack message.
 // collectMentions returns a mrkdwn string of Slack user/group mentions from all alerts.
 func collectMentions(alerts []model.Alert) string {
 	slackUsers := make(map[string]bool)
@@ -560,11 +514,11 @@ func truncateText(s string, maxLen int) string {
 // size limit; a team name longer than this is malformed anyway.
 const maxTeamLabelLen = 80
 
-// slackLabelSanitizer neutralises the characters that would break out of the
+// labelSanitizer neutralises the characters that would break out of the
 // notice's markup. The backtick closes the code span the label sits in and the
 // line breaks split the block; the other three are mrkdwn-significant. It runs
 // as a single pass, so nothing is escaped twice.
-var slackLabelSanitizer = strings.NewReplacer(
+var labelSanitizer = strings.NewReplacer(
 	"&", "&amp;",
 	"<", "&lt;",
 	">", "&gt;",
@@ -580,12 +534,12 @@ func sanitizeTeamLabel(teamID string) string {
 	if r := []rune(teamID); len(r) > maxTeamLabelLen {
 		teamID = string(r[:maxTeamLabelLen]) + "…"
 	}
-	return slackLabelSanitizer.Replace(teamID)
+	return labelSanitizer.Replace(teamID)
 }
 
 // unknownTeamNotice is what stands in for the action buttons when the alert
 // group names a team TokayOps does not have.
-func (s *SlackProvider) unknownTeamNotice(teamID string) string {
+func (s *Provider) unknownTeamNotice(teamID string) string {
 	notice := fmt.Sprintf(
 		"*⚠️ Unknown team `%s`*\nTokayOps has no such team, so this alert cannot be acknowledged or resolved from Slack.",
 		sanitizeTeamLabel(teamID),
@@ -598,25 +552,25 @@ func (s *SlackProvider) unknownTeamNotice(teamID string) string {
 
 // plainTitle returns the unformatted title for use as the top-level message
 // text (notification preview / accessibility fallback).
-func (s *SlackProvider) plainTitle(ag *model.AlertGroup, isResolved bool) string {
-	firing := countFiring(ag.Alerts)
-	return resolveStatus(ag, isResolved, firing).title
+func (s *Provider) plainTitle(ag *model.AlertGroup, isResolved bool) string {
+	firing := providers.CountFiring(ag.Alerts)
+	return providers.ResolveStatus(ag, isResolved, firing).Title
 }
 
 // renderTitleBlocks returns the title section as top-level blocks. Used as
 // both the in-channel header (above the colored attachment) and the unfurl
 // preview content — Slack message-link unfurls render only top-level blocks.
-func (s *SlackProvider) renderTitleBlocks(ag *model.AlertGroup, isResolved bool) []slack.Block {
-	firing := countFiring(ag.Alerts)
-	status := resolveStatus(ag, isResolved, firing)
+func (s *Provider) renderTitleBlocks(ag *model.AlertGroup, isResolved bool) []slackapi.Block {
+	firing := providers.CountFiring(ag.Alerts)
+	status := providers.ResolveStatus(ag, isResolved, firing)
 
-	titleText := status.title
+	titleText := status.Title
 	if ag.ExternalURL != "" {
-		titleText = fmt.Sprintf("<%s|%s>", ag.ExternalURL, status.title)
+		titleText = fmt.Sprintf("<%s|%s>", ag.ExternalURL, status.Title)
 	}
-	return []slack.Block{
-		slack.NewSectionBlock(
-			slack.NewTextBlockObject(slack.MarkdownType, "*"+titleText+"*", false, false),
+	return []slackapi.Block{
+		slackapi.NewSectionBlock(
+			slackapi.NewTextBlockObject(slackapi.MarkdownType, "*"+titleText+"*", false, false),
 			nil, nil,
 		),
 	}
@@ -626,12 +580,12 @@ func (s *SlackProvider) renderTitleBlocks(ag *model.AlertGroup, isResolved bool)
 // optional action buttons, and footer. The title is NOT included — it lives in
 // the top-level blocks (renderTitleBlocks) so Slack message-link unfurls can
 // preview it.
-func (s *SlackProvider) renderBodyAttachment(ag *model.AlertGroup, isResolved bool) slack.Attachment {
-	firing := countFiring(ag.Alerts)
-	status := resolveStatus(ag, isResolved, firing)
+func (s *Provider) renderBodyAttachment(ag *model.AlertGroup, isResolved bool) slackapi.Attachment {
+	firing := providers.CountFiring(ag.Alerts)
+	status := providers.ResolveStatus(ag, isResolved, firing)
 	mentions := collectMentions(ag.Alerts)
 
-	var blocks []slack.Block
+	var blocks []slackapi.Block
 
 	// Severity + alerts
 	bodyText := ""
@@ -646,8 +600,8 @@ func (s *SlackProvider) renderBodyAttachment(ag *model.AlertGroup, isResolved bo
 	}
 	bodyText += "*Alerts:*\n" + alertList
 	bodyText = truncateText(bodyText, 3000)
-	blocks = append(blocks, slack.NewSectionBlock(
-		slack.NewTextBlockObject(slack.MarkdownType, bodyText, false, false),
+	blocks = append(blocks, slackapi.NewSectionBlock(
+		slackapi.NewTextBlockObject(slackapi.MarkdownType, bodyText, false, false),
 		nil, nil,
 	))
 
@@ -663,41 +617,41 @@ func (s *SlackProvider) renderBodyAttachment(ag *model.AlertGroup, isResolved bo
 	actionable := interactive && !isResolved
 	teamOnboarded := true
 	if actionable {
-		teamOnboarded = teamIsOnboarded(s.teamLookup, ag.TeamID)
+		teamOnboarded = providers.TeamIsOnboarded(s.teamLookup, ag.TeamID)
 	}
 
 	showAck := actionable && teamOnboarded && ag.Status != model.AlertGroupStatusAcknowledged
 	showResolve := actionable && teamOnboarded
 
 	if showAck || showResolve {
-		blocks = append(blocks, slack.NewDividerBlock())
+		blocks = append(blocks, slackapi.NewDividerBlock())
 
-		var buttons []slack.BlockElement
+		var buttons []slackapi.BlockElement
 		if showAck {
-			ackBtn := slack.NewButtonBlockElement(
+			ackBtn := slackapi.NewButtonBlockElement(
 				model.SlackActionAckAlertGroup, ag.ID,
-				slack.NewTextBlockObject(slack.PlainTextType, "Acknowledge", true, false),
+				slackapi.NewTextBlockObject(slackapi.PlainTextType, "Acknowledge", true, false),
 			)
-			ackBtn.WithStyle(slack.StyleDanger)
+			ackBtn.WithStyle(slackapi.StyleDanger)
 			buttons = append(buttons, ackBtn)
 		}
 		if showResolve {
-			resolveBtn := slack.NewButtonBlockElement(
+			resolveBtn := slackapi.NewButtonBlockElement(
 				model.SlackActionResolveAlertGroup, ag.ID,
-				slack.NewTextBlockObject(slack.PlainTextType, "Resolve", true, false),
+				slackapi.NewTextBlockObject(slackapi.PlainTextType, "Resolve", true, false),
 			)
 			buttons = append(buttons, resolveBtn)
 		}
-		blocks = append(blocks, slack.NewActionBlock("alert_actions", buttons...))
+		blocks = append(blocks, slackapi.NewActionBlock("alert_actions", buttons...))
 	} else if actionable && !teamOnboarded {
 		// Where the buttons would have been, say why they are not there. The
 		// claim is deliberately limited to what the lookup proves: the team is
 		// absent, so nobody can act on this from Slack. It says nothing about
 		// escalation, because alert_groups.team_id has no foreign key and an
 		// escalation started before the team was deleted keeps running.
-		blocks = append(blocks, slack.NewDividerBlock())
-		blocks = append(blocks, slack.NewSectionBlock(
-			slack.NewTextBlockObject(slack.MarkdownType, s.unknownTeamNotice(ag.TeamID), false, false),
+		blocks = append(blocks, slackapi.NewDividerBlock())
+		blocks = append(blocks, slackapi.NewSectionBlock(
+			slackapi.NewTextBlockObject(slackapi.MarkdownType, s.unknownTeamNotice(ag.TeamID), false, false),
 			nil, nil,
 		))
 	}
@@ -709,19 +663,19 @@ func (s *SlackProvider) renderBodyAttachment(ag *model.AlertGroup, isResolved bo
 	} else {
 		footerText = fmt.Sprintf("ID: %s", ag.ID)
 	}
-	blocks = append(blocks, slack.NewContextBlock("alert_footer",
-		slack.NewTextBlockObject(slack.MarkdownType, footerText, false, false),
+	blocks = append(blocks, slackapi.NewContextBlock("alert_footer",
+		slackapi.NewTextBlockObject(slackapi.MarkdownType, footerText, false, false),
 	))
 
-	return slack.Attachment{
-		Color:    status.color,
-		Fallback: status.title,
-		Blocks:   slack.Blocks{BlockSet: blocks},
+	return slackapi.Attachment{
+		Color:    status.Color,
+		Fallback: status.Title,
+		Blocks:   slackapi.Blocks{BlockSet: blocks},
 	}
 }
 
 // renderTimeline generates the combined summary + timeline message for Slack thread
-func (s *SlackProvider) renderTimeline(ag *model.AlertGroup) string {
+func (s *Provider) renderTimeline(ag *model.AlertGroup) string {
 	var sections []string
 
 	// Section 1: Alert Summaries (descriptions)
@@ -767,7 +721,7 @@ func (s *SlackProvider) renderTimeline(ag *model.AlertGroup) string {
 }
 
 // renderAlertSummaries generates the alert descriptions section
-func (s *SlackProvider) renderAlertSummaries(ag *model.AlertGroup) string {
+func (s *Provider) renderAlertSummaries(ag *model.AlertGroup) string {
 	const maxSummaries = 10
 	const maxDescLen = 200
 

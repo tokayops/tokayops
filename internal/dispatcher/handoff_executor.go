@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 
 	"github.com/tokayops/tokayops/internal/model"
 )
@@ -36,9 +37,9 @@ func (e *HandoffExecutor) Execute(ctx context.Context, job *model.Job, step *mod
 	}
 
 	// Handoff is a fire-and-forget DM. No delivery row (no AlertGroup).
-	if _, err := provider.Send(ctx, NotificationRequest{
+	if _, err := provider.Send(ctx, providers.NotificationRequest{
 		Kind:     "handoff",
-		Target:   NotificationTarget{Kind: "user", ID: stepData.TargetID},
+		Target:   providers.NotificationTarget{Kind: "user", ID: stepData.TargetID},
 		Message:  stepData.Message,
 		Editable: false,
 	}); err != nil {

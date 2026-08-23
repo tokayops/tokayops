@@ -1,4 +1,4 @@
-package dispatcher
+package slack
 
 import (
 	"context"
@@ -11,11 +11,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/slack-go/slack"
+	slackapi "github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
-// mockTokenSource implements SlackTokenSource for testing
+// mockTokenSource implements TokenSource for testing
 type mockTokenSource struct {
 	token       string
 	interactive bool
@@ -29,13 +30,13 @@ func (m *mockTokenSource) GetSlackInteractive() bool {
 	return m.interactive
 }
 
-// newSlackProviderForTest creates a SlackProvider with a pre-configured client for testing
+// newSlackProviderForTest creates a Provider with a pre-configured client for testing
 // This allows tests to use a mock server without the provider recreating the client
-func newSlackProviderForTest(token, apiURL, selfURL string) *SlackProvider {
-	return &SlackProvider{
+func newSlackProviderForTest(token, apiURL, selfURL string) *Provider {
+	return &Provider{
 		tokenSource: &mockTokenSource{token: token},
 		selfURL:     selfURL,
-		client:      slack.New(token, slack.OptionAPIURL(apiURL)),
+		client:      slackapi.New(token, slackapi.OptionAPIURL(apiURL)),
 		cachedToken: token,
 	}
 }
@@ -57,7 +58,7 @@ func TestSlackSendUpdateResolve(t *testing.T) {
 		if r.URL.Path == "/chat.getPermalink" {
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"ok":        true,
-				"permalink": "https://slack.test/archives/C123/p123456",
+				"permalink": "https://slackapi.test/archives/C123/p123456",
 			})
 			return
 		}
@@ -88,9 +89,9 @@ func TestSlackSendUpdateResolve(t *testing.T) {
 	}
 
 	// 1. Send
-	dataStr, err := provider.Send(ctx, NotificationRequest{
+	dataStr, err := provider.Send(ctx, providers.NotificationRequest{
 		Kind:       "channel",
-		Target:     NotificationTarget{Kind: "channel", ID: "C123"},
+		Target:     providers.NotificationTarget{Kind: "channel", ID: "C123"},
 		AlertGroup: ag,
 		Editable:   true,
 	})
@@ -141,9 +142,9 @@ func TestSlackProvider_SendDM_OpensConversationAndPosts(t *testing.T) {
 	defer server.Close()
 
 	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	if _, err := provider.Send(context.Background(), NotificationRequest{
+	if _, err := provider.Send(context.Background(), providers.NotificationRequest{
 		Kind:     "slack_dm",
-		Target:   NotificationTarget{Kind: "user", ID: "U_TARGET"},
+		Target:   providers.NotificationTarget{Kind: "user", ID: "U_TARGET"},
 		Message:  "hello there",
 		Editable: false,
 	}); err != nil {
@@ -164,7 +165,7 @@ func TestSlackProvider_SendDM_OpensConversationAndPosts(t *testing.T) {
 }
 
 // TestSlackProvider_LookupByEmail covers users.lookupByEmail success and the
-// users_not_found -> ErrSlackUserNotFound mapping.
+// users_not_found -> ErrUserNotFound mapping.
 func TestSlackProvider_LookupByEmail(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -187,8 +188,8 @@ func TestSlackProvider_LookupByEmail(t *testing.T) {
 		t.Fatalf("lookup found: got id=%q err=%v, want U_FOUND/nil", id, err)
 	}
 
-	if _, err := provider.GetSlackUserIDByEmail(context.Background(), "missing@x.test"); !errors.Is(err, ErrSlackUserNotFound) {
-		t.Errorf("lookup missing: expected ErrSlackUserNotFound, got %v", err)
+	if _, err := provider.GetSlackUserIDByEmail(context.Background(), "missing@x.test"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("lookup missing: expected ErrUserNotFound, got %v", err)
 	}
 }
 
@@ -218,8 +219,8 @@ func TestSlackProvider_EmailBySlackID(t *testing.T) {
 	if err != nil || email != "ok@x.test" {
 		t.Fatalf("info ok: got email=%q err=%v, want ok@x.test/nil", email, err)
 	}
-	if _, err := provider.GetEmailBySlackID(context.Background(), "U_MISSING"); !errors.Is(err, ErrSlackUserNotFound) {
-		t.Errorf("info missing: expected ErrSlackUserNotFound, got %v", err)
+	if _, err := provider.GetEmailBySlackID(context.Background(), "U_MISSING"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("info missing: expected ErrUserNotFound, got %v", err)
 	}
 	if _, err := provider.GetEmailBySlackID(context.Background(), "U_NOEMAIL"); err == nil {
 		t.Error("info no-email: expected an error for a user with no profile email")
@@ -245,24 +246,24 @@ func TestSlackProvider_UpdateResolve_InvalidPayload(t *testing.T) {
 }
 
 // TestSlackProvider_MissingToken verifies that an unconfigured token surfaces as
-// ErrNoSlackToken on both channel and DM sends (a permanent, no-retry error).
+// ErrNoToken on both channel and DM sends (a permanent, no-retry error).
 func TestSlackProvider_MissingToken(t *testing.T) {
-	provider := &SlackProvider{tokenSource: &mockTokenSource{token: ""}}
+	provider := &Provider{tokenSource: &mockTokenSource{token: ""}}
 
-	if _, err := provider.Send(context.Background(), NotificationRequest{
-		Kind: "channel", Target: NotificationTarget{Kind: "channel", ID: "C1"}, AlertGroup: &model.AlertGroup{}, Editable: true,
-	}); !errors.Is(err, ErrNoSlackToken) {
-		t.Errorf("channel send: expected ErrNoSlackToken, got %v", err)
+	if _, err := provider.Send(context.Background(), providers.NotificationRequest{
+		Kind: "channel", Target: providers.NotificationTarget{Kind: "channel", ID: "C1"}, AlertGroup: &model.AlertGroup{}, Editable: true,
+	}); !errors.Is(err, ErrNoToken) {
+		t.Errorf("channel send: expected ErrNoToken, got %v", err)
 	}
-	if _, err := provider.Send(context.Background(), NotificationRequest{
-		Kind: "slack_dm", Target: NotificationTarget{Kind: "user", ID: "U1"}, Message: "x",
-	}); !errors.Is(err, ErrNoSlackToken) {
-		t.Errorf("dm send: expected ErrNoSlackToken, got %v", err)
+	if _, err := provider.Send(context.Background(), providers.NotificationRequest{
+		Kind: "slack_dm", Target: providers.NotificationTarget{Kind: "user", ID: "U1"}, Message: "x",
+	}); !errors.Is(err, ErrNoToken) {
+		t.Errorf("dm send: expected ErrNoToken, got %v", err)
 	}
 }
 
 func TestRenderTimeline(t *testing.T) {
-	provider := &SlackProvider{}
+	provider := &Provider{}
 
 	// Case 1: Empty timeline
 	ag1 := &model.AlertGroup{
@@ -356,7 +357,7 @@ func TestSlackTimelinePosting(t *testing.T) {
 		if r.URL.Path == "/chat.getPermalink" {
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"ok":        true,
-				"permalink": "https://slack.test/archives/C123/p100200",
+				"permalink": "https://slackapi.test/archives/C123/p100200",
 			})
 			return
 		}
@@ -385,9 +386,9 @@ func TestSlackTimelinePosting(t *testing.T) {
 	// Send should post TWO messages:
 	// 1. Main alert card
 	// 2. Timeline thread reply
-	dataStr, err := provider.Send(ctx, NotificationRequest{
+	dataStr, err := provider.Send(ctx, providers.NotificationRequest{
 		Kind:       "channel",
-		Target:     NotificationTarget{Kind: "channel", ID: "C123"},
+		Target:     providers.NotificationTarget{Kind: "channel", ID: "C123"},
 		AlertGroup: ag,
 		Editable:   true,
 	})
@@ -415,7 +416,7 @@ func TestSlackTimelinePosting(t *testing.T) {
 	}
 
 	// Verify returned data contains TimelineTimestamp
-	var data SlackData
+	var data Data
 	json.Unmarshal([]byte(dataStr), &data)
 	if data.TimelineTimestamp != "100.200" {
 		t.Errorf("Expected TimelineTimestamp to be set, got %s", data.TimelineTimestamp)
@@ -450,7 +451,7 @@ func TestResolve_ReturnsErrorOnMainMessageUpdateFailure(t *testing.T) {
 	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
 	ctx := context.Background()
 
-	slackData := SlackData{
+	slackData := Data{
 		ChannelID: "C123",
 		Timestamp: "123.456",
 	}
@@ -502,7 +503,7 @@ func TestResolve_SucceedsWhenThreadReplyFails(t *testing.T) {
 	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
 	ctx := context.Background()
 
-	slackData := SlackData{
+	slackData := Data{
 		ChannelID: "C123",
 		Timestamp: "123.456",
 	}
@@ -530,7 +531,7 @@ func TestResolve_SucceedsWhenThreadReplyFails(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRenderTitleAndBody_Triggered(t *testing.T) {
-	provider := &SlackProvider{selfURL: "https://tokayops.example.com", tokenSource: &mockTokenSource{interactive: true}}
+	provider := &Provider{selfURL: "https://tokayops.example.com", tokenSource: &mockTokenSource{interactive: true}}
 	ag := &model.AlertGroup{
 		ID:       "ag-v2-1",
 		Title:    "HighCPU",
@@ -570,7 +571,7 @@ func TestRenderTitleAndBody_Triggered(t *testing.T) {
 	}
 
 	// Title block (from renderTitleBlocks) contains alert title
-	titleBlock, ok := title[0].(*slack.SectionBlock)
+	titleBlock, ok := title[0].(*slackapi.SectionBlock)
 	if !ok {
 		t.Fatal("title[0] is not SectionBlock")
 	}
@@ -579,7 +580,7 @@ func TestRenderTitleAndBody_Triggered(t *testing.T) {
 	}
 
 	// ActionBlock has 2 buttons: Acknowledge + Resolve
-	actionBlock, ok := att.Blocks.BlockSet[2].(*slack.ActionBlock)
+	actionBlock, ok := att.Blocks.BlockSet[2].(*slackapi.ActionBlock)
 	if !ok {
 		t.Fatal("block 2 is not ActionBlock")
 	}
@@ -587,18 +588,18 @@ func TestRenderTitleAndBody_Triggered(t *testing.T) {
 		t.Fatalf("expected 2 buttons, got %d", len(actionBlock.Elements.ElementSet))
 	}
 
-	ackBtn := actionBlock.Elements.ElementSet[0].(*slack.ButtonBlockElement)
+	ackBtn := actionBlock.Elements.ElementSet[0].(*slackapi.ButtonBlockElement)
 	if ackBtn.ActionID != "ack_alert_group" {
 		t.Errorf("ack button ActionID = %q, want ack_alert_group", ackBtn.ActionID)
 	}
 	if ackBtn.Value != "ag-v2-1" {
 		t.Errorf("ack button Value = %q, want ag-v2-1", ackBtn.Value)
 	}
-	if ackBtn.Style != slack.StyleDanger {
+	if ackBtn.Style != slackapi.StyleDanger {
 		t.Errorf("ack button Style = %q, want danger", ackBtn.Style)
 	}
 
-	resolveBtn := actionBlock.Elements.ElementSet[1].(*slack.ButtonBlockElement)
+	resolveBtn := actionBlock.Elements.ElementSet[1].(*slackapi.ButtonBlockElement)
 	if resolveBtn.ActionID != "resolve_alert_group" {
 		t.Errorf("resolve button ActionID = %q, want resolve_alert_group", resolveBtn.ActionID)
 	}
@@ -607,17 +608,17 @@ func TestRenderTitleAndBody_Triggered(t *testing.T) {
 	}
 
 	// Context block (footer) with deep link
-	ctxBlock, ok := att.Blocks.BlockSet[3].(*slack.ContextBlock)
+	ctxBlock, ok := att.Blocks.BlockSet[3].(*slackapi.ContextBlock)
 	if !ok {
 		t.Fatal("block 3 is not ContextBlock")
 	}
-	footerText := ctxBlock.ContextElements.Elements[0].(*slack.TextBlockObject)
+	footerText := ctxBlock.ContextElements.Elements[0].(*slackapi.TextBlockObject)
 	if !strings.Contains(footerText.Text, "ag-v2-1") {
 		t.Errorf("footer should contain AG ID, got %q", footerText.Text)
 	}
 
 	// Alerts section contains dashboard and runbook links
-	alertsBlock := att.Blocks.BlockSet[0].(*slack.SectionBlock)
+	alertsBlock := att.Blocks.BlockSet[0].(*slackapi.SectionBlock)
 	if !strings.Contains(alertsBlock.Text.Text, "[dash]") {
 		t.Errorf("alerts block should contain dashboard link, got %q", alertsBlock.Text.Text)
 	}
@@ -627,7 +628,7 @@ func TestRenderTitleAndBody_Triggered(t *testing.T) {
 }
 
 func TestRenderTitleAndBody_Acknowledged(t *testing.T) {
-	provider := &SlackProvider{tokenSource: &mockTokenSource{interactive: true}}
+	provider := &Provider{tokenSource: &mockTokenSource{interactive: true}}
 	ag := &model.AlertGroup{
 		ID:       "ag-v2-2",
 		Title:    "HighMem",
@@ -651,24 +652,24 @@ func TestRenderTitleAndBody_Acknowledged(t *testing.T) {
 	}
 
 	// Title contains "Acknowledged"
-	titleBlock := title[0].(*slack.SectionBlock)
+	titleBlock := title[0].(*slackapi.SectionBlock)
 	if !strings.Contains(titleBlock.Text.Text, "Acknowledged") {
 		t.Errorf("title should contain 'Acknowledged', got %q", titleBlock.Text.Text)
 	}
 
 	// ActionBlock has only 1 button (Resolve)
-	actionBlock := att.Blocks.BlockSet[2].(*slack.ActionBlock)
+	actionBlock := att.Blocks.BlockSet[2].(*slackapi.ActionBlock)
 	if len(actionBlock.Elements.ElementSet) != 1 {
 		t.Fatalf("expected 1 button (Resolve only), got %d", len(actionBlock.Elements.ElementSet))
 	}
-	btn := actionBlock.Elements.ElementSet[0].(*slack.ButtonBlockElement)
+	btn := actionBlock.Elements.ElementSet[0].(*slackapi.ButtonBlockElement)
 	if btn.ActionID != "resolve_alert_group" {
 		t.Errorf("button ActionID = %q, want resolve_alert_group", btn.ActionID)
 	}
 }
 
 func TestRenderTitleAndBody_Resolved(t *testing.T) {
-	provider := &SlackProvider{}
+	provider := &Provider{}
 	ag := &model.AlertGroup{
 		ID:       "ag-v2-3",
 		Title:    "DiskFull",
@@ -691,20 +692,20 @@ func TestRenderTitleAndBody_Resolved(t *testing.T) {
 		t.Fatalf("expected 2 blocks for resolved body (no buttons), got %d", len(att.Blocks.BlockSet))
 	}
 
-	titleBlock := title[0].(*slack.SectionBlock)
+	titleBlock := title[0].(*slackapi.SectionBlock)
 	if !strings.Contains(titleBlock.Text.Text, "Resolved") {
 		t.Errorf("title should contain 'Resolved', got %q", titleBlock.Text.Text)
 	}
 
 	// Last block is context (footer), no action block
-	_, isContext := att.Blocks.BlockSet[1].(*slack.ContextBlock)
+	_, isContext := att.Blocks.BlockSet[1].(*slackapi.ContextBlock)
 	if !isContext {
 		t.Error("last block should be ContextBlock (footer)")
 	}
 }
 
 func TestRenderTitleAndBody_WithMentions(t *testing.T) {
-	provider := &SlackProvider{}
+	provider := &Provider{}
 	ag := &model.AlertGroup{
 		ID:       "ag-v2-mentions",
 		Title:    "MentionTest",
@@ -724,7 +725,7 @@ func TestRenderTitleAndBody_WithMentions(t *testing.T) {
 	att := provider.renderBodyAttachment(ag, false)
 
 	// Severity section (block 0 in body attachment) should contain mentions
-	severityBlock := att.Blocks.BlockSet[0].(*slack.SectionBlock)
+	severityBlock := att.Blocks.BlockSet[0].(*slackapi.SectionBlock)
 	if !strings.Contains(severityBlock.Text.Text, "<@U12345>") {
 		t.Errorf("severity block should contain user mention, got %q", severityBlock.Text.Text)
 	}
@@ -734,7 +735,7 @@ func TestRenderTitleAndBody_WithMentions(t *testing.T) {
 }
 
 func TestRenderTitleAndBody_WithExternalURL(t *testing.T) {
-	provider := &SlackProvider{}
+	provider := &Provider{}
 	ag := &model.AlertGroup{
 		ID:          "ag-v2-url",
 		Title:       "URLTest",
@@ -747,7 +748,7 @@ func TestRenderTitleAndBody_WithExternalURL(t *testing.T) {
 
 	title := provider.renderTitleBlocks(ag, false)
 
-	titleBlock := title[0].(*slack.SectionBlock)
+	titleBlock := title[0].(*slackapi.SectionBlock)
 	if !strings.Contains(titleBlock.Text.Text, "https://alertmanager.example.com/alerts/1") {
 		t.Errorf("title should contain external URL as link, got %q", titleBlock.Text.Text)
 	}
@@ -768,16 +769,16 @@ func TestSendProducesBlockKit(t *testing.T) {
 			})
 		case "/chat.getPermalink":
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok": true, "permalink": "https://slack.test/p",
+				"ok": true, "permalink": "https://slackapi.test/p",
 			})
 		}
 	}))
 	defer server.Close()
 
 	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	dataStr, err := provider.Send(context.Background(), NotificationRequest{
+	dataStr, err := provider.Send(context.Background(), providers.NotificationRequest{
 		Kind:       "channel",
-		Target:     NotificationTarget{Kind: "channel", ID: "C123"},
+		Target:     providers.NotificationTarget{Kind: "channel", ID: "C123"},
 		AlertGroup: &model.AlertGroup{ID: "ag-fmt", Title: "FmtTest", Severity: "critical"},
 		Editable:   true,
 	})
@@ -786,9 +787,9 @@ func TestSendProducesBlockKit(t *testing.T) {
 	}
 
 	// Persisted data still parses cleanly and carries channel + timestamp.
-	var data SlackData
+	var data Data
 	if err := json.Unmarshal([]byte(dataStr), &data); err != nil {
-		t.Fatalf("unmarshal SlackData: %v", err)
+		t.Fatalf("unmarshal Data: %v", err)
 	}
 	if data.ChannelID == "" || data.Timestamp == "" {
 		t.Errorf("expected non-empty ChannelID/Timestamp, got %+v", data)
@@ -840,11 +841,11 @@ func TestUpdateProducesBlockKit(t *testing.T) {
 		Status: model.AlertGroupStatusAcknowledged,
 	}
 
-	// SlackData no longer carries a format flag — the renderer is always Block Kit.
+	// Data no longer carries a format flag — the renderer is always Block Kit.
 	// Legacy persisted rows that contained "format":"" or "format":"v1" simply
 	// have the unknown field ignored on unmarshal.
 	t.Run("fresh row", func(t *testing.T) {
-		data := SlackData{ChannelID: "C123", Timestamp: "111.222"}
+		data := Data{ChannelID: "C123", Timestamp: "111.222"}
 		b, _ := json.Marshal(data)
 		delivery := &model.NotificationDelivery{ID: "del-1", ProviderPayload: string(b)}
 
@@ -907,7 +908,7 @@ func TestResolveProducesBlockKit(t *testing.T) {
 	}
 
 	t.Run("fresh row", func(t *testing.T) {
-		data := SlackData{ChannelID: "C123", Timestamp: "111.222"}
+		data := Data{ChannelID: "C123", Timestamp: "111.222"}
 		b, _ := json.Marshal(data)
 		delivery := &model.NotificationDelivery{ID: "del-1", ProviderPayload: string(b)}
 
@@ -963,7 +964,7 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 		})
 	}
 
-	provider := &SlackProvider{}
+	provider := &Provider{}
 	ag := &model.AlertGroup{
 		ID: "ag-trunc", Title: "TruncTest", Severity: "critical", Alerts: alerts,
 	}
@@ -971,7 +972,7 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 	att := provider.renderBodyAttachment(ag, false)
 
 	// Alerts section block (index 0 in body attachment) must be ≤ 3000 chars
-	alertsBlock := att.Blocks.BlockSet[0].(*slack.SectionBlock)
+	alertsBlock := att.Blocks.BlockSet[0].(*slackapi.SectionBlock)
 	text := alertsBlock.Text.Text
 	if len(text) > 3000 {
 		t.Errorf("alerts block text exceeds 3000 chars: %d", len(text))
@@ -997,7 +998,7 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 	}
 }
 
-// countingTeamLookup is a TeamLookup that records how often it ran, so a test
+// countingTeamLookup is a providers.TeamLookup that records how often it ran, so a test
 // can assert the lookup was skipped, not just that its answer was ignored.
 type countingTeamLookup struct {
 	calls     int
@@ -1011,9 +1012,9 @@ func (c *countingTeamLookup) fn(string) (bool, error) {
 }
 
 // findActionBlock reports whether the attachment offers Ack/Resolve.
-func findActionBlock(att slack.Attachment) *slack.ActionBlock {
+func findActionBlock(att slackapi.Attachment) *slackapi.ActionBlock {
 	for _, b := range att.Blocks.BlockSet {
-		if ab, ok := b.(*slack.ActionBlock); ok {
+		if ab, ok := b.(*slackapi.ActionBlock); ok {
 			return ab
 		}
 	}
@@ -1022,9 +1023,9 @@ func findActionBlock(att slack.Attachment) *slack.ActionBlock {
 
 // findUnknownTeamNotice returns the notice section's text, or "" when absent.
 // The footer is a context block, so only sections are candidates.
-func findUnknownTeamNotice(att slack.Attachment) string {
+func findUnknownTeamNotice(att slackapi.Attachment) string {
 	for _, b := range att.Blocks.BlockSet {
-		sb, ok := b.(*slack.SectionBlock)
+		sb, ok := b.(*slackapi.SectionBlock)
 		if !ok || sb.Text == nil {
 			continue
 		}
@@ -1110,7 +1111,7 @@ func TestSlack_TeamGate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			provider := &SlackProvider{
+			provider := &Provider{
 				tokenSource: &mockTokenSource{token: "tok", interactive: tt.interactive},
 				selfURL:     "https://tokay.example",
 			}
@@ -1142,7 +1143,7 @@ func TestSlack_TeamGate(t *testing.T) {
 // The team label is free text off the alert and it lands inside a code span, so
 // a backtick would close that span early and a newline would split the block.
 func TestSlack_UnknownTeamNotice_SanitisesLabel(t *testing.T) {
-	provider := &SlackProvider{selfURL: "https://tokay.example"}
+	provider := &Provider{selfURL: "https://tokay.example"}
 
 	tests := []struct {
 		name        string
@@ -1209,11 +1210,11 @@ func TestSlack_UnknownTeamNotice_SanitisesLabel(t *testing.T) {
 	})
 
 	t.Run("the link is omitted without a selfURL", func(t *testing.T) {
-		withURL := (&SlackProvider{selfURL: "https://tokay.example"}).unknownTeamNotice("payments")
+		withURL := (&Provider{selfURL: "https://tokay.example"}).unknownTeamNotice("payments")
 		if !strings.Contains(withURL, "/#/cfg/teams|Set up the team>") {
 			t.Errorf("expected a setup link, got %q", withURL)
 		}
-		without := (&SlackProvider{}).unknownTeamNotice("payments")
+		without := (&Provider{}).unknownTeamNotice("payments")
 		if strings.Contains(without, "Set up the team") {
 			t.Errorf("expected no link without selfURL, got %q", without)
 		}

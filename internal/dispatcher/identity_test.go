@@ -2,6 +2,8 @@ package dispatcher
 
 import (
 	"errors"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
+	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
 	"testing"
 
 	"github.com/tokayops/tokayops/internal/model"
@@ -69,5 +71,19 @@ func TestResolveRecipient_Generic_AnyProvider(t *testing.T) {
 	}
 	if !isPermanentError(err) {
 		t.Fatal("ErrIdentityNotLinked must be a permanent error")
+	}
+}
+
+// TestAChannelWithNoTokenIsPermanent keeps the classification where the rule
+// lives. A missing integration token is a configuration fault: retrying it
+// occupies a worker and changes nothing until somebody sets the token.
+func TestAChannelWithNoTokenIsPermanent(t *testing.T) {
+	for name, err := range map[string]error{
+		"slack":    slackprovider.ErrNoToken,
+		"telegram": telegramprovider.ErrNoToken,
+	} {
+		if !isPermanentError(err) {
+			t.Errorf("%s: a missing token is retried forever", name)
+		}
 	}
 }
