@@ -156,6 +156,89 @@ func TestEveryDoorIntoATerminalStateIsCounted(t *testing.T) {
 			},
 		},
 		{
+			name: "recovery assumed a delivery that had gone quiet",
+			want: map[string]float64{string(outbound.StatusSucceeded): 1},
+			open: func(t *testing.T) {
+				commitment := dmCommitment("U0001")
+				commitment.AmbiguityPolicy = keys.PolicyAssumeAccepted
+				intentID := oneOwed(t, s, commitment)
+
+				token := claimOne(t, s, intentID)
+				beginOne(t, s, intentID, token)
+				expireLease(t, s, intentID)
+
+				recovered, err := s.RecoverStaleAttempts(ctx, outbound.FamilyNotification, 10)
+				if err != nil || len(recovered) != 1 ||
+					recovered[0].To != outbound.StatusSucceeded {
+					t.Fatalf("recover: %+v %v", recovered, err)
+				}
+			},
+		},
+		{
+			// The other two things recovery can decide. Both leave the
+			// commitment alive - one to be tried again, one to wait for a
+			// person - and counting either as an ending would report a page
+			// as over while it is still owed.
+			name: "recovery left the commitment to be tried again",
+			want: map[string]float64{},
+			open: func(t *testing.T) {
+				intentID := oneOwed(t, s, dmCommitment("U0001"))
+				token := claimOne(t, s, intentID)
+				beginOne(t, s, intentID, token)
+				expireLease(t, s, intentID)
+
+				recovered, err := s.RecoverStaleAttempts(ctx, outbound.FamilyNotification, 10)
+				if err != nil || len(recovered) != 1 ||
+					recovered[0].To != outbound.StatusPending {
+					t.Fatalf("recover: %+v %v", recovered, err)
+				}
+			},
+		},
+		{
+			name: "recovery left the commitment for a person to decide",
+			want: map[string]float64{},
+			open: func(t *testing.T) {
+				commitment := dmCommitment("U0001")
+				commitment.AmbiguityPolicy = keys.PolicyManualReview
+				intentID := oneOwed(t, s, commitment)
+
+				token := claimOne(t, s, intentID)
+				beginOne(t, s, intentID, token)
+				expireLease(t, s, intentID)
+
+				recovered, err := s.RecoverStaleAttempts(ctx, outbound.FamilyNotification, 10)
+				if err != nil || len(recovered) != 1 ||
+					recovered[0].To != outbound.StatusManualReview {
+					t.Fatalf("recover: %+v %v", recovered, err)
+				}
+			},
+		},
+		{
+			// Three separate calls to the same withdrawal, one per door, and
+			// each of them can be dropped on its own. Acknowledging is above;
+			// these are the two ways an alert ends.
+			name: "a person resolved the alert",
+			want: map[string]float64{string(outbound.StatusCanceled): 2},
+			open: func(t *testing.T) {
+				agID := outboundGroup(t, s)
+				admitOne(t, s, agID, channelCommitment("C0001", 0), dmCommitment("U0001"))
+				if changed, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil); err != nil || !changed {
+					t.Fatalf("resolve: %v %v", changed, err)
+				}
+			},
+		},
+		{
+			name: "every alert in the group resolved itself",
+			want: map[string]float64{string(outbound.StatusCanceled): 2},
+			open: func(t *testing.T) {
+				agID := outboundGroup(t, s)
+				admitOne(t, s, agID, channelCommitment("C0001", 0), dmCommitment("U0001"))
+				if changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, nil, nil, nil); err != nil || !changed {
+					t.Fatalf("auto-resolve: %v %v", changed, err)
+				}
+			},
+		},
+		{
 			name: "a retryable rejection, which is not an ending",
 			want: map[string]float64{},
 			open: func(t *testing.T) {

@@ -73,12 +73,17 @@ func outboundContractf(format string, args ...any) error {
 //
 // Non-terminal transitions are ignored here rather than at the call sites, so
 // that adding a door is one line and not a decision.
+//
+// The family is required and NOT defaulted. It used to fall back to the paging
+// family when empty, which was safe while paging was the only one and would
+// stop being safe the moment a webhook delivery ended: its ending would be
+// counted against the queue an operator watches for missed pages. Every caller
+// has a real family - the commitment carries it, and the withdrawal path names
+// it - so an empty one is a new caller that forgot, and a series labelled with
+// nothing is how it says so.
 func countTerminal(family string, to outbound.Status) {
 	if !to.Terminal() {
 		return
-	}
-	if family == "" {
-		family = outbound.FamilyNotification
 	}
 	metrics.OutboundIntentsTerminalTotal.WithLabelValues(family, string(to)).Inc()
 }
