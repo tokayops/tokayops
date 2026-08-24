@@ -700,3 +700,116 @@ func TestErasureAndAResultInFlightMeetInBothOrders(t *testing.T) {
 		})
 	}
 }
+
+// TestTheJournalTellsAnErasedDeliveryFromOneThatNeverHappened.
+//
+// Read through the journal, not through SQL, because the journal is what a
+// person looking at a stuck alert actually sees - and after an erasure it shows
+// no receipt on both a delivery that happened and one that never did. Those
+// mean opposite things, and the difference cannot be recovered from the
+// commitment: after a new generation its own receipt describes the CURRENT
+// effect, while the question is about the attempt in front of you.
+func TestTheJournalTellsAnErasedDeliveryFromOneThatNeverHappened(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	t.Run("a delivery that happened, then was erased", func(t *testing.T) {
+		seedTeam(t, s, "devops-j1", "alice", "journal-1")
+		intentID := oneOwed(t, s, dmForUser("journal-1", 1))
+		token := claimOne(t, s, intentID)
+		begun := beginOne(t, s, intentID, token)
+		if _, err := s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+			AttemptID: begun.AttemptID, LeaseToken: token,
+			Conclusion: acceptedConclusion(t, "D7001"),
+		}); err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+		if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "journal-1"); err != nil {
+			t.Fatalf("erase: %v", err)
+		}
+
+		journal, err := s.IntentJournal(ctx, intentID)
+		if err != nil {
+			t.Fatalf("read the journal: %v", err)
+		}
+		if len(journal.Attempts) != 1 {
+			t.Fatalf("the journal holds %d attempts", len(journal.Attempts))
+		}
+		attempt := journal.Attempts[0]
+		if !attempt.ReceiptRecorded {
+			t.Error("the journal says nothing was ever delivered")
+		}
+		if attempt.Receipt != nil {
+			t.Errorf("the journal still shows the coordinates: %s", attempt.Receipt)
+		}
+		if attempt.ReceiptRedactedAt == nil {
+			t.Error("the journal cannot say the coordinates were removed rather than absent")
+		}
+	})
+
+	t.Run("a late result that was kept, then erased", func(t *testing.T) {
+		seedTeam(t, s, "devops-j2", "alice", "journal-2")
+		intentID := oneOwed(t, s, dmForUser("journal-2", 1))
+		token := claimOne(t, s, intentID)
+		begun := beginOne(t, s, intentID, token)
+
+		expireLease(t, s, intentID)
+		if _, err := s.RecoverStaleAttempts(ctx, outbound.FamilyNotification, 10); err != nil {
+			t.Fatalf("recover: %v", err)
+		}
+		if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "journal-2"); err != nil {
+			t.Fatalf("erase: %v", err)
+		}
+		if _, err := s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+			AttemptID: begun.AttemptID, LeaseToken: token,
+			Conclusion: acceptedConclusion(t, "D7002"),
+		}); err != nil {
+			t.Fatalf("finalize late: %v", err)
+		}
+
+		journal, err := s.IntentJournal(ctx, intentID)
+		if err != nil {
+			t.Fatalf("read the journal: %v", err)
+		}
+		if len(journal.Observations) != 1 {
+			t.Fatalf("the journal holds %d late results", len(journal.Observations))
+		}
+		observed := journal.Observations[0]
+		if !observed.ReceiptRecorded {
+			t.Error("the journal says the late result proved nothing")
+		}
+		if observed.Receipt != nil {
+			t.Errorf("the journal still shows the coordinates: %s", observed.Receipt)
+		}
+		if observed.ReceiptRedactedAt == nil {
+			t.Error("the journal cannot say the coordinates were removed rather than absent")
+		}
+	})
+
+	t.Run("a delivery that never happened", func(t *testing.T) {
+		seedTeam(t, s, "devops-j3", "alice", "journal-3")
+		intentID := oneOwed(t, s, dmForUser("journal-3", 1))
+		token := claimOne(t, s, intentID)
+		begun := beginOne(t, s, intentID, token)
+		if _, err := s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+			AttemptID: begun.AttemptID, LeaseToken: token,
+			Conclusion: concluded(outbound.OutcomePermanentRejection, "channel_not_found"),
+		}); err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+		if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "journal-3"); err != nil {
+			t.Fatalf("erase: %v", err)
+		}
+
+		journal, err := s.IntentJournal(ctx, intentID)
+		if err != nil {
+			t.Fatalf("read the journal: %v", err)
+		}
+		attempt := journal.Attempts[0]
+		if attempt.ReceiptRecorded || attempt.ReceiptRedactedAt != nil {
+			t.Errorf("an attempt that produced nothing reads as recorded=%v redacted=%v, "+
+				"which is what an erased delivery is supposed to look like",
+				attempt.ReceiptRecorded, attempt.ReceiptRedactedAt)
+		}
+	})
+}

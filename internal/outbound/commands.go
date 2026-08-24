@@ -474,9 +474,22 @@ type AttemptRecord struct {
 	Outcome         Outcome
 	ErrorClass      string
 	ProviderStatus  string
-	Receipt         json.RawMessage
-	Summary         string
-	FinishReason    string
+	// Receipt, ReceiptRecorded and ReceiptRedactedAt are the three states an
+	// external object can be in, and the journal has to show all three: a
+	// receipt that never existed and one whose coordinates were removed by an
+	// erasure both read as nil, and they mean opposite things about whether a
+	// message went out.
+	//
+	// The commitment's own HasReceipt cannot answer this. After a new
+	// generation it describes the CURRENT effect, and the question a journal
+	// answers is about the attempt in front of you - which may be the one that
+	// delivered to somebody who has since been erased.
+	Receipt           json.RawMessage
+	ReceiptRecorded   bool
+	ReceiptRedactedAt *time.Time
+
+	Summary      string
+	FinishReason string
 
 	CompletionFingerprintVersion int
 }
@@ -498,8 +511,15 @@ type Observation struct {
 	ProviderStatus       string
 	ProviderResultDetail string
 	AppliedRevision      *int64
-	Receipt              json.RawMessage
-	Summary              string
+
+	// The same three states as an attempt's, for the same reason: a late
+	// result is often the only proof a message exists, and after an erasure it
+	// is proof without coordinates rather than no proof at all.
+	Receipt           json.RawMessage
+	ReceiptRecorded   bool
+	ReceiptRedactedAt *time.Time
+
+	Summary string
 
 	CompletionFingerprintVersion int
 }

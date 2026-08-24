@@ -1198,7 +1198,8 @@ func journalAttemptsTx(ctx context.Context, tx *sql.Tx,
 		SELECT id, attempt_no, record_kind, generation_no, attempt_kind, operation,
 		       provider, COALESCE(bound_endpoint, ''), COALESCE(provider_key, ''),
 		       applied_revision, started_at, finished_at, COALESCE(outcome, ''),
-		       COALESCE(error_class, ''), COALESCE(provider_status, ''), receipt,
+		       COALESCE(error_class, ''), COALESCE(provider_status, ''),
+		       receipt, receipt_recorded, receipt_redacted_at,
 		       COALESCE(response_summary, ''), COALESCE(finish_reason, ''),
 		       COALESCE(completion_fingerprint_version, 0)
 		FROM outbound_attempts WHERE intent_id = $1 ORDER BY attempt_no`, intentID)
@@ -1216,16 +1217,22 @@ func journalAttemptsTx(ctx context.Context, tx *sql.Tx,
 			finished sql.NullTime
 			receipt  []byte
 		)
+		var redacted sql.NullTime
 		if err := rows.Scan(&record.ID, &record.AttemptNo, &record.RecordKind,
 			&record.GenerationNo, &record.AttemptKind, &record.Operation, &record.Provider,
 			&record.BoundEndpoint, &record.ProviderKey, &revision, &started, &finished,
-			&record.Outcome, &record.ErrorClass, &record.ProviderStatus, &receipt,
+			&record.Outcome, &record.ErrorClass, &record.ProviderStatus,
+			&receipt, &record.ReceiptRecorded, &redacted,
 			&record.Summary, &record.FinishReason,
 			&record.CompletionFingerprintVersion); err != nil {
 			return nil, err
 		}
 		if len(receipt) > 0 {
 			record.Receipt = json.RawMessage(receipt)
+		}
+		if redacted.Valid {
+			at := redacted.Time
+			record.ReceiptRedactedAt = &at
 		}
 		if revision.Valid {
 			value := revision.Int64
@@ -1250,7 +1257,8 @@ func journalObservationsTx(ctx context.Context, tx *sql.Tx,
 	rows, err := tx.QueryContext(ctx, `
 		SELECT o.attempt_id, o.observation_kind, o.observed_at, o.outcome,
 		       COALESCE(o.error_class, ''), COALESCE(o.provider_status, ''),
-		       COALESCE(o.provider_result_detail, ''), o.applied_revision, o.receipt,
+		       COALESCE(o.provider_result_detail, ''), o.applied_revision,
+		       o.receipt, o.receipt_recorded, o.receipt_redacted_at,
 		       COALESCE(o.response_summary, ''),
 		       COALESCE(o.completion_fingerprint_version, 0)
 		FROM outbound_attempt_observations o
@@ -1268,10 +1276,16 @@ func journalObservationsTx(ctx context.Context, tx *sql.Tx,
 			revision sql.NullInt64
 			receipt  []byte
 		)
+		var redacted sql.NullTime
 		if err := rows.Scan(&o.AttemptID, &o.Kind, &o.ObservedAt, &o.Outcome,
 			&o.ErrorClass, &o.ProviderStatus, &o.ProviderResultDetail, &revision,
-			&receipt, &o.Summary, &o.CompletionFingerprintVersion); err != nil {
+			&receipt, &o.ReceiptRecorded, &redacted,
+			&o.Summary, &o.CompletionFingerprintVersion); err != nil {
 			return nil, err
+		}
+		if redacted.Valid {
+			at := redacted.Time
+			o.ReceiptRedactedAt = &at
 		}
 		if revision.Valid {
 			value := revision.Int64
