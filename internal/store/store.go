@@ -237,7 +237,50 @@ func (s *Store) applyLegacyColumnMigrations() error {
 	return tx.Commit()
 }
 
+// schemaInitLock serialises the WHOLE start-up schema build, not only the
+// guarded migrations inside it.
+//
+// `CREATE TABLE IF NOT EXISTS` is not a serialisation primitive: two backends
+// running it at the same moment both find the table missing, and the loser
+// fails on a duplicate key in `pg_type` rather than becoming a no-op. The same
+// check-then-act gap sits in every guarded ALTER and every
+// `CREATE INDEX IF NOT EXISTS` below. Every instance calls InitDB on start-up,
+// so a rollout is exactly the moment several of them do this at once.
+//
+// The number is arbitrary and only has to stay stable and distinct from the
+// other schema locks: "toka" plus the next sequence number.
+const schemaInitLock int64 = 0x746F6B6114
+
+// InitDB builds the schema this build expects, and holds the schema lock for as
+// long as that takes.
+//
+// The lock lives in a transaction of its own that does nothing else: the build
+// below spans many transactions - three of them take their own locks - and one
+// statement cannot cover them all. An instance that waits here comes in after
+// the winner has committed everything, and finds every statement a no-op.
+//
+// The inner locks stay. They are each function's own guarantee, and they cost
+// nothing while this one is held: the order is always outer first, so there is
+// no way round to invert.
 func (s *Store) InitDB() error {
+	guard, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer guard.Rollback()
+
+	if _, err := guard.Exec(`SELECT pg_advisory_xact_lock($1)`, schemaInitLock); err != nil {
+		return fmt.Errorf("failed to take the schema lock: %w", err)
+	}
+
+	if err := s.buildSchema(); err != nil {
+		return err
+	}
+
+	return guard.Commit()
+}
+
+func (s *Store) buildSchema() error {
 	// PostgreSQL Schema for Phase 2 - Create tables FIRST
 	query := `
 	-- Alert Groups table (renamed from incidents)
