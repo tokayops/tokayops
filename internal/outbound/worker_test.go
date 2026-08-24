@@ -12,6 +12,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/tokayops/tokayops/internal/metrics"
 )
 
 // What the worker is responsible for is arithmetic and order: it takes exactly
@@ -712,4 +716,130 @@ func TestTheAttemptLogSaysWhatHappenedWithoutSayingWhatWasSent(t *testing.T) {
 			t.Errorf("the attempt line leaked %q:\n%s", forbidden, line)
 		}
 	}
+}
+
+func counterValue(t *testing.T, c *prometheus.CounterVec, labels ...string) float64 {
+	t.Helper()
+	counter, err := c.GetMetricWithLabelValues(labels...)
+	if err != nil {
+		t.Fatalf("read the counter: %v", err)
+	}
+	var m dto.Metric
+	if err := counter.Write(&m); err != nil {
+		t.Fatalf("read the counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+func histogramCount(t *testing.T, h *prometheus.HistogramVec, labels ...string) uint64 {
+	t.Helper()
+	observer, err := h.GetMetricWithLabelValues(labels...)
+	if err != nil {
+		t.Fatalf("read the histogram: %v", err)
+	}
+	var m dto.Metric
+	if err := observer.(prometheus.Metric).Write(&m); err != nil {
+		t.Fatalf("read the histogram: %v", err)
+	}
+	return m.GetHistogram().GetSampleCount()
+}
+
+// TestALateResultIsNotABug.
+//
+// A lost lease is what fencing is FOR: recovery reclaims an attempt whose lease
+// ran out, the original worker finishes a moment later, and the store keeps its
+// answer as a durable observation. A slow provider is enough to produce it.
+//
+// Counted as a contract violation - which it was - a busy afternoon would raise
+// an alert that says "there is a bug here", and an alert that fires on ordinary
+// operation is an alert nobody reads. A lost lease with NOTHING recorded is the
+// other thing entirely: somebody finalising an attempt they cannot prove is
+// theirs.
+func TestALateResultIsNotABug(t *testing.T) {
+	cases := []struct {
+		name      string
+		result    FinalizeResult
+		wantKind  string
+		violation bool
+	}{
+		{
+			name:   "the result arrived late and was kept",
+			result: FinalizeResult{Outcome: FinalizeLeaseLost, ObservationRecorded: true},
+		},
+		{
+			name:      "a stranger finalised somebody else's attempt",
+			result:    FinalizeResult{Outcome: FinalizeLeaseLost},
+			wantKind:  "foreign_token",
+			violation: true,
+		},
+		{
+			name:      "two contradicting accounts of one call",
+			result:    FinalizeResult{Outcome: FinalizeConflict},
+			wantKind:  "conflict",
+			violation: true,
+		},
+		{
+			name:      "a result for an attempt that does not exist",
+			result:    FinalizeResult{Outcome: FinalizeNotFound},
+			wantKind:  "not_found",
+			violation: true,
+		},
+		{name: "the ordinary case", result: FinalizeResult{Outcome: FinalizeFinalized}},
+		{name: "a repeat after a lost reply", result: FinalizeResult{Outcome: FinalizeIdempotentRepeat}},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			kind, broken := brokenContract(tt.result)
+			if broken != tt.violation {
+				t.Fatalf("%q counted as a contract violation: %v, want %v",
+					tt.result.Outcome, broken, tt.violation)
+			}
+			if kind != tt.wantKind {
+				t.Errorf("counted under kind %q, want %q", kind, tt.wantKind)
+			}
+		})
+	}
+}
+
+// TestTheLatencyOfACallThatNeverCameBackIsStillMeasured.
+//
+// The histogram is defined as admitted_at to started_at, and both are committed
+// before the provider is even called. Observed after the call - as this first
+// did - a provider that hangs and a process that dies would remove exactly the
+// worst measurements from a distribution about how long a page takes to go out.
+// The metric would then look healthiest at the moment it stopped being true.
+func TestTheLatencyOfACallThatNeverCameBackIsStillMeasured(t *testing.T) {
+	latency := 3.5
+	store := newFakeStore()
+	store.beginOut.FirstAttemptLatency = &latency
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
+	store.available["slack"] = &queues{fresh: 1}
+
+	channel := newFakeChannel()
+	channel.block = make(chan struct{})
+
+	before := histogramCount(t, metrics.OutboundAdmissionLatencySeconds, FamilyNotification)
+
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	w.tick(ctx)
+
+	// The call is in flight and will never come back on its own.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(channel.made()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no attempt was started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if got := histogramCount(t, metrics.OutboundAdmissionLatencySeconds, FamilyNotification); got != before+1 {
+		t.Fatalf("the histogram holds %d observations, want %d: a call that has not "+
+			"answered yet is exactly the one worth measuring", got, before+1)
+	}
+
+	close(channel.block)
+	w.running.Wait()
 }

@@ -173,7 +173,12 @@ const (
 type Intent struct {
 	ID           string
 	AlertGroupID string
-	Provider     string
+	// Family is the execution partition this commitment runs in. It travels
+	// with the commitment because everything that ends one - a finalisation, an
+	// expiry, an operator, an alert being acknowledged - has to be able to say
+	// which queue just got shorter without being told separately.
+	Family   string
+	Provider string
 	// TargetKind and TargetRef are the recipient as THIS system names them - a
 	// channel by its provider id, a person by their user id here. Turning the
 	// second into an address the provider knows is preparation's job, and it is

@@ -134,22 +134,12 @@ func (w *Worker) tick(ctx context.Context) {
 	if expired, err := w.store.ExpireDueIntents(ctx, w.family, w.pool); err != nil {
 		log.Printf("outbound worker %s: expire: %v", w.workerID, err)
 	} else if len(expired) > 0 {
-		metrics.OutboundIntentsTerminalTotal.
-			WithLabelValues(w.family, string(StatusExpired)).Add(float64(len(expired)))
 		log.Printf("outbound worker %s: %d commitments passed their deadline unsent",
 			w.workerID, len(expired))
 	}
 	if recovered, err := w.store.RecoverStaleAttempts(ctx, w.family, w.pool); err != nil {
 		log.Printf("outbound worker %s: recover: %v", w.workerID, err)
 	} else if len(recovered) > 0 {
-		// Recovery closes an ATTEMPT; where that leaves the commitment is its
-		// own answer, and only some of them are endings.
-		for _, one := range recovered {
-			if one.To.Terminal() {
-				metrics.OutboundIntentsTerminalTotal.
-					WithLabelValues(w.family, string(one.To)).Inc()
-			}
-		}
 		log.Printf("outbound worker %s: %d abandoned attempts closed", w.workerID, len(recovered))
 	}
 
@@ -306,6 +296,17 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 		return
 	}
 
+	// Observed HERE, before the call, because the fact it measures is already
+	// durable: the attempt exists and its started_at is committed. Observed
+	// after the call instead - as this first did - the distribution would only
+	// ever contain attempts that came back, so a provider that hangs and a
+	// process that dies would quietly remove exactly the worst measurements
+	// from a metric about how long a page takes to go out.
+	if begun.FirstAttemptLatency != nil {
+		metrics.OutboundAdmissionLatencySeconds.WithLabelValues(w.family).
+			Observe(*begun.FirstAttemptLatency)
+	}
+
 	attemptCtx, cancelAttempt := context.WithTimeout(detached, NotificationAttemptDeadline)
 	result, execErr := channel.ExecuteAttempt(attemptCtx, Call{
 		IntentID:             leased.Intent.ID,
@@ -357,26 +358,16 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 	}
 
 	// Anything but a plain finalisation means somebody else had already decided
-	// this attempt, and that is worth saying out loud: a conflict in particular
-	// is two contradicting accounts of one call, which no amount of retrying
-	// resolves.
+	// this attempt, and that is worth saying out loud. Whether it is a BUG is a
+	// separate question - see brokenContract.
+	if kind, broken := brokenContract(recorded); broken {
+		metrics.OutboundContractViolationsTotal.WithLabelValues("finalize", kind).Inc()
+	}
 	switch recorded.Outcome {
 	case FinalizeFinalized, FinalizeIdempotentRepeat:
 	default:
-		metrics.OutboundContractViolationsTotal.WithLabelValues("finalize", string(recorded.Outcome)).Inc()
 		log.Printf("outbound worker %s: the result of %s was answered %q",
 			w.workerID, begun.AttemptID, recorded.Outcome)
-	}
-
-	// Counted after the commit, not before it: the alert on this fires on any
-	// increment, and an ending recorded for a transaction that rolled back
-	// would wake somebody over a delivery that is still being retried.
-	if recorded.To.Terminal() {
-		metrics.OutboundIntentsTerminalTotal.WithLabelValues(w.family, string(recorded.To)).Inc()
-	}
-	if begun.FirstAttemptLatency != nil {
-		metrics.OutboundAdmissionLatencySeconds.WithLabelValues(w.family).
-			Observe(*begun.FirstAttemptLatency)
 	}
 
 	// One line per attempt: this is where an operator sees that TokayOps is
@@ -429,4 +420,37 @@ func detail(c Conclusion) string {
 // not hold a slot for the length of a lease.
 func recording(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, NotificationRecordDeadline)
+}
+
+// brokenContract says whether a finalisation that was not accepted indicates a
+// BUG, as opposed to a race the design expects.
+//
+// The distinction was got wrong once and it matters, because this counter is
+// meant to be zero: an alert on it says "go and read the log", and an alert
+// that fires on ordinary operation stops being read.
+//
+// A lost lease is the ordinary case. Recovery reclaims an attempt whose lease
+// ran out, the original worker finishes a moment later and its result arrives
+// late - which is exactly what fencing is for, and the store keeps that result
+// as a durable observation rather than throwing it away. A slow provider is
+// enough to produce it.
+//
+// A lost lease with NOTHING recorded is the other thing entirely: the caller
+// could not prove the result was theirs, so it was refused outright. That is a
+// stranger finalising somebody else's attempt, and there is no benign way for
+// it to happen.
+func brokenContract(recorded FinalizeResult) (string, bool) {
+	switch recorded.Outcome {
+	case FinalizeFinalized, FinalizeIdempotentRepeat:
+		return "", false
+	case FinalizeLeaseLost:
+		if recorded.ObservationRecorded {
+			return "", false
+		}
+		return "foreign_token", true
+	default:
+		// A conflict is two contradicting accounts of one call; not_found is a
+		// result for an attempt that does not exist. Neither is a race.
+		return string(recorded.Outcome), true
+	}
 }

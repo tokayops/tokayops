@@ -89,6 +89,9 @@ func (s *Store) ExpireDueIntents(ctx context.Context, family string, limit int) 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	for range expired {
+		countTerminal(family, outbound.StatusExpired)
+	}
 	return expired, nil
 }
 
@@ -394,6 +397,7 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	countTerminal(intent.Family, transition.To)
 	return &outbound.Recovered{
 		IntentID: intentID, AttemptID: attemptID,
 		To: transition.To, Row: transition.Row,
@@ -808,6 +812,12 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 	if err := tx.Commit(); err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
+	// A preparation refused for good is a commitment that ended without the
+	// provider ever hearing about it - no linked identity, no integration, an
+	// unreadable payload. It is a door into permanent_failed like any other,
+	// and the one that was missed when this counter lived in the worker: the
+	// worker returns the moment Begin is not "started".
+	countTerminal(intent.Family, transition.To)
 
 	result := outbound.BeginAttemptResult{
 		Outcome: outbound.BeginPreparedRetry, AttemptID: recordID, AttemptNo: attemptNo,
@@ -1071,6 +1081,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	if err := tx.Commit(); err != nil {
 		return outbound.FinalizeResult{}, err
 	}
+	countTerminal(intent.Family, transition.To)
 	return outbound.FinalizeResult{
 		Outcome: outbound.FinalizeFinalized, To: transition.To, Row: transition.Row,
 	}, nil

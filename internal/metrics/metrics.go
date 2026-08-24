@@ -224,10 +224,17 @@ var (
 
 	// OutboundIntentsTerminalTotal counts commitments that ended, by how.
 	//
-	// Everything except "delivered" is a page that did not happen, and the
-	// alert on this counter fires on any increment of those - which is why it
-	// is counted after the transaction commits rather than inside it. A
+	// The terminal states are succeeded, permanent_failed, expired and
+	// canceled; everything except "succeeded" is a page that did not happen,
+	// and the alert is written against those. It is incremented after the
+	// transaction that ended the commitment commits, never inside it: a
 	// rollback would otherwise report an ending that never occurred.
+	//
+	// Best effort, like every counter in a process. A commit whose reply is
+	// lost, or a process that dies between the two, loses the observation. An
+	// alert that may not miss a permanent_failed has to be built over the
+	// durable state - the commitment rows and their journal - and this counter
+	// is for rate and for noticing, not for accounting.
 	OutboundIntentsTerminalTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "outbound_intents_terminal_total",
 		Help: "Outbound commitments that reached a terminal state, by state.",

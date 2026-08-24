@@ -57,6 +57,32 @@ func outboundContractf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrOutboundContract, fmt.Sprintf(format, args...))
 }
 
+// countTerminal records a commitment that ended.
+//
+// One owner for the whole counter, and it is this package, because a commitment
+// ends when a transaction here commits and at no other moment. Split between
+// the store and its callers - as it was first written - the doors nobody
+// remembered to count were exactly the ones nobody remembers: a preparation
+// refused for good, and an operator deciding. The alert on this counter is
+// "somebody was not paged", so a missing door is a page that never happened and
+// never got reported.
+//
+// Called AFTER the commit, always. Counted inside, a transaction that then
+// rolled back would report an ending that did not happen - and this counter
+// alerts on any increment at all.
+//
+// Non-terminal transitions are ignored here rather than at the call sites, so
+// that adding a door is one line and not a decision.
+func countTerminal(family string, to outbound.Status) {
+	if !to.Terminal() {
+		return
+	}
+	if family == "" {
+		family = outbound.FamilyNotification
+	}
+	metrics.OutboundIntentsTerminalTotal.WithLabelValues(family, string(to)).Inc()
+}
+
 // ErrUndeliverable is the other one: the row itself is broken, for every build
 // and forever. The state a commitment renders from is gone, or no longer
 // produces the digest its keys were computed over, or describes another alert.
@@ -584,7 +610,7 @@ func intentIDsOfBatch(ctx context.Context, tx *sql.Tx, batchID string) ([]string
 // in Go, because the process clock is not the one the leases are written
 // against.
 const outboundIntentColumns = `
-	SELECT id, COALESCE(alert_group_id, ''), provider, target_kind, target_ref,
+	SELECT id, COALESCE(alert_group_id, ''), delivery_family, provider, target_kind, target_ref,
 	       form, completion_mode,
 	       ambiguity_policy, status, generation_no, attempts_in_generation,
 	       failure_streak, desired_revision, applied_revision,
@@ -608,7 +634,7 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		deadlinePassed bool
 	)
 	if err := row.Scan(
-		&intent.ID, &groupID, &intent.Provider, &intent.TargetKind, &intent.TargetRef,
+		&intent.ID, &groupID, &intent.Family, &intent.Provider, &intent.TargetKind, &intent.TargetRef,
 		&intent.Form, &intent.CompletionMode,
 		&intent.AmbiguityPolicy, &intent.Status, &intent.GenerationNo,
 		&intent.AttemptsInGeneration, &intent.FailureStreak, &intent.DesiredRevision,

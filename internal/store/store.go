@@ -1529,15 +1529,10 @@ func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Aler
 	return true, nil
 }
 
-// countWithdrawn records commitments that ended because the alert did, AFTER
-// the transaction that ended them committed. The counter alerts on any
-// increment, so an ending reported for a transaction that rolled back would
-// wake somebody over a delivery that is still going out.
+// countWithdrawn records commitments that ended because the alert did.
 func countWithdrawn(n int) {
-	if n > 0 {
-		metrics.OutboundIntentsTerminalTotal.
-			WithLabelValues(outbound.FamilyNotification, string(outbound.StatusCanceled)).
-			Add(float64(n))
+	for i := 0; i < n; i++ {
+		countTerminal(outbound.FamilyNotification, outbound.StatusCanceled)
 	}
 }
 

@@ -267,6 +267,10 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	if err := tx.Commit(); err != nil {
 		return outbound.ResolveAmbiguityResult{}, err
 	}
+	// An operator ends commitments too - assume_accepted finishes one, cancel
+	// withdraws one - and this door was missed when the counter lived in the
+	// worker, which never sees an operator at all.
+	countTerminal(intent.Family, transition.To)
 	return outbound.ResolveAmbiguityResult{
 		Outcome: outbound.ResolveResolved, Status: transition.To, Row: transition.Row,
 	}, nil
