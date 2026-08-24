@@ -345,13 +345,18 @@ func (t *erasureTx) withdrawOutbound(ctx context.Context, query, userID, kind, r
 // that says where the message ended up, and the response summary - which reads
 // "accepted with channel=D0123" and is therefore an address in prose.
 //
-// What stays, deliberately: the outcome, the applied revision and the
-// completion fingerprint. They are the audit of a delivery that happened, they
-// name nobody, and the fingerprint is a hash - a pseudonymous value the domain
-// needs to tell an idempotent repeat from a conflict. And the FACT of a receipt
-// stays: receipt_recorded remains true with receipt_redacted_at set, so the
-// state machine still knows a message exists out there rather than deciding it
-// never happened.
+// What stays, deliberately: the outcome, the applied revision and the completion
+// fingerprint. The first two name nobody. The fingerprint is a SHA-256 whose
+// inputs include the receipt reference, which makes it pseudonymous rather than
+// irreversible - channel ids are enumerable, so the hash confirms a guess for
+// anybody who already holds both this database and a candidate list. It is kept
+// with that risk named, because it is what tells an idempotent repeat from a
+// conflict: without it one delivery could be finalised twice with two different
+// answers and nothing would notice.
+//
+// And the FACT of a receipt stays: receipt_recorded remains true with
+// receipt_redacted_at set, so the state machine still knows a message exists out
+// there rather than deciding it never happened.
 //
 // The commitments are updated before the attempts under them. That is the order
 // Finalize takes - the commitment, then its attempt - and taking it the other

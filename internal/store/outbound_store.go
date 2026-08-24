@@ -313,18 +313,34 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 	}, nil
 }
 
-// erasedRecipients locks the people this admission promises to reach and
+// erasedRecipients locks EVERY person this admission promises to reach and
 // reports the ones who are no longer there.
 //
-// FOR SHARE rather than FOR UPDATE: this transaction does not change the users,
-// it needs them to stay as they are until it commits. An erasure takes the row
-// exclusively, so the two serialise in whichever order they arrive - and the
-// answer is the same either way, because an erasure that has not committed yet
-// cannot have removed the address these commitments would use.
+// Every person, not only the erased ones, and that is the whole mechanism. A
+// predicate of `deleted_at IS NOT NULL` leaves an active row out of the result
+// set, so FOR SHARE never touches it - and an erasure is then free to commit
+// between this check and the inserts below. The sequence that produces is
+// entirely ordinary: a plan built while somebody was still on call, an operator
+// taking them off it, an erasure, and an admission arriving a moment later with
+// a commitment aimed at a person who no longer exists. It leaves an obligation
+// nothing marked, a delivery that fails for a reason nobody can act on, and a
+// second erasure that will not pick it up because erasing an erased user is a
+// no-op.
 //
-// Ordered by id, which is the canonical order every command that locks several
-// users takes. Two admissions promising the same two people in different orders
-// would otherwise deadlock over nothing.
+// Selecting the rows locks them, and after that only two orders exist. This
+// transaction got there first: the erasure waits, and when it runs it finds the
+// new commitments and withdraws them like any other. The erasure got there
+// first: this waits, and then reads deleted_at and refuses the batch.
+//
+// FOR SHARE rather than FOR UPDATE because this transaction does not change the
+// users - it needs them to stay as they are until it commits. Ordered by id,
+// the canonical order every command that locks several users takes, so two
+// admissions naming the same two people cannot deadlock over nothing.
+//
+// A recipient with no row at all is NOT treated as erased. Erasure anonymizes
+// and keeps the row, so absence means something else - an id that never
+// resolved - and that surfaces where it belongs, as a delivery that cannot find
+// an identity, rather than as a refusal of the whole escalation.
 func erasedRecipients(ctx context.Context, tx *sql.Tx, admission keys.Admission) ([]string, error) {
 	seen := map[string]bool{}
 	var people []string
@@ -341,8 +357,8 @@ func erasedRecipients(ctx context.Context, tx *sql.Tx, admission keys.Admission)
 	sort.Strings(people)
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id FROM users
-		WHERE id = ANY($1) AND deleted_at IS NOT NULL
+		SELECT id, deleted_at FROM users
+		WHERE id = ANY($1)
 		ORDER BY id
 		FOR SHARE`, pq.Array(people))
 	if err != nil {
@@ -353,10 +369,13 @@ func erasedRecipients(ctx context.Context, tx *sql.Tx, admission keys.Admission)
 	var erased []string
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err != nil {
+		var deletedAt sql.NullTime
+		if err := rows.Scan(&id, &deletedAt); err != nil {
 			return nil, err
 		}
-		erased = append(erased, id)
+		if deletedAt.Valid {
+			erased = append(erased, id)
+		}
 	}
 	return erased, rows.Err()
 }

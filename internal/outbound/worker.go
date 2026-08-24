@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -395,31 +394,30 @@ func errorClass(c Conclusion) string {
 	return ""
 }
 
-// detail is what the log line adds beyond the outcome, and only when there is
-// something to add.
+// detail is what the log line adds beyond the outcome, and it is a closed
+// vocabulary on purpose.
 //
-// Never the response body: what a provider says about a failure can carry
-// anything, including the message that was being sent.
+// Two things used to be here that cannot be. The receipt REFERENCE is
+// coordinates - a Slack channel and timestamp, a Telegram chat id - and for a
+// direct message the channel IS a working address for the person. And the
+// response summary is free text from the provider: on the paths where Slack
+// answers oddly it reads "accepted with channel=D0123", which is that same
+// address in prose, and on an error path it is whatever the provider felt like
+// saying.
 //
-// And never the receipt REFERENCE, which is where this was wrong. A receipt ref
-// is coordinates - a Slack channel and timestamp, a Telegram chat id - and for
-// a direct message the channel IS a working address for the person. Written to
-// a log, it outlives the erasure that removes the same value from every table,
-// because a log is not something this system can go back and edit. What a
-// reader actually needs from the line is whether the provider gave us anything
-// to identify the message by, and that is a boolean.
+// Both are kept where they can be REMOVED - the attempt's own record, which
+// erasure scrubs. A log cannot be edited afterwards, so what goes in it is only
+// what stays true and safe forever: the outcome, the channel's own closed
+// classification of a failure, and whether the provider gave us anything at all
+// to identify the message by.
 func detail(c Conclusion) string {
 	completion := c.Completion()
 	out := ""
 	if completion.ErrorClass != nil && *completion.ErrorClass != "" {
 		out += " error_class=" + *completion.ErrorClass
 	}
-	out += fmt.Sprintf(" receipt_recorded=%t",
+	return out + fmt.Sprintf(" receipt_recorded=%t",
 		completion.ReceiptRef != nil && *completion.ReceiptRef != "")
-	if summary := c.Summary(); summary != "" {
-		out += " response_summary=" + strconv.Quote(summary)
-	}
-	return out
 }
 
 // recording bounds one short database call.

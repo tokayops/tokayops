@@ -778,11 +778,16 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		// would leave a delivery to nobody.
 		"outbound_intents.target_ref": true,
 
-		// The completion fingerprint is a hash of what an attempt concluded.
-		// It is pseudonymous - nothing in it can be turned back into a person
-		// or an address - and it is what tells an idempotent repeat from a
-		// conflict, so a delivery that lost it could be finalised twice with
-		// two different answers and nobody would notice.
+		// Kept with the risk named: the completion fingerprint is a SHA-256 over what an
+		// attempt concluded, and the receipt reference is one of its inputs.
+		// That makes it pseudonymous, not irreversible: channel ids come from a
+		// small, enumerable space, so somebody holding the hash and a list of
+		// candidate ids can confirm a guess. It is kept anyway, and the reason
+		// is named rather than glossed - it is what tells an idempotent repeat
+		// from a conflict, and a delivery that lost it could be finalised twice
+		// with two different answers and nobody would notice. The residual risk
+		// is a confirmation oracle for somebody who already has both the
+		// database and a candidate list.
 		"outbound_attempts.completion_fingerprint":             true,
 		"outbound_attempt_observations.completion_fingerprint": true,
 	}

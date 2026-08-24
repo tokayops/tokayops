@@ -19,6 +19,7 @@ import (
 	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
 // MockStore is an in-memory implementation of StoreInterface for testing.
@@ -2903,6 +2904,15 @@ func (m *MockStore) SubmitEscalationBatch(ctx context.Context,
 			Outcome: outbound.SubmitExisting, BatchID: held.Admission.Admission.BatchKey,
 			IntentIDs: held.IntentIDs,
 		}, nil
+	}
+
+	// Nobody is promised a message who is not there to receive one. After the
+	// claim, like the real store: a repeat of an admission accepted before the
+	// erasure is still that admission.
+	for _, c := range admission.Commitments {
+		if c.Target.Kind == keys.TargetUser && m.erasedUsers[c.Target.Ref] {
+			return outbound.SubmitResult{Outcome: outbound.SubmitRecipientErased}, nil
+		}
 	}
 
 	// The user is ahead of us: they acknowledged or resolved before this

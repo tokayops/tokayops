@@ -428,19 +428,185 @@ func TestTheJournalSaysWhatActuallyHappenedToASendInFlight(t *testing.T) {
 	}
 }
 
-// TestErasureAndAResultInFlightMeetAtOnce.
+// blocked reports whether something is still waiting, without a sleep deciding
+// the answer.
 //
-// Everything above runs the two in sequence, which is the easy half: whichever
-// happens first, the other one reads what it wrote. This is the hard half - the
-// two transactions genuinely overlapping - and it is driven from both starting
-// orders because "erasure first" and "finalize first" take their row locks in
-// different sequences.
+// A short wait is unavoidable when the claim is "this has NOT finished" - there
+// is no event for a thing that did not happen. What is avoided is a sleep
+// deciding the ORDER: the order below is settled by a row lock somebody else is
+// holding, so the test proves the serialisation rather than hoping for it.
+func blocked(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return false
+	case <-time.After(150 * time.Millisecond):
+		return true
+	}
+}
+
+// TestAdmissionWaitsForAnErasureItCannotSee.
 //
-// The assertion is the same in both: whatever the interleaving, the coordinates
-// do not survive and the fact does. If finalize wins the race, its receipt
-// lands and erasure redacts it; if erasure wins, the marker is already there
-// and finalize never writes the address at all.
-func TestErasureAndAResultInFlightMeetAtOnce(t *testing.T) {
+// The sequence this exists for is entirely ordinary: a plan built while
+// somebody was still on call, an operator taking them off it, an erasure, and
+// an admission arriving a moment later with a commitment aimed at them. If the
+// admission does not lock the recipients it can slip its inserts in after the
+// erasure's sweep - leaving an obligation to an erased person that nothing
+// marked, that fails for a reason nobody can act on, and that a second erasure
+// will not pick up because erasing an erased user is a no-op.
+//
+// The lock is the whole fix, so the test holds one: the erasure's transaction
+// is simulated by a real FOR UPDATE on the user row that does not commit until
+// the test says so.
+func TestAdmissionWaitsForAnErasureItCannotSee(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+	seedTeam(t, s, "devops", "alice", "slow-erasure")
+
+	agID := outboundGroup(t, s)
+	adm := outboundAdmission(t, agID, "first", dmForUser("slow-erasure", 1))
+
+	// An erasure in progress: the user row is taken and marked, and nothing is
+	// committed yet.
+	erasing, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin the erasure: %v", err)
+	}
+	defer erasing.Rollback()
+	if _, err := erasing.ExecContext(ctx,
+		`SELECT id FROM users WHERE id = $1 FOR UPDATE`, "slow-erasure"); err != nil {
+		t.Fatalf("lock the user: %v", err)
+	}
+	if _, err := erasing.ExecContext(ctx,
+		`UPDATE users SET deleted_at = now() WHERE id = $1`, "slow-erasure"); err != nil {
+		t.Fatalf("erase the user: %v", err)
+	}
+
+	admitted := make(chan outbound.SubmitResult, 1)
+	failed := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		result, err := s.SubmitEscalationBatch(ctx, adm)
+		if err != nil {
+			failed <- err
+			return
+		}
+		admitted <- result
+	}()
+
+	if !blocked(done) {
+		t.Fatal("the admission did not wait for the erasure holding its recipient; " +
+			"it can insert a commitment to a person who is about to be gone")
+	}
+
+	if err := erasing.Commit(); err != nil {
+		t.Fatalf("commit the erasure: %v", err)
+	}
+
+	select {
+	case err := <-failed:
+		t.Fatalf("submit: %v", err)
+	case result := <-admitted:
+		if result.Outcome != outbound.SubmitRecipientErased {
+			t.Fatalf("after the erasure committed the admission answered %q", result.Outcome)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the admission never came back after the erasure committed")
+	}
+
+	var owed int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM outbound_intents WHERE target_ref = 'slow-erasure'`).
+		Scan(&owed); err != nil {
+		t.Fatalf("count the commitments: %v", err)
+	}
+	if owed != 0 {
+		t.Fatalf("%d commitments were created for an erased person", owed)
+	}
+}
+
+// TestAnErasureWaitsForAnAdmissionThatGotThereFirst is the other order, and it
+// is the reason the admission takes a SHARED lock rather than an exclusive one:
+// two admissions naming the same people must not queue behind each other, and
+// an erasure must.
+//
+// What the erasure finds when it gets in is the new commitment, which it
+// withdraws like any other - which is why admitting first is safe.
+func TestAnErasureWaitsForAnAdmissionThatGotThereFirst(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+	seedTeam(t, s, "devops", "alice", "late-erasure")
+
+	agID := outboundGroup(t, s)
+	adm := outboundAdmission(t, agID, "first", dmForUser("late-erasure", 1))
+	if got := mustSubmit(t, s, adm).Outcome; got != outbound.SubmitCreated {
+		t.Fatalf("the admission answered %q", got)
+	}
+
+	// An admission in progress over the same person, holding the shared lock.
+	admitting, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin the admission: %v", err)
+	}
+	defer admitting.Rollback()
+	if _, err := admitting.ExecContext(ctx,
+		`SELECT id FROM users WHERE id = $1 FOR SHARE`, "late-erasure"); err != nil {
+		t.Fatalf("lock the user: %v", err)
+	}
+
+	erased := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		erased <- erasure.NewService(s.ErasureRepository()).Erase(ctx, "late-erasure")
+	}()
+
+	if !blocked(done) {
+		t.Fatal("the erasure did not wait for the admission holding its user")
+	}
+
+	if err := admitting.Commit(); err != nil {
+		t.Fatalf("commit the admission: %v", err)
+	}
+	select {
+	case err := <-erased:
+		if err != nil {
+			t.Fatalf("erase: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erasure never came back after the admission committed")
+	}
+
+	// And what it found, it withdrew.
+	var owed, marked int
+	if err := s.db.QueryRow(`
+		SELECT count(*) FILTER (WHERE status <> 'canceled'),
+		       count(*) FILTER (WHERE recipient_erased_at IS NOT NULL)
+		FROM outbound_intents WHERE target_ref = 'late-erasure'`).
+		Scan(&owed, &marked); err != nil {
+		t.Fatalf("read the commitments: %v", err)
+	}
+	if owed != 0 {
+		t.Fatalf("%d commitments to an erased person are still owed", owed)
+	}
+	if marked == 0 {
+		t.Fatal("the commitments were withdrawn without the erasure marker, so a " +
+			"later writer could still put the address back")
+	}
+}
+
+// TestErasureAndAResultInFlightMeetInBothOrders.
+//
+// Both sequences, and the assertion is the same in each: the coordinates do not
+// survive and the fact does. If the result lands first, its receipt is written
+// and the erasure redacts it; if the erasure lands first, the marker is already
+// there and the result never writes an address at all.
+//
+// The commitment ends up in different states in the two orders - withdrawn in
+// one, delivered-then-redacted in the other - which is why the check afterwards
+// is "the address is nowhere", asked of every column of all three tables,
+// rather than a status.
+func TestErasureAndAResultInFlightMeetInBothOrders(t *testing.T) {
 	s := setupTestDB(t)
 	ctx := context.Background()
 
@@ -466,24 +632,34 @@ func TestErasureAndAResultInFlightMeetAtOnce(t *testing.T) {
 			var eraseErr, finalizeErr error
 
 			wg.Add(2)
+			// The order is TAKEN, not slept for: whichever goes second is
+			// released only once the first has committed, so the interleaving
+			// the subtest names is the one that actually happens.
+			second := make(chan struct{})
 			go func() {
 				defer wg.Done()
 				<-start
 				if !order.erasureFirst {
-					time.Sleep(5 * time.Millisecond)
+					<-second
 				}
 				eraseErr = erasure.NewService(s.ErasureRepository()).Erase(ctx, userID)
+				if order.erasureFirst {
+					close(second)
+				}
 			}()
 			go func() {
 				defer wg.Done()
 				<-start
 				if order.erasureFirst {
-					time.Sleep(5 * time.Millisecond)
+					<-second
 				}
 				_, finalizeErr = s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
 					AttemptID: begun.AttemptID, LeaseToken: token,
 					Conclusion: acceptedConclusion(t, "D9999"),
 				})
+				if !order.erasureFirst {
+					close(second)
+				}
 			}()
 			close(start)
 			wg.Wait()

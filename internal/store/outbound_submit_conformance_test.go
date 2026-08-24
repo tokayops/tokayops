@@ -21,6 +21,10 @@ import (
 // admitting is the part of a store an admission scenario needs.
 type admitting interface {
 	CreateAlertGroup(ag *model.AlertGroup) error
+	// eraseUser is how each store is told a recipient is gone. The two do it
+	// differently - one writes deleted_at, the other keeps a set - so the
+	// scenario asks the store rather than the database.
+	eraseUser(t *testing.T, userID string)
 	TransitionAlertGroupStatus(id string, from, to model.AlertGroupStatus) (bool, error)
 	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
 	SubmitEscalationBatch(ctx context.Context,
@@ -82,6 +86,31 @@ func TestBothStoresAdmitTheSameWay(t *testing.T) {
 				acknowledge(t, s, agID)
 				adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
 				return []outbound.SubmitOutcome{submitTo(t, s, adm).Outcome}
+			},
+		},
+		{
+			name: "an admission promising an erased person is refused",
+			run: func(t *testing.T, s admitting, agID string) []outbound.SubmitOutcome {
+				s.eraseUser(t, "erased-conformance")
+				adm := outboundAdmission(t, agID, "first",
+					dmCommitment("erased-conformance"))
+				return []outbound.SubmitOutcome{submitTo(t, s, adm).Outcome}
+			},
+		},
+		{
+			// And the claim still answers first. An admission accepted before
+			// the erasure is work that exists and is being delivered; telling
+			// its producer "that person is gone" would turn a lost reply into
+			// a rejected plan.
+			name: "a repeat of an admission accepted before the erasure",
+			run: func(t *testing.T, s admitting, agID string) []outbound.SubmitOutcome {
+				adm := outboundAdmission(t, agID, "first",
+					dmCommitment("erased-after-admission"))
+				first := submitTo(t, s, adm)
+				s.eraseUser(t, "erased-after-admission")
+				repeat := submitTo(t, s, adm)
+				sameClaim(t, first, repeat)
+				return []outbound.SubmitOutcome{first.Outcome, repeat.Outcome}
 			},
 		},
 		{
@@ -173,5 +202,23 @@ func sameClaim(t *testing.T, first, repeat outbound.SubmitResult) {
 			t.Errorf("the repeat named commitment %s, the claim holds %s",
 				repeat.IntentIDs[i], first.IntentIDs[i])
 		}
+	}
+}
+
+// The two stores are told about an erased user in their own way, so the
+// scenarios can say "this person is gone" without knowing which store they are
+// talking to.
+func (m *MockStore) eraseUser(t *testing.T, userID string) {
+	t.Helper()
+	m.EraseUser(userID)
+}
+
+func (s *Store) eraseUser(t *testing.T, userID string) {
+	t.Helper()
+	if _, err := s.db.Exec(
+		`INSERT INTO users (id, email, name, role, created_at, deleted_at)
+		 VALUES ($1, $1 || '@example.com', $1, 'user', now(), now())
+		 ON CONFLICT (id) DO UPDATE SET deleted_at = now()`, userID); err != nil {
+		t.Fatalf("erase %s: %v", userID, err)
 	}
 }

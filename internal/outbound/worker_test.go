@@ -668,9 +668,11 @@ func TestRunHoldsUntilTheAnswerIsRecorded(t *testing.T) {
 // in the system to leak: the payload is right there, and so is whatever the
 // provider chose to say back.
 //
-// So the line is pinned by what it must contain AND by what it must not. The
-// summary is allowed and bounded (NFR-7); the payload and the lease are not
-// allowed at all.
+// So the line is pinned by what it must contain AND by what it must not, and
+// the second list grew after review: the provider's own summary reads "accepted
+// with channel=D0123" on some paths, which is an address in prose, and a
+// receipt reference is coordinates outright. Both live in the attempt's record,
+// where erasure can remove them. A log cannot be edited afterwards.
 func TestTheAttemptLogSaysWhatHappenedWithoutSayingWhatWasSent(t *testing.T) {
 	store := newFakeStore()
 	store.beginOut.Payload = json.RawMessage(`{"text":"disk will fill on db-primary"}`)
@@ -710,7 +712,9 @@ func TestTheAttemptLogSaysWhatHappenedWithoutSayingWhatWasSent(t *testing.T) {
 	for _, forbidden := range []string{
 		"disk will fill", // the payload
 		"token-7",        // the lease
-		longTail,         // the untruncated tail of the provider's answer
+		"aaaa",           // the provider's own words, which can name a channel
+		longTail,
+		"C-bound", // the coordinates of the message it made
 	} {
 		if strings.Contains(line, forbidden) {
 			t.Errorf("the attempt line leaked %q:\n%s", forbidden, line)

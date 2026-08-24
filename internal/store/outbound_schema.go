@@ -443,6 +443,20 @@ BEGIN
 				OR (receipt_recorded AND receipt IS NULL AND receipt_redacted_at IS NOT NULL)
 			) NOT VALID;
 	END IF;
+
+	-- And validated, in a step of its own so that a database which somehow got
+	-- the constraint without the backfill fails HERE, loudly, rather than
+	-- carrying rows nobody can interpret. NOT VALID on its own only promises
+	-- something about rows written from now on, and the whole point of these
+	-- three states is that every row has exactly one of them.
+	IF EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = '` + outboundReceiptStateConstraint + `'
+		  AND conrelid = '` + table + `'::regclass
+		  AND NOT convalidated
+	) THEN
+		ALTER TABLE ` + table + ` VALIDATE CONSTRAINT ` + outboundReceiptStateConstraint + `;
+	END IF;
 END $$;
 `
 }

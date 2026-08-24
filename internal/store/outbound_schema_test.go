@@ -1,7 +1,9 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1054,5 +1056,106 @@ func TestTheTargetRuleReachesAnExistingDatabase(t *testing.T) {
 		uuid.New().String(), batch.ID, agID)
 	if err == nil {
 		t.Fatal("a commitment addressed two ways was written after the rule was restored")
+	}
+}
+
+// TestARowCannotBeInTwoReceiptStates.
+//
+// The three states are the whole reason erasure can remove coordinates without
+// removing the fact: none, usable, redacted. Written as three columns they can
+// disagree, and a row claiming both "nothing was ever sent" and "its
+// coordinates were redacted" is a row nobody can interpret afterwards - least
+// of all the state machine, which would offer to send the message again.
+//
+// The database is what holds this, not the writers: there are four of them
+// already and every one of them writes all three columns.
+func TestARowCannotBeInTwoReceiptStates(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	// The constraint is validated, not merely declared for future rows.
+	for _, table := range []string{
+		"outbound_intents", "outbound_attempts", "outbound_attempt_observations",
+	} {
+		var validated bool
+		if err := s.db.QueryRowContext(ctx, `
+			SELECT convalidated FROM pg_constraint
+			WHERE conname = $1 AND conrelid = $2::regclass`,
+			outboundReceiptStateConstraint, table).Scan(&validated); err != nil {
+			t.Fatalf("read the constraint on %s: %v", table, err)
+		}
+		if !validated {
+			t.Errorf("the receipt-state rule on %s is declared but never checked "+
+				"against the rows that are already there", table)
+		}
+	}
+
+	agID := outboundGroup(t, s)
+	intentID := admitOne(t, s, agID)[0]
+	token := claimOne(t, s, intentID)
+	attemptID := beginOne(t, s, intentID, token).AttemptID
+
+	rows := map[string]string{
+		"outbound_intents":  `UPDATE outbound_intents SET %s WHERE id = '` + intentID + `'`,
+		"outbound_attempts": `UPDATE outbound_attempts SET %s WHERE id = '` + attemptID + `'`,
+	}
+
+	// Every combination the three columns can be put in that means nothing.
+	nonsense := []struct {
+		name string
+		set  string
+	}{
+		{
+			name: "nothing was sent, and here are its coordinates",
+			set:  `receipt_recorded = FALSE, receipt = '{"a":1}'::jsonb, receipt_redacted_at = NULL`,
+		},
+		{
+			name: "nothing was sent, and its coordinates were redacted",
+			set:  `receipt_recorded = FALSE, receipt = NULL, receipt_redacted_at = now()`,
+		},
+		{
+			name: "something was sent, and there is neither a receipt nor a redaction",
+			set:  `receipt_recorded = TRUE, receipt = NULL, receipt_redacted_at = NULL`,
+		},
+		{
+			name: "the coordinates are both present and redacted",
+			set:  `receipt_recorded = TRUE, receipt = '{"a":1}'::jsonb, receipt_redacted_at = now()`,
+		},
+	}
+
+	for table, shape := range rows {
+		for _, bad := range nonsense {
+			t.Run(table+": "+bad.name, func(t *testing.T) {
+				_, err := s.db.ExecContext(ctx, fmt.Sprintf(shape, bad.set))
+				if err == nil {
+					t.Fatal("the database accepted a row in no receipt state at all")
+				}
+				if !strings.Contains(err.Error(), outboundReceiptStateConstraint) {
+					t.Fatalf("refused by something else: %v", err)
+				}
+			})
+		}
+	}
+
+	// The observations table has no row of its own here, so it is checked by
+	// inserting one directly - the shape is what matters, not the history.
+	for _, bad := range nonsense {
+		t.Run("outbound_attempt_observations: "+bad.name, func(t *testing.T) {
+			_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+				INSERT INTO outbound_attempt_observations (
+					id, attempt_id, observation_kind, outcome,
+					completion_fingerprint, completion_fingerprint_version,
+					receipt_recorded, receipt, receipt_redacted_at)
+				VALUES ('%s', '%s', 'late_finalize', 'accepted', $1, 1, %s)`,
+				uuid.New().String(), attemptID,
+				strings.NewReplacer("receipt_recorded = ", "", "receipt = ", "",
+					"receipt_redacted_at = ", "").Replace(bad.set)), digest32(0x40))
+			if err == nil {
+				t.Fatal("the database accepted an observation in no receipt state at all")
+			}
+			if !strings.Contains(err.Error(), outboundReceiptStateConstraint) {
+				t.Fatalf("refused by something else: %v", err)
+			}
+		})
 	}
 }
