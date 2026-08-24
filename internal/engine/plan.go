@@ -74,9 +74,15 @@ const firehoseProvider = "slack"
 // teamOnCall is who is on duty for the alert's team, read once by the caller
 // and handed in: the snapshot stored on the group and the people paged have to
 // be the same answer, and two reads a moment apart can straddle a handoff.
-func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup, policyID string,
+func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup,
 	teamOnCall schedulerender.TeamOnCallResult) (outbound.EscalationAdmission, error) {
 
+	team, err := p.teamFor(ag.TeamID)
+	if err != nil {
+		return outbound.EscalationAdmission{}, err
+	}
+
+	policyID := team.route(ag.Severity)
 	policy, err := p.policyFor(policyID)
 	if err != nil {
 		return outbound.EscalationAdmission{}, err
@@ -85,7 +91,7 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup, policyID 
 		policyID = ""
 	}
 
-	state, err := p.freeze(ag)
+	state, err := p.freeze(ag, team)
 	if err != nil {
 		return outbound.EscalationAdmission{}, err
 	}
@@ -93,7 +99,13 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup, policyID 
 	plan := *p
 	plan.firehose = p.firehoseChannel(ag.Severity)
 
-	planned, unpromised, err := plan.commitments(ctx, policy, teamOnCall)
+	// Who the people named by this plan actually are, resolved once and shared.
+	// The commitments and the snapshot on the group are the same answer about
+	// the same moment, and two reads a moment apart - or one that came back
+	// short - would page Alice while the group said she was not on call.
+	people := &roster{store: p.store}
+
+	planned, unpromised, err := plan.commitments(ctx, people, policy, teamOnCall)
 	if err != nil {
 		return outbound.EscalationAdmission{}, err
 	}
@@ -119,10 +131,10 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup, policyID 
 		// What the snapshot above was frozen from, checked again under the
 		// lock that decides the admission: a plan built a moment too early is
 		// refused whole rather than held forever.
-		SourceVersion:  ag.SlackUpdateGeneration,
+		SourceVersion:  ag.RenderSourceVersion,
 		PolicyID:       policyID,
 		PolicySnapshot: policySnapshot(policyID, policy, planned),
-		OnCallSnapshot: plan.onCallSnapshot(ag.ID, teamOnCall),
+		OnCallSnapshot: plan.onCallSnapshot(ag.ID, people, teamOnCall),
 		Unpromised:     unpromised,
 		Actor:          "engine",
 	}, nil
@@ -150,7 +162,9 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup, policyID 
 // Source is what survives of the override information now that the projection
 // answers instead of a legacy override row: L1Users already names the stand-in,
 // and Source says that is why.
-func (p *planner) onCallSnapshot(agID string, read schedulerender.TeamOnCallResult) json.RawMessage {
+func (p *planner) onCallSnapshot(agID string, people *roster,
+	read schedulerender.TeamOnCallResult) json.RawMessage {
+
 	if read.Err() != nil {
 		return nil
 	}
@@ -158,7 +172,7 @@ func (p *planner) onCallSnapshot(agID string, read schedulerender.TeamOnCallResu
 	team := read.OnCall()
 	out := &model.OnCallResult{}
 	if l1 := team.OnCall.L1; l1 != nil {
-		users, err := p.usersByIDs(l1.UserIDs)
+		users, err := people.people(l1.UserIDs)
 		if err != nil {
 			log.Printf("AlertEngine: the on-call snapshot of %s was not recorded: %v", agID, err)
 			return nil
@@ -170,7 +184,7 @@ func (p *planner) onCallSnapshot(agID string, read schedulerender.TeamOnCallResu
 		out.Source = l1.Source
 	}
 	if l2 := team.OnCall.L2; l2 != nil && len(l2.UserIDs) > 0 {
-		users, err := p.usersByIDs(l2.UserIDs[:1])
+		users, err := people.people(l2.UserIDs[:1])
 		if err != nil {
 			log.Printf("AlertEngine: the on-call snapshot of %s was not recorded: %v", agID, err)
 			return nil
@@ -188,23 +202,54 @@ func (p *planner) onCallSnapshot(agID string, read schedulerender.TeamOnCallResu
 	return raw
 }
 
-// usersByIDs hydrates ids into people, in the projection's order, dropping
-// anyone the store no longer has.
-func (p *planner) usersByIDs(ids []string) ([]*model.User, error) {
-	if len(ids) == 0 || p.store == nil {
+// roster is who the people named by one plan are.
+//
+// It exists so that a plan asks each question once. The commitments and the
+// on-call snapshot recorded on the group are the same claim about the same
+// moment, and they used to be two reads: a person erased between them, or a
+// second answer that came back short, produced a commitment aimed at Alice and
+// a group saying Alice was not on call.
+//
+// People the store does not return are remembered as absent rather than asked
+// about again. An erased person has no identity left to notify, and the answer
+// is the same however often it is asked.
+type roster struct {
+	store planStore
+	known map[string]*model.User
+}
+
+// people resolves ids into people, in the order they were given, dropping
+// anyone the store does not have.
+func (r *roster) people(ids []string) ([]*model.User, error) {
+	if len(ids) == 0 || r.store == nil {
 		return nil, nil
 	}
-	fetched, err := p.store.GetUsersByIDs(ids)
-	if err != nil {
-		return nil, err
+	if r.known == nil {
+		r.known = map[string]*model.User{}
 	}
-	byID := make(map[string]*model.User, len(fetched))
-	for _, u := range fetched {
-		byID[u.ID] = u
+
+	var ask []string
+	for _, id := range ids {
+		if _, asked := r.known[id]; !asked {
+			ask = append(ask, id)
+		}
 	}
+	if len(ask) > 0 {
+		fetched, err := r.store.GetUsersByIDs(ask)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ask {
+			r.known[id] = nil
+		}
+		for _, u := range fetched {
+			r.known[u.ID] = u
+		}
+	}
+
 	out := make([]*model.User, 0, len(ids))
 	for _, id := range ids {
-		if u, ok := byID[id]; ok {
+		if u := r.known[id]; u != nil {
 			out = append(out, u)
 		}
 	}
@@ -225,6 +270,64 @@ type plannedCommitment struct {
 	firehose   bool
 }
 
+// teamRead is the alert's team, read once.
+//
+// The two questions it answers are asked in different places - which policy
+// this alert escalates by, and whether a card may offer buttons - and they used
+// to be two reads. That is the whole reason this type exists: with two, a read
+// that failed could answer one of them and a read that succeeded the other, and
+// the alert would be escalated by nothing at all while its card said the team
+// was fine.
+type teamRead struct {
+	// team is nil when the alert names a team that is not there.
+	team *model.Team
+
+	// unnamed: the alert names no team at all. Not the same as a team that is
+	// missing - there is nothing here somebody failed to set up, so the card
+	// says nothing about it.
+	unnamed bool
+}
+
+// route is the policy this alert escalates by: the severity's own route if the
+// team has one, otherwise the team's default. Empty means the firehose alone.
+func (r teamRead) route(severity string) string {
+	if r.team == nil {
+		return ""
+	}
+	if policyID, ok := r.team.SeverityRoutes[severity]; ok && policyID != "" {
+		return policyID
+	}
+	return r.team.DefaultPolicyID
+}
+
+// onboarded is whether a card may offer buttons that act on this alert.
+func (r teamRead) onboarded() bool { return r.unnamed || r.team != nil }
+
+// teamFor reads the alert's team, and distinguishes the two ways that comes
+// back empty.
+//
+// A team that is NOT THERE is a product fact: the alert names a team nobody set
+// up, so it escalates by no policy and its card says the buttons would answer
+// nobody. A lookup that could not RUN says nothing about the team, and
+// answering it either way freezes a guess into an escalation that is held
+// forever - firehose-only, permanently, over a database that was busy for a
+// second. Nothing is admitted and the next tick asks again.
+func (p *planner) teamFor(teamID string) (teamRead, error) {
+	if teamID == "" || p.store == nil {
+		return teamRead{unnamed: true}, nil
+	}
+
+	team, err := p.store.GetTeamByID(teamID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		log.Printf("AlertEngine: team %s does not exist, admitting the firehose only", teamID)
+		return teamRead{}, nil
+	case err != nil:
+		return teamRead{}, fmt.Errorf("%w: team %s: %w", ErrOnCallResolutionUnavailable, teamID, err)
+	}
+	return teamRead{team: team}, nil
+}
+
 // freeze takes the state every message of this escalation will be rendered
 // from, at revision 0.
 //
@@ -232,21 +335,24 @@ type plannedCommitment struct {
 // the links whole rather than a base URL, whether the alert's team is set up in
 // TokayOps, and the zone times are printed in. Two instances, or one instance
 // an hour later, then render the same bytes.
-func (p *planner) freeze(ag *model.AlertGroup) (keys.RenderSnapshot, error) {
+func (p *planner) freeze(ag *model.AlertGroup, team teamRead) (keys.RenderSnapshot, error) {
 	selfURL := ""
 	if p.cfg != nil {
 		selfURL = p.cfg.Global.SelfURL
 	}
 
-	onboarded, err := p.teamIsOnboarded(ag.TeamID)
-	if err != nil {
-		return keys.RenderSnapshot{}, err
-	}
-
 	in := providers.ViewOf(providers.GroupView{
-		Group:         ag,
-		SelfURL:       selfURL,
-		TeamOnboarded: onboarded,
+		Group:   ag,
+		SelfURL: selfURL,
+		// Whether the alert's team is set up here, from the same read the
+		// routing came from. A card says so where its buttons would be, and
+		// asking again at send time would let that answer change between two
+		// attempts of one delivery.
+		//
+		// The channels degrade the other way at send time, on purpose: there
+		// the snapshot already holds an answer and the question is only whether
+		// to trust a blip over it.
+		TeamOnboarded: team.onboarded(),
 		// The zone this instance was told to use, frozen now. It is not read
 		// again: an instance in another zone rendering this snapshot has to
 		// produce the same message.
@@ -291,39 +397,11 @@ func tellableHistory(agID string, events []keys.TimelineEventSnapshot) []keys.Ti
 	return out
 }
 
-// teamIsOnboarded asks once, here, whether the alert's team exists in TokayOps.
-// A card says so where its buttons would be, and asking again at send time
-// would let that answer change between two attempts of one delivery.
-//
-// The two ways this can fail are different answers. A team that is NOT THERE is
-// what the notice on the card is about - the alert names a team nobody set up,
-// so nobody can act on it from Slack. A lookup that could not RUN says nothing
-// about the team, and answering it either way would freeze a guess into every
-// message of this escalation: nothing is admitted, and the next tick asks
-// again.
-//
-// The channels degrade the other way at send time, on purpose: there the
-// snapshot already holds an answer and the question is only whether to trust a
-// blip over it.
-func (p *planner) teamIsOnboarded(teamID string) (bool, error) {
-	if teamID == "" || p.store == nil {
-		return true, nil
-	}
-
-	team, err := p.store.GetTeamByID(teamID)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("%w: team %s: %w", ErrOnCallResolutionUnavailable, teamID, err)
-	}
-	return team != nil, nil
-}
-
 // commitments turns the plan into promises: the firehose first, then the policy
 // steps in order.
-func (p *planner) commitments(ctx context.Context, policy *model.EscalationPolicy,
-	teamOnCall schedulerender.TeamOnCallResult) ([]plannedCommitment, []outbound.UnpromisedStep, error) {
+func (p *planner) commitments(ctx context.Context, people *roster,
+	policy *model.EscalationPolicy, teamOnCall schedulerender.TeamOnCallResult) (
+	[]plannedCommitment, []outbound.UnpromisedStep, error) {
 
 	var (
 		out        []plannedCommitment
@@ -352,7 +430,7 @@ func (p *planner) commitments(ctx context.Context, policy *model.EscalationPolic
 		return out, unpromised, nil
 	}
 
-	resolver := &scheduleResolver{store: p.store, oncall: p.oncall, team: teamOnCall}
+	resolver := &scheduleResolver{people: people, oncall: p.oncall, team: teamOnCall}
 
 	// The offset is cumulative from ADMISSION, not from the previous step
 	// finishing (S1-D4). A step that is still retrying no longer holds the rest
@@ -540,7 +618,7 @@ func (p *planner) policyFor(policyID string) (*model.EscalationPolicy, error) {
 // steps naming the same schedule are one question, and neither a handoff nor a
 // transient failure landing between them may split the answer.
 type scheduleResolver struct {
-	store  planStore
+	people *roster
 	oncall onCallProjection
 	team   schedulerender.TeamOnCallResult
 
@@ -616,21 +694,11 @@ func (r *scheduleResolver) hydrate(onCall schedulerender.OnCall) ([]*model.User,
 	if onCall.L1 == nil || len(onCall.L1.UserIDs) == 0 {
 		return nil, nil
 	}
-	fetched, err := r.store.GetUsersByIDs(onCall.L1.UserIDs)
+	users, err := r.people.people(onCall.L1.UserIDs)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrOnCallResolutionUnavailable, err)
 	}
-	byID := make(map[string]*model.User, len(fetched))
-	for _, u := range fetched {
-		byID[u.ID] = u
-	}
-	out := make([]*model.User, 0, len(onCall.L1.UserIDs))
-	for _, id := range onCall.L1.UserIDs {
-		if u, ok := byID[id]; ok {
-			out = append(out, u)
-		}
-	}
-	return out, nil
+	return users, nil
 }
 
 // policySnapshot is what the group records about the policy it was escalated
@@ -674,7 +742,15 @@ func slotTarget(slot keys.Slot, provider string, target keys.Target) string {
 	return fmt.Sprintf("%s/%d/%s/%s/%s", slot.Kind, slot.Index, provider, target.Kind, target.Ref)
 }
 
+// describeStep names one step of a policy the way its history has to: by its
+// index first, because that is what tells two steps apart. A policy naming the
+// same schedule twice produces two lines, and without the index they are the
+// same sentence about different work.
 func describeStep(step *model.EscalationStep) string {
+	return fmt.Sprintf("%d (%s)", step.StepIndex, describeTarget(step))
+}
+
+func describeTarget(step *model.EscalationStep) string {
 	if step.TargetType == "schedule" {
 		return "schedule " + step.TargetID
 	}

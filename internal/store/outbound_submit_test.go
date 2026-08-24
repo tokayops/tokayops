@@ -597,3 +597,168 @@ func TestSubmitWithoutAnOnCallAnswerRecordsNothing(t *testing.T) {
 		}
 	})
 }
+
+// A claim that already exists answers the repeat, whatever the world has done
+// since.
+//
+// A producer retrying after a lost reply is asking one question: "was my work
+// accepted?" The answer was written minutes ago and cannot change. Every other
+// rule in an admission is about taking on NEW work - is the group still
+// waiting, is the plan still current, is the deadline still ahead - and running
+// those first turns a lost reply into a refusal over commitments that exist and
+// are being delivered right now (D2/D3).
+
+// expiringCommitment is a promise with a deadline, so the repeat can be made
+// after the deadline has passed. The bytes are identical on both submits, which
+// is what makes the second one a repeat rather than different work.
+func expiringCommitment(ref string, at time.Time) keys.EscalationCommitment {
+	c := channelCommitment(ref, 0)
+	c.Expiry = &keys.TimingSpec{Kind: keys.TimingAbsolute, At: at}
+	return c
+}
+
+// waitPastTheDeadline blocks until the DATABASE says the deadline has passed.
+// The admission compares against the database's clock, so waiting on this one
+// is what makes the test independent of the two agreeing.
+func waitPastTheDeadline(t *testing.T, s *Store, deadline time.Time) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		var past bool
+		if err := s.db.QueryRow(`SELECT now() > $1`, deadline).Scan(&past); err != nil {
+			t.Fatalf("ask the database for the time: %v", err)
+		}
+		if past {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the deadline never passed")
+}
+
+func TestSubmitRepeatSurvivesTheWorldMovingOn(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	// Each case gets its own deadline: one that passes during the test, or one
+	// that never does. Shared, the case that waits out its deadline would leave
+	// the others unable to make their FIRST admission.
+	moveOn := []struct {
+		name    string
+		expires time.Duration
+		moveOn  func(t *testing.T, agID string, deadline time.Time)
+	}{
+		{
+			name:    "the deadline passed",
+			expires: 200 * time.Millisecond,
+			moveOn: func(t *testing.T, agID string, deadline time.Time) {
+				waitPastTheDeadline(t, s, deadline)
+			},
+		},
+		{
+			name:    "an alert joined the group",
+			expires: time.Hour,
+			moveOn: func(t *testing.T, agID string, deadline time.Time) {
+				if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(agID, []model.Alert{{
+					Fingerprint: "fp-late", Status: "firing", StartsAt: time.Now(),
+				}}); err != nil {
+					t.Fatalf("change the alert group: %v", err)
+				}
+			},
+		},
+		{
+			name:    "the user acknowledged",
+			expires: time.Hour,
+			moveOn: func(t *testing.T, agID string, deadline time.Time) {
+				if _, err := s.db.ExecContext(ctx,
+					`UPDATE alert_groups SET status = $1 WHERE id = $2`,
+					model.AlertGroupStatusAcknowledged, agID); err != nil {
+					t.Fatalf("acknowledge the group: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, move := range moveOn {
+		t.Run(move.name, func(t *testing.T) {
+			// The deadline is taken from the database, because that is the
+			// clock the admission checks it against.
+			var dbNow time.Time
+			if err := s.db.QueryRow(`SELECT now()`).Scan(&dbNow); err != nil {
+				t.Fatalf("ask the database for the time: %v", err)
+			}
+			deadline := dbNow.Add(move.expires)
+
+			agID := outboundGroup(t, s)
+			adm := outboundAdmission(t, agID, "first", expiringCommitment("C0001", deadline))
+
+			first := mustSubmit(t, s, adm)
+			if first.Outcome != outbound.SubmitCreated {
+				t.Fatalf("the first admission answered %q", first.Outcome)
+			}
+
+			move.moveOn(t, agID, deadline)
+
+			repeat := mustSubmit(t, s, adm)
+			if repeat.Outcome != outbound.SubmitExisting {
+				t.Fatalf("a repeat answered %q, so a lost reply became a refusal over "+
+					"commitments that already exist", repeat.Outcome)
+			}
+			if repeat.BatchID != first.BatchID {
+				t.Errorf("the repeat found claim %s, the work is under %s",
+					repeat.BatchID, first.BatchID)
+			}
+			if len(repeat.IntentIDs) != len(first.IntentIDs) {
+				t.Fatalf("the repeat named %d commitments, the claim holds %d",
+					len(repeat.IntentIDs), len(first.IntentIDs))
+			}
+			for i := range first.IntentIDs {
+				if repeat.IntentIDs[i] != first.IntentIDs[i] {
+					t.Errorf("the repeat named commitment %s, the claim holds %s",
+						repeat.IntentIDs[i], first.IntentIDs[i])
+				}
+			}
+
+			// And nothing was created a second time.
+			var intents int
+			if err := s.db.QueryRow(
+				`SELECT count(*) FROM outbound_intents WHERE alert_group_id = $1`,
+				agID).Scan(&intents); err != nil {
+				t.Fatalf("count the commitments: %v", err)
+			}
+			if intents != len(first.IntentIDs) {
+				t.Fatalf("the group holds %d commitments after a repeat, want %d",
+					intents, len(first.IntentIDs))
+			}
+		})
+	}
+}
+
+// TestSubmitAnswersDifferentWorkAsAConflictWhateverHasMoved. The same door, the
+// other answer: a claim held by DIFFERENT work is a conflict, and it stays a
+// conflict after the group has been acknowledged. Refusing it as "not
+// admissible" instead would tell the producer to fix its plan, when what
+// actually happened is that somebody else's plan is already running.
+func TestSubmitAnswersDifferentWorkAsAConflictWhateverHasMoved(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+	agID := outboundGroup(t, s)
+
+	winner := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
+	first := mustSubmit(t, s, winner)
+
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE alert_groups SET status = $1, render_source_version = 9 WHERE id = $2`,
+		model.AlertGroupStatusAcknowledged, agID); err != nil {
+		t.Fatalf("acknowledge the group: %v", err)
+	}
+
+	loser := outboundAdmission(t, agID, "second", channelCommitment("C0009", 0))
+	result := mustSubmit(t, s, loser)
+	if result.Outcome != outbound.SubmitConflict {
+		t.Fatalf("different work under a held claim answered %q", result.Outcome)
+	}
+	if result.BatchID != first.BatchID {
+		t.Errorf("the conflict names claim %s, the work is under %s",
+			result.BatchID, first.BatchID)
+	}
+}

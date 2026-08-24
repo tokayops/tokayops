@@ -110,6 +110,95 @@ func NewStore(dsn string) (*Store, error) {
 	return &Store{db: db, lockTimeout: outbound.NotificationLockTimeout}, nil
 }
 
+// legacyColumnMigrationsDDL renames what older schemas called things.
+//
+// It runs after the tables are created, and every step is guarded, so a fresh
+// database executes it and changes nothing. Lifted out of InitDB so a test can
+// build an old database and prove a rename carries its values across - which is
+// the one thing here nobody can verify by reading it.
+const legacyColumnMigrationsDDL = `
+	DO $$
+	BEGIN
+		-- 1. Rename incident_id to alert_group_id in timeline_events (legacy migration)
+		IF EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='timeline_events' AND column_name='incident_id') THEN
+			ALTER TABLE timeline_events RENAME COLUMN incident_id TO alert_group_id;
+		END IF;
+        
+        -- 3. Add external_url column if not exists (for clickable Alertmanager links)
+        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='external_url') THEN
+            ALTER TABLE alert_groups ADD COLUMN external_url TEXT;
+        END IF;
+        
+        -- 4. Add notification_states column if not exists (for per-target retry tracking)
+        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='notification_states') THEN
+            ALTER TABLE alert_groups ADD COLUMN notification_states TEXT;
+        END IF;
+        
+        -- 5. Add auth_provider column to users table if not exists (OIDC support)
+        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='auth_provider') THEN
+            ALTER TABLE users ADD COLUMN auth_provider TEXT;
+        END IF;
+
+		-- 6. Add FK for notification_deliveries.job_step_id if missing
+		IF NOT EXISTS(
+			SELECT 1 FROM information_schema.table_constraints
+			WHERE table_name = 'notification_deliveries'
+			  AND constraint_name = 'notification_deliveries_job_step_id_fkey'
+		) THEN
+			ALTER TABLE notification_deliveries
+			ADD CONSTRAINT notification_deliveries_job_step_id_fkey
+			FOREIGN KEY (job_step_id) REFERENCES job_steps(id) ON DELETE SET NULL;
+		END IF;
+
+		-- 7. Add resolved_by column
+		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='resolved_by') THEN
+			ALTER TABLE alert_groups ADD COLUMN resolved_by TEXT;
+		END IF;
+
+		-- 8. Add ack_processed_at column for tracking when ack update was processed
+		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='ack_processed_at') THEN
+			ALTER TABLE alert_groups ADD COLUMN ack_processed_at TIMESTAMPTZ;
+		END IF;
+
+		-- 8. Add slack_update_pending flag for tracking when Slack messages need updating
+		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_pending') THEN
+			ALTER TABLE alert_groups ADD COLUMN slack_update_pending BOOLEAN NOT NULL DEFAULT FALSE;
+		END IF;
+
+		-- 8. The version of the state a card is drawn from. Every write that
+		-- changes what a message about this alert would say increments it.
+		--
+		-- Two things read it. A producer that froze a snapshot hands the
+		-- version back when it admits the escalation, and the admission
+		-- refuses a plan built from state that has moved since. And the
+		-- slack_update_pending gate above clears the flag only for the version
+		-- it read, so an alert arriving while the update job is created keeps
+		-- the flag up instead of being cleared away with it.
+		--
+		-- It was called slack_update_generation, which was the second of those
+		-- two jobs under the name of a loop that is on its way out.
+		IF EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_generation')
+		   AND NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='render_source_version') THEN
+			ALTER TABLE alert_groups RENAME COLUMN slack_update_generation TO render_source_version;
+		END IF;
+		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='render_source_version') THEN
+			ALTER TABLE alert_groups ADD COLUMN render_source_version BIGINT NOT NULL DEFAULT 0;
+		END IF;
+
+		-- 9. Add alert_group_id column to jobs table
+		IF NOT EXISTS(SELECT 1 FROM information_schema.columns
+		              WHERE table_name='jobs' AND column_name='alert_group_id') THEN
+			ALTER TABLE jobs ADD COLUMN alert_group_id TEXT;
+		END IF;
+
+		-- 9b. Filling alert_group_id and keeping one escalation row per group
+		-- used to happen here, around a unique index this block dropped and
+		-- recreated on every start. Both moved into the one-shot job dedup
+		-- migration: recreating that index after the model exists would put
+		-- back the rule the model replaced.
+	END $$;
+	`
+
 func (s *Store) InitDB() error {
 	// PostgreSQL Schema for Phase 2 - Create tables FIRST
 	query := `
@@ -350,77 +439,7 @@ func (s *Store) InitDB() error {
 
 	// Migration Phase: Rename legacy columns/tables if they exist
 	// This runs AFTER table creation to handle upgrades from older schemas
-	migrationQuery := `
-	DO $$
-	BEGIN
-		-- 1. Rename incident_id to alert_group_id in timeline_events (legacy migration)
-		IF EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='timeline_events' AND column_name='incident_id') THEN
-			ALTER TABLE timeline_events RENAME COLUMN incident_id TO alert_group_id;
-		END IF;
-        
-        -- 3. Add external_url column if not exists (for clickable Alertmanager links)
-        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='external_url') THEN
-            ALTER TABLE alert_groups ADD COLUMN external_url TEXT;
-        END IF;
-        
-        -- 4. Add notification_states column if not exists (for per-target retry tracking)
-        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='notification_states') THEN
-            ALTER TABLE alert_groups ADD COLUMN notification_states TEXT;
-        END IF;
-        
-        -- 5. Add auth_provider column to users table if not exists (OIDC support)
-        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='auth_provider') THEN
-            ALTER TABLE users ADD COLUMN auth_provider TEXT;
-        END IF;
-
-		-- 6. Add FK for notification_deliveries.job_step_id if missing
-		IF NOT EXISTS(
-			SELECT 1 FROM information_schema.table_constraints
-			WHERE table_name = 'notification_deliveries'
-			  AND constraint_name = 'notification_deliveries_job_step_id_fkey'
-		) THEN
-			ALTER TABLE notification_deliveries
-			ADD CONSTRAINT notification_deliveries_job_step_id_fkey
-			FOREIGN KEY (job_step_id) REFERENCES job_steps(id) ON DELETE SET NULL;
-		END IF;
-
-		-- 7. Add resolved_by column
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='resolved_by') THEN
-			ALTER TABLE alert_groups ADD COLUMN resolved_by TEXT;
-		END IF;
-
-		-- 8. Add ack_processed_at column for tracking when ack update was processed
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='ack_processed_at') THEN
-			ALTER TABLE alert_groups ADD COLUMN ack_processed_at TIMESTAMPTZ;
-		END IF;
-
-		-- 8. Add slack_update_pending flag for tracking when Slack messages need updating
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_pending') THEN
-			ALTER TABLE alert_groups ADD COLUMN slack_update_pending BOOLEAN NOT NULL DEFAULT FALSE;
-		END IF;
-
-		-- 8. The version of the flag above. Raising the flag increments it, and
-		-- the producer clears the flag only for the version it read, so an
-		-- alert that arrives while the update job is being created keeps the
-		-- flag up instead of being cleared away with it.
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_generation') THEN
-			ALTER TABLE alert_groups ADD COLUMN slack_update_generation BIGINT NOT NULL DEFAULT 0;
-		END IF;
-
-		-- 9. Add alert_group_id column to jobs table
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns
-		              WHERE table_name='jobs' AND column_name='alert_group_id') THEN
-			ALTER TABLE jobs ADD COLUMN alert_group_id TEXT;
-		END IF;
-
-		-- 9b. Filling alert_group_id and keeping one escalation row per group
-		-- used to happen here, around a unique index this block dropped and
-		-- recreated on every start. Both moved into the one-shot job dedup
-		-- migration: recreating that index after the model exists would put
-		-- back the rule the model replaced.
-	END $$;
-	`
-	if _, err := s.db.Exec(migrationQuery); err != nil {
+	if _, err := s.db.Exec(legacyColumnMigrationsDDL); err != nil {
 		return err
 	}
 
@@ -957,7 +976,7 @@ func (s *Store) InitDB() error {
 const alertGroupColumns = `id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step,
 	external_url, alerts_data, policy_snapshot, oncall_snapshot,
 	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, ack_processed_at,
-	slack_update_pending, slack_update_generation`
+	slack_update_pending, render_source_version`
 
 // alertGroupScanner is an interface for scanning rows (works with *sql.Row and *sql.Rows).
 type alertGroupScanner interface {
@@ -978,7 +997,7 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 		&externalURL, &alertsData,
 		&policySnapshot, &oncallSnapshot,
 		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt, &acknowledgedBy, &resolvedBy, &ackProcessedAt,
-		&ag.SlackUpdatePending, &ag.SlackUpdateGeneration,
+		&ag.SlackUpdatePending, &ag.RenderSourceVersion,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -1003,9 +1022,18 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 		ag.AckProcessedAt = &ackProcessedAt.Time
 	}
 
-	// Unmarshal JSON fields
+	// The alerts ARE the alert group: they are what a message about it says,
+	// and what an escalation is planned from. A row whose alerts cannot be read
+	// is refused rather than returned as a group with none - swallowed, the
+	// producer would freeze a snapshot describing an alert with nothing wrong
+	// with it, once, for every message of that escalation.
+	//
+	// The two snapshots below are annotations about the group rather than the
+	// group, and a damaged one must not hide the alert it is attached to.
 	if alertsData.Valid && alertsData.String != "" {
-		_ = json.Unmarshal([]byte(alertsData.String), &ag.Alerts)
+		if err := json.Unmarshal([]byte(alertsData.String), &ag.Alerts); err != nil {
+			return nil, fmt.Errorf("read the alerts of group %s: %w", ag.ID, err)
+		}
 	}
 	if policySnapshot.Valid && policySnapshot.String != "" {
 		_ = json.Unmarshal([]byte(policySnapshot.String), &ag.PolicySnapshot)
@@ -1125,7 +1153,9 @@ func (s *Store) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*m
 func (s *Store) TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error) {
 	now := time.Now()
 	res, err := s.db.Exec(
-		`UPDATE alert_groups SET status = $1, updated_at = $2 WHERE id = $3 AND status = $4`,
+		`UPDATE alert_groups SET status = $1, updated_at = $2,
+		        render_source_version = render_source_version + 1
+		 WHERE id = $3 AND status = $4`,
 		toStatus, now, id, fromStatus,
 	)
 	if err != nil {
@@ -1212,7 +1242,8 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	// 1. Conditional UPDATE — from 'processing' or 'triggered' (single-winner semantics)
 	res, err := tx.Exec(
 		`UPDATE alert_groups
-		 SET status = $1, acknowledged_by = $2, ack_processed_at = NULL, updated_at = $3
+		 SET status = $1, acknowledged_by = $2, ack_processed_at = NULL, updated_at = $3,
+		     render_source_version = render_source_version + 1
 		 WHERE id = $4 AND status IN ($5, $6)`,
 		model.AlertGroupStatusAcknowledged, actor, now, id,
 		model.AlertGroupStatusProcessing, model.AlertGroupStatusTriggered,
@@ -1283,7 +1314,8 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	// 1. Conditional UPDATE — from 'processing', 'triggered', or 'acknowledged'
 	res, err := tx.Exec(
 		`UPDATE alert_groups
-		 SET status = $1, resolved_at = $2, resolved_by = $3, updated_at = $2
+		 SET status = $1, resolved_at = $2, resolved_by = $3, updated_at = $2,
+		     render_source_version = render_source_version + 1
 		 WHERE id = $4 AND status IN ($5, $6, $7)`,
 		model.AlertGroupStatusResolved, now, actor, id,
 		model.AlertGroupStatusProcessing, model.AlertGroupStatusTriggered, model.AlertGroupStatusAcknowledged,
@@ -1355,7 +1387,8 @@ func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Aler
 	// 1. Conditional UPDATE — alerts_data + status + resolved fields
 	res, err := tx.Exec(
 		`UPDATE alert_groups
-		 SET alerts_data = $1, status = $2, resolved_by = 'system', resolved_at = $3, updated_at = $3
+		 SET alerts_data = $1, status = $2, resolved_by = 'system', resolved_at = $3, updated_at = $3,
+		     render_source_version = render_source_version + 1
 		 WHERE id = $4 AND status IN ($5, $6, $7, $8)`,
 		string(alertsJSON), model.AlertGroupStatusResolved, now, id,
 		model.AlertGroupStatusNew, model.AlertGroupStatusProcessing,
@@ -1697,7 +1730,9 @@ func scanNotificationDelivery(scanner notificationDeliveryScanner) (*model.Notif
 
 func (s *Store) UpdateAlertGroupAlerts(id string, alerts []model.Alert) error {
 	data, _ := json.Marshal(alerts)
-	query := `UPDATE alert_groups SET alerts_data = $1, updated_at = $2 WHERE id = $3`
+	query := `UPDATE alert_groups SET alerts_data = $1, updated_at = $2,
+	                 render_source_version = render_source_version + 1
+	          WHERE id = $3`
 	_, err := s.db.Exec(query, string(data), time.Now(), id)
 	return err
 }
@@ -1796,7 +1831,7 @@ func (s *Store) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []mo
 		UPDATE alert_groups
 		   SET alerts_data = $1,
 		       slack_update_pending = TRUE,
-		       slack_update_generation = slack_update_generation + 1,
+		       render_source_version = render_source_version + 1,
 		       updated_at = $2
 		 WHERE id = $3
 	`, string(data), time.Now(), id)
@@ -1823,12 +1858,17 @@ func (s *Store) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []mo
 // setter with a boolean - throws that alert away, and the message never shows
 // it. A false answer is not a failure: it means the work has to be done again,
 // and the next tick does it.
-func (s *Store) ClearSlackUpdate(id string, observedGeneration int64) (bool, error) {
+//
+// The version is the group's render source version, so anything that changes
+// what a message would say fails this clear, not only the alerts that raise the
+// flag. A group acknowledged mid-build therefore costs one extra update, which
+// is the direction to be wrong in: the card is redrawn from what is now there.
+func (s *Store) ClearSlackUpdate(id string, observedVersion int64) (bool, error) {
 	res, err := s.db.Exec(`
 		UPDATE alert_groups
 		   SET slack_update_pending = FALSE, updated_at = $1
-		 WHERE id = $2 AND slack_update_generation = $3
-	`, time.Now(), id, observedGeneration)
+		 WHERE id = $2 AND render_source_version = $3
+	`, time.Now(), id, observedVersion)
 	if err != nil {
 		return false, err
 	}

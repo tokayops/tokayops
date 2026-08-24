@@ -96,10 +96,13 @@ func TestProcessNewAlertGroups(t *testing.T) {
 	}
 }
 
-func TestResolvePolicy(t *testing.T) {
+// TestTheTeamDecidesTheRouting drives the routing through the path production
+// uses - the plan - rather than through a helper beside it. The routing and
+// whether the team is set up here come out of ONE read of the team, and a test
+// that called the helper directly would not notice if they stopped doing so.
+func TestTheTeamDecidesTheRouting(t *testing.T) {
 	s := store.NewMockStore()
 
-	// Create teams in Store
 	s.CreateTeam(&model.Team{
 		ID:              "devops",
 		Name:            "DevOps",
@@ -113,49 +116,47 @@ func TestResolvePolicy(t *testing.T) {
 		Name:            "Triage",
 		DefaultPolicyID: "triage_policy",
 	})
+	for _, id := range []string{"critical_policy", "default_policy", "triage_policy"} {
+		s.CreateEscalationPolicy(&model.EscalationPolicy{ID: id, Name: id})
+	}
 
-	e := &Engine{store: s}
+	plan := &planner{store: s, oncall: &fakeProjection{}, settings: &fakeSettings{},
+		cfg: &config.Config{}}
 
 	tests := []struct {
-		name     string
-		team     string
-		severity string
-		want     string
+		name      string
+		team      string
+		severity  string
+		want      string
+		onboarded bool
 	}{
-		{
-			name:     "Direct Match",
-			team:     "devops",
-			severity: "critical",
-			want:     "critical_policy",
-		},
-		{
-			name:     "Fallback to Default Route",
-			team:     "devops",
-			severity: "unknown",
-			want:     "default_policy",
-		},
-		{
-			name:     "Triage Default",
-			team:     "triage",
-			severity: "info",
-			want:     "triage_policy",
-		},
-		{
-			name:     "Team Not Found",
-			team:     "missing_team",
-			severity: "critical",
-			want:     "", // No team = no policy
-		},
+		{"the severity has its own route", "devops", "critical", "critical_policy", true},
+		{"the severity falls back to the default", "devops", "unknown", "default_policy", true},
+		{"a team with no routes uses its default", "triage", "info", "triage_policy", true},
+		{"a team nobody set up escalates by nothing", "missing_team", "critical", "", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := e.resolvePolicy(tt.team, tt.severity); got != tt.want {
-				t.Errorf("resolvePolicy() = %v, want %v", got, tt.want)
+			admission, err := plan.buildPlan(context.Background(), &model.AlertGroup{
+				ID: "ag-" + tt.team, AlertKey: "dk-" + tt.team,
+				Status: model.AlertGroupStatusNew, TeamID: tt.team,
+				Severity: tt.severity, Title: "Disk filling up",
+			}, schedulerender.TeamOnCallResult{})
+			if err != nil {
+				t.Fatalf("build the plan: %v", err)
+			}
+
+			if admission.PolicyID != tt.want {
+				t.Errorf("the alert escalates by %q, want %q", admission.PolicyID, tt.want)
+			}
+			// From the same read: a team that answered the routing also answers
+			// whether its people can act on the card.
+			if got := admission.Admission.Snapshot.Content().TeamOnboarded; got != tt.onboarded {
+				t.Errorf("the card says team_onboarded=%v", got)
 			}
 		})
 	}
-
 }
 
 func TestPolicySnapshot_Versioning(t *testing.T) {

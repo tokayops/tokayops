@@ -31,7 +31,7 @@ type StoreInterface interface {
 	// for one version, which is how a producer avoids clearing away a change
 	// that arrived while it worked.
 	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
-	ClearSlackUpdate(id string, observedGeneration int64) (bool, error)
+	ClearSlackUpdate(id string, observedVersion int64) (bool, error)
 	GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error)
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
 	GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset int) ([]*model.AlertGroup, int, error)

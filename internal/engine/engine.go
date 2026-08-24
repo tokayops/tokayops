@@ -111,9 +111,9 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 
 	// The tick names the batch before it touches it, because every other line
 	// below is written after the work it describes. Without this one, a hang or
-	// a panic - in resolvePolicy, which reads the database without a context at
-	// all, or anywhere inside Build - leaves nothing at all to go on, and a
-	// poison group in a crash loop cannot be narrowed down.
+	// a panic - anywhere inside the plan, which reads the team, the policy and
+	// the schedule - leaves nothing at all to go on, and a poison group in a
+	// crash loop cannot be narrowed down.
 	//
 	// One line per tick rather than one per group: a group that cannot be built
 	// is back in the next tick's batch, so anything written per group is written
@@ -138,9 +138,6 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 	var deferredErr error
 
 	for _, ag := range alertGroups {
-		// Resolve Policy (may be empty - that's OK for firehose-only)
-		policyID := e.resolvePolicy(ag.TeamID, ag.Severity)
-
 		// Who is on duty is read ONCE per alert group, and the same answer both
 		// escalates and is recorded. Reading it again for the snapshot would put
 		// a handoff or a save between the two, and the alert group would then
@@ -154,7 +151,7 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 
 		// What this alert promises, and to whom: the state every message will
 		// be rendered from, and one commitment per recipient.
-		admission, err := e.plan.buildPlan(ctx, ag, policyID, teamOnCall)
+		admission, err := e.plan.buildPlan(ctx, ag, teamOnCall)
 
 		// The recipients could not be resolved, so no job is committed and the
 		// alert group stays "new" for the next tick to try again. Committing
@@ -253,23 +250,4 @@ func alertGroupIDs(ags []*model.AlertGroup) string {
 		b.WriteString(ag.ID)
 	}
 	return b.String()
-}
-
-func (e *Engine) resolvePolicy(teamID, severity string) string {
-	// Try to get team from Store
-	team, err := e.store.GetTeamByID(teamID)
-	if err != nil {
-		log.Printf("AlertEngine: Team '%s' not found: %v", teamID, err)
-		return ""
-	}
-
-	// Check severity-specific route
-	if team.SeverityRoutes != nil {
-		if policyID, ok := team.SeverityRoutes[severity]; ok && policyID != "" {
-			return policyID
-		}
-	}
-
-	// Fall back to default policy
-	return team.DefaultPolicyID
 }

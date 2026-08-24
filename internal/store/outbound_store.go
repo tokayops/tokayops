@@ -94,13 +94,35 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 	var version int64
 	var now time.Time
 	err = tx.QueryRowContext(ctx,
-		`SELECT status, slack_update_generation, now() FROM alert_groups WHERE id = $1 FOR UPDATE`,
+		`SELECT status, render_source_version, now() FROM alert_groups WHERE id = $1 FOR UPDATE`,
 		admission.AlertGroupID).Scan(&status, &version, &now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return outbound.SubmitResult{}, fmt.Errorf("alert group %s not found", admission.AlertGroupID)
 	}
 	if err != nil {
 		return outbound.SubmitResult{}, fmt.Errorf("lock alert group %s: %w", admission.AlertGroupID, err)
+	}
+
+	// What is already claimed answers first, and answers alone.
+	//
+	// Everything below this is a question about admitting NEW work: is the
+	// group still waiting, is the plan still current, is the deadline still
+	// ahead. None of them is a question about work that was accepted minutes
+	// ago - and a producer retrying after a lost reply is asking exactly that.
+	// Asked in the wrong order, the same admission stops being idempotent the
+	// moment the world moves: an expired deadline, an alert that joined, a user
+	// who acknowledged, and the repeat comes back "not admissible" over
+	// commitments that exist and are being delivered.
+	//
+	// The group is locked above, and every admission for it takes that lock
+	// first, so this read is the whole truth about the claim (D2/D3).
+	if held, found, err := existingAdmission(ctx, tx, admission); err != nil {
+		return outbound.SubmitResult{}, err
+	} else if found {
+		if err := tx.Commit(); err != nil {
+			return outbound.SubmitResult{}, err
+		}
+		return held, nil
 	}
 
 	if err := outbound.ValidateEscalationAdmission(admission, now); err != nil {
@@ -232,6 +254,24 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 func lostAdmission(ctx context.Context, tx *sql.Tx,
 	admission keys.Admission) (outbound.SubmitResult, error) {
 
+	result, found, err := existingAdmission(ctx, tx, admission)
+	if err != nil {
+		return outbound.SubmitResult{}, err
+	}
+	if !found {
+		// The insert said the claim was taken and the read says it is not. The
+		// group is locked, so nothing may have deleted it in between.
+		return outbound.SubmitResult{}, outboundContractf(
+			"admission %s was refused as taken and is not there", admission.BatchKey)
+	}
+	return result, nil
+}
+
+// existingAdmission is what is already claimed under this batch key, if
+// anything: the same work, or different work under the same claim.
+func existingAdmission(ctx context.Context, tx *sql.Tx,
+	admission keys.Admission) (outbound.SubmitResult, bool, error) {
+
 	var existingID string
 	var existingFingerprint []byte
 	var existingVersion int
@@ -239,29 +279,32 @@ func lostAdmission(ctx context.Context, tx *sql.Tx,
 		SELECT id, fingerprint, fingerprint_version
 		FROM outbound_batches WHERE batch_key = $1`, admission.BatchKey).
 		Scan(&existingID, &existingFingerprint, &existingVersion)
+	if errors.Is(err, sql.ErrNoRows) {
+		return outbound.SubmitResult{}, false, nil
+	}
 	if err != nil {
-		return outbound.SubmitResult{}, fmt.Errorf("read the winning admission: %w", err)
+		return outbound.SubmitResult{}, false, fmt.Errorf("read the winning admission: %w", err)
 	}
 
 	if existingVersion != admission.FingerprintVersion {
 		// The stored row was written by another protocol version. Comparing
 		// digests across protocols would answer a question neither of them
 		// asked, so the comparison is refused rather than guessed at.
-		return outbound.SubmitResult{}, outboundContractf(
+		return outbound.SubmitResult{}, false, outboundContractf(
 			"admission %s was fingerprinted under version %d, this build compares under %d",
 			admission.BatchKey, existingVersion, admission.FingerprintVersion)
 	}
 
 	ids, err := intentIDsOfBatch(ctx, tx, existingID)
 	if err != nil {
-		return outbound.SubmitResult{}, err
+		return outbound.SubmitResult{}, false, err
 	}
 
 	outcome := outbound.SubmitConflict
 	if bytes.Equal(existingFingerprint, admission.Fingerprint) {
 		outcome = outbound.SubmitExisting
 	}
-	return outbound.SubmitResult{Outcome: outcome, BatchID: existingID, IntentIDs: ids}, nil
+	return outbound.SubmitResult{Outcome: outcome, BatchID: existingID, IntentIDs: ids}, true, nil
 }
 
 // insertCommitmentsTx writes the commitments in key order.
@@ -740,7 +783,9 @@ func groupEffectsTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
 		// send was in flight has already moved the group, and a delivery must
 		// not move it back.
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE alert_groups SET status = $2, updated_at = now()
+			UPDATE alert_groups
+			SET status = $2, updated_at = now(),
+			    render_source_version = render_source_version + 1
 			WHERE id = $1 AND status = $3`,
 			alertGroupID, model.AlertGroupStatusTriggered, model.AlertGroupStatusProcessing,
 		); err != nil {

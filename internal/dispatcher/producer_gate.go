@@ -82,11 +82,17 @@ func (d *Dispatcher) resolutionGate() jobGate {
 // alertUpdateGate is `slack_update_pending`, and it is the one gate that
 // carries a version, because it is the one whose event repeats: every alert
 // that changes the group raises it again.
+//
+// The version it carries is the group's render source version, which moves for
+// any change to what a message would say - not only for the alerts that raise
+// this flag. So a group acknowledged while the update job was being built also
+// fails to clear, and the update is built once more. That is the safe direction:
+// the card is redrawn from state that has since changed.
 func (d *Dispatcher) alertUpdateGate() jobGate {
 	return jobGate{
 		family: "alert update",
 		down: func(ag *model.AlertGroup) (bool, error) {
-			return d.store.ClearSlackUpdate(ag.ID, ag.SlackUpdateGeneration)
+			return d.store.ClearSlackUpdate(ag.ID, ag.RenderSourceVersion)
 		},
 		lowerOnDuplicate: false,
 	}

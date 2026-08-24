@@ -89,13 +89,13 @@ func TestEscalationSourcesReadTheWholeAlert(t *testing.T) {
 
 	var version int64
 	if err := s.db.QueryRow(
-		`SELECT slack_update_generation FROM alert_groups WHERE id = $1`, agID).
+		`SELECT render_source_version FROM alert_groups WHERE id = $1`, agID).
 		Scan(&version); err != nil {
 		t.Fatalf("read the version: %v", err)
 	}
-	if source.SlackUpdateGeneration != version {
+	if source.RenderSourceVersion != version {
 		t.Errorf("the projection says version %d, the group is at %d",
-			source.SlackUpdateGeneration, version)
+			source.RenderSourceVersion, version)
 	}
 	if version == 0 {
 		t.Error("the fixture did not move the version, so the check above proves nothing")
@@ -171,12 +171,103 @@ func TestSubmitAnswersTheUserBeforeTheVersion(t *testing.T) {
 
 	if _, err := s.db.ExecContext(ctx, `
 		UPDATE alert_groups
-		SET status = $1, slack_update_generation = slack_update_generation + 1
+		SET status = $1, render_source_version = render_source_version + 1
 		WHERE id = $2`, model.AlertGroupStatusAcknowledged, agID); err != nil {
 		t.Fatalf("acknowledge the group: %v", err)
 	}
 
 	if got := mustSubmit(t, s, adm).Outcome; got != outbound.SubmitGroupNotAdmitted {
 		t.Fatalf("an acknowledged group whose version also moved answered %q", got)
+	}
+}
+
+// TestAnUnreadableAlertIsNotAnAlertWithNothingWrong. The alerts are what a
+// message about the group says and what the escalation is planned from. Read as
+// "no alerts", a damaged row would be frozen into a snapshot describing an
+// alert with nothing firing - once, for every message of that escalation, with
+// no revision that ever corrects it.
+func TestAnUnreadableAlertIsNotAnAlertWithNothingWrong(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	agID := uuid.New().String()
+	if err := s.CreateAlertGroup(&model.AlertGroup{
+		ID: agID, AlertKey: "damaged-" + agID, Status: model.AlertGroupStatusNew,
+		Title: "Disk filling up", Severity: "critical",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("create the alert group: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE alert_groups SET alerts_data = 'not json at all' WHERE id = $1`,
+		agID); err != nil {
+		t.Fatalf("damage the alerts: %v", err)
+	}
+
+	if _, err := s.GetEscalationSources(ctx); err == nil {
+		t.Fatal("a group whose alerts cannot be read was returned as one with none")
+	}
+}
+
+// TestTheVersionColumnKeepsItsValuesWhenRenamed. The column was called
+// slack_update_generation, which was one of its two jobs under the name of a
+// loop that is on its way out. A database that predates the rename must arrive
+// at the new name with the same numbers in it: added instead of renamed, every
+// group would come back at version zero and every plan built against a real
+// version would be refused as stale, forever.
+func TestTheVersionColumnKeepsItsValuesWhenRenamed(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	agID := uuid.New().String()
+	if err := s.CreateAlertGroup(&model.AlertGroup{
+		ID: agID, AlertKey: "renamed-" + agID, Status: model.AlertGroupStatusNew,
+		Title: "Disk filling up", Severity: "critical",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("create the alert group: %v", err)
+	}
+
+	// An older database: the column under its old name, with a group that has
+	// been updated four times.
+	if _, err := s.db.ExecContext(ctx,
+		`ALTER TABLE alert_groups RENAME COLUMN render_source_version TO slack_update_generation`,
+	); err != nil {
+		t.Fatalf("build the old schema: %v", err)
+	}
+	t.Cleanup(func() {
+		// Whatever this test proves, the suite continues against the new name.
+		_, _ = s.db.Exec(legacyColumnMigrationsDDL)
+	})
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE alert_groups SET slack_update_generation = 4 WHERE id = $1`, agID); err != nil {
+		t.Fatalf("seed the old version: %v", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx, legacyColumnMigrationsDDL); err != nil {
+		t.Fatalf("run the migrations: %v", err)
+	}
+
+	var version int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT render_source_version FROM alert_groups WHERE id = $1`, agID).
+		Scan(&version); err != nil {
+		t.Fatalf("read the version under its new name: %v", err)
+	}
+	if version != 4 {
+		t.Fatalf("the group came out of the migration at version %d, want 4", version)
+	}
+
+	// And running it again changes nothing, which is what every start does.
+	if _, err := s.db.ExecContext(ctx, legacyColumnMigrationsDDL); err != nil {
+		t.Fatalf("run the migrations again: %v", err)
+	}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT render_source_version FROM alert_groups WHERE id = $1`, agID).
+		Scan(&version); err != nil {
+		t.Fatalf("read the version again: %v", err)
+	}
+	if version != 4 {
+		t.Fatalf("a second run left the group at version %d", version)
 	}
 }

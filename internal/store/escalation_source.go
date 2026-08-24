@@ -27,7 +27,7 @@ import (
 
 // GetEscalationSources returns the alert groups nobody has been paged for, each
 // with the alerts and the history a card is drawn from, and the version they
-// were read at (AlertGroup.SlackUpdateGeneration).
+// were read at (AlertGroup.RenderSourceVersion).
 //
 // Read-only and repeatable read. Read-only because it is: the isolation level
 // is what this is for, and saying so lets Postgres treat it as such. Repeatable

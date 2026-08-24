@@ -80,15 +80,38 @@ type AlertGroup struct {
 	// Slack Update Tracking
 	SlackUpdatePending bool `json:"slack_update_pending,omitempty"` // Set when alerts change; cleared after Slack update job created
 
-	// SlackUpdateGeneration counts the times the flag above was raised, and is
-	// what lets the producer lower it without losing an alert that arrived
-	// while it worked: it clears the flag only if the generation it read is
-	// still the current one.
+	// RenderSourceVersion is the version of the state a message about this
+	// alert is drawn from. Every write that changes what such a message would
+	// say increments it.
 	//
-	// Not part of the group as the API presents it - it is the token of an
-	// internal gate, and a reader outside this repository can do nothing with
-	// it but be confused.
-	SlackUpdateGeneration int64 `json:"-"`
+	// Two things read it, and it is named after neither. A producer that froze
+	// a snapshot hands the version back when it admits the escalation, and the
+	// admission refuses a plan built from state that has moved since - the
+	// snapshot is what every message renders from for as long as the
+	// escalation lives, so a plan built a moment too early would page about a
+	// state the alert is no longer in. The flag above uses it as its token: the
+	// producer clears the flag only if the version it read is still current,
+	// which is how an alert arriving mid-build keeps the flag up.
+	//
+	// It moves when the ALERT changes - its alerts, its status, who
+	// acknowledged or resolved it - and two things are deliberately left out,
+	// for the same reason: a version moved by the act of recording work would
+	// leave nothing ever current.
+	//
+	// The history, although a card shows it: deliveries write history, so a
+	// line moving the version would make every update invalidate the state it
+	// was drawn from and the flag above would never come down. And the write
+	// that admits an escalation, which moves the group to "processing": it is
+	// not news about the alert, and a snapshot stale the moment it was accepted
+	// is no snapshot at all.
+	//
+	// A card can be one line of history behind the audit. It cannot be about
+	// the wrong alert.
+	//
+	// Not part of the group as the API presents it - it is an internal token,
+	// and a reader outside this repository can do nothing with it but be
+	// confused.
+	RenderSourceVersion int64 `json:"-"`
 
 	// External Link to Alertmanager Source (for clickable titles)
 	ExternalURL string `json:"external_url,omitempty"`

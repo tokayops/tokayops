@@ -213,7 +213,9 @@ func (s *Store) EnsureEscalationJob(agID string, job *model.Job, stages []*model
 
 	// 3. Transition to processing (or touch updated_at if already processing)
 	now := time.Now()
-	_, err = tx.Exec(`UPDATE alert_groups SET status = $1, updated_at = $2 WHERE id = $3`,
+	_, err = tx.Exec(`UPDATE alert_groups SET status = $1, updated_at = $2,
+	                         render_source_version = render_source_version + 1
+	                  WHERE id = $3`,
 		model.AlertGroupStatusProcessing, now, agID)
 	if err != nil {
 		return false, fmt.Errorf("failed to update AG status: %w", err)

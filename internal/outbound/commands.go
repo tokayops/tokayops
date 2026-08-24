@@ -35,24 +35,20 @@ type EscalationAdmission struct {
 	//
 	// The snapshot is the state EVERY message of this escalation is rendered
 	// from, for as long as the escalation lives. Between reading the group and
-	// admitting the plan, an alert can join the group, or resolve, or somebody
-	// can add a line to its history - and the plan would then page about a
-	// state the alert is no longer in, with no revision that ever corrects it.
+	// admitting the plan, an alert can join it or a user can resolve it - and
+	// the plan would then page about a state the alert is no longer in, with no
+	// revision that ever corrects it.
 	//
 	// So it is checked again under the lock that decides the admission. A
 	// version that has moved is not an error and not a conflict: it is a plan
 	// built a moment too early, refused whole, with the group left for the next
 	// tick to plan again from what is now there.
 	//
-	// Zero is a version, not "unset": a group nothing has updated is at zero,
+	// Zero is a version, not "unset": a group nothing has changed is at zero,
 	// and it is compared like any other.
 	//
-	// What it covers is what moves the version: the alerts in the group, and
-	// the status the group is in - the latter answered separately, and first,
-	// because a user who acknowledged is not a plan to rebuild. A line added to
-	// the history moves neither, so a card can freeze a history one line behind
-	// the audit. That is a card missing a line, not an escalation aimed at the
-	// wrong people, and it is the difference the version is scoped to.
+	// What moves it, and the two things deliberately left out, are the store's
+	// to say: see model.AlertGroup.RenderSourceVersion.
 	SourceVersion int64
 
 	// OnCallSnapshot is who was on duty when this alert arrived, recorded on

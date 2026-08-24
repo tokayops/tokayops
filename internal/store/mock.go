@@ -272,6 +272,7 @@ func (m *MockStore) UpdateAlertGroupAlerts(id string, alerts []model.Alert) erro
 		ag.Alerts = make([]model.Alert, len(alerts))
 		copy(ag.Alerts, alerts)
 		ag.UpdatedAt = time.Now()
+		ag.RenderSourceVersion++
 		return nil
 	}
 	return sql.ErrNoRows
@@ -692,6 +693,7 @@ func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string
 	ag.AcknowledgedBy = actor
 	ag.AckProcessedAt = nil
 	ag.UpdatedAt = now
+	ag.RenderSourceVersion++
 
 	// Add timeline event atomically (under same lock)
 	event := &model.TimelineEvent{
@@ -730,6 +732,7 @@ func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]st
 	ag.ResolvedBy = actor
 	ag.ResolvedAt = &now
 	ag.UpdatedAt = now
+	ag.RenderSourceVersion++
 
 	// Add timeline event atomically (under same lock)
 	event := &model.TimelineEvent{
@@ -772,6 +775,7 @@ func (m *MockStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.
 	ag.ResolvedBy = "system"
 	ag.ResolvedAt = &now
 	ag.UpdatedAt = now
+	ag.RenderSourceVersion++
 
 	for _, e := range timelineEvents {
 		eventCopy := *e
@@ -839,6 +843,7 @@ func (m *MockStore) TransitionAlertGroupStatus(id string, fromStatus, toStatus m
 
 	ag.Status = toStatus
 	ag.UpdatedAt = time.Now()
+	ag.RenderSourceVersion++
 	return true, nil
 }
 
@@ -868,14 +873,14 @@ func (m *MockStore) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts 
 	}
 	ag.Alerts = append([]model.Alert(nil), alerts...)
 	ag.SlackUpdatePending = true
-	ag.SlackUpdateGeneration++
+	ag.RenderSourceVersion++
 	ag.UpdatedAt = time.Now()
 	return nil
 }
 
 // ClearSlackUpdate mirrors the store's conditional clear, including the answer
 // it gives when a newer raise has overtaken the caller.
-func (m *MockStore) ClearSlackUpdate(id string, observedGeneration int64) (bool, error) {
+func (m *MockStore) ClearSlackUpdate(id string, observedVersion int64) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -885,7 +890,7 @@ func (m *MockStore) ClearSlackUpdate(id string, observedGeneration int64) (bool,
 		// not an error either implementation reports.
 		return false, nil
 	}
-	if ag.SlackUpdateGeneration != observedGeneration {
+	if ag.RenderSourceVersion != observedVersion {
 		return false, nil
 	}
 	ag.SlackUpdatePending = false
@@ -3024,24 +3029,46 @@ func (m *MockStore) SubmitEscalationBatch(ctx context.Context,
 	if !ok {
 		return outbound.SubmitResult{}, fmt.Errorf("alert group %s not found", admission.AlertGroupID)
 	}
-	if ag.Status != model.AlertGroupStatusNew && ag.Status != model.AlertGroupStatusProcessing {
-		return outbound.SubmitResult{Outcome: outbound.SubmitGroupNotAdmitted}, nil
-	}
 
 	if m.admissions == nil {
 		m.admissions = map[string]*admittedBatch{}
 	}
+
+	// The order below is the contract, not an implementation detail, so it is
+	// the same order the real store uses.
+	//
+	// What is already claimed answers first. A producer retrying after a lost
+	// reply is asking whether its work was accepted, and that answer was
+	// written before any of the guards below became true - asked in the wrong
+	// order, an acknowledged group or an alert that has since moved turns a
+	// repeat into a refusal over commitments that exist.
 	if held, ok := m.admissions[admission.BatchKey]; ok {
 		// The same claim, held by somebody. Whether it is the same work is what
 		// the fingerprint says, and the answer differs: one is "already done",
 		// the other is "somebody promised something else for this group".
 		if !bytes.Equal(held.Admission.Admission.Fingerprint, admission.Fingerprint) {
-			return outbound.SubmitResult{Outcome: outbound.SubmitConflict}, nil
+			return outbound.SubmitResult{
+				Outcome: outbound.SubmitConflict, BatchID: held.Admission.Admission.BatchKey,
+				IntentIDs: held.IntentIDs,
+			}, nil
 		}
 		return outbound.SubmitResult{
 			Outcome: outbound.SubmitExisting, BatchID: held.Admission.Admission.BatchKey,
 			IntentIDs: held.IntentIDs,
 		}, nil
+	}
+
+	// The user is ahead of us: they acknowledged or resolved before this
+	// escalation was admitted.
+	if ag.Status != model.AlertGroupStatusNew && ag.Status != model.AlertGroupStatusProcessing {
+		return outbound.SubmitResult{Outcome: outbound.SubmitGroupNotAdmitted}, nil
+	}
+
+	// The alert moved after the producer read it, so the snapshot describes a
+	// state it is no longer in. Nothing is claimed and the next tick plans it
+	// again.
+	if adm.SourceVersion != ag.RenderSourceVersion {
+		return outbound.SubmitResult{Outcome: outbound.SubmitSourceChanged}, nil
 	}
 
 	batch := &admittedBatch{Admission: adm}

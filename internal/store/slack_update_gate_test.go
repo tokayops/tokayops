@@ -113,7 +113,7 @@ func runSlackUpdateGateCases(t *testing.T, newStore func(t *testing.T) slackUpda
 				raise(t, s, id, "alert-a", "alert-b")
 			}
 
-			cleared, err := s.ClearSlackUpdate(id, read.SlackUpdateGeneration)
+			cleared, err := s.ClearSlackUpdate(id, read.RenderSourceVersion)
 			if err != nil {
 				t.Fatalf("ClearSlackUpdate: %v", err)
 			}
@@ -178,7 +178,7 @@ func TestSlackUpdateGateMovesWithTheAlerts(t *testing.T) {
 			if !ag.SlackUpdatePending {
 				t.Error("the alerts were recorded with the gate down")
 			}
-			if ag.SlackUpdateGeneration == 0 {
+			if ag.RenderSourceVersion == 0 {
 				t.Error("the version did not move with the alerts")
 			}
 		})
@@ -252,7 +252,7 @@ func TestSlackUpdateGateIsMonotonic(t *testing.T) {
 				if err != nil {
 					t.Fatalf("GetAlertGroupByID: %v", err)
 				}
-				seen = append(seen, ag.SlackUpdateGeneration)
+				seen = append(seen, ag.RenderSourceVersion)
 			}
 
 			for i := 1; i < len(seen); i++ {
@@ -270,9 +270,9 @@ func TestSlackUpdateGateIsMonotonic(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GetAlertGroupByID: %v", err)
 			}
-			if ag.SlackUpdateGeneration != seen[len(seen)-1] {
+			if ag.RenderSourceVersion != seen[len(seen)-1] {
 				t.Errorf("generation = %d after a clear, want it untouched at %d",
-					ag.SlackUpdateGeneration, seen[len(seen)-1])
+					ag.RenderSourceVersion, seen[len(seen)-1])
 			}
 		})
 	}

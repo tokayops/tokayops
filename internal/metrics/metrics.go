@@ -93,8 +93,8 @@ var (
 	})
 
 	// EngineEscalationSourceChangedTotal counts plans refused because the alert
-	// moved while they were being built - an alert joined the group, or its
-	// history grew, between the read and the admission. The group is not
+	// moved while they were being built - an alert joined the group, or a user
+	// acknowledged it, between the read and the admission. The group is not
 	// claimed and the next tick plans it again from what is now there.
 	//
 	// A few of these under a storm are the design working. A rate that stays
