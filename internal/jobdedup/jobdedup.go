@@ -49,9 +49,15 @@ const (
 	// It is NOT a start-up guard. Nothing refuses to serve a database that
 	// still holds an active escalation job, and nothing needs to: the upgrade
 	// is a stop-the-world cutover, and a leftover job fails on its first step
-	// because no executor takes "dm", "channel" or "firehose" any more. Failing
-	// is the right end for it - the group it belongs to has no admission, so
-	// the producer picks the group up and escalates it properly.
+	// because no executor takes "dm", "channel" or "firehose" any more.
+	//
+	// What that buys is bounded, and worth stating exactly: the row stays
+	// readable and the job stops without producing the effect it was written
+	// for. It does NOT mean the escalation is picked up again. The producer
+	// takes groups that are "new" or stale "processing", so a group the old job
+	// had already moved to "triggered" is nobody's after that. An escalation in
+	// flight across the cutover is lost, which is what a destructive upgrade
+	// means.
 	NamespaceEscalation  Namespace = "escalation"
 	NamespaceAckUpdate   Namespace = "ack_update"
 	NamespaceAlertUpdate Namespace = "alert_update"

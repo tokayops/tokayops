@@ -603,38 +603,61 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	awaitShutdown(quit, cancel, internalSrv, outboundStopped)
+	awaitShutdown(quit, cancel, []listener{e, internalSrv}, outboundStopped)
 }
 
-// awaitShutdown is the exit path, in one place so the order is testable: what a
-// signal cancels, and what the process waits for before it returns.
+// listener is a server this process stops before it waits for anything.
+// Both *echo.Echo and *http.Server are one.
+type listener interface {
+	Shutdown(ctx context.Context) error
+}
+
+// awaitShutdown is the exit path, in one place so the order is testable: what
+// stops accepting, what gets cancelled, and what the process waits for before
+// it returns.
 //
-// The waiting is the part that was missing. Background workers were started
-// fire-and-forget, so a SIGTERM cancelled their context and the process exited
-// while the outbound worker was still holding a call it had already made. The
-// answer arriving a moment later went nowhere, and the delivery became
-// ambiguous - a message that may or may not have been sent, with nothing saying
-// which.
+// The order is the whole point, and both halves of it were wrong.
 //
-// No deadline is imposed on the waiting here. Each worker handed in has its own
-// (the outbound one: outbound.NotificationShutdownDeadline), and a shorter one
+// The listeners close FIRST. Waiting for the workers can take a minute, and a
+// process that spent that minute still serving its API and its ingestion
+// endpoint would be taking on alerts, acknowledgements and webhook deliveries
+// that nothing behind them is running any more - the engine and the delivery
+// worker are stopping. Closed first, the load balancer sees a refused
+// connection and goes elsewhere, which is what it is for.
+//
+// The workers are waited for LAST, and that is what was missing entirely: they
+// were started fire-and-forget, so a SIGTERM cancelled their context and the
+// process exited while the outbound worker was still holding a call it had
+// already made. The answer arriving a moment later went nowhere, and the
+// delivery became ambiguous - a message that may or may not have been sent,
+// with nothing saying which.
+//
+// No deadline is imposed on that wait. Each worker handed in has its own (the
+// outbound one: outbound.NotificationShutdownDeadline), and a shorter one
 // wrapped round it would defeat the reason that number exists. The container's
-// stop grace period is what bounds it from outside - see docker-compose.prod.yml.
+// stop grace period bounds it from outside - see docker-compose.prod.yml.
 func awaitShutdown(quit <-chan os.Signal, cancel context.CancelFunc,
-	internalSrv *http.Server, workers ...<-chan struct{}) {
+	listeners []listener, workers ...<-chan struct{}) {
 
 	<-quit
 
 	log.Println("Shutting down...")
-	cancel()
 
-	if internalSrv != nil {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		if err := internalSrv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Internal server shutdown error: %v", err)
+	// Bounded, unlike the wait below: this one is for requests already in
+	// flight, and a client holding a connection open must not keep the process
+	// from getting on with the part that cannot be hurried.
+	closing, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	for _, srv := range listeners {
+		if srv == nil {
+			continue
+		}
+		if err := srv.Shutdown(closing); err != nil {
+			log.Printf("Server shutdown error: %v", err)
 		}
 	}
+
+	cancel()
 
 	for _, stopped := range workers {
 		<-stopped

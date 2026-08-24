@@ -73,8 +73,9 @@ func withLegacySteps(d *Dispatcher) *Dispatcher {
 //
 // A step type that resolves is a step type something can execute, and an
 // escalation is not the job engine's work any more. A leftover job from before
-// the cutover has to FAIL on its first step, which is what makes the producer
-// pick its group up and escalate it properly.
+// the cutover has to FAIL on its first step, so that it stops without producing
+// the effect it was written for - not so that its group is escalated again,
+// which a destructive upgrade does not promise.
 func TestTheEscalationStepTypesAreGone(t *testing.T) {
 	d, err := NewDispatcher(store.NewMockStore(), &config.Config{})
 	if err != nil {
