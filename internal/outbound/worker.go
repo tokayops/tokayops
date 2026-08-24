@@ -4,9 +4,12 @@ import (
 	"context"
 	"log"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/tokayops/tokayops/internal/metrics"
 )
 
 // The worker: one process's share of a family's delivery.
@@ -131,12 +134,22 @@ func (w *Worker) tick(ctx context.Context) {
 	if expired, err := w.store.ExpireDueIntents(ctx, w.family, w.pool); err != nil {
 		log.Printf("outbound worker %s: expire: %v", w.workerID, err)
 	} else if len(expired) > 0 {
+		metrics.OutboundIntentsTerminalTotal.
+			WithLabelValues(w.family, string(StatusExpired)).Add(float64(len(expired)))
 		log.Printf("outbound worker %s: %d commitments passed their deadline unsent",
 			w.workerID, len(expired))
 	}
 	if recovered, err := w.store.RecoverStaleAttempts(ctx, w.family, w.pool); err != nil {
 		log.Printf("outbound worker %s: recover: %v", w.workerID, err)
 	} else if len(recovered) > 0 {
+		// Recovery closes an ATTEMPT; where that leaves the commitment is its
+		// own answer, and only some of them are endings.
+		for _, one := range recovered {
+			if one.To.Terminal() {
+				metrics.OutboundIntentsTerminalTotal.
+					WithLabelValues(w.family, string(one.To)).Inc()
+			}
+		}
 		log.Printf("outbound worker %s: %d abandoned attempts closed", w.workerID, len(recovered))
 	}
 
@@ -314,10 +327,18 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 		// Not fatal to the delivery - the conclusion above is already the safe
 		// one - but a channel that does this is wrong, and silence here would
 		// keep it wrong.
+		metrics.OutboundContractViolationsTotal.WithLabelValues("execute_attempt", string(breach)).Inc()
 		log.Printf("outbound worker %s: %s broke its contract on attempt %s (%s); "+
 			"recorded as %s", w.workerID, leased.Intent.Provider, begun.AttemptID,
 			breach, concluded.Outcome())
 	}
+
+	// Counted here rather than after the record below, because this is where
+	// the fact is: the call was made and it ended this way. Whether writing it
+	// down succeeds is a different question, and the log line at the bottom is
+	// what answers it.
+	metrics.OutboundAttemptsTotal.WithLabelValues(w.family, leased.Intent.Provider,
+		string(begun.Operation), string(concluded.Outcome()), errorClass(concluded)).Inc()
 
 	finalizeCtx, cancelFinalize := recording(detached)
 	recorded, err := w.store.FinalizeDeliveryAttempt(finalizeCtx, FinalizeRequest{
@@ -342,9 +363,62 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 	switch recorded.Outcome {
 	case FinalizeFinalized, FinalizeIdempotentRepeat:
 	default:
+		metrics.OutboundContractViolationsTotal.WithLabelValues("finalize", string(recorded.Outcome)).Inc()
 		log.Printf("outbound worker %s: the result of %s was answered %q",
 			w.workerID, begun.AttemptID, recorded.Outcome)
 	}
+
+	// Counted after the commit, not before it: the alert on this fires on any
+	// increment, and an ending recorded for a transaction that rolled back
+	// would wake somebody over a delivery that is still being retried.
+	if recorded.To.Terminal() {
+		metrics.OutboundIntentsTerminalTotal.WithLabelValues(w.family, string(recorded.To)).Inc()
+	}
+	if begun.FirstAttemptLatency != nil {
+		metrics.OutboundAdmissionLatencySeconds.WithLabelValues(w.family).
+			Observe(*begun.FirstAttemptLatency)
+	}
+
+	// One line per attempt: this is where an operator sees that TokayOps is
+	// still trying, and which delivery of which alert it is trying.
+	//
+	// What is NOT here is as deliberate as what is. No payload, no token, no
+	// provider response body - the summary is the channel's own short
+	// classification, already truncated where it was built (NFR-7), and the
+	// receipt reference is coordinates rather than content.
+	log.Printf("outbound worker %s: intent=%s provider=%s generation=%d attempt=%s "+
+		"outcome=%s status=%s%s", w.workerID, leased.Intent.ID, leased.Intent.Provider,
+		leased.Intent.GenerationNo, begun.AttemptID, concluded.Outcome(),
+		recorded.To, detail(concluded))
+}
+
+// errorClass is the channel's own classification of a failure, and empty for a
+// call that was accepted. It is a label, so it is a closed vocabulary rather
+// than a message: an error string here would make a new time series out of
+// every distinct failure text.
+func errorClass(c Conclusion) string {
+	if class := c.Completion().ErrorClass; class != nil {
+		return *class
+	}
+	return ""
+}
+
+// detail is what the log line adds beyond the outcome, and only when there is
+// something to add. Never the response body: what a provider says about a
+// failure can carry anything, including the message that was being sent.
+func detail(c Conclusion) string {
+	completion := c.Completion()
+	out := ""
+	if completion.ErrorClass != nil && *completion.ErrorClass != "" {
+		out += " error_class=" + *completion.ErrorClass
+	}
+	if completion.ReceiptRef != nil && *completion.ReceiptRef != "" {
+		out += " receipt=" + *completion.ReceiptRef
+	}
+	if summary := c.Summary(); summary != "" {
+		out += " response_summary=" + strconv.Quote(summary)
+	}
+	return out
 }
 
 // recording bounds one short database call.

@@ -550,6 +550,29 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{}, fmt.Errorf("open the attempt: %w", err)
 	}
 
+	// How long the promise took to become a call, measured by the database at
+	// both ends. Only for the FIRST journal record of a commitment that was due
+	// the moment it was admitted.
+	//
+	// Both conditions carry weight. A step the policy scheduled for later
+	// waited exactly as long as it was told to, and reporting that as latency
+	// would make a working escalation look like a slow one. And a commitment
+	// whose first record was a REFUSAL - preparation could not be done yet -
+	// went to backoff, so the call that follows is late by arrangement rather
+	// than by fault; it is left unmeasured rather than counted as delay.
+	var latency *float64
+	if attemptNo == 1 {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT EXTRACT(EPOCH FROM (a.started_at - b.admitted_at))::double precision
+			FROM outbound_attempts a
+			JOIN outbound_intents i ON i.id = a.intent_id
+			JOIN outbound_batches b ON b.id = i.batch_id
+			WHERE a.id = $1 AND i.not_before <= b.admitted_at`, attemptID,
+		).Scan(&latency); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return outbound.BeginAttemptResult{}, fmt.Errorf("measure the admission latency: %w", err)
+		}
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE outbound_intents
 		SET status = 'sending', current_attempt_id = $2,
@@ -575,6 +598,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		Outcome:                      outbound.BeginStarted,
 		AttemptID:                    attemptID,
 		AttemptNo:                    attemptNo,
+		FirstAttemptLatency:          latency,
 		GenerationNo:                 intent.GenerationNo,
 		AttemptKind:                  plan.Kind,
 		Operation:                    plan.Operation,

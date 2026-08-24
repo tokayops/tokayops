@@ -317,6 +317,18 @@ type BeginAttemptResult struct {
 	// closes it has to be the one that opened it.
 	CompletionFingerprintVersion int
 
+	// FirstAttemptLatency is how long this commitment waited between being
+	// admitted and its first call starting, in seconds. Set only when both are
+	// true: this is the FIRST attempt, and the commitment was due immediately.
+	//
+	// It comes from here rather than from the worker's own clock because both
+	// ends of the interval are database timestamps, and a worker subtracting
+	// its own time from one of them would be reporting clock drift as latency.
+	// Nil is "this measurement does not apply", which is the common case: a
+	// retry, or a policy step that was scheduled for later and waited exactly
+	// as long as it was told to.
+	FirstAttemptLatency *float64
+
 	Intent Intent
 }
 

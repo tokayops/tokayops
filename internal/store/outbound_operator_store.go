@@ -22,7 +22,11 @@ import (
 // in flight is flagged rather than cancelled, and the flag is consumed when
 // that send finishes: it may already have landed, and the two outcomes have to
 // converge on the same visible result.
-func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, actor string) error {
+// It returns how many commitments it WITHDREW outright, for the caller to count
+// once its transaction has committed. Counted inside, a transaction that then
+// rolled back would report an ending that never happened - and the alert on
+// that counter fires on any increment at all.
+func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, actor string) (int, error) {
 	// Nothing has gone out and nothing will: these are withdrawn outright, and
 	// the lease goes with them so the worker holding one finds out at its next
 	// compare-and-set.
@@ -33,7 +37,7 @@ func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, acto
 		WHERE alert_group_id = $1 AND receipt IS NULL AND status = 'pending'
 		RETURNING id`, alertGroupID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// In flight. The outcome decides: a send that failed becomes a withdrawal,
@@ -44,7 +48,7 @@ func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, acto
 		WHERE alert_group_id = $1 AND receipt IS NULL AND status = 'sending'
 		RETURNING id`, alertGroupID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// Waiting for a person about a call that never produced anything: the
@@ -55,38 +59,42 @@ func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, acto
 		WHERE alert_group_id = $1 AND receipt IS NULL AND status = 'manual_review'
 		RETURNING id`, alertGroupID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	for _, id := range notSent {
 		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "canceled",
 			reason, actor); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	for _, id := range inFlight {
 		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "cancellation_requested",
 			reason, actor); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	for _, id := range waiting {
 		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "canceled",
 			reason+"; the outcome of the previous attempt stays unknown", actor); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
-	touched := len(notSent) + len(inFlight) + len(waiting)
+	withdrawn := len(notSent) + len(waiting)
+	touched := withdrawn + len(inFlight)
 	if touched == 0 {
-		return nil
+		return 0, nil
 	}
 
 	// One line in the alert's history, and a line each in the commitments' own:
 	// the group's timeline says what happened to the alert, and the journal says
 	// what happened to every promise it had made.
-	return addTimelineTx(ctx, tx, alertGroupID, model.TimelineEventNotificationFailed,
-		fmt.Sprintf("%d pending notification(s) withdrawn: %s", touched, reason), actor)
+	if err := addTimelineTx(ctx, tx, alertGroupID, model.TimelineEventNotificationFailed,
+		fmt.Sprintf("%d pending notification(s) withdrawn: %s", touched, reason), actor); err != nil {
+		return 0, err
+	}
+	return withdrawn, nil
 }
 
 func cancelRowsTx(ctx context.Context, tx *sql.Tx, query, alertGroupID string) ([]string, error) {

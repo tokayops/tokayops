@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -38,7 +39,21 @@ import (
 // and an old instance must not be able to end work a new format created.
 var ErrOutboundContract = errors.New("store: outbound contract violation")
 
+// Every one of these is counted, in this one place, because none of them is a
+// delivery problem: a contract violation is a bug in this system or in an
+// assumption about a protocol version, and a nonzero rate is a thing to go and
+// read the log about.
+//
+// One kind rather than one per call site. What distinguishes them is a sentence
+// an operator reads in the log; as a label it would be a new time series for
+// every phrasing, and the question a metric answers here is only "is this
+// happening at all".
+//
+// Counted where it is raised rather than after a commit, unlike the terminal
+// states: this says a row cannot be handled, which is true whether or not the
+// transaction that found it goes on to commit.
 func outboundContractf(format string, args ...any) error {
+	metrics.OutboundContractViolationsTotal.WithLabelValues("store", "invariant").Inc()
 	return fmt.Errorf("%w: %s", ErrOutboundContract, fmt.Sprintf(format, args...))
 }
 

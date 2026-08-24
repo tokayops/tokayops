@@ -43,6 +43,17 @@ var (
 		"Current count of outbox deliveries by status.",
 		[]string{"status"}, nil,
 	)
+	outboundIntentsByStatusDesc = prometheus.NewDesc(
+		"outbound_intents_by_status",
+		"Current count of outbound delivery commitments by status.",
+		[]string{"family", "status"}, nil,
+	)
+	outboundQueueLatenessDesc = prometheus.NewDesc(
+		"outbound_queue_lateness_seconds",
+		"Age of the oldest outbound commitment that is due now and has not started. "+
+			"Work scheduled for later is not late; leased work is included, because a worker that hung is what this must not hide.",
+		[]string{"family"}, nil,
+	)
 )
 
 // BusinessCollector queries the store on each Prometheus scrape.
@@ -58,6 +69,8 @@ func (c *BusinessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- alertGroupsByStatusDesc
 	ch <- outboxEventsByStatusDesc
 	ch <- outboxDeliveriesByStatusDesc
+	ch <- outboundIntentsByStatusDesc
+	ch <- outboundQueueLatenessDesc
 }
 
 func (c *BusinessCollector) Collect(ch chan<- prometheus.Metric) {
@@ -105,6 +118,20 @@ func (c *BusinessCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			outboxDeliveriesByStatusDesc, prometheus.GaugeValue,
 			float64(sc.Count), sc.Status,
+		)
+	}
+
+	for _, sc := range snap.OutboundIntentsByStatus {
+		ch <- prometheus.MustNewConstMetric(
+			outboundIntentsByStatusDesc, prometheus.GaugeValue,
+			float64(sc.Count), sc.Family, sc.Status,
+		)
+	}
+
+	for _, l := range snap.OutboundLatenessSeconds {
+		ch <- prometheus.MustNewConstMetric(
+			outboundQueueLatenessDesc, prometheus.GaugeValue,
+			l.Seconds, l.Family,
 		)
 	}
 }

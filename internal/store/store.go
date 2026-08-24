@@ -1371,11 +1371,16 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	// change, because "acknowledged" and "nobody is being paged any more" are
 	// one fact: split in two, a crash between them pages somebody for an alert
 	// that is already being handled.
-	if err := cancelIntentsTx(context.Background(), tx, id, "the alert was acknowledged", actor); err != nil {
+	withdrawn, err := cancelIntentsTx(context.Background(), tx, id, "the alert was acknowledged", actor)
+	if err != nil {
 		return false, err
 	}
 
-	return true, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	countWithdrawn(withdrawn)
+	return true, nil
 }
 
 // ResolveAlertGroupAtomic atomically resolves an alert group.
@@ -1438,11 +1443,16 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	// change, because "acknowledged" and "nobody is being paged any more" are
 	// one fact: split in two, a crash between them pages somebody for an alert
 	// that is already being handled.
-	if err := cancelIntentsTx(context.Background(), tx, id, "the alert was resolved", actor); err != nil {
+	withdrawn, err := cancelIntentsTx(context.Background(), tx, id, "the alert was resolved", actor)
+	if err != nil {
 		return false, err
 	}
 
-	return true, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	countWithdrawn(withdrawn)
+	return true, nil
 }
 
 // ResolveAlertGroupWithAlertsAtomic atomically resolves an alert group while updating its alerts data.
@@ -1506,12 +1516,29 @@ func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Aler
 
 	// 4. Withdraw what the group still owes: the alerts resolved themselves,
 	// and paging somebody about them now would be paging them about nothing.
-	if err := cancelIntentsTx(context.Background(), tx, id,
-		"every alert in the group resolved", "system"); err != nil {
+	withdrawn, err := cancelIntentsTx(context.Background(), tx, id,
+		"every alert in the group resolved", "system")
+	if err != nil {
 		return false, err
 	}
 
-	return true, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	countWithdrawn(withdrawn)
+	return true, nil
+}
+
+// countWithdrawn records commitments that ended because the alert did, AFTER
+// the transaction that ended them committed. The counter alerts on any
+// increment, so an ending reported for a transaction that rolled back would
+// wake somebody over a delivery that is still going out.
+func countWithdrawn(n int) {
+	if n > 0 {
+		metrics.OutboundIntentsTerminalTotal.
+			WithLabelValues(outbound.FamilyNotification, string(outbound.StatusCanceled)).
+			Add(float64(n))
+	}
 }
 
 // ========================================
@@ -3258,5 +3285,77 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, err
 	}
 
+	// 7. Outbound commitments by family and status.
+	rows5, err := s.db.Query(`
+		SELECT delivery_family, status, COUNT(*) FROM outbound_intents
+		GROUP BY delivery_family, status`)
+	if err != nil {
+		return nil, fmt.Errorf("outbound intents by status query: %w", err)
+	}
+	defer rows5.Close()
+	for rows5.Next() {
+		var c model.OutboundStatusCount
+		if err := rows5.Scan(&c.Family, &c.Status, &c.Count); err != nil {
+			return nil, err
+		}
+		snap.OutboundIntentsByStatus = append(snap.OutboundIntentsByStatus, c)
+	}
+	if err := rows5.Err(); err != nil {
+		return nil, err
+	}
+
+	// 8. How far behind each family is.
+	//
+	// The subtraction is the database's, in the same statement that finds the
+	// row: taken from the process's clock instead, this would report the drift
+	// between two machines as a backlog.
+	//
+	// Two predicates carry the definition. `next_attempt_at <= now()` excludes
+	// work that is SCHEDULED - a delayed policy step, a retry on backoff - which
+	// is not lateness but the plan. And nothing is said about the lease: a
+	// commitment claimed by a worker that then hung would otherwise disappear
+	// from this gauge for the length of its lease, which is precisely the moment
+	// somebody needs to be told.
+	//
+	// Every family that has rows at all reports a number, zero included, so a
+	// backlog that has been worked off stops ringing instead of leaving its last
+	// value behind forever.
+	rows6, err := s.db.Query(`
+		SELECT delivery_family,
+		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(next_attempt_at)
+		           FILTER (WHERE status = 'pending' AND next_attempt_at <= now()))), 0)::double precision
+		FROM outbound_intents
+		GROUP BY delivery_family`)
+	if err != nil {
+		return nil, fmt.Errorf("outbound queue lateness query: %w", err)
+	}
+	defer rows6.Close()
+	for rows6.Next() {
+		var l model.OutboundLateness
+		if err := rows6.Scan(&l.Family, &l.Seconds); err != nil {
+			return nil, err
+		}
+		snap.OutboundLatenessSeconds = append(snap.OutboundLatenessSeconds, l)
+	}
+	if err := rows6.Err(); err != nil {
+		return nil, err
+	}
+	// And the paging family reports even when it has no rows at all, so the
+	// series exists from the first scrape rather than appearing the first time
+	// somebody is paged.
+	if !hasFamily(snap.OutboundLatenessSeconds, outbound.FamilyNotification) {
+		snap.OutboundLatenessSeconds = append(snap.OutboundLatenessSeconds,
+			model.OutboundLateness{Family: outbound.FamilyNotification})
+	}
+
 	return snap, nil
+}
+
+func hasFamily(rows []model.OutboundLateness, family string) bool {
+	for _, row := range rows {
+		if row.Family == family {
+			return true
+		}
+	}
+	return false
 }

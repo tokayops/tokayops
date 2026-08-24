@@ -198,6 +198,80 @@ var (
 	})
 )
 
+// Tier 8 - outbound delivery
+//
+// What an operator needs from this domain is two questions answered: is
+// anything owed that should already have gone out, and did anything end without
+// being delivered. The counters below answer the second; the gauges in the
+// collector answer the first, because "how much is late" is a fact about rows
+// and only the database can be asked it.
+//
+// Deliberately absent: the age of the oldest pending commitment. A step of an
+// escalation that is scheduled for ten minutes' time, and a retry waiting out
+// its backoff, are planned work - counted as a backlog they would wake somebody
+// for a system that is doing exactly what it was told.
+var (
+	// OutboundAttemptsTotal counts calls that were STARTED, by how they ended.
+	//
+	// error_class is empty for an accepted call and carries the channel's own
+	// classification otherwise ("rate_limited", "channel_not_found", ...). It
+	// is a closed vocabulary per provider, not a message: an error string in a
+	// label is a cardinality bomb.
+	OutboundAttemptsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_attempts_total",
+		Help: "Outbound delivery attempts that reached the provider, by outcome.",
+	}, []string{"family", "provider", "operation", "outcome", "error_class"})
+
+	// OutboundIntentsTerminalTotal counts commitments that ended, by how.
+	//
+	// Everything except "delivered" is a page that did not happen, and the
+	// alert on this counter fires on any increment of those - which is why it
+	// is counted after the transaction commits rather than inside it. A
+	// rollback would otherwise report an ending that never occurred.
+	OutboundIntentsTerminalTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_intents_terminal_total",
+		Help: "Outbound commitments that reached a terminal state, by state.",
+	}, []string{"family", "status"})
+
+	// OutboundContractViolationsTotal counts what should not be able to happen:
+	// a finalisation carrying a lease token that is not the one on the row, two
+	// contradicting accounts of one call, an invariant the store refuses, a
+	// channel reporting success with nothing to identify the message by.
+	//
+	// None of these is a delivery problem. Every one of them is a bug in this
+	// system or in an assumption about a provider, and a nonzero rate is a
+	// thing to go and read the log about.
+	OutboundContractViolationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_contract_violations_total",
+		Help: "Refusals that indicate a broken contract rather than a failed delivery.",
+	}, []string{"op", "kind"})
+
+	// OutboundAdmissionsTotal counts what happened to each escalation offered
+	// for admission.
+	//
+	// "no_targets" is not one of the store's outcomes - it is an admission that
+	// was accepted and promised nothing, and it is broken out because it is the
+	// one success that means nobody was paged.
+	OutboundAdmissionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_admissions_total",
+		Help: "Escalation admissions by outcome. no_targets is an accepted admission that promised nothing.",
+	}, []string{"outcome"})
+
+	// OutboundAdmissionLatencySeconds measures the promise: from the commit
+	// that admitted an escalation to the start of the FIRST attempt of a
+	// commitment that was due immediately.
+	//
+	// Only immediately-due commitments are observed. A step with a ten-minute
+	// delay would otherwise report ten minutes of latency for working exactly
+	// as configured. Both ends of the interval are the database's own clock,
+	// so nothing here depends on two processes agreeing about the time.
+	OutboundAdmissionLatencySeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "outbound_admission_latency_seconds",
+		Help:    "Seconds from admitting an escalation to starting the first attempt of an immediately due commitment.",
+		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+	}, []string{"family"})
+)
+
 // Tier 8 - storage contract
 //
 // TokayOps trusts the physical integrity of PostgreSQL and assumes production
@@ -264,6 +338,11 @@ func init() {
 	prometheus.MustRegister(OutboxDeliveryBlockedTotal)
 
 	// Tier 8
+	prometheus.MustRegister(OutboundAttemptsTotal)
+	prometheus.MustRegister(OutboundIntentsTerminalTotal)
+	prometheus.MustRegister(OutboundContractViolationsTotal)
+	prometheus.MustRegister(OutboundAdmissionsTotal)
+	prometheus.MustRegister(OutboundAdmissionLatencySeconds)
 	prometheus.MustRegister(StorageContractFailuresTotal)
 }
 

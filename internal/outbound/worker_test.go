@@ -1,10 +1,14 @@
 package outbound
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -650,5 +654,62 @@ func TestRunHoldsUntilTheAnswerIsRecorded(t *testing.T) {
 	}
 	if got := store.finalized[0].Conclusion.Outcome(); got != OutcomeAccepted {
 		t.Fatalf("the answer was recorded as %q", got)
+	}
+}
+
+// TestTheAttemptLogSaysWhatHappenedWithoutSayingWhatWasSent.
+//
+// One line per attempt is where an operator sees that TokayOps is still trying,
+// and which delivery of which alert it is trying. It is also the easiest place
+// in the system to leak: the payload is right there, and so is whatever the
+// provider chose to say back.
+//
+// So the line is pinned by what it must contain AND by what it must not. The
+// summary is allowed and bounded (NFR-7); the payload and the lease are not
+// allowed at all.
+func TestTheAttemptLogSaysWhatHappenedWithoutSayingWhatWasSent(t *testing.T) {
+	store := newFakeStore()
+	store.beginOut.Payload = json.RawMessage(`{"text":"disk will fill on db-primary"}`)
+
+	longTail := "TAIL-THAT-MUST-BE-CUT"
+	channel := newFakeChannel()
+	channel.result = Result{
+		Evidence: ProviderResponse,
+		Status:   "ok",
+		Summary:  strings.Repeat("a", SummaryLimit) + longTail,
+		Receipt:  mustReceipt("C-bound/1700000000.000100", `{"channel":"C-bound"}`),
+	}
+
+	var written bytes.Buffer
+	log.SetOutput(&written)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	w.serve(context.Background(), Leased{
+		Intent: Intent{
+			ID: "intent-7", Provider: "slack", Status: StatusPending,
+			AlertGroupID: "ag-1", GenerationNo: 2,
+		},
+		LeaseToken: "token-7",
+	})
+
+	line := written.String()
+	for _, want := range []string{
+		"intent=intent-7", "provider=slack", "generation=2",
+		"attempt=attempt-for-intent-7", "outcome=accepted",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("the attempt line does not say %s:\n%s", want, line)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"disk will fill", // the payload
+		"token-7",        // the lease
+		longTail,         // the untruncated tail of the provider's answer
+	} {
+		if strings.Contains(line, forbidden) {
+			t.Errorf("the attempt line leaked %q:\n%s", forbidden, line)
+		}
 	}
 }
