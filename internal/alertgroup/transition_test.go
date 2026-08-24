@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -163,41 +162,6 @@ func TestAck_UsesTeamNameSnapshot(t *testing.T) {
 		}
 	}
 	t.Fatal("Outbox event not found")
-}
-
-func TestAck_CancelsEscalation(t *testing.T) {
-	s := store.NewMockStore()
-	svc := NewService(s)
-	createAG(t, s, "ag-cancel", model.AlertGroupStatusTriggered)
-
-	// A pending escalation job shaped like the real one: cancellation addresses
-	// it by alert group, so a fixture without alert_group_id would be a job the
-	// escalation builder never produces.
-	agID := "ag-cancel"
-	if err := s.SeedEscalationJob(agID, &model.Job{
-		ID:      "job-ag-cancel",
-		Status:  model.JobStatusPending,
-		Payload: json.RawMessage("{}"),
-	}, nil, nil); err != nil {
-		t.Fatalf("SeedEscalationJob: %v", err)
-	}
-
-	result, err := svc.Ack("ag-cancel", Actor{Name: "Denis"}, nil)
-	if err != nil {
-		t.Fatalf("Ack: %v", err)
-	}
-	if result.Outcome != OutcomeApplied {
-		t.Fatalf("Expected applied, got %s", result.Outcome)
-	}
-
-	// Verify job was cancelled
-	job, err := s.FindJobByIdentity(jobdedup.Escalation(agID))
-	if err != nil || job == nil {
-		t.Fatalf("escalation job not found after ack: %v", err)
-	}
-	if job.Status != model.JobStatusCanceled {
-		t.Errorf("Expected job to be canceled, got %s", job.Status)
-	}
 }
 
 func TestResolve_Applied(t *testing.T) {

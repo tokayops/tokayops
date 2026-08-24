@@ -61,15 +61,11 @@ func NewDispatcher(s store.StoreInterface, cfg *config.Config) (*Dispatcher, err
 		WorkerID:  uuid.New().String(),
 	}
 
-	escalationExec := NewEscalationExecutor(s, d.providers, cfg)
-
-	// Step types are (provider, target_kind) pairs; the executor switches on
-	// target_kind. "firehose" stays as a sentinel because it is intentionally
-	// Slack-only (bypasses the taxonomy — see escalation_executor.go).
-	d.RegisterExecutor("dm", escalationExec)
-	d.RegisterExecutor("channel", escalationExec)
-	d.RegisterExecutor("firehose", escalationExec)
-
+	// The "dm", "channel" and "firehose" step types are gone with the
+	// escalation executor: an escalation is a set of commitments in the
+	// outbound domain now, and nothing builds job steps for one. A job step
+	// left over from before this change finds no executor and fails, which is
+	// what the upgrade's stop-the-world cutover exists to make impossible.
 	resolutionExec := NewResolutionExecutor(s, d.providers, cfg)
 	d.RegisterExecutor("resolve", resolutionExec)
 	d.RegisterExecutor("update", resolutionExec) // update uses same executor with Operation field
@@ -369,12 +365,11 @@ func (d *Dispatcher) ProcessAcknowledgedAlertGroups(ctx context.Context) {
 	gate := d.ackUpdateGate()
 
 	for _, ag := range alertGroups {
-		// 1. Cancel any active escalation jobs - user acknowledged, no more escalation needed
-		if err := d.store.CancelEscalationJobByAlertGroupID(ag.ID); err != nil {
-			log.Printf("JobController: Failed to cancel escalation for acknowledged AG %s: %v", ag.ID, err)
-		}
-
-		// 2. Build the update that turns the message yellow.
+		// Nothing to cancel here any more: acknowledging a group withdraws what
+		// it still owes in the same commit as the status change, so a delivery
+		// cannot survive the acknowledgement it was too late for.
+		//
+		// Build the update that turns the message yellow.
 		job, stages, steps, err := builder.Build(ag)
 		if err != nil {
 			if errors.Is(err, builders.ErrNoUpdatableDeliveries) {
@@ -441,12 +436,10 @@ func (d *Dispatcher) ProcessResolvedAlertGroups(ctx context.Context) {
 	gate := d.resolutionGate()
 
 	for _, ag := range alertGroups {
-		// 1. Cancel any active escalation jobs
-		if err := d.store.CancelEscalationJobByAlertGroupID(ag.ID); err != nil {
-			log.Printf("JobController: Failed to cancel jobs for resolved AG %s: %v", ag.ID, err)
-		}
-
-		// 2. Build the resolution
+		// Resolving withdraws what the group owes in the same commit as the
+		// status change, so there is nothing to cancel here.
+		//
+		// Build the resolution
 		job, stages, steps, err := builder.Build(ag)
 		if err != nil {
 			log.Printf("JobController: Build failed for resolved AG %s (will retry): %v", ag.ID, err)

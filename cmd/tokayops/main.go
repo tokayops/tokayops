@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
-	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
 	"log"
 	"net/http"
 	"net/url"
@@ -17,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -30,6 +29,10 @@ import (
 	"github.com/tokayops/tokayops/internal/ingester"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
+	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
 	"github.com/tokayops/tokayops/internal/outbox"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -420,9 +423,41 @@ func main() {
 	// setWebhook never blocks startup.
 	go apiService.RegisterTelegramWebhookOnStartup(ctx)
 
+	// The outbound delivery worker: what actually sends what the engine
+	// promised. The engine admits commitments and never sends anything itself,
+	// so without this process nothing an escalation owes goes out.
+	//
+	// It takes the store as its own narrow interface and a channel per
+	// provider. A provider missing from the map is one this instance cannot
+	// serve; it is left alone rather than failed, because what this process was
+	// configured with is not a property of the commitment.
+	//
+	// The token source is the same integration cache the dispatcher uses, read
+	// at each attempt on purpose: a rotated token has to apply to work that has
+	// not gone out yet. What a MESSAGE depends on was frozen at admission
+	// instead - see the engine above.
+	identityLookup := func(_ context.Context, userID, provider string) (string, error) {
+		identity, err := st.GetExternalIdentity(userID, provider)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", providers.ErrNotLinked
+		}
+		if err != nil {
+			return "", err
+		}
+		if identity == nil || identity.ExternalID == "" {
+			return "", providers.ErrNotLinked
+		}
+		return identity.ExternalID, nil
+	}
+	outboundWorker := outbound.NewWorker(st, uuid.New().String(), map[string]outbound.Channel{
+		"slack":    slackprovider.NewHandler(integrationCache, identityLookup),
+		"telegram": telegramprovider.NewHandler(integrationCache, identityLookup),
+	})
+
 	// 9. Start Background Workers
 	go eng.Run(ctx)
 	go disp.Run(ctx)
+	go outboundWorker.Run(ctx)
 
 	// Outbox Delivery Worker
 	allowedCIDRs, _ := config.ParseAllowedPrivateCIDRs()

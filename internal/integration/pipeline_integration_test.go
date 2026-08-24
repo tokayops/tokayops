@@ -133,7 +133,7 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	testutil.BindSlack(t, s, "U_TEST", "S_TEST")
 	testutil.BindSlack(t, s, "U_DEFAULT", "S_DEFAULT")
 
-	// 1b. Create escalation policies in DB (required for Store-based EscalationJobBuilder)
+	// 1b. Create escalation policies in DB: the producer reads them to plan.
 	criticalPolicy := &model.EscalationPolicy{
 		ID:   "critical_policy",
 		Name: "Critical Policy",

@@ -69,67 +69,6 @@ func testJobIdentity(jobID string) *jobdedup.Spec {
 	return jobdedup.AlertUpdate("test:" + jobID)
 }
 
-func TestProcessStep_SlackSuccess(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{
-		Global: config.GlobalConfig{},
-	}
-	d := mustNewDispatcher(t, s, cfg)
-
-	called := false
-	mp := &MockProvider{
-		SendDMFunc: func(ctx context.Context, userID, message string) error {
-			called = true
-			if userID != "U1" {
-				t.Errorf("expected target U1, got %s", userID)
-			}
-			return nil
-		},
-	}
-	d.RegisterProvider("slack", mp)
-
-	// Seed AG
-	ag := &model.AlertGroup{ID: "ag1", AlertKey: "dk1"}
-	s.CreateAlertGroup(ag)
-
-	// Seed Job (Required for processStep lookup)
-	leaseToken := "lease-slack-success"
-	job := &model.Job{
-		ID:     "job1",
-		Dedup:  testJobIdentity("job1"),
-		Status: model.JobStatusRunning,
-	}
-	// Prepare Step
-	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
-	dataBytes, _ := json.Marshal(stepData)
-
-	step := &model.JobStep{
-		ID:          "step1",
-		JobID:       "job1",
-		StageID:     "stage-0",
-		StepIndex:   0,
-		StepType:    "dm",
-		Status:      model.JobStepStatusRunning,
-		Data:        json.RawMessage(dataBytes),
-		MaxAttempts: 3,
-		LockedBy:    &leaseToken,
-	}
-	stages := []*model.JobStage{
-		{ID: "stage-0", JobID: "job1", StageIndex: 0, Status: model.JobStageStatusActive},
-	}
-	s.CreateJobWithDedup(job, stages, []*model.JobStep{step})
-
-	d.processStep(context.Background(), step)
-
-	if !called {
-		t.Error("Provider Send not called")
-	}
-	storedStep, _ := s.GetJobStepByID("step1")
-	if storedStep.Status != model.JobStepStatusSucceeded {
-		t.Errorf("Expected status Succeeded, got %s", storedStep.Status)
-	}
-}
-
 func TestProcessStep_Retry(t *testing.T) {
 	s := store.NewMockStore()
 	d := mustNewDispatcher(t, s, &config.Config{})
@@ -193,59 +132,6 @@ func TestProcessStep_Retry(t *testing.T) {
 	storedStep, _ := s.GetJobStepByID("step1")
 	if storedStep.Status != model.JobStepStatusFailed {
 		t.Errorf("Expected status Failed (on max attempts), got %s", storedStep.Status)
-	}
-}
-
-func TestProcessStep_Firehose(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{
-		Global: config.GlobalConfig{},
-	}
-	d := mustNewDispatcher(t, s, cfg)
-
-	called := false
-	mp := &MockProvider{
-		SendFunc: func(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
-			called = true
-			if targetID != "C_FIREHOSE" {
-				t.Errorf("expected target C_FIREHOSE, got %s", targetID)
-			}
-			return "msg123", nil
-		},
-	}
-	d.RegisterProvider("slack", mp)
-
-	// Seed AG
-	s.CreateAlertGroup(&model.AlertGroup{ID: "ag1"})
-
-	// Seed Job
-	leaseToken := "lease-firehose"
-	job := &model.Job{ID: "job1", Status: model.JobStatusRunning, Dedup: testJobIdentity("job1")}
-	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "C_FIREHOSE", ProviderName: "slack"}
-	dataBytes, _ := json.Marshal(stepData)
-
-	step := &model.JobStep{
-		ID:       "step1",
-		JobID:    "job1",
-		StageID:  "stage-0",
-		StepType: "firehose",
-		Status:   model.JobStepStatusRunning,
-		Data:     json.RawMessage(dataBytes),
-		LockedBy: &leaseToken,
-	}
-	stages := []*model.JobStage{
-		{ID: "stage-0", JobID: "job1", StageIndex: 0, Status: model.JobStageStatusActive},
-	}
-	s.CreateJobWithDedup(job, stages, []*model.JobStep{step})
-
-	d.processStep(context.Background(), step)
-
-	if !called {
-		t.Error("Provider Send not called")
-	}
-	storedStep, _ := s.GetJobStepByID("step1")
-	if storedStep.Status != model.JobStepStatusSucceeded {
-		t.Errorf("Expected status Succeeded, got %s", storedStep.Status)
 	}
 }
 
@@ -831,76 +717,6 @@ func TestProcessAcknowledgedAlertGroups_NoDuplicateJobs_WithJobCompletion(t *tes
 		t.Errorf("Expected AG to stay acknowledged, but got status %s", updatedAG.Status)
 	}
 }
-
-// TestProcessAcknowledgedAlertGroups_CancelsEscalationJob tests that when an AG is acknowledged,
-// the active escalation job is canceled to stop further escalation steps.
-func TestProcessAcknowledgedAlertGroups_CancelsEscalationJob(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d := mustNewDispatcher(t, s, cfg)
-
-	mp := &MockProvider{
-		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
-			return `{"ts":"1234567890.123456"}`, nil
-		},
-	}
-	d.RegisterProvider("slack", mp)
-
-	// Create acknowledged AG with a dedup key
-	ag := &model.AlertGroup{
-		ID:       "ag1",
-		AlertKey: "test_dedup_key",
-		Status:   model.AlertGroupStatusAcknowledged,
-	}
-	s.CreateAlertGroup(ag)
-
-	// Create an updatable delivery
-	delivery := &model.NotificationDelivery{
-		ID:              "delivery1",
-		AlertGroupID:    "ag1",
-		Provider:        "slack",
-		SupportsUpdate:  true,
-		IsPrimary:       true,
-		ProviderPayload: `{"channel":"C123","ts":"1234567890.000000"}`,
-	}
-	s.UpsertNotificationDelivery(delivery)
-
-	// Create an active escalation job (simulating ongoing escalation), shaped
-	// like the builder's: cancellation addresses alert_group_id, and the dedup
-	// identity is that same group.
-	escalationAGID := ag.ID
-	escalationJob := &model.Job{
-		ID:           "escalation_job_1",
-		Type:         "escalation",
-		Status:       model.JobStatusRunning,
-		Dedup:        jobdedup.Escalation(ag.ID),
-		AlertGroupID: &escalationAGID,
-	}
-	escalationStep := &model.JobStep{
-		ID:        "step1",
-		JobID:     "escalation_job_1",
-		StepIndex: 1,
-		Status:    model.JobStepStatusBlocked, // Waiting to run
-	}
-	if err := s.SeedEscalationJob(ag.ID, escalationJob, nil, []*model.JobStep{escalationStep}); err != nil {
-		t.Fatalf("SeedEscalationJob: %v", err)
-	}
-
-	ctx := context.Background()
-
-	// Process acknowledged AG - should cancel escalation job
-	d.ProcessAcknowledgedAlertGroups(ctx)
-
-	// Verify escalation job is canceled
-	updatedJob, _ := s.GetJobByID("escalation_job_1")
-	if updatedJob.Status != model.JobStatusCanceled {
-		t.Errorf("Expected escalation job to be canceled, but got status %s", updatedJob.Status)
-	}
-}
-
-// ===================================================================================
-// AckProcessedAt Tests - Fix for infinite loop when no Slack deliveries exist
-// ===================================================================================
 
 // TestProcessAcknowledgedAlertGroups_MarksAsProcessed tests that ProcessAcknowledgedAlertGroups
 // marks alert groups as processed via ack_processed_at, preventing infinite loops.

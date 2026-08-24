@@ -374,3 +374,57 @@ func TestInstancesStartingTogetherMigrateOnce(t *testing.T) {
 		t.Fatalf("the table has %d version columns", columns)
 	}
 }
+
+// TestTheAlertUpdateLoopLeavesOutboundGroupsAlone. That loop updates a card by
+// finding the delivery that produced it, and the outbound path writes no such
+// row - so for an admitted group it finds nothing to update, leaves its gate up
+// and comes back with the same answer every two seconds until the alert
+// resolves. Sprint 2 gives the card to the outbound domain; until then an
+// admitted group's card is not this loop's to keep current (S1-D24).
+func TestTheAlertUpdateLoopLeavesOutboundGroupsAlone(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	admitted := outboundGroup(t, s)
+	mustSubmit(t, s, outboundAdmission(t, admitted, "first", channelCommitment("C0001", 0)))
+
+	// A group of the old shape: nothing was admitted for it, so the loop is
+	// still the only thing that can keep its card current.
+	legacy := outboundGroup(t, s)
+
+	for _, agID := range []string{admitted, legacy} {
+		if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(agID, []model.Alert{{
+			Fingerprint: "fp-late", Status: "firing", StartsAt: time.Now(),
+		}}); err != nil {
+			t.Fatalf("raise the gate on %s: %v", agID, err)
+		}
+	}
+
+	pending, err := s.GetAlertGroupsPendingSlackUpdate()
+	if err != nil {
+		t.Fatalf("read the groups waiting for an update: %v", err)
+	}
+
+	seen := map[string]bool{}
+	for _, ag := range pending {
+		seen[ag.ID] = true
+	}
+	if seen[admitted] {
+		t.Error("an admitted group was picked up by the loop that cannot update it")
+	}
+	if !seen[legacy] {
+		t.Error("a group with no admission was skipped, so its card stops being updated")
+	}
+
+	// The gate is still up on the admitted group, which is the honest state:
+	// its card IS behind, and Sprint 2 is what starts updating it.
+	var raised bool
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT slack_update_pending FROM alert_groups WHERE id = $1`, admitted).
+		Scan(&raised); err != nil {
+		t.Fatalf("read the gate: %v", err)
+	}
+	if !raised {
+		t.Error("the admitted group's gate was lowered by nobody")
+	}
+}

@@ -37,6 +37,15 @@ const (
 type Namespace string
 
 const (
+	// NamespaceEscalation is history and has no constructor. The escalation
+	// left the job engine in Epic 12: it is a set of commitments in the
+	// outbound domain now, and nothing writes a job under this name any more.
+	//
+	// It stays declared because the registry is how a row is READ. A database
+	// that still holds an escalation job from before the cutover would be a
+	// database this build refuses to start against - the dedup upgrade will not
+	// start on an active job whose family it cannot classify - and forgetting
+	// the name buys nothing: the whole registry goes in Sprint 3.
 	NamespaceEscalation  Namespace = "escalation"
 	NamespaceAckUpdate   Namespace = "ack_update"
 	NamespaceAlertUpdate Namespace = "alert_update"
@@ -185,16 +194,6 @@ func mustSpec(ns Namespace, key string) *Spec {
 		panic("jobdedup: no policy for " + string(ns))
 	}
 	return &Spec{namespace: ns, key: key, scope: d.scope, jobType: d.jobType}
-}
-
-// Escalation identifies the escalation of one alert group.
-//
-// The key is the alert group's ID and not its dedup key, which names the ALERT.
-// Alert groups are recreated under the same alert dedup key after every resolve,
-// so a forever claim on that string would silently swallow the escalation of
-// every repeat incident - nobody would be paged.
-func Escalation(alertGroupID string) *Spec {
-	return mustSpec(NamespaceEscalation, alertGroupID)
 }
 
 // AckUpdate identifies the message update that follows an acknowledgement.

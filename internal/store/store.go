@@ -1367,12 +1367,7 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 		return false, err
 	}
 
-	// 4. Cancel escalation job (same TX)
-	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
-		return false, err
-	}
-
-	// 5. Withdraw what the group still owes. In the same commit as the status
+	// 4. Withdraw what the group still owes. In the same commit as the status
 	// change, because "acknowledged" and "nobody is being paged any more" are
 	// one fact: split in two, a crash between them pages somebody for an alert
 	// that is already being handled.
@@ -1439,12 +1434,7 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 		return false, err
 	}
 
-	// 4. Cancel escalation job (same TX)
-	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
-		return false, err
-	}
-
-	// 5. Withdraw what the group still owes. In the same commit as the status
+	// 4. Withdraw what the group still owes. In the same commit as the status
 	// change, because "acknowledged" and "nobody is being paged any more" are
 	// one fact: split in two, a crash between them pages somebody for an alert
 	// that is already being handled.
@@ -1514,12 +1504,7 @@ func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Aler
 		return false, err
 	}
 
-	// 4. Cancel escalation job
-	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
-		return false, err
-	}
-
-	// 5. Withdraw what the group still owes: the alerts resolved themselves,
+	// 4. Withdraw what the group still owes: the alerts resolved themselves,
 	// and paging somebody about them now would be paging them about nothing.
 	if err := cancelIntentsTx(context.Background(), tx, id,
 		"every alert in the group resolved", "system"); err != nil {
@@ -1527,65 +1512,6 @@ func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Aler
 	}
 
 	return true, tx.Commit()
-}
-
-// cancelEscalationJobByAlertGroupIDTx cancels the escalation jobs of one alert
-// group, with their stages and their steps.
-//
-// It addresses them by what the caller means - this group's escalation - and not
-// by the dedup key, which is how this was written before. The key is a string
-// whose namespace each builder invents; addressing by it made the correctness of
-// cancellation depend on a uniqueness index rather than on the query, and it
-// would break silently the moment a job's identity changed.
-//
-// Every returned id is collected rather than the first one. The dedup model
-// admits one escalation per alert group, so a single Scan would look correct -
-// and would quietly stop being correct the moment a second namespace is allowed
-// to fill alert_group_id. Cancelling the jobs but only one job's children is the
-// kind of half-done state this function exists to prevent.
-//
-// type = 'escalation' is a schema predicate here, not a statement about
-// families. It does not make alert_group_id an escalation-only column - nothing
-// stops another type from filling it, which is precisely why the type predicate
-// is written out.
-func cancelEscalationJobByAlertGroupIDTx(tx *sql.Tx, alertGroupID string) error {
-	rows, err := tx.Query(`
-		UPDATE jobs SET status='canceled', canceled_at=NOW(), finished_at=NOW(), updated_at=NOW()
-		WHERE type='escalation' AND alert_group_id=$1 AND status IN ('pending','running')
-		RETURNING id`, alertGroupID)
-	if err != nil {
-		return err
-	}
-	var jobIDs []string
-	for rows.Next() {
-		var jobID string
-		if err := rows.Scan(&jobID); err != nil {
-			rows.Close()
-			return err
-		}
-		jobIDs = append(jobIDs, jobID)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	// Closed before the next statement, not deferred: lib/pq serves one
-	// statement at a time per connection, and the transaction has more to do.
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if len(jobIDs) == 0 {
-		return nil
-	}
-
-	_, err = tx.Exec(`UPDATE job_stages SET status='canceled', updated_at=NOW()
-		WHERE job_id = ANY($1) AND status IN ('active','blocked')`, pq.Array(jobIDs))
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(`UPDATE job_steps SET status='canceled', updated_at=NOW()
-		WHERE job_id = ANY($1) AND status IN ('pending','blocked','retry')`, pq.Array(jobIDs))
-	return err
 }
 
 // ========================================
@@ -1964,8 +1890,22 @@ func (s *Store) ClearSlackUpdate(id string, observedVersion int64) (bool, error)
 	return rows > 0, nil
 }
 
+// GetAlertGroupsPendingSlackUpdate finds the groups whose card is behind the
+// alerts on it.
+//
+// Outbound groups are excluded, and not as an optimisation. This loop updates a
+// card by finding the delivery that produced it in `notification_deliveries`,
+// and the outbound path writes no rows there - so for an admitted group it
+// finds nothing to update, leaves the gate up and comes back with the same
+// answer every two seconds until the group resolves. Sprint 2 gives the card to
+// the outbound domain; until then, an outbound group's card is not this loop's
+// to keep current (S1-D24).
 func (s *Store) GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error) {
-	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups WHERE slack_update_pending = TRUE AND status IN ($1, $2, $3)`
+	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups ag
+	          WHERE slack_update_pending = TRUE AND status IN ($1, $2, $3)
+	            AND NOT EXISTS (
+	                SELECT 1 FROM outbound_batches b WHERE b.alert_group_id = ag.id
+	            )`
 
 	rows, err := s.db.Query(query, model.AlertGroupStatusProcessing, model.AlertGroupStatusAcknowledged, model.AlertGroupStatusTriggered)
 	if err != nil {

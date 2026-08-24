@@ -16,8 +16,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher/builders"
-	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -521,118 +519,11 @@ func TestEngine_ScheduleRecreation_OnCallConsistency(t *testing.T) {
 	}
 }
 
-func TestEngine_StaleProcessing_WithSucceededJob_NotReconciled(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{}
-
-	teamID := "team-succeeded-noop"
-	policyID := "policy-succeeded"
-	s.CreateTeam(&model.Team{
-		ID:              teamID,
-		DefaultPolicyID: policyID,
-	})
-	s.CreateEscalationPolicy(&model.EscalationPolicy{
-		ID:   policyID,
-		Name: "Succeeded Policy",
-		Steps: []*model.EscalationStep{
-			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U111", StepIndex: 0, MaxAttempts: 3},
-		},
-	})
-
-	// AG in processing with stale updated_at
-	ag := &model.AlertGroup{
-		ID:        "ag-succeeded-noop",
-		AlertKey:  "dk-succeeded-noop",
-		Status:    model.AlertGroupStatusProcessing,
-		TeamID:    teamID,
-		Severity:  "info",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now().Add(-60 * time.Second),
-	}
-	s.CreateAlertGroup(ag)
-
-	// Simulate: escalation job already ran and succeeded
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
-	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
-	job, stages, steps, snapshot, _ := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
-	// Create job directly (bypassing engine) and mark as succeeded
-	if err := s.SeedEscalationJob(ag.ID, job, stages, steps); err != nil {
-		t.Fatalf("SeedEscalationJob: %v", err)
-	}
-	s.MarkJobSucceeded(jobdedup.Escalation(ag.ID))
-	// Save snapshot so we can verify it's not overwritten
-	s.UpdateAlertGroupPolicy(ag.ID, snapshot.PolicyID, snapshot)
-
-	beforeRun := time.Now()
-	eng.ProcessNewAlertGroups(context.Background())
-
-	// AG should NOT be picked up — job exists (succeeded), not a true orphan
-	updated, _ := s.GetAlertGroupByID("ag-succeeded-noop")
-	if updated.UpdatedAt.After(beforeRun) {
-		t.Error("Stale processing AG with succeeded job should NOT be re-processed by engine")
-	}
-}
-
-func TestEnsureEscalationJob_SkipsAckedAG(t *testing.T) {
-	s := store.NewMockStore()
-
-	// Create team + policy
-	teamID := "team-ack-skip"
-	policyID := "policy-ack-skip"
-	s.CreateTeam(&model.Team{
-		ID:              teamID,
-		DefaultPolicyID: policyID,
-	})
-	s.CreateEscalationPolicy(&model.EscalationPolicy{
-		ID:   policyID,
-		Name: "Ack Skip Policy",
-		Steps: []*model.EscalationStep{
-			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U111", StepIndex: 0, MaxAttempts: 3},
-		},
-	})
-
-	// Create AG already acknowledged
-	ag := &model.AlertGroup{
-		ID:        "ag-acked",
-		AlertKey:  "dk-acked",
-		Status:    model.AlertGroupStatusAcknowledged,
-		TeamID:    teamID,
-		Severity:  "info",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	s.CreateAlertGroup(ag)
-
-	// Build job for this AG (as engine would)
-	cfg := &config.Config{}
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
-	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
-	job, stages, steps, snapshot, err := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
-	if err != nil {
-		t.Fatalf("Build failed: %v", err)
-	}
-	if job == nil {
-		t.Fatal("Expected job to be built")
-	}
-	_ = eng // engine not used directly here
-
-	// Call EnsureEscalationJob — should return (false, nil)
-	created, err := s.EnsureEscalationJob(ag.ID, job, stages, steps, snapshot)
-	if err != nil {
-		t.Fatalf("EnsureEscalationJob error: %v", err)
-	}
-	if created {
-		t.Error("Expected created=false for acknowledged AG")
-	}
-
-	// Verify AG status unchanged
-	updated, _ := s.GetAlertGroupByID("ag-acked")
-	if updated.Status != model.AlertGroupStatusAcknowledged {
-		t.Errorf("Expected status to stay 'acknowledged', got '%s'", updated.Status)
-	}
-}
-
-func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
+// TestASecondTickDoesNotRestateWhatTheGroupEscalatesBy. The policy is edited
+// after the escalation was admitted, and the group keeps saying what it was
+// admitted under: the winner of the claim said what this group escalates by,
+// and a later producer does not get to restate it.
+func TestASecondTickDoesNotRestateWhatTheGroupEscalatesBy(t *testing.T) {
 	s := store.NewMockStore()
 
 	teamID := "team-dedup-snap"
@@ -699,7 +590,11 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	}
 }
 
-func TestEnsureEscalationJob_SkipsSucceededJob(t *testing.T) {
+// TestAGroupIsAdmittedOnceAndNeverAgain. The claim over a group's escalation is
+// held forever, whatever became of the deliveries under it. A group that comes
+// back round - a status change, a stale reconcile, anything - does not get a
+// second escalation, and a tick that finds the claim held touches nothing.
+func TestAGroupIsAdmittedOnceAndNeverAgain(t *testing.T) {
 	s := store.NewMockStore()
 	cfg := &config.Config{}
 
@@ -1078,9 +973,9 @@ func TestEngine_OnCallReadFailure_DefersEverything(t *testing.T) {
 		t.Errorf("the fallback schedule was read %d times after a failed team read, want 0", proj.scheduleCalls)
 	}
 
-	job, err := s.FindJobByIdentity(jobdedup.Escalation(ag.ID))
-	if err == nil && job != nil {
-		t.Errorf("job %s was committed on an unknown roster - nothing would ever rebuild it", job.ID)
+	if admission, admitted := s.AdmissionFor(ag.ID); admitted {
+		t.Errorf("the escalation was admitted on an unknown roster (%s) - an admission is "+
+			"held forever, so nothing would ever rebuild it", admission.Admission.BatchKey)
 	}
 
 	if got := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal) - deferralsBefore; got != 1 {

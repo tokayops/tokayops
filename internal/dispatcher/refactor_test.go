@@ -7,10 +7,8 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher/builders"
 	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -96,87 +94,6 @@ func TestResolutionFlow(t *testing.T) {
 	// 4. Verify Executor Called
 	if !resolveCalled {
 		t.Error("Executor did not call Resolve")
-	}
-}
-
-func TestEscalationFlow_BuilderIntegration(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d := mustNewDispatcher(t, s, cfg)
-
-	s.CreateUser(&model.User{ID: "U_ESCALATION", Name: "Escalation User"})
-	s.BindExternalIdentity(&model.ExternalIdentity{UserID: "U_ESCALATION", Provider: "slack", ExternalID: "U_ESCALATION"})
-
-	// Create policy in Store (new pattern)
-	policy := &model.EscalationPolicy{
-		ID:   "p1",
-		Name: "Test Policy",
-		Steps: []*model.EscalationStep{
-			{
-				ID:             "step1",
-				PolicyID:       "p1",
-				StepIndex:      0,
-				Provider:       "slack",
-				TargetKind:     "dm",
-				TargetType:     "user",
-				TargetID:       "U_ESCALATION",
-				DelaySeconds:   0,
-				TimeoutSeconds: 30,
-				MaxAttempts:    3,
-			},
-		},
-	}
-	s.CreateEscalationPolicy(policy)
-
-	mp := &MockProvider{
-		SendDMFunc: func(ctx context.Context, userID, message string) error {
-			if userID != "U_ESCALATION" {
-				t.Errorf("expected U_ESCALATION, got %s", userID)
-			}
-			return nil
-		},
-	}
-	d.RegisterProvider("slack", mp)
-
-	// Create AG
-	ag := &model.AlertGroup{ID: "ag1", TeamID: "team1", Severity: "critical", AlertKey: "dk1"}
-	s.CreateAlertGroup(ag)
-
-	// Build Job via Builder (now uses Store)
-	builder := builders.NewEscalationJobBuilder(s, &fakeTeamOnCall{}, cfg)
-	job, stages, steps, _, err := builder.Build(context.Background(), ag, "p1", schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
-	if err != nil {
-		t.Fatalf("Builder failed: %v", err)
-	}
-
-	// Set lease token and running status before seeding store (simulates claim)
-	step := steps[0]
-	leaseToken := "lease-escalation"
-	step.Status = model.JobStepStatusRunning
-	step.LockedBy = &leaseToken
-
-	if err := s.SeedEscalationJob(ag.ID, job, stages, steps); err != nil {
-		t.Fatalf("SeedEscalationJob: %v", err)
-	}
-
-	d.processStep(context.Background(), step)
-
-	storedStep, _ := s.GetJobStepByID(step.ID)
-	if storedStep.Status != model.JobStepStatusSucceeded {
-		t.Errorf("Escalation step failed: %s", storedStep.Status)
-	}
-
-	// Verify Timeline
-	events, _ := s.GetTimelineEvents("ag1")
-	found := false
-	for _, e := range events {
-		if e.Type == model.TimelineEventNotificationSent {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("Escalation should add timeline event")
 	}
 }
 

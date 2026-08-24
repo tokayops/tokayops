@@ -140,13 +140,11 @@ type StoreInterface interface {
 	// answer. The existing job's ID is not returned, because no caller ever
 	// read it.
 	CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (created bool, err error)
-	EnsureEscalationJob(agID string, job *model.Job, stages []*model.JobStage, steps []*model.JobStep, snapshot *model.EscalationPolicySnapshot) (bool, error)
 	GetJobByID(id string) (*model.Job, error)
 	GetJobStepByID(stepID string) (*model.JobStep, error)
 	ClaimNextJobSteps(limit int, duration time.Duration) ([]*model.JobStep, error)
 	UpdateJobStepIfOwned(step *model.JobStep, leaseToken string) (bool, error)
 	FinishStepAndAdvance(stepID string, leaseToken string, outcome model.JobStepStatus, result string, stepError string) (model.AdvanceResult, error)
-	CancelEscalationJobByAlertGroupID(alertGroupID string) error
 	ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error
 	FailJob(jobID string, errorMsg string) error
 

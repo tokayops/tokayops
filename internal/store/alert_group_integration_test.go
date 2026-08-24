@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 )
 
 func TestAlertGroupLifecycle(t *testing.T) {
@@ -885,324 +886,6 @@ func TestTransitionAlertGroupStatus_WrongFromStatus(t *testing.T) {
 	}
 }
 
-// ===================================================================================
-// EnsureEscalationJob Integration Tests
-// ===================================================================================
-
-// findEscalationJob is the local answer to "which job is this group's
-// escalation". The store used to expose a lookup by dedup key; nothing in
-// production ever called it, so it went away with the model rather than being
-// renamed into a lookup by identity nobody would call either.
-func findEscalationJob(t *testing.T, s *Store, agID string) *model.Job {
-	t.Helper()
-	var jobID string
-	err := s.GetDB().QueryRow(
-		`SELECT id FROM jobs WHERE type = 'escalation' AND alert_group_id = $1`, agID).Scan(&jobID)
-	if err != nil {
-		t.Fatalf("no escalation job for alert group %s: %v", agID, err)
-	}
-	job, err := s.GetJobByID(jobID)
-	if err != nil {
-		t.Fatalf("GetJobByID(%s): %v", jobID, err)
-	}
-	return job
-}
-
-// makeTestJob builds an escalation job the way the real builder does - which,
-// since the family became a closed registry, means NOT naming its identity, its
-// type or its alert group: EnsureEscalationJob derives all three from the group
-// it locks. The parameter is here for the stage and step fixtures.
-func makeTestJob(agID string) (*model.Job, []*model.JobStage, []*model.JobStep, *model.EscalationPolicySnapshot) {
-	now := time.Now()
-	jobID := uuid.New().String()
-	stageID := uuid.New().String()
-	stepID := uuid.New().String()
-
-	job := &model.Job{
-		ID:           jobID,
-		Status:       model.JobStatusPending,
-		CurrentStage: 0,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-	stages := []*model.JobStage{
-		{
-			ID:         stageID,
-			JobID:      jobID,
-			StageIndex: 0,
-			Status:     model.JobStageStatusActive,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-		},
-	}
-	steps := []*model.JobStep{
-		{
-			ID:          stepID,
-			JobID:       jobID,
-			StageID:     stageID,
-			StepIndex:   0,
-			StepType:    "dm",
-			Status:      model.JobStepStatusPending,
-			MaxAttempts: 3,
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		},
-	}
-	snapshot := &model.EscalationPolicySnapshot{
-		PolicyID: "test-policy",
-		Name:     "Test Policy",
-		Steps: []*model.EscalationStepSnapshot{
-			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U999"},
-		},
-	}
-	return job, stages, steps, snapshot
-}
-
-func TestEnsureEscalationJob_CreatesJobAndSnapshot(t *testing.T) {
-	s := setupTestDB(t)
-
-	agID := createTestTeamAndAG(t, s, "team-ensure-create", model.AlertGroupStatusNew)
-	job, stages, steps, snapshot := makeTestJob(agID)
-
-	created, err := s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
-	if err != nil {
-		t.Fatalf("EnsureEscalationJob failed: %v", err)
-	}
-	if !created {
-		t.Error("Expected created=true for new AG")
-	}
-
-	// Verify AG is now processing with snapshot
-	updated, err := s.GetAlertGroupByID(agID)
-	if err != nil {
-		t.Fatalf("GetAlertGroupByID failed: %v", err)
-	}
-	if updated.Status != model.AlertGroupStatusProcessing {
-		t.Errorf("Expected status 'processing', got '%s'", updated.Status)
-	}
-	if updated.PolicyID != "test-policy" {
-		t.Errorf("Expected policy_id 'test-policy', got '%s'", updated.PolicyID)
-	}
-	if updated.PolicySnapshot == nil {
-		t.Fatal("Expected policy snapshot to be saved")
-	}
-	if len(updated.PolicySnapshot.Steps) != 1 || updated.PolicySnapshot.Steps[0].TargetID != "U999" {
-		t.Errorf("Snapshot has wrong data: %+v", updated.PolicySnapshot)
-	}
-
-	// Verify job exists
-	fetchedJob := findEscalationJob(t, s, agID)
-	if fetchedJob.Type != "escalation" {
-		t.Errorf("Expected job type 'escalation', got '%s'", fetchedJob.Type)
-	}
-}
-
-func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
-	s := setupTestDB(t)
-
-	agID := createTestTeamAndAG(t, s, "team-ensure-dedup", model.AlertGroupStatusNew)
-
-	// First call — creates job with V1 snapshot
-	job1, stages1, steps1, snapshot1 := makeTestJob(agID)
-	snapshot1.Steps[0].TargetID = "UserV1"
-
-	created, err := s.EnsureEscalationJob(agID, job1, stages1, steps1, snapshot1)
-	if err != nil {
-		t.Fatalf("First EnsureEscalationJob failed: %v", err)
-	}
-	if !created {
-		t.Fatal("Expected first call to create")
-	}
-
-	// Force AG back to "new" to allow re-processing
-	forceAlertGroupStatus(t, s, agID, model.AlertGroupStatusNew)
-
-	// Second call — same dedup_key, V2 snapshot
-	job2, stages2, steps2, snapshot2 := makeTestJob(agID)
-	snapshot2.Steps[0].TargetID = "UserV2"
-
-	created, err = s.EnsureEscalationJob(agID, job2, stages2, steps2, snapshot2)
-	if err != nil {
-		t.Fatalf("Second EnsureEscalationJob failed: %v", err)
-	}
-	if created {
-		t.Error("Expected created=false on dedup conflict")
-	}
-
-	// Verify snapshot is still V1
-	updated, _ := s.GetAlertGroupByID(agID)
-	if updated.PolicySnapshot == nil {
-		t.Fatal("Snapshot should still exist")
-	}
-	if updated.PolicySnapshot.Steps[0].TargetID != "UserV1" {
-		t.Errorf("Snapshot should stay UserV1, got %s", updated.PolicySnapshot.Steps[0].TargetID)
-	}
-}
-
-func TestEnsureEscalationJob_UserWins_ConcurrentAck(t *testing.T) {
-	s := setupTestDB(t)
-
-	// Start AG in "processing" so both EnsureEscalationJob and AckAlertGroupAtomic
-	// can legitimately operate on it — this is the real race window.
-	agID := createTestTeamAndAG(t, s, "team-ensure-race-ack", model.AlertGroupStatusProcessing)
-
-	const iterations = 20
-	for i := 0; i < iterations; i++ {
-		// Reset AG to processing for each iteration
-		forceAlertGroupStatus(t, s, agID, model.AlertGroupStatusProcessing)
-		// Cancel any existing active job so dedup doesn't interfere
-		s.CancelEscalationJobByAlertGroupID(agID)
-
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		var ackChanged bool
-		var ackErr error
-		var ensureCreated bool
-		var ensureErr error
-
-		// Goroutine 1: user acks the AG
-		go func() {
-			defer wg.Done()
-			ackChanged, ackErr = s.AckAlertGroupAtomic(agID, "UserWins", nil, nil)
-		}()
-
-		// Goroutine 2: engine ensures escalation job
-		go func() {
-			defer wg.Done()
-			job, stages, steps, snapshot := makeTestJob(agID)
-			ensureCreated, ensureErr = s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
-		}()
-
-		wg.Wait()
-
-		if ackErr != nil {
-			t.Fatalf("iteration %d: AckAlertGroupAtomic error: %v", i, ackErr)
-		}
-		if ensureErr != nil {
-			t.Fatalf("iteration %d: EnsureEscalationJob error: %v", i, ensureErr)
-		}
-
-		// Invariant: exactly one wins. They must not both succeed.
-		// - If ack wins: ackChanged=true, ensureCreated=false, status=acknowledged
-		// - If ensure wins: ensureCreated=true, ackChanged may be true (ack from processing is valid),
-		//   but status ends up acknowledged (ack runs after ensure's commit)
-		//   OR ackChanged=false if ack saw acknowledged/other non-eligible status.
-		//
-		// The critical invariant: if ensureCreated=true, the AG must NOT silently
-		// lose the ack (i.e., stay processing without the ack timeline event).
-		updated, _ := s.GetAlertGroupByID(agID)
-
-		if ackChanged && ensureCreated {
-			// Both succeeded — this is valid only if ensure ran first (AG: processing→processing+job),
-			// then ack ran (AG: processing→acknowledged). Final status must be acknowledged.
-			if updated.Status != model.AlertGroupStatusAcknowledged {
-				t.Fatalf("iteration %d: both succeeded but status is '%s', expected 'acknowledged'",
-					i, updated.Status)
-			}
-		} else if ackChanged && !ensureCreated {
-			// Ack won, ensure saw non-eligible status
-			if updated.Status != model.AlertGroupStatusAcknowledged {
-				t.Fatalf("iteration %d: ack won but status is '%s'", i, updated.Status)
-			}
-		} else if !ackChanged && ensureCreated {
-			// Ensure won, ack saw already-acknowledged or lost the race.
-			// Status should be processing (ensure set it, ack failed).
-			if updated.Status != model.AlertGroupStatusProcessing {
-				t.Fatalf("iteration %d: ensure won but status is '%s'", i, updated.Status)
-			}
-		} else {
-			// Neither succeeded — shouldn't happen from processing status
-			t.Fatalf("iteration %d: neither ack nor ensure succeeded (ack=%v, ensure=%v, status=%s)",
-				i, ackChanged, ensureCreated, updated.Status)
-		}
-	}
-}
-
-func TestEnsureEscalationJob_ConcurrentRace(t *testing.T) {
-	s := setupTestDB(t)
-
-	agID := createTestTeamAndAG(t, s, "team-ensure-concurrent", model.AlertGroupStatusNew)
-
-	const goroutines = 5
-	var wg sync.WaitGroup
-	wg.Add(goroutines)
-
-	results := make([]bool, goroutines)
-	errs := make([]error, goroutines)
-
-	for i := 0; i < goroutines; i++ {
-		go func(idx int) {
-			defer wg.Done()
-			job, stages, steps, snapshot := makeTestJob(agID)
-			created, err := s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
-			results[idx] = created
-			errs[idx] = err
-		}(i)
-	}
-
-	wg.Wait()
-
-	createdCount := 0
-	for i := 0; i < goroutines; i++ {
-		if errs[i] != nil {
-			t.Errorf("goroutine %d: unexpected error: %v", i, errs[i])
-		}
-		if results[i] {
-			createdCount++
-		}
-	}
-
-	if createdCount != 1 {
-		t.Errorf("Expected exactly 1 created=true, got %d", createdCount)
-	}
-
-	// Verify AG is processing
-	updated, _ := s.GetAlertGroupByID(agID)
-	if updated.Status != model.AlertGroupStatusProcessing {
-		t.Errorf("Expected status 'processing', got '%s'", updated.Status)
-	}
-}
-
-func TestEnsureEscalationJob_BlockedBySucceededJob(t *testing.T) {
-	s := setupTestDB(t)
-
-	agID := createTestTeamAndAG(t, s, "team-blocked-succeeded", model.AlertGroupStatusNew)
-	job, stages, steps, snapshot := makeTestJob(agID)
-	// Set AlertGroupID on the job
-	job.AlertGroupID = &agID
-
-	// First call — creates escalation job
-	created, err := s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
-	if err != nil {
-		t.Fatalf("First EnsureEscalationJob failed: %v", err)
-	}
-	if !created {
-		t.Fatal("Expected first call to create")
-	}
-
-	// Mark job as succeeded
-	_, err = s.GetDB().Exec(`UPDATE jobs SET status = 'succeeded', finished_at = NOW() WHERE id = $1`, job.ID)
-	if err != nil {
-		t.Fatalf("Failed to mark job as succeeded: %v", err)
-	}
-
-	// Force AG back to "new" to allow re-processing
-	forceAlertGroupStatus(t, s, agID, model.AlertGroupStatusNew)
-
-	// Second call — should be blocked by the unique index (succeeded job exists)
-	job2, stages2, steps2, snapshot2 := makeTestJob(agID)
-	job2.AlertGroupID = &agID
-
-	created, err = s.EnsureEscalationJob(agID, job2, stages2, steps2, snapshot2)
-	if err != nil {
-		t.Fatalf("Second EnsureEscalationJob failed: %v", err)
-	}
-	if created {
-		t.Error("Expected created=false — DB invariant should block second escalation job for same AG")
-	}
-}
-
 // TestGetEscalationSources_SkipsAGAlreadyAdmitted. A group whose escalation was
 // admitted is out of the loop for good, whatever became of the deliveries under
 // it: the claim is held forever, and picking the group up again would promise
@@ -1823,207 +1506,95 @@ func TestSeed_AlertGroupHasTeamNameSnapshot(t *testing.T) {
 }
 
 // ===================================================================================
-// Escalation cancellation by alert group (Epic 11 Sprint 1)
+// What acknowledging and resolving stop
 //
-// Cancellation used to address the job by its raw dedup key, which made its
-// correctness depend on a uniqueness index rather than on the query. These tests
-// pin what it addresses now.
+// A user who acknowledges is saying "I have this", and a user who resolves is
+// saying "it is over". Either way nobody may be paged about it afterwards - and
+// that has to hold in the SAME commit as the status change, because a crash
+// between the two would page somebody for an alert that is already handled.
 //
-// They lean on createTestTeamAndAG setting AlertKey = "key-" + agID: the two are
-// deliberately different, so a query that went back to matching on dedup_key
-// while being handed an alert group id would find nothing and redden every
-// positive case below.
+// All three doors are here. Only one of them used to be exercised against what
+// it actually withdraws, and the other two were covered by a job that no longer
+// exists.
 // ===================================================================================
 
-// jobStatuses reads back a job with its stages and steps.
-func jobStatuses(t *testing.T, s *Store, jobID string) (string, []string, []string) {
-	t.Helper()
+func TestTheDoorsThatStopADeliveryStopAllOfIt(t *testing.T) {
+	s := setupTestDB(t)
 
-	var jobStatus string
-	if err := s.GetDB().QueryRow(`SELECT status FROM jobs WHERE id = $1`, jobID).Scan(&jobStatus); err != nil {
-		t.Fatalf("read job %s: %v", jobID, err)
-	}
-
-	read := func(query string) []string {
-		rows, err := s.GetDB().Query(query, jobID)
-		if err != nil {
-			t.Fatalf("read children of %s: %v", jobID, err)
-		}
-		defer rows.Close()
-		var out []string
-		for rows.Next() {
-			var st string
-			if err := rows.Scan(&st); err != nil {
-				t.Fatalf("scan status: %v", err)
+	doors := map[string]func(t *testing.T, agID string){
+		"a user acknowledged": func(t *testing.T, agID string) {
+			changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+			if err != nil || !changed {
+				t.Fatalf("AckAlertGroupAtomic = %v, %v", changed, err)
 			}
-			out = append(out, st)
-		}
-		return out
+		},
+		"a user resolved": func(t *testing.T, agID string) {
+			changed, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+			if err != nil || !changed {
+				t.Fatalf("ResolveAlertGroupAtomic = %v, %v", changed, err)
+			}
+		},
+		"every alert resolved itself": func(t *testing.T, agID string) {
+			changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, nil, nil, nil)
+			if err != nil || !changed {
+				t.Fatalf("ResolveAlertGroupWithAlertsAtomic = %v, %v", changed, err)
+			}
+		},
 	}
-	return jobStatus,
-		read(`SELECT status FROM job_stages WHERE job_id = $1`),
-		read(`SELECT status FROM job_steps WHERE job_id = $1`)
+
+	for name, close := range doors {
+		t.Run(name, func(t *testing.T) {
+			agID := outboundGroup(t, s)
+			owed := admitOne(t, s, agID,
+				channelCommitment("C0001", 0), channelCommitment("C0002", 5*time.Minute))
+
+			close(t, agID)
+
+			for _, intentID := range owed {
+				if got := statusOf(t, s, intentID); got != outbound.StatusCanceled {
+					t.Errorf("a notification survived as %s", got)
+				}
+			}
+
+			// And the history says why, once per withdrawn commitment: an
+			// operator reading the alert has to be able to tell "nobody was
+			// told" from "everybody was told".
+			var explained int
+			if err := s.db.QueryRow(`
+				SELECT count(*) FROM outbound_intent_events e
+				JOIN outbound_intents i ON i.id = e.intent_id
+				WHERE i.alert_group_id = $1 AND e.kind = 'canceled'`,
+				agID).Scan(&explained); err != nil {
+				t.Fatalf("count the explanations: %v", err)
+			}
+			if explained != len(owed) {
+				t.Errorf("%d of %d withdrawals were explained", explained, len(owed))
+			}
+		})
+	}
 }
 
-// seedEscalation puts an alert group into processing with a live escalation job,
-// the way the engine does.
-func seedEscalation(t *testing.T, s *Store, teamID string) (agID, jobID string) {
-	t.Helper()
-	agID = createTestTeamAndAG(t, s, teamID, model.AlertGroupStatusProcessing)
-	job, stages, steps, snapshot := makeTestJob(agID)
-	created, err := s.EnsureEscalationJob(agID, job, stages, steps, snapshot)
-	if err != nil || !created {
-		t.Fatalf("EnsureEscalationJob(%s) = %v, %v", agID, created, err)
-	}
-	return agID, job.ID
-}
-
-func requireCanceledThrough(t *testing.T, s *Store, jobID string) {
-	t.Helper()
-	jobStatus, stages, steps := jobStatuses(t, s, jobID)
-	if jobStatus != string(model.JobStatusCanceled) {
-		t.Errorf("job %s = %s, want canceled", jobID, jobStatus)
-	}
-	for _, st := range stages {
-		if st != string(model.JobStageStatusCanceled) {
-			t.Errorf("stage of %s = %s, want canceled", jobID, st)
-		}
-	}
-	for _, st := range steps {
-		if st != string(model.JobStepStatusCanceled) {
-			t.Errorf("step of %s = %s, want canceled", jobID, st)
-		}
-	}
-}
-
-func TestAckAlertGroupAtomic_CancelsEscalationOfItsGroup(t *testing.T) {
+// TestADoorLeavesAnotherAlertAlone. The withdrawal names one alert group, and a
+// query that stopped naming it would take every alert in the system with it.
+func TestADoorLeavesAnotherAlertAlone(t *testing.T) {
 	s := setupTestDB(t)
-	agID, jobID := seedEscalation(t, s, "team-cancel-ack")
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil)
-	if err != nil || !changed {
-		t.Fatalf("AckAlertGroupAtomic = %v, %v", changed, err)
-	}
-	requireCanceledThrough(t, s, jobID)
-}
+	acknowledged := outboundGroup(t, s)
+	owed := admitOne(t, s, acknowledged)[0]
 
-func TestResolveAlertGroupAtomic_CancelsEscalationOfItsGroup(t *testing.T) {
-	s := setupTestDB(t)
-	agID, jobID := seedEscalation(t, s, "team-cancel-resolve")
+	bystander := outboundGroup(t, s)
+	stillOwed := admitOne(t, s, bystander)[0]
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil)
-	if err != nil || !changed {
-		t.Fatalf("ResolveAlertGroupAtomic = %v, %v", changed, err)
-	}
-	requireCanceledThrough(t, s, jobID)
-}
-
-func TestResolveAlertGroupWithAlertsAtomic_CancelsEscalationOfItsGroup(t *testing.T) {
-	s := setupTestDB(t)
-	agID, jobID := seedEscalation(t, s, "team-cancel-resolve-alerts")
-
-	changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, nil, nil, nil)
-	if err != nil || !changed {
-		t.Fatalf("ResolveAlertGroupWithAlertsAtomic = %v, %v", changed, err)
-	}
-	requireCanceledThrough(t, s, jobID)
-}
-
-// TestCancelEscalationJob_LeavesAnotherGroupAlone: cancellation names one alert
-// group, and a query that stopped naming it would take the whole table with it.
-func TestCancelEscalationJob_LeavesAnotherGroupAlone(t *testing.T) {
-	s := setupTestDB(t)
-	acked, ackedJob := seedEscalation(t, s, "team-cancel-mine")
-	_, otherJob := seedEscalation(t, s, "team-cancel-theirs")
-
-	if err := s.CancelEscalationJobByAlertGroupID(acked); err != nil {
-		t.Fatalf("CancelEscalationJobByAlertGroupID: %v", err)
+	if _, err := s.AckAlertGroupAtomic(acknowledged, "nina", nil, nil); err != nil {
+		t.Fatalf("acknowledge: %v", err)
 	}
 
-	requireCanceledThrough(t, s, ackedJob)
-	if status, _, _ := jobStatuses(t, s, otherJob); status != string(model.JobStatusPending) {
-		t.Errorf("another group's escalation = %s, want pending", status)
+	if got := statusOf(t, s, owed); got != outbound.StatusCanceled {
+		t.Errorf("the acknowledged alert still owes a notification: %s", got)
 	}
-}
-
-// TestCancelEscalationJob_LeavesOtherJobTypesAlone: the type predicate.
-//
-// Production does not put alert_group_id on resolution jobs today, so the row is
-// inserted directly - the point is the predicate, not the scenario. It stops
-// being hypothetical the moment another family gains that column.
-func TestCancelEscalationJob_LeavesOtherJobTypesAlone(t *testing.T) {
-	s := setupTestDB(t)
-	agID, escalationJob := seedEscalation(t, s, "team-cancel-types")
-
-	resolutionJob := uuid.New().String()
-	if _, err := s.GetDB().Exec(`
-		INSERT INTO jobs (id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
-			alert_group_id, current_stage, created_at, updated_at)
-		VALUES ($1, 'resolution', 'pending', '{}', 'resolution', $2, 'while_active', $3, 0, NOW(), NOW())`,
-		resolutionJob, "resolve_"+agID, agID); err != nil {
-		t.Fatalf("seed resolution job: %v", err)
+	if got := statusOf(t, s, stillOwed); got != outbound.StatusPending {
+		t.Fatalf("another alert's notification was withdrawn too: %s", got)
 	}
-
-	if err := s.CancelEscalationJobByAlertGroupID(agID); err != nil {
-		t.Fatalf("CancelEscalationJobByAlertGroupID: %v", err)
-	}
-
-	requireCanceledThrough(t, s, escalationJob)
-	if status, _, _ := jobStatuses(t, s, resolutionJob); status != string(model.JobStatusPending) {
-		t.Errorf("resolution job of the same group = %s, want pending", status)
-	}
-}
-
-func TestCancelEscalationJobByAlertGroupID_NoActiveJob(t *testing.T) {
-	s := setupTestDB(t)
-	agID := createTestTeamAndAG(t, s, "team-cancel-none", model.AlertGroupStatusTriggered)
-
-	if err := s.CancelEscalationJobByAlertGroupID(agID); err != nil {
-		t.Errorf("cancelling with no active escalation = %v, want nil", err)
-	}
-}
-
-// TestCancelEscalationJob_ReachesChildrenOfEveryMatch: cancellation must not
-// stop at the first job it cancelled.
-//
-// The UPDATE cancels every matching row, so reading one id back and cancelling
-// only that job's stages and steps leaves the rest half-cancelled - jobs marked
-// canceled with children still pending, which the worker would happily claim.
-//
-// The dedup model admits one escalation per alert group, so a second row of the
-// same identity cannot exist. A row with no identity at all can: that is the
-// shape a historical job takes when the upgrade could not classify it, and
-// nothing stops it from being active and pointing at this group. It is exactly
-// the second match the predicate has to reach.
-func TestCancelEscalationJob_ReachesChildrenOfEveryMatch(t *testing.T) {
-	s := setupTestDB(t)
-	agID, firstJob := seedEscalation(t, s, "team-cancel-many")
-
-	secondJob, secondStage, secondStep := uuid.New().String(), uuid.New().String(), uuid.New().String()
-	if _, err := s.GetDB().Exec(`
-		INSERT INTO jobs (id, type, status, payload, alert_group_id, current_stage, created_at, updated_at)
-		VALUES ($1, 'escalation', 'pending', '{}', $2, 0, NOW(), NOW())`,
-		secondJob, agID); err != nil {
-		t.Fatalf("seed the second escalation: %v", err)
-	}
-	if _, err := s.GetDB().Exec(`
-		INSERT INTO job_stages (id, job_id, stage_index, status, created_at, updated_at)
-		VALUES ($1, $2, 0, 'active', NOW(), NOW())`, secondStage, secondJob); err != nil {
-		t.Fatalf("seed its stage: %v", err)
-	}
-	if _, err := s.GetDB().Exec(`
-		INSERT INTO job_steps (id, job_id, stage_id, step_index, step_type, status, data, max_attempts, created_at, updated_at)
-		VALUES ($1, $2, $3, 0, 'dm', 'pending', '{}', 3, NOW(), NOW())`,
-		secondStep, secondJob, secondStage); err != nil {
-		t.Fatalf("seed its step: %v", err)
-	}
-
-	if err := s.CancelEscalationJobByAlertGroupID(agID); err != nil {
-		t.Fatalf("CancelEscalationJobByAlertGroupID: %v", err)
-	}
-
-	requireCanceledThrough(t, s, firstJob)
-	requireCanceledThrough(t, s, secondJob)
 }
 
 // TestAlertKeyRenameFromAnOlderSchema: a database written before the alert's
