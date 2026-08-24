@@ -587,3 +587,68 @@ func TestAWorkerStopsWhenItIsTold(t *testing.T) {
 		t.Fatal("a worker with nothing in flight waited to be told twice")
 	}
 }
+
+// TestRunHoldsUntilTheAnswerIsRecorded. Everything above drives tick() and
+// serve(); this one drives Run, because the property is about Run RETURNING.
+//
+// Whoever starts the worker has to be able to wait for it, and waiting only
+// means something if Run does not come back while a call it has already made is
+// still being written down. A process that exits there leaves the delivery
+// ambiguous: the message may have gone out, nothing says so, and somebody has
+// to decide. This is what the join in cmd/tokayops guards, and the container's
+// stop grace period has to outlast it.
+func TestRunHoldsUntilTheAnswerIsRecorded(t *testing.T) {
+	store := newFakeStore()
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
+	store.available["slack"] = &queues{fresh: 1}
+
+	channel := newFakeChannel()
+	channel.block = make(chan struct{})
+
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	ctx, stop := context.WithCancel(context.Background())
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		w.Run(ctx)
+	}()
+
+	// Wait until a call is genuinely out at the provider.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(channel.made()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no attempt was ever started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// SIGTERM, as far as the worker is concerned.
+	stop()
+
+	select {
+	case <-returned:
+		t.Fatal("Run returned while a call it had made was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, _, finalized := store.counts(); finalized != 0 {
+		t.Fatalf("%d results were recorded before the provider answered", finalized)
+	}
+
+	// The provider answers, a second after the shutdown began.
+	close(channel.block)
+
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after the call it was holding finished")
+	}
+
+	if _, _, finalized := store.counts(); finalized != 1 {
+		t.Fatalf("%d results were recorded, so an answer that arrived during the "+
+			"shutdown was thrown away", finalized)
+	}
+	if got := store.finalized[0].Conclusion.Outcome(); got != OutcomeAccepted {
+		t.Fatalf("the answer was recorded as %q", got)
+	}
+}

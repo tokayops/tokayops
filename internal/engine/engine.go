@@ -153,10 +153,10 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		// be rendered from, and one commitment per recipient.
 		admission, err := e.plan.buildPlan(ctx, ag, teamOnCall)
 
-		// The recipients could not be resolved, so no job is committed and the
-		// alert group stays "new" for the next tick to try again. Committing
-		// one would spend this alert's only chance to page its on-call: nothing
-		// picks up an alert group that already has an escalation job.
+		// The recipients could not be resolved, so nothing is admitted and the
+		// alert group stays "new" for the next tick to try again. Admitting
+		// would spend this alert's only chance to page its on-call: nothing
+		// picks up a group that already holds an admission.
 		//
 		// Nothing is logged for this group: it will be back next tick, and the
 		// tick after that. The tally declared above the loop reports all of
@@ -178,8 +178,8 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		}
 		log.Printf("AlertEngine: Processing %s (Team: %s, Sev: %s)", ag.ID, ag.TeamID, ag.Severity)
 		// Still reachable, and worth one line: a policy with no schedule-typed
-		// step builds fine without this answer, and damaged schedule data
-		// degrades to a marker rather than deferring. Both commit a job, so
+		// step plans fine without this answer, and damaged schedule data
+		// degrades to a recorded reason rather than deferring. Both admit, so
 		// this group is processed once rather than every tick.
 		if err := teamOnCall.Err(); err != nil {
 			log.Printf("AlertEngine: Failed to fetch oncall for %s: %v", ag.ID, err)

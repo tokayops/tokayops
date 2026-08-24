@@ -12,17 +12,6 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// escalationJobType is the type an escalation row carries. It is read from the
-// model rather than spelled out here: the registry decides what a family is,
-// and a second copy of the answer is a second thing to keep in step.
-func escalationJobType() string {
-	policy, ok := jobdedup.PolicyOf(jobdedup.NamespaceEscalation)
-	if !ok {
-		panic("jobdedup: the escalation namespace is not declared")
-	}
-	return policy.JobType
-}
-
 // insertJobTx inserts a job with its stages and steps inside the given
 // transaction and reports whether it was inserted at all.
 //

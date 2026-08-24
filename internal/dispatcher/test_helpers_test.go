@@ -65,3 +65,34 @@ func withLegacySteps(d *Dispatcher) *Dispatcher {
 	}
 	return d
 }
+
+// TestTheEscalationStepTypesAreGone. Every other test in this package goes
+// through mustNewDispatcher, which registers a stand-in for the deleted
+// escalation executor - so none of them would notice production putting one
+// back. This one asks the real constructor.
+//
+// A step type that resolves is a step type something can execute, and an
+// escalation is not the job engine's work any more. A leftover job from before
+// the cutover has to FAIL on its first step, which is what makes the producer
+// pick its group up and escalate it properly.
+func TestTheEscalationStepTypesAreGone(t *testing.T) {
+	d, err := NewDispatcher(store.NewMockStore(), &config.Config{})
+	if err != nil {
+		t.Fatalf("NewDispatcher: %v", err)
+	}
+
+	for _, stepType := range []string{"dm", "channel", "firehose"} {
+		if _, registered := d.executors[stepType]; registered {
+			t.Errorf("%q still has an executor, so an escalation job would run "+
+				"beside the outbound domain", stepType)
+		}
+	}
+
+	// And the ones that are still the job engine's work are still there, so
+	// this test fails for the right reason if the registry is emptied wholesale.
+	for _, stepType := range []string{"resolve", "update", "handoff_notify"} {
+		if _, registered := d.executors[stepType]; !registered {
+			t.Errorf("%q lost its executor", stepType)
+		}
+	}
+}

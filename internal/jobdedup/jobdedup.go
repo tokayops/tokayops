@@ -41,11 +41,17 @@ const (
 	// left the job engine in Epic 12: it is a set of commitments in the
 	// outbound domain now, and nothing writes a job under this name any more.
 	//
-	// It stays declared because the registry is how a row is READ. A database
-	// that still holds an escalation job from before the cutover would be a
-	// database this build refuses to start against - the dedup upgrade will not
-	// start on an active job whose family it cannot classify - and forgetting
-	// the name buys nothing: the whole registry goes in Sprint 3.
+	// It stays declared for one reason only - the registry is how a row is
+	// READ, and PolicyOf on an unknown namespace is an error. Rows written
+	// before the cutover stay readable; that is all this name does. The whole
+	// registry goes in Sprint 3.
+	//
+	// It is NOT a start-up guard. Nothing refuses to serve a database that
+	// still holds an active escalation job, and nothing needs to: the upgrade
+	// is a stop-the-world cutover, and a leftover job fails on its first step
+	// because no executor takes "dm", "channel" or "firehose" any more. Failing
+	// is the right end for it - the group it belongs to has no admission, so
+	// the producer picks the group up and escalates it properly.
 	NamespaceEscalation  Namespace = "escalation"
 	NamespaceAckUpdate   Namespace = "ack_update"
 	NamespaceAlertUpdate Namespace = "alert_update"

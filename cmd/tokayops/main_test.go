@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -117,5 +120,65 @@ func TestUnknownCommandRefusedBeforeTheDatabase(t *testing.T) {
 	// refusal came from the database, not from the argument.
 	if strings.Contains(output, "Using DB:") {
 		t.Errorf("the binary reached the database before refusing the command:\n%s", output)
+	}
+}
+
+// TestShutdownWaitsForTheWorkersItWasGiven.
+//
+// The outbound worker holds calls that have BEEN MADE. A process that cancels
+// its context and exits leaves an answer arriving a moment later with nowhere
+// to go, and the delivery becomes ambiguous - a message that may or may not
+// have been sent, with nothing saying which. That is what this waits for, and
+// it was missing: the workers were started fire-and-forget.
+func TestShutdownWaitsForTheWorkersItWasGiven(t *testing.T) {
+	quit := make(chan os.Signal, 1)
+	stopped := make(chan struct{})
+
+	var cancelled atomic.Bool
+	cancelledFirst := make(chan struct{})
+	cancel := func() {
+		cancelled.Store(true)
+		close(cancelledFirst)
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		awaitShutdown(quit, cancel, nil, stopped)
+	}()
+
+	// Nothing happens until the signal.
+	select {
+	case <-returned:
+		t.Fatal("the process gave up before it was told to")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	quit <- syscall.SIGTERM
+
+	// The worker is told to stop before it is waited for, or the wait would be
+	// for something that has no reason to end.
+	select {
+	case <-cancelledFirst:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the background context was never cancelled")
+	}
+
+	// And the process stays while the worker is still finishing.
+	select {
+	case <-returned:
+		t.Fatal("the process exited while a worker was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(stopped)
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the process did not exit after its workers were done")
+	}
+	if !cancelled.Load() {
+		t.Error("the workers were waited for without being told to stop")
 	}
 }

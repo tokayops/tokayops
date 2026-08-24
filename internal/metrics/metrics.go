@@ -148,11 +148,6 @@ var (
 		Name: "slack_unlinked_user_total",
 		Help: "Slack interaction attempts from users without a linked TokayOps account.",
 	})
-
-	SlackEscalationCancelErrorTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "slack_escalation_cancel_error_total",
-		Help: "Errors when cancelling escalation jobs from Slack interactive handler.",
-	})
 )
 
 // Tier 6b — Telegram interactivity (Epic 8 Sprint 3). Mirrors the Slack counters;
@@ -256,7 +251,6 @@ func init() {
 	prometheus.MustRegister(SlackUserLinkedTotal)
 	prometheus.MustRegister(SlackInteractionTotal)
 	prometheus.MustRegister(SlackUnlinkedUserTotal)
-	prometheus.MustRegister(SlackEscalationCancelErrorTotal)
 
 	prometheus.MustRegister(TelegramUserLinkedTotal)
 	prometheus.MustRegister(TelegramInteractionTotal)

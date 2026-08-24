@@ -436,8 +436,8 @@ func main() {
 	// at each attempt on purpose: a rotated token has to apply to work that has
 	// not gone out yet. What a MESSAGE depends on was frozen at admission
 	// instead - see the engine above.
-	identityLookup := func(_ context.Context, userID, provider string) (string, error) {
-		identity, err := st.GetExternalIdentity(userID, provider)
+	identityLookup := func(ctx context.Context, userID, provider string) (string, error) {
+		identity, err := st.GetExternalIdentityContext(ctx, userID, provider)
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", providers.ErrNotLinked
 		}
@@ -457,7 +457,27 @@ func main() {
 	// 9. Start Background Workers
 	go eng.Run(ctx)
 	go disp.Run(ctx)
-	go outboundWorker.Run(ctx)
+
+	// The outbound worker is the one that gets waited for on the way out.
+	//
+	// The others can be abandoned mid-tick: their work is a row in a queue that
+	// the next process picks up. This one is holding calls that have BEEN MADE,
+	// and walking away from an answer that has just arrived is the one outcome
+	// the whole domain exists to avoid - the delivery becomes ambiguous, and
+	// somebody has to decide whether it happened. Run drains what it holds and
+	// returns; nothing else waited for it, so every restart risked a handful of
+	// those.
+	//
+	// It is given no deadline here on purpose. The worker has its own
+	// (outbound.NotificationShutdownDeadline, 60s: the longest one commitment
+	// can take), and a shorter one wrapped round it would defeat the reason
+	// that number is a sum rather than a guess. The container's stop grace
+	// period has to be longer than it - see docker-compose.prod.yml.
+	outboundStopped := make(chan struct{})
+	go func() {
+		defer close(outboundStopped)
+		outboundWorker.Run(ctx)
+	}()
 
 	// Outbox Delivery Worker
 	allowedCIDRs, _ := config.ParseAllowedPrivateCIDRs()
@@ -582,15 +602,42 @@ func main() {
 	// Graceful Shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	awaitShutdown(quit, cancel, internalSrv, outboundStopped)
+}
+
+// awaitShutdown is the exit path, in one place so the order is testable: what a
+// signal cancels, and what the process waits for before it returns.
+//
+// The waiting is the part that was missing. Background workers were started
+// fire-and-forget, so a SIGTERM cancelled their context and the process exited
+// while the outbound worker was still holding a call it had already made. The
+// answer arriving a moment later went nowhere, and the delivery became
+// ambiguous - a message that may or may not have been sent, with nothing saying
+// which.
+//
+// No deadline is imposed on the waiting here. Each worker handed in has its own
+// (the outbound one: outbound.NotificationShutdownDeadline), and a shorter one
+// wrapped round it would defeat the reason that number exists. The container's
+// stop grace period is what bounds it from outside - see docker-compose.prod.yml.
+func awaitShutdown(quit <-chan os.Signal, cancel context.CancelFunc,
+	internalSrv *http.Server, workers ...<-chan struct{}) {
+
 	<-quit
 
 	log.Println("Shutting down...")
 	cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := internalSrv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Internal server shutdown error: %v", err)
+	if internalSrv != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := internalSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Internal server shutdown error: %v", err)
+		}
+	}
+
+	for _, stopped := range workers {
+		<-stopped
 	}
 }
 

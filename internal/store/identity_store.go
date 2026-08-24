@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -130,9 +131,22 @@ func (s *Store) BindExternalIdentityIfAbsent(userID, provider, externalID, displ
 // signalled by sql.ErrNoRows; the dispatcher's resolveRecipient maps it to
 // ErrIdentityNotLinked (a permanent dispatcher error).
 func (s *Store) GetExternalIdentity(userID, provider string) (*model.ExternalIdentity, error) {
+	return s.GetExternalIdentityContext(context.Background(), userID, provider)
+}
+
+// GetExternalIdentityContext is the same lookup under a caller's deadline.
+//
+// It exists because preparation has one. Resolving an address is local work
+// measured in milliseconds, and the deadline around it
+// (outbound.NotificationPrepareDeadline) is there so a database that hangs
+// costs one delivery slot for five seconds rather than for the length of a
+// lease. Handed a context the query ignores, that deadline was a comment.
+func (s *Store) GetExternalIdentityContext(ctx context.Context, userID, provider string) (
+	*model.ExternalIdentity, error) {
+
 	query := `SELECT id, user_id, provider, external_id, chat_id, display_name, created_at, updated_at
 	          FROM external_identities WHERE user_id = $1 AND provider = $2`
-	row := s.db.QueryRow(query, userID, provider)
+	row := s.db.QueryRowContext(ctx, query, userID, provider)
 	return scanIdentity(row)
 }
 

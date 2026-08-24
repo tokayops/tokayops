@@ -19,6 +19,13 @@ services:
     # (0.1.0) or an exact build (sha-<commit>) instead.
     image: ghcr.io/tokayops/tokayops:${TOKAY_TAG:-latest}
     restart: unless-stopped
+    # Longer than the worker's own drain deadline (60s: the longest a single
+    # delivery can take end to end). On SIGTERM the process stops taking new
+    # work and then waits for the calls it has already made, so that an answer
+    # arriving in the last second is recorded rather than lost - a killed
+    # process leaves the delivery ambiguous, and somebody has to decide whether
+    # it happened. Docker's default is 10 seconds, which is not enough.
+    stop_grace_period: 90s
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -299,5 +300,28 @@ func TestMockStore_ConsumeLinkToken(t *testing.T) {
 	}
 	if _, err := s.ConsumeLinkToken(provider, "tok-1", "TG_1", "C_1", "Mock"); !errors.Is(err, store.ErrLinkTokenInvalid) {
 		t.Errorf("second consume should be invalid, got %v", err)
+	}
+}
+
+// TestTheIdentityLookupHonoursItsDeadline. Resolving a person's address is the
+// slow half of preparing an attempt, and it runs under a deadline
+// (outbound.NotificationPrepareDeadline) so a database that hangs costs one
+// delivery slot for five seconds rather than for the length of a lease.
+//
+// Handed a context the query never passes on, that deadline is a comment: the
+// call blocks for as long as the database wants, and the worker's slot goes
+// with it. This asks the cheapest question that tells the two apart - a context
+// that is already cancelled has to come back as cancelled, not as "no such
+// identity".
+func TestTheIdentityLookupHonoursItsDeadline(t *testing.T) {
+	s := testutil.SetupDB(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := s.GetExternalIdentityContext(ctx, "some-user", "slack")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled lookup answered %v, so the preparation deadline "+
+			"never reaches the database", err)
 	}
 }
