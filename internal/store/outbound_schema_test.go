@@ -964,7 +964,7 @@ func TestACommitmentCannotBeAddressedTwoWays(t *testing.T) {
 	agID := outboundGroup(t, s)
 	batch := newBatch(agID).mustInsert(t, s)
 
-	insert := func(targetKind, targetRef, payload string) error {
+	insert := func(kind, targetKind, targetRef, payload string) error {
 		_, err := s.db.Exec(`
 			INSERT INTO outbound_intents (
 				id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
@@ -972,28 +972,87 @@ func TestACommitmentCannotBeAddressedTwoWays(t *testing.T) {
 				ambiguity_policy, payload_schema_version, payload,
 				provider_key_codec_version, status, desired_revision, not_before,
 				next_attempt_at)
-			VALUES ($1, $2, $1, 'notification', 'escalation', 1,
+			VALUES ($1, $2, $1, 'notification', $7, 1,
 			        'slack', $3, $4, $5, 'editable', 'on_acceptance',
 			        'retry', 1, $6::jsonb, 1, 'pending', 0, now(), now())`,
-			uuid.New().String(), batch.ID, targetKind, targetRef, agID, payload)
+			uuid.New().String(), batch.ID, targetKind, targetRef, agID, payload, kind)
 		return err
 	}
 
-	if err := insert("channel", "C0001",
-		`{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C0001"},"interactive":true}`,
-	); err != nil {
-		t.Fatalf("a commitment that agrees with itself was refused: %v", err)
+	agrees := `{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C0001"},"interactive":true}`
+
+	// Both escalation kinds share one payload shape, so the rule covers both.
+	// A replay admitted with a payload addressed elsewhere would deliver the
+	// same way the original would.
+	for _, kind := range []string{"escalation", "escalation_replay"} {
+		if err := insert(kind, "channel", "C0001", agrees); err != nil {
+			t.Fatalf("a %s that agrees with itself was refused: %v", kind, err)
+		}
+
+		for name, mismatch := range map[string]string{
+			"a private message addressed to a channel": `{"slot":{"kind":"firehose"},"target":{"kind":"user","ref":"user-1"},"interactive":true}`,
+			"the right kind, the wrong recipient":      `{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C9999"},"interactive":true}`,
+			"a payload with no target at all":          `{"slot":{"kind":"firehose"},"interactive":true}`,
+		} {
+			t.Run(kind+": "+name, func(t *testing.T) {
+				if err := insert(kind, "channel", "C0001", mismatch); err == nil {
+					t.Fatal("the database accepted a commitment addressed two ways")
+				}
+			})
+		}
+	}
+}
+
+// TestTheTargetRuleReachesAnExistingDatabase.
+//
+// Declared inside CREATE TABLE IF NOT EXISTS, a rule added later never appears
+// on a database that already exists - and every one of those keeps accepting
+// exactly the rows it forbids. It is therefore added by its own statement on
+// every start, and this drops it and asks the schema to put it back.
+func TestTheTargetRuleReachesAnExistingDatabase(t *testing.T) {
+	s := setupTestDB(t)
+
+	if _, err := s.db.Exec(
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+			outboundTargetAgreementConstraint); err != nil {
+		t.Fatalf("drop the constraint: %v", err)
+	}
+	// The statement itself, not the whole schema: what is being checked is that
+	// this rule is applied on every start, and re-running every other statement
+	// in the middle of a suite is a side effect nobody asked for.
+	if _, err := s.db.Exec(outboundTargetAgreementDDL); err != nil {
+		t.Fatalf("re-apply the rule: %v", err)
 	}
 
-	for name, mismatch := range map[string]string{
-		"a private message addressed to a channel": `{"slot":{"kind":"firehose"},"target":{"kind":"user","ref":"user-1"},"interactive":true}`,
-		"the right kind, the wrong recipient":      `{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C9999"},"interactive":true}`,
-		"a payload with no target at all":          `{"slot":{"kind":"firehose"},"interactive":true}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			if err := insert("channel", "C0001", mismatch); err == nil {
-				t.Fatal("the database accepted a commitment addressed two ways")
-			}
-		})
+	var present int
+	if err := s.db.QueryRow(`
+		SELECT count(*) FROM pg_constraint
+		WHERE conname = $1 AND conrelid = 'outbound_intents'::regclass`,
+		outboundTargetAgreementConstraint).Scan(&present); err != nil {
+		t.Fatalf("look for the constraint: %v", err)
+	}
+	if present != 1 {
+		t.Fatalf("the rule is on the table %d times after a restart", present)
+	}
+
+	// And it is applied to what gets written from now on, which is the point of
+	// adding it to a database that predates it.
+	agID := outboundGroup(t, s)
+	batch := newBatch(agID).mustInsert(t, s)
+	_, err := s.db.Exec(`
+		INSERT INTO outbound_intents (
+			id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
+			provider, target_kind, target_ref, alert_group_id, form, completion_mode,
+			ambiguity_policy, payload_schema_version, payload,
+			provider_key_codec_version, status, desired_revision, not_before,
+			next_attempt_at)
+		VALUES ($1, $2, $1, 'notification', 'escalation', 1,
+		        'slack', 'channel', 'C0001', $3, 'editable', 'on_acceptance',
+		        'retry', 1,
+		        '{"slot":{"kind":"firehose"},"target":{"kind":"user","ref":"user-1"}}'::jsonb,
+		        1, 'pending', 0, now(), now())`,
+		uuid.New().String(), batch.ID, agID)
+	if err == nil {
+		t.Fatal("a commitment addressed two ways was written after the rule was restored")
 	}
 }

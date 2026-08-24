@@ -570,3 +570,33 @@ func TestThePayloadIsStoredUnderTheseNames(t *testing.T) {
 			raw, want)
 	}
 }
+
+// TestAStoredPayloadHasToEndWhereItsValueDoes.
+//
+// Everything after the payload is refused, and the check is a second decode
+// rather than json.Decoder.More(): outside an array or an object More() answers
+// "is the next token something other than ] or }", so a stray closing brace
+// after a good payload reads as "nothing follows". A row with junk on the end
+// is a row somebody or something wrote by hand, and rendering the part that
+// parsed would carry out half of what it says.
+func TestAStoredPayloadHasToEndWhereItsValueDoes(t *testing.T) {
+	const good = `{"slot":{"kind":"firehose","index":0},` +
+		`"target":{"kind":"channel","ref":"C0001"},"interactive":true}`
+
+	if _, err := DecodeEscalationPayloadV1(1, []byte(good)); err != nil {
+		t.Fatalf("a whole payload was refused: %v", err)
+	}
+
+	for name, raw := range map[string]string{
+		"a stray closing brace": good + "}",
+		"a second payload":      good + good,
+		"a bare value after it": good + " null",
+		"junk after it":         good + " oops",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeEscalationPayloadV1(1, []byte(raw)); err == nil {
+				t.Fatalf("a payload with %s was accepted", name)
+			}
+		})
+	}
+}

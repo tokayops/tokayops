@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"io"
 	"time"
 )
 
@@ -209,8 +211,13 @@ func DecodeEscalationPayloadV1(schemaVersion int, raw []byte) (EscalationPayload
 	if err := decoder.Decode(&payload); err != nil {
 		return payload, contractf("the payload cannot be read: %v", err)
 	}
-	if decoder.More() {
-		return payload, contractf("the payload has more than one value in it")
+	// A second Decode rather than More(): outside an array or an object, More()
+	// answers "is the next token something other than ] or }", so a stray
+	// closing brace after a perfectly good payload reads as "nothing follows".
+	// What has to be true is that the input ENDED.
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return payload, contractf("the payload does not end where the value does")
 	}
 
 	if err := payload.Slot.validate(); err != nil {

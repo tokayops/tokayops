@@ -193,25 +193,10 @@ CREATE TABLE IF NOT EXISTS outbound_intents (
 		CHECK (status <> 'sending' OR lease_token IS NOT NULL),
 	CONSTRAINT outbound_intents_counters_nonneg
 		CHECK (attempts_in_generation >= 0 AND failure_streak >= 0
-			AND generation_no >= 0),
-	-- The recipient is named twice: in the columns above, which decide WHERE a
-	-- message goes, and inside the payload, which decides WHAT is written. A row
-	-- where the two disagree does not produce a confusing journal entry - it
-	-- delivers what was composed for one person into the channel named beside
-	-- it. A channel compares them before it sends; this makes the row
-	-- impossible to write in the first place.
-	--
-	-- Scoped to the shape it knows: another kind, or a later payload schema,
-	-- brings its own rule rather than being silently exempt from this one.
-	CONSTRAINT outbound_intents_payload_addresses_the_target CHECK (
-		key_kind <> 'escalation' OR payload_schema_version <> 1
-		-- IS NOT DISTINCT FROM, not =: a payload with no target at all yields
-		-- NULL, and a CHECK that evaluates to NULL is satisfied. Written with
-		-- =, the one row that names its recipient only once would be the one
-		-- row this rule let through.
-		OR (payload #>> '{target,kind}' IS NOT DISTINCT FROM target_kind
-			AND payload #>> '{target,ref}' IS NOT DISTINCT FROM target_ref)
-	)
+			AND generation_no >= 0)
+	-- One more rule about this table - that a commitment names its recipient
+	-- one way - is added by its own statement below, so that it reaches
+	-- databases created before it was written.
 );
 
 CREATE TABLE IF NOT EXISTS outbound_attempts (
@@ -400,6 +385,54 @@ BEGIN
 END $$;
 `
 
+// outboundTargetAgreementConstraint is the name of the rule below.
+const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_the_target"
+
+// outboundTargetAgreementDDL states that a commitment may only name its
+// recipient one way.
+//
+// The recipient is named twice: in the columns, which decide WHERE a message
+// goes, and inside the payload, which decides WHAT is written. A row where the
+// two disagree does not produce a confusing journal entry - it delivers what
+// was composed for one person into the channel named beside it. A channel
+// compares them before it sends; this makes the row impossible to write.
+//
+// Added by its own statement rather than with the table, for the same reason
+// the foreign key above is: declared inline it appears only in databases
+// created after it was written, and every existing one would keep accepting the
+// rows it forbids. Asked by name AND by table, like the other one.
+//
+// NOT VALID, and that is deliberate. It applies to every row written from now
+// on, which is the whole point, and it does not stop the process from starting
+// against a database that already holds rows from before the rule existed -
+// those are pre-cutover rows that the cutover destroys.
+//
+// Scoped to the shapes it knows: both escalation kinds share one payload, and
+// a later payload schema or another kind brings its own rule rather than being
+// silently exempt from this one.
+const outboundTargetAgreementDDL = `
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = '` + outboundTargetAgreementConstraint + `'
+		  AND conrelid = 'outbound_intents'::regclass
+	) THEN
+		ALTER TABLE outbound_intents
+			ADD CONSTRAINT ` + outboundTargetAgreementConstraint + ` CHECK (
+				key_kind NOT IN ('escalation', 'escalation_replay')
+				OR payload_schema_version <> 1
+				-- IS NOT DISTINCT FROM, not =: a payload with no target at all
+				-- yields NULL, and a CHECK that evaluates to NULL is satisfied.
+				-- Written with =, the one row that names its recipient only
+				-- once would be the one row this rule let through.
+				OR (payload #>> '{target,kind}' IS NOT DISTINCT FROM target_kind
+					AND payload #>> '{target,ref}' IS NOT DISTINCT FROM target_ref)
+			) NOT VALID;
+	END IF;
+END $$;
+`
+
 // applyOutboundSchema creates the outbound delivery schema, in one transaction,
 // on every start.
 //
@@ -423,6 +456,9 @@ func (s *Store) applyOutboundSchema() error {
 
 	if _, err := tx.Exec(outboundCurrentAttemptFKDDL); err != nil {
 		return fmt.Errorf("failed to add %s: %w", outboundCurrentAttemptFK, err)
+	}
+	if _, err := tx.Exec(outboundTargetAgreementDDL); err != nil {
+		return fmt.Errorf("failed to add %s: %w", outboundTargetAgreementConstraint, err)
 	}
 
 	return tx.Commit()
