@@ -243,36 +243,50 @@ func (t *erasureTx) DeleteUserLinkTokens(ctx context.Context, userID string) err
 	return err
 }
 
-// CancelLiveOutboundIntentsForUser withdraws what is still owed to the erased
-// person, in the same transaction that removes the address it would go to.
+// CancelLiveOutboundIntentsForUser marks this person's commitments as erased
+// and withdraws what is still owed to them.
 //
-// Three states and three answers, which is the same split the acknowledgement
-// path makes, for the same reasons:
+// The MARKER comes first, and it is the point of the whole operation: erasure
+// is not a sweep that cleans up once, it is a durable prohibition every later
+// writer has to honour. A result already in flight, a late observation from a
+// worker whose lease was reclaimed, an operator reviving a failed commitment -
+// each of those would otherwise put the address back minutes after the person
+// was erased.
 //
-//   - pending: nothing has gone out and nothing will. Withdrawn outright, and
-//     the lease goes with it so a worker holding one finds out at its next
-//     compare-and-set.
-//   - sending: a call is in flight. Flagged rather than withdrawn - it may
-//     already have landed, and the flag is consumed when that send finishes.
-//   - manual_review: somebody was going to decide about a call whose fate is
-//     unknown. The question is moot now; the doubt stays in the history.
+// Then the withdrawal, and three states get three answers - the same split the
+// acknowledgement path makes:
 //
-// A commitment that already has a receipt is left alone in every state. A
-// message exists out there, and erasure removes the ability to CONTACT a
-// person - it does not unsend what was sent.
+//   - pending and manual_review: nothing has gone out and nothing will.
+//     Withdrawn outright, and the lease goes with them so a worker holding one
+//     finds out at its next compare-and-set.
+//   - sending: a call is in flight and may already have landed. FLAGGED, not
+//     withdrawn - and the journal says cancellation_requested, because
+//     "canceled" would be a claim about an external effect nobody knows the
+//     fate of yet.
+//   - anything with a receipt: left alone. Something exists out there, and
+//     erasure removes the ability to CONTACT a person rather than unsending
+//     what was sent. Its coordinates are redacted below.
 //
-// The recipient is matched by target_kind and target_ref: this system's own
-// user id, not the provider address. The address is being deleted in this same
-// transaction, so matching on it would find nothing depending on statement
-// order - the kind of dependency that breaks silently.
+// The rows are taken in one statement per state, ordered by id, and the
+// commitments are locked before the attempts under them - the same order
+// Finalize takes, because the opposite order is a deadlock waiting for a busy
+// afternoon.
 func (t *erasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID string) error {
+	if _, err := t.tx.ExecContext(ctx, `
+		UPDATE outbound_intents SET recipient_erased_at = now(), updated_at = now()
+		WHERE target_kind = 'user' AND target_ref = $1 AND recipient_erased_at IS NULL`,
+		userID); err != nil {
+		return fmt.Errorf("mark the commitments of an erased user: %w", err)
+	}
+
 	withdrawn, err := t.withdrawOutbound(ctx, `
 		UPDATE outbound_intents
 		SET status = 'canceled', lease_token = NULL, locked_until = NULL,
 		    worker_id = NULL, updated_at = now()
 		WHERE target_kind = 'user' AND target_ref = $1
-		  AND receipt IS NULL AND status IN ('pending', 'manual_review')
-		RETURNING id`, userID)
+		  AND NOT receipt_recorded AND status IN ('pending', 'manual_review')
+		RETURNING id`, userID, "canceled",
+		"the recipient was erased")
 	if err != nil {
 		return err
 	}
@@ -281,8 +295,9 @@ func (t *erasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID
 		UPDATE outbound_intents
 		SET cancellation_requested = TRUE, updated_at = now()
 		WHERE target_kind = 'user' AND target_ref = $1
-		  AND receipt IS NULL AND status = 'sending'
-		RETURNING id`, userID); err != nil {
+		  AND NOT receipt_recorded AND status = 'sending'
+		RETURNING id`, userID, "cancellation_requested",
+		"the recipient was erased; this send was already in flight"); err != nil {
 		return err
 	}
 
@@ -293,9 +308,9 @@ func (t *erasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID
 }
 
 // withdrawOutbound runs one withdrawal and writes a line in each commitment's
-// own journal. The reason names nobody: it is written into a row that survives
-// the person it is about.
-func (t *erasureTx) withdrawOutbound(ctx context.Context, query, userID string) (int, error) {
+// own journal, saying what actually happened to it. The reason names nobody: it
+// is written into a row that survives the person it is about.
+func (t *erasureTx) withdrawOutbound(ctx context.Context, query, userID, kind, reason string) (int, error) {
 	rows, err := t.tx.QueryContext(ctx, query, userID)
 	if err != nil {
 		return 0, fmt.Errorf("withdraw the notifications of an erased user: %w", err)
@@ -315,39 +330,73 @@ func (t *erasureTx) withdrawOutbound(ctx context.Context, query, userID string) 
 	}
 
 	for _, id := range ids {
-		if err := appendIntentEventTx(ctx, t.tx, id, nextEventSeq, "canceled",
-			"the recipient was erased", "erasure"); err != nil {
+		if err := appendIntentEventTx(ctx, t.tx, id, nextEventSeq, kind,
+			reason, "erasure"); err != nil {
 			return 0, err
 		}
 	}
 	return len(ids), nil
 }
 
-// ScrubOutboundEndpointsForUser clears the provider addresses this person's
-// deliveries were bound to, in both places the domain keeps them.
+// ScrubOutboundEndpointsForUser removes every personal coordinate the delivery
+// domain holds for this person, in all three tables that can hold one.
 //
-// They are the same data as external_identities: a Slack user id, a Telegram
-// chat id. The commitment and every attempt under it record the address the
-// effect was actually bound to, so deleting the identity alone would leave the
-// address behind in two more tables.
+// What goes: the address a message was sent to (bound_endpoint), the receipt
+// that says where the message ended up, and the response summary - which reads
+// "accepted with channel=D0123" and is therefore an address in prose.
 //
-// target_ref is deliberately untouched - it is this system's own user id, and
-// the history of a delivery has to stay joinable to the (anonymized) person it
-// was for.
+// What stays, deliberately: the outcome, the applied revision and the
+// completion fingerprint. They are the audit of a delivery that happened, they
+// name nobody, and the fingerprint is a hash - a pseudonymous value the domain
+// needs to tell an idempotent repeat from a conflict. And the FACT of a receipt
+// stays: receipt_recorded remains true with receipt_redacted_at set, so the
+// state machine still knows a message exists out there rather than deciding it
+// never happened.
+//
+// The commitments are updated before the attempts under them. That is the order
+// Finalize takes - the commitment, then its attempt - and taking it the other
+// way round here is what turns a busy afternoon into a deadlock.
 func (t *erasureTx) ScrubOutboundEndpointsForUser(ctx context.Context, userID string) error {
 	if _, err := t.tx.ExecContext(ctx, `
-		UPDATE outbound_attempts SET bound_endpoint = NULL
-		WHERE bound_endpoint IS NOT NULL AND intent_id IN (
-			SELECT id FROM outbound_intents WHERE target_kind = 'user' AND target_ref = $1
-		)`, userID); err != nil {
+		UPDATE outbound_intents
+		SET bound_endpoint = NULL,
+		    receipt = NULL,
+		    receipt_redacted_at = CASE
+		        WHEN receipt_recorded THEN COALESCE(receipt_redacted_at, now())
+		        ELSE NULL END,
+		    updated_at = now()
+		WHERE target_kind = 'user' AND target_ref = $1
+		  AND (bound_endpoint IS NOT NULL OR receipt IS NOT NULL)`, userID); err != nil {
+		return fmt.Errorf("scrub the commitment endpoints of an erased user: %w", err)
+	}
+
+	if _, err := t.tx.ExecContext(ctx, `
+		UPDATE outbound_attempts a
+		SET bound_endpoint = NULL,
+		    receipt = NULL,
+		    receipt_redacted_at = CASE
+		        WHEN a.receipt_recorded THEN COALESCE(a.receipt_redacted_at, now())
+		        ELSE NULL END,
+		    response_summary = NULL
+		FROM outbound_intents i
+		WHERE i.id = a.intent_id AND i.target_kind = 'user' AND i.target_ref = $1
+		  AND (a.bound_endpoint IS NOT NULL OR a.receipt IS NOT NULL
+		       OR a.response_summary IS NOT NULL)`, userID); err != nil {
 		return fmt.Errorf("scrub the attempt endpoints of an erased user: %w", err)
 	}
 
 	if _, err := t.tx.ExecContext(ctx, `
-		UPDATE outbound_intents SET bound_endpoint = NULL
-		WHERE bound_endpoint IS NOT NULL AND target_kind = 'user' AND target_ref = $1`,
+		UPDATE outbound_attempt_observations o
+		SET receipt = NULL,
+		    receipt_redacted_at = CASE
+		        WHEN o.receipt_recorded THEN COALESCE(o.receipt_redacted_at, now())
+		        ELSE NULL END,
+		    response_summary = NULL
+		FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
+		WHERE a.id = o.attempt_id AND i.target_kind = 'user' AND i.target_ref = $1
+		  AND (o.receipt IS NOT NULL OR o.response_summary IS NOT NULL)`,
 		userID); err != nil {
-		return fmt.Errorf("scrub the commitment endpoints of an erased user: %w", err)
+		return fmt.Errorf("scrub the observed endpoints of an erased user: %w", err)
 	}
 	return nil
 }

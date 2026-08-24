@@ -146,7 +146,18 @@ CREATE TABLE IF NOT EXISTS outbound_intents (
 	failure_streak             INT  NOT NULL DEFAULT 0,
 	bound_endpoint             TEXT,
 	create_key                 TEXT,
+	-- The coordinates of the external object, and - separately - the FACT that
+	-- one exists. The two are separate because erasure removes the first and
+	-- must not remove the second: a message that was sent stays sent, and the
+	-- state machine reads "is there something out there" from receipt_recorded,
+	-- never from the coordinates themselves.
 	receipt                    JSONB,
+	receipt_recorded           BOOLEAN NOT NULL DEFAULT FALSE,
+	receipt_redacted_at        TIMESTAMPTZ,
+	-- When the recipient of this commitment was erased. A durable prohibition
+	-- rather than a record: every writer after it must refuse to put personal
+	-- coordinates back.
+	recipient_erased_at        TIMESTAMPTZ,
 	desired_revision           BIGINT NOT NULL DEFAULT 0,
 	applied_revision           BIGINT,
 	final_revision_applied     BOOLEAN NOT NULL DEFAULT FALSE,
@@ -229,7 +240,11 @@ CREATE TABLE IF NOT EXISTS outbound_attempts (
 	-- moves on to a new external effect and clears its own copy - otherwise the
 	-- address of a message that was actually sent is lost.
 	receipt                       JSONB,
+	receipt_recorded              BOOLEAN NOT NULL DEFAULT FALSE,
+	receipt_redacted_at           TIMESTAMPTZ,
 	-- A short, safe summary of the response. Never the payload, never secrets.
+	-- It can still name an address - "accepted with channel=D0123" - so erasure
+	-- clears it along with the coordinates.
 	response_summary              TEXT,
 	finish_reason                 TEXT,
 	completion_fingerprint        BYTEA,
@@ -292,6 +307,8 @@ CREATE TABLE IF NOT EXISTS outbound_attempt_observations (
 	-- A late acceptance is sometimes the only proof that the effect happened,
 	-- so what is kept is the result, not just a hash of it.
 	receipt                       JSONB,
+	receipt_recorded              BOOLEAN NOT NULL DEFAULT FALSE,
+	receipt_redacted_at           TIMESTAMPTZ,
 	applied_revision              BIGINT,
 	provider_result_detail        TEXT,
 	response_summary              TEXT,
@@ -386,6 +403,61 @@ END $$;
 `
 
 // outboundTargetAgreementConstraint is the name of the rule below.
+// The erasure columns, for databases created before they existed, plus the rule
+// that keeps the three receipt states apart.
+//
+// A receipt is in one of three states, and the difference between the last two
+// is the whole point of erasure being a prohibition rather than a delete:
+//
+//	none      no external object is proved to exist
+//	usable    it exists and these are its coordinates
+//	redacted  it exists and its coordinates have been removed
+//
+// Written as a CHECK because the alternative is three columns that can disagree,
+// and a row claiming both "no receipt" and "redacted" would be a row nobody can
+// interpret afterwards.
+const outboundReceiptStateConstraint = "outbound_receipt_state"
+
+func outboundReceiptStateDDL(table string) string {
+	return `
+DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+	               WHERE table_name = '` + table + `' AND column_name = 'receipt_recorded') THEN
+		ALTER TABLE ` + table + ` ADD COLUMN receipt_recorded BOOLEAN NOT NULL DEFAULT FALSE;
+		ALTER TABLE ` + table + ` ADD COLUMN receipt_redacted_at TIMESTAMPTZ;
+		-- Every row written before this column existed carries its coordinates,
+		-- so the fact and the coordinates agree by construction.
+		UPDATE ` + table + ` SET receipt_recorded = TRUE WHERE receipt IS NOT NULL;
+	END IF;
+
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = '` + outboundReceiptStateConstraint + `'
+		  AND conrelid = '` + table + `'::regclass
+	) THEN
+		ALTER TABLE ` + table + `
+			ADD CONSTRAINT ` + outboundReceiptStateConstraint + ` CHECK (
+				(NOT receipt_recorded AND receipt IS NULL AND receipt_redacted_at IS NULL)
+				OR (receipt_recorded AND receipt IS NOT NULL AND receipt_redacted_at IS NULL)
+				OR (receipt_recorded AND receipt IS NULL AND receipt_redacted_at IS NOT NULL)
+			) NOT VALID;
+	END IF;
+END $$;
+`
+}
+
+// outboundRecipientErasedDDL adds the durable prohibition itself.
+const outboundRecipientErasedDDL = `
+DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+	               WHERE table_name = 'outbound_intents' AND column_name = 'recipient_erased_at') THEN
+		ALTER TABLE outbound_intents ADD COLUMN recipient_erased_at TIMESTAMPTZ;
+	END IF;
+END $$;
+`
+
 const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_the_target"
 
 // outboundTargetAgreementDDL states that a commitment may only name its
@@ -459,6 +531,17 @@ func (s *Store) applyOutboundSchema() error {
 	}
 	if _, err := tx.Exec(outboundTargetAgreementDDL); err != nil {
 		return fmt.Errorf("failed to add %s: %w", outboundTargetAgreementConstraint, err)
+	}
+	if _, err := tx.Exec(outboundRecipientErasedDDL); err != nil {
+		return fmt.Errorf("failed to add the erasure marker: %w", err)
+	}
+	for _, table := range []string{
+		"outbound_intents", "outbound_attempts", "outbound_attempt_observations",
+	} {
+		if _, err := tx.Exec(outboundReceiptStateDDL(table)); err != nil {
+			return fmt.Errorf("failed to add %s on %s: %w",
+				outboundReceiptStateConstraint, table, err)
+		}
 	}
 
 	return tx.Commit()

@@ -616,7 +616,8 @@ func TestTheCallIsDecidedByTheRecord(t *testing.T) {
 		// call was needed rather than quietly creating a second object at the
 		// same address.
 		if _, err := s.db.Exec(
-			`UPDATE outbound_intents SET receipt = $2::jsonb WHERE id = $1`,
+			`UPDATE outbound_intents SET receipt = $2::jsonb, receipt_recorded = TRUE
+			 WHERE id = $1`,
 			intentID, `{"channel":"C0001","ts":"1700000000.000100"}`); err != nil {
 			t.Fatalf("give the commitment an object: %v", err)
 		}

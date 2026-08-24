@@ -222,7 +222,18 @@ type Intent struct {
 	AppliedRevision      *int64
 	FinalRevisionApplied bool
 
-	HasReceipt            bool
+	// HasReceipt is the FACT that an external object exists, which is not the
+	// same as having its coordinates. Erasure removes the coordinates and
+	// leaves the fact: a message that was sent stays sent, and a state machine
+	// that read the coordinates instead would decide it never happened.
+	HasReceipt bool
+
+	// RecipientErased is the durable prohibition. The person this commitment
+	// was for has been erased, so nothing may put their address back: no
+	// retry, no new generation, no coordinates written by a call that was
+	// already in flight.
+	RecipientErased bool
+
 	CancellationRequested bool
 	AcceptedDuplicateRisk bool
 

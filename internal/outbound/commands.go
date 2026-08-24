@@ -132,6 +132,13 @@ const (
 	// SubmitGroupNotAdmitted: the alert group moved on - acknowledged, resolved
 	// - before this admission got there. The user won.
 	SubmitGroupNotAdmitted SubmitOutcome = "group_not_admitted"
+
+	// SubmitRecipientErased: the plan promises a message to somebody who has
+	// been erased. Nothing is admitted: a commitment aimed at them would need
+	// an address, and erasure is a standing prohibition on producing one - not
+	// a sweep that happened once. The next tick plans the group again without
+	// them.
+	SubmitRecipientErased SubmitOutcome = "recipient_erased"
 )
 
 // SubmitResult is the answer to an admission, with what was accepted.
@@ -425,6 +432,12 @@ const (
 	ResolveBusinessClosed ResolveOutcome = "business_closed"
 
 	ResolveNotFound ResolveOutcome = "not_found"
+
+	// ResolveRecipientErased: the person this commitment was for has been
+	// erased. Nothing here may be revived - a new attempt would need an
+	// address, and putting one back is exactly what the erasure forbade. The
+	// only decision left is to withdraw it.
+	ResolveRecipientErased ResolveOutcome = "recipient_erased"
 )
 
 // ResolveAmbiguityResult is where the commitment ended up.

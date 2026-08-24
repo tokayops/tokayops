@@ -1053,12 +1053,27 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		return outbound.FinalizeResult{}, err
 	}
 
+	// The attempt's own record. The receipt and the summary are refused if the
+	// recipient has been erased - both can carry an address - while the
+	// outcome, the revision and the fingerprint stay: they are the audit, and
+	// they name nobody.
+	//
+	// The marker is read from the commitment inside this statement rather than
+	// from what was loaded earlier, so an erasure committing in between cannot
+	// be undone by a result that was already in flight.
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE outbound_attempts
+		UPDATE outbound_attempts a
 		SET finished_at = now(), outcome = $2, error_class = $3, provider_status = $4,
-		    receipt = $5, response_summary = $6, finish_reason = 'worker',
+		    receipt = CASE WHEN i.recipient_erased_at IS NULL THEN $5::jsonb ELSE NULL END,
+		    receipt_recorded = ($5::jsonb IS NOT NULL),
+		    receipt_redacted_at = CASE
+		        WHEN $5::jsonb IS NOT NULL AND i.recipient_erased_at IS NOT NULL THEN now()
+		        ELSE NULL END,
+		    response_summary = CASE WHEN i.recipient_erased_at IS NULL THEN $6 ELSE NULL END,
+		    finish_reason = 'worker',
 		    completion_fingerprint = $7
-		WHERE id = $1 AND finished_at IS NULL`,
+		FROM outbound_intents i
+		WHERE a.id = $1 AND a.finished_at IS NULL AND i.id = a.intent_id`,
 		req.AttemptID, string(completion.Outcome), completion.ErrorClass,
 		completion.ProviderStatus, nullableJSON(receipt), nilIfEmpty(req.Conclusion.Summary()),
 		fingerprint,
@@ -1124,12 +1139,27 @@ func recordObservationTx(ctx context.Context, tx *sql.Tx, o observation) (bool, 
 		return false, err
 	}
 
+	// A late result is proof that the effect happened, and it is kept as
+	// proof - but a late result about an erased recipient is kept WITHOUT its
+	// coordinates. This is the third door an address could come back through:
+	// the worker whose lease recovery took, answering after everything else
+	// had finished.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO outbound_attempt_observations (
 			id, attempt_id, observation_kind, outcome, error_class, provider_status,
-			receipt, applied_revision, provider_result_detail, response_summary,
+			receipt, receipt_recorded, receipt_redacted_at,
+			applied_revision, provider_result_detail, response_summary,
 			completion_fingerprint, completion_fingerprint_version)
-		VALUES ($1, $2, 'late_finalize', $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		SELECT $1, $2, 'late_finalize', $3, $4, $5,
+		       CASE WHEN i.recipient_erased_at IS NULL THEN $6::jsonb ELSE NULL END,
+		       ($6::jsonb IS NOT NULL),
+		       CASE WHEN $6::jsonb IS NOT NULL AND i.recipient_erased_at IS NOT NULL
+		            THEN now() ELSE NULL END,
+		       $7, $8,
+		       CASE WHEN i.recipient_erased_at IS NULL THEN $9 ELSE NULL END,
+		       $10, $11
+		FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
+		WHERE a.id = $2`,
 		uuid.New().String(), o.AttemptID, string(o.Completion.Outcome),
 		o.Completion.ErrorClass, o.Completion.ProviderStatus,
 		nullableJSON(o.Receipt), o.Completion.AppliedRevision,

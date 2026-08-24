@@ -3,7 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/outbound"
@@ -141,10 +144,11 @@ func TestErasureWithdrawsWhatIsOwedAndForgetsTheAddress(t *testing.T) {
 	}
 
 	// Something exists out there. Erasure removes the ability to contact
-	// somebody; it does not unsend.
+	// somebody; it does not unsend, and it does not pretend nothing happened.
 	if got := statusOf(t, s, delivered); got != outbound.StatusSucceeded {
 		t.Errorf("a delivered notification was rewritten as %s", got)
 	}
+	requireRedacted(t, s, delivered)
 
 	// Somebody else's commitment is nobody else's business.
 	if got := statusOf(t, s, channel); got != outbound.StatusPending {
@@ -190,5 +194,333 @@ func TestErasureWithdrawsWhatIsOwedAndForgetsTheAddress(t *testing.T) {
 	// the erasure's own transaction committed.
 	if got := terminalCount(t, outbound.FamilyNotification, string(outbound.StatusCanceled)) - before; got != 1 {
 		t.Errorf("the erasure counted %v withdrawals, want 1", got)
+	}
+}
+
+// requireRedacted is the third receipt state: the external object existed and
+// its coordinates are gone.
+//
+// Both halves matter. Without the fact, the state machine decides nothing was
+// ever sent and offers to send it again; without the redaction, erasure has
+// removed an address from one table and left it in another.
+func requireRedacted(t *testing.T, s *Store, intentID string) {
+	t.Helper()
+
+	var recorded bool
+	var raw []byte
+	var redactedAt sql.NullTime
+	if err := s.db.QueryRow(`
+		SELECT receipt_recorded, receipt, receipt_redacted_at
+		FROM outbound_intents WHERE id = $1`, intentID).
+		Scan(&recorded, &raw, &redactedAt); err != nil {
+		t.Fatalf("read the receipt state: %v", err)
+	}
+	if !recorded {
+		t.Error("the commitment forgot that a message exists out there")
+	}
+	if raw != nil {
+		t.Errorf("the commitment still holds the coordinates: %s", raw)
+	}
+	if !redactedAt.Valid {
+		t.Error("the commitment does not say its coordinates were redacted")
+	}
+
+	var leftovers int
+	if err := s.db.QueryRow(`
+		SELECT count(*) FROM outbound_attempts
+		WHERE intent_id = $1 AND (receipt IS NOT NULL OR response_summary IS NOT NULL)`,
+		intentID).Scan(&leftovers); err != nil {
+		t.Fatalf("read the attempts: %v", err)
+	}
+	if leftovers != 0 {
+		t.Errorf("%d attempts still hold coordinates or a summary", leftovers)
+	}
+
+	var observed int
+	if err := s.db.QueryRow(`
+		SELECT count(*) FROM outbound_attempt_observations o
+		JOIN outbound_attempts a ON a.id = o.attempt_id
+		WHERE a.intent_id = $1 AND (o.receipt IS NOT NULL OR o.response_summary IS NOT NULL)`,
+		intentID).Scan(&observed); err != nil {
+		t.Fatalf("read the observations: %v", err)
+	}
+	if observed != 0 {
+		t.Errorf("%d late results still hold coordinates or a summary", observed)
+	}
+}
+
+// TestTheAddressDoesNotComeBack.
+//
+// A one-time sweep is not erasure. Everything below is a writer that runs AFTER
+// the person is gone and would, without the durable marker, put a working
+// address back into a table it was just removed from - and each is driven in
+// both orders, because "erase, then write" and "write, then erase" are
+// different code paths and only one of them is the sweep.
+func TestTheAddressDoesNotComeBack(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	t.Run("a call that was already in flight answers after the erasure", func(t *testing.T) {
+		seedTeam(t, s, "devops-1", "alice", "erased-1")
+		intentID := oneOwed(t, s, dmForUser("erased-1", 1))
+		token := claimOne(t, s, intentID)
+		begun := beginOne(t, s, intentID, token)
+
+		if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "erased-1"); err != nil {
+			t.Fatalf("erase: %v", err)
+		}
+
+		// Slack answers a moment later, with the coordinates of the message it
+		// made. The result is kept; the coordinates are not.
+		if _, err := s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+			AttemptID: begun.AttemptID, LeaseToken: token,
+			Conclusion: acceptedConclusion(t, "D0001"),
+		}); err != nil {
+			t.Fatalf("finalize after the erasure: %v", err)
+		}
+		requireRedacted(t, s, intentID)
+	})
+
+	t.Run("a late result arrives after the erasure", func(t *testing.T) {
+		seedTeam(t, s, "devops-2", "alice", "erased-2")
+		intentID := oneOwed(t, s, dmForUser("erased-2", 1))
+		token := claimOne(t, s, intentID)
+		begun := beginOne(t, s, intentID, token)
+
+		// Recovery reclaims the attempt: the worker's lease is gone.
+		expireLease(t, s, intentID)
+		if _, err := s.RecoverStaleAttempts(ctx, outbound.FamilyNotification, 10); err != nil {
+			t.Fatalf("recover: %v", err)
+		}
+		if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "erased-2"); err != nil {
+			t.Fatalf("erase: %v", err)
+		}
+
+		// And only now the original worker answers. Its result is durable
+		// proof, kept as an observation - without the address.
+		result, err := s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+			AttemptID: begun.AttemptID, LeaseToken: token,
+			Conclusion: acceptedConclusion(t, "D0002"),
+		})
+		if err != nil {
+			t.Fatalf("finalize late: %v", err)
+		}
+		if !result.ObservationRecorded {
+			t.Fatalf("the late result was not kept at all (%s)", result.Outcome)
+		}
+
+		var raw []byte
+		var recorded bool
+		if err := s.db.QueryRow(`
+			SELECT receipt, receipt_recorded FROM outbound_attempt_observations
+			WHERE attempt_id = $1`, begun.AttemptID).Scan(&raw, &recorded); err != nil {
+			t.Fatalf("read the observation: %v", err)
+		}
+		if raw != nil {
+			t.Errorf("the late result kept the coordinates: %s", raw)
+		}
+		if !recorded {
+			t.Error("the late result forgot that a message exists out there")
+		}
+	})
+
+	t.Run("a plan built before the erasure is admitted after it", func(t *testing.T) {
+		seedTeam(t, s, "devops-3", "alice", "erased-3")
+		agID := outboundGroup(t, s)
+		// The producer built this while the person still existed.
+		adm := outboundAdmission(t, agID, "first", dmForUser("erased-3", 1))
+
+		if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "erased-3"); err != nil {
+			t.Fatalf("erase: %v", err)
+		}
+
+		result := mustSubmit(t, s, adm)
+		if result.Outcome != outbound.SubmitRecipientErased {
+			t.Fatalf("an admission promising an erased person answered %q", result.Outcome)
+		}
+		var owed int
+		if err := s.db.QueryRow(
+			`SELECT count(*) FROM outbound_intents WHERE target_ref = 'erased-3'`).
+			Scan(&owed); err != nil {
+			t.Fatalf("count the commitments: %v", err)
+		}
+		if owed != 0 {
+			t.Fatalf("%d commitments were created for an erased person", owed)
+		}
+	})
+
+	t.Run("an operator tries to revive a commitment after the erasure", func(t *testing.T) {
+		seedTeam(t, s, "devops-4", "alice", "erased-4")
+		// A commitment erasure does NOT withdraw: it already ended, so there
+		// is nothing owed - and reviving it is exactly the door the marker has
+		// to keep shut. An unsent one would simply have been withdrawn.
+		intentID := oneOwed(t, s, dmForUser("erased-4", 1))
+		token := claimOne(t, s, intentID)
+		begun := beginOne(t, s, intentID, token)
+		if _, err := s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+			AttemptID: begun.AttemptID, LeaseToken: token,
+			Conclusion: concluded(outbound.OutcomePermanentRejection, "channel_not_found"),
+		}); err != nil {
+			t.Fatalf("finalize as permanently failed: %v", err)
+		}
+		if got := statusOf(t, s, intentID); got != outbound.StatusPermanentFailed {
+			t.Fatalf("the fixture is %s, not a commitment an operator could revive", got)
+		}
+
+		if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "erased-4"); err != nil {
+			t.Fatalf("erase: %v", err)
+		}
+
+		for _, decision := range []outbound.Decision{
+			outbound.DecisionRetryNewGeneration, outbound.DecisionAssumeAccepted,
+		} {
+			result, err := s.ResolveAmbiguity(ctx, outbound.ResolveAmbiguityRequest{
+				IntentID: intentID, Decision: decision, Actor: "nina",
+				Reason: "trying anyway", AcceptedDuplicateRisk: true,
+			})
+			if err != nil {
+				t.Fatalf("%s: %v", decision, err)
+			}
+			if result.Outcome != outbound.ResolveRecipientErased {
+				t.Errorf("%s on an erased recipient answered %q", decision, result.Outcome)
+			}
+		}
+
+		// Withdrawing is still allowed: it sends nothing, and the alternative
+		// is a commitment nobody can ever close.
+		result, err := s.ResolveAmbiguity(ctx, outbound.ResolveAmbiguityRequest{
+			IntentID: intentID, Decision: outbound.DecisionCancel,
+			Actor: "nina", Reason: "the recipient is gone",
+		})
+		if err != nil || result.Outcome != outbound.ResolveResolved {
+			t.Fatalf("withdrawing an erased recipient's commitment answered %q: %v",
+				result.Outcome, err)
+		}
+	})
+}
+
+// TestTheJournalSaysWhatActuallyHappenedToASendInFlight. A call that is already
+// out may have landed. Recorded as "canceled" it would be a claim about an
+// external effect nobody knows the fate of - the one thing this domain refuses
+// to guess at anywhere else.
+func TestTheJournalSaysWhatActuallyHappenedToASendInFlight(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+	seedTeam(t, s, "devops", "alice", "bob")
+
+	intentID := oneOwed(t, s, dmForUser("bob", 1))
+	token := claimOne(t, s, intentID)
+	beginOne(t, s, intentID, token)
+
+	if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "bob"); err != nil {
+		t.Fatalf("erase: %v", err)
+	}
+
+	var kind string
+	if err := s.db.QueryRow(`
+		SELECT kind FROM outbound_intent_events
+		WHERE intent_id = $1 AND actor = 'erasure'
+		ORDER BY seq DESC LIMIT 1`, intentID).Scan(&kind); err != nil {
+		t.Fatalf("read the journal: %v", err)
+	}
+	if kind != "cancellation_requested" {
+		t.Fatalf("a send in flight was recorded as %q", kind)
+	}
+}
+
+// TestErasureAndAResultInFlightMeetAtOnce.
+//
+// Everything above runs the two in sequence, which is the easy half: whichever
+// happens first, the other one reads what it wrote. This is the hard half - the
+// two transactions genuinely overlapping - and it is driven from both starting
+// orders because "erasure first" and "finalize first" take their row locks in
+// different sequences.
+//
+// The assertion is the same in both: whatever the interleaving, the coordinates
+// do not survive and the fact does. If finalize wins the race, its receipt
+// lands and erasure redacts it; if erasure wins, the marker is already there
+// and finalize never writes the address at all.
+func TestErasureAndAResultInFlightMeetAtOnce(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	orders := []struct {
+		name         string
+		erasureFirst bool
+	}{
+		{name: "the erasure starts first", erasureFirst: true},
+		{name: "the result starts first"},
+	}
+
+	for i, order := range orders {
+		t.Run(order.name, func(t *testing.T) {
+			userID := fmt.Sprintf("racer-%d", i)
+			seedTeam(t, s, fmt.Sprintf("team-race-%d", i), "alice", userID)
+
+			intentID := oneOwed(t, s, dmForUser(userID, 1))
+			token := claimOne(t, s, intentID)
+			begun := beginOne(t, s, intentID, token)
+
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			var eraseErr, finalizeErr error
+
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-start
+				if !order.erasureFirst {
+					time.Sleep(5 * time.Millisecond)
+				}
+				eraseErr = erasure.NewService(s.ErasureRepository()).Erase(ctx, userID)
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				if order.erasureFirst {
+					time.Sleep(5 * time.Millisecond)
+				}
+				_, finalizeErr = s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+					AttemptID: begun.AttemptID, LeaseToken: token,
+					Conclusion: acceptedConclusion(t, "D9999"),
+				})
+			}()
+			close(start)
+			wg.Wait()
+
+			if eraseErr != nil {
+				t.Fatalf("erase: %v", eraseErr)
+			}
+			if finalizeErr != nil {
+				t.Fatalf("finalize: %v", finalizeErr)
+			}
+
+			requireRedacted(t, s, intentID)
+
+			// And nowhere else either: the address must not be recoverable
+			// from any column of any of the three tables.
+			var leaks int
+			if err := s.db.QueryRow(`
+				SELECT (SELECT count(*) FROM outbound_intents
+				        WHERE target_ref = $1 AND receipt::text LIKE '%D9999%')
+				     + (SELECT count(*) FROM outbound_attempts a
+				        JOIN outbound_intents i ON i.id = a.intent_id
+				        WHERE i.target_ref = $1
+				          AND (a.receipt::text LIKE '%D9999%'
+				               OR a.bound_endpoint LIKE '%D9999%'
+				               OR a.response_summary LIKE '%D9999%'))
+				     + (SELECT count(*) FROM outbound_attempt_observations o
+				        JOIN outbound_attempts a ON a.id = o.attempt_id
+				        JOIN outbound_intents i ON i.id = a.intent_id
+				        WHERE i.target_ref = $1
+				          AND (o.receipt::text LIKE '%D9999%'
+				               OR o.response_summary LIKE '%D9999%'))`,
+				userID).Scan(&leaks); err != nil {
+				t.Fatalf("look for the address: %v", err)
+			}
+			if leaks != 0 {
+				t.Fatalf("the address survived the race in %d places", leaks)
+			}
+		})
 	}
 }

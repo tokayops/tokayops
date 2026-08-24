@@ -22,6 +22,11 @@ import (
 // in flight is flagged rather than cancelled, and the flag is consumed when
 // that send finishes: it may already have landed, and the two outcomes have to
 // converge on the same visible result.
+//
+// "Has a receipt" is receipt_recorded, not the coordinates. Erasure removes the
+// coordinates of a message that WAS sent and leaves the fact behind it; asked
+// the other way round, an acknowledgement would withdraw a delivery that had
+// already happened and the history would say it never did.
 // It returns how many commitments it WITHDREW outright, for the caller to count
 // once its transaction has committed. Counted inside, a transaction that then
 // rolled back would report an ending that never happened - and the alert on
@@ -34,7 +39,7 @@ func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, acto
 		UPDATE outbound_intents
 		SET status = 'canceled', lease_token = NULL, locked_until = NULL,
 		    worker_id = NULL, updated_at = now()
-		WHERE alert_group_id = $1 AND receipt IS NULL AND status = 'pending'
+		WHERE alert_group_id = $1 AND NOT receipt_recorded AND status = 'pending'
 		RETURNING id`, alertGroupID)
 	if err != nil {
 		return 0, err
@@ -45,7 +50,7 @@ func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, acto
 	inFlight, err := cancelRowsTx(ctx, tx, `
 		UPDATE outbound_intents
 		SET cancellation_requested = TRUE, updated_at = now()
-		WHERE alert_group_id = $1 AND receipt IS NULL AND status = 'sending'
+		WHERE alert_group_id = $1 AND NOT receipt_recorded AND status = 'sending'
 		RETURNING id`, alertGroupID)
 	if err != nil {
 		return 0, err
@@ -56,7 +61,7 @@ func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, acto
 	waiting, err := cancelRowsTx(ctx, tx, `
 		UPDATE outbound_intents
 		SET status = 'canceled', updated_at = now()
-		WHERE alert_group_id = $1 AND receipt IS NULL AND status = 'manual_review'
+		WHERE alert_group_id = $1 AND NOT receipt_recorded AND status = 'manual_review'
 		RETURNING id`, alertGroupID)
 	if err != nil {
 		return 0, err
@@ -177,6 +182,16 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 		// happened rather than guess.
 		return outbound.ResolveAmbiguityResult{
 			Outcome: outbound.ResolveAlreadyResolved, Status: intent.Status,
+		}, nil
+	}
+
+	// The person is gone, and reviving this would need an address. Cancelling
+	// is still allowed: it ends a commitment rather than sending anything, and
+	// leaving one stuck in manual_review forever is the state this refusal
+	// exists to avoid, not to create.
+	if intent.RecipientErased && req.Decision != outbound.DecisionCancel {
+		return outbound.ResolveAmbiguityResult{
+			Outcome: outbound.ResolveRecipientErased, Status: intent.Status,
 		}, nil
 	}
 

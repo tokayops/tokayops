@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
@@ -171,6 +173,26 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 		return held, nil
 	}
 
+	// Nobody is promised a message who is not there to receive one.
+	//
+	// The one-time sweep an erasure performs cannot cover this on its own: a
+	// producer can have built its plan BEFORE the erasure and be inserting it
+	// after, and the commitments it inserts would be aimed at an address that
+	// was just deleted. So admission asks, under a lock, and refuses the whole
+	// batch - the next tick plans the group again without that person.
+	//
+	// After the existing-claim read on purpose: a repeat of an admission that
+	// was accepted before the erasure is still that admission, and answering it
+	// with a refusal would make a lost reply look like a rejected plan.
+	if erased, err := erasedRecipients(ctx, tx, admission); err != nil {
+		return outbound.SubmitResult{}, err
+	} else if len(erased) > 0 {
+		if err := tx.Commit(); err != nil {
+			return outbound.SubmitResult{}, err
+		}
+		return outbound.SubmitResult{Outcome: outbound.SubmitRecipientErased}, nil
+	}
+
 	if err := outbound.ValidateEscalationAdmission(admission, now); err != nil {
 		return outbound.SubmitResult{}, err
 	}
@@ -289,6 +311,54 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 		BatchID:   batchID,
 		IntentIDs: intentIDs,
 	}, nil
+}
+
+// erasedRecipients locks the people this admission promises to reach and
+// reports the ones who are no longer there.
+//
+// FOR SHARE rather than FOR UPDATE: this transaction does not change the users,
+// it needs them to stay as they are until it commits. An erasure takes the row
+// exclusively, so the two serialise in whichever order they arrive - and the
+// answer is the same either way, because an erasure that has not committed yet
+// cannot have removed the address these commitments would use.
+//
+// Ordered by id, which is the canonical order every command that locks several
+// users takes. Two admissions promising the same two people in different orders
+// would otherwise deadlock over nothing.
+func erasedRecipients(ctx context.Context, tx *sql.Tx, admission keys.Admission) ([]string, error) {
+	seen := map[string]bool{}
+	var people []string
+	for _, c := range admission.Commitments {
+		if c.Target.Kind != keys.TargetUser || seen[c.Target.Ref] {
+			continue
+		}
+		seen[c.Target.Ref] = true
+		people = append(people, c.Target.Ref)
+	}
+	if len(people) == 0 {
+		return nil, nil
+	}
+	sort.Strings(people)
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM users
+		WHERE id = ANY($1) AND deleted_at IS NOT NULL
+		ORDER BY id
+		FOR SHARE`, pq.Array(people))
+	if err != nil {
+		return nil, fmt.Errorf("check the recipients of the admission: %w", err)
+	}
+	defer rows.Close()
+
+	var erased []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		erased = append(erased, id)
+	}
+	return erased, rows.Err()
 }
 
 // lostAdmission answers for the producer that did not get the claim.
@@ -619,7 +689,8 @@ const outboundIntentColumns = `
 	       form, completion_mode,
 	       ambiguity_policy, status, generation_no, attempts_in_generation,
 	       failure_streak, desired_revision, applied_revision,
-	       final_revision_applied, receipt, cancellation_requested,
+	       final_revision_applied, receipt_recorded, recipient_erased_at IS NOT NULL,
+	       cancellation_requested,
 	       accepted_duplicate_risk, not_before, next_attempt_at, expires_at,
 	       create_key IS NOT NULL, payload_schema_version,
 	       provider_key_codec_version, payload,
@@ -634,7 +705,6 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		groupID        sql.NullString
 		applied        sql.NullInt64
 		expiresAt      sql.NullTime
-		receipt        []byte
 		payload        []byte
 		deadlinePassed bool
 	)
@@ -643,7 +713,8 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		&intent.Form, &intent.CompletionMode,
 		&intent.AmbiguityPolicy, &intent.Status, &intent.GenerationNo,
 		&intent.AttemptsInGeneration, &intent.FailureStreak, &intent.DesiredRevision,
-		&applied, &intent.FinalRevisionApplied, &receipt, &intent.CancellationRequested,
+		&applied, &intent.FinalRevisionApplied, &intent.HasReceipt, &intent.RecipientErased,
+		&intent.CancellationRequested,
 		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt, &expiresAt,
 		&intent.GenerationBound, &intent.PayloadSchemaVersion,
 		&intent.ProviderKeyCodecVersion, &payload, &deadlinePassed); err != nil {
@@ -659,7 +730,6 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		at := expiresAt.Time
 		intent.ExpiresAt = &at
 	}
-	intent.HasReceipt = len(receipt) > 0
 	if len(payload) > 0 {
 		intent.Payload = json.RawMessage(payload)
 	}
@@ -763,10 +833,28 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 			attempts_in_generation = CASE WHEN $6 THEN 0 ELSE attempts_in_generation END,
 			bound_endpoint = CASE WHEN $6 THEN NULL ELSE bound_endpoint END,
 			create_key     = CASE WHEN $6 THEN NULL ELSE create_key END,
+			-- The three receipt states, kept consistent in one statement.
+			--
+			-- The erasure marker is read from the ROW, not from what the caller
+			-- believed when it started: an erasure that commits between this
+			-- transaction's read and this write would otherwise have its
+			-- prohibition undone by a result that was already in flight. The
+			-- fact survives either way - something exists out there - and only
+			-- the coordinates are refused.
 			receipt = CASE
 				WHEN $6 THEN NULL
-				WHEN $7 AND $8::jsonb IS NOT NULL THEN $8::jsonb
+				WHEN $7 AND $8::jsonb IS NOT NULL AND recipient_erased_at IS NULL THEN $8::jsonb
+				WHEN $7 AND $8::jsonb IS NOT NULL THEN NULL
 				ELSE receipt END,
+			receipt_recorded = CASE
+				WHEN $6 THEN FALSE
+				WHEN $7 AND $8::jsonb IS NOT NULL THEN TRUE
+				ELSE receipt_recorded END,
+			receipt_redacted_at = CASE
+				WHEN $6 THEN NULL
+				WHEN $7 AND $8::jsonb IS NOT NULL AND recipient_erased_at IS NOT NULL THEN now()
+				WHEN $7 AND $8::jsonb IS NOT NULL THEN NULL
+				ELSE receipt_redacted_at END,
 			failure_streak = CASE
 				WHEN $9  THEN 0
 				WHEN $10 THEN failure_streak + 1

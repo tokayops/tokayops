@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
 	"strconv"
@@ -395,17 +396,26 @@ func errorClass(c Conclusion) string {
 }
 
 // detail is what the log line adds beyond the outcome, and only when there is
-// something to add. Never the response body: what a provider says about a
-// failure can carry anything, including the message that was being sent.
+// something to add.
+//
+// Never the response body: what a provider says about a failure can carry
+// anything, including the message that was being sent.
+//
+// And never the receipt REFERENCE, which is where this was wrong. A receipt ref
+// is coordinates - a Slack channel and timestamp, a Telegram chat id - and for
+// a direct message the channel IS a working address for the person. Written to
+// a log, it outlives the erasure that removes the same value from every table,
+// because a log is not something this system can go back and edit. What a
+// reader actually needs from the line is whether the provider gave us anything
+// to identify the message by, and that is a boolean.
 func detail(c Conclusion) string {
 	completion := c.Completion()
 	out := ""
 	if completion.ErrorClass != nil && *completion.ErrorClass != "" {
 		out += " error_class=" + *completion.ErrorClass
 	}
-	if completion.ReceiptRef != nil && *completion.ReceiptRef != "" {
-		out += " receipt=" + *completion.ReceiptRef
-	}
+	out += fmt.Sprintf(" receipt_recorded=%t",
+		completion.ReceiptRef != nil && *completion.ReceiptRef != "")
 	if summary := c.Summary(); summary != "" {
 		out += " response_summary=" + strconv.Quote(summary)
 	}

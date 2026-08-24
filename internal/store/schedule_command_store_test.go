@@ -745,6 +745,19 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		// it. Both are nulled.
 		"outbound_intents.bound_endpoint":  true,
 		"outbound_attempts.bound_endpoint": true,
+
+		// The coordinates of the message that was made. For a direct message
+		// the channel in there IS a working address for the person, so it goes
+		// the same way as the endpoint - redacted, with the FACT that a message
+		// exists kept beside it.
+		"outbound_intents.receipt":              true,
+		"outbound_attempts.receipt":             true,
+		"outbound_attempt_observations.receipt": true,
+
+		// A short account of what the provider said, which reads "accepted
+		// with channel=D0123" - an address in prose.
+		"outbound_attempts.response_summary":             true,
+		"outbound_attempt_observations.response_summary": true,
 	}
 	// Columns that survive by design: immutable identity references that
 	// history is joined on.
@@ -764,6 +777,14 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		// stay joinable to the anonymized person it was for. Scrubbing it
 		// would leave a delivery to nobody.
 		"outbound_intents.target_ref": true,
+
+		// The completion fingerprint is a hash of what an attempt concluded.
+		// It is pseudonymous - nothing in it can be turned back into a person
+		// or an address - and it is what tells an idempotent repeat from a
+		// conflict, so a delivery that lost it could be finalised twice with
+		// two different answers and nobody would notice.
+		"outbound_attempts.completion_fingerprint":             true,
+		"outbound_attempt_observations.completion_fingerprint": true,
 	}
 
 	rows, err := s.db.Query(`
@@ -783,6 +804,12 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		       -- check once already.
 		       OR column_name = 'target_ref'
 		       OR column_name = 'bound_endpoint'
+		       -- What a delivery produced, and what it said about it. Both can
+		       -- carry an address; the fingerprint beside them deliberately
+		       -- cannot, and is classified as kept.
+		       OR column_name = 'receipt'
+		       OR column_name = 'response_summary'
+		       OR column_name = 'completion_fingerprint'
 		       OR (table_name = 'users' AND column_name IN
 		           ('id', 'email', 'name', 'role', 'password_hash', 'auth_provider', 'deleted_at')))
 		ORDER BY table_name, column_name`)
@@ -824,6 +851,7 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		"user_id": true, "created_by": true, "recorded_by": true,
 		"acknowledged_by": true, "resolved_by": true,
 		"target_ref": true, "bound_endpoint": true,
+		"receipt": true, "response_summary": true, "completion_fingerprint": true,
 	}
 	var phantom []string
 	for _, set := range []map[string]bool{erased, byDesign} {
