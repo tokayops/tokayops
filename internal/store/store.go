@@ -1703,24 +1703,26 @@ func (s *Store) UpdateAlertGroupAlerts(id string, alerts []model.Alert) error {
 }
 
 func (s *Store) GetNewAlertGroups() ([]*model.AlertGroup, error) {
-	// Also pick up stale "processing" AGs orphaned by a crash between
-	// status update and job creation — but ONLY if no escalation job exists.
-	// If any escalation job exists (succeeded, failed, canceled, etc.), the AG was
-	// already processed and should not spawn a duplicate job.
+	// Also pick up stale "processing" groups orphaned by a crash between the
+	// status change and the admission - but ONLY if nothing was admitted for
+	// them. An admission is the claim over a group's escalation and it is held
+	// forever, whatever became of the deliveries under it, so a group that has
+	// one has been escalated and must never be picked up again.
 	//
-	// Asked by type and alert_group_id rather than by the escalation identity,
-	// for the same reason cancellation is (see cancelEscalationJobByAlertGroupIDTx):
-	// the question is what this group already holds, not what holds a
-	// particular dedup claim. EnsureEscalationJob is what keeps the type and
-	// the namespace from disagreeing.
+	// It asks the admissions rather than the jobs, and that is not a cosmetic
+	// change of table: once the escalation job is gone, "no escalation job"
+	// becomes true of every group in the system, and every processing group
+	// would come back round every thirty seconds to be escalated again.
+	//
+	// Asked by alert_group_id rather than by a batch key: the question is what
+	// this group already holds, not what holds a particular claim.
 	staleThreshold := time.Now().Add(-30 * time.Second)
 	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups ag
 	          WHERE ag.status = $1
 	             OR (ag.status = $2 AND ag.updated_at < $3
 	                 AND NOT EXISTS (
-	                     SELECT 1 FROM jobs j
-	                     WHERE j.alert_group_id = ag.id
-	                       AND j.type = 'escalation'
+	                     SELECT 1 FROM outbound_batches b
+	                     WHERE b.alert_group_id = ag.id
 	                 ))`
 
 	rows, err := s.db.Query(query, model.AlertGroupStatusNew, model.AlertGroupStatusProcessing, staleThreshold)

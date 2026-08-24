@@ -1202,7 +1202,16 @@ func TestEnsureEscalationJob_BlockedBySucceededJob(t *testing.T) {
 	}
 }
 
-func TestGetNewAlertGroups_SkipsAGWithEscalationJob(t *testing.T) {
+// TestGetNewAlertGroups_SkipsAGAlreadyAdmitted. A group whose escalation was
+// admitted is out of the loop for good, whatever became of the deliveries under
+// it: the claim is held forever, and picking the group up again would promise
+// the same page twice.
+//
+// It asks the admissions rather than the jobs. Asked about jobs, the answer
+// becomes "no escalation job" for every group in the system the moment the job
+// path is gone - and every processing group would come back round every thirty
+// seconds to be escalated again.
+func TestGetNewAlertGroups_SkipsAGAlreadyAdmitted(t *testing.T) {
 	s := setupTestDB(t)
 
 	teamID := "team-skip-escalation"
@@ -1227,19 +1236,18 @@ func TestGetNewAlertGroups_SkipsAGWithEscalationJob(t *testing.T) {
 		t.Fatalf("Failed to backdate AG: %v", err)
 	}
 
-	// Create a succeeded escalation job linked to this AG via alert_group_id
-	now := time.Now()
-	jobID := uuid.New().String()
+	// An admission for this group, with nothing left of its deliveries: the
+	// claim is what says the group was escalated.
 	_, err = s.GetDB().Exec(`
-		INSERT INTO jobs (id, type, status, payload, dedup_namespace, dedup_key, dedup_scope,
-			alert_group_id, current_stage, created_at, updated_at, finished_at)
-		VALUES ($1, 'escalation', 'succeeded', '{}', 'escalation', $2, 'forever', $2, 0, $3, $3, $3)`,
-		jobID, agID, now)
+		INSERT INTO outbound_batches
+			(id, batch_key, key_kind, delivery_family, grammar_version, alert_group_id,
+			 fingerprint, fingerprint_version, admission_outcome, intent_count)
+		VALUES ($1, $2, 'escalation', 'notification', 1, $3, $4, 1, 'admitted', 1)`,
+		uuid.New().String(), "batch-"+agID, agID, digest32(0x20))
 	if err != nil {
-		t.Fatalf("Failed to create succeeded job: %v", err)
+		t.Fatalf("Failed to record the admission: %v", err)
 	}
 
-	// GetNewAlertGroups should NOT return this AG
 	results, err := s.GetNewAlertGroups()
 	if err != nil {
 		t.Fatalf("GetNewAlertGroups failed: %v", err)
@@ -1247,7 +1255,7 @@ func TestGetNewAlertGroups_SkipsAGWithEscalationJob(t *testing.T) {
 
 	for _, r := range results {
 		if r.ID == agID {
-			t.Error("Expected AG with succeeded escalation job (via alert_group_id) to be excluded from GetNewAlertGroups")
+			t.Error("a group whose escalation was already admitted was picked up again")
 		}
 	}
 }

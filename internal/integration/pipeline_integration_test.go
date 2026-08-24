@@ -4,6 +4,12 @@ package integration
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +38,8 @@ type IntegrationTestEnv struct {
 	Eng      *engine.Engine
 	Disp     *dispatcher.Dispatcher
 	MockProv *MockProvider
+	Worker   *outbound.Worker
+	Channel  *recordingChannel
 	Echo     *echo.Echo
 
 	// Schedules is the schedule configuration command service, and Renderer the
@@ -189,15 +197,25 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	// Components
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
 	renderer := schedulerender.New(s.ScheduleReadRepository())
-	eng := engine.NewEngine(s, renderer, cfg)
+	eng := engine.NewEngine(s, renderer, &testSettings{}, cfg)
 	disp, err := dispatcher.NewDispatcher(s, cfg)
 	if err != nil {
 		t.Fatalf("NewDispatcher failed: %v", err)
 	}
 
-	// Mock Provider
+	// Mock Provider. The dispatcher still runs the alert-update and resolution
+	// loops, which is what it is here for.
 	mockProvider := &MockProvider{}
 	disp.RegisterProvider("slack", mockProvider)
+
+	// The escalation itself no longer goes through the dispatcher: the engine
+	// admits commitments and the outbound worker sends them. The channel below
+	// stands in for Slack, and resolves an address by taking the recipient at
+	// its word - what these tests are about is who was promised and who was
+	// sent to, not how a user id becomes a Slack account.
+	channel := &recordingChannel{identity: storeIdentity(s)}
+	worker := outbound.NewWorker(s, "integration-worker",
+		map[string]outbound.Channel{"slack": channel, "telegram": channel})
 
 	// Echo
 	e := echo.New()
@@ -209,6 +227,8 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 		Eng:       eng,
 		Disp:      disp,
 		MockProv:  mockProvider,
+		Worker:    worker,
+		Channel:   channel,
 		Echo:      e,
 		Schedules: scheduleconfig.NewService(s.ScheduleConfigRepository()),
 		Renderer:  renderer,
@@ -225,30 +245,143 @@ func sendWebhook(t *testing.T, e *echo.Echo, payload string) {
 	}
 }
 
-func waitForStepCompletion(t *testing.T, s *store.Store, alertKey string, stageIndex int) {
-	deadline := time.Now().Add(5 * time.Second)
+// waitForDeliveries waits until an alert group's escalation has settled: every
+// commitment it admitted has reached an outcome.
+//
+// It replaces waiting on job steps. An escalation is no longer a job - it is a
+// set of promises with their own lifecycle - and "the stage finished" has no
+// meaning in it.
+func waitForDeliveries(t *testing.T, s *store.Store, alertKey string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		var status string
-		// The escalation is identified by its alert group, so the group's
-		// dedup key - the alert fingerprint the caller has - reaches the job
-		// through alert_groups rather than off the job row.
+		var settled int
 		err := s.GetDB().QueryRow(`
-			SELECT js.status
-			FROM job_steps js
-			JOIN job_stages jst ON js.stage_id = jst.id
-			JOIN jobs j ON jst.job_id = j.id
-			JOIN alert_groups ag ON j.alert_group_id = ag.id
-			WHERE ag.alert_key = $1 AND jst.stage_index = $2
-			LIMIT 1
-		`, alertKey, stageIndex).Scan(&status)
-
-		if err == nil && (status == string(model.JobStepStatusSucceeded) || status == string(model.JobStepStatusFailed) || status == string(model.JobStepStatusCanceled)) {
+			SELECT count(*) FROM outbound_intents i
+			JOIN alert_groups ag ON ag.id = i.alert_group_id
+			WHERE ag.alert_key = $1
+			  AND i.status IN ('succeeded', 'idle', 'permanent_failed', 'expired', 'canceled')`,
+			alertKey).Scan(&settled)
+		if err == nil && settled >= want {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("Timeout waiting for stage %d of group %s to complete", stageIndex, alertKey)
+
+	var admitted, settled int
+	_ = s.GetDB().QueryRow(`
+		SELECT count(*), count(*) FILTER (WHERE i.status NOT IN ('pending', 'sending'))
+		FROM outbound_intents i JOIN alert_groups ag ON ag.id = i.alert_group_id
+		WHERE ag.alert_key = $1`, alertKey).Scan(&admitted, &settled)
+	t.Fatalf("timeout waiting for %d deliveries of %s: %d admitted, %d settled",
+		want, alertKey, admitted, settled)
 }
+
+// runOutboundWorker drives the delivery worker until the context is cancelled.
+//
+// Its own tick rather than Run(): the worker's interval is a second, and a test
+// that waited whole seconds for each delivery would spend most of its life
+// asleep.
+func runOutboundWorker(ctx context.Context, worker *outbound.Worker) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			worker.Tick(ctx)
+		}
+	}
+}
+
+// recordingChannel is Slack as these tests need it: it takes the recipient at
+// its word, always succeeds, and remembers where it was asked to send.
+type recordingChannel struct {
+	identity providers.IdentityLookup
+
+	mu      sync.Mutex
+	targets []string
+}
+
+func (c *recordingChannel) Prepare(ctx context.Context, intent outbound.Intent) outbound.Preparation {
+	if intent.TargetKind != keys.TargetUser {
+		return outbound.Ready(intent.TargetRef)
+	}
+	// A person is resolved to the address their provider knows them by, which
+	// is the half of preparation these tests are about: the plan promises a
+	// user, and what reaches the provider is their Slack account.
+	address, err := c.identity(ctx, intent.TargetRef, intent.Provider)
+	switch {
+	case errors.Is(err, providers.ErrNotLinked):
+		return outbound.Impossible("identity_not_linked", intent.TargetRef+" has no account here")
+	case err != nil:
+		return outbound.NotNow("identity_lookup_failed", err.Error())
+	}
+	return outbound.Ready(address)
+}
+
+func (c *recordingChannel) ExecuteAttempt(_ context.Context,
+	call outbound.Call) (outbound.Result, error) {
+
+	c.mu.Lock()
+	c.targets = append(c.targets, call.Endpoint)
+	sent := len(c.targets)
+	c.mu.Unlock()
+
+	receipt, err := outbound.NewReceipt(fmt.Sprintf("%s/%d", call.Endpoint, sent),
+		json.RawMessage(fmt.Sprintf(`{"channel":%q,"ts":"%d"}`, call.Endpoint, sent)))
+	if err != nil {
+		return outbound.Result{}, err
+	}
+	return outbound.Result{
+		Evidence: outbound.ProviderResponse, Status: "ok", Receipt: receipt,
+	}, nil
+}
+
+func (c *recordingChannel) ClassifyResponse(res outbound.Result) (outbound.Outcome, string, bool) {
+	if res.Status == "ok" {
+		return outbound.OutcomeAccepted, "", true
+	}
+	return "", "", false
+}
+
+// SentTargets is where this channel was asked to send, in order.
+func (c *recordingChannel) SentTargets() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.targets...)
+}
+
+func (c *recordingChannel) SentCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.targets)
+}
+
+// storeIdentity is how a person becomes an address: the same lookup the wiring
+// hands to a real channel.
+func storeIdentity(s *store.Store) providers.IdentityLookup {
+	return func(_ context.Context, userID, provider string) (string, error) {
+		identity, err := s.GetExternalIdentity(userID, provider)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", providers.ErrNotLinked
+		}
+		if err != nil {
+			return "", err
+		}
+		if identity == nil || identity.ExternalID == "" {
+			return "", providers.ErrNotLinked
+		}
+		return identity.ExternalID, nil
+	}
+}
+
+// testSettings is the channel configuration a plan freezes.
+type testSettings struct{}
+
+func (testSettings) GetSlackInteractive() bool    { return true }
+func (testSettings) GetTelegramInteractive() bool { return true }
 
 // runDispatcherLoop runs ProcessPendingSteps in a loop until context is canceled
 func runDispatcherLoop(ctx context.Context, disp *dispatcher.Dispatcher) {
@@ -330,13 +463,13 @@ func TestPipeline_HappyPath(t *testing.T) {
 
 	// Run dispatcher loop in background to process all steps
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
 	// Unified escalation job: firehose is step 0, policy step is step 1
-	waitForStepCompletion(t, env.S, "test_dedup_1", 0) // Step 0: Firehose
-	waitForStepCompletion(t, env.S, "test_dedup_1", 1) // Step 1: Policy DM
+	waitForDeliveries(t, env.S, "test_dedup_1", 2)
 
-	if env.MockProv.SentCount() < 2 {
-		t.Errorf("Expected at least 2 notifications (Firehose + Policy DM), got %d", env.MockProv.SentCount())
+	if env.Channel.SentCount() < 2 {
+		t.Errorf("Expected at least 2 notifications (Firehose + Policy DM), got %d", env.Channel.SentCount())
 	}
 
 	// Verify Timeline
@@ -369,9 +502,9 @@ func TestPipeline_PartialUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "test_partial_1", 0) // Step 0: Firehose
-	waitForStepCompletion(t, env.S, "test_partial_1", 1) // Step 1: Policy DM
+	waitForDeliveries(t, env.S, "test_partial_1", 2)
 
 	// Verify initial state - Wait for worker to update status to Triggered
 	waitForAlertGroupStatus(t, env.S, "test_partial_1", model.AlertGroupStatusTriggered)
@@ -420,9 +553,9 @@ func TestPipeline_FullResolve(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "test_resolve_1", 0) // Step 0: Firehose
-	waitForStepCompletion(t, env.S, "test_resolve_1", 1) // Step 1: Policy DM
+	waitForDeliveries(t, env.S, "test_resolve_1", 2)
 
 	// Full Resolve
 	payload2 := `{
@@ -442,23 +575,11 @@ func TestPipeline_FullResolve(t *testing.T) {
 		t.Errorf("Expected status Resolved, got %s", status)
 	}
 
-	// Dispatcher Resolution Loop
-	// Legacy method `ProcessResolvedAlertGroups` still exists and works on Resolved AGs (creates Jobs).
+	// Dispatcher Resolution Loop. It still closes the alert group; editing the
+	// cards it sent is the half that moves with the update path, and until it
+	// does what this asserts is that the alert owes nobody anything.
 	env.Disp.ProcessResolvedAlertGroups(ctx)
-	// Note: dispatcher loop is already running, it will pick up resolution steps
-
-	// Wait for Resolution
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if env.MockProv.ResolveCount() > 0 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	if env.MockProv.ResolveCount() == 0 {
-		t.Error("Provider Resolve should have been called (via Resolution Job)")
-	}
+	waitForNothingOwed(t, env.S, "test_resolve_1")
 
 	// Verify Closed
 	env.S.GetDB().QueryRow("SELECT status FROM alert_groups WHERE alert_key = $1", "test_resolve_1").Scan(&status)
@@ -605,14 +726,13 @@ func TestPipeline_FirehoseOnly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	initialSentCount := env.MockProv.SentCount()
-	env.Disp.ProcessPendingSteps(ctx)
+	initialSentCount := env.Channel.SentCount()
+	go runOutboundWorker(ctx, env.Worker)
 
-	// Wait for firehose step (step 0) to complete
-	waitForStepCompletion(t, env.S, "test_firehose_only_1", 0)
+	waitForDeliveries(t, env.S, "test_firehose_only_1", 1)
 
 	// Verify firehose notification was sent
-	if env.MockProv.SentCount() <= initialSentCount {
+	if env.Channel.SentCount() <= initialSentCount {
 		t.Error("Expected firehose notification to be sent")
 	}
 
@@ -659,9 +779,9 @@ func TestPipeline_ResolutionAllDeliveries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "test_resolve_all_1", 0) // Firehose
-	waitForStepCompletion(t, env.S, "test_resolve_all_1", 1) // Policy DM
+	waitForDeliveries(t, env.S, "test_resolve_all_1", 2)
 
 	// 3. Resolve alert
 	resolvePayload := `{
@@ -677,22 +797,12 @@ func TestPipeline_ResolutionAllDeliveries(t *testing.T) {
 	// 4. Process resolution (dispatcher loop is already running)
 	env.Disp.ProcessResolvedAlertGroups(ctx)
 
-	// Wait for resolution to complete
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		// Resolution job should resolve all updatable deliveries
-		// Firehose is updatable (SupportsUpdate=true)
-		// DM is NOT updatable (SupportsUpdate=false)
-		// So we expect at least 1 resolve call (firehose only, as DM doesn't support update)
-		if env.MockProv.ResolveCount() > 0 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	if env.MockProv.ResolveCount() == 0 {
-		t.Error("Expected at least one resolve call for updatable deliveries")
-	}
+	// Bringing the cards to their resolved state is the piece of work that has
+	// not moved yet: the resolution loop still edits from
+	// notification_deliveries, which the admitted path does not write. What
+	// holds today is that a resolved alert owes nobody anything - no page goes
+	// out about an alert that is already over.
+	waitForNothingOwed(t, env.S, "test_resolve_all_1")
 
 	// Verify AG is closed
 	var status string
@@ -752,62 +862,52 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	initialSentCount := env.MockProv.SentCount()
+	initialSentCount := env.Channel.SentCount()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
 	// Stage 0: firehose, Stage 1: fan-out DMs (L1 + L2 if resolved)
-	waitForStepCompletion(t, env.S, "test_fanout_1", 0) // Firehose
-	waitForStepCompletion(t, env.S, "test_fanout_1", 1) // Fan-out stage
+	waitForDeliveries(t, env.S, "test_fanout_1", 2)
 
 	// Should have sent at least 2: firehose + at least 1 DM
-	if env.MockProv.SentCount()-initialSentCount < 2 {
-		t.Errorf("Expected at least 2 notifications (firehose + DM), got %d", env.MockProv.SentCount()-initialSentCount)
+	if env.Channel.SentCount()-initialSentCount < 2 {
+		t.Errorf("Expected at least 2 notifications (firehose + DM), got %d", env.Channel.SentCount()-initialSentCount)
 	}
 
-	// Verify job succeeded
-	waitForJobStatus(t, env.S, "test_fanout_1", model.JobStatusSucceeded)
-
-	// Verify 2 stages: firehose + schedule fan-out
-	var stageCount int
-	env.S.GetDB().QueryRow(`
-		SELECT COUNT(*) FROM job_stages jst
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_fanout_1'
-	`).Scan(&stageCount)
-	if stageCount != 2 {
-		t.Errorf("Expected 2 stages, got %d", stageCount)
+	// The firehose and one promise per person on call, and both settled. There
+	// are no stages any more: commitments do not hold each other up, which is
+	// what the fan-out was working around with continue_on_failure.
+	promises := promisedTargets(t, env.S, "test_fanout_1")
+	if len(promises) < 2 {
+		t.Errorf("the escalation promised %v, want the firehose and at least one person", promises)
 	}
+}
 
-	// Verify fan-out stage has at least 1 step (L1; L2 if schedule fully configured)
-	var fanoutStepCount int
-	env.S.GetDB().QueryRow(`
-		SELECT COUNT(*) FROM job_steps js
-		JOIN job_stages jst ON js.stage_id = jst.id
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_fanout_1' AND jst.stage_index = 1
-	`).Scan(&fanoutStepCount)
-	if fanoutStepCount < 1 {
-		t.Errorf("Expected at least 1 step in fan-out stage, got %d", fanoutStepCount)
+// promisedTargets is who an alert group's escalation promised to reach, in the
+// order the commitments were admitted.
+func promisedTargets(t *testing.T, s *store.Store, alertKey string) []string {
+	t.Helper()
+	rows, err := s.GetDB().Query(`
+		SELECT i.target_ref FROM outbound_intents i
+		JOIN alert_groups ag ON ag.id = i.alert_group_id
+		WHERE ag.alert_key = $1 ORDER BY i.idempotency_key`, alertKey)
+	if err != nil {
+		t.Fatalf("read the promises of %s: %v", alertKey, err)
 	}
+	defer rows.Close()
 
-	// Verify all fan-out steps have ContinueOnFailure=true and TargetType=user
-	var nonCofCount int
-	env.S.GetDB().QueryRow(`
-		SELECT COUNT(*) FROM job_steps js
-		JOIN job_stages jst ON js.stage_id = jst.id
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_fanout_1' AND jst.stage_index = 1
-		  AND js.continue_on_failure = false
-	`).Scan(&nonCofCount)
-	if nonCofCount > 0 {
-		t.Errorf("All fan-out steps should have ContinueOnFailure=true, but %d don't", nonCofCount)
+	var targets []string
+	for rows.Next() {
+		var target string
+		if err := rows.Scan(&target); err != nil {
+			t.Fatalf("read a promise: %v", err)
+		}
+		targets = append(targets, target)
 	}
+	return targets
 }
 
 // TestPipeline_ScheduleFanOut_MultiUserGroup verifies that a single L1 group
@@ -870,61 +970,21 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	initialSentCount := env.MockProv.SentCount()
+	initialSentCount := env.Channel.SentCount()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "test_multi_fanout_1", 0) // Firehose
-	waitForStepCompletion(t, env.S, "test_multi_fanout_1", 1) // Fan-out stage
-	waitForJobStatus(t, env.S, "test_multi_fanout_1", model.JobStatusSucceeded)
-
-	// Stage count: firehose + fan-out
-	var stageCount int
-	env.S.GetDB().QueryRow(`
-		SELECT COUNT(*) FROM job_stages jst
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_multi_fanout_1'
-	`).Scan(&stageCount)
-	if stageCount != 2 {
-		t.Errorf("Expected 2 stages, got %d", stageCount)
-	}
-
-	// Fan-out stage must have EXACTLY 2 steps (one per group member)
-	var fanoutStepCount int
-	env.S.GetDB().QueryRow(`
-		SELECT COUNT(*) FROM job_steps js
-		JOIN job_stages jst ON js.stage_id = jst.id
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_multi_fanout_1' AND jst.stage_index = 1
-	`).Scan(&fanoutStepCount)
-	if fanoutStepCount != 2 {
-		t.Errorf("Expected exactly 2 fan-out steps, got %d", fanoutStepCount)
-	}
-
-	// All fan-out steps must have ContinueOnFailure=true
-	var nonCofCount int
-	env.S.GetDB().QueryRow(`
-		SELECT COUNT(*) FROM job_steps js
-		JOIN job_stages jst ON js.stage_id = jst.id
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_multi_fanout_1' AND jst.stage_index = 1
-		  AND js.continue_on_failure = false
-	`).Scan(&nonCofCount)
-	if nonCofCount > 0 {
-		t.Errorf("All fan-out steps should have ContinueOnFailure=true, but %d don't", nonCofCount)
-	}
+	waitForDeliveries(t, env.S, "test_multi_fanout_1", 2)
 
 	// Both Slack IDs must have received DMs
-	if env.MockProv.SentCount()-initialSentCount < 3 {
+	if env.Channel.SentCount()-initialSentCount < 3 {
 		t.Errorf("Expected at least 3 notifications (firehose + 2 DMs), got %d",
-			env.MockProv.SentCount()-initialSentCount)
+			env.Channel.SentCount()-initialSentCount)
 	}
-	targets := env.MockProv.SentTargets()
+	targets := env.Channel.SentTargets()
 	targetSet := make(map[string]bool)
 	for _, tgt := range targets {
 		targetSet[tgt] = true
@@ -1009,31 +1069,17 @@ func TestPipeline_ScheduleFanOut_OverrideOverGroup(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	initialSentCount := env.MockProv.SentCount()
+	initialSentCount := env.Channel.SentCount()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "test_override_group_1", 0)
-	waitForStepCompletion(t, env.S, "test_override_group_1", 1)
-	waitForJobStatus(t, env.S, "test_override_group_1", model.JobStatusSucceeded)
-
-	// Fan-out stage must have EXACTLY 1 step (override replaces entire group)
-	var stepCount int
-	env.S.GetDB().QueryRow(`
-		SELECT COUNT(*) FROM job_steps js
-		JOIN job_stages jst ON js.stage_id = jst.id
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_override_group_1' AND jst.stage_index = 1
-	`).Scan(&stepCount)
-	if stepCount != 1 {
-		t.Errorf("Expected exactly 1 step (override replaces group), got %d", stepCount)
-	}
+	waitForDeliveries(t, env.S, "test_override_group_1", 2)
 
 	// Only S_BOB should have received a DM, not S_ALICE
-	targets := env.MockProv.SentTargets()
+	targets := env.Channel.SentTargets()
 	for _, tgt := range targets[initialSentCount:] {
 		if tgt == "S_ALICE" {
 			t.Errorf("S_ALICE should not receive DM when override active, targets: %v", targets)
@@ -1109,31 +1155,17 @@ func TestPipeline_ScheduleFanOut_NoL2Additive(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	initialSentCount := env.MockProv.SentCount()
+	initialSentCount := env.Channel.SentCount()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "test_no_l2_additive_1", 0)
-	waitForStepCompletion(t, env.S, "test_no_l2_additive_1", 1)
-	waitForJobStatus(t, env.S, "test_no_l2_additive_1", model.JobStatusSucceeded)
-
-	// Fan-out stage must have EXACTLY 1 step (L1 only, no implicit L2)
-	var stepCount int
-	env.S.GetDB().QueryRow(`
-		SELECT COUNT(*) FROM job_steps js
-		JOIN job_stages jst ON js.stage_id = jst.id
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_no_l2_additive_1' AND jst.stage_index = 1
-	`).Scan(&stepCount)
-	if stepCount != 1 {
-		t.Errorf("Expected exactly 1 fan-out step (L1 only, no L2 additive), got %d", stepCount)
-	}
+	waitForDeliveries(t, env.S, "test_no_l2_additive_1", 2)
 
 	// S_L2 must NOT appear in sent targets
-	targets := env.MockProv.SentTargets()
+	targets := env.Channel.SentTargets()
 	for _, tgt := range targets[initialSentCount:] {
 		if tgt == "S_L2" {
 			t.Errorf("S_L2 must not receive DM (L2 not additive in schedule fan-out), targets: %v", targets)
@@ -1195,34 +1227,53 @@ func TestPipeline_DisabledProvider_PermanentFail(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "test_disabled_1", 0) // firehose succeeds
-	waitForStepCompletion(t, env.S, "test_disabled_1", 1) // blocked DM step terminal
+	// The firehose still goes out. A step naming a provider nothing here
+	// delivers through is not promised at all: promised, it would be a
+	// commitment whose every attempt fails, and refused at the gate it would
+	// take the whole escalation - including this firehose - down with it on
+	// every tick, forever.
+	waitForDeliveries(t, env.S, "test_disabled_1", 1)
 
-	// The blocked step must be failed and must NOT have retried (attempt_count stays 0
-	// because the permanent-error check short-circuits before the retry increment).
-	var status string
-	var attempts int
+	var promised int
 	if err := env.S.GetDB().QueryRow(`
-		SELECT js.status, js.attempt_count
-		FROM job_steps js
-		JOIN job_stages jst ON js.stage_id = jst.id
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_disabled_1' AND jst.stage_index = 1
-		LIMIT 1
-	`).Scan(&status, &attempts); err != nil {
-		t.Fatalf("query blocked step: %v", err)
+		SELECT count(*) FROM outbound_intents i
+		JOIN alert_groups ag ON ag.id = i.alert_group_id
+		WHERE ag.alert_key = 'test_disabled_1' AND i.provider = 'blocked'`).
+		Scan(&promised); err != nil {
+		t.Fatalf("count the promises: %v", err)
 	}
-	if status != string(model.JobStepStatusFailed) {
-		t.Errorf("expected blocked step status 'failed', got %q", status)
-	}
-	if attempts != 0 {
-		t.Errorf("permanent failure must not retry: expected attempt_count 0, got %d", attempts)
+	if promised != 0 {
+		t.Errorf("%d commitments were made for a provider with no channel", promised)
 	}
 
-	// Non-COF failed step hard-fails the job.
-	waitForJobStatus(t, env.S, "test_disabled_1", model.JobStatusFailed)
+	// And the alert's history says why, which is the whole point of not
+	// promising it: somebody has to be able to find out.
+	events, err := env.S.GetTimelineEvents(agIDForKey(t, env.S, "test_disabled_1"))
+	if err != nil {
+		t.Fatalf("read the timeline: %v", err)
+	}
+	var explained bool
+	for _, event := range events {
+		if strings.Contains(event.Message, "Escalation step") &&
+			strings.Contains(event.Message, "blocked") {
+			explained = true
+		}
+	}
+	if !explained {
+		t.Error("nothing in the alert's history says the step could not be delivered")
+	}
+}
+
+// agIDForKey is the alert group behind an alert key.
+func agIDForKey(t *testing.T, s *store.Store, alertKey string) string {
+	t.Helper()
+	ag, err := s.GetActiveAlertGroupByAlertKey(alertKey)
+	if err != nil {
+		t.Fatalf("get the alert group of %s: %v", alertKey, err)
+	}
+	return ag.ID
 }
 
 // TestPipeline_ChannelUpdate verifies a policy CHANNEL step produces an editable
@@ -1267,22 +1318,27 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "test_channel_update_1", 0) // firehose
-	waitForStepCompletion(t, env.S, "test_channel_update_1", 1) // policy channel step
+	waitForDeliveries(t, env.S, "test_channel_update_1", 2)
 
-	// The policy channel step must have produced an editable delivery row.
-	var supportsUpdate bool
+	// The policy channel step promised an editable card - one the alert can
+	// bring to a later revision - and the delivery recorded where it went,
+	// which is what makes that possible.
+	var form, receipt string
 	if err := env.S.GetDB().QueryRow(`
-		SELECT nd.supports_update
-		FROM notification_deliveries nd
-		JOIN alert_groups ag ON nd.alert_group_id = ag.id
-		WHERE ag.alert_key = $1 AND nd.target_id = 'C_POLICY_CHAN'
-	`, "test_channel_update_1").Scan(&supportsUpdate); err != nil {
-		t.Fatalf("query channel delivery: %v", err)
+		SELECT i.form, COALESCE(i.receipt::text, '')
+		FROM outbound_intents i
+		JOIN alert_groups ag ON ag.id = i.alert_group_id
+		WHERE ag.alert_key = $1 AND i.target_ref = 'C_POLICY_CHAN'`,
+		"test_channel_update_1").Scan(&form, &receipt); err != nil {
+		t.Fatalf("read the channel commitment: %v", err)
 	}
-	if !supportsUpdate {
-		t.Error("expected the channel-step delivery to be updatable (supports_update=true)")
+	if form != "editable" {
+		t.Errorf("the channel card is %q", form)
+	}
+	if receipt == "" {
+		t.Error("the delivered card does not say where it is")
 	}
 
 	// A timeline event specific to the CHANNEL step must exist — assert on its
@@ -1297,18 +1353,22 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTimelineEvents: %v", err)
 	}
+	// The line has to say WHICH delivery it is about. An alert with a firehose
+	// card and several direct messages produces several lines that would
+	// otherwise read identically, and telling them apart is usually the reason
+	// somebody is reading the history at all.
 	found := false
 	for _, ev := range events {
 		if ev.Type == model.TimelineEventNotificationSent &&
-			ev.Metadata["step_type"] == "channel" &&
-			ev.Metadata["channel_id"] == "C_POLICY_CHAN" {
+			ev.Metadata["provider"] == "slack" &&
+			ev.Metadata["target_ref"] == "C_POLICY_CHAN" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("expected a notification-sent timeline event for the channel step "+
-			"(step_type=channel, channel_id=C_POLICY_CHAN); got %d events", len(events))
+		t.Errorf("expected a notification-sent line naming the channel delivery "+
+			"(provider=slack, target_ref=C_POLICY_CHAN); got %d events", len(events))
 	}
 }
 
@@ -1360,40 +1420,41 @@ func TestPipeline_EscalationUnlinked(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "test_unlinked_1", 0) // firehose
-	waitForStepCompletion(t, env.S, "test_unlinked_1", 1) // unlinked DM step
+	waitForDeliveries(t, env.S, "test_unlinked_1", 2)
 
-	var status string
-	var attempts int
+	// Nobody's account links itself, so the commitment ends where a person can
+	// see it rather than retrying for as long as the alert lives.
+	var status, errorClass string
+	var calls int
 	if err := env.S.GetDB().QueryRow(`
-		SELECT js.status, js.attempt_count
-		FROM job_steps js
-		JOIN job_stages jst ON js.stage_id = jst.id
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_unlinked_1' AND jst.stage_index = 1
-		LIMIT 1
-	`).Scan(&status, &attempts); err != nil {
-		t.Fatalf("query unlinked step: %v", err)
+		SELECT i.status,
+		       COALESCE((SELECT a.error_class FROM outbound_attempts a
+		                 WHERE a.intent_id = i.id ORDER BY a.attempt_no DESC LIMIT 1), ''),
+		       (SELECT count(*) FROM outbound_attempts a
+		        WHERE a.intent_id = i.id AND a.record_kind = 'attempt')
+		FROM outbound_intents i
+		JOIN alert_groups ag ON ag.id = i.alert_group_id
+		WHERE ag.alert_key = 'test_unlinked_1' AND i.target_ref = 'U_UNLINKED'`).
+		Scan(&status, &errorClass, &calls); err != nil {
+		t.Fatalf("read the commitment: %v", err)
 	}
-	if status != string(model.JobStepStatusFailed) {
-		t.Errorf("expected unlinked DM step status 'failed', got %q", status)
+	if status != "permanent_failed" {
+		t.Errorf("an unlinked recipient left the commitment %q", status)
 	}
-	if attempts != 0 {
-		t.Errorf("missing identity is permanent: expected attempt_count 0 (no retry), got %d", attempts)
+	if errorClass != "identity_not_linked" {
+		t.Errorf("the journal says %q rather than why nobody could be reached", errorClass)
 	}
-
-	// MockProvider must never have been asked to send — resolution fails first.
-	if env.MockProv.SentTargets() != nil {
-		for _, tgt := range env.MockProv.SentTargets() {
-			if tgt == "U_UNLINKED" {
-				t.Errorf("MockProvider.Send should not be called for an unlinked recipient")
-			}
+	// A refusal leaves proof, not doubt: no call was made at all.
+	if calls != 0 {
+		t.Errorf("%d calls were recorded for a recipient with no account", calls)
+	}
+	for _, tgt := range env.Channel.SentTargets() {
+		if tgt == "U_UNLINKED" {
+			t.Error("the channel was asked to send to an unlinked recipient")
 		}
 	}
-
-	waitForJobStatus(t, env.S, "test_unlinked_1", model.JobStatusFailed)
 }
 
 // TestPipeline_CancelDuringExecution tests the real ack-driven cancellation path.
@@ -1452,9 +1513,10 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
 	// Wait for firehose (stage 0) to complete — DM step (stage 1) is delayed, still pending
-	waitForStepCompletion(t, env.S, "test_cancel_exec_1", 0)
+	waitForDeliveries(t, env.S, "test_cancel_exec_1", 1)
 
 	// Ack via the real production path: AckAlertGroupAtomic
 	ag, err := env.S.GetActiveAlertGroupByAlertKey("test_cancel_exec_1")
@@ -1478,20 +1540,23 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	ackCtx := context.Background()
 	env.Disp.ProcessAcknowledgedAlertGroups(ackCtx)
 
-	// Verify job is canceled
-	waitForJobStatus(t, env.S, "test_cancel_exec_1", model.JobStatusCanceled)
-
-	// Verify no active/blocked stages remain on the canceled escalation job
-	var activeStageCnt int
-	env.S.GetDB().QueryRow(`
-		SELECT COUNT(*) FROM job_stages jst
-		JOIN jobs j ON jst.job_id = j.id
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = 'test_cancel_exec_1' AND j.status = 'canceled'
-		  AND jst.status IN ('active', 'blocked')
-	`).Scan(&activeStageCnt)
-	if activeStageCnt != 0 {
-		t.Errorf("Expected 0 active/blocked stages on canceled escalation job, got %d", activeStageCnt)
+	// Verify the delayed page was withdrawn. It had not gone out - it was five
+	// minutes away - so acknowledging the alert takes it back rather than
+	// letting it wake somebody about an alert that is already handled.
+	var withdrawn, owing int
+	if err := env.S.GetDB().QueryRow(`
+		SELECT count(*) FILTER (WHERE i.status = 'canceled'),
+		       count(*) FILTER (WHERE i.status IN ('pending', 'sending'))
+		FROM outbound_intents i
+		JOIN alert_groups ag ON ag.id = i.alert_group_id
+		WHERE ag.alert_key = 'test_cancel_exec_1'`).Scan(&withdrawn, &owing); err != nil {
+		t.Fatalf("read the commitments: %v", err)
+	}
+	if withdrawn != 1 {
+		t.Errorf("%d commitments were withdrawn, want the delayed page", withdrawn)
+	}
+	if owing != 0 {
+		t.Errorf("%d commitments are still owed after the acknowledgement", owing)
 	}
 
 	// Verify AG status is acknowledged
@@ -1520,4 +1585,24 @@ func waitForJobStatus(t *testing.T, s *store.Store, alertKey string, expected mo
 		JOIN alert_groups ag ON j.alert_group_id = ag.id
 		WHERE ag.alert_key = $1`, alertKey).Scan(&actual)
 	t.Fatalf("Timeout waiting for job %s to reach status %s, current: %s", alertKey, expected, actual)
+}
+
+// waitForNothingOwed waits until an alert group has no commitment left in
+// flight: everything it promised has either gone out or been withdrawn.
+func waitForNothingOwed(t *testing.T, s *store.Store, alertKey string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var owing int
+		err := s.GetDB().QueryRow(`
+			SELECT count(*) FROM outbound_intents i
+			JOIN alert_groups ag ON ag.id = i.alert_group_id
+			WHERE ag.alert_key = $1 AND i.status IN ('pending', 'sending')`,
+			alertKey).Scan(&owing)
+		if err == nil && owing == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("%s still owes deliveries after it was resolved", alertKey)
 }

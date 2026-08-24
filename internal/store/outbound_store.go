@@ -356,13 +356,38 @@ func admissionTimelineTx(ctx context.Context, tx *sql.Tx,
 func addTimelineTx(ctx context.Context, tx *sql.Tx, alertGroupID string,
 	eventType model.TimelineEventType, message, actor string) error {
 
+	return addTimelineWithTx(ctx, tx, alertGroupID, eventType, message, actor, nil)
+}
+
+// addTimelineWithTx writes a line of the alert's history, with what it was
+// about.
+//
+// The metadata is not decoration. An alert with a firehose card and three
+// direct messages produces four lines that would otherwise read identically:
+// "Notification sent", four times, with nothing to say which of the four
+// deliveries each one is. Whoever is reading that history is usually trying to
+// work out exactly that.
+func addTimelineWithTx(ctx context.Context, tx *sql.Tx, alertGroupID string,
+	eventType model.TimelineEventType, message, actor string,
+	about map[string]string) error {
+
 	if actor == "" {
 		actor = "system"
 	}
+
+	metadata := []byte("{}")
+	if len(about) > 0 {
+		encoded, err := json.Marshal(about)
+		if err != nil {
+			return fmt.Errorf("record %s in the timeline: %w", eventType, err)
+		}
+		metadata = encoded
+	}
+
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO timeline_events (id, alert_group_id, type, message, actor, metadata, created_at)
-		VALUES ($1, $2, $3, $4, $5, '{}', now())`,
-		uuid.New().String(), alertGroupID, eventType, message, actor)
+		VALUES ($1, $2, $3, $4, $5, $6, now())`,
+		uuid.New().String(), alertGroupID, eventType, message, actor, metadata)
 	if err != nil {
 		return fmt.Errorf("record %s in the timeline: %w", eventType, err)
 	}
@@ -609,7 +634,7 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 	if !w.Intent.GroupBound() {
 		return nil
 	}
-	return groupEffectsTx(ctx, tx, w.Intent.AlertGroupID, w.Transition)
+	return groupEffectsTx(ctx, tx, w.Intent, w.Transition)
 }
 
 // appendTransitionEventTx records the lifecycle events a transition produces -
@@ -644,11 +669,18 @@ func appendTransitionEventTx(ctx context.Context, tx *sql.Tx, w transitionWrite)
 
 // groupEffectsTx writes what a transition means for the alert group: its
 // history, and the one status move a delivery is allowed to make.
-func groupEffectsTx(ctx context.Context, tx *sql.Tx, alertGroupID string,
+func groupEffectsTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
 	transition outbound.Transition) error {
 
+	alertGroupID := intent.AlertGroupID
 	if message, eventType, ok := timelineFor(transition); ok {
-		if err := addTimelineTx(ctx, tx, alertGroupID, eventType, message, "system"); err != nil {
+		if err := addTimelineWithTx(ctx, tx, alertGroupID, eventType, message, "system",
+			map[string]string{
+				"intent_id":   intent.ID,
+				"provider":    intent.Provider,
+				"target_kind": string(intent.TargetKind),
+				"target_ref":  intent.TargetRef,
+			}); err != nil {
 			return err
 		}
 	}

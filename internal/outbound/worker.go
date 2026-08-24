@@ -114,6 +114,14 @@ func (w *Worker) drain() {
 	}
 }
 
+// Tick is one pass of the cycle: housekeeping, then a claim for the slots that
+// are free.
+//
+// Exported so that something other than the clock can drive it - a test that
+// waited whole seconds per delivery would spend its life asleep - and because
+// what a pass DOES is worth naming rather than hiding inside a ticker.
+func (w *Worker) Tick(ctx context.Context) { w.tick(ctx) }
+
 func (w *Worker) tick(ctx context.Context) {
 	tick := w.ticks.Add(1)
 

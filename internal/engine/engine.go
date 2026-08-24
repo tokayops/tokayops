@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher/builders"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -31,9 +31,9 @@ type onCallProjection interface {
 }
 
 type Engine struct {
-	store      escalationStore
-	oncall     onCallProjection
-	escBuilder *builders.EscalationJobBuilder
+	store  escalationStore
+	oncall onCallProjection
+	plan   *planner
 }
 
 // NewEngine builds the alert engine. The on-call projection is shared with the
@@ -64,17 +64,22 @@ type escalationStore interface {
 	// it: whatever the builder may read, the engine may read.
 	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
 
-	EnsureEscalationJob(agID string, job *model.Job, stages []*model.JobStage,
-		steps []*model.JobStep, snapshot *model.EscalationPolicySnapshot) (bool, error)
+	// SubmitEscalationBatch admits the whole escalation in one commit: the
+	// claim over the group, its commitments, the state they render from and the
+	// policy they were built against. It replaced EnsureEscalationJob, and the
+	// boundary it carries is the same one - split into separate calls, a crash
+	// between them leaves a group that looks handled and is not.
+	SubmitEscalationBatch(ctx context.Context,
+		adm outbound.EscalationAdmission) (outbound.SubmitResult, error)
 }
 
-func NewEngine(s escalationStore, oncall onCallProjection, cfg *config.Config) *Engine {
-	// cfg is not kept: the only thing the engine did with it was hand it to the
-	// builder, which now holds it.
+func NewEngine(s escalationStore, oncall onCallProjection, settings channelSettings,
+	cfg *config.Config) *Engine {
+
 	return &Engine{
-		store:      s,
-		oncall:     oncall,
-		escBuilder: builders.NewEscalationJobBuilder(s, oncall, cfg),
+		store:  s,
+		oncall: oncall,
+		plan:   &planner{store: s, oncall: oncall, settings: settings, cfg: cfg},
 	}
 }
 
@@ -144,8 +149,9 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		// may name a schedule this team no longer owns.
 		teamOnCall := schedulerender.TeamOnCallRead(e.oncall.CurrentTeamOnCallNow(ctx, ag.TeamID))
 
-		// Build unified job (includes firehose as step 0 if configured)
-		job, stages, steps, snapshot, err := e.escBuilder.Build(ctx, ag, policyID, teamOnCall)
+		// What this alert promises, and to whom: the state every message will
+		// be rendered from, and one commitment per recipient.
+		admission, err := e.plan.buildPlan(ctx, ag, policyID, teamOnCall)
 
 		// The recipients could not be resolved, so no job is committed and the
 		// alert group stays "new" for the next tick to try again. Committing
@@ -155,7 +161,7 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		// Nothing is logged for this group: it will be back next tick, and the
 		// tick after that. The tally declared above the loop reports all of
 		// them in one line once the loop is done.
-		if errors.Is(err, builders.ErrOnCallResolutionUnavailable) {
+		if errors.Is(err, ErrOnCallResolutionUnavailable) {
 			metrics.EngineEscalationBuildDeferralsTotal.Inc()
 			deferred++
 			if deferredErr == nil {
@@ -180,38 +186,32 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		}
 
 		if err != nil {
-			// Build failed — leave AG as "new" so it retries on next tick
-			log.Printf("AlertEngine: Failed to build job for %s (will retry): %v", ag.ID, err)
+			// The plan could not be built - a state that cannot be frozen, a
+			// grammar that refuses it. Nothing is admitted and the group stays
+			// new, so the next tick tries again rather than spending this
+			// alert's only chance to page on a half-built escalation.
+			log.Printf("AlertEngine: Failed to build the escalation for %s (will retry): %v", ag.ID, err)
 			continue
 		}
 
-		if job != nil {
-			// Atomic: lock AG row, check status, transition to processing,
-			// create job with dedup, save snapshot — all in one TX.
-			created, err := e.store.EnsureEscalationJob(ag.ID, job, stages, steps, snapshot)
-			if err != nil {
-				log.Printf("AlertEngine: Failed to ensure job for %s (will retry): %v", ag.ID, err)
-				continue
-			}
-			if created {
-				log.Printf("AlertEngine: Job created for %s (policy=%s, steps=%d)", ag.ID, snapshot.PolicyID, len(steps))
-			} else {
-				log.Printf("AlertEngine: Job already exists or AG status changed for %s", ag.ID)
-			}
-		} else {
-			// job == nil: no firehose and no policy
-			// CAS new→processing (for new AG) + touch updated_at (for stale processing)
-			if ag.Status == model.AlertGroupStatusNew {
-				if _, err := e.store.TransitionAlertGroupStatus(ag.ID, model.AlertGroupStatusNew, model.AlertGroupStatusProcessing); err != nil {
-					log.Printf("AlertEngine: Failed to transition %s to processing: %v", ag.ID, err)
-				}
-			} else {
-				// Stale processing without job — touch updated_at to prevent re-pickup
-				if _, err := e.store.TransitionAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing, model.AlertGroupStatusProcessing); err != nil {
-					log.Printf("AlertEngine: Failed to touch %s: %v", ag.ID, err)
-				}
-			}
-			log.Printf("AlertEngine: No job created for %s (no firehose, no policy)", ag.ID)
+		result, err := e.store.SubmitEscalationBatch(ctx, admission)
+		if err != nil {
+			log.Printf("AlertEngine: Failed to admit the escalation for %s (will retry): %v", ag.ID, err)
+			continue
+		}
+		switch result.Outcome {
+		case outbound.SubmitCreated:
+			// Nobody to notify is an ANSWER, not a failure: the group is
+			// admitted either way and never comes back to this loop, and the
+			// timeline says which of the two happened.
+			log.Printf("AlertEngine: Admitted %s (policy=%s, commitments=%d, unattended=%d)",
+				ag.ID, admission.PolicyID, len(result.IntentIDs),
+				len(admission.StepsWithoutRecipients))
+		default:
+			// Somebody else admitted this group first, or admitted something
+			// different for it. Both are answers about a group that is no
+			// longer this tick's to decide.
+			log.Printf("AlertEngine: %s was already admitted (%s)", ag.ID, result.Outcome)
 		}
 
 		// Save OnCall snapshot (regardless of job creation), from the very

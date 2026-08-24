@@ -320,14 +320,17 @@ func main() {
 	// WithClock - visibly in tests, silently in production.
 	scheduleRenderer := schedulerender.New(st.ScheduleReadRepository())
 
-	// Engine
-	eng := engine.NewEngine(st, scheduleRenderer, cfg)
-
 	// 4. Integration Cache (for webhook secrets and Slack config)
 	integrationCache := store.NewIntegrationCache()
 	if err := integrationCache.LoadAll(st); err != nil {
 		log.Fatalf("Failed to load integrations from DB: %v", err)
 	}
+
+	// Engine. It is built after the integration cache because a plan freezes
+	// whether a channel's messages carry buttons: that is configuration a
+	// MESSAGE depends on, so it is decided when the escalation is admitted
+	// rather than read again by whoever sends it.
+	eng := engine.NewEngine(st, scheduleRenderer, integrationCache, cfg)
 
 	// Dispatcher
 	disp, err := dispatcher.NewDispatcher(st, cfg)

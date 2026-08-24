@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"log"
 	"strings"
 	"testing"
@@ -61,7 +63,7 @@ func TestProcessNewAlertGroups(t *testing.T) {
 	// Setup Config (only for firehose channels now)
 	cfg := &config.Config{}
 
-	e := NewEngine(s, &fakeProjection{}, cfg)
+	e := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 
 	// Seed a NEW alert group
 	ag := &model.AlertGroup{
@@ -158,7 +160,7 @@ func TestResolvePolicy(t *testing.T) {
 
 func TestPolicySnapshot_Versioning(t *testing.T) {
 	s := store.NewMockStore()
-	eng := NewEngine(s, &fakeProjection{}, &config.Config{})
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, &config.Config{})
 
 	// 1. Setup Policy V1
 	policyID := "mutable_policy"
@@ -236,52 +238,86 @@ func TestPolicySnapshot_Versioning(t *testing.T) {
 	}
 }
 
-func TestEngine_BuildFailure_AGStaysNew(t *testing.T) {
+// TestEngine_PlanFailure_AGStaysNew: a plan that cannot be built at all admits
+// nothing, and the group stays new for the next tick.
+//
+// The state here cannot be frozen - two alerts carrying the same fingerprint
+// cannot be told apart, so a digest over them would not say what was rendered.
+// Admitting anyway would spend this alert's one chance to page on an escalation
+// whose messages nothing can identify.
+func TestEngine_PlanFailure_AGStaysNew(t *testing.T) {
 	s := store.NewMockStore()
 
-	// Create team that routes to a policy with an invalid step (empty TargetID)
-	teamID := "team_bad_policy"
-	policyID := "bad_policy"
-	s.CreateTeam(&model.Team{
-		ID:              teamID,
-		DefaultPolicyID: policyID,
-	})
-	s.CreateEscalationPolicy(&model.EscalationPolicy{
-		ID:   policyID,
-		Name: "Bad Policy",
-		Steps: []*model.EscalationStep{
-			{
-				Provider:    "slack",
-				TargetKind:  "dm",
-				TargetType:  "user",
-				TargetID:    "", // Empty target → Build() returns error
-				StepIndex:   0,
-				MaxAttempts: 3,
-			},
-		},
-	})
-
-	cfg := &config.Config{}
-	eng := NewEngine(s, &fakeProjection{}, cfg)
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseCriticalChannel: "C_FIRE"}}
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 
 	ag := &model.AlertGroup{
-		ID:       "ag-build-fail",
-		AlertKey: "dedup-build-fail",
+		ID:       "ag-plan-fail",
+		AlertKey: "dedup-plan-fail",
 		Status:   model.AlertGroupStatusNew,
-		TeamID:   teamID,
-		Severity: "info",
+		Severity: "critical",
+		Alerts: []model.Alert{
+			{Fingerprint: "same", Status: model.AlertStatusFiring, StartsAt: time.Now()},
+			{Fingerprint: "same", Status: model.AlertStatusFiring, StartsAt: time.Now()},
+		},
 	}
 	s.CreateAlertGroup(ag)
 
 	eng.ProcessNewAlertGroups(context.Background())
 
-	// AG should stay "new" because Build() failed — not marked as "processing"
-	updated, err := s.GetAlertGroupByID("ag-build-fail")
+	updated, err := s.GetAlertGroupByID("ag-plan-fail")
 	if err != nil {
 		t.Fatalf("Failed to fetch alert group: %v", err)
 	}
 	if updated.Status != model.AlertGroupStatusNew {
-		t.Errorf("Expected AG status to stay 'new' after Build failure, got '%s'", updated.Status)
+		t.Errorf("Expected AG status to stay 'new' after a plan failure, got '%s'", updated.Status)
+	}
+	if _, admitted := s.AdmissionFor("ag-plan-fail"); admitted {
+		t.Error("an escalation was admitted for a group whose state cannot be frozen")
+	}
+}
+
+// TestEngine_StepWithNoTarget_IsRecordedNotFailed. A step nobody can be found
+// for is not a reason to hold the whole escalation: the rest of the plan is
+// admitted, and the step that resolved to nobody is named in the group's
+// history instead of becoming a commitment that is certain to fail.
+func TestEngine_StepWithNoTarget_IsRecordedNotFailed(t *testing.T) {
+	s := store.NewMockStore()
+
+	teamID := "team_bad_policy"
+	policyID := "bad_policy"
+	s.CreateTeam(&model.Team{ID: teamID, DefaultPolicyID: policyID})
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID:   policyID,
+		Name: "Bad Policy",
+		Steps: []*model.EscalationStep{{
+			Provider: "slack", TargetKind: "dm", TargetType: "user",
+			TargetID: "", StepIndex: 0, MaxAttempts: 3,
+		}},
+	})
+
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseWarningChannel: "C_FIRE"}}
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+
+	ag := &model.AlertGroup{
+		ID: "ag-no-target", AlertKey: "dedup-no-target",
+		Status: model.AlertGroupStatusNew, TeamID: teamID, Severity: "info",
+	}
+	s.CreateAlertGroup(ag)
+
+	eng.ProcessNewAlertGroups(context.Background())
+
+	admission, admitted := s.AdmissionFor("ag-no-target")
+	if !admitted {
+		t.Fatal("nothing was admitted for a group whose policy step names nobody")
+	}
+	if len(admission.Admission.Commitments) != 1 {
+		t.Fatalf("expected the firehose alone, got %d commitments",
+			len(admission.Admission.Commitments))
+	}
+	if len(admission.StepsWithoutRecipients) != 1 {
+		t.Fatalf("the step that resolved to nobody was not recorded: %v",
+			admission.StepsWithoutRecipients)
 	}
 }
 
@@ -292,7 +328,7 @@ func TestEngine_FirehoseCreation(t *testing.T) {
 			FirehoseCriticalChannel: "C_FIRE",
 		},
 	}
-	eng := NewEngine(s, &fakeProjection{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 
 	// Create AG (Critical) - no policy, firehose only
 	ag := &model.AlertGroup{ID: "ag_fire", Severity: "critical", AlertKey: "dk_fire", Status: model.AlertGroupStatusNew}
@@ -300,34 +336,25 @@ func TestEngine_FirehoseCreation(t *testing.T) {
 
 	eng.ProcessNewAlertGroups(context.Background())
 
-	// Firehose is now step 0 in the unified escalation job
-	job, err := s.FindJobByIdentity(jobdedup.Escalation("ag_fire"))
-	if err != nil {
-		t.Fatalf("Escalation job not found: %v", err)
+	admission, admitted := s.AdmissionFor("ag_fire")
+	if !admitted {
+		t.Fatal("nothing was admitted for a group with a firehose channel")
 	}
-	if job == nil {
-		t.Fatal("Escalation job is nil")
-	}
-	if job.Type != "escalation" {
-		t.Errorf("Expected job type escalation, got %s", job.Type)
+	if len(admission.Admission.Commitments) != 1 {
+		t.Fatalf("expected one commitment, got %d", len(admission.Admission.Commitments))
 	}
 
-	// Step 0 should be firehose
-	fetchedSteps := s.GetJobStepsByJobID(job.ID)
-	step := fetchedSteps[0]
-	if step.StepType != "firehose" {
-		t.Errorf("Expected step type firehose, got %s", step.StepType)
+	commitment := admission.Admission.Commitments[0]
+	if commitment.Slot.Kind != keys.SlotFirehose {
+		t.Errorf("the firehose is in slot %q", commitment.Slot.Kind)
 	}
-
-	var data model.EscalationStepData
-	if err := json.Unmarshal(step.Data, &data); err != nil {
-		t.Fatalf("Unmarshal failed: %v", err)
+	if commitment.Target.Kind != keys.TargetChannel || commitment.Target.Ref != "C_FIRE" {
+		t.Errorf("the firehose promises %s %q", commitment.Target.Kind, commitment.Target.Ref)
 	}
-	if data.TargetID != "C_FIRE" {
-		t.Errorf("Expected target C_FIRE, got %s", data.TargetID)
-	}
-	if !data.IsFirehose {
-		t.Error("IsFirehose should be true")
+	// It goes out immediately: everything else in a plan is measured from the
+	// admission, and the firehose is the zero of that measurement.
+	if commitment.Timing.Offset != 0 {
+		t.Errorf("the firehose waits %s", commitment.Timing.Offset)
 	}
 }
 
@@ -364,7 +391,7 @@ func TestEngine_ReconcileStaleProcessing(t *testing.T) {
 		t.Fatalf("Failed to create AG: %v", err)
 	}
 
-	eng := NewEngine(s, &fakeProjection{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 	eng.ProcessNewAlertGroups(context.Background())
 
 	// Verify: AG should still be "processing" (re-processed by engine)
@@ -376,16 +403,18 @@ func TestEngine_ReconcileStaleProcessing(t *testing.T) {
 		t.Errorf("Expected status processing, got %s", updated.Status)
 	}
 
-	// Verify: a job should now exist for this AG
-	job, err := s.FindJobByIdentity(jobdedup.Escalation("ag-orphan"))
-	if err != nil {
-		t.Fatalf("Job lookup failed: %v", err)
+	// Verify: the orphan is escalated now - it was picked up precisely because
+	// nothing had been admitted for it.
+	admission, admitted := s.AdmissionFor("ag-orphan")
+	if !admitted {
+		t.Fatal("nothing was admitted for a group that has been processing with no escalation")
 	}
-	if job == nil {
-		t.Fatal("Expected job to be created for orphaned AG, got nil")
+	if len(admission.Admission.Commitments) != 1 {
+		t.Fatalf("expected the policy's one step, got %d commitments",
+			len(admission.Admission.Commitments))
 	}
-	if job.Type != "escalation" {
-		t.Errorf("Expected job type escalation, got %s", job.Type)
+	if got := admission.Admission.Commitments[0].Target.Ref; got != "U999" {
+		t.Errorf("the escalation promises %q", got)
 	}
 }
 
@@ -443,7 +472,7 @@ func TestEngine_ScheduleRecreation_OnCallConsistency(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	cfg := &config.Config{}
-	eng := NewEngine(s, proj, cfg)
+	eng := NewEngine(s, proj, &fakeSettings{}, cfg)
 	eng.ProcessNewAlertGroups(context.Background())
 
 	// 1. Verify on-call snapshot shows user-new (Denis)
@@ -459,33 +488,31 @@ func TestEngine_ScheduleRecreation_OnCallConsistency(t *testing.T) {
 		t.Errorf("OnCallSnapshot should show '%s' (Denis), got '%s'", userNew.ID, snapshotUserID)
 	}
 
-	// 2. Verify job step targets the same user
-	job, err := s.FindJobByIdentity(jobdedup.Escalation("ag-stale-engine"))
-	if err != nil || job == nil {
-		t.Fatalf("Job not found: %v", err)
+	// 2. Verify the escalation promises the same person
+	admission, admitted := s.AdmissionFor("ag-stale-engine")
+	if !admitted {
+		t.Fatal("nothing was admitted")
 	}
-	fetchedSteps := s.GetJobStepsByJobID(job.ID)
-	var dmStep *model.JobStep
-	for _, step := range fetchedSteps {
-		if step.StepType == "dm" {
-			dmStep = step
+	var promised string
+	for _, commitment := range admission.Admission.Commitments {
+		if commitment.Target.Kind == keys.TargetUser {
+			promised = commitment.Target.Ref
 			break
 		}
 	}
-	if dmStep == nil {
-		t.Fatal("Expected a dm step in the job")
+	if promised == "" {
+		t.Fatal("the escalation promises nobody")
 	}
 
-	var stepData model.EscalationStepData
-	json.Unmarshal(dmStep.Data, &stepData)
-
-	// Critical consistency check: snapshot and job step must agree
-	if stepData.TargetID != snapshotUserID {
-		t.Errorf("REGRESSION: Job step targets '%s' but OnCallSnapshot shows '%s' — stale schedule bug!",
-			stepData.TargetID, snapshotUserID)
+	// The consistency that matters: what was recorded on the group and what
+	// was promised are one answer, read once, from the schedule the team has
+	// NOW rather than the one a policy step still names.
+	if promised != snapshotUserID {
+		t.Errorf("REGRESSION: the escalation promises '%s' while the on-call snapshot shows '%s' - stale schedule bug!",
+			promised, snapshotUserID)
 	}
-	if stepData.TargetID != userNew.ID {
-		t.Errorf("REGRESSION: Job step should target '%s' (Denis), got '%s'", userNew.ID, stepData.TargetID)
+	if promised != userNew.ID {
+		t.Errorf("REGRESSION: the escalation should promise '%s' (Denis), got '%s'", userNew.ID, promised)
 	}
 }
 
@@ -520,7 +547,7 @@ func TestEngine_StaleProcessing_WithSucceededJob_NotReconciled(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	// Simulate: escalation job already ran and succeeded
-	eng := NewEngine(s, &fakeProjection{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
 	job, stages, steps, snapshot, _ := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	// Create job directly (bypassing engine) and mark as succeeded
@@ -573,7 +600,7 @@ func TestEnsureEscalationJob_SkipsAckedAG(t *testing.T) {
 
 	// Build job for this AG (as engine would)
 	cfg := &config.Config{}
-	eng := NewEngine(s, &fakeProjection{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
 	job, stages, steps, snapshot, err := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
 	if err != nil {
@@ -630,7 +657,7 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	cfg := &config.Config{}
-	eng := NewEngine(s, &fakeProjection{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 
 	// First call — should create job with V1 snapshot
 	eng.ProcessNewAlertGroups(context.Background())
@@ -697,35 +724,37 @@ func TestEnsureEscalationJob_SkipsSucceededJob(t *testing.T) {
 	}
 	s.CreateAlertGroup(ag)
 
-	eng := NewEngine(s, &fakeProjection{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 
-	// First run — creates escalation job
+	// First run - admits the escalation
 	eng.ProcessNewAlertGroups(context.Background())
 
-	// Verify job was created
-	job, err := s.FindJobByIdentity(jobdedup.Escalation("ag-succeeded-skip"))
-	if err != nil {
-		t.Fatalf("Job not found: %v", err)
-	}
-	if job == nil {
-		t.Fatal("Expected job to be created")
+	first, admitted := s.AdmissionFor("ag-succeeded-skip")
+	if !admitted {
+		t.Fatal("nothing was admitted on the first tick")
 	}
 
-	// Mark job as succeeded
-	s.MarkJobSucceeded(jobdedup.Escalation("ag-succeeded-skip"))
-
-	// Force AG back to new to re-trigger processing
+	// Whatever happens to the deliveries afterwards, the claim over this group
+	// is held forever: an escalation is admitted once, and a group that comes
+	// back round - by a status change, a stale reconcile, anything - does not
+	// get a second one.
 	s.SetAlertGroupStatus("ag-succeeded-skip", model.AlertGroupStatusNew)
-
-	// Second run — should NOT create a new job (DB invariant: 1 escalation per AG)
 	eng.ProcessNewAlertGroups(context.Background())
 
-	// Verify AG was picked up but dedup prevented a new job
-	updated, _ := s.GetAlertGroupByID("ag-succeeded-skip")
-	// AG transitions to processing because EnsureEscalationJob updates status before dedup check
-	if updated.Status != model.AlertGroupStatusProcessing {
-		t.Errorf("Expected AG status 'processing' (transitioned before dedup), got '%s'", updated.Status)
+	if batches := s.AdmittedBatches(); len(batches) != 1 {
+		t.Fatalf("the group was admitted %d times", len(batches))
 	}
+	again, _ := s.AdmissionFor("ag-succeeded-skip")
+	if again.Admission.BatchKey != first.Admission.BatchKey {
+		t.Errorf("the second tick replaced the claim: %q then %q",
+			first.Admission.BatchKey, again.Admission.BatchKey)
+	}
+
+	// The group's status is not asserted here on purpose. A tick that finds the
+	// claim already held touches nothing about the group - the producer that
+	// won said what this group escalates by, and a later one does not get to
+	// restate it - so what the status says afterwards is whatever the test set
+	// it to. What matters is above: one claim, unchanged.
 }
 
 func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
@@ -752,7 +781,7 @@ func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	cfg := &config.Config{}
-	eng := NewEngine(s, &fakeProjection{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 
 	// First tick — should pick up stale AG and touch updated_at
 	eng.ProcessNewAlertGroups(context.Background())
@@ -795,7 +824,7 @@ func TestEngine_OnCallSnapshot_OverrideCarriesSource(t *testing.T) {
 	proj := &fakeProjection{teams: map[string]schedulerender.TeamOnCall{
 		teamID: teamSchedule("sched-1", onDutyByOverride("ovr-1", standIn.ID)),
 	}}
-	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -831,7 +860,7 @@ func TestEngine_OnCallSnapshot_NoSchedule_IsEmptyNotAnError(t *testing.T) {
 	}
 	s.CreateAlertGroup(ag)
 
-	NewEngine(s, &fakeProjection{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, &fakeProjection{}, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -864,7 +893,7 @@ func TestEngine_OnCallSnapshot_DeletedSchedule_IsEmpty(t *testing.T) {
 	proj := &fakeProjection{teams: map[string]schedulerender.TeamOnCall{
 		teamID: {ScheduleID: "sched-1", DeletedAt: &deletedAt, OnCall: schedulerender.OnCall{At: projectionBase}},
 	}}
-	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -897,7 +926,7 @@ func TestEngine_OnCallSnapshot_L2IsRecorded(t *testing.T) {
 	proj := &fakeProjection{teams: map[string]schedulerender.TeamOnCall{
 		teamID: teamSchedule("sched-1", withL2),
 	}}
-	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -947,7 +976,7 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 		first: teamSchedule("sched-1", onDuty("g-outgoing", outgoing.ID)),
 		then:  &after,
 	}
-	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	if proj.calls != 1 {
 		t.Errorf("projection read %d times for one alert group, want 1", proj.calls)
@@ -962,27 +991,24 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 	}
 	snapshotUser := updated.OnCallSnapshot.L1Users[0].ID
 
-	job, err := s.FindJobByIdentity(jobdedup.Escalation(ag.ID))
-	if err != nil || job == nil {
-		t.Fatalf("job not found: %v", err)
+	admission, admitted := s.AdmissionFor(ag.ID)
+	if !admitted {
+		t.Fatal("nothing was admitted")
 	}
 	var targets []string
-	for _, step := range s.GetJobStepsByJobID(job.ID) {
-		if step.StepType != "dm" {
-			continue
+	for _, commitment := range admission.Admission.Commitments {
+		if commitment.Target.Kind == keys.TargetUser {
+			targets = append(targets, commitment.Target.Ref)
 		}
-		var data model.EscalationStepData
-		if err := json.Unmarshal(step.Data, &data); err != nil {
-			t.Fatalf("unmarshal step data: %v", err)
-		}
-		targets = append(targets, data.TargetID)
 	}
 	if len(targets) != 2 {
-		t.Fatalf("job has %d dm steps, want one per policy step: %v", len(targets), targets)
+		t.Fatalf("the escalation promises %d people, want one per policy step: %v",
+			len(targets), targets)
 	}
 	for _, target := range targets {
 		if target != snapshotUser {
-			t.Errorf("job step pages %q while the snapshot records %q", target, snapshotUser)
+			t.Errorf("the escalation promises %q while the snapshot records %q",
+				target, snapshotUser)
 		}
 	}
 }
@@ -1028,7 +1054,7 @@ func TestEngine_OnCallReadFailure_DefersEverything(t *testing.T) {
 		byID: map[string]schedulerender.OnCall{"sched-old": onDuty("g-old", stale.ID)},
 	}
 	deferralsBefore := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
-	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -1088,13 +1114,13 @@ func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
 		errUntilCall: 1,
 		first:        teamSchedule("sched-current", onDuty("g-a", onDutyUser.ID)),
 	}
-	engine := NewEngine(s, proj, &config.Config{})
+	engine := NewEngine(s, proj, &fakeSettings{}, &config.Config{})
 
 	deferralsBefore := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
 	engine.ProcessNewAlertGroups(context.Background())
 
-	if job, _ := s.FindJobByIdentity(jobdedup.Escalation(ag.ID)); job != nil {
-		t.Fatalf("first tick committed job %s although the roster was unknown", job.ID)
+	if _, admitted := s.AdmissionFor(ag.ID); admitted {
+		t.Fatal("the first tick admitted an escalation although the roster was unknown")
 	}
 	deferralsAfterFirst := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
 	if got := deferralsAfterFirst - deferralsBefore; got != 1 {
@@ -1103,13 +1129,13 @@ func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
 
 	engine.ProcessNewAlertGroups(context.Background())
 
-	job, err := s.FindJobByIdentity(jobdedup.Escalation(ag.ID))
-	if err != nil || job == nil {
-		t.Fatalf("second tick built no job although the projection answered: %v", err)
+	admission, admitted := s.AdmissionFor(ag.ID)
+	if !admitted {
+		t.Fatal("the second tick admitted nothing although the projection answered")
 	}
-	targets := dmTargetsOf(t, s.GetJobStepsByJobID(job.ID))
+	targets := promisedUsers(admission)
 	if len(targets) != 1 || targets[0] != onDutyUser.ID {
-		t.Errorf("second tick pages %v, want the on-call user %q", targets, onDutyUser.ID)
+		t.Errorf("the second tick promises %v, want the on-call user %q", targets, onDutyUser.ID)
 	}
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
@@ -1162,7 +1188,7 @@ func TestEngine_DeferredTick_NamesTheBatchOnceAndNothingPerGroup(t *testing.T) {
 	defer log.SetOutput(restore)
 
 	proj := &countingProjection{err: errors.New("could not begin transaction")}
-	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
 	if len(lines) != 2 {
@@ -1242,4 +1268,25 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 		t.Fatalf("read counter: %v", err)
 	}
 	return m.GetCounter().GetValue()
+}
+
+// fakeSettings is the channel configuration a plan freezes: whether messages
+// may carry buttons.
+type fakeSettings struct {
+	slack    bool
+	telegram bool
+}
+
+func (f *fakeSettings) GetSlackInteractive() bool    { return f.slack }
+func (f *fakeSettings) GetTelegramInteractive() bool { return f.telegram }
+
+// promisedUsers is who an admission promises to page, in key order.
+func promisedUsers(admission outbound.EscalationAdmission) []string {
+	var out []string
+	for _, commitment := range admission.Admission.Commitments {
+		if commitment.Target.Kind == keys.TargetUser {
+			out = append(out, commitment.Target.Ref)
+		}
+	}
+	return out
 }

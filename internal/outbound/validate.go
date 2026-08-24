@@ -33,6 +33,15 @@ var notificationProviders = map[string]bool{
 	"telegram": true,
 }
 
+// DeliversThrough reports whether this build has a channel for a provider.
+//
+// Exported because the producer has to ask BEFORE it promises: a step naming a
+// provider nothing delivers through is refused here, and refusing it refuses
+// the whole admission - the alert would lose its firehose over one misspelled
+// step, and retry that forever. Asked in advance, the step is dropped, the
+// history says why, and the rest of the escalation goes out.
+func DeliversThrough(provider string) bool { return notificationProviders[provider] }
+
 // ValidateEscalationAdmission is the gate a commitment has to pass to become
 // durable.
 //

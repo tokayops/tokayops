@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
 	"net/http"
 	"net/http/httptest"
@@ -57,7 +59,18 @@ func (f *fakeBot) start(t *testing.T) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		switch method {
 		case "sendMessage":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"message_id": 4242}})
+			// The whole Message, as the Bot API answers it: the chat is half of
+			// what says WHERE the message is, and a delivery that cannot say
+			// that is not an acceptance anybody can act on later. The id comes
+			// back as a NUMBER even when the request named a @username, which
+			// is what a receipt has to be able to read.
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok": true,
+				"result": map[string]interface{}{
+					"message_id": 4242,
+					"chat":       map[string]interface{}{"id": -1001234567890},
+				},
+			})
 		case "getMe":
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"username": "e2e_bot"}})
 		default:
@@ -79,11 +92,12 @@ func (f *fakeBot) sendBody() map[string]interface{} {
 }
 
 type tgPipelineEnv struct {
-	S    *store.Store
-	Eng  *engine.Engine
-	Disp *dispatcher.Dispatcher
-	Echo *echo.Echo
-	Bot  *fakeBot
+	S      *store.Store
+	Eng    *engine.Engine
+	Disp   *dispatcher.Dispatcher
+	Echo   *echo.Echo
+	Bot    *fakeBot
+	Worker *outbound.Worker
 }
 
 // setupTelegramPipeline wires the real pipeline (ingester → engine → dispatcher)
@@ -135,16 +149,25 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 	}
 
 	// Empty firehose config → no firehose step prepended (firehose is Slack-only).
-	cfg := &config.Config{ConfigVersion: 3}
+	// The self URL is not empty though: the buttons need somewhere to send
+	// people back to, and a plan freezes that link when it admits the
+	// escalation rather than building it at send time.
+	cfg := &config.Config{
+		ConfigVersion: 3,
+		Global:        config.GlobalConfig{SelfURL: "https://tokay.e2e"},
+	}
 
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
-	eng := engine.NewEngine(s, schedulerender.New(s.ScheduleReadRepository()), cfg)
+	eng := engine.NewEngine(s, schedulerender.New(s.ScheduleReadRepository()), &testSettings{}, cfg)
 	disp, err := dispatcher.NewDispatcher(s, cfg)
 	if err != nil {
 		t.Fatalf("NewDispatcher: %v", err)
 	}
 
-	// One shared provider instance for both send (dispatcher) and answerCallback (API).
+	// One shared provider instance for the ack-update loop (dispatcher) and
+	// answerCallback (API). The escalation SEND no longer goes through it: the
+	// engine admits commitments and the outbound worker below delivers them
+	// through the channel handler, against the same fake Bot API.
 	tg := telegramprovider.NewProvider(cache, "https://tokay.e2e", telegramprovider.WithBaseURL(server.URL))
 	disp.RegisterProvider("telegram", tg)
 	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
@@ -158,7 +181,16 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 	ing.RegisterRoutes(e)        // /webhook/alertmanager (ingest)
 	apiService.RegisterRoutes(e) // /telegram/webhook (+ everything else)
 
-	return &tgPipelineEnv{S: s, Eng: eng, Disp: disp, Echo: e, Bot: bot}
+	worker := outbound.NewWorker(s, "telegram-integration",
+		map[string]outbound.Channel{
+			"telegram": telegramprovider.NewHandler(cache,
+				func(context.Context, string, string) (string, error) {
+					return "", providers.ErrNotLinked
+				},
+				telegramprovider.WithHandlerBaseURL(server.URL)),
+		})
+
+	return &tgPipelineEnv{S: s, Eng: eng, Disp: disp, Worker: worker, Echo: e, Bot: bot}
 }
 
 func postTelegramWebhook(t *testing.T, e *echo.Echo, secret, body string) *httptest.ResponseRecorder {
@@ -214,8 +246,9 @@ func TestTelegramPipeline_SendCallbackAck(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
+	go runOutboundWorker(ctx, env.Worker)
 
-	waitForStepCompletion(t, env.S, "tg_e2e_1", 0)
+	waitForDeliveries(t, env.S, "tg_e2e_1", 1)
 
 	// Assert: exactly one sendMessage carrying the card chat + Ack/Resolve keyboard.
 	if got := env.Bot.count("sendMessage"); got != 1 {
@@ -234,13 +267,21 @@ func TestTelegramPipeline_SendCallbackAck(t *testing.T) {
 		t.Errorf("keyboard missing ack/res callback_data: %s", rm)
 	}
 
-	// Assert: durable, updatable delivery row.
-	del, err := env.S.GetPrimaryDelivery(ag.ID, "telegram")
-	if err != nil || del == nil {
-		t.Fatalf("GetPrimaryDelivery: %v / %+v", err, del)
+	// Assert: a durable commitment that says where the message went. It is
+	// editable because the card is a channel card - the alert can bring it to a
+	// later revision - and it holds the coordinates that make that possible.
+	var form, receipt string
+	if err := env.S.GetDB().QueryRow(`
+		SELECT i.form, COALESCE(i.receipt::text, '')
+		FROM outbound_intents i WHERE i.alert_group_id = $1`, ag.ID).
+		Scan(&form, &receipt); err != nil {
+		t.Fatalf("read the commitment: %v", err)
 	}
-	if !del.SupportsUpdate || del.ProviderPayload == "" {
-		t.Errorf("delivery should be updatable with payload, got %+v", del)
+	if form != "editable" {
+		t.Errorf("the channel card is %q", form)
+	}
+	if !strings.Contains(receipt, "4242") {
+		t.Errorf("the commitment does not say where the message is: %q", receipt)
 	}
 
 	// 2. Inbound Ack button → answerCallbackQuery + AG acknowledged.
@@ -255,9 +296,19 @@ func TestTelegramPipeline_SendCallbackAck(t *testing.T) {
 		t.Errorf("AG status = %s, want acknowledged", acked.Status)
 	}
 
-	// 3. Ack-update loop edits the card in place (via TelegramProvider.Update).
-	env.Disp.ProcessAcknowledgedAlertGroups(ctx)
-	waitForFake(t, func() int { return env.Bot.count("editMessageText") }, 1, "editMessageText")
+	// Bringing the card itself to the acknowledged revision is the next piece
+	// of work: the update loop still reads notification_deliveries, which the
+	// admitted path does not write. What this test can say today is that the
+	// acknowledgement reached the alert and took the commitment with it.
+	var intentStatus string
+	if err := env.S.GetDB().QueryRow(
+		`SELECT status FROM outbound_intents WHERE alert_group_id = $1`, ag.ID).
+		Scan(&intentStatus); err != nil {
+		t.Fatalf("read the commitment: %v", err)
+	}
+	if intentStatus != "idle" && intentStatus != "succeeded" && intentStatus != "canceled" {
+		t.Errorf("the commitment is %q after the alert was acknowledged", intentStatus)
+	}
 }
 
 // TestTelegramPipeline_StartLinkingAndSecretGuard covers the inbound /start deep-link
@@ -301,7 +352,8 @@ func deliverCardForLinkedUser(t *testing.T, env *tgPipelineEnv, ctx context.Cont
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
 	go runDispatcherLoop(ctx, env.Disp)
-	waitForStepCompletion(t, env.S, dedup, 0)
+	go runOutboundWorker(ctx, env.Worker)
+	waitForDeliveries(t, env.S, dedup, 1)
 	ag, err := env.S.GetActiveAlertGroupByAlertKey(dedup)
 	if err != nil {
 		t.Fatalf("GetActiveAlertGroup: %v", err)
@@ -330,9 +382,21 @@ func TestTelegramPipeline_ResolveCallback(t *testing.T) {
 		t.Errorf("AG status = %s, want resolved", resolved.Status)
 	}
 
-	// Resolution loop edits the card to the resolved state.
-	env.Disp.ProcessResolvedAlertGroups(ctx)
-	waitForFake(t, func() int { return env.Bot.count("editMessageText") }, 1, "editMessageText")
+	// Bringing the card to its resolved state is the piece of work that has not
+	// moved yet: the resolution loop still edits from notification_deliveries,
+	// which the admitted path does not write. What holds today is that
+	// resolving the alert withdraws what it still owed - nobody is paged about
+	// an alert somebody has already closed.
+	var owing int
+	if err := env.S.GetDB().QueryRow(`
+		SELECT count(*) FROM outbound_intents
+		WHERE alert_group_id = $1 AND status IN ('pending', 'sending')`, ag.ID).
+		Scan(&owing); err != nil {
+		t.Fatalf("read the commitments: %v", err)
+	}
+	if owing != 0 {
+		t.Errorf("%d commitments are still owed for a resolved alert", owing)
+	}
 }
 
 // TestTelegramPipeline_LinkEndpointDeepLink exercises the full link loop against

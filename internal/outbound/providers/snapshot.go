@@ -84,7 +84,7 @@ func ViewOf(view GroupView) keys.SnapshotInput {
 	}
 
 	for _, alert := range group.Alerts {
-		in.Alerts = append(in.Alerts, alertSnapshot(alert))
+		in.Alerts = append(in.Alerts, alertSnapshot(alert, group.CreatedAt))
 	}
 	for _, event := range group.TimelineEvents {
 		if event == nil {
@@ -98,13 +98,24 @@ func ViewOf(view GroupView) keys.SnapshotInput {
 
 // alertSnapshot resolves the label-or-annotation fallbacks once, so a renderer
 // reads a field instead of guessing which map an operator put a URL in.
-func alertSnapshot(alert model.Alert) keys.AlertSnapshot {
+//
+// An alert that arrived without a start time gets the moment this system first
+// saw its group. That is a fact of our own record rather than an invention, and
+// the alternative is worse than inexact: a payload that omitted startsAt would
+// make the whole escalation unadmittable, and nobody would be paged because a
+// field nobody reads was empty. Identity is not filled in the same way - a
+// fingerprint cannot be invented, and admission refuses without one.
+func alertSnapshot(alert model.Alert, firstSeen time.Time) keys.AlertSnapshot {
 	out := keys.AlertSnapshot{
 		Fingerprint: alert.Fingerprint,
 		Status:      alertStatus(alert.Status),
 		StartsAt:    alert.StartsAt,
 		AlertName:   alert.Labels["alertname"],
 		Severity:    alert.Labels["severity"],
+	}
+
+	if out.StartsAt.IsZero() {
+		out.StartsAt = firstSeen
 	}
 
 	out.SlackUser = optional(alert.Labels["slack_user"])

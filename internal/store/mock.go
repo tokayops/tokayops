@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -16,10 +18,14 @@ import (
 	"github.com/tokayops/tokayops/internal/integrations"
 	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 )
 
 // MockStore is an in-memory implementation of StoreInterface for testing.
 type MockStore struct {
+	// admissions is what SubmitEscalationBatch accepted, by batch key.
+	admissions map[string]*admittedBatch
+
 	mu sync.RWMutex
 
 	alertGroups            map[string]*model.AlertGroup
@@ -2973,3 +2979,99 @@ func (m *MockStore) GetDeliveryAttempts(deliveryID string) ([]*model.DeliveryAtt
 // Ensure Store implements StoreInterface
 var _ StoreInterface = (*Store)(nil)
 var _ StoreInterface = (*MockStore)(nil)
+
+// admittedBatch is what the double remembers about one admission, so a test can
+// ask what an escalation promised instead of what it happened to write.
+type admittedBatch struct {
+	Admission outbound.EscalationAdmission
+	IntentIDs []string
+}
+
+// SubmitEscalationBatch admits an escalation the way the store does: the group
+// is claimed, its commitments are recorded, and a second producer for the same
+// group is told which of the two answers it got.
+//
+// It keeps the parts of the real one that a caller can observe - the group must
+// be new or processing, the claim is once and forever, and the same batch
+// submitted twice is the same batch - and none of the parts that are about
+// storage.
+func (m *MockStore) SubmitEscalationBatch(ctx context.Context,
+	adm outbound.EscalationAdmission) (outbound.SubmitResult, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	admission := adm.Admission
+	ag, ok := m.alertGroups[admission.AlertGroupID]
+	if !ok {
+		return outbound.SubmitResult{}, fmt.Errorf("alert group %s not found", admission.AlertGroupID)
+	}
+	if ag.Status != model.AlertGroupStatusNew && ag.Status != model.AlertGroupStatusProcessing {
+		return outbound.SubmitResult{Outcome: outbound.SubmitGroupNotAdmitted}, nil
+	}
+
+	if m.admissions == nil {
+		m.admissions = map[string]*admittedBatch{}
+	}
+	if held, ok := m.admissions[admission.BatchKey]; ok {
+		// The same claim, held by somebody. Whether it is the same work is what
+		// the fingerprint says, and the answer differs: one is "already done",
+		// the other is "somebody promised something else for this group".
+		if !bytes.Equal(held.Admission.Admission.Fingerprint, admission.Fingerprint) {
+			return outbound.SubmitResult{Outcome: outbound.SubmitConflict}, nil
+		}
+		return outbound.SubmitResult{
+			Outcome: outbound.SubmitExisting, BatchID: held.Admission.Admission.BatchKey,
+			IntentIDs: held.IntentIDs,
+		}, nil
+	}
+
+	batch := &admittedBatch{Admission: adm}
+	for range admission.Commitments {
+		batch.IntentIDs = append(batch.IntentIDs, uuid.New().String())
+	}
+	m.admissions[admission.BatchKey] = batch
+
+	// The group is escalating by this policy from now on, and it is out of the
+	// engine's loop whether or not anybody was found to notify.
+	ag.Status = model.AlertGroupStatusProcessing
+	ag.UpdatedAt = time.Now()
+	ag.PolicyID = adm.PolicyID
+	if len(adm.PolicySnapshot) > 0 {
+		var snapshot model.EscalationPolicySnapshot
+		if err := json.Unmarshal(adm.PolicySnapshot, &snapshot); err == nil {
+			ag.PolicySnapshot = &snapshot
+		}
+	}
+
+	return outbound.SubmitResult{
+		Outcome: outbound.SubmitCreated, BatchID: admission.BatchKey,
+		IntentIDs: batch.IntentIDs,
+	}, nil
+}
+
+// AdmittedBatches is every admission this double accepted, for a test to read.
+func (m *MockStore) AdmittedBatches() []outbound.EscalationAdmission {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]outbound.EscalationAdmission, 0, len(m.admissions))
+	for _, batch := range m.admissions {
+		out = append(out, batch.Admission)
+	}
+	return out
+}
+
+// AdmissionFor is the admission held for one alert group, or false if nothing
+// was admitted for it.
+func (m *MockStore) AdmissionFor(agID string) (outbound.EscalationAdmission, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, batch := range m.admissions {
+		if batch.Admission.Admission.AlertGroupID == agID {
+			return batch.Admission, true
+		}
+	}
+	return outbound.EscalationAdmission{}, false
+}
