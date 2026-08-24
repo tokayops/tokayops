@@ -302,6 +302,54 @@ type recordingChannel struct {
 
 	mu      sync.Mutex
 	targets []string
+	bytes   []string
+
+	// answer decides what the provider says for one address, so a test can
+	// make a single recipient fail without touching the others. Nil, or an
+	// address that is not in it, still means "accepted".
+	answer map[string]outbound.Result
+	// answerErr does the same for a transport failure - a call that never got
+	// an answer at all.
+	answerErr map[string]error
+
+	// hold keeps every call inside the provider until it is closed, which is
+	// how a test looks at a worker with its slots genuinely occupied.
+	hold chan struct{}
+}
+
+// Hold makes every call block inside the provider until the returned function
+// is called. Without it a "slow provider" is not slow at all: an error returns
+// immediately and the slot is free again before anybody can look at it.
+func (c *recordingChannel) Hold() func() {
+	c.mu.Lock()
+	c.hold = make(chan struct{})
+	held := c.hold
+	c.mu.Unlock()
+
+	var once sync.Once
+	return func() { once.Do(func() { close(held) }) }
+}
+
+// FailWith makes this channel answer one address the way a provider would when
+// it refuses.
+func (c *recordingChannel) FailWith(address string, res outbound.Result, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.answer == nil {
+		c.answer = map[string]outbound.Result{}
+		c.answerErr = map[string]error{}
+	}
+	c.answer[address] = res
+	c.answerErr[address] = err
+}
+
+// StopFailing makes the address succeed again, which is how a test shows a
+// commitment surviving until the provider recovers.
+func (c *recordingChannel) StopFailing(address string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.answer, address)
+	delete(c.answerErr, address)
 }
 
 func (c *recordingChannel) Prepare(ctx context.Context, intent outbound.Intent) outbound.Preparation {
@@ -326,8 +374,24 @@ func (c *recordingChannel) ExecuteAttempt(_ context.Context,
 
 	c.mu.Lock()
 	c.targets = append(c.targets, call.Endpoint)
+	// What the provider was actually asked to send, so a test can prove two
+	// attempts of one commitment carried the same message. The digest is the
+	// whole frozen state rather than one field of it: the alerts are what a
+	// group's row changes between attempts, and a title would not notice.
+	c.bytes = append(c.bytes, fmt.Sprintf("%x|%s", call.State.Digest(), call.Payload))
 	sent := len(c.targets)
+	told, failing := c.answer[call.Endpoint]
+	toldErr := c.answerErr[call.Endpoint]
+	hold := c.hold
 	c.mu.Unlock()
+
+	if hold != nil {
+		<-hold
+	}
+
+	if failing {
+		return told, toldErr
+	}
 
 	receipt, err := outbound.NewReceipt(fmt.Sprintf("%s/%d", call.Endpoint, sent),
 		json.RawMessage(fmt.Sprintf(`{"channel":%q,"ts":"%d"}`, call.Endpoint, sent)))
@@ -340,10 +404,29 @@ func (c *recordingChannel) ExecuteAttempt(_ context.Context,
 }
 
 func (c *recordingChannel) ClassifyResponse(res outbound.Result) (outbound.Outcome, string, bool) {
-	if res.Status == "ok" {
+	switch res.Status {
+	case "ok":
 		return outbound.OutcomeAccepted, "", true
+	case "rate_limited":
+		return outbound.OutcomeRetryableRejection, "rate_limited", true
+	case "channel_not_found":
+		return outbound.OutcomePermanentRejection, "channel_not_found", true
 	}
 	return "", "", false
+}
+
+// SentTo is what this channel was asked to send to ONE address, in order.
+// Comparing two calls only means something when they are the same commitment.
+func (c *recordingChannel) SentTo(address string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for i, target := range c.targets {
+		if target == address {
+			out = append(out, c.bytes[i])
+		}
+	}
+	return out
 }
 
 // SentTargets is where this channel was asked to send, in order.
