@@ -91,6 +91,19 @@ var (
 		Name: "engine_escalation_build_deferrals_total",
 		Help: "Escalation builds deferred because the on-call recipients could not be resolved. One alert group increments this on every retry, so this counts deferrals, not distinct alert groups.",
 	})
+
+	// EngineEscalationSourceChangedTotal counts plans refused because the alert
+	// moved while they were being built - an alert joined the group, or its
+	// history grew, between the read and the admission. The group is not
+	// claimed and the next tick plans it again from what is now there.
+	//
+	// A few of these under a storm are the design working. A rate that stays
+	// high is a group changing faster than a plan can be built, which is a page
+	// that never goes out.
+	EngineEscalationSourceChangedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "engine_escalation_source_changed_total",
+		Help: "Escalation plans refused because the alert group changed between being read and being admitted. One alert group increments this on every retry, so this counts refusals, not distinct alert groups.",
+	})
 )
 
 // Tier 5 — Handoff notifier
@@ -210,6 +223,7 @@ func init() {
 	prometheus.MustRegister(EngineRunsTotal)
 	prometheus.MustRegister(EngineAlertGroupsPickedTotal)
 	prometheus.MustRegister(EngineEscalationBuildDeferralsTotal)
+	prometheus.MustRegister(EngineEscalationSourceChangedTotal)
 
 	// Tier 5
 	prometheus.MustRegister(HandoffWarmupNotComplete)

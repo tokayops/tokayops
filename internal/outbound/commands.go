@@ -30,14 +30,86 @@ type EscalationAdmission struct {
 	PolicyID       string
 	PolicySnapshot json.RawMessage
 
-	// StepsWithoutRecipients names the plan steps that resolved to nobody.
-	// They produce no commitment - a commitment that must fail is an alert
-	// about a failure the system knew about in advance - so the history is
-	// where they are recorded.
-	StepsWithoutRecipients []string
+	// SourceVersion is the version of the alert group the snapshot was frozen
+	// from, as the producer observed it.
+	//
+	// The snapshot is the state EVERY message of this escalation is rendered
+	// from, for as long as the escalation lives. Between reading the group and
+	// admitting the plan, an alert can join the group, or resolve, or somebody
+	// can add a line to its history - and the plan would then page about a
+	// state the alert is no longer in, with no revision that ever corrects it.
+	//
+	// So it is checked again under the lock that decides the admission. A
+	// version that has moved is not an error and not a conflict: it is a plan
+	// built a moment too early, refused whole, with the group left for the next
+	// tick to plan again from what is now there.
+	//
+	// Zero is a version, not "unset": a group nothing has updated is at zero,
+	// and it is compared like any other.
+	//
+	// What it covers is what moves the version: the alerts in the group, and
+	// the status the group is in - the latter answered separately, and first,
+	// because a user who acknowledged is not a plan to rebuild. A line added to
+	// the history moves neither, so a card can freeze a history one line behind
+	// the audit. That is a card missing a line, not an escalation aimed at the
+	// wrong people, and it is the difference the version is scoped to.
+	SourceVersion int64
+
+	// OnCallSnapshot is who was on duty when this alert arrived, recorded on
+	// the group by the winner and by nobody else.
+	//
+	// It is here, and not written by the producer after the fact, because it is
+	// a claim about the SAME moment the commitments were built from. Written
+	// outside this unit of work it would be the loser's answer overwriting the
+	// winner's - a group displaying one set of people while another set is
+	// being paged (S1-D20).
+	//
+	// Empty means nothing is recorded. That is not the same as an empty
+	// snapshot: "nobody was on call" is a fact about the schedule, and a
+	// producer that could not read the people has no business asserting it.
+	OnCallSnapshot json.RawMessage
+
+	// Unpromised names the plan steps that produced no commitment, and why.
+	// A commitment that must fail is an alert about a failure the system knew
+	// about in advance, so the history is where these are recorded - and the
+	// reason travels with them, because "nobody was on call" and "nothing here
+	// can deliver to that provider" send a reader to two different places.
+	Unpromised []UnpromisedStep
 
 	Actor string
 }
+
+// UnpromisedStep is one step of a plan that promised nothing.
+type UnpromisedStep struct {
+	// Step names it as the policy does: its index and what it was aiming at.
+	Step   string
+	Reason UnpromisedReason
+	// Detail is what the reason does not say on its own - which provider,
+	// which schedule.
+	Detail string
+}
+
+// UnpromisedReason is why a step promised nothing. Closed, because each of
+// these sends whoever reads the history somewhere different: to the schedule,
+// to the policy, or to the deployment.
+type UnpromisedReason string
+
+const (
+	// ReasonNobodyOnCall: the schedule answered, and the answer was nobody.
+	ReasonNobodyOnCall UnpromisedReason = "nobody_on_call"
+
+	// ReasonNoTarget: the step names no recipient at all.
+	ReasonNoTarget UnpromisedReason = "no_target"
+
+	// ReasonNoChannel: the step names a provider this build cannot deliver
+	// through. Not a fact about the alert - a fact about what is deployed.
+	ReasonNoChannel UnpromisedReason = "no_channel"
+
+	// ReasonDuplicate: the plan asked for the same message twice - the same
+	// recipient, in the same step of the policy. One promise is what that
+	// means, and the second is recorded rather than dropped in silence.
+	ReasonDuplicate UnpromisedReason = "duplicate"
+)
 
 // SubmitOutcome is what happened to an admission.
 type SubmitOutcome string
@@ -45,6 +117,11 @@ type SubmitOutcome string
 const (
 	// SubmitCreated: this producer's set was accepted.
 	SubmitCreated SubmitOutcome = "created"
+
+	// SubmitSourceChanged: the alert moved while the plan was being built, so
+	// the snapshot describes a state that is already behind. Nothing was
+	// written and the group was not claimed - the next tick plans it again.
+	SubmitSourceChanged SubmitOutcome = "source_changed"
 
 	// SubmitExisting: the same set was already accepted, by this producer or
 	// another. An idempotent repeat, and the normal answer to a retry after a

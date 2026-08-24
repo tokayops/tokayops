@@ -1702,46 +1702,6 @@ func (s *Store) UpdateAlertGroupAlerts(id string, alerts []model.Alert) error {
 	return err
 }
 
-func (s *Store) GetNewAlertGroups() ([]*model.AlertGroup, error) {
-	// Also pick up stale "processing" groups orphaned by a crash between the
-	// status change and the admission - but ONLY if nothing was admitted for
-	// them. An admission is the claim over a group's escalation and it is held
-	// forever, whatever became of the deliveries under it, so a group that has
-	// one has been escalated and must never be picked up again.
-	//
-	// It asks the admissions rather than the jobs, and that is not a cosmetic
-	// change of table: once the escalation job is gone, "no escalation job"
-	// becomes true of every group in the system, and every processing group
-	// would come back round every thirty seconds to be escalated again.
-	//
-	// Asked by alert_group_id rather than by a batch key: the question is what
-	// this group already holds, not what holds a particular claim.
-	staleThreshold := time.Now().Add(-30 * time.Second)
-	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups ag
-	          WHERE ag.status = $1
-	             OR (ag.status = $2 AND ag.updated_at < $3
-	                 AND NOT EXISTS (
-	                     SELECT 1 FROM outbound_batches b
-	                     WHERE b.alert_group_id = ag.id
-	                 ))`
-
-	rows, err := s.db.Query(query, model.AlertGroupStatusNew, model.AlertGroupStatusProcessing, staleThreshold)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var alertGroups []*model.AlertGroup
-	for rows.Next() {
-		ag, err := scanAlertGroupRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		alertGroups = append(alertGroups, ag)
-	}
-	return alertGroups, nil
-}
-
 func (s *Store) GetProcessingAlertGroups() ([]*model.AlertGroup, error) {
 	// Include both processing and acknowledged (for Slack updates after Ack)
 	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups WHERE status IN ($1, $2)`
@@ -2952,6 +2912,12 @@ func (s *Store) GetEscalationPolicyByID(id string) (*model.EscalationPolicy, err
 		}
 		step.Message = msg.String
 		p.Steps = append(p.Steps, &step)
+	}
+	// A read that stopped halfway is not a shorter policy: returned as one, an
+	// escalation would quietly skip the steps that did not arrive, and nobody
+	// would be paged by them.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the steps of policy %s: %w", id, err)
 	}
 
 	return &p, nil

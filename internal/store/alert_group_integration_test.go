@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 	"testing"
@@ -1202,7 +1203,7 @@ func TestEnsureEscalationJob_BlockedBySucceededJob(t *testing.T) {
 	}
 }
 
-// TestGetNewAlertGroups_SkipsAGAlreadyAdmitted. A group whose escalation was
+// TestGetEscalationSources_SkipsAGAlreadyAdmitted. A group whose escalation was
 // admitted is out of the loop for good, whatever became of the deliveries under
 // it: the claim is held forever, and picking the group up again would promise
 // the same page twice.
@@ -1211,7 +1212,7 @@ func TestEnsureEscalationJob_BlockedBySucceededJob(t *testing.T) {
 // becomes "no escalation job" for every group in the system the moment the job
 // path is gone - and every processing group would come back round every thirty
 // seconds to be escalated again.
-func TestGetNewAlertGroups_SkipsAGAlreadyAdmitted(t *testing.T) {
+func TestGetEscalationSources_SkipsAGAlreadyAdmitted(t *testing.T) {
 	s := setupTestDB(t)
 
 	teamID := "team-skip-escalation"
@@ -1248,9 +1249,9 @@ func TestGetNewAlertGroups_SkipsAGAlreadyAdmitted(t *testing.T) {
 		t.Fatalf("Failed to record the admission: %v", err)
 	}
 
-	results, err := s.GetNewAlertGroups()
+	results, err := s.GetEscalationSources(context.Background())
 	if err != nil {
-		t.Fatalf("GetNewAlertGroups failed: %v", err)
+		t.Fatalf("GetEscalationSources failed: %v", err)
 	}
 
 	for _, r := range results {
@@ -1260,7 +1261,7 @@ func TestGetNewAlertGroups_SkipsAGAlreadyAdmitted(t *testing.T) {
 	}
 }
 
-func TestGetNewAlertGroups_IncludesStaleProcessing(t *testing.T) {
+func TestGetEscalationSources_IncludesStaleProcessing(t *testing.T) {
 	s := setupTestDB(t)
 
 	teamID := "team-reconcile"
@@ -1302,9 +1303,9 @@ func TestGetNewAlertGroups_IncludesStaleProcessing(t *testing.T) {
 		t.Fatalf("Failed to backdate AG: %v", err)
 	}
 
-	results, err := s.GetNewAlertGroups()
+	results, err := s.GetEscalationSources(context.Background())
 	if err != nil {
-		t.Fatalf("GetNewAlertGroups failed: %v", err)
+		t.Fatalf("GetEscalationSources failed: %v", err)
 	}
 
 	ids := make(map[string]bool)

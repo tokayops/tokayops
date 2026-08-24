@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,6 +60,10 @@ type planner struct {
 	oncall   onCallProjection
 	settings channelSettings
 	cfg      *config.Config
+
+	// firehose is the channel THIS alert's severity routes to, settled when
+	// the plan starts rather than asked again while it is being built.
+	firehose string
 }
 
 // firehoseProvider: the firehose is Slack-only, deliberately, as it was.
@@ -72,7 +77,10 @@ const firehoseProvider = "slack"
 func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup, policyID string,
 	teamOnCall schedulerender.TeamOnCallResult) (outbound.EscalationAdmission, error) {
 
-	policy := p.policyFor(policyID)
+	policy, err := p.policyFor(policyID)
+	if err != nil {
+		return outbound.EscalationAdmission{}, err
+	}
 	if policy == nil {
 		policyID = ""
 	}
@@ -82,9 +90,17 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup, policyID 
 		return outbound.EscalationAdmission{}, err
 	}
 
-	commitments, unattended, err := p.commitments(ctx, ag, policy, policyID, teamOnCall)
+	plan := *p
+	plan.firehose = p.firehoseChannel(ag.Severity)
+
+	planned, unpromised, err := plan.commitments(ctx, policy, teamOnCall)
 	if err != nil {
 		return outbound.EscalationAdmission{}, err
+	}
+
+	commitments := make([]keys.EscalationCommitment, 0, len(planned))
+	for _, step := range planned {
+		commitments = append(commitments, step.commitment)
 	}
 
 	admission, err := keys.EscalationBatch{
@@ -99,12 +115,114 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup, policyID 
 	}
 
 	return outbound.EscalationAdmission{
-		Admission:              admission,
-		PolicyID:               policyID,
-		PolicySnapshot:         policySnapshot(policyID, policy, commitments),
-		StepsWithoutRecipients: unattended,
-		Actor:                  "engine",
+		Admission: admission,
+		// What the snapshot above was frozen from, checked again under the
+		// lock that decides the admission: a plan built a moment too early is
+		// refused whole rather than held forever.
+		SourceVersion:  ag.SlackUpdateGeneration,
+		PolicyID:       policyID,
+		PolicySnapshot: policySnapshot(policyID, policy, planned),
+		OnCallSnapshot: plan.onCallSnapshot(ag.ID, teamOnCall),
+		Unpromised:     unpromised,
+		Actor:          "engine",
 	}, nil
+}
+
+// onCallSnapshot records who was on duty when the alert arrived, for the winner
+// of the admission to write on the group.
+//
+// It takes the projection rather than fetching one: this is the same answer the
+// commitments were built from, and that is the whole point of it being a
+// parameter. Two reads a moment apart can straddle a handoff, and the group
+// would then display one set of people while another set is being paged.
+//
+// A team with no schedule, or one between shifts, gets an EMPTY snapshot rather
+// than none: "nobody was on call" is a fact worth having on the alert group,
+// and the readers of the field already treat an empty group as exactly that.
+//
+// Nothing is recorded when the answer could not be read at all, and that is
+// where this parts company with the rest of the plan. A schedule that cannot be
+// resolved defers the whole admission, because it decides WHO GETS PAGED and
+// the decision is held forever. This decides who is DISPLAYED, and an empty
+// field is honest about not knowing - so a database blip costs a line in the
+// audit rather than the alert.
+//
+// Source is what survives of the override information now that the projection
+// answers instead of a legacy override row: L1Users already names the stand-in,
+// and Source says that is why.
+func (p *planner) onCallSnapshot(agID string, read schedulerender.TeamOnCallResult) json.RawMessage {
+	if read.Err() != nil {
+		return nil
+	}
+
+	team := read.OnCall()
+	out := &model.OnCallResult{}
+	if l1 := team.OnCall.L1; l1 != nil {
+		users, err := p.usersByIDs(l1.UserIDs)
+		if err != nil {
+			log.Printf("AlertEngine: the on-call snapshot of %s was not recorded: %v", agID, err)
+			return nil
+		}
+		since, until := l1.AssignmentStart, l1.AssignmentEnd
+		out.L1Users = users
+		out.L1Since = &since
+		out.L1Until = &until
+		out.Source = l1.Source
+	}
+	if l2 := team.OnCall.L2; l2 != nil && len(l2.UserIDs) > 0 {
+		users, err := p.usersByIDs(l2.UserIDs[:1])
+		if err != nil {
+			log.Printf("AlertEngine: the on-call snapshot of %s was not recorded: %v", agID, err)
+			return nil
+		}
+		if len(users) > 0 {
+			out.L2User = users[0]
+		}
+	}
+
+	raw, err := json.Marshal(out)
+	if err != nil {
+		log.Printf("AlertEngine: the on-call snapshot of %s was not recorded: %v", agID, err)
+		return nil
+	}
+	return raw
+}
+
+// usersByIDs hydrates ids into people, in the projection's order, dropping
+// anyone the store no longer has.
+func (p *planner) usersByIDs(ids []string) ([]*model.User, error) {
+	if len(ids) == 0 || p.store == nil {
+		return nil, nil
+	}
+	fetched, err := p.store.GetUsersByIDs(ids)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]*model.User, len(fetched))
+	for _, u := range fetched {
+		byID[u.ID] = u
+	}
+	out := make([]*model.User, 0, len(ids))
+	for _, id := range ids {
+		if u, ok := byID[id]; ok {
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
+// plannedCommitment is one promise, plus what the plan called it.
+//
+// The two vocabularies are deliberately both here. A commitment names an
+// ADDRESS - a user or a channel - because that is what a delivery needs; the
+// policy names the SHAPE of the message - a dm or a channel post - because that
+// is what somebody configured. Recording one as the other, as an earlier
+// version did, makes every direct message read as "channel kind: user" in the
+// audit.
+type plannedCommitment struct {
+	commitment keys.EscalationCommitment
+	targetKind string
+	firehose   bool
 }
 
 // freeze takes the state every message of this escalation will be rendered
@@ -120,65 +238,118 @@ func (p *planner) freeze(ag *model.AlertGroup) (keys.RenderSnapshot, error) {
 		selfURL = p.cfg.Global.SelfURL
 	}
 
-	state, err := providers.SnapshotOf(providers.GroupView{
+	onboarded, err := p.teamIsOnboarded(ag.TeamID)
+	if err != nil {
+		return keys.RenderSnapshot{}, err
+	}
+
+	in := providers.ViewOf(providers.GroupView{
 		Group:         ag,
 		SelfURL:       selfURL,
-		TeamOnboarded: p.teamIsOnboarded(ag.TeamID),
+		TeamOnboarded: onboarded,
 		// The zone this instance was told to use, frozen now. It is not read
 		// again: an instance in another zone rendering this snapshot has to
 		// produce the same message.
 		Zone: providers.ProcessZone(),
 	})
+	in.Timeline = tellableHistory(ag.ID, in.Timeline)
+
+	state, err := keys.NewRenderSnapshot(in)
 	if err != nil {
 		return keys.RenderSnapshot{}, fmt.Errorf("freeze the state of %s: %w", ag.ID, err)
 	}
 	return state, nil
 }
 
+// tellableHistory drops the lines of the history this build cannot put in a
+// message.
+//
+// The snapshot refuses an event it cannot name or identify, and it is right to:
+// a digest that stood for "acknowledged" and rendered as something else would
+// be a receipt for a message nobody sent. But refusing here would cost the
+// PAGE - one line of history written by another build, and the alert is
+// unadmittable on every tick, forever, with nobody notified.
+//
+// So the line is left out of the card and stays in the audit, which is where a
+// history lives anyway. The card is a summary; the timeline table is the
+// record.
+func tellableHistory(agID string, events []keys.TimelineEventSnapshot) []keys.TimelineEventSnapshot {
+	out := events[:0]
+	for _, event := range events {
+		switch {
+		case event.ID == "":
+			log.Printf("AlertEngine: %s has a history line with no id, left out of the card", agID)
+		case event.CreatedAt.IsZero():
+			log.Printf("AlertEngine: %s has a history line with no time, left out of the card", agID)
+		case !keys.KnownTimelineEventType(event.Type):
+			log.Printf("AlertEngine: %s has a history line of kind %q, which this build cannot show",
+				agID, event.Type)
+		default:
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
 // teamIsOnboarded asks once, here, whether the alert's team exists in TokayOps.
 // A card says so where its buttons would be, and asking again at send time
 // would let that answer change between two attempts of one delivery.
-func (p *planner) teamIsOnboarded(teamID string) bool {
+//
+// The two ways this can fail are different answers. A team that is NOT THERE is
+// what the notice on the card is about - the alert names a team nobody set up,
+// so nobody can act on it from Slack. A lookup that could not RUN says nothing
+// about the team, and answering it either way would freeze a guess into every
+// message of this escalation: nothing is admitted, and the next tick asks
+// again.
+//
+// The channels degrade the other way at send time, on purpose: there the
+// snapshot already holds an answer and the question is only whether to trust a
+// blip over it.
+func (p *planner) teamIsOnboarded(teamID string) (bool, error) {
 	if teamID == "" || p.store == nil {
-		return true
+		return true, nil
 	}
+
 	team, err := p.store.GetTeamByID(teamID)
-	if err != nil {
-		// The same direction the channels degraded in: deciding "not onboarded"
-		// on a database blip strips the buttons from teams that are set up
-		// perfectly well, and does it exactly when alerts arrive in bulk.
-		log.Printf("AlertEngine: team lookup for %q failed, assuming onboarded: %v", teamID, err)
-		return true
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("%w: team %s: %w", ErrOnCallResolutionUnavailable, teamID, err)
 	}
-	return team != nil
+	return team != nil, nil
 }
 
 // commitments turns the plan into promises: the firehose first, then the policy
 // steps in order.
-func (p *planner) commitments(ctx context.Context, ag *model.AlertGroup,
-	policy *model.EscalationPolicy, policyID string,
-	teamOnCall schedulerender.TeamOnCallResult) ([]keys.EscalationCommitment, []string, error) {
+func (p *planner) commitments(ctx context.Context, policy *model.EscalationPolicy,
+	teamOnCall schedulerender.TeamOnCallResult) ([]plannedCommitment, []outbound.UnpromisedStep, error) {
 
 	var (
-		out        []keys.EscalationCommitment
-		unattended []string
+		out        []plannedCommitment
+		unpromised []outbound.UnpromisedStep
+		seen       = map[string]bool{}
 	)
 
-	if channel := p.firehoseChannel(ag.Severity); channel != "" {
-		out = append(out, keys.EscalationCommitment{
-			Slot:            keys.Slot{Kind: keys.SlotFirehose},
-			Provider:        firehoseProvider,
-			Target:          keys.Target{Kind: keys.TargetChannel, Ref: channel},
-			Editable:        true,
-			Interactive:     p.interactiveOn(firehoseProvider),
-			Timing:          keys.TimingSpec{Kind: keys.TimingRelativeToAdmission},
-			CompletionMode:  keys.CompletionOnAcceptance,
-			AmbiguityPolicy: keys.PolicyRetry,
+	if p.firehose != "" {
+		out = append(out, plannedCommitment{
+			commitment: keys.EscalationCommitment{
+				Slot:            keys.Slot{Kind: keys.SlotFirehose},
+				Provider:        firehoseProvider,
+				Target:          keys.Target{Kind: keys.TargetChannel, Ref: p.firehose},
+				Editable:        true,
+				Interactive:     p.interactiveOn(firehoseProvider),
+				Timing:          keys.TimingSpec{Kind: keys.TimingRelativeToAdmission},
+				CompletionMode:  keys.CompletionOnAcceptance,
+				AmbiguityPolicy: keys.PolicyRetry,
+			},
+			targetKind: "channel",
+			firehose:   true,
 		})
 	}
 
 	if policy == nil {
-		return out, unattended, nil
+		return out, unpromised, nil
 	}
 
 	resolver := &scheduleResolver{store: p.store, oncall: p.oncall, team: teamOnCall}
@@ -188,19 +359,30 @@ func (p *planner) commitments(ctx context.Context, ag *model.AlertGroup,
 	// of the escalation back: the promise of step one outlives its own delay,
 	// and step two goes out when the policy said it would.
 	offset := time.Duration(0)
-	for index, step := range policy.Steps {
+	for _, step := range policy.Steps {
 		if step == nil {
 			continue
 		}
 		offset += time.Duration(step.DelaySeconds) * time.Second
+
+		// The slot is the step's OWN index, not its position in the slice. The
+		// two are the same only while a policy's indices happen to be dense,
+		// and the slot is part of a commitment's identity: steps 5 and 9
+		// admitted as 0 and 1 would be a different escalation than the one the
+		// policy describes, and a re-admission after an edit would name them
+		// differently again.
+		slot := keys.Slot{Kind: keys.SlotPolicy, Index: step.StepIndex}
 
 		// A provider nothing here delivers through is refused by the admission
 		// gate, and that refusal takes the WHOLE batch with it: one misspelled
 		// step would cost the alert its firehose, on every tick, forever. So it
 		// is asked in advance and the step is recorded rather than promised.
 		if !outbound.DeliversThrough(step.Provider) {
-			unattended = append(unattended, fmt.Sprintf("%d (%s: no channel for provider %q)",
-				index+1, describeStep(step), step.Provider))
+			unpromised = append(unpromised, outbound.UnpromisedStep{
+				Step:   describeStep(step),
+				Reason: outbound.ReasonNoChannel,
+				Detail: fmt.Sprintf("nothing here delivers through %q", step.Provider),
+			})
 			continue
 		}
 
@@ -209,30 +391,57 @@ func (p *planner) commitments(ctx context.Context, ag *model.AlertGroup,
 			return nil, nil, err
 		}
 		if len(recipients) == 0 {
-			// A step that resolved to nobody produces no commitment. An intent
-			// that is certain to fail is an alert about a failure the system
-			// knew about in advance; the alert's history is where this belongs.
-			unattended = append(unattended, fmt.Sprintf("%d (%s)", index+1, describeStep(step)))
+			// A step that named nobody produces no commitment. An intent that
+			// is certain to fail is an alert about a failure the system knew
+			// about in advance; the alert's history is where this belongs, and
+			// it says which of the two happened.
+			reason := outbound.ReasonNobodyOnCall
+			if step.TargetType != "schedule" {
+				reason = outbound.ReasonNoTarget
+			}
+			unpromised = append(unpromised, outbound.UnpromisedStep{
+				Step: describeStep(step), Reason: reason,
+			})
 			continue
 		}
 
 		for _, target := range recipients {
-			out = append(out, keys.EscalationCommitment{
-				Slot:            keys.Slot{Kind: keys.SlotPolicy, Index: index},
-				Provider:        step.Provider,
-				Target:          target,
-				Editable:        step.TargetKind == "channel",
-				MessageOverride: optionalText(step.Message),
-				Interactive:     p.interactiveOn(step.Provider),
-				Timing: keys.TimingSpec{
-					Kind: keys.TimingRelativeToAdmission, Offset: offset,
+			// Two steps that share an index AND a recipient are one commitment
+			// by identity, and the grammar refuses an admission that contains
+			// the same key twice. Refused there it would be refused on every
+			// tick, forever, over a policy somebody can fix - so the repeat is
+			// recorded here and the escalation goes out.
+			if key := slotTarget(slot, step.Provider, target); seen[key] {
+				unpromised = append(unpromised, outbound.UnpromisedStep{
+					Step:   describeStep(step),
+					Reason: outbound.ReasonDuplicate,
+					Detail: fmt.Sprintf("%s %s is already promised in step %d",
+						target.Kind, target.Ref, step.StepIndex),
+				})
+				continue
+			} else {
+				seen[key] = true
+			}
+
+			out = append(out, plannedCommitment{
+				commitment: keys.EscalationCommitment{
+					Slot:            slot,
+					Provider:        step.Provider,
+					Target:          target,
+					Editable:        step.TargetKind == "channel",
+					MessageOverride: optionalText(step.Message),
+					Interactive:     p.interactiveOn(step.Provider),
+					Timing: keys.TimingSpec{
+						Kind: keys.TimingRelativeToAdmission, Offset: offset,
+					},
+					CompletionMode:  keys.CompletionOnAcceptance,
+					AmbiguityPolicy: keys.PolicyRetry,
 				},
-				CompletionMode:  keys.CompletionOnAcceptance,
-				AmbiguityPolicy: keys.PolicyRetry,
+				targetKind: step.TargetKind,
 			})
 		}
 	}
-	return out, unattended, nil
+	return out, unpromised, nil
 }
 
 // recipients is who one policy step names, as this system names them.
@@ -298,18 +507,29 @@ func (p *planner) interactiveOn(provider string) bool {
 	}
 }
 
-func (p *planner) policyFor(policyID string) *model.EscalationPolicy {
+// policyFor reads the policy this group escalates by, and distinguishes the two
+// ways that can come back empty.
+//
+// A policy that is NOT THERE is a product fact: somebody deleted it, or the
+// routing names one that never existed, and the alert still reaches its
+// firehose channel. A policy that could not be READ is a database that is
+// unavailable, and answering "firehose only" to that would page a fraction of
+// the people this alert is supposed to reach - permanently, because an
+// admission is held forever.
+func (p *planner) policyFor(policyID string) (*model.EscalationPolicy, error) {
 	if policyID == "" || p.store == nil {
-		return nil
+		return nil, nil
 	}
+
 	policy, err := p.store.GetEscalationPolicyByID(policyID)
-	if err != nil {
-		// The same degradation as before: an alert still reaches its firehose
-		// channel when the policy behind it cannot be read.
-		log.Printf("AlertEngine: policy %s not found (%v), admitting the firehose only", policyID, err)
-		return nil
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		log.Printf("AlertEngine: policy %s does not exist, admitting the firehose only", policyID)
+		return nil, nil
+	case err != nil:
+		return nil, fmt.Errorf("%w: policy %s: %w", ErrOnCallResolutionUnavailable, policyID, err)
 	}
-	return policy
+	return policy, nil
 }
 
 // scheduleResolver answers "who is on duty for this step" consistently within
@@ -416,20 +636,24 @@ func (r *scheduleResolver) hydrate(onCall schedulerender.OnCall) ([]*model.User,
 // policySnapshot is what the group records about the policy it was escalated
 // by: what was decided, in the shape the API already reads.
 func policySnapshot(policyID string, policy *model.EscalationPolicy,
-	commitments []keys.EscalationCommitment) json.RawMessage {
+	planned []plannedCommitment) json.RawMessage {
 
 	snapshot := model.EscalationPolicySnapshot{PolicyID: policyID}
 	if policy != nil {
 		snapshot.Name = policy.Name
 	}
-	for _, commitment := range commitments {
+	for _, step := range planned {
 		snapshot.Steps = append(snapshot.Steps, &model.EscalationStepSnapshot{
-			Provider:   commitment.Provider,
-			TargetKind: string(commitment.Target.Kind),
-			TargetType: string(commitment.Target.Kind),
-			TargetID:   commitment.Target.Ref,
-			IsFirehose: commitment.Slot.Kind == keys.SlotFirehose,
-			StageIndex: commitment.Slot.Index,
+			Provider: step.commitment.Provider,
+			// The shape of the message, as the policy words it, and the kind of
+			// address it went to. They are different questions: a dm is
+			// addressed to a user, and recording "user" as the kind would make
+			// every direct message read as a target kind nobody configures.
+			TargetKind: step.targetKind,
+			TargetType: string(step.commitment.Target.Kind),
+			TargetID:   step.commitment.Target.Ref,
+			IsFirehose: step.firehose,
+			StageIndex: step.commitment.Slot.Index,
 		})
 	}
 
@@ -440,6 +664,14 @@ func policySnapshot(policyID string, policy *model.EscalationPolicy,
 		return nil
 	}
 	return raw
+}
+
+// slotTarget is what makes two commitments the same commitment: the same slot
+// of the plan, the same provider, the same recipient. It mirrors the business
+// key rather than restating it - the grammar is what decides identity, and this
+// only has to agree with it about repeats.
+func slotTarget(slot keys.Slot, provider string, target keys.Target) string {
+	return fmt.Sprintf("%s/%d/%s/%s/%s", slot.Kind, slot.Index, provider, target.Kind, target.Ref)
 }
 
 func describeStep(step *model.EscalationStep) string {

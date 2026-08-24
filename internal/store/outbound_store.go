@@ -87,12 +87,15 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 	defer tx.Rollback()
 
 	// The group first, and its clock with it: everything this transaction
-	// computes about time is computed from the database's now().
+	// computes about time is computed from the database's now(). Its version
+	// comes from the same locked row, because that is the only read of it that
+	// nothing can change between the check and the insert.
 	var status string
+	var version int64
 	var now time.Time
 	err = tx.QueryRowContext(ctx,
-		`SELECT status, now() FROM alert_groups WHERE id = $1 FOR UPDATE`,
-		admission.AlertGroupID).Scan(&status, &now)
+		`SELECT status, slack_update_generation, now() FROM alert_groups WHERE id = $1 FOR UPDATE`,
+		admission.AlertGroupID).Scan(&status, &version, &now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return outbound.SubmitResult{}, fmt.Errorf("alert group %s not found", admission.AlertGroupID)
 	}
@@ -112,6 +115,24 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 			return outbound.SubmitResult{}, err
 		}
 		return outbound.SubmitResult{Outcome: outbound.SubmitGroupNotAdmitted}, nil
+	}
+
+	// The alert moved after the producer read it, so the snapshot in this
+	// admission describes a state that is already behind - and a snapshot is
+	// what every message of an escalation is rendered from, forever.
+	//
+	// Asked AFTER the status check, because the two say different things. A
+	// group the user already acknowledged is finished with; a group that merely
+	// changed is not, and the next tick plans it again from what is now there.
+	//
+	// Nothing is written and nothing is claimed. A batch inserted here would
+	// hold the group's one escalation under a plan built from stale state, and
+	// no later revision would ever correct it.
+	if adm.SourceVersion != version {
+		if err := tx.Commit(); err != nil {
+			return outbound.SubmitResult{}, err
+		}
+		return outbound.SubmitResult{Outcome: outbound.SubmitSourceChanged}, nil
 	}
 
 	batchID := uuid.New().String()
@@ -165,14 +186,25 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 		return outbound.SubmitResult{}, fmt.Errorf("store the snapshot: %w", err)
 	}
 
-	// Only now the group itself.
+	// Only now the group itself: what it escalates by, and who was on duty when
+	// it arrived. Both are the winner's answers and nobody else's - a loser that
+	// wrote either would leave a group describing one escalation and executing
+	// another (S1-D20).
+	//
+	// COALESCE, because "the producer could not read the people" and "nobody was
+	// on call" are different claims. The first arrives here as nothing at all
+	// and must not blank a snapshot; the second arrives as an empty one and is
+	// recorded.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE alert_groups
 		SET status = CASE WHEN status = $1 THEN $2 ELSE status END,
-		    policy_id = $3, policy_snapshot = $4, updated_at = now()
-		WHERE id = $5`,
+		    policy_id = $3, policy_snapshot = $4,
+		    oncall_snapshot = COALESCE($5, oncall_snapshot),
+		    updated_at = now()
+		WHERE id = $6`,
 		model.AlertGroupStatusNew, model.AlertGroupStatusProcessing,
-		adm.PolicyID, nullableJSON(adm.PolicySnapshot), admission.AlertGroupID,
+		adm.PolicyID, nullableJSON(adm.PolicySnapshot),
+		nullableJSON(adm.OnCallSnapshot), admission.AlertGroupID,
 	); err != nil {
 		return outbound.SubmitResult{}, fmt.Errorf("record the escalation on the group: %w", err)
 	}
@@ -342,15 +374,33 @@ func admissionTimelineTx(ctx context.Context, tx *sql.Tx,
 			return err
 		}
 	}
-	for _, step := range adm.StepsWithoutRecipients {
-		if err := addTimelineTx(ctx, tx, admission.AlertGroupID,
-			model.TimelineEventNotificationFailed,
-			fmt.Sprintf("Escalation step %s resolved to nobody on call", step),
-			adm.Actor); err != nil {
+	for _, step := range adm.Unpromised {
+		if err := addTimelineWithTx(ctx, tx, admission.AlertGroupID,
+			model.TimelineEventNotificationFailed, unpromisedMessage(step), adm.Actor,
+			map[string]string{"step": step.Step, "reason": string(step.Reason)}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// unpromisedMessage says what actually happened, because each reason sends a
+// reader somewhere different: to the schedule, to the policy, or to whoever
+// deploys this.
+func unpromisedMessage(step outbound.UnpromisedStep) string {
+	switch step.Reason {
+	case outbound.ReasonNobodyOnCall:
+		return fmt.Sprintf("Escalation step %s resolved to nobody on call", step.Step)
+	case outbound.ReasonNoTarget:
+		return fmt.Sprintf("Escalation step %s names no recipient", step.Step)
+	case outbound.ReasonNoChannel:
+		return fmt.Sprintf("Escalation step %s could not be delivered: %s", step.Step, step.Detail)
+	case outbound.ReasonDuplicate:
+		return fmt.Sprintf("Escalation step %s repeats a notification already promised: %s",
+			step.Step, step.Detail)
+	default:
+		return fmt.Sprintf("Escalation step %s produced no delivery: %s", step.Step, step.Detail)
+	}
 }
 
 func addTimelineTx(ctx context.Context, tx *sql.Tx, alertGroupID string,

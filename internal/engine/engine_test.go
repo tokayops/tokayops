@@ -315,9 +315,13 @@ func TestEngine_StepWithNoTarget_IsRecordedNotFailed(t *testing.T) {
 		t.Fatalf("expected the firehose alone, got %d commitments",
 			len(admission.Admission.Commitments))
 	}
-	if len(admission.StepsWithoutRecipients) != 1 {
-		t.Fatalf("the step that resolved to nobody was not recorded: %v",
-			admission.StepsWithoutRecipients)
+	if len(admission.Unpromised) != 1 {
+		t.Fatalf("the step that named nobody was not recorded: %v", admission.Unpromised)
+	}
+	// The reason matters: a step with no recipient sends a reader to the
+	// policy, and "nobody on call" sends them to the schedule.
+	if got := admission.Unpromised[0].Reason; got != outbound.ReasonNoTarget {
+		t.Errorf("the step was recorded as %q", got)
 	}
 }
 
@@ -956,10 +960,12 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 	s.CreateEscalationPolicy(&model.EscalationPolicy{
 		ID: policyID, Name: "Schedule Policy",
 		Steps: []*model.EscalationStep{
-			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
-			// A second step naming the SAME schedule: two steps of one job are
+			{ID: "s1", StepIndex: 0, Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
+			// A second step naming the SAME schedule: two steps of one plan are
 			// one question, and they must not be answered differently either.
-			{ID: "s2", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
+			// Its own index, because that index is part of what tells the two
+			// promises apart.
+			{ID: "s2", StepIndex: 1, Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
 		},
 	})
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Handoff Race", DefaultPolicyID: policyID})

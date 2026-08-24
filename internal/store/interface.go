@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/model"
@@ -15,7 +16,11 @@ type StoreInterface interface {
 	UpdateAlertGroupPolicy(id string, policyID string, snapshot *model.EscalationPolicySnapshot) error
 	UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResult) error
 	UpdateAlertGroupAlerts(id string, alerts []model.Alert) error
-	GetNewAlertGroups() ([]*model.AlertGroup, error)
+	// GetEscalationSources is the read a producer plans from: the groups
+	// nobody has been paged for, with the alerts and the history their cards
+	// are drawn from, and the version they were read at - all from one
+	// consistent view of the database.
+	GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, error)
 	GetProcessingAlertGroups() ([]*model.AlertGroup, error)
 	GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error)
 	GetResolvedAlertGroups() ([]*model.AlertGroup, error)

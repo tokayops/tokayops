@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -73,8 +74,25 @@ func outboundAdmission(t *testing.T, groupID, title string,
 		Admission:      admission,
 		PolicyID:       "policy-" + title,
 		PolicySnapshot: json.RawMessage(`{"name":"` + title + `"}`),
+		// Who this producer believed was on duty. It travels with the admission
+		// so the winner writes it and the loser does not - the group must not
+		// display one set of people while another set is being paged.
+		OnCallSnapshot: json.RawMessage(`{"l1_users":[],"source":"` + title + `"}`),
 		Actor:          "engine",
 	}
+}
+
+// storedOnCall is what the group says about who was on duty. A NULL column
+// comes back as "", which is how these tests spell "nothing was recorded".
+func storedOnCall(t *testing.T, s *Store, agID string) string {
+	t.Helper()
+	var source sql.NullString
+	if err := s.db.QueryRow(
+		`SELECT oncall_snapshot->>'source' FROM alert_groups WHERE id = $1`, agID).
+		Scan(&source); err != nil {
+		t.Fatalf("read the on-call snapshot: %v", err)
+	}
+	return source.String
 }
 
 func mustSubmit(t *testing.T, s *Store, adm outbound.EscalationAdmission) outbound.SubmitResult {
@@ -273,6 +291,13 @@ func TestSubmitLoserWritesNothingAboutTheGroup(t *testing.T) {
 		t.Fatalf("the loser overwrote the policy snapshot: it names %q", stored.Name)
 	}
 
+	// And who was on duty, which is the same claim about the same moment: the
+	// two producers read the schedule at different instants, and the group has
+	// to name the people the accepted commitments are aimed at.
+	if got := storedOnCall(t, s, agID); got != "first" {
+		t.Fatalf("the loser overwrote the on-call snapshot: it names %q", got)
+	}
+
 	var storedTitle string
 	if err := s.db.QueryRow(
 		`SELECT snapshot->>'title' FROM outbound_group_snapshots WHERE alert_group_id = $1`,
@@ -386,7 +411,9 @@ func TestSubmitRecordsAnAdmissionWithNobodyToNotify(t *testing.T) {
 	agID := outboundGroup(t, s)
 
 	adm := outboundAdmission(t, agID, "first")
-	adm.StepsWithoutRecipients = []string{"policy step 1"}
+	adm.Unpromised = []outbound.UnpromisedStep{{
+		Step: "schedule sched-1", Reason: outbound.ReasonNobodyOnCall,
+	}}
 
 	result := mustSubmit(t, s, adm)
 	if result.Outcome != outbound.SubmitCreated {
@@ -423,6 +450,21 @@ func TestSubmitRecordsAnAdmissionWithNobodyToNotify(t *testing.T) {
 	}
 	if notes != 2 {
 		t.Fatalf("the history has %d notes about having nobody to notify, want 2", notes)
+	}
+
+	// And the note says WHICH of the reasons it was. "No delivery" sends a
+	// reader to the schedule, the policy or the deployment depending on the
+	// answer, so the answer travels with the line rather than being inferred
+	// from its wording.
+	var reason string
+	if err := s.db.QueryRow(`
+		SELECT metadata::jsonb->>'reason' FROM timeline_events
+		WHERE alert_group_id = $1 AND metadata::jsonb->>'step' = 'schedule sched-1'`,
+		agID).Scan(&reason); err != nil {
+		t.Fatalf("read the note: %v", err)
+	}
+	if reason != string(outbound.ReasonNobodyOnCall) {
+		t.Errorf("the note blames %q", reason)
 	}
 }
 
@@ -494,4 +536,64 @@ func TestSubmitRefusesWhatThisBuildCannotDeliver(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSubmitRecordsWhoWasOnDuty: the snapshot is part of the admission, so it
+// lands in the same commit as the commitments it describes. It used to be a
+// separate write after the fact, which left a window where the group was
+// escalating and named nobody - and, on the losing branch, a window where it
+// named the wrong people.
+func TestSubmitRecordsWhoWasOnDuty(t *testing.T) {
+	s := setupTestDB(t)
+	agID := outboundGroup(t, s)
+
+	mustSubmit(t, s, outboundAdmission(t, agID, "first", channelCommitment("C0001", 0)))
+
+	if got := storedOnCall(t, s, agID); got != "first" {
+		t.Fatalf("the group says %q was on duty", got)
+	}
+}
+
+// TestSubmitWithoutAnOnCallAnswerRecordsNothing. Nothing to say and "nobody was
+// on call" are different claims, and only one of them belongs on the group. A
+// producer whose schedule read failed hands over no snapshot, and the column
+// stays as it was rather than being blanked into an assertion nobody made.
+func TestSubmitWithoutAnOnCallAnswerRecordsNothing(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	t.Run("a fresh group is left empty", func(t *testing.T) {
+		agID := outboundGroup(t, s)
+		adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
+		adm.OnCallSnapshot = nil
+
+		mustSubmit(t, s, adm)
+
+		var snapshot sql.NullString
+		if err := s.db.QueryRow(
+			`SELECT oncall_snapshot FROM alert_groups WHERE id = $1`, agID).
+			Scan(&snapshot); err != nil {
+			t.Fatalf("read the group: %v", err)
+		}
+		if snapshot.Valid {
+			t.Fatalf("a producer that could not read the schedule recorded %q", snapshot.String)
+		}
+	})
+
+	t.Run("an answer already there survives", func(t *testing.T) {
+		agID := outboundGroup(t, s)
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE alert_groups SET oncall_snapshot = '{"source":"earlier"}'::jsonb WHERE id = $1`,
+			agID); err != nil {
+			t.Fatalf("seed the on-call snapshot: %v", err)
+		}
+
+		adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
+		adm.OnCallSnapshot = nil
+		mustSubmit(t, s, adm)
+
+		if got := storedOnCall(t, s, agID); got != "earlier" {
+			t.Fatalf("the admission blanked an answer that was already there: %q", got)
+		}
+	})
 }

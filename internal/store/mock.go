@@ -277,32 +277,50 @@ func (m *MockStore) UpdateAlertGroupAlerts(id string, alerts []model.Alert) erro
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) GetNewAlertGroups() ([]*model.AlertGroup, error) {
+func (m *MockStore) GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	staleThreshold := time.Now().Add(-30 * time.Second)
 	var result []*model.AlertGroup
 	for _, ag := range m.alertGroups {
-		if ag.Status == model.AlertGroupStatusNew {
-			result = append(result, m.copyAlertGroup(ag))
-		} else if ag.Status == model.AlertGroupStatusProcessing && ag.UpdatedAt.Before(staleThreshold) {
-			// Only include stale processing AGs that have NO escalation job at all (true orphan).
-			// If any escalation job exists (succeeded, failed, canceled, etc.), the AG was already
-			// processed and should not spawn a duplicate job.
-			hasAnyJob := false
-			for _, j := range m.jobs {
-				if j.AlertGroupID != nil && *j.AlertGroupID == ag.ID && j.Type == "escalation" {
-					hasAnyJob = true
-					break
-				}
-			}
-			if !hasAnyJob {
-				result = append(result, m.copyAlertGroup(ag))
-			}
+		switch {
+		case ag.Status == model.AlertGroupStatusNew:
+		case ag.Status == model.AlertGroupStatusProcessing &&
+			ag.UpdatedAt.Before(staleThreshold) && !m.admittedLocked(ag.ID):
+			// A true orphan: the status changed and the crash came before the
+			// admission. A group that HAS one has been escalated, whatever
+			// became of the deliveries under it, and never comes back.
+		default:
+			continue
 		}
+
+		source := m.copyAlertGroup(ag)
+		for _, e := range m.timelineEvents[ag.ID] {
+			event := *e
+			source.TimelineEvents = append(source.TimelineEvents, &event)
+		}
+		sort.SliceStable(source.TimelineEvents, func(i, j int) bool {
+			a, b := source.TimelineEvents[i], source.TimelineEvents[j]
+			if !a.CreatedAt.Equal(b.CreatedAt) {
+				return a.CreatedAt.Before(b.CreatedAt)
+			}
+			return a.ID < b.ID
+		})
+		result = append(result, source)
 	}
 	return result, nil
+}
+
+// admittedLocked says whether this group's escalation was already claimed. The
+// caller holds the lock.
+func (m *MockStore) admittedLocked(agID string) bool {
+	for _, batch := range m.admissions {
+		if batch.Admission.Admission.AlertGroupID == agID {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *MockStore) GetProcessingAlertGroups() ([]*model.AlertGroup, error) {
@@ -3041,6 +3059,15 @@ func (m *MockStore) SubmitEscalationBatch(ctx context.Context,
 		var snapshot model.EscalationPolicySnapshot
 		if err := json.Unmarshal(adm.PolicySnapshot, &snapshot); err == nil {
 			ag.PolicySnapshot = &snapshot
+		}
+	}
+	// Who was on duty, from the same admission. Nothing recorded leaves what is
+	// already there: the producer could not read the people, which is not a
+	// claim that there were none.
+	if len(adm.OnCallSnapshot) > 0 {
+		var snapshot model.OnCallResult
+		if err := json.Unmarshal(adm.OnCallSnapshot, &snapshot); err == nil {
+			ag.OnCallSnapshot = &snapshot
 		}
 	}
 
