@@ -138,6 +138,32 @@ type Tx interface {
 	DeleteUserExternalIdentities(ctx context.Context, userID string) error
 	DeleteUserLinkTokens(ctx context.Context, userID string) error
 
+	// CancelLiveOutboundIntentsForUser withdraws what the system still owes the
+	// erased person.
+	//
+	// Not tidiness: the address it would have been sent to is deleted in this
+	// same transaction, so the first attempt after it would resolve nobody and
+	// end the commitment as permanently failed - which raises the alert that
+	// says a page did not happen. That alert would be about the erasure doing
+	// its job, and an alert that fires on correct behaviour is one nobody
+	// reads.
+	//
+	// A commitment with a receipt is not withdrawn. Something exists out there
+	// and saying otherwise would be a lie the history has to keep; erasure
+	// removes the ability to CONTACT somebody, it does not unsend.
+	CancelLiveOutboundIntentsForUser(ctx context.Context, userID string) error
+
+	// ScrubOutboundEndpointsForUser clears the provider addresses the delivery
+	// domain bound for this person - the Slack id or Telegram chat id a message
+	// was actually sent to.
+	//
+	// They are the same data as external_identities, which erasure already
+	// deletes, kept in a second place by the effect that used it. The internal
+	// recipient (outbound_intents.target_ref) is NOT touched: it is this
+	// system's own user id, and history about a delivery to a person who has
+	// since been erased has to stay readable, exactly like users.id.
+	ScrubOutboundEndpointsForUser(ctx context.Context, userID string) error
+
 	// DeleteUserTeamMemberships removes the user from every team, matching
 	// what the legacy delete did.
 	DeleteUserTeamMemberships(ctx context.Context, userID string) error

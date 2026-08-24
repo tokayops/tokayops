@@ -738,6 +738,13 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		"team_members.user_id":               true,
 		"schedule_override_revisions.reason": true,
 		"schedule_revisions.change_reason":   true,
+
+		// The provider addresses the delivery domain bound: a Slack user id, a
+		// Telegram chat id. The same data as external_identities, which
+		// erasure deletes, kept in two more places by the effects that used
+		// it. Both are nulled.
+		"outbound_intents.bound_endpoint":  true,
+		"outbound_attempts.bound_endpoint": true,
 	}
 	// Columns that survive by design: immutable identity references that
 	// history is joined on.
@@ -750,6 +757,13 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		"alert_groups.acknowledged_by":            true,
 		"alert_groups.resolved_by":                true,
 		"timeline_events.actor":                   true,
+
+		// The delivery domain's recipient is this system's own user id, under
+		// a target_kind that says so. It is the same class as users.id: the
+		// history of a page sent to somebody who has since been erased has to
+		// stay joinable to the anonymized person it was for. Scrubbing it
+		// would leave a delivery to nobody.
+		"outbound_intents.target_ref": true,
 	}
 
 	rows, err := s.db.Query(`
@@ -761,6 +775,14 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		       OR column_name = 'recorded_by'
 		       OR column_name = 'acknowledged_by'
 		       OR column_name = 'resolved_by'
+		       -- The delivery domain names people two ways, and neither is
+		       -- called user_id. target_ref is polymorphic - a user id or a
+		       -- channel id, told apart by target_kind - and bound_endpoint is
+		       -- the provider's own address. Asked for by name, because that
+		       -- is exactly how notification_deliveries.target_id escaped this
+		       -- check once already.
+		       OR column_name = 'target_ref'
+		       OR column_name = 'bound_endpoint'
 		       OR (table_name = 'users' AND column_name IN
 		           ('id', 'email', 'name', 'role', 'password_hash', 'auth_provider', 'deleted_at')))
 		ORDER BY table_name, column_name`)
@@ -801,6 +823,7 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 	scannedNames := map[string]bool{
 		"user_id": true, "created_by": true, "recorded_by": true,
 		"acknowledged_by": true, "resolved_by": true,
+		"target_ref": true, "bound_endpoint": true,
 	}
 	var phantom []string
 	for _, set := range []map[string]bool{erased, byDesign} {

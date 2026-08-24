@@ -51,18 +51,29 @@ func (r *erasureRepo) WithinTx(ctx context.Context, fn func(erasure.Tx) error) e
 		}
 	}()
 
-	if err := fn(&erasureTx{tx: tx}); err != nil {
+	unit := &erasureTx{tx: tx}
+	if err := fn(unit); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	committed = true
+
+	// After the commit, never inside it: an erasure that rolled back would
+	// otherwise report deliveries as withdrawn while they are still going out,
+	// and this counter is the one an operator watches for pages that did not
+	// happen.
+	countWithdrawn(unit.withdrawn)
 	return nil
 }
 
 type erasureTx struct {
 	tx *sql.Tx
+
+	// withdrawn is how many commitments this erasure ended, held until the
+	// transaction commits. See WithinTx.
+	withdrawn int
 }
 
 // adminLifecycleLockKey is an arbitrary but fixed advisory-lock key. Every
@@ -230,6 +241,115 @@ func (t *erasureTx) DeleteUserExternalIdentities(ctx context.Context, userID str
 func (t *erasureTx) DeleteUserLinkTokens(ctx context.Context, userID string) error {
 	_, err := t.tx.ExecContext(ctx, `DELETE FROM link_tokens WHERE user_id = $1`, userID)
 	return err
+}
+
+// CancelLiveOutboundIntentsForUser withdraws what is still owed to the erased
+// person, in the same transaction that removes the address it would go to.
+//
+// Three states and three answers, which is the same split the acknowledgement
+// path makes, for the same reasons:
+//
+//   - pending: nothing has gone out and nothing will. Withdrawn outright, and
+//     the lease goes with it so a worker holding one finds out at its next
+//     compare-and-set.
+//   - sending: a call is in flight. Flagged rather than withdrawn - it may
+//     already have landed, and the flag is consumed when that send finishes.
+//   - manual_review: somebody was going to decide about a call whose fate is
+//     unknown. The question is moot now; the doubt stays in the history.
+//
+// A commitment that already has a receipt is left alone in every state. A
+// message exists out there, and erasure removes the ability to CONTACT a
+// person - it does not unsend what was sent.
+//
+// The recipient is matched by target_kind and target_ref: this system's own
+// user id, not the provider address. The address is being deleted in this same
+// transaction, so matching on it would find nothing depending on statement
+// order - the kind of dependency that breaks silently.
+func (t *erasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID string) error {
+	withdrawn, err := t.withdrawOutbound(ctx, `
+		UPDATE outbound_intents
+		SET status = 'canceled', lease_token = NULL, locked_until = NULL,
+		    worker_id = NULL, updated_at = now()
+		WHERE target_kind = 'user' AND target_ref = $1
+		  AND receipt IS NULL AND status IN ('pending', 'manual_review')
+		RETURNING id`, userID)
+	if err != nil {
+		return err
+	}
+
+	if _, err := t.withdrawOutbound(ctx, `
+		UPDATE outbound_intents
+		SET cancellation_requested = TRUE, updated_at = now()
+		WHERE target_kind = 'user' AND target_ref = $1
+		  AND receipt IS NULL AND status = 'sending'
+		RETURNING id`, userID); err != nil {
+		return err
+	}
+
+	// Counted, not returned: the caller is the erasure service, which has no
+	// business knowing how many messages somebody was owed.
+	t.withdrawn += withdrawn
+	return nil
+}
+
+// withdrawOutbound runs one withdrawal and writes a line in each commitment's
+// own journal. The reason names nobody: it is written into a row that survives
+// the person it is about.
+func (t *erasureTx) withdrawOutbound(ctx context.Context, query, userID string) (int, error) {
+	rows, err := t.tx.QueryContext(ctx, query, userID)
+	if err != nil {
+		return 0, fmt.Errorf("withdraw the notifications of an erased user: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, id := range ids {
+		if err := appendIntentEventTx(ctx, t.tx, id, nextEventSeq, "canceled",
+			"the recipient was erased", "erasure"); err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
+}
+
+// ScrubOutboundEndpointsForUser clears the provider addresses this person's
+// deliveries were bound to, in both places the domain keeps them.
+//
+// They are the same data as external_identities: a Slack user id, a Telegram
+// chat id. The commitment and every attempt under it record the address the
+// effect was actually bound to, so deleting the identity alone would leave the
+// address behind in two more tables.
+//
+// target_ref is deliberately untouched - it is this system's own user id, and
+// the history of a delivery has to stay joinable to the (anonymized) person it
+// was for.
+func (t *erasureTx) ScrubOutboundEndpointsForUser(ctx context.Context, userID string) error {
+	if _, err := t.tx.ExecContext(ctx, `
+		UPDATE outbound_attempts SET bound_endpoint = NULL
+		WHERE bound_endpoint IS NOT NULL AND intent_id IN (
+			SELECT id FROM outbound_intents WHERE target_kind = 'user' AND target_ref = $1
+		)`, userID); err != nil {
+		return fmt.Errorf("scrub the attempt endpoints of an erased user: %w", err)
+	}
+
+	if _, err := t.tx.ExecContext(ctx, `
+		UPDATE outbound_intents SET bound_endpoint = NULL
+		WHERE bound_endpoint IS NOT NULL AND target_kind = 'user' AND target_ref = $1`,
+		userID); err != nil {
+		return fmt.Errorf("scrub the commitment endpoints of an erased user: %w", err)
+	}
+	return nil
 }
 
 // NullifyOverrideRevisionReasons clears free text on override revisions where
