@@ -203,6 +203,24 @@ var (
 	})
 )
 
+// Tier 8 - storage contract
+//
+// TokayOps trusts the physical integrity of PostgreSQL and assumes production
+// rows are written only by this application's typed writers. Where that
+// assumption is load bearing - the fields an obligation is created from - a row
+// that cannot be decoded is refused rather than read as an empty one, and
+// refusing it can stop the admission scan until an operator fixes the row.
+//
+// That is a deliberate risk, and a risk taken deliberately has to be visible.
+// This counter is the visible half: any nonzero increment means a durable row
+// no longer parses, and the log beside it names the group.
+var (
+	StorageContractFailuresTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "storage_contract_failures_total",
+		Help: "Durable rows that could not be decoded into the type they are stored as. Any increment is a storage-contract violation, not a transient failure.",
+	}, []string{"field"})
+)
+
 func init() {
 	// Tier 1
 	prometheus.MustRegister(HTTPRequestsTotal)
@@ -250,6 +268,9 @@ func init() {
 	prometheus.MustRegister(OutboxDeliveryAttemptsTotal)
 	prometheus.MustRegister(OutboxDeliveryDuration)
 	prometheus.MustRegister(OutboxDeliveryBlockedTotal)
+
+	// Tier 8
+	prometheus.MustRegister(StorageContractFailuresTotal)
 }
 
 // ObserveAck records the ack duration (MTTA) for an alert group.

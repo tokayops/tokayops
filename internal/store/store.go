@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 )
@@ -110,12 +111,24 @@ func NewStore(dsn string) (*Store, error) {
 	return &Store{db: db, lockTimeout: outbound.NotificationLockTimeout}, nil
 }
 
+// legacyColumnMigrationsLock is what makes the block below safe for instances
+// starting at the same moment.
+//
+// Every step in it is guarded, which is enough to run it twice in a row and not
+// enough to run it twice at once: the guard and the ALTER it protects are two
+// statements, and a rename committing between them leaves the other instance
+// adding a column that now exists. One start fails, the container restarts, and
+// on a bad day that is a crash loop over a schema that is already correct.
+//
+// The number is arbitrary and only has to stay stable and distinct from the
+// other schema locks: "toka" plus the next sequence number.
+const legacyColumnMigrationsLock int64 = 0x746F6B6113
+
 // legacyColumnMigrationsDDL renames what older schemas called things.
 //
 // It runs after the tables are created, and every step is guarded, so a fresh
-// database executes it and changes nothing. Lifted out of InitDB so a test can
-// build an old database and prove a rename carries its values across - which is
-// the one thing here nobody can verify by reading it.
+// database executes it and changes nothing. Never executed on its own - see
+// applyLegacyColumnMigrations, which is what holds the lock.
 const legacyColumnMigrationsDDL = `
 	DO $$
 	BEGIN
@@ -198,6 +211,31 @@ const legacyColumnMigrationsDDL = `
 		-- back the rule the model replaced.
 	END $$;
 	`
+
+// applyLegacyColumnMigrations brings an older schema onto the current names, in
+// one transaction, on every start.
+//
+// The lock is taken first and the whole block runs inside it, so instances
+// starting together queue rather than race: the second one re-reads the
+// catalogue with the first one's work already committed, and its own statements
+// become no-ops.
+func (s *Store) applyLegacyColumnMigrations() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, legacyColumnMigrationsLock); err != nil {
+		return fmt.Errorf("failed to take the legacy column migration lock: %w", err)
+	}
+
+	if _, err := tx.Exec(legacyColumnMigrationsDDL); err != nil {
+		return fmt.Errorf("failed to migrate the legacy columns: %w", err)
+	}
+
+	return tx.Commit()
+}
 
 func (s *Store) InitDB() error {
 	// PostgreSQL Schema for Phase 2 - Create tables FIRST
@@ -439,7 +477,7 @@ func (s *Store) InitDB() error {
 
 	// Migration Phase: Rename legacy columns/tables if they exist
 	// This runs AFTER table creation to handle upgrades from older schemas
-	if _, err := s.db.Exec(legacyColumnMigrationsDDL); err != nil {
+	if err := s.applyLegacyColumnMigrations(); err != nil {
 		return err
 	}
 
@@ -1032,6 +1070,10 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	// group, and a damaged one must not hide the alert it is attached to.
 	if alertsData.Valid && alertsData.String != "" {
 		if err := json.Unmarshal([]byte(alertsData.String), &ag.Alerts); err != nil {
+			// Counted as well as returned. The refusal can stop the admission
+			// scan until somebody fixes the row, and a risk taken deliberately
+			// has to be visible before an operator notices the silence.
+			metrics.StorageContractFailuresTotal.WithLabelValues("alerts_data").Inc()
 			return nil, fmt.Errorf("read the alerts of group %s: %w", ag.ID, err)
 		}
 	}

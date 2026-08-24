@@ -762,3 +762,51 @@ func TestSubmitAnswersDifferentWorkAsAConflictWhateverHasMoved(t *testing.T) {
 			result.BatchID, first.BatchID)
 	}
 }
+
+// TestSubmitRefusesAClaimThatIsNotAboutThisAdmission. The batch key carries the
+// alert, the kind of claim and the grammar that built it, so a stored row under
+// that key naming any of the three differently is not an answer about this
+// admission at all. Read as one, a repeat would be told its work exists on the
+// strength of somebody else's - and a conflict would be reported over an
+// escalation belonging to another alert.
+func TestSubmitRefusesAClaimThatIsNotAboutThisAdmission(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	spoil := map[string]func(t *testing.T, agID string){
+		"held for another alert group": func(t *testing.T, agID string) {
+			exec(t, s, `UPDATE outbound_batches SET alert_group_id = $2 WHERE alert_group_id = $1`,
+				agID, outboundGroup(t, s))
+		},
+		"held as another kind of claim": func(t *testing.T, agID string) {
+			exec(t, s, `UPDATE outbound_batches SET key_kind = 'escalation_replay' WHERE alert_group_id = $1`,
+				agID)
+		},
+		"keyed under another grammar": func(t *testing.T, agID string) {
+			exec(t, s, `UPDATE outbound_batches SET grammar_version = 99 WHERE alert_group_id = $1`,
+				agID)
+		},
+	}
+
+	for name, damage := range spoil {
+		t.Run(name, func(t *testing.T) {
+			agID := outboundGroup(t, s)
+			adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
+			mustSubmit(t, s, adm)
+
+			damage(t, agID)
+
+			_, err := s.SubmitEscalationBatch(ctx, adm)
+			if !errors.Is(err, ErrOutboundContract) {
+				t.Fatalf("a claim that is not about this admission answered %v", err)
+			}
+		})
+	}
+}
+
+func exec(t *testing.T, s *Store, query string, args ...any) {
+	t.Helper()
+	if _, err := s.db.Exec(query, args...); err != nil {
+		t.Fatalf("run %s: %v", query, err)
+	}
+}

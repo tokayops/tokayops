@@ -272,18 +272,45 @@ func lostAdmission(ctx context.Context, tx *sql.Tx,
 func existingAdmission(ctx context.Context, tx *sql.Tx,
 	admission keys.Admission) (outbound.SubmitResult, bool, error) {
 
-	var existingID string
+	var existingID, existingGroup, existingKind string
+	var existingGrammar int
 	var existingFingerprint []byte
 	var existingVersion int
 	err := tx.QueryRowContext(ctx, `
-		SELECT id, fingerprint, fingerprint_version
+		SELECT id, alert_group_id, key_kind, grammar_version, fingerprint, fingerprint_version
 		FROM outbound_batches WHERE batch_key = $1`, admission.BatchKey).
-		Scan(&existingID, &existingFingerprint, &existingVersion)
+		Scan(&existingID, &existingGroup, &existingKind, &existingGrammar,
+			&existingFingerprint, &existingVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return outbound.SubmitResult{}, false, nil
 	}
 	if err != nil {
 		return outbound.SubmitResult{}, false, fmt.Errorf("read the winning admission: %w", err)
+	}
+
+	// The key is supposed to carry all three of these, so a row under this key
+	// that names a different alert, a different kind of claim or a different
+	// grammar is not an answer about this admission at all. Answered as one, a
+	// repeat would be told its work exists on the strength of somebody else's -
+	// and, on the other branch, a conflict would be reported over an escalation
+	// belonging to another alert.
+	//
+	// This is the grammar and the stored row disagreeing, which no producer can
+	// fix and no retry improves.
+	if existingGroup != admission.AlertGroupID {
+		return outbound.SubmitResult{}, false, outboundContractf(
+			"admission %s is held for alert group %s, this one is for %s",
+			admission.BatchKey, existingGroup, admission.AlertGroupID)
+	}
+	if existingKind != string(admission.Kind) {
+		return outbound.SubmitResult{}, false, outboundContractf(
+			"admission %s is held as %q, this one is %q",
+			admission.BatchKey, existingKind, admission.Kind)
+	}
+	if existingGrammar != admission.GrammarVersion {
+		return outbound.SubmitResult{}, false, outboundContractf(
+			"admission %s was keyed under grammar %d, this build keys under %d",
+			admission.BatchKey, existingGrammar, admission.GrammarVersion)
 	}
 
 	if existingVersion != admission.FingerprintVersion {

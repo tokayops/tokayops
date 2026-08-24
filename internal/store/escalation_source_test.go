@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 )
@@ -204,9 +207,31 @@ func TestAnUnreadableAlertIsNotAnAlertWithNothingWrong(t *testing.T) {
 		t.Fatalf("damage the alerts: %v", err)
 	}
 
+	before := storageContractFailures(t, "alerts_data")
+
 	if _, err := s.GetEscalationSources(ctx); err == nil {
 		t.Fatal("a group whose alerts cannot be read was returned as one with none")
 	}
+
+	// The refusal can stop the admission scan until somebody fixes the row, so
+	// it is counted rather than only returned: a risk taken deliberately has to
+	// be visible before an operator notices the silence.
+	if after := storageContractFailures(t, "alerts_data"); after <= before {
+		t.Errorf("the storage-contract counter stayed at %v", before)
+	}
+}
+
+func storageContractFailures(t *testing.T, field string) float64 {
+	t.Helper()
+	var m dto.Metric
+	counter, err := metrics.StorageContractFailuresTotal.GetMetricWithLabelValues(field)
+	if err != nil {
+		t.Fatalf("read the counter: %v", err)
+	}
+	if err := counter.Write(&m); err != nil {
+		t.Fatalf("read the counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
 }
 
 // TestTheVersionColumnKeepsItsValuesWhenRenamed. The column was called
@@ -237,14 +262,14 @@ func TestTheVersionColumnKeepsItsValuesWhenRenamed(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		// Whatever this test proves, the suite continues against the new name.
-		_, _ = s.db.Exec(legacyColumnMigrationsDDL)
+		_ = s.applyLegacyColumnMigrations()
 	})
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE alert_groups SET slack_update_generation = 4 WHERE id = $1`, agID); err != nil {
 		t.Fatalf("seed the old version: %v", err)
 	}
 
-	if _, err := s.db.ExecContext(ctx, legacyColumnMigrationsDDL); err != nil {
+	if err := s.applyLegacyColumnMigrations(); err != nil {
 		t.Fatalf("run the migrations: %v", err)
 	}
 
@@ -259,7 +284,7 @@ func TestTheVersionColumnKeepsItsValuesWhenRenamed(t *testing.T) {
 	}
 
 	// And running it again changes nothing, which is what every start does.
-	if _, err := s.db.ExecContext(ctx, legacyColumnMigrationsDDL); err != nil {
+	if err := s.applyLegacyColumnMigrations(); err != nil {
 		t.Fatalf("run the migrations again: %v", err)
 	}
 	if err := s.db.QueryRowContext(ctx,
@@ -269,5 +294,83 @@ func TestTheVersionColumnKeepsItsValuesWhenRenamed(t *testing.T) {
 	}
 	if version != 4 {
 		t.Fatalf("a second run left the group at version %d", version)
+	}
+}
+
+// TestInstancesStartingTogetherMigrateOnce. Guarded steps are enough to run the
+// block twice in a row and not enough to run it twice at once: the guard and
+// the ALTER it protects are two statements, so a rename committing between them
+// leaves the other instance adding a column that now exists. That start fails,
+// the container restarts, and on a bad day it is a crash loop over a schema
+// that is already correct.
+func TestInstancesStartingTogetherMigrateOnce(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+
+	agID := uuid.New().String()
+	if err := s.CreateAlertGroup(&model.AlertGroup{
+		ID: agID, AlertKey: "racing-" + agID, Status: model.AlertGroupStatusNew,
+		Title: "Disk filling up", Severity: "critical",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("create the alert group: %v", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		`ALTER TABLE alert_groups RENAME COLUMN render_source_version TO slack_update_generation`,
+	); err != nil {
+		t.Fatalf("build the old schema: %v", err)
+	}
+	t.Cleanup(func() { _ = s.applyLegacyColumnMigrations() })
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE alert_groups SET slack_update_generation = 7 WHERE id = $1`, agID); err != nil {
+		t.Fatalf("seed the old version: %v", err)
+	}
+
+	// Eight instances coming up against one database, which is what a rollout
+	// looks like.
+	const instances = 8
+	var wg sync.WaitGroup
+	errs := make([]error, instances)
+	start := make(chan struct{})
+	for i := 0; i < instances; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = s.applyLegacyColumnMigrations()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("instance %d failed to start: %v", i, err)
+		}
+	}
+
+	var version int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT render_source_version FROM alert_groups WHERE id = $1`, agID).
+		Scan(&version); err != nil {
+		t.Fatalf("read the version: %v", err)
+	}
+	if version != 7 {
+		t.Fatalf("the group came out of the rollout at version %d, want 7", version)
+	}
+
+	// One column, not two: an instance that added instead of renaming would
+	// leave the old name behind with the numbers still in it.
+	var columns int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_name = 'alert_groups'
+		  AND column_name IN ('render_source_version', 'slack_update_generation')`).
+		Scan(&columns); err != nil {
+		t.Fatalf("read the catalogue: %v", err)
+	}
+	if columns != 1 {
+		t.Fatalf("the table has %d version columns", columns)
 	}
 }
