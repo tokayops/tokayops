@@ -14,11 +14,33 @@ import (
 // exist once: the same rules are checked by a test that walks the entire input
 // space, and rules living in five UPDATE statements cannot be walked at all.
 //
-// Two families of transition are deliberately NOT here, because they are
+// Three families of transition are deliberately NOT here, because they are
 // set-based by nature and the database performs them over many rows at once:
-// expiry of everything that is due, and cancellation of everything a group owes
-// when it is acknowledged. Those are SQL predicates, and each is covered by an
-// integration test of its own - the honest cost of the split.
+// expiry of everything that is due, cancellation of everything a group owes
+// when it is acknowledged, and the raising of a group's desired state over
+// every editable commitment it has. Those are SQL predicates, and each is
+// covered by an integration test of its own - the honest cost of the split.
+//
+// The third is the widest, so its rows are written out here rather than left to
+// be read out of one UPDATE. Raising the desired state (D1, T21-T24) does this,
+// by the status the commitment is in:
+//
+//	idle          -> pending, claimable now: it had caught up, and the state
+//	                 moved out from under it (T21)
+//	pending       -> pending, and its next attempt stays where it was: a
+//	                 commitment already on a backoff is coming back anyway, and
+//	                 pulling it forward would outrun the wait a provider asked
+//	                 for (T22)
+//	sending       -> sending: the attempt in flight finishes against the
+//	                 revision it started with, and settles into S4 - straight
+//	                 back into the queue, because what is desired has moved
+//	                 (T23)
+//	manual_review -> manual_review: the revision is recorded and a person still
+//	                 decides. A commitment revived later aims at the current
+//	                 state rather than the one it stopped at (T24)
+//
+// Terminal commitments are not touched - nothing may come back from one - and
+// neither are one-shot ones, which have a single revision by definition.
 
 // ErrInvalidTransition is a statement the machine does not have. It is a
 // contract violation, not a runtime condition: the caller asked for something

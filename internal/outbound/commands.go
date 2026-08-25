@@ -16,7 +16,8 @@ import (
 // outcomes are the vocabulary the workflows above are written in.
 
 // DesiredReason is why the desired state of an alert group moved. Closed,
-// because it is what the history says happened and what the metric counts.
+// because it is what the history says happened, what the metric counts, and
+// what decides whether the revision is the last one.
 type DesiredReason string
 
 const (
@@ -34,6 +35,16 @@ func (r DesiredReason) Known() bool {
 		return false
 	}
 }
+
+// Final says this revision is the last one a message will ever be brought to.
+//
+// It is derived rather than passed in, and that is the point: as a field beside
+// the reason it could disagree with it, and both ways of disagreeing produce a
+// message that lies. "Acknowledged and final" freezes a card mid-incident, so
+// nothing that happens afterwards ever reaches it. "Resolved and not final"
+// leaves the commitment waiting for a revision that will never come, and the
+// alert's own resolution never lands on the card.
+func (r DesiredReason) Final() bool { return r == DesiredResolve }
 
 // DesiredOutcome is what happened to a proposal to move the desired state.
 type DesiredOutcome string
@@ -67,13 +78,15 @@ const (
 // transition wrote, without the alerts a merge just added.
 type DesiredStateRequest struct {
 	AlertGroupID string
-	Reason       DesiredReason
 
-	// Final says this is the last revision the message will ever be brought
-	// to. It raises a revision even when the content is unchanged: a commitment
-	// parked at an equal revision would never take another attempt, and the
-	// message would never be finished.
-	Final bool
+	// Reason is what happened to the alert, and the command checks the group
+	// against it: an acknowledgement whose group is not acknowledged means the
+	// caller has not made the transition it is claiming, and the snapshot would
+	// freeze a state nobody is in.
+	//
+	// It also decides finality (see DesiredReason.Final), which is why there is
+	// no separate flag to contradict it.
+	Reason DesiredReason
 
 	Actor string
 }

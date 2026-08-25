@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
 // Raising the desired state of a group is four writes - the snapshot, the
@@ -32,6 +34,49 @@ func desiredGroup(t *testing.T, s *Store, title string) string {
 		t.Fatalf("create the alert group: %v", err)
 	}
 	return id
+}
+
+// moveGroup puts the group in the state a transition would leave it in. The
+// command checks the two against each other, so a test that raises a revision
+// has to have made the move first - which is also what the real doors do, in
+// the same transaction.
+func moveGroup(t *testing.T, s *Store, agID string, status model.AlertGroupStatus) {
+	t.Helper()
+	if _, err := s.db.Exec(
+		`UPDATE alert_groups SET status = $2, acknowledged_by = CASE WHEN $2 = 'acknowledged'
+		 THEN 'nina' ELSE acknowledged_by END, resolved_by = CASE WHEN $2 = 'resolved'
+		 THEN 'nina' ELSE resolved_by END WHERE id = $1`, agID, string(status)); err != nil {
+		t.Fatalf("move the group to %s: %v", status, err)
+	}
+}
+
+// storedStatus is what the stored snapshot says the alert looked like - the
+// thing every message of that revision renders.
+func storedStatus(t *testing.T, s *Store, agID string) keys.GroupStatus {
+	t.Helper()
+	var raw []byte
+	if err := s.db.QueryRow(
+		`SELECT snapshot FROM outbound_group_snapshots WHERE alert_group_id = $1`, agID).
+		Scan(&raw); err != nil {
+		t.Fatalf("read the stored snapshot: %v", err)
+	}
+	var snapshot keys.RenderSnapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		t.Fatalf("read the stored snapshot back: %v", err)
+	}
+	return snapshot.Content().Status
+}
+
+// storedDigest is the content identity of the stored state.
+func storedDigest(t *testing.T, s *Store, agID string) []byte {
+	t.Helper()
+	var digest []byte
+	if err := s.db.QueryRow(
+		`SELECT snapshot_digest FROM outbound_group_snapshots WHERE alert_group_id = $1`,
+		agID).Scan(&digest); err != nil {
+		t.Fatalf("read the stored digest: %v", err)
+	}
+	return digest
 }
 
 // raiseDesired runs the command the way every real caller does: inside a
@@ -83,6 +128,7 @@ func TestDesiredStateRaisesARevisionAndAimsTheCards(t *testing.T) {
 	agID := desiredGroup(t, s, "Disk filling up")
 	mustSubmit(t, s, outboundAdmission(t, agID, "Disk filling up",
 		channelCommitment("C-ops", 0), dmCommitment("U-nina")))
+	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
 
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
 		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
@@ -104,6 +150,10 @@ func TestDesiredStateRaisesARevisionAndAimsTheCards(t *testing.T) {
 	revision, final := storedRevision(t, s, agID)
 	if revision != 1 || final {
 		t.Fatalf("the stored state is at revision %d, final=%v", revision, final)
+	}
+	// And it is the acknowledged alert that was frozen, not the one before it.
+	if status := storedStatus(t, s, agID); status != keys.GroupAcknowledged {
+		t.Fatalf("the stored state shows the alert as %s", status)
 	}
 
 	// The card is aimed at the new revision and back in the queue; the direct
@@ -234,10 +284,11 @@ func TestTheFinalRevisionIsRaisedEvenWhenNothingMoved(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("raise the desired state: %v", err)
 	}
+	digestBefore := storedDigest(t, s, agID)
 
-	// Nothing about the group has changed since, so the content is identical.
+	moveGroup(t, s, agID, model.AlertGroupStatusResolved)
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredResolve, Final: true, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: "nina",
 	})
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -247,6 +298,16 @@ func TestTheFinalRevisionIsRaisedEvenWhenNothingMoved(t *testing.T) {
 	}
 	if revision, final := storedRevision(t, s, agID); revision != 2 || !final {
 		t.Fatalf("the stored state is at revision %d, final=%v", revision, final)
+	}
+	if status := storedStatus(t, s, agID); status != keys.GroupResolved {
+		t.Fatalf("the final state shows the alert as %s", status)
+	}
+
+	// The point of the test, said directly: what changed is the alert's state
+	// and nothing else about the message, and that alone is enough - a
+	// commitment parked at an equal revision would take no further attempt.
+	if bytes.Equal(digestBefore, storedDigest(t, s, agID)) {
+		t.Fatal("the resolution did not change the state that gets rendered")
 	}
 }
 
@@ -262,8 +323,9 @@ func TestDesiredStateRefusesToMoveAfterFinal(t *testing.T) {
 	mustSubmit(t, s, outboundAdmission(t, agID, "Disk filling up",
 		channelCommitment("C-ops", 0)))
 
+	moveGroup(t, s, agID, model.AlertGroupStatusResolved)
 	if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredResolve, Final: true, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: "nina",
 	}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -277,13 +339,13 @@ func TestDesiredStateRefusesToMoveAfterFinal(t *testing.T) {
 	}
 
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: "ingester",
+		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: "nina",
 	})
 	if err != nil {
 		t.Fatalf("raise the desired state: %v", err)
 	}
 	if result.Outcome != outbound.DesiredStaleAfterFinal {
-		t.Fatalf("a payload after the resolve came back %s", result.Outcome)
+		t.Fatalf("a second resolve came back %s", result.Outcome)
 	}
 	if revision, _ := storedRevision(t, s, agID); revision != result.Revision {
 		t.Fatal("the refused proposal moved the revision anyway")
@@ -298,6 +360,7 @@ func TestDesiredStateWithoutASnapshotChangesNothing(t *testing.T) {
 	s.SetRenderEnvironment("https://tokay.example", "UTC")
 
 	agID := desiredGroup(t, s, "Nobody has been paged")
+	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
 
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
 		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
@@ -366,6 +429,85 @@ func TestAStateThatCannotBeFrozenEndsTheWholeTransition(t *testing.T) {
 	}
 }
 
+// TestAReasonThatTheGroupContradictsIsRefused. The reason is not a label on the
+// history: it decides whether the revision is the last one, and it says which
+// state the message is being frozen in. A caller that raises "acknowledged"
+// over a group that is not acknowledged has not made the transition it claims,
+// and the card would show a state nobody is in - permanently, because that is
+// what every later attempt renders.
+func TestAReasonThatTheGroupContradictsIsRefused(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	mustSubmit(t, s, outboundAdmission(t, agID, "Disk filling up",
+		channelCommitment("C-ops", 0)))
+	before, _ := storedRevision(t, s, agID)
+
+	for _, tc := range []struct {
+		name   string
+		status model.AlertGroupStatus
+		reason outbound.DesiredReason
+	}{
+		{"an acknowledgement of a group nobody acknowledged",
+			model.AlertGroupStatusProcessing, outbound.DesiredAck},
+		{"a resolution of a group that is still open",
+			model.AlertGroupStatusAcknowledged, outbound.DesiredResolve},
+		{"alerts merged into an incident that is over",
+			model.AlertGroupStatusResolved, outbound.DesiredMerge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			moveGroup(t, s, agID, tc.status)
+			if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
+				AlertGroupID: agID, Reason: tc.reason, Actor: "nina",
+			}); err == nil {
+				t.Fatal("the desired state was raised for a transition nobody made")
+			}
+			if after, _ := storedRevision(t, s, agID); after != before {
+				t.Fatalf("the refused proposal moved the revision to %d", after)
+			}
+		})
+	}
+}
+
+// TestAStateThisBuildCannotWriteIsLeftAlone. A snapshot stored under a schema
+// version this build does not know belongs to an instance that is ahead.
+// Rewriting it with what this build can express would delete the part a newer
+// renderer needs - and the read side already refuses such a row, so the card
+// would then be unrenderable by both of us. Stopping leaves the work for the
+// instance that can do it.
+func TestAStateThisBuildCannotWriteIsLeftAlone(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	mustSubmit(t, s, outboundAdmission(t, agID, "Disk filling up",
+		channelCommitment("C-ops", 0)))
+	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
+
+	if _, err := s.db.Exec(
+		`UPDATE outbound_group_snapshots SET snapshot_schema_version = 2
+		 WHERE alert_group_id = $1`, agID); err != nil {
+		t.Fatalf("write the newer state: %v", err)
+	}
+
+	if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+	}); err == nil {
+		t.Fatal("a state from a newer schema was overwritten")
+	}
+
+	var version int
+	if err := s.db.QueryRow(
+		`SELECT snapshot_schema_version FROM outbound_group_snapshots WHERE alert_group_id = $1`,
+		agID).Scan(&version); err != nil {
+		t.Fatalf("read the state back: %v", err)
+	}
+	if version != 2 {
+		t.Fatalf("the stored state came back at version %d", version)
+	}
+}
+
 // TestTheFourWritesCommitTogether. The snapshot, the revision on the
 // commitments, their return to the queue and their history are one fact. A
 // caller whose transaction fails after the raise must leave none of them
@@ -387,8 +529,9 @@ func TestTheFourWritesCommitTogether(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	if _, err := tx.Exec(
-		`SELECT 1 FROM alert_groups WHERE id = $1 FOR UPDATE`, agID); err != nil {
-		t.Fatalf("lock the group: %v", err)
+		`UPDATE alert_groups SET status = $2 WHERE id = $1 `,
+		agID, string(model.AlertGroupStatusAcknowledged)); err != nil {
+		t.Fatalf("acknowledge: %v", err)
 	}
 	result, err := setDesiredStateTx(context.Background(), tx, s.render,
 		outbound.DesiredStateRequest{
