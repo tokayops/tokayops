@@ -42,6 +42,10 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   rather than being sent - and alerts that arrive afterwards escalate normally.
   This is the same instruction as the first note, said for what it costs: pick a
   quiet moment.
+
+  It does NOT block the upgrade, and the note below is about something else. An
+  escalation still running is recognised, so the startup check lets it through;
+  it is its first remaining step that fails, once the new version is up.
 - The upgrade refuses to run while a job it cannot classify is still executing,
   and names the job in the message. That job either finishes or is cancelled,
   and the upgrade is started again. The alternative would be to let it run on
@@ -130,7 +134,10 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   gone out is, and work scheduled for later - a delayed policy step, a retry
   waiting out its backoff - is deliberately not counted as late. Beside it,
   `outbound_intents_terminal_total` counts notifications that ended, by how:
-  anything other than `succeeded` is a page that did not happen.
+  anything other than `succeeded` ended without anybody being able to say it
+  worked. That is not the same as never sent - a call whose answer never arrived
+  can be withdrawn or time out, and the message may well have gone; the alert's
+  own history is where that is settled.
   `outbound_attempts_total`, `outbound_admissions_total` and
   `outbound_admission_latency_seconds` cover the rest, and
   `outbound_contract_violations_total` should stay at zero - it counts things

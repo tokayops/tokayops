@@ -225,10 +225,19 @@ var (
 	// OutboundIntentsTerminalTotal counts commitments that ended, by how.
 	//
 	// The terminal states are succeeded, permanent_failed, expired and
-	// canceled; everything except "succeeded" is a page that did not happen,
-	// and the alert is written against those. It is incremented after the
-	// transaction that ended the commitment commits, never inside it: a
-	// rollback would otherwise report an ending that never occurred.
+	// canceled. Everything except "succeeded" is a commitment that ended
+	// WITHOUT A PROVEN SUCCESS, which is not the same as a message that was
+	// never sent: a call whose fate is unknown can be withdrawn by an
+	// acknowledgement or run out of time, and the effect may well have
+	// happened. Whether it did is a question for the commitment's journal -
+	// this counter says only that nothing proved it.
+	//
+	// The alert is written against those three for that reason: each one is an
+	// escalation that stopped without anybody being able to say it worked.
+	//
+	// It is incremented after the transaction that ended the commitment
+	// commits, never inside it: a rollback would otherwise report an ending
+	// that never occurred.
 	//
 	// Best effort, like every counter in a process. A commit whose reply is
 	// lost, or a process that dies between the two, loses the observation. An
@@ -237,7 +246,7 @@ var (
 	// is for rate and for noticing, not for accounting.
 	OutboundIntentsTerminalTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "outbound_intents_terminal_total",
-		Help: "Outbound commitments that reached a terminal state, by state.",
+		Help: "Outbound commitments that reached a terminal state, by state. Anything other than succeeded ended without a proven success, which is not the same as never sent - see the commitment journal.",
 	}, []string{"family", "status"})
 
 	// OutboundContractViolationsTotal counts what should not be able to happen:
