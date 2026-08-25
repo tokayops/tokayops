@@ -142,20 +142,36 @@ func TestARetryableFailureHasNoDeathCounter(t *testing.T) {
 	// Far past anything MaxAttempts would have allowed. The backoff is what
 	// slows this down, so the attempts are forced forward rather than waited
 	// for: the point is the absence of a limit, not the curve.
+	// Waited for in the DATABASE, not at the provider. The channel counts a call
+	// when it is ENTERED, so a fourth call is in flight long before the fourth
+	// failure is recorded - and a test reading the row at that moment would find
+	// a streak of three, or a commitment still sending, and fail a working
+	// implementation.
 	const failures = 4
-	for want := 1; want <= failures; want++ {
-		until(t, fmt.Sprintf("failure %d", want), func() bool {
-			if len(env.Channel.SentTo("S_TEST")) >= want {
-				return true
-			}
-			_, _ = env.S.GetDB().Exec(`
-				UPDATE outbound_intents SET next_attempt_at = now()
-				WHERE status = 'pending' AND next_attempt_at > now()`)
-			return false
-		})
-	}
+	until(t, fmt.Sprintf("%d recorded failures", failures), func() bool {
+		var streak int
+		var status string
+		if err := env.S.GetDB().QueryRow(`
+			SELECT i.failure_streak, i.status FROM outbound_intents i
+			JOIN alert_groups ag ON ag.id = i.alert_group_id
+			WHERE ag.alert_key = $1 AND i.target_kind = 'user'`,
+			"no_death_counter").Scan(&streak, &status); err != nil {
+			t.Fatalf("read the commitment: %v", err)
+		}
+		if status == string(outbound.StatusPending) && streak >= failures {
+			return true
+		}
+		// The backoff is what this test is not about.
+		_, _ = env.S.GetDB().Exec(`
+			UPDATE outbound_intents SET next_attempt_at = now()
+			WHERE status = 'pending' AND next_attempt_at > now()`)
+		return false
+	})
 
 	tried := len(env.Channel.SentTo("S_TEST"))
+	if tried < failures {
+		t.Fatalf("%d failures were recorded from only %d calls", failures, tried)
+	}
 	for _, intent := range intentsOf(t, env, "no_death_counter") {
 		if intent.TargetKind != "user" {
 			continue
@@ -163,10 +179,6 @@ func TestARetryableFailureHasNoDeathCounter(t *testing.T) {
 		if intent.Status.Terminal() {
 			t.Fatalf("a retryable failure ended the commitment as %s after %d attempts",
 				intent.Status, tried)
-		}
-		if intent.FailureStreak < failures {
-			t.Errorf("the failure streak is %d after %d failed attempts",
-				intent.FailureStreak, tried)
 		}
 	}
 }
@@ -337,6 +349,13 @@ func TestNoMoreLeasesThanSlots(t *testing.T) {
 	// More work than the pool, all of it held inside the provider so the slots
 	// stay occupied while the worker keeps ticking.
 	release := env.Channel.Hold()
+	// Deferred as well as called at the end. If an assertion below fails, the
+	// calls are still inside the provider, and the cleanup that stops the
+	// worker would sit in Drain for its whole deadline before giving up and
+	// leaving them running. Deferred functions run before cleanups, and release
+	// is idempotent.
+	defer release()
+
 	for i := 0; i < outbound.NotificationPoolSize+4; i++ {
 		sendWebhook(t, env.Echo, criticalAlert(fmt.Sprintf("pool_%d", i), "DiskFilling"))
 	}

@@ -103,6 +103,11 @@ func (w *Worker) Run(ctx context.Context) {
 // believes the worker has stopped. In a test that is rows appearing during the
 // next test's setup; in production it is the answer to a call being thrown
 // away, which is what the join in cmd/tokayops exists to prevent.
+//
+// PRECONDITION: whatever drives this worker has already stopped. Drain waits
+// for what is in flight; it does not prevent a tick from starting more, so
+// called while a ticker is still running it says nothing about the moment it
+// returns. Run satisfies this by draining only after its loop has left.
 func (w *Worker) Drain() { w.drain() }
 
 // drain waits for the attempts already in flight.
