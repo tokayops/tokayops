@@ -152,6 +152,11 @@ func main() {
 			"and Telegram account linking (/start) cannot complete. Set TOKAY_SELF_URL to a public HTTPS URL to enable them.")
 	}
 
+	// What a message needs that an alert group does not carry, frozen into
+	// every revision of a card the same way the producer of revision 0 freezes
+	// it: two instances, or one instance a month later, render the same bytes.
+	st.SetRenderEnvironment(cfg.Global.SelfURL, providers.ProcessZone())
+
 	// CLI Commands
 	if len(os.Args) > 1 {
 		cmd := os.Args[1]

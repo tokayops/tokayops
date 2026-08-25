@@ -15,6 +15,81 @@ import (
 // a bool cannot say that. The same goes for every other operation here - the
 // outcomes are the vocabulary the workflows above are written in.
 
+// DesiredReason is why the desired state of an alert group moved. Closed,
+// because it is what the history says happened and what the metric counts.
+type DesiredReason string
+
+const (
+	DesiredAck     DesiredReason = "ack"
+	DesiredResolve DesiredReason = "resolve"
+	DesiredMerge   DesiredReason = "merge"
+)
+
+// Known reports whether a reason is one this build states.
+func (r DesiredReason) Known() bool {
+	switch r {
+	case DesiredAck, DesiredResolve, DesiredMerge:
+		return true
+	default:
+		return false
+	}
+}
+
+// DesiredOutcome is what happened to a proposal to move the desired state.
+type DesiredOutcome string
+
+const (
+	// DesiredApplied: a new revision exists and the commitments are aimed at it.
+	DesiredApplied DesiredOutcome = "applied"
+
+	// DesiredUnchanged: what the message would say has not moved, so nothing
+	// was written. Alertmanager repeats the same payload, and a revision raised
+	// for every repeat would be a polling loop with a real edit on each tick.
+	DesiredUnchanged DesiredOutcome = "unchanged"
+
+	// DesiredNoSnapshot: the group has not been admitted yet, so there is no
+	// state to supersede. Its revision 0 will be frozen by the admission, from
+	// a group that already includes this change.
+	DesiredNoSnapshot DesiredOutcome = "no_snapshot"
+
+	// DesiredStaleAfterFinal: the alert's desired state is settled. A late
+	// payload cannot raise a revision over the one that resolved it - nothing
+	// would ever apply it.
+	DesiredStaleAfterFinal DesiredOutcome = "stale_after_final"
+)
+
+// DesiredStateRequest raises the desired state of an alert group.
+//
+// It carries no revision and no snapshot, and that is the contract rather than
+// an omission: both are computed inside the transition's own transaction, from
+// the rows as they became. Built before it, a snapshot describes the state the
+// acknowledgement was applied TO - without the actor, without the line the
+// transition wrote, without the alerts a merge just added.
+type DesiredStateRequest struct {
+	AlertGroupID string
+	Reason       DesiredReason
+
+	// Final says this is the last revision the message will ever be brought
+	// to. It raises a revision even when the content is unchanged: a commitment
+	// parked at an equal revision would never take another attempt, and the
+	// message would never be finished.
+	Final bool
+
+	Actor string
+}
+
+// DesiredStateResult is what the proposal did.
+type DesiredStateResult struct {
+	Outcome DesiredOutcome
+
+	// Revision is the revision now stored - the new one when applied, the
+	// existing one otherwise. Zero only when there is no snapshot at all.
+	Revision int64
+
+	// Touched is how many commitments were aimed at the new revision.
+	Touched int
+}
+
 // EscalationAdmission is what a producer hands the store: the identities the
 // grammar derived, plus the two things about the alert group that are settled
 // at the same moment.

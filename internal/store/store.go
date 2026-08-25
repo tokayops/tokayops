@@ -84,6 +84,11 @@ type Store struct {
 	// at three seconds, a loaded machine produces timeouts that say nothing
 	// about who took which row first.
 	lockTimeout time.Duration
+
+	// render is what a message needs that an alert group does not carry: the
+	// base URL of this installation and the zone times are printed in. Set once
+	// at wiring - see SetRenderEnvironment.
+	render renderEnvironment
 }
 
 func (s *Store) Close() error {

@@ -655,6 +655,18 @@ func addTimelineWithTx(ctx context.Context, tx *sql.Tx, alertGroupID string,
 func appendIntentEventTx(ctx context.Context, tx *sql.Tx,
 	intentID string, seq int, kind, reason, actor string) error {
 
+	return appendIntentEventDetailTx(ctx, tx, intentID, seq, kind, reason, actor, nil)
+}
+
+// appendIntentEventDetailTx is the same line with the facts the kind needs.
+//
+// A lifecycle event that says only what happened is enough for most kinds -
+// withdrawn, expired, decided on. Raising the desired state is not one of them:
+// which revision was raised is what says when a card started being out of date,
+// and it is the only durable record of that moment.
+func appendIntentEventDetailTx(ctx context.Context, tx *sql.Tx,
+	intentID string, seq int, kind, reason, actor string, detail []byte) error {
+
 	// seq 0 means "whatever comes next": the caller of a lifecycle event knows
 	// what happened, not how many things happened before it.
 	sequence := any(seq)
@@ -663,13 +675,14 @@ func appendIntentEventTx(ctx context.Context, tx *sql.Tx,
 	}
 
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO outbound_intent_events (id, intent_id, seq, kind, reason, actor)
+		INSERT INTO outbound_intent_events (id, intent_id, seq, kind, reason, actor, detail)
 		VALUES ($1, $2,
 		        COALESCE($3::int,
 		                 (SELECT COALESCE(max(seq), 0) + 1
 		                  FROM outbound_intent_events WHERE intent_id = $2)),
-		        $4, $5, $6)`,
-		uuid.New().String(), intentID, sequence, kind, nilIfEmpty(reason), nilIfEmpty(actor))
+		        $4, $5, $6, $7)`,
+		uuid.New().String(), intentID, sequence, kind, nilIfEmpty(reason), nilIfEmpty(actor),
+		nullableJSON(detail))
 	if err != nil {
 		return fmt.Errorf("record %s for commitment %s: %w", kind, intentID, err)
 	}
