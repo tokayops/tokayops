@@ -56,8 +56,9 @@ func (e renderEnvironment) displayZone() string {
 //
 // It runs inside the caller's transaction and expects the group's row to be
 // locked by it already - the ack, the resolve and the merge all take that lock
-// as their first step, which is what makes the revision monotonic without a
-// compare-and-set standing in for it.
+// as their first step, which is what makes the revision monotonic. The
+// compare-and-set below does not stand in for that lock; it is what catches a
+// caller who forgot it.
 func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 	req outbound.DesiredStateRequest) (outbound.DesiredStateResult, error) {
 
@@ -67,12 +68,15 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 			req.AlertGroupID, req.Reason)
 	}
 
-	// The group first, and with it the check that the caller made the
-	// transition it is claiming. It comes before everything else on purpose: a
-	// wrong reason is a contract violation, and answering it with one of the
-	// softer outcomes below would file a bug under "nothing to do".
-	view, err := groupViewTx(ctx, tx, env, req)
-	if err != nil {
+	// The reason is checked against the group before anything else: a wrong one
+	// is a contract violation, and answering it with one of the softer outcomes
+	// below would file a bug under "nothing to do".
+	//
+	// Only the status is read for it. The rest of the group - the alerts a
+	// message is drawn from, read strictly, as execution data - is not needed
+	// by any of the three answers below, and reading it here would let a
+	// damaged row end an acknowledgement of a group that has no card at all.
+	if err := checkReasonTx(ctx, tx, req); err != nil {
 		return outbound.DesiredStateResult{}, err
 	}
 
@@ -82,7 +86,7 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 		schemaVersion int
 		final         bool
 	)
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT revision, snapshot_digest, snapshot_schema_version, final
 		FROM outbound_group_snapshots WHERE alert_group_id = $1`,
 		req.AlertGroupID).Scan(&revision, &digest, &schemaVersion, &final)
@@ -111,11 +115,15 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 		}, nil
 	}
 
-	// Both snapshots below are built from the ONE read above. Reading the group
-	// twice would let the comparison and the thing being stored describe two
-	// different instants, which is the whole failure this command exists to
-	// avoid.
-	//
+	// Now the state a message is drawn from, once: both snapshots below are
+	// built from this one read. Reading the group twice would let the
+	// comparison and the thing being stored describe two different instants,
+	// which is the whole failure this command exists to avoid.
+	view, err := groupViewTx(ctx, tx, env, req)
+	if err != nil {
+		return outbound.DesiredStateResult{}, err
+	}
+
 	// The candidate is built at the CURRENT number, because the comparison
 	// below is about content: the revision is part of the material, so a
 	// candidate carrying the next number would differ from the stored digest
@@ -165,10 +173,11 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 	// help against that: the transaction would commit the dangling reference
 	// exactly as faithfully as it commits a good one.
 	//
-	// It has no test, and deliberately: under the lock it cannot happen, and
-	// without the lock the reader above sees the moved row and its own
-	// predicate matches. Reaching this line means an assumption broke, which is
-	// why it stops rather than corrects.
+	// Without the lock it is reachable, which is what the concurrent test
+	// proves: two transactions read the same revision, the first commits, and
+	// the second finds its predicate no longer true when the row is released.
+	// Under the lock it cannot happen at all - so reaching this line means an
+	// assumption broke, which is why it stops rather than corrects.
 	affected, err := written.RowsAffected()
 	if err != nil {
 		return outbound.DesiredStateResult{}, err
@@ -274,9 +283,6 @@ func groupViewTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 			"the desired state of %s was raised, and there is no such alert group",
 			req.AlertGroupID)
 	}
-	if err := reasonMatchesGroup(req.Reason, group.Status); err != nil {
-		return providers.GroupView{}, err
-	}
 
 	// Whether the alert's team is set up here. An alert that names no team has
 	// nothing anybody failed to set up, so its card says nothing about it -
@@ -295,6 +301,22 @@ func groupViewTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 		TeamOnboarded: onboarded,
 		Zone:          env.displayZone(),
 	}, nil
+}
+
+// checkReasonTx reads the one column the check needs and nothing else.
+func checkReasonTx(ctx context.Context, tx *sql.Tx, req outbound.DesiredStateRequest) error {
+	var status string
+	err := tx.QueryRowContext(ctx,
+		`SELECT status FROM alert_groups WHERE id = $1`, req.AlertGroupID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return outboundContractf(
+			"the desired state of %s was raised, and there is no such alert group",
+			req.AlertGroupID)
+	}
+	if err != nil {
+		return fmt.Errorf("read the alert group %s: %w", req.AlertGroupID, err)
+	}
+	return reasonMatchesGroup(req.Reason, model.AlertGroupStatus(status))
 }
 
 // reasonMatchesGroup says whether the group is in the state the reason claims

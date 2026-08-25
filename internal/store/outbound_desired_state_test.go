@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
@@ -506,6 +507,333 @@ func TestAStateThisBuildCannotWriteIsLeftAlone(t *testing.T) {
 	if version != 2 {
 		t.Fatalf("the stored state came back at version %d", version)
 	}
+}
+
+// intentState is what a raise may and may not touch on one commitment.
+type intentState struct {
+	status        string
+	desired       int64
+	nextAttempt   time.Time
+	leaseToken    sql.NullString
+	currentAttemp sql.NullString
+}
+
+func readIntentState(t *testing.T, s *Store, intentID string) intentState {
+	t.Helper()
+	var out intentState
+	if err := s.db.QueryRow(`
+		SELECT status, desired_revision, next_attempt_at, lease_token, current_attempt_id
+		FROM outbound_intents WHERE id = $1`, intentID).
+		Scan(&out.status, &out.desired, &out.nextAttempt, &out.leaseToken,
+			&out.currentAttemp); err != nil {
+		t.Fatalf("read the commitment %s: %v", intentID, err)
+	}
+	return out
+}
+
+// park puts a commitment in a state the ordinary path does not reach cheaply.
+// The lease and the attempt are cleared with it, because the schema says a
+// commitment holding either is one that is working.
+func park(t *testing.T, s *Store, intentID string, status outbound.Status) {
+	t.Helper()
+	if _, err := s.db.Exec(`
+		UPDATE outbound_intents
+		SET status = $2, lease_token = NULL, locked_until = NULL, current_attempt_id = NULL
+		WHERE id = $1`, intentID, string(status)); err != nil {
+		t.Fatalf("park %s as %s: %v", intentID, status, err)
+	}
+}
+
+// TestARaiseTouchesExactlyTheFourRowsOfTheTable walks D1's T21-T24 and the
+// states that are not in it.
+//
+// The command is one UPDATE over many rows, which is why it is not in the state
+// machine - and why the machine's own comment points here. Nothing else proves
+// that an attempt in flight is left alone, that a commitment waiting out a
+// backoff keeps the wait its provider asked for, or that a terminal one cannot
+// be brought back by an alert moving underneath it.
+func TestARaiseTouchesExactlyTheFourRowsOfTheTable(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	ids := admitOne(t, s, agID,
+		channelCommitment("C-idle", 0),
+		channelCommitment("C-sending", 0),
+		channelCommitment("C-backoff", 0),
+		channelCommitment("C-review", 0),
+		channelCommitment("C-succeeded", 0),
+		channelCommitment("C-canceled", 0),
+		dmCommitment("U-nina"))
+
+	byTarget := map[string]string{}
+	for _, id := range ids {
+		var ref string
+		if err := s.db.QueryRow(
+			`SELECT target_ref FROM outbound_intents WHERE id = $1`, id).Scan(&ref); err != nil {
+			t.Fatalf("read the target: %v", err)
+		}
+		byTarget[ref] = id
+	}
+
+	// One claim takes every commitment that is due, so the tokens are collected
+	// once and the ones this test does not drive are released again.
+	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: testFamily, Provider: "slack", Phase: outbound.ClaimRetriesFirst,
+		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	tokens := map[string]string{}
+	for _, l := range leased {
+		tokens[l.Intent.TargetRef] = l.LeaseToken
+	}
+	for _, ref := range []string{"C-backoff", "C-review", "C-succeeded", "C-canceled", "U-nina"} {
+		if _, err := s.db.Exec(`
+			UPDATE outbound_intents SET lease_token = NULL, locked_until = NULL
+			WHERE id = $1`, byTarget[ref]); err != nil {
+			t.Fatalf("release the lease of %s: %v", ref, err)
+		}
+	}
+
+	// idle: it sent its card and had caught up.
+	idle := byTarget["C-idle"]
+	token := tokens["C-idle"]
+	begun := beginOne(t, s, idle, token)
+	if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token, Conclusion: accepted(),
+	}); err != nil {
+		t.Fatalf("settle the card: %v", err)
+	}
+	if got := statusOf(t, s, idle); got != outbound.StatusIdle {
+		t.Fatalf("the settled card is %s", got)
+	}
+
+	// sending: an attempt is in flight, with a lease and an attempt row.
+	sending := byTarget["C-sending"]
+	beginOne(t, s, sending, tokens["C-sending"])
+
+	// pending on a backoff: coming back later, at a moment its provider chose.
+	backoff := byTarget["C-backoff"]
+	if _, err := s.db.Exec(
+		`UPDATE outbound_intents SET next_attempt_at = now() + interval '1 hour'
+		 WHERE id = $1`, backoff); err != nil {
+		t.Fatalf("put %s on a backoff: %v", backoff, err)
+	}
+
+	park(t, s, byTarget["C-review"], outbound.StatusManualReview)
+	park(t, s, byTarget["C-succeeded"], outbound.StatusSucceeded)
+	park(t, s, byTarget["C-canceled"], outbound.StatusCanceled)
+
+	before := map[string]intentState{}
+	for ref, id := range byTarget {
+		before[ref] = readIntentState(t, s, id)
+	}
+
+	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
+	result, raiseErr := raiseDesired(t, s, outbound.DesiredStateRequest{
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+	})
+	if raiseErr != nil {
+		t.Fatalf("raise the desired state: %v", raiseErr)
+	}
+	if result.Outcome != outbound.DesiredApplied {
+		t.Fatalf("the raise came back %s", result.Outcome)
+	}
+	next := result.Revision
+
+	cases := []struct {
+		ref     string
+		row     string
+		status  outbound.Status
+		aimed   bool
+		claimed bool // due now rather than when it was
+	}{
+		{"C-idle", "T21", outbound.StatusPending, true, true},
+		{"C-backoff", "T22", outbound.StatusPending, true, false},
+		{"C-sending", "T23", outbound.StatusSending, true, false},
+		{"C-review", "T24", outbound.StatusManualReview, true, false},
+		{"C-succeeded", "terminal", outbound.StatusSucceeded, false, false},
+		{"C-canceled", "terminal", outbound.StatusCanceled, false, false},
+		{"U-nina", "one-shot", outbound.StatusPending, false, false},
+	}
+	if result.Touched != 4 {
+		t.Fatalf("the raise aimed %d commitments, want the four rows of the table",
+			result.Touched)
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.ref+" ("+tc.row+")", func(t *testing.T) {
+			was, now := before[tc.ref], readIntentState(t, s, byTarget[tc.ref])
+
+			if now.status != string(tc.status) {
+				t.Errorf("status is %s, want %s", now.status, tc.status)
+			}
+
+			wantDesired := was.desired
+			if tc.aimed {
+				wantDesired = next
+			}
+			if now.desired != wantDesired {
+				t.Errorf("aimed at revision %d, want %d", now.desired, wantDesired)
+			}
+
+			switch {
+			case tc.claimed:
+				if now.nextAttempt.After(time.Now()) {
+					t.Errorf("it is not claimable until %s", now.nextAttempt)
+				}
+			default:
+				if !now.nextAttempt.Equal(was.nextAttempt) {
+					t.Errorf("its next attempt moved from %s to %s",
+						was.nextAttempt, now.nextAttempt)
+				}
+			}
+
+			// The lease and the attempt belong to whoever is executing. A raise
+			// that touched either would take work away from a live worker.
+			if now.leaseToken != was.leaseToken {
+				t.Errorf("the lease changed from %v to %v", was.leaseToken, now.leaseToken)
+			}
+			if now.currentAttemp != was.currentAttemp {
+				t.Errorf("the attempt in flight changed from %v to %v",
+					was.currentAttemp, now.currentAttemp)
+			}
+		})
+	}
+}
+
+// TestADamagedAlertDoesNotEndAnAcknowledgementItHasNoCardFor. A group nobody
+// has been paged for has no card, so nothing about the alerts is needed to
+// answer that. Reading them anyway - strictly, as execution data - would let a
+// row nobody can render end an acknowledgement of a group with no message to
+// render in the first place.
+func TestADamagedAlertDoesNotEndAnAcknowledgementItHasNoCardFor(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Nobody has been paged")
+	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
+	if _, err := s.db.Exec(
+		`UPDATE alert_groups SET alerts_data = 'not json at all' WHERE id = $1`,
+		agID); err != nil {
+		t.Fatalf("write the damaged alerts: %v", err)
+	}
+
+	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+	})
+	if err != nil {
+		t.Fatalf("the acknowledgement was ended by alerts no card needed: %v", err)
+	}
+	if result.Outcome != outbound.DesiredNoSnapshot {
+		t.Fatalf("a group with no admission came back %s", result.Outcome)
+	}
+}
+
+// TestTwoRaisesWithoutTheGroupLockCannotBothWin is the defensive
+// compare-and-set doing what it is for.
+//
+// Every real caller holds the group's row, which is what makes the revision
+// monotonic without a predicate. Without it two transactions can both read
+// revision N: the second is released when the first commits, finds the row is
+// no longer at N, and updates nothing. Ignoring that answer would aim every
+// card at a revision whose snapshot was never stored - and the transaction
+// would commit that dangling reference as faithfully as a good one.
+//
+// The interleaving is forced rather than raced: a competitor holds the snapshot
+// row uncommitted, so the raise reads the old revision and then waits on the
+// update. Getting the wait wrong makes this test fail rather than pass by
+// accident - a raise that read after the commit would simply succeed.
+func TestTwoRaisesWithoutTheGroupLockCannotBothWin(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	mustSubmit(t, s, outboundAdmission(t, agID, "Disk filling up",
+		channelCommitment("C-ops", 0)))
+	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
+	before, _ := storedRevision(t, s, agID)
+
+	// The competitor: it has the snapshot row and has not committed.
+	competitor, err := s.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer competitor.Rollback()
+	if _, err := competitor.Exec(
+		`UPDATE outbound_group_snapshots SET revision = revision + 1
+		 WHERE alert_group_id = $1`, agID); err != nil {
+		t.Fatalf("the competitor's write: %v", err)
+	}
+
+	loser, err := s.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer loser.Rollback()
+
+	raised := make(chan error, 1)
+	go func() {
+		_, err := setDesiredStateTx(context.Background(), loser, s.render,
+			outbound.DesiredStateRequest{
+				AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+			})
+		raised <- err
+	}()
+
+	waitForABlockedStatement(t, s)
+	if err := competitor.Commit(); err != nil {
+		t.Fatalf("commit the competitor: %v", err)
+	}
+
+	select {
+	case err := <-raised:
+		if err == nil {
+			t.Fatal("the raise stored nothing and said it had")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the raise never came back")
+	}
+	if err := loser.Rollback(); err != nil {
+		t.Fatalf("roll back: %v", err)
+	}
+
+	// Nothing of the loser's survives, and the competitor's number stands.
+	if after, _ := storedRevision(t, s, agID); after != before+1 {
+		t.Fatalf("the revision went from %d to %d", before, after)
+	}
+	var desired int64
+	if err := s.db.QueryRow(`
+		SELECT desired_revision FROM outbound_intents
+		WHERE alert_group_id = $1 AND form = $2`, agID, string(outbound.FormEditable)).
+		Scan(&desired); err != nil {
+		t.Fatalf("read the commitment: %v", err)
+	}
+	if desired != before {
+		t.Fatalf("the card was aimed at revision %d by a raise that stored nothing", desired)
+	}
+}
+
+// waitForABlockedStatement waits until something in this database is waiting
+// for a lock. The test database is ephemeral and serves one test at a time, so
+// an ungranted lock is the statement this test is waiting to see block.
+func waitForABlockedStatement(t *testing.T, s *Store) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var blocked int
+		if err := s.db.QueryRow(
+			`SELECT count(*) FROM pg_locks WHERE NOT granted`).Scan(&blocked); err != nil {
+			t.Fatalf("read the locks: %v", err)
+		}
+		if blocked > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("nothing ever blocked, so the interleaving this test needs did not happen")
 }
 
 // TestTheFourWritesCommitTogether. The snapshot, the revision on the
