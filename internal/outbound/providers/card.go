@@ -2,6 +2,7 @@ package providers
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
@@ -64,4 +65,47 @@ func CountFiring(alerts []keys.AlertSnapshot) int {
 		}
 	}
 	return n
+}
+
+// AlertDescription is what an alert says is wrong. Empty when the alert carries
+// nothing to say.
+//
+// It does not shorten anything: the bound is keys.AlertDescriptionLimit and it
+// is applied when the snapshot is canonicalised, before the digest. Cutting
+// here instead would let two snapshots that render identically hold different
+// digests - a revision raised, and a real edit sent, for a difference nobody
+// can see.
+func AlertDescription(a keys.AlertSnapshot) string {
+	if a.Description == nil {
+		return ""
+	}
+	return *a.Description
+}
+
+// AlertStartedAt is when the alert began, printed in the snapshot's zone.
+//
+// The zone comes from the snapshot and never from the process: two instances
+// rendering one revision have to produce the same bytes, and the second attempt
+// of a delivery has to produce the same message as the first.
+//
+// The offset is printed in full rather than as whole hours. Half-hour zones
+// exist, and "GMT+5" for Asia/Kolkata is a time that is wrong by thirty
+// minutes rather than a shorter way of saying the right one.
+func AlertStartedAt(a keys.AlertSnapshot, zone string) string {
+	local := a.StartsAt.In(DisplayZone(zone))
+	return local.Format("2006-01-02 15:04") + " GMT" + local.Format("-07:00")
+}
+
+// DisplayZone resolves a snapshot's zone name. A snapshot cannot hold one that
+// does not load - the protocol refuses it - so the fallback is for the paths
+// that render a live row rather than an admitted one.
+func DisplayZone(name string) *time.Location {
+	if name == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return time.UTC
+	}
+	return loc
 }

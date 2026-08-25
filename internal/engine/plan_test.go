@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -297,89 +298,60 @@ func TestThePlanCarriesTheVersionItWasReadAt(t *testing.T) {
 	}
 }
 
-// TestTheFrozenStateCarriesTheHistory. The card shows what has happened to the
-// alert so far, and the snapshot is the only thing it may read. A producer that
-// never loaded the history froze an empty one into every message of the
-// escalation - permanently, because revision 0 is what the first cards render.
-func TestTheFrozenStateCarriesTheHistory(t *testing.T) {
-	ag := criticalGroup()
-	ag.TimelineEvents = []*model.TimelineEvent{
+// TestTheHistoryDoesNotReachTheFrozenState. The alert's history left the
+// snapshot with tag 14 on 2026-08-25, and this is the assertion that keeps it
+// out: two groups that differ ONLY in what has happened to them freeze to the
+// same content identity.
+//
+// It is not tidiness. The digest answers "did the desired state change", and a
+// field that reaches it without reaching the message makes that answer wrong -
+// every line of history, including the ones a delivery writes about itself,
+// would raise a revision and send a real edit nobody can see.
+func TestTheHistoryDoesNotReachTheFrozenState(t *testing.T) {
+	freeze := func(t *testing.T, events []*model.TimelineEvent) []byte {
+		t.Helper()
+		ag := criticalGroup()
+		ag.TimelineEvents = events
+		admission, err := planFor(&failingStore{
+			policyErr: sql.ErrNoRows, team: &model.Team{ID: "team-1"},
+		}).buildPlan(context.Background(), ag, schedulerender.TeamOnCallResult{})
+		if err != nil {
+			t.Fatalf("build the plan: %v", err)
+		}
+		if len(admission.Admission.Commitments) == 0 {
+			t.Fatal("nothing was promised")
+		}
+		return admission.Admission.Snapshot.Digest()
+	}
+
+	bare := freeze(t, nil)
+
+	busy := freeze(t, []*model.TimelineEvent{
 		{
-			ID: "ev-2", AlertGroupID: ag.ID, Type: model.TimelineEventAlertAdded,
+			ID: "ev-2", AlertGroupID: "ag-1", Type: model.TimelineEventAlertAdded,
 			Message: "A second alert joined", CreatedAt: time.Unix(1700000200, 0),
 		},
 		{
-			ID: "ev-1", AlertGroupID: ag.ID, Type: model.TimelineEventCreated,
+			ID: "ev-1", AlertGroupID: "ag-1", Type: model.TimelineEventCreated,
 			Message: "Alert group created", CreatedAt: time.Unix(1700000100, 0),
 		},
+	})
+	if !bytes.Equal(bare, busy) {
+		t.Fatal("the history changed the content identity of the state")
 	}
 
-	admission, err := planFor(&failingStore{
-		policyErr: sql.ErrNoRows, team: &model.Team{ID: "team-1"},
-	}).buildPlan(context.Background(), ag, schedulerender.TeamOnCallResult{})
-	if err != nil {
-		t.Fatalf("build the plan: %v", err)
-	}
-
-	history := admission.Admission.Snapshot.Content().Timeline
-	if len(history) != 2 {
-		t.Fatalf("the frozen state holds %d lines of history, want 2", len(history))
-	}
-	// Oldest first: the snapshot settles the order once, and the stored, hashed
-	// and rendered orders are the same order.
-	if history[0].ID != "ev-1" || history[1].ID != "ev-2" {
-		t.Fatalf("the history reads %s then %s", history[0].ID, history[1].ID)
-	}
-}
-
-// TestAHistoryLineThisBuildCannotShowDoesNotCostThePage. Admission refuses an
-// event it cannot name, and it is right to: rendering it as something else
-// would put a digest behind a message nobody wrote. But refusing HERE costs the
-// page - one line written by another build and the alert is unadmittable on
-// every tick, forever, with nobody notified. The line stays in the audit and
-// leaves the card.
-func TestAHistoryLineThisBuildCannotShowDoesNotCostThePage(t *testing.T) {
-	unshowable := []*model.TimelineEvent{
+	// The lines that used to need a filter of their own: written by a build
+	// that knows more, or recorded without an id or a time. None of them can
+	// cost the page any more, because none of them is read.
+	unshowable := freeze(t, []*model.TimelineEvent{
 		{
 			ID: "ev-x", AlertGroupID: "ag-1", Type: model.TimelineEventType("teleported"),
 			Message: "written by a build that knows more", CreatedAt: time.Unix(1700000100, 0),
 		},
-		{
-			ID: "", AlertGroupID: "ag-1", Type: model.TimelineEventCreated,
-			Message: "no id", CreatedAt: time.Unix(1700000100, 0),
-		},
-		{
-			ID: "ev-z", AlertGroupID: "ag-1", Type: model.TimelineEventCreated,
-			Message: "no time",
-		},
-	}
-
-	for _, event := range unshowable {
-		t.Run(event.Message, func(t *testing.T) {
-			ag := criticalGroup()
-			ag.TimelineEvents = []*model.TimelineEvent{
-				{
-					ID: "ev-1", AlertGroupID: ag.ID, Type: model.TimelineEventCreated,
-					Message: "Alert group created", CreatedAt: time.Unix(1700000000, 0),
-				},
-				event,
-			}
-
-			admission, err := planFor(&failingStore{
-				policyErr: sql.ErrNoRows, team: &model.Team{ID: "team-1"},
-			}).buildPlan(context.Background(), ag, schedulerender.TeamOnCallResult{})
-			if err != nil {
-				t.Fatalf("a history line nobody can show stopped the escalation: %v", err)
-			}
-			if len(admission.Admission.Commitments) == 0 {
-				t.Fatal("nothing was promised")
-			}
-
-			history := admission.Admission.Snapshot.Content().Timeline
-			if len(history) != 1 || history[0].ID != "ev-1" {
-				t.Fatalf("the card would show %+v", history)
-			}
-		})
+		{ID: "", AlertGroupID: "ag-1", Type: model.TimelineEventCreated, Message: "no id"},
+	})
+	if !bytes.Equal(bare, unshowable) {
+		t.Fatal("a history line nobody can show still reached the state")
 	}
 }
 

@@ -74,14 +74,17 @@ type Provider struct {
 	client      *slackapi.Client
 }
 
-// Data is the opaque provider payload Slack stores in a delivery row. It
-// holds the coordinates of the posted message (channel + timestamp), the timeline
-// thread timestamp, and a permalink for DM "Open in Slack" links.
+// Data is the opaque provider payload Slack stores in a delivery row. It holds
+// the coordinates of the posted message (channel + timestamp) and a permalink
+// for DM "Open in Slack" links.
+//
+// The thread timestamp left it with the threaded timeline: a second message in
+// a thread is a second external effect, and one attempt performs one (NFR-6).
+// Rows written before it went away still parse - an unknown field is ignored.
 type Data struct {
-	ChannelID         string `json:"channel_id"`
-	Timestamp         string `json:"timestamp"`
-	TimelineTimestamp string `json:"timeline_ts,omitempty"`
-	Permalink         string `json:"permalink,omitempty"`
+	ChannelID string `json:"channel_id"`
+	Timestamp string `json:"timestamp"`
+	Permalink string `json:"permalink,omitempty"`
 }
 
 func parseData(raw string) (*Data, bool) {
@@ -276,8 +279,7 @@ func (s *Provider) Send(ctx context.Context, req providers.NotificationRequest) 
 }
 
 // sendCard posts an alert-group card (title blocks + colored attachment) to a
-// channel, plus the timeline as a threaded reply, and returns the Data
-// payload needed to update/resolve it later.
+// channel and returns the Data payload needed to update/resolve it later.
 func (s *Provider) sendCard(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
 	if ag == nil {
 		return "", fmt.Errorf("slack: channel send requires an alert group")
@@ -319,25 +321,11 @@ func (s *Provider) sendCard(ctx context.Context, targetID string, ag *model.Aler
 
 	log.Printf("Provider: Sent message to %s (ts: %s)", channelID, timestamp)
 
-	// Post Timeline to Thread (second message)
-	timelineText := RenderTimeline(state)
-	var timelineTS string
-	if timelineText != "" {
-		_, timelineTS, err = client.PostMessageContext(ctx, channelID,
-			slackapi.MsgOptionText(timelineText, false),
-			slackapi.MsgOptionTS(timestamp),
-		)
-		if err != nil {
-			log.Printf("Provider: Failed to post timeline thread: %v", err)
-		}
-	}
-
 	// Return data to be saved for updates
 	data := Data{
-		ChannelID:         channelID,
-		Timestamp:         timestamp,
-		TimelineTimestamp: timelineTS,
-		Permalink:         permalink,
+		ChannelID: channelID,
+		Timestamp: timestamp,
+		Permalink: permalink,
 	}
 	bytes, _ := json.Marshal(data)
 	return string(bytes), nil
@@ -370,33 +358,6 @@ func (s *Provider) Update(ctx context.Context, d *model.NotificationDelivery, ag
 		return "", err
 	}
 
-	// 2. Update/Create Timeline Thread
-	timelineText := RenderTimeline(state)
-	if timelineText != "" {
-		timelineTS := data.TimelineTimestamp
-		if timelineTS != "" {
-			// Update existing
-			_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, timelineTS,
-				slackapi.MsgOptionText(timelineText, false),
-			)
-			if err != nil {
-				log.Printf("Provider: Failed to update timeline: %v", err)
-			}
-		} else {
-			// Create new
-			_, newTS, err := client.PostMessageContext(ctx, data.ChannelID,
-				slackapi.MsgOptionText(timelineText, false),
-				slackapi.MsgOptionTS(data.Timestamp),
-			)
-			if err == nil {
-				data.TimelineTimestamp = newTS
-			} else {
-				log.Printf("Provider: Failed to create timeline: %v", err)
-			}
-		}
-	}
-
-	// Return updated data (in case TimelineTimestamp changed)
 	bytes, _ := json.Marshal(data)
 	return string(bytes), nil
 }
@@ -416,16 +377,6 @@ func (s *Provider) Resolve(ctx context.Context, d *model.NotificationDelivery, a
 		return fmt.Errorf("slack: invalid provider payload for delivery %s", d.ID)
 	}
 
-	// 1. Thread Reply
-	_, _, err = client.PostMessageContext(ctx, data.ChannelID,
-		slackapi.MsgOptionText("✅ Alert Group Resolved", false),
-		slackapi.MsgOptionTS(data.Timestamp),
-	)
-	if err != nil {
-		log.Printf("Provider: Failed to send reply: %v", err)
-	}
-
-	// 2. Update Main Message (critical — user-visible)
 	state := s.freeze(ag, true)
 	card := Render(state, s.interactive())
 
@@ -437,19 +388,6 @@ func (s *Provider) Resolve(ctx context.Context, d *model.NotificationDelivery, a
 	if err != nil {
 		return fmt.Errorf("failed to update main message: %w", err)
 	}
-
-	// 3. Update Timeline Thread (Final state)
-	timelineText := RenderTimeline(state)
-	timelineTS := data.TimelineTimestamp
-	if timelineText != "" && timelineTS != "" {
-		_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, timelineTS,
-			slackapi.MsgOptionText(timelineText, false),
-		)
-		if err != nil {
-			log.Printf("Provider: Failed to update final timeline: %v", err)
-		}
-	}
-
 	return nil
 }
 

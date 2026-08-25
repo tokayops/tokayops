@@ -358,43 +358,12 @@ func (p *planner) freeze(ag *model.AlertGroup, team teamRead) (keys.RenderSnapsh
 		// produce the same message.
 		Zone: providers.ProcessZone(),
 	})
-	in.Timeline = tellableHistory(ag.ID, in.Timeline)
 
 	state, err := keys.NewRenderSnapshot(in)
 	if err != nil {
 		return keys.RenderSnapshot{}, fmt.Errorf("freeze the state of %s: %w", ag.ID, err)
 	}
 	return state, nil
-}
-
-// tellableHistory drops the lines of the history this build cannot put in a
-// message.
-//
-// The snapshot refuses an event it cannot name or identify, and it is right to:
-// a digest that stood for "acknowledged" and rendered as something else would
-// be a receipt for a message nobody sent. But refusing here would cost the
-// PAGE - one line of history written by another build, and the alert is
-// unadmittable on every tick, forever, with nobody notified.
-//
-// So the line is left out of the card and stays in the audit, which is where a
-// history lives anyway. The card is a summary; the timeline table is the
-// record.
-func tellableHistory(agID string, events []keys.TimelineEventSnapshot) []keys.TimelineEventSnapshot {
-	out := events[:0]
-	for _, event := range events {
-		switch {
-		case event.ID == "":
-			log.Printf("AlertEngine: %s has a history line with no id, left out of the card", agID)
-		case event.CreatedAt.IsZero():
-			log.Printf("AlertEngine: %s has a history line with no time, left out of the card", agID)
-		case !keys.KnownTimelineEventType(event.Type):
-			log.Printf("AlertEngine: %s has a history line of kind %q, which this build cannot show",
-				agID, event.Type)
-		default:
-			out = append(out, event)
-		}
-	}
-	return out
 }
 
 // commitments turns the plan into promises: the firehose first, then the policy

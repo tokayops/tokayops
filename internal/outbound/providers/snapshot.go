@@ -86,13 +86,11 @@ func ViewOf(view GroupView) keys.SnapshotInput {
 	for _, alert := range group.Alerts {
 		in.Alerts = append(in.Alerts, alertSnapshot(alert, group.CreatedAt))
 	}
-	for _, event := range group.TimelineEvents {
-		if event == nil {
-			continue
-		}
-		in.Timeline = append(in.Timeline, timelineSnapshot(event))
-	}
 
+	// The group's history is deliberately not read. It left the snapshot with
+	// tag 14 on 2026-08-25: no message renders it, and a field that reaches the
+	// digest without reaching the message makes the digest answer "the desired
+	// state changed" when nothing visible did.
 	return in
 }
 
@@ -134,16 +132,6 @@ func alertSnapshot(alert model.Alert, firstSeen time.Time) keys.AlertSnapshot {
 	return out
 }
 
-func timelineSnapshot(event *model.TimelineEvent) keys.TimelineEventSnapshot {
-	return keys.TimelineEventSnapshot{
-		ID:        event.ID,
-		Type:      timelineType(event.Type),
-		Message:   event.Message,
-		Actor:     optional(event.Actor),
-		CreatedAt: event.CreatedAt,
-	}
-}
-
 // RenderableOf is the freeze for the path that renders a row that already
 // exists, and it cannot fail.
 //
@@ -170,16 +158,11 @@ func RenderableOf(view GroupView) keys.SnapshotInput {
 		if in.Alerts[i].StartsAt.IsZero() {
 			in.Alerts[i].StartsAt = fallback
 		}
-	}
-	for i := range in.Timeline {
-		if in.Timeline[i].ID == "" {
-			in.Timeline[i].ID = fmt.Sprintf("unidentified-%d", i)
-		}
-		if in.Timeline[i].CreatedAt.IsZero() {
-			in.Timeline[i].CreatedAt = fallback
-		}
-		if !keys.KnownTimelineEventType(in.Timeline[i].Type) {
-			in.Timeline[i].Type = keys.EventNote
+		// The same bound the protocol applies when it canonicalises. A live row
+		// rendered here has to produce the bytes an admitted snapshot would.
+		if d := in.Alerts[i].Description; d != nil {
+			cut := keys.TruncateAlertDescription(*d)
+			in.Alerts[i].Description = &cut
 		}
 	}
 
@@ -237,31 +220,6 @@ func alertStatus(status model.AlertStatus) keys.AlertStatus {
 		return keys.AlertResolved
 	default:
 		return keys.AlertStatus(status)
-	}
-}
-
-func timelineType(eventType model.TimelineEventType) keys.TimelineEventType {
-	switch eventType {
-	case model.TimelineEventCreated:
-		return keys.EventCreated
-	case model.TimelineEventAlertAdded:
-		return keys.EventAlertAdded
-	case model.TimelineEventAlertResolved:
-		return keys.EventAlertResolved
-	case model.TimelineEventAcknowledged:
-		return keys.EventAcknowledged
-	case model.TimelineEventResolved:
-		return keys.EventResolved
-	case model.TimelineEventNotificationSent:
-		return keys.EventNotificationSent
-	case model.TimelineEventNotificationFailed:
-		return keys.EventNotificationFailed
-	case model.TimelineEventStatusChange:
-		return keys.EventStatusChange
-	case model.TimelineEventNote:
-		return keys.EventNote
-	default:
-		return keys.TimelineEventType(eventType)
 	}
 }
 

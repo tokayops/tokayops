@@ -84,9 +84,6 @@ func TestAdmissionRefusesWhatRenderingTolerates(t *testing.T) {
 	if len(state.Alerts) != 1 || state.Alerts[0].Fingerprint == "" {
 		t.Fatalf("rendering a live row dropped an alert nobody fingerprinted: %+v", state.Alerts)
 	}
-	if len(state.Timeline) != 1 || state.Timeline[0].ID == "" {
-		t.Fatalf("rendering a live row dropped an event with no id: %+v", state.Timeline)
-	}
 }
 
 // TestTheProcessZoneNeverReachesASnapshot. "Local" is not a zone, it is a
@@ -137,9 +134,6 @@ func TestAVocabularyThisBuildDoesNotShare(t *testing.T) {
 	}
 	if renderable.Alerts[0].Status != keys.AlertFiring {
 		t.Fatalf("the alert is %q", renderable.Alerts[0].Status)
-	}
-	if renderable.Timeline[0].Type != keys.EventNote {
-		t.Fatalf("the event is %q", renderable.Timeline[0].Type)
 	}
 	if _, err := keys.NewRenderSnapshot(renderable); err != nil {
 		t.Fatalf("the renderable state is still not renderable: %v", err)

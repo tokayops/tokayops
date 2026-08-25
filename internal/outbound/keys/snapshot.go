@@ -18,8 +18,8 @@ const renderSnapshotProtocol = "render_snapshot/v1"
 // same fields: a second counter would eventually disagree with the first.
 const RenderSnapshotSchemaV1 = 1
 
-// GroupStatus, AlertStatus and TimelineEventType are closed sets, listed here
-// rather than borrowed from the alerting model.
+// GroupStatus and AlertStatus are closed sets, listed here rather than borrowed
+// from the alerting model.
 //
 // A protocol that says "whatever the model declares today" is not frozen: a
 // literal added or renamed somewhere else would silently change what these
@@ -50,24 +50,34 @@ const (
 
 var alertStatuses = map[AlertStatus]bool{AlertFiring: true, AlertResolved: true}
 
-type TimelineEventType string
+// AlertDescriptionLimit is how much of an alert's description the protocol
+// keeps, in runes, and it is part of canonicalisation rather than of rendering.
+//
+// The difference matters. Truncating at render time would leave two snapshots
+// with the same first 120 runes and different tails holding different digests
+// while producing byte-identical messages - so raising a revision, and sending
+// a real edit nobody can see. That is the defect the history was removed from
+// this protocol for; a rule applied after the digest would have reintroduced it
+// through a field nobody thought of as high-churn.
+//
+// A value longer than this is stored as its first AlertDescriptionLimit runes
+// followed by the literal below. Applying the rule to an already-truncated
+// value changes nothing - the first 120 runes of "R[:120]..." are R[:120] - so
+// a stored snapshot canonicalises back to itself.
+const AlertDescriptionLimit = 120
 
-const (
-	EventCreated            TimelineEventType = "created"
-	EventAlertAdded         TimelineEventType = "alert_added"
-	EventAlertResolved      TimelineEventType = "alert_resolved"
-	EventAcknowledged       TimelineEventType = "acknowledged"
-	EventResolved           TimelineEventType = "resolved"
-	EventNotificationSent   TimelineEventType = "notification_sent"
-	EventNotificationFailed TimelineEventType = "notification_failed"
-	EventNote               TimelineEventType = "note"
-	EventStatusChange       TimelineEventType = "status_change"
-)
+// AlertDescriptionEllipsis marks a description the protocol cut.
+const AlertDescriptionEllipsis = "..."
 
-var timelineEventTypes = map[TimelineEventType]bool{
-	EventCreated: true, EventAlertAdded: true, EventAlertResolved: true,
-	EventAcknowledged: true, EventResolved: true, EventNotificationSent: true,
-	EventNotificationFailed: true, EventNote: true, EventStatusChange: true,
+// TruncateAlertDescription is the canonical form of a description, exported so
+// the paths that render a live row rather than an admitted one produce the same
+// bytes as the ones that render a snapshot.
+func TruncateAlertDescription(description string) string {
+	r := []rune(description)
+	if len(r) <= AlertDescriptionLimit {
+		return description
+	}
+	return string(r[:AlertDescriptionLimit]) + AlertDescriptionEllipsis
 }
 
 // AlertSnapshot is one alert as a message shows it.
@@ -117,37 +127,8 @@ func (a AlertSnapshot) encode() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// TimelineEventSnapshot is one line of the history a card shows.
-type TimelineEventSnapshot struct {
-	ID        string            `json:"id"`
-	Type      TimelineEventType `json:"type"`
-	Message   string            `json:"message"`
-	Actor     *string           `json:"actor,omitempty"`
-	CreatedAt time.Time         `json:"created_at"`
-}
-
-func (e TimelineEventSnapshot) encode() ([]byte, error) {
-	if e.ID == "" {
-		return nil, contractf("a timeline event with no id")
-	}
-	if !timelineEventTypes[e.Type] {
-		return nil, contractf("timeline event type %q is not one this protocol knows", e.Type)
-	}
-	if e.CreatedAt.IsZero() {
-		return nil, contractf("timeline event %s has no time", e.ID)
-	}
-
-	var buf bytes.Buffer
-	tagged(&buf, 1, func(b *bytes.Buffer) { encStr(b, e.ID) })
-	tagged(&buf, 2, func(b *bytes.Buffer) { encStr(b, string(e.Type)) })
-	tagged(&buf, 3, func(b *bytes.Buffer) { encStr(b, e.Message) })
-	tagged(&buf, 4, func(b *bytes.Buffer) { encOpt(b, e.Actor) })
-	tagged(&buf, 5, func(b *bytes.Buffer) { enc(b, int64Bytes(e.CreatedAt.UTC().UnixNano())) })
-	return buf.Bytes(), nil
-}
-
-// KnownGroupStatus, KnownAlertStatus and KnownTimelineEventType are the closed
-// sets, asked from outside.
+// KnownGroupStatus and KnownAlertStatus are the closed sets, asked from
+// outside.
 //
 // A caller that maps its own vocabulary into this one has to be able to tell
 // whether a value survived that mapping, or it ends up quietly substituting -
@@ -157,11 +138,6 @@ func KnownGroupStatus(status GroupStatus) bool { return groupStatuses[status] }
 
 // KnownAlertStatus reports whether an alert status is one this protocol knows.
 func KnownAlertStatus(status AlertStatus) bool { return alertStatuses[status] }
-
-// KnownTimelineEventType reports whether an event type is one this protocol knows.
-func KnownTimelineEventType(eventType TimelineEventType) bool {
-	return timelineEventTypes[eventType]
-}
 
 // SnapshotInput is the state a message is rendered from, as a producer supplies
 // it: everything a card or a direct message shows, and nothing else.
@@ -189,12 +165,11 @@ type SnapshotInput struct {
 	// it has to mean the same thing on every instance: "Local" is whatever the
 	// process happens to be set to, which is the very thing this snapshot
 	// exists to keep out of a message.
-	DisplayTimezone string                  `json:"display_timezone"`
-	AcknowledgedBy  *string                 `json:"acknowledged_by,omitempty"`
-	ResolvedBy      *string                 `json:"resolved_by,omitempty"`
-	Alerts          []AlertSnapshot         `json:"alerts"`
-	Timeline        []TimelineEventSnapshot `json:"timeline"`
-	TeamSetupURL    *string                 `json:"team_setup_url,omitempty"`
+	DisplayTimezone string          `json:"display_timezone"`
+	AcknowledgedBy  *string         `json:"acknowledged_by,omitempty"`
+	ResolvedBy      *string         `json:"resolved_by,omitempty"`
+	Alerts          []AlertSnapshot `json:"alerts"`
+	TeamSetupURL    *string         `json:"team_setup_url,omitempty"`
 }
 
 // RenderSnapshot is a snapshot that is canonical and valid, and can be nothing
@@ -242,6 +217,10 @@ func NewRenderSnapshot(in SnapshotInput) (RenderSnapshot, error) {
 	alerts := make(map[string]bool, len(out.Alerts))
 	for i := range out.Alerts {
 		out.Alerts[i].StartsAt = out.Alerts[i].StartsAt.UTC()
+		if d := out.Alerts[i].Description; d != nil {
+			cut := TruncateAlertDescription(*d)
+			out.Alerts[i].Description = &cut
+		}
 		fingerprint := out.Alerts[i].Fingerprint
 		if fingerprint == "" {
 			return RenderSnapshot{}, contractf("an alert with no fingerprint")
@@ -254,33 +233,11 @@ func NewRenderSnapshot(in SnapshotInput) (RenderSnapshot, error) {
 		alerts[fingerprint] = true
 	}
 
-	events := make(map[string]bool, len(out.Timeline))
-	for i := range out.Timeline {
-		out.Timeline[i].CreatedAt = out.Timeline[i].CreatedAt.UTC()
-		id := out.Timeline[i].ID
-		if id == "" {
-			return RenderSnapshot{}, contractf("a timeline event with no id")
-		}
-		if events[id] {
-			// Same reason as the alerts above: two events sharing an id leave
-			// (time, id) unable to order them, and a stable sort would then
-			// carry the input order into the digest.
-			return RenderSnapshot{}, contractf("timeline event id %s appears twice", id)
-		}
-		events[id] = true
-	}
-
 	sort.Slice(out.Alerts, func(i, j int) bool {
 		if !out.Alerts[i].StartsAt.Equal(out.Alerts[j].StartsAt) {
 			return out.Alerts[i].StartsAt.Before(out.Alerts[j].StartsAt)
 		}
 		return out.Alerts[i].Fingerprint < out.Alerts[j].Fingerprint
-	})
-	sort.Slice(out.Timeline, func(i, j int) bool {
-		if !out.Timeline[i].CreatedAt.Equal(out.Timeline[j].CreatedAt) {
-			return out.Timeline[i].CreatedAt.Before(out.Timeline[j].CreatedAt)
-		}
-		return out.Timeline[i].ID < out.Timeline[j].ID
 	})
 
 	digest, err := digestOf(out)
@@ -338,11 +295,6 @@ func (s SnapshotInput) clone() SnapshotInput {
 		out.Alerts[i] = a
 	}
 
-	out.Timeline = make([]TimelineEventSnapshot, len(s.Timeline))
-	for i, e := range s.Timeline {
-		e.Actor = cloneString(e.Actor)
-		out.Timeline[i] = e
-	}
 	return out
 }
 
@@ -421,16 +373,16 @@ func digestOf(s SnapshotInput) ([]byte, error) {
 	}
 	tagged(&material, 13, func(b *bytes.Buffer) { encList(b, alerts) })
 
-	events := make([][]byte, 0, len(s.Timeline))
-	for _, e := range s.Timeline {
-		encoded, err := e.encode()
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, encoded)
-	}
-	tagged(&material, 14, func(b *bytes.Buffer) { encList(b, events) })
-
+	// Tag 14 held the alert's history and was retired on 2026-08-25. It is not
+	// reused: a number that meant one thing and now means another would let two
+	// different snapshots hash the same.
+	//
+	// It was removed rather than left in place because the digest gained a
+	// second reader. Besides telling two proposals apart, it now answers
+	// "did the desired state change" - and a field that reaches the digest
+	// without reaching the message makes that answer wrong: every line of
+	// history, including the ones a delivery writes about itself, would raise a
+	// revision and send a real edit that changes nothing anybody can see.
 	tagged(&material, 15, func(b *bytes.Buffer) { encOpt(b, s.TeamSetupURL) })
 
 	sum := sha256.Sum256(material.Bytes())

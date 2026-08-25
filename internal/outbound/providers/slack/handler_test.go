@@ -31,10 +31,6 @@ func handlerState(t *testing.T) keys.RenderSnapshot {
 			StartsAt:  time.Unix(1700000000, 0).UTC(),
 			AlertName: "DiskWillFill", Severity: "critical",
 		}},
-		Timeline: []keys.TimelineEventSnapshot{{
-			ID: "e1", Type: keys.EventCreated, Message: "Alert group created",
-			CreatedAt: time.Unix(1700000000, 0).UTC(),
-		}},
 	})
 	if err != nil {
 		t.Fatalf("build the state: %v", err)

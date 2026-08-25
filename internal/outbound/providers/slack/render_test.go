@@ -23,7 +23,6 @@ func fullState() keys.SnapshotInput {
 	groupURL := "https://tokay.example/#/ops/alert-groups/ag-1"
 	external := "https://alertmanager.example/#/alerts"
 	ackedBy := "nina"
-	actor := "nina"
 	description := "the disk will be full in two hours"
 	dashboard := "https://grafana.example/d/disk"
 	runbook := "https://runbooks.example/disk"
@@ -47,13 +46,6 @@ func fullState() keys.SnapshotInput {
 		GroupURL: &groupURL, TeamSetupURL: &setup, ExternalURL: &external,
 		DisplayTimezone: "Europe/Berlin", AcknowledgedBy: &ackedBy,
 		Alerts: alerts,
-		Timeline: []keys.TimelineEventSnapshot{{
-			ID: "e1", Type: keys.EventCreated, Message: "Alert group created",
-			CreatedAt: time.Unix(1700000000, 0).UTC(),
-		}, {
-			ID: "e2", Type: keys.EventAcknowledged, Message: "Alert group acknowledged",
-			Actor: &actor, CreatedAt: time.Unix(1700000060, 0).UTC(),
-		}},
 	}
 }
 
@@ -64,8 +56,7 @@ func rendered(t *testing.T, state keys.SnapshotInput, interactive bool) string {
 		Text       string `json:"text"`
 		Blocks     any    `json:"blocks"`
 		Attachment any    `json:"attachment"`
-		Timeline   string `json:"timeline"`
-	}{card.Text, card.Blocks, card.Attachment, RenderTimeline(state)})
+	}{card.Text, card.Blocks, card.Attachment})
 	if err != nil {
 		t.Fatalf("serialise the card: %v", err)
 	}
@@ -91,8 +82,12 @@ func TestACardIsAFunctionOfItsSnapshot(t *testing.T) {
 	}
 
 	// And the zone it DOES print in is the snapshot's, not the machine's.
-	if !strings.Contains(RenderTimeline(state), "GMT+1") {
-		t.Fatalf("the timeline is not in the snapshot's zone: %s", RenderTimeline(state))
+	// Europe/Berlin was at +01:00 on the fixture's instant.
+	if !strings.Contains(first, "GMT+01:00") {
+		t.Fatalf("the alert's start is not in the snapshot's zone: %s", first)
+	}
+	if !strings.Contains(first, "the disk will be full in two hours") {
+		t.Fatalf("the alert's description did not reach the card: %s", first)
 	}
 }
 

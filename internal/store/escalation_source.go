@@ -2,11 +2,8 @@ package store
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"fmt"
 
-	"github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
@@ -14,46 +11,27 @@ import (
 //
 // The snapshot a producer freezes is what every message of that escalation is
 // rendered from, forever. So it has to be a picture of ONE moment. A group read
-// here, a history read there and a version read somewhere else can already be
-// describing three different alerts by the time they are put together, and
-// nothing downstream would ever notice: the digest would faithfully record the
-// collage.
+// here and a version read somewhere else can already be describing two
+// different alerts by the time they are put together, and nothing downstream
+// would ever notice: the digest would faithfully record the collage.
 //
-// Two things make it a picture. Everything is read inside one repeatable-read
-// transaction, so the parts agree with each other. And the version the group
-// was at is read WITH them, so the admission can refuse a plan built from state
-// that has moved since - see SubmitEscalationBatch, which checks it again under
-// the lock that decides the escalation.
+// One statement makes it a picture. Everything a card is drawn from - the
+// alerts included - lives on the group's own row, and the version it was at is
+// read WITH it, so the admission can refuse a plan built from state that has
+// moved since: see SubmitEscalationBatch, which checks it again under the lock
+// that decides the escalation.
+//
+// The group's history used to be read here too, inside a repeatable-read
+// transaction that existed to make the two reads agree with each other. It left
+// the snapshot with tag 14 on 2026-08-25, and the transaction left with it: one
+// statement is already one instant, and a transaction around it would only
+// claim to be doing something.
 
 // GetEscalationSources returns the alert groups nobody has been paged for, each
-// with the alerts and the history a card is drawn from, and the version they
-// were read at (AlertGroup.RenderSourceVersion).
-//
-// Read-only and repeatable read. Read-only because it is: the isolation level
-// is what this is for, and saying so lets Postgres treat it as such. Repeatable
-// read because the group and its history are two statements, and at the default
-// level the second one would see writes the first one did not.
+// with the alerts a card is drawn from and the version they were read at
+// (AlertGroup.RenderSourceVersion).
 func (s *Store) GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
-		Isolation: sql.LevelRepeatableRead,
-		ReadOnly:  true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("read the escalation sources: %w", err)
-	}
-	defer tx.Rollback()
-
-	groups, err := newAlertGroupsTx(ctx, tx)
-	if err != nil {
-		return nil, err
-	}
-	if len(groups) == 0 {
-		return nil, nil
-	}
-	if err := historyForTx(ctx, tx, groups); err != nil {
-		return nil, err
-	}
-	return groups, nil
+	return newAlertGroups(ctx, s.db)
 }
 
 // newAlertGroupsTx finds the groups whose escalation has not been admitted.
@@ -71,8 +49,8 @@ func (s *Store) GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, 
 //
 // Asked by alert_group_id rather than by a batch key: the question is what this
 // group already holds, not what holds a particular claim.
-func newAlertGroupsTx(ctx context.Context, tx *sql.Tx) ([]*model.AlertGroup, error) {
-	rows, err := tx.QueryContext(ctx, `
+func newAlertGroups(ctx context.Context, q sqlQueryer) ([]*model.AlertGroup, error) {
+	rows, err := q.QueryContext(ctx, `
 		SELECT `+alertGroupColumns+` FROM alert_groups ag
 		WHERE ag.status = $1
 		   OR (ag.status = $2 AND ag.updated_at < now() - interval '30 seconds'
@@ -97,42 +75,4 @@ func newAlertGroupsTx(ctx context.Context, tx *sql.Tx) ([]*model.AlertGroup, err
 		return nil, fmt.Errorf("read the escalation sources: %w", err)
 	}
 	return groups, nil
-}
-
-// historyForTx attaches each group's history, in one query rather than one per
-// group. The order is the order a card shows it in, and the one the snapshot
-// hashes: oldest first, ties broken by id.
-func historyForTx(ctx context.Context, tx *sql.Tx, groups []*model.AlertGroup) error {
-	ids := make([]string, 0, len(groups))
-	byID := make(map[string]*model.AlertGroup, len(groups))
-	for _, ag := range groups {
-		ids = append(ids, ag.ID)
-		byID[ag.ID] = ag
-	}
-
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id, alert_group_id, type, message, actor, metadata, created_at
-		FROM timeline_events
-		WHERE alert_group_id = ANY($1)
-		ORDER BY created_at ASC, id ASC`, pq.Array(ids))
-	if err != nil {
-		return fmt.Errorf("read the escalation history: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var e model.TimelineEvent
-		var metadata sql.NullString
-		if err := rows.Scan(&e.ID, &e.AlertGroupID, &e.Type, &e.Message, &e.Actor,
-			&metadata, &e.CreatedAt); err != nil {
-			return fmt.Errorf("read the escalation history: %w", err)
-		}
-		if metadata.Valid && metadata.String != "" {
-			_ = json.Unmarshal([]byte(metadata.String), &e.Metadata)
-		}
-		if ag := byID[e.AlertGroupID]; ag != nil {
-			ag.TimelineEvents = append(ag.TimelineEvents, &e)
-		}
-	}
-	return rows.Err()
 }

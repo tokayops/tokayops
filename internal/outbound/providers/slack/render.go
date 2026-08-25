@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	slackapi "github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
@@ -77,7 +76,7 @@ func renderBodyAttachment(state keys.SnapshotInput, interactive bool) slackapi.A
 	}
 	bodyText += fmt.Sprintf("*Severity:* %s\n", state.Severity)
 
-	alertList := buildAlertList(state.Alerts)
+	alertList := buildAlertList(state.Alerts, state.DisplayTimezone)
 	if len(state.Alerts) == 0 {
 		alertList = "• " + state.Title
 	}
@@ -148,104 +147,6 @@ func renderBodyAttachment(state keys.SnapshotInput, interactive bool) slackapi.A
 	}
 }
 
-// RenderTimeline generates the combined summary + timeline message posted in
-// the card's thread.
-func RenderTimeline(state keys.SnapshotInput) string {
-	var sections []string
-
-	// Section 1: Alert Summaries (descriptions)
-	summarySection := renderAlertSummaries(state)
-	if summarySection != "" {
-		sections = append(sections, summarySection)
-	}
-
-	// Section 2: Timeline (limit to last 20 events to avoid Slack message truncation)
-	const maxTimelineEvents = 20
-	if len(state.Timeline) > 0 {
-		zone := displayZone(state.DisplayTimezone)
-		events := state.Timeline
-		skippedCount := 0
-		if len(events) > maxTimelineEvents {
-			skippedCount = len(events) - maxTimelineEvents
-			events = events[skippedCount:] // Take last N events
-		}
-
-		var lines []string
-		if skippedCount > 0 {
-			lines = append(lines, fmt.Sprintf("... and %d earlier events", skippedCount))
-		}
-		for _, e := range events {
-			icon := getEventIcon(e.Type)
-			// The zone comes from the snapshot, never from the process: two
-			// instances in different zones have to print one snapshot the same
-			// way, or the second attempt of a delivery is a different message.
-			localTime := e.CreatedAt.In(zone)
-			_, offset := localTime.Zone()
-			offsetHours := offset / 3600
-			timeStr := fmt.Sprintf("[%s GMT%+d]", localTime.Format("15:04:05"), offsetHours)
-			line := fmt.Sprintf("%s %s %s", timeStr, icon, e.Message)
-			if e.Actor != nil && *e.Actor != "" && *e.Actor != "system" {
-				line += " (by " + *e.Actor + ")"
-			}
-			lines = append(lines, line)
-		}
-		sections = append(sections, "📋 *Timeline:*\n```\n"+strings.Join(lines, "\n")+"\n```")
-	}
-
-	if len(sections) == 0 {
-		return ""
-	}
-
-	return strings.Join(sections, "\n\n")
-}
-
-// displayZone resolves the snapshot's zone. A snapshot cannot hold one that
-// does not load - NewRenderSnapshot refuses it - so the fallback is for a
-// database that lost a zone between the two.
-func displayZone(name string) *time.Location {
-	zone, err := time.LoadLocation(name)
-	if err != nil {
-		return time.UTC
-	}
-	return zone
-}
-
-// renderAlertSummaries generates the alert descriptions section
-func renderAlertSummaries(state keys.SnapshotInput) string {
-	const maxSummaries = 10
-	const maxDescLen = 200
-
-	var summaries []string
-	for _, a := range state.Alerts {
-		if len(summaries) >= maxSummaries {
-			break
-		}
-		if a.Description == nil || *a.Description == "" {
-			continue
-		}
-		sum := *a.Description
-		if len([]rune(sum)) > maxDescLen {
-			sum = string([]rune(sum)[:maxDescLen]) + "..."
-		}
-
-		icon := "🔴"
-		if a.Status == keys.AlertResolved {
-			icon = "🟢"
-		}
-		// Format: 🔴 *AlertName*: Summary text
-		summaries = append(summaries, fmt.Sprintf("%s *%s*: %s", icon, a.AlertName, sum))
-	}
-
-	if len(summaries) == 0 {
-		return ""
-	}
-	result := "*Alert Details:*\n" + strings.Join(summaries, "\n")
-	if len(state.Alerts) > maxSummaries {
-		result += fmt.Sprintf("\n_... and %d more alert details_", len(state.Alerts)-maxSummaries)
-	}
-	return result
-}
-
 // collectMentions returns a mrkdwn string of Slack user/group mentions from all
 // alerts.
 //
@@ -281,8 +182,15 @@ func collectMentions(alerts []keys.AlertSnapshot) string {
 	return strings.Join(parts, " ")
 }
 
-// buildAlertList returns a mrkdwn bullet list of alerts (max 10).
-func buildAlertList(alerts []keys.AlertSnapshot) string {
+// buildAlertList returns a mrkdwn bullet list of alerts (max 10), each with a
+// second line saying what is wrong and since when.
+//
+// That second line is where the alert's description lives now. It used to be in
+// the card's thread, in a message of its own, and the thread went away with the
+// rule that one attempt performs one external effect. Nothing carried the
+// content over, which left the one field that says what actually broke reaching
+// no message at all.
+func buildAlertList(alerts []keys.AlertSnapshot, zone string) string {
 	const maxAlerts = 10
 	alertList := ""
 	rendered := 0
@@ -307,11 +215,22 @@ func buildAlertList(alerts []keys.AlertSnapshot) string {
 		} else {
 			alertList += fmt.Sprintf("• 🟢 %s (Resolved)%s%s\n", a.AlertName, dashLink, bookLink)
 		}
+		alertList += "   _" + alertDetail(a, zone) + "_\n"
 	}
 	if remaining := len(alerts) - maxAlerts; remaining > 0 {
 		alertList += fmt.Sprintf("_... and %d more alerts_\n", remaining)
 	}
 	return alertList
+}
+
+// alertDetail is the second line: the description when there is one, and the
+// moment the alert started, which there always is.
+func alertDetail(a keys.AlertSnapshot, zone string) string {
+	since := "since " + providers.AlertStartedAt(a, zone)
+	if description := providers.AlertDescription(a); description != "" {
+		return description + " · " + since
+	}
+	return since
 }
 
 // truncateText truncates s to fit within maxLen bytes (including suffix),
@@ -382,30 +301,4 @@ func unknownTeamNotice(state keys.SnapshotInput) string {
 		notice += fmt.Sprintf(" <%s|Set up the team>", *state.TeamSetupURL)
 	}
 	return notice
-}
-
-// getEventIcon returns an emoji icon for the event type
-func getEventIcon(eventType keys.TimelineEventType) string {
-	switch eventType {
-	case keys.EventCreated:
-		return "[NEW]"
-	case keys.EventAlertAdded:
-		return "[+]"
-	case keys.EventAlertResolved:
-		return "[-]"
-	case keys.EventAcknowledged:
-		return "[ACK]"
-	case keys.EventResolved:
-		return "[RESOLVED]"
-	case keys.EventNotificationSent:
-		return "[->]"
-	case keys.EventNotificationFailed:
-		return "[X]"
-	case keys.EventNote:
-		return "[NOTE]"
-	case keys.EventStatusChange:
-		return "[~]"
-	default:
-		return "[?]"
-	}
 }

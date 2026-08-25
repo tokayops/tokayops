@@ -654,11 +654,25 @@ func alertLines(state keys.SnapshotInput) []string {
 		} else {
 			out = append(out, fmt.Sprintf("• 🟢 %s (Resolved)", name))
 		}
+		// What is wrong and since when, on a line of its own. Slack says the
+		// same thing the same way: a card that told the two channels different
+		// stories about one alert would be worse than either.
+		out = append(out, "   <i>"+html.EscapeString(alertDetail(a, state.DisplayTimezone))+"</i>")
 	}
 	if remaining := len(state.Alerts) - maxAlerts; remaining > 0 {
 		out = append(out, fmt.Sprintf("… and %d more alerts", remaining))
 	}
 	return out
+}
+
+// alertDetail is the second line of an alert: its description when it has one,
+// and the moment it started, which it always has.
+func alertDetail(a keys.AlertSnapshot, zone string) string {
+	since := "since " + providers.AlertStartedAt(a, zone)
+	if description := providers.AlertDescription(a); description != "" {
+		return description + " · " + since
+	}
+	return since
 }
 
 // cardFooter returns the "Open in Tokay" deep-link footer as one complete HTML line.

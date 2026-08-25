@@ -58,9 +58,8 @@ func TestRegression_Resolve_ErrorLeak(t *testing.T) {
 	ctx := context.Background()
 
 	data := Data{
-		ChannelID:         "C123",
-		Timestamp:         "100.200",
-		TimelineTimestamp: "100.300",
+		ChannelID: "C123",
+		Timestamp: "100.200",
 	}
 	dataBytes, _ := json.Marshal(data)
 
@@ -252,10 +251,13 @@ func TestRegression_RenderMessageV2_SlackUsersMentionsPreserved(t *testing.T) {
 	}
 }
 
-// TestRegression_RenderAlertSummaries_Truncation verifies that
-// renderAlertSummaries() truncates both the number of summaries
-// and the description length.
-func TestRegression_RenderAlertSummaries_Truncation(t *testing.T) {
+// TestRegression_AlertList_Truncation verifies that the card caps how many
+// alerts it lists.
+//
+// The descriptions moved into that list on 2026-08-25, from the threaded
+// message they used to have to themselves, so the cap that used to belong to
+// the summaries section is this one now.
+func TestRegression_AlertList_Truncation(t *testing.T) {
 	provider := &Provider{}
 
 	alerts := make([]model.Alert, 15)
@@ -276,31 +278,35 @@ func TestRegression_RenderAlertSummaries_Truncation(t *testing.T) {
 		Alerts: alerts,
 	}
 
-	result := renderAlertSummaries(provider.freeze(ag, false))
+	state := provider.freeze(ag, false)
+	result := buildAlertList(state.Alerts, state.DisplayTimezone)
 
-	// Count summary lines (each starts with icon)
+	// Count alert lines (each bullet starts with an icon)
 	lines := strings.Split(result, "\n")
 	summaryCount := 0
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "🔴") || strings.HasPrefix(trimmed, "🟢") {
+		if strings.HasPrefix(trimmed, "• 🔴") || strings.HasPrefix(trimmed, "• 🟢") {
 			summaryCount++
 		}
 	}
 
-	// EXPECTED: max 10 summaries + truncation notice
-	// BUG (unfixed): all 15 summaries rendered
 	if summaryCount > 10 {
-		t.Errorf("Expected at most 10 alert summaries, got %d", summaryCount)
+		t.Errorf("Expected at most 10 alerts listed, got %d", summaryCount)
 	}
-	if !strings.Contains(result, "more alert details") {
-		t.Error("Expected truncation notice for alert summaries")
+	if !strings.Contains(result, "more alerts") {
+		t.Error("Expected a notice for the alerts that did not fit")
+	}
+	// Every listed alert says what is wrong, not just what it is called.
+	if !strings.Contains(result, "Description for alert 1") {
+		t.Error("the alert's description did not reach the card")
 	}
 }
 
-// TestRegression_RenderAlertSummaries_LongDescription verifies that
-// very long alert descriptions are truncated.
-func TestRegression_RenderAlertSummaries_LongDescription(t *testing.T) {
+// TestRegression_AlertList_LongDescription verifies that a very long alert
+// description is shortened rather than pushing the alerts below it out of the
+// card: the body is capped, and what is cut is cut here on purpose.
+func TestRegression_AlertList_LongDescription(t *testing.T) {
 	provider := &Provider{}
 
 	longDesc := strings.Repeat("x", 500) // 500 chars
@@ -316,18 +322,27 @@ func TestRegression_RenderAlertSummaries_LongDescription(t *testing.T) {
 		},
 	}
 
-	result := renderAlertSummaries(provider.freeze(ag, false))
+	state := provider.freeze(ag, false)
+	result := buildAlertList(state.Alerts, state.DisplayTimezone)
 
-	// EXPECTED: description truncated to ~200 chars + "..."
-	// BUG (unfixed): full 500 chars rendered
 	if strings.Contains(result, longDesc) {
 		t.Error("Long description should be truncated, but full text was found")
+	}
+
+	// And the cut happens before the digest, not here: two descriptions that
+	// differ only past the bound have to produce the same request. Rendering
+	// them apart would mean a revision raised for a difference nobody sees.
+	other := ag.Alerts[0].Annotations["description"] + "-and-a-different-tail"
+	ag.Alerts[0].Annotations["description"] = other
+	twin := provider.freeze(ag, false)
+	if got := buildAlertList(twin.Alerts, twin.DisplayTimezone); got != result {
+		t.Errorf("two descriptions cut to the same value rendered differently:\n%s\n%s",
+			result, got)
 	}
 	if !strings.Contains(result, "...") {
 		t.Error("Expected '...' suffix for truncated description")
 	}
-	// The result should be significantly shorter than the original
 	if len(result) > 300 {
-		t.Errorf("Result too long (%d chars), expected truncation to ~200 char description", len(result))
+		t.Errorf("Result too long (%d chars), expected the description to be cut", len(result))
 	}
 }

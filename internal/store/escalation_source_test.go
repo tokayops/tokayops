@@ -17,10 +17,14 @@ import (
 // to say which moment. Everything an escalation ever shows is frozen out of it,
 // once, and no later revision corrects a card that was drawn from a collage.
 
-// TestEscalationSourcesReadTheWholeAlert. The group, the alerts on it, the
-// history behind it and the version they were read at, in one read. The history
-// is the part that used to be missing, and it was missing silently: the cards
-// simply had an empty history section forever.
+// TestEscalationSourcesReadTheWholeAlert. The group, the alerts on it and the
+// version they were read at, in one read.
+//
+// The history used to be read here too, and is deliberately not any more: it
+// left the render snapshot with tag 14 on 2026-08-25, so reading it would be a
+// query per tick for a field nothing renders. The assertion below is that it
+// stays unread - a projection that quietly resumed loading it would put the
+// cost back without a consumer.
 func TestEscalationSourcesReadTheWholeAlert(t *testing.T) {
 	s := setupTestDB(t)
 	ctx := context.Background()
@@ -78,16 +82,9 @@ func TestEscalationSourcesReadTheWholeAlert(t *testing.T) {
 	if len(source.Alerts) != 1 || source.Alerts[0].Fingerprint != "fp-1" {
 		t.Errorf("the alerts read back as %+v", source.Alerts)
 	}
-	if len(source.TimelineEvents) != 2 {
-		t.Fatalf("the history read back with %d lines, want 2", len(source.TimelineEvents))
-	}
-	// Oldest first, which is the order a card shows and the snapshot hashes.
-	if source.TimelineEvents[0].ID != "ev-1" || source.TimelineEvents[1].ID != "ev-2" {
-		t.Errorf("the history reads %s then %s",
-			source.TimelineEvents[0].ID, source.TimelineEvents[1].ID)
-	}
-	if source.TimelineEvents[0].Message != "Alert group created" {
-		t.Errorf("the history line says %q", source.TimelineEvents[0].Message)
+	if len(source.TimelineEvents) != 0 {
+		t.Errorf("the projection loaded %d lines of history nothing renders",
+			len(source.TimelineEvents))
 	}
 
 	var version int64

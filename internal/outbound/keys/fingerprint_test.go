@@ -59,14 +59,17 @@ func fingerprintOf(t *testing.T, b EscalationBatch) string {
 // Two vectors, and the second is the one that matters most: an admission that
 // found nobody to notify has no commitments to hash, so everything that tells
 // two such proposals apart has to be in the material before the list.
+//
+// Both moved on 2026-08-25, deliberately: the batch's content reference is the
+// render snapshot's digest, and the snapshot lost its timeline (tag 14).
 func TestBatchFingerprintIsGolden(t *testing.T) {
 	if got, want := fingerprintOf(t, fixtureBatch(t, fixtureCommitment())),
-		"a418314c9580758742ffd8a0e94e0c69a7dba0384172d2f21935f13d21212555"; got != want {
+		"ec2b0714f5f78b7461ed36889c23d7e5ac7dee95c460abfce3153b5caa2cd78d"; got != want {
 		t.Errorf("admitted proposal\n got: %s\nwant: %s", got, want)
 	}
 
 	if got, want := fingerprintOf(t, fixtureBatch(t)),
-		"9e8ebb9aa67aa56f5df7f5f3afa49ae47cfc1b4eaf05ecda57bef24e675a10fb"; got != want {
+		"46d2d4d98333a6444760ec0d5a63cd8bb292c56ba4663ad372556bdd7cf17292"; got != want {
 		t.Errorf("empty proposal\n got: %s\nwant: %s", got, want)
 	}
 }

@@ -263,58 +263,15 @@ func TestSlackProvider_MissingToken(t *testing.T) {
 	}
 }
 
-func TestRenderTimeline(t *testing.T) {
-	provider := &Provider{}
-
-	// Case 1: Empty timeline
-	ag1 := &model.AlertGroup{
-		TimelineEvents: nil,
-	}
-	timeline1 := RenderTimeline(provider.freeze(ag1, false))
-	if timeline1 != "" {
-		t.Errorf("Expected empty timeline for no events, got: %s", timeline1)
-	}
-
-	// Case 2: Timeline with events
-	ag2 := &model.AlertGroup{
-		TimelineEvents: []*model.TimelineEvent{
-			{
-				Type:    model.TimelineEventCreated,
-				Message: "Alert group created",
-			},
-			{
-				Type:    model.TimelineEventAlertAdded,
-				Message: "Alert: TestAlert",
-			},
-			{
-				Type:    model.TimelineEventNotificationSent,
-				Message: "Notification sent via slack",
-			},
-		},
-	}
-	timeline2 := RenderTimeline(provider.freeze(ag2, false))
-	if !strings.Contains(timeline2, "📋 *Timeline:*") {
-		t.Errorf("Expected timeline header, got: %s", timeline2)
-	}
-	if !strings.Contains(timeline2, "```") {
-		t.Errorf("Expected code block wrapper, got: %s", timeline2)
-	}
-	if !strings.Contains(timeline2, "[NEW]") {
-		t.Errorf("Expected created icon [NEW], got: %s", timeline2)
-	}
-	if !strings.Contains(timeline2, "[+]") {
-		t.Errorf("Expected alert added icon [+], got: %s", timeline2)
-	}
-	if !strings.Contains(timeline2, "[->]") {
-		t.Errorf("Expected notification sent icon [->], got: %s", timeline2)
-	}
-	// Check for GMT offset presence
-	if !strings.Contains(timeline2, "GMT") {
-		t.Errorf("Expected GMT offset in timestamp, got: %s", timeline2)
-	}
-}
-
-func TestSlackTimelinePosting(t *testing.T) {
+// TestACardSendIsOneExternalEffect. Posting the card used to be followed by a
+// second message - the history, in the card's thread - and that made one
+// attempt carry two external effects. An attempt performs one (NFR-6): the
+// second had no journal entry of its own, no receipt, and no way to be retried
+// without duplicating the first.
+//
+// The thread went with tag 14 on 2026-08-25. What is left is the assertion that
+// it did not come back.
+func TestACardSendIsOneExternalEffect(t *testing.T) {
 	// Mock Slack API to track calls
 	var postMessageCalls int
 	var lastChannel, lastText, lastThreadTS string
@@ -370,7 +327,6 @@ func TestSlackTimelinePosting(t *testing.T) {
 	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
 	ctx := context.Background()
 
-	// Create AlertGroup WITH timeline events
 	ag := &model.AlertGroup{
 		ID:       "ag-timeline-1",
 		Title:    "Timeline Test",
@@ -384,9 +340,6 @@ func TestSlackTimelinePosting(t *testing.T) {
 		},
 	}
 
-	// Send should post TWO messages:
-	// 1. Main alert card
-	// 2. Timeline thread reply
 	dataStr, err := provider.Send(ctx, providers.NotificationRequest{
 		Kind:       "channel",
 		Target:     providers.NotificationTarget{Kind: "channel", ID: "C123"},
@@ -397,33 +350,27 @@ func TestSlackTimelinePosting(t *testing.T) {
 		t.Fatalf("Send failed: %v", err)
 	}
 
-	// Verify we got 2 PostMessage calls
-	if postMessageCalls != 2 {
-		t.Errorf("Expected 2 PostMessage calls (Main + Timeline), got %d", postMessageCalls)
+	if postMessageCalls != 1 {
+		t.Errorf("one send made %d calls to chat.postMessage, want 1", postMessageCalls)
 	}
-
 	if lastChannel != "C123" {
-		t.Errorf("Expected last message to be in channel C123, got %s", lastChannel)
+		t.Errorf("the card went to %s, want C123", lastChannel)
+	}
+	if lastThreadTS != "" {
+		t.Errorf("something was posted in thread %s", lastThreadTS)
+	}
+	if strings.Contains(lastText, "Group created") {
+		t.Errorf("the history reached the message: %s", lastText)
 	}
 
-	// Verify the second call was in a thread
-	if lastThreadTS != "100.200" {
-		t.Errorf("Expected timeline to be in thread 100.200, got %s", lastThreadTS)
-	}
-
-	// Verify timeline content
-	if !strings.Contains(lastText, "Group created") {
-		t.Errorf("Expected timeline text to contain 'Group created', got: %s", lastText)
-	}
-
-	// Verify returned data contains TimelineTimestamp
 	var data Data
-	json.Unmarshal([]byte(dataStr), &data)
-	if data.TimelineTimestamp != "100.200" {
-		t.Errorf("Expected TimelineTimestamp to be set, got %s", data.TimelineTimestamp)
+	if err := json.Unmarshal([]byte(dataStr), &data); err != nil {
+		t.Fatalf("read the payload back: %v", err)
+	}
+	if data.ChannelID == "" || data.Timestamp == "" {
+		t.Errorf("the payload does not name the message: %+v", data)
 	}
 }
-
 func TestResolve_ReturnsErrorOnMainMessageUpdateFailure(t *testing.T) {
 	// Mock Slack API: thread reply succeeds, main message update fails
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -993,7 +940,8 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 	}
 
 	// buildAlertList itself should NOT truncate (v1 backward compat)
-	rawList := buildAlertList(provider.freeze(ag, false).Alerts)
+	state := provider.freeze(ag, false)
+	rawList := buildAlertList(state.Alerts, state.DisplayTimezone)
 	if strings.Contains(rawList, "truncated") {
 		t.Error("buildAlertList should not truncate — that's renderBodyAttachment's job")
 	}

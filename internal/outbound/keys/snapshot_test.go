@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -39,9 +40,6 @@ func fixtureSnapshot() SnapshotInput {
 				Severity: "warning",
 			},
 		},
-		Timeline: []TimelineEventSnapshot{
-			{ID: "ev-1", Type: EventCreated, Message: "alert group created", CreatedAt: fixtureEvent},
-		},
 		TeamSetupURL: str("https://tokay.example/#/cfg/teams"),
 	}
 }
@@ -65,9 +63,13 @@ func mustDigest(t *testing.T, s RenderSnapshot) string {
 // This digest travels in the key of every commitment the revision produced, so
 // changing it changes what those commitments are about - and a producer
 // repeating an admission would be told its own proposal conflicts.
+//
+// It moved once, on 2026-08-25, when tag 14 (the alert's history) was retired
+// from the protocol. That is the only reason it is allowed to move: a digest
+// that changes for any other reason is a bug, not a refactor.
 func TestRenderSnapshotDigestIsGolden(t *testing.T) {
 	got := mustDigest(t, mustSnapshot(t, fixtureSnapshot()))
-	want := "3940f90ed3e8816cc873d5d004b4c4e02e6ea2afe97a33879c492117fb9c67f8"
+	want := "823f2da6ea49a29a2da9175e0e0c2dd5552d30943104690bb3bed5d704f4d08e"
 	if got != want {
 		t.Fatalf("snapshot digest\n got: %s\nwant: %s", got, want)
 	}
@@ -80,32 +82,81 @@ func TestRenderSnapshotDigestIsGolden(t *testing.T) {
 func TestRenderSnapshotCanonicalisesOnce(t *testing.T) {
 	forward := mustSnapshot(t, fixtureSnapshot())
 
+	extra := AlertSnapshot{
+		Fingerprint: "fp-0", Status: AlertFiring,
+		StartsAt: fixtureStart.Add(-time.Minute), AlertName: "DiskWarm",
+		Severity: "warning",
+	}
+
 	shuffled := fixtureSnapshot()
-	shuffled.Alerts = []AlertSnapshot{shuffled.Alerts[1], shuffled.Alerts[0]}
-	shuffled.Timeline = append(shuffled.Timeline, TimelineEventSnapshot{
-		ID: "ev-0", Type: EventNote, Message: "note", CreatedAt: fixtureEvent.Add(-time.Minute),
-	})
+	shuffled.Alerts = []AlertSnapshot{shuffled.Alerts[1], extra, shuffled.Alerts[0]}
 	backward := mustSnapshot(t, shuffled)
 
-	forwardWithNote := fixtureSnapshot()
-	forwardWithNote.Timeline = append([]TimelineEventSnapshot{{
-		ID: "ev-0", Type: EventNote, Message: "note", CreatedAt: fixtureEvent.Add(-time.Minute),
-	}}, forwardWithNote.Timeline...)
-	expected := mustSnapshot(t, forwardWithNote)
+	forwardWithExtra := fixtureSnapshot()
+	forwardWithExtra.Alerts = append([]AlertSnapshot{extra}, forwardWithExtra.Alerts...)
+	expected := mustSnapshot(t, forwardWithExtra)
 
 	if mustDigest(t, backward) != mustDigest(t, expected) {
 		t.Fatal("the same content in a different input order produced a different digest")
 	}
-	if first := backward.Content().Alerts[0].Fingerprint; first != "fp-1" {
+	if first := backward.Content().Alerts[0].Fingerprint; first != "fp-0" {
 		t.Fatalf("alerts were not canonicalised: first is %s", first)
-	}
-	if first := backward.Content().Timeline[0].ID; first != "ev-0" {
-		t.Fatalf("timeline was not canonicalised: first is %s", first)
 	}
 
 	// And the stored order is what a renderer will read back.
 	if mustDigest(t, forward) == mustDigest(t, backward) {
-		t.Fatal("adding an event did not change the digest")
+		t.Fatal("adding an alert did not change the digest")
+	}
+}
+
+// TestALongDescriptionIsCutBeforeTheDigest is the rule that keeps the digest
+// and the message agreeing about one field.
+//
+// Two alerts whose descriptions share their first 120 runes and differ after
+// them render byte for byte the same. If the cut happened at render time, they
+// would still hold different digests - and the difference nobody can see would
+// raise a revision and send a real edit. That is exactly why the history left
+// this protocol, and a field cut in the wrong place brings it back.
+func TestALongDescriptionIsCutBeforeTheDigest(t *testing.T) {
+	head := strings.Repeat("x", AlertDescriptionLimit)
+
+	with := func(tail string) RenderSnapshot {
+		in := fixtureSnapshot()
+		full := head + tail
+		in.Alerts[0].Description = &full
+		return mustSnapshot(t, in)
+	}
+
+	first := with("...and then some")
+	second := with("...and then something else entirely")
+
+	if mustDigest(t, first) != mustDigest(t, second) {
+		t.Fatal("two descriptions that render the same produced different digests")
+	}
+
+	stored := *first.Content().Alerts[0].Description
+	if stored != head+AlertDescriptionEllipsis {
+		t.Fatalf("the stored description is %q", stored)
+	}
+	if *second.Content().Alerts[0].Description != stored {
+		t.Fatal("the two snapshots stored different descriptions")
+	}
+
+	// Canonicalising what was already canonicalised has to change nothing, or
+	// a snapshot would not survive the round trip through storage it makes
+	// before every attempt.
+	again := fixtureSnapshot()
+	again.Alerts[0].Description = &stored
+	if mustDigest(t, mustSnapshot(t, again)) != mustDigest(t, first) {
+		t.Fatal("cutting an already-cut description changed the snapshot")
+	}
+
+	// And a description that fits is left exactly as it came.
+	short := "12% left"
+	fits := fixtureSnapshot()
+	fits.Alerts[0].Description = &short
+	if got := *mustSnapshot(t, fits).Content().Alerts[0].Description; got != short {
+		t.Fatalf("a description that fits came back as %q", got)
 	}
 }
 
@@ -119,9 +170,6 @@ func TestRenderSnapshotIgnoresTheProcessZone(t *testing.T) {
 	shifted := fixtureSnapshot()
 	for i := range shifted.Alerts {
 		shifted.Alerts[i].StartsAt = shifted.Alerts[i].StartsAt.In(somewhere)
-	}
-	for i := range shifted.Timeline {
-		shifted.Timeline[i].CreatedAt = shifted.Timeline[i].CreatedAt.In(somewhere)
 	}
 
 	if mustDigest(t, mustSnapshot(t, shifted)) != mustDigest(t, mustSnapshot(t, fixtureSnapshot())) {
@@ -152,8 +200,19 @@ func TestRenderSnapshotSurvivesStorage(t *testing.T) {
 	// rendered into a message whose content its key does not describe.
 	var corrupted RenderSnapshot
 	if err := json.Unmarshal([]byte(`{"alert_group_id":"ag-1","status":"firing",`+
-		`"display_timezone":"UTC","alerts":[],"timeline":[]}`), &corrupted); err == nil {
+		`"display_timezone":"UTC","alerts":[]}`), &corrupted); err == nil {
 		t.Fatal("a stored snapshot with a status from nowhere was read back happily")
+	}
+
+	// And a row from the build that still had tag 14. It is refused rather
+	// than read with the history dropped: the digest its commitments were
+	// keyed against covered that field, so a snapshot without it is not the
+	// same snapshot. This is what makes the retirement of the tag observable
+	// rather than merely asserted.
+	var older RenderSnapshot
+	if err := json.Unmarshal([]byte(`{"alert_group_id":"ag-1","status":"processing",`+
+		`"display_timezone":"UTC","alerts":[],"timeline":[]}`), &older); err == nil {
+		t.Fatal("a snapshot carrying the retired timeline was read back happily")
 	}
 }
 
@@ -166,7 +225,7 @@ func TestRenderSnapshotCannotBeReachedAround(t *testing.T) {
 
 	content := snapshot.Content()
 	content.Alerts[0].AlertName = "something else"
-	content.Timeline = nil
+	content.Alerts = nil
 
 	if mustDigest(t, snapshot) != before {
 		t.Fatal("editing a rendered copy changed the snapshot it came from")
@@ -275,13 +334,6 @@ func TestRenderSnapshotDigestCoversEveryField(t *testing.T) {
 		{"an alert's start", func(s *SnapshotInput) { s.Alerts[0].StartsAt = fixtureStart.Add(time.Second) }},
 		{"an alert's fingerprint", func(s *SnapshotInput) { s.Alerts[0].Fingerprint = "fp-3" }},
 		{"an alert disappearing", func(s *SnapshotInput) { s.Alerts = s.Alerts[:1] }},
-
-		{"an event's type", func(s *SnapshotInput) { s.Timeline[0].Type = EventStatusChange }},
-		{"an event's message", func(s *SnapshotInput) { s.Timeline[0].Message = "something else" }},
-		{"an event's actor", func(s *SnapshotInput) { s.Timeline[0].Actor = str("nina") }},
-		{"an event's id", func(s *SnapshotInput) { s.Timeline[0].ID = "ev-9" }},
-		{"an event's time", func(s *SnapshotInput) { s.Timeline[0].CreatedAt = fixtureEvent.Add(time.Second) }},
-		{"an event disappearing", func(s *SnapshotInput) { s.Timeline = nil }},
 	}
 
 	seen := map[string]string{baseline: "baseline"}
@@ -316,15 +368,9 @@ func TestRenderSnapshotRefusesWhatItCannotIdentify(t *testing.T) {
 		{"no display zone", func(s *SnapshotInput) { s.DisplayTimezone = "" }},
 		{"a group status from somewhere else", func(s *SnapshotInput) { s.Status = GroupStatus("firing") }},
 		{"an alert status from somewhere else", func(s *SnapshotInput) { s.Alerts[0].Status = AlertStatus("pending") }},
-		{"an event type from somewhere else", func(s *SnapshotInput) { s.Timeline[0].Type = TimelineEventType("escalated") }},
 		{"an alert with no fingerprint", func(s *SnapshotInput) { s.Alerts[0].Fingerprint = "" }},
 		{"two alerts with one fingerprint", func(s *SnapshotInput) { s.Alerts[1].Fingerprint = s.Alerts[0].Fingerprint }},
 		{"an alert with no start", func(s *SnapshotInput) { s.Alerts[0].StartsAt = time.Time{} }},
-		{"an event with no id", func(s *SnapshotInput) { s.Timeline[0].ID = "" }},
-		{"an event with no time", func(s *SnapshotInput) { s.Timeline[0].CreatedAt = time.Time{} }},
-		{"two events with one id", func(s *SnapshotInput) {
-			s.Timeline = append(s.Timeline, s.Timeline[0])
-		}},
 		{"the process zone under another name", func(s *SnapshotInput) { s.DisplayTimezone = "Local" }},
 		{"a zone nobody has heard of", func(s *SnapshotInput) { s.DisplayTimezone = "Mars/Olympus" }},
 	}
