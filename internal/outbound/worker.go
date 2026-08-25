@@ -94,6 +94,17 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
+// Drain waits for the attempts this worker already started, and is what Run
+// does on its way out.
+//
+// Exported for the same reason Tick is: something other than the clock has to
+// be able to drive the worker, and a caller that can start it without being
+// able to WAIT for it leaves goroutines writing to the database after it
+// believes the worker has stopped. In a test that is rows appearing during the
+// next test's setup; in production it is the answer to a call being thrown
+// away, which is what the join in cmd/tokayops exists to prevent.
+func (w *Worker) Drain() { w.drain() }
+
 // drain waits for the attempts already in flight.
 //
 // They are not cancelled with the worker: a call that was made and whose answer

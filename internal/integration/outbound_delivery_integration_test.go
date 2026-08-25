@@ -77,9 +77,7 @@ func TestARetryCarriesWhatWasAdmitted(t *testing.T) {
 	sendWebhook(t, env.Echo, criticalAlert("retry_same_bytes", "DiskFilling"))
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	until(t, "the first attempt to fail", func() bool {
 		return len(env.Channel.SentTo("S_TEST")) >= 1
@@ -134,16 +132,20 @@ func TestARetryableFailureHasNoDeathCounter(t *testing.T) {
 	sendWebhook(t, env.Echo, criticalAlert("no_death_counter", "DiskFilling"))
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
+	// Counted per ADDRESS. The firehose in the same escalation succeeds on its
+	// first call, so a count of every call this channel made would reach four
+	// with only three failures behind it - and an implementation that gave up
+	// on the fourth would pass.
+	//
 	// Far past anything MaxAttempts would have allowed. The backoff is what
 	// slows this down, so the attempts are forced forward rather than waited
-	// for - the point is the absence of a limit, not the curve.
-	for want := 1; want <= 4; want++ {
-		until(t, fmt.Sprintf("attempt %d", want), func() bool {
-			if env.Channel.SentCount() >= want {
+	// for: the point is the absence of a limit, not the curve.
+	const failures = 4
+	for want := 1; want <= failures; want++ {
+		until(t, fmt.Sprintf("failure %d", want), func() bool {
+			if len(env.Channel.SentTo("S_TEST")) >= want {
 				return true
 			}
 			_, _ = env.S.GetDB().Exec(`
@@ -153,17 +155,18 @@ func TestARetryableFailureHasNoDeathCounter(t *testing.T) {
 		})
 	}
 
+	tried := len(env.Channel.SentTo("S_TEST"))
 	for _, intent := range intentsOf(t, env, "no_death_counter") {
 		if intent.TargetKind != "user" {
 			continue
 		}
 		if intent.Status.Terminal() {
 			t.Fatalf("a retryable failure ended the commitment as %s after %d attempts",
-				intent.Status, env.Channel.SentCount())
+				intent.Status, tried)
 		}
-		if intent.FailureStreak < 3 {
-			t.Errorf("the failure streak is %d after %d attempts",
-				intent.FailureStreak, env.Channel.SentCount())
+		if intent.FailureStreak < failures {
+			t.Errorf("the failure streak is %d after %d failed attempts",
+				intent.FailureStreak, tried)
 		}
 	}
 }
@@ -185,9 +188,7 @@ func TestOneRecipientFailingLeavesTheOthersAlone(t *testing.T) {
 	sendWebhook(t, env.Echo, criticalAlert("fan_out_isolation", "DiskFilling"))
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "fan_out_isolation", 2)
 
@@ -213,9 +214,13 @@ func TestOneRecipientFailingLeavesTheOthersAlone(t *testing.T) {
 // TestWorkOutlivesTheProcessThatTookIt is epic check 14.
 //
 // Every instance goes away - a deploy, a crash, a node draining - and what is
-// owed has to survive it. Nothing here lives in a process: the commitment is a
-// row, the lease is a column with a deadline, and the next worker to come along
-// picks it up because the deadline passed.
+// owed has to survive it. Nothing owed lives in a process: the commitment is a
+// row and its state is durable, so a worker that comes up afterwards finds
+// pending work waiting and carries on.
+//
+// This is about durable pending work, not about reclaiming a lease: an attempt
+// abandoned mid-flight is recovery's job and has its own tests. Here the first
+// instance FINISHES what it started - badly - and then goes away.
 func TestWorkOutlivesTheProcessThatTookIt(t *testing.T) {
 	env := setupIntegrationTest(t)
 
@@ -229,14 +234,24 @@ func TestWorkOutlivesTheProcessThatTookIt(t *testing.T) {
 	sendWebhook(t, env.Echo, criticalAlert("survives_restart", "DiskFilling"))
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	// One instance runs, fails everything it touches, and stops.
-	first, stopFirst := context.WithCancel(context.Background())
-	go runOutboundWorker(first, env.Worker)
-	until(t, "the first instance to try", func() bool { return env.Channel.SentCount() >= 2 })
+	// One instance runs and fails everything it touches.
+	stopFirst := startOutboundWorker(t, env.Worker)
+	until(t, "both commitments to have failed once and gone back to the queue", func() bool {
+		var waiting int
+		if err := env.S.GetDB().QueryRow(`
+			SELECT count(*) FROM outbound_intents i
+			JOIN alert_groups ag ON ag.id = i.alert_group_id
+			WHERE ag.alert_key = $1 AND i.status = 'pending' AND i.failure_streak > 0`,
+			"survives_restart").Scan(&waiting); err != nil {
+			t.Fatalf("read the queue: %v", err)
+		}
+		return waiting == 2
+	})
+
+	// And then goes away. Joined, not merely cancelled: an instance still
+	// writing to the database is an instance that has not stopped.
 	stopFirst()
 
-	// Nothing was lost: the commitments are still owed, and no lease outlives
-	// the process that took it in a way that stops anybody else.
 	owed := 0
 	for _, intent := range intentsOf(t, env, "survives_restart") {
 		if !intent.Status.Terminal() {
@@ -257,11 +272,27 @@ func TestWorkOutlivesTheProcessThatTookIt(t *testing.T) {
 
 	restarted := outbound.NewWorker(env.S, "integration-worker-2",
 		map[string]outbound.Channel{"slack": env.Channel, "telegram": env.Channel})
-	second, stopSecond := context.WithCancel(context.Background())
-	defer stopSecond()
-	go runOutboundWorker(second, restarted)
+	startOutboundWorker(t, restarted)
 
 	waitForDeliveries(t, env.S, "survives_restart", 2)
+
+	// And it was the SECOND instance that finished them. Without this the test
+	// passes on a first instance that never actually stopped.
+	var byFirst, bySecond int
+	if err := env.S.GetDB().QueryRow(`
+		SELECT count(*) FILTER (WHERE a.worker_id = 'integration-worker'),
+		       count(*) FILTER (WHERE a.worker_id = 'integration-worker-2')
+		FROM outbound_attempts a
+		JOIN outbound_intents i ON i.id = a.intent_id
+		JOIN alert_groups ag ON ag.id = i.alert_group_id
+		WHERE ag.alert_key = $1 AND a.outcome = 'accepted'`,
+		"survives_restart").Scan(&byFirst, &bySecond); err != nil {
+		t.Fatalf("read the journal: %v", err)
+	}
+	if bySecond != 2 || byFirst != 0 {
+		t.Fatalf("the deliveries were made by %d attempts of the first instance and "+
+			"%d of the second, want 0 and 2", byFirst, bySecond)
+	}
 }
 
 // TestAPageStartsGoingOutPromptly is the D7 smoke, and it is declared a smoke
@@ -275,9 +306,7 @@ func TestAPageStartsGoingOutPromptly(t *testing.T) {
 	sendWebhook(t, env.Echo, criticalAlert("slo_smoke", "DiskFilling"))
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "slo_smoke", 2)
 
@@ -308,15 +337,12 @@ func TestNoMoreLeasesThanSlots(t *testing.T) {
 	// More work than the pool, all of it held inside the provider so the slots
 	// stay occupied while the worker keeps ticking.
 	release := env.Channel.Hold()
-	defer release()
 	for i := 0; i < outbound.NotificationPoolSize+4; i++ {
 		sendWebhook(t, env.Echo, criticalAlert(fmt.Sprintf("pool_%d", i), "DiskFilling"))
 	}
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go runOutboundWorker(ctx, env.Worker)
+	stop := startOutboundWorker(t, env.Worker)
 
 	// The worker has to have started before the count means anything.
 	until(t, "the pool to fill", func() bool {
@@ -337,6 +363,23 @@ func TestNoMoreLeasesThanSlots(t *testing.T) {
 				leased, outbound.NotificationPoolSize)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The calls are still inside the provider, so the test ends by letting them
+	// out and waiting: attempts finishing after a test believes it is over are
+	// rows appearing in the middle of the next one's setup.
+	release()
+	stop()
+
+	var live int
+	if err := env.S.GetDB().QueryRow(`
+		SELECT count(*) FROM outbound_intents
+		WHERE status = 'sending' OR (lease_token IS NOT NULL AND locked_until > now())`).
+		Scan(&live); err != nil {
+		t.Fatalf("count what is still in flight: %v", err)
+	}
+	if live != 0 {
+		t.Fatalf("%d commitments are still in flight after the worker stopped", live)
 	}
 }
 

@@ -277,6 +277,34 @@ func waitForDeliveries(t *testing.T, s *store.Store, alertKey string, want int) 
 		want, alertKey, admitted, settled)
 }
 
+// startOutboundWorker runs the delivery worker and returns the function that
+// stops it.
+//
+// Stopping WAITS - it cancels, then joins the loop, which drains what is in
+// flight. A test that only cancelled would leave attempts finishing against the
+// database while the next test truncates it, and the failure that produces
+// lands somewhere else entirely.
+func startOutboundWorker(t *testing.T, worker *outbound.Worker) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		runOutboundWorker(ctx, worker)
+		worker.Drain()
+	}()
+
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			<-stopped
+		})
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
 // runOutboundWorker drives the delivery worker until the context is cancelled.
 //
 // Its own tick rather than Run(): the worker's interval is a second, and a test
@@ -546,7 +574,7 @@ func TestPipeline_HappyPath(t *testing.T) {
 
 	// Run dispatcher loop in background to process all steps
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	// Unified escalation job: firehose is step 0, policy step is step 1
 	waitForDeliveries(t, env.S, "test_dedup_1", 2)
@@ -585,7 +613,7 @@ func TestPipeline_PartialUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_partial_1", 2)
 
@@ -636,7 +664,7 @@ func TestPipeline_FullResolve(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_resolve_1", 2)
 
@@ -805,12 +833,9 @@ func TestPipeline_FirehoseOnly(t *testing.T) {
 		t.Errorf("Expected empty PolicyID for unknown team, got %s", active.PolicyID)
 	}
 
-	// 3. Dispatcher - should execute firehose step
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
+	// 3. The outbound worker sends what the admission promised.
 	initialSentCount := env.Channel.SentCount()
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_firehose_only_1", 1)
 
@@ -862,7 +887,7 @@ func TestPipeline_ResolutionAllDeliveries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_resolve_all_1", 2)
 
@@ -950,7 +975,7 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	// Stage 0: firehose, Stage 1: fan-out DMs (L1 + L2 if resolved)
 	waitForDeliveries(t, env.S, "test_fanout_1", 2)
@@ -1058,7 +1083,7 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_multi_fanout_1", 2)
 
@@ -1157,7 +1182,7 @@ func TestPipeline_ScheduleFanOut_OverrideOverGroup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_override_group_1", 2)
 
@@ -1243,7 +1268,7 @@ func TestPipeline_ScheduleFanOut_NoL2Additive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_no_l2_additive_1", 2)
 
@@ -1310,7 +1335,7 @@ func TestPipeline_DisabledProvider_PermanentFail(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	// The firehose still goes out. A step naming a provider nothing here
 	// delivers through is not promised at all: promised, it would be a
@@ -1401,7 +1426,7 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_channel_update_1", 2)
 
@@ -1503,7 +1528,7 @@ func TestPipeline_EscalationUnlinked(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_unlinked_1", 2)
 
@@ -1596,7 +1621,7 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go runDispatcherLoop(ctx, env.Disp)
-	go runOutboundWorker(ctx, env.Worker)
+	startOutboundWorker(t, env.Worker)
 
 	// Wait for firehose (stage 0) to complete — DM step (stage 1) is delayed, still pending
 	waitForDeliveries(t, env.S, "test_cancel_exec_1", 1)
