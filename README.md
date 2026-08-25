@@ -99,14 +99,12 @@ Enable dual-send to L2 Support channels in `tokay.yaml`:
 global:
   firehose_critical_channel: "C_L2_CRITICAL_CHANNEL_ID"
   firehose_warning_channel: "C_L2_WARNING_CHANNEL_ID"
-  dm_fallback_to_firehose: true # Default true. If no primary delivery, use firehose permalink in DMs
 ```
 
 Firehose sends full messages with timeline, updates and resolve notifications.
 
-**DM fallback:**
-- `dm_fallback_to_firehose: true` (default) - if no primary delivery, DM links to firehose message.
-- `dm_fallback_to_firehose: false` - DM omits the Slack link when primary is missing.
+A direct message about an alert links to the alert in TokayOps rather than to
+the firehose message, so the link works whether or not a firehose card exists.
 
 ### Running Locally
 1. Start the database using Docker Compose:

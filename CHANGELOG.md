@@ -35,11 +35,46 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   differently, so one shift change can be announced twice and another not at
   all. This is the same instruction as above - stop every instance - said for
   the case where escalations are not what you notice.
+- **Escalations in flight do not survive this upgrade.** How an alert is
+  escalated changed completely: it is no longer a background job with steps, and
+  the steps of the old kind are not executed by this version. An escalation that
+  is mid-flight when instances are stopped ends there - its remaining steps fail
+  rather than being sent - and alerts that arrive afterwards escalate normally.
+  This is the same instruction as the first note, said for what it costs: pick a
+  quiet moment.
 - The upgrade refuses to run while a job it cannot classify is still executing,
   and names the job in the message. That job either finishes or is cancelled,
   and the upgrade is started again. The alternative would be to let it run on
   without its claim on the work, which for an escalation means a second round of
   pages for one incident.
+
+### Changed
+
+- **An escalation step goes out when the policy said it would.** A step's delay
+  is now counted from the moment the alert was picked up, not from the moment
+  the previous step finished. A policy that says "the channel now, the on-call
+  engineer in five minutes" pages the engineer five minutes after the alert
+  arrives, even if the first message is still being retried. Before, a step that
+  was slow to send pushed everything behind it back by however long it took.
+- **A notification that keeps failing keeps being retried.** There is no attempt
+  limit any more: a delivery that fails in a way worth retrying is tried again,
+  with a growing wait between tries, until it succeeds, until the alert is
+  acknowledged or resolved, or until it reaches a deadline. Previously the third
+  failure ended it silently - the page simply never arrived, and nothing said
+  so. `max_attempts` on an escalation step no longer ends a page; a provider
+  refusing for good still does, immediately.
+- **A direct message about an alert links to the alert in TokayOps.** It used to
+  link to the message in the channel, which meant the link was missing whenever
+  there was no channel message to point at. The `dm_fallback_to_firehose`
+  setting is gone with the path it configured; remove it from `tokay.yaml` if it
+  is there, where it is now ignored.
+- **The alerts inside a message are listed by when they started**, rather than
+  in whatever order they arrived from Alertmanager. Two instances rendering the
+  same alert now produce the same message.
+- **Erasing a user also removes the addresses their notifications were sent to**,
+  and withdraws anything still owed to them. What was already delivered is kept
+  as a record that it happened, without the coordinates of the message; nothing
+  written afterwards can put an address back.
 
 ### Fixed
 
@@ -90,6 +125,18 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   the on-call recipients could not be resolved. Its increase over a window
   should normally be zero; alert on a positive increase rather than on the
   value, which never returns to zero once it has moved.
+- Metrics for outbound delivery. `outbound_queue_lateness_seconds` is the one to
+  watch: it is how far behind the oldest notification that should ALREADY have
+  gone out is, and work scheduled for later - a delayed policy step, a retry
+  waiting out its backoff - is deliberately not counted as late. Beside it,
+  `outbound_intents_terminal_total` counts notifications that ended, by how:
+  anything other than `succeeded` is a page that did not happen.
+  `outbound_attempts_total`, `outbound_admissions_total` and
+  `outbound_admission_latency_seconds` cover the rest, and
+  `outbound_contract_violations_total` should stay at zero - it counts things
+  that indicate a bug rather than a failed delivery.
+- `storage_contract_failures_total` counts durable rows that no longer parse.
+  Any increase is a data problem to look at, not a transient failure.
 
 ## [0.1.0] - 2026-08-18
 

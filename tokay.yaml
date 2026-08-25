@@ -7,7 +7,6 @@ global:
   # firehose messages - team channels and DMs still work either way.
   firehose_critical_channel: ""  # Global log of critical alerts
   firehose_warning_channel: ""   # Global log of warning alerts
-  dm_fallback_to_firehose: true # Default true. If no primary delivery, use firehose permalink in DMs
 
 # NOTE: slack_token and providers sections removed in v3.
 # Use the Integrations API instead: POST /api/v1/integrations

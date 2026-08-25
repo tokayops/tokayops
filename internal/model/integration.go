@@ -69,8 +69,7 @@ type TelegramConfig struct {
 }
 
 // IsInteractive reports whether Ack/Resolve buttons are enabled, defaulting to
-// true when the field was never set. Mirrors config.GlobalConfig's
-// DmFallbackToFirehose accessor.
+// true when the field was never set.
 func (c TelegramConfig) IsInteractive() bool {
 	if c.Interactive == nil {
 		return true
