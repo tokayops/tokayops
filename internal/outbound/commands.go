@@ -74,8 +74,9 @@ const (
 // It carries no revision and no snapshot, and that is the contract rather than
 // an omission: both are computed inside the transition's own transaction, from
 // the rows as they became. Built before it, a snapshot describes the state the
-// acknowledgement was applied TO - without the actor, without the line the
-// transition wrote, without the alerts a merge just added.
+// change was applied TO - the alert still reading as firing, nobody named as
+// having acknowledged or resolved it, and none of the alerts a merge just
+// recorded. Every one of those reaches the message.
 type DesiredStateRequest struct {
 	AlertGroupID string
 
