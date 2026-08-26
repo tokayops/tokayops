@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
@@ -47,7 +46,7 @@ func testJobIdentity(jobID string) *jobdedup.Spec {
 
 func TestProcessStep_Retry(t *testing.T) {
 	s := store.NewMockStore()
-	d := mustNewDispatcher(t, s, &config.Config{})
+	d := mustNewDispatcher(t, s)
 
 	mp := &MockProvider{
 		SendDMFunc: func(ctx context.Context, userID, message string) error {
@@ -113,7 +112,7 @@ func TestProcessStep_Retry(t *testing.T) {
 
 func TestProcessStep_MaxRetries(t *testing.T) {
 	s := store.NewMockStore()
-	d := mustNewDispatcher(t, s, &config.Config{})
+	d := mustNewDispatcher(t, s)
 
 	mp := &MockProvider{
 		SendDMFunc: func(ctx context.Context, userID, message string) error {
@@ -160,7 +159,7 @@ func TestProcessStep_MaxRetries(t *testing.T) {
 
 func TestProcessStep_Canceled(t *testing.T) {
 	s := store.NewMockStore()
-	d := mustNewDispatcher(t, s, &config.Config{})
+	d := mustNewDispatcher(t, s)
 
 	s.CreateAlertGroup(&model.AlertGroup{ID: "ag1"})
 	// Job is Canceled
@@ -222,7 +221,7 @@ func TestProcessStep_TransientError(t *testing.T) {
 		FailCount:      1, // Fail once
 	}
 
-	d := mustNewDispatcher(t, wrapper, &config.Config{})
+	d := mustNewDispatcher(t, wrapper)
 
 	leaseToken := "lease-transient"
 	stepData := model.EscalationStepData{AlertGroupID: "ag1", TargetID: "U1", ProviderName: "slack"}
@@ -263,7 +262,7 @@ func TestProcessStep_TransientError(t *testing.T) {
 
 func TestFailStep_ContinueOnFailure_HasNextStep(t *testing.T) {
 	s := store.NewMockStore()
-	d := mustNewDispatcher(t, s, &config.Config{})
+	d := mustNewDispatcher(t, s)
 
 	mp := &MockProvider{
 		SendFunc: func(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
@@ -333,7 +332,7 @@ func TestFailStep_ContinueOnFailure_HasNextStep(t *testing.T) {
 
 func TestFailStep_ContinueOnFailure_NoNextStep(t *testing.T) {
 	s := store.NewMockStore()
-	d := mustNewDispatcher(t, s, &config.Config{})
+	d := mustNewDispatcher(t, s)
 
 	mp := &MockProvider{
 		SendFunc: func(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
@@ -385,7 +384,7 @@ func TestFailStep_ContinueOnFailure_NoNextStep(t *testing.T) {
 
 func TestFailStep_Default(t *testing.T) {
 	s := store.NewMockStore()
-	d := mustNewDispatcher(t, s, &config.Config{})
+	d := mustNewDispatcher(t, s)
 
 	mp := &MockProvider{
 		SendDMFunc: func(ctx context.Context, userID, message string) error {
@@ -475,7 +474,7 @@ func TestContinueOnFailure_UnlockRetrySuccess(t *testing.T) {
 		FinishFailCount: 2, // Fail twice, succeed on third
 	}
 
-	d := mustNewDispatcher(t, wrapper, &config.Config{})
+	d := mustNewDispatcher(t, wrapper)
 
 	mp := &MockProvider{
 		SendFunc: func(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
@@ -551,7 +550,7 @@ func TestContinueOnFailure_UnlockRetryExhausted(t *testing.T) {
 		FinishFailCount: 10, // More than maxRetries (3)
 	}
 
-	d := mustNewDispatcher(t, wrapper, &config.Config{})
+	d := mustNewDispatcher(t, wrapper)
 
 	mp := &MockProvider{
 		SendFunc: func(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
@@ -649,20 +648,6 @@ func (f *FailingCreateJobStoreWrapper) CreateJobWithDedup(job *model.Job, stages
 // Transient Build Error Tests (Issue 1 fix)
 // ===================================================================================
 
-// FailingListDeliveriesStoreWrapper wraps MockStore to inject ListDeliveries errors
-type FailingListDeliveriesStoreWrapper struct {
-	store.StoreInterface
-	FailCount int
-}
-
-func (f *FailingListDeliveriesStoreWrapper) ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error) {
-	if f.FailCount > 0 {
-		f.FailCount--
-		return nil, errors.New("transient db error")
-	}
-	return f.StoreInterface.ListDeliveries(alertGroupID)
-}
-
 // ===================================================================================
 // Regression Tests: completeStep deadlock + ProcessResolvedAlertGroups lost notifications
 // ===================================================================================
@@ -679,7 +664,7 @@ func TestRegression_CompleteStep_UnlockFailure(t *testing.T) {
 		FinishFailCount: 10,
 	}
 
-	d := mustNewDispatcher(t, wrapper, &config.Config{})
+	d := mustNewDispatcher(t, wrapper)
 
 	mp := &MockProvider{
 		SendDMFunc: func(ctx context.Context, userID, message string) error {
