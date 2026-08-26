@@ -75,10 +75,10 @@ type AlertGroup struct {
 	// Acknowledgement
 	AcknowledgedBy string     `json:"acknowledged_by,omitempty"`
 	ResolvedBy     string     `json:"resolved_by,omitempty"`
-	AckProcessedAt *time.Time `json:"ack_processed_at,omitempty"` // When ack update job was processed
+	AckProcessedAt *time.Time `json:"ack_processed_at,omitempty"` // Declared, no longer written: the loop that set it is gone
 
 	// Slack Update Tracking
-	SlackUpdatePending bool `json:"slack_update_pending,omitempty"` // Set when alerts change; cleared after Slack update job created
+	SlackUpdatePending bool `json:"slack_update_pending,omitempty"` // Declared, no longer written: what a card shows is a revision now
 
 	// RenderSourceVersion is the version of the state a message about this
 	// alert is drawn from. Every write that changes what such a message would

@@ -186,15 +186,13 @@ const legacyColumnMigrationsDDL = `
 		-- 8. The version of the state a card is drawn from. Every write that
 		-- changes what a message about this alert would say increments it.
 		--
-		-- Two things read it. A producer that froze a snapshot hands the
-		-- version back when it admits the escalation, and the admission
-		-- refuses a plan built from state that has moved since. And the
-		-- slack_update_pending gate above clears the flag only for the version
-		-- it read, so an alert arriving while the update job is created keeps
-		-- the flag up instead of being cleared away with it.
+		-- A producer that froze a snapshot hands the version back when it
+		-- admits the escalation, and the admission refuses a plan built from
+		-- state that has moved since.
 		--
-		-- It was called slack_update_generation, which was the second of those
-		-- two jobs under the name of a loop that is on its way out.
+		-- It was called slack_update_generation, after a loop that no longer
+		-- exists. The flag that loop read, slack_update_pending above, is
+		-- declared and no longer written or read by anything.
 		IF EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_generation')
 		   AND NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='render_source_version') THEN
 			ALTER TABLE alert_groups RENAME COLUMN slack_update_generation TO render_source_version;
