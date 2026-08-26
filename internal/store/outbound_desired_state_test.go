@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -539,6 +540,74 @@ func park(t *testing.T, s *Store, intentID string, status outbound.Status) {
 		SET status = $2, lease_token = NULL, locked_until = NULL, current_attempt_id = NULL
 		WHERE id = $1`, intentID, string(status)); err != nil {
 		t.Fatalf("park %s as %s: %v", intentID, status, err)
+	}
+}
+
+// TestTheHistoryOfATransitionReadsInTheOrderItHappened.
+//
+// An acknowledgement writes two lines: the transition, and the withdrawal of
+// what the alert still owed - which happened BECAUSE of it. The history is read
+// back by (created_at, id), so two lines timed by different clocks can be
+// returned in an order neither of them happened in: the transition took the
+// process clock and the withdrawal took the server's.
+func TestTheHistoryOfATransitionReadsInTheOrderItHappened(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		transition model.TimelineEventType
+		close      func(t *testing.T, s *Store, agID string)
+	}{
+		{
+			name: "an acknowledgement", transition: model.TimelineEventAcknowledged,
+			close: func(t *testing.T, s *Store, agID string) {
+				if changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil || !changed {
+					t.Fatalf("acknowledge: %v %v", changed, err)
+				}
+			},
+		},
+		{
+			name: "a resolution", transition: model.TimelineEventResolved,
+			close: func(t *testing.T, s *Store, agID string) {
+				if changed, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil); err != nil || !changed {
+					t.Fatalf("resolve: %v %v", changed, err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := setupTestDB(t)
+			s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+			agID := desiredGroup(t, s, "Disk filling up")
+			// Something owed, so there is a withdrawal to order against.
+			mustSubmit(t, s, outboundAdmission(t, agID, "Disk filling up",
+				channelCommitment("C-ops", 0)))
+
+			tc.close(t, s, agID)
+
+			events, err := s.GetTimelineEvents(agID)
+			if err != nil {
+				t.Fatalf("read the history: %v", err)
+			}
+			transitionAt, withdrawalAt := -1, -1
+			for i, e := range events {
+				switch e.Type {
+				case tc.transition:
+					transitionAt = i
+				case model.TimelineEventNotificationFailed:
+					if strings.Contains(e.Message, "withdrawn") {
+						withdrawalAt = i
+					}
+				}
+			}
+			if transitionAt < 0 || withdrawalAt < 0 {
+				t.Fatalf("the history holds %d lines and not both of these: %+v",
+					len(events), events)
+			}
+			if withdrawalAt < transitionAt {
+				t.Fatalf("the history says the notifications were withdrawn before "+
+					"the alert moved: %d then %d", withdrawalAt, transitionAt)
+			}
+		})
 	}
 }
 

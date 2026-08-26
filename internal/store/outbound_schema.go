@@ -551,30 +551,58 @@ END $$;
 const outboundAdmittedStateConstraint = "outbound_batches_admission_snapshot_present"
 
 // outboundAdmittedStateDDL brings the frozen admission state to databases the
-// previous version created, and fills it in for the claims already in them.
+// previous version created, and decides what to do about the claims in them.
 //
-// The four columns cannot arrive with the table: it is created by CREATE TABLE
-// IF NOT EXISTS, so on a database that already has one they would simply never
-// appear - and the first admission afterwards would fail on a column that does
-// not exist.
+// The columns cannot arrive with the table: it is created by CREATE TABLE IF
+// NOT EXISTS, so on a database that already has one they would never appear -
+// and the first admission afterwards would fail on a column that is not there.
+// That part is structural and applies to every database.
 //
-// The backfill is exact rather than approximate, and only because of when it
-// runs. The previous version had nothing that could raise a group's revision,
-// so every snapshot it wrote is revision 0 - which IS the state its admission
-// froze. Copying it across is therefore not a guess about what was admitted; it
-// is the same row. A group whose snapshot has moved past 0 cannot exist here:
-// the only thing that moves it is the code this migration ships with, and it
-// runs before that code can.
+// What to do with the claims already there is a different question, and the
+// answer is deliberately narrow.
 //
-// What is deliberately NOT done: leaving the old claims empty. A one-shot
-// commitment renders the state its admission froze, so an empty one is a
-// message that ends as undeliverable at the moment somebody needed it.
+// A snapshot written before 2026-08-25 carries the alert's history under tag
+// 14. Copying such a row into the batch would produce a claim that parses as
+// nothing this build can read - the codec refuses fields it does not know - and
+// the commitment under it would end as undeliverable at the moment somebody
+// needed it. Repairing it is not possible either: the digest those commitments
+// were keyed against covered a field this protocol no longer has.
+//
+// So the three cases are answered separately, and none of them by guessing:
+//
+//   - no claims at all: the structure is brought up to date and there is
+//     nothing else to do. This is every database that has not escalated yet;
+//   - claims whose snapshots are in the current format: filled in from the
+//     group's own snapshot at revision 0, which IS what they were admitted
+//     from - nothing before this sprint could move a revision off zero;
+//   - claims whose snapshots still carry the history: the start stops and says
+//     so. This build cannot deliver those commitments, and pretending
+//     otherwise would hide it until a page failed. TokayOps is not deployed
+//     from that version anywhere, so the remedy is a local reset rather than a
+//     migration nobody would ever run twice.
 const outboundAdmittedStateDDL = `
 DO $$
+DECLARE
+	stale INT;
+	orphaned INT;
 BEGIN
 	IF NOT EXISTS (SELECT 1 FROM information_schema.columns
 	               WHERE table_name = 'outbound_batches'
 	                 AND column_name = 'admission_snapshot') THEN
+
+		SELECT count(*) INTO stale
+		FROM outbound_group_snapshots
+		WHERE snapshot ? 'timeline';
+
+		IF stale > 0 THEN
+			RAISE EXCEPTION 'this database holds % render snapshot(s) written before '
+				'2026-08-25, when the alert history left the protocol. The deliveries '
+				'admitted from them cannot be rendered by this build and cannot be '
+				'repaired: the digest they were keyed against covered a field that no '
+				'longer exists. Drop the outbound_* tables and let this version create '
+				'them, or start from a fresh database.', stale;
+		END IF;
+
 		ALTER TABLE outbound_batches
 			ADD COLUMN admission_snapshot JSONB,
 			ADD COLUMN admission_digest BYTEA,
@@ -590,6 +618,18 @@ BEGIN
 		WHERE g.alert_group_id = b.alert_group_id
 		  AND b.admission_snapshot IS NULL
 		  AND g.revision = 0;
+
+		SELECT count(*) INTO orphaned
+		FROM outbound_batches
+		WHERE admission_snapshot IS NULL
+		  AND key_kind IN ('escalation', 'escalation_replay');
+
+		IF orphaned > 0 THEN
+			RAISE EXCEPTION 'this database holds % escalation claim(s) with no state to '
+				'render from, and none can be reconstructed. Drop the outbound_* tables '
+				'and let this version create them, or start from a fresh database.',
+				orphaned;
+		END IF;
 	END IF;
 END $$;
 `

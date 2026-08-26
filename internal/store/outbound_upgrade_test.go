@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/tokayops/tokayops/internal/outbound"
@@ -139,6 +140,82 @@ func TestAStartUpgradesADatabaseFromThePreviousVersion(t *testing.T) {
 	}
 }
 
+// TestAStartRefusesSnapshotsItCannotRender is the case the structural test
+// above cannot see.
+//
+// A database from the version before this one holds snapshots with the alert's
+// history in them, under a tag this protocol no longer has. Copying one into a
+// claim would produce a commitment that parses as nothing readable - and
+// repairing it is not possible, because the digest it was keyed against covered
+// that field. The start says so instead of leaving it to be discovered by a
+// page that failed.
+func TestAStartRefusesSnapshotsItCannotRender(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	admitOne(t, s, agID, dmCommitment("U-nina"))
+
+	previousOutboundShape(t, s)
+	// The shape of a snapshot the previous version wrote.
+	if _, err := s.db.Exec(`
+		UPDATE outbound_group_snapshots
+		SET snapshot = jsonb_set(snapshot, '{timeline}', '[]')
+		WHERE alert_group_id = $1`, agID); err != nil {
+		t.Fatalf("write the previous snapshot shape: %v", err)
+	}
+	// The remedy this refusal names, applied to one alert: the claim and what
+	// it admitted go with the snapshot nobody can render. Without it every
+	// later start in this process refuses for the same reason.
+	t.Cleanup(func() {
+		for _, statement := range []string{
+			`DELETE FROM outbound_intent_events e USING outbound_intents i
+			 WHERE e.intent_id = i.id AND i.alert_group_id = $1`,
+			`DELETE FROM outbound_attempts a USING outbound_intents i
+			 WHERE a.intent_id = i.id AND i.alert_group_id = $1`,
+			`UPDATE outbound_intents SET current_attempt_id = NULL, status = 'canceled',
+			 lease_token = NULL, locked_until = NULL WHERE alert_group_id = $1`,
+			`DELETE FROM outbound_intents WHERE alert_group_id = $1`,
+			`DELETE FROM outbound_batches WHERE alert_group_id = $1`,
+			`DELETE FROM outbound_group_snapshots WHERE alert_group_id = $1`,
+		} {
+			if _, err := s.db.Exec(statement, agID); err != nil {
+				t.Fatalf("apply the remedy: %v", err)
+			}
+		}
+		if err := s.applyOutboundSchema(); err != nil {
+			t.Fatalf("put the schema back: %v", err)
+		}
+	})
+
+	err := s.applyOutboundSchema()
+	if err == nil {
+		t.Fatal("a start accepted a database it cannot deliver from")
+	}
+	if !strings.Contains(err.Error(), "2026-08-25") {
+		t.Fatalf("the refusal does not say what is wrong: %v", err)
+	}
+	// And it changed nothing: a refusal that half-applied would be worse than
+	// the state it refused.
+	if hasColumn(t, s, "outbound_batches", "admission_snapshot") {
+		t.Error("the refusal added the columns anyway")
+	}
+}
+
+// TestAStartUpgradesADatabaseThatHasEscalatedNothing. The commonest case, and
+// the one with no claims to decide about: the structure moves, and that is all.
+func TestAStartUpgradesADatabaseThatHasEscalatedNothing(t *testing.T) {
+	s := setupTestDB(t)
+
+	previousOutboundShape(t, s)
+	if err := s.applyOutboundSchema(); err != nil {
+		t.Fatalf("start against the previous shape: %v", err)
+	}
+	if !hasColumn(t, s, "outbound_batches", "admission_snapshot") {
+		t.Error("the columns did not arrive")
+	}
+}
+
 // TestTheRulesRefuseWhatTheyAreFor. The three statements added above are only
 // worth adding if they refuse something.
 func TestTheRulesRefuseWhatTheyAreFor(t *testing.T) {
@@ -195,13 +272,20 @@ func TestAFormThisBuildDoesNotDeliverStopsBeforeTheNetwork(t *testing.T) {
 		`UPDATE outbound_intents SET form = 'thread' WHERE id = $1`, intentID); err != nil {
 		t.Fatalf("write the unknown form: %v", err)
 	}
-	// Put it back before leaving: the row outlives this test, and the next
-	// start-up would refuse to add the rule again over a row that breaks it.
+	// Put BOTH back before leaving. Restoring the row alone would leave the
+	// rule off for the rest of the process, and every test after this one would
+	// be checking a schema nothing runs on.
 	t.Cleanup(func() {
 		if _, err := s.db.Exec(
 			`UPDATE outbound_intents SET form = $2 WHERE id = $1`,
 			intentID, string(outbound.FormEditable)); err != nil {
 			t.Fatalf("put the form back: %v", err)
+		}
+		if err := s.applyOutboundSchema(); err != nil {
+			t.Fatalf("put the schema back: %v", err)
+		}
+		if !hasNamedConstraint(t, s, "outbound_intents", outboundFormKnownConstraint) {
+			t.Fatal("the rule did not come back, and every later test runs without it")
 		}
 	})
 
