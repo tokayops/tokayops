@@ -9,7 +9,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher/builders"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
@@ -18,18 +17,19 @@ import (
 	"github.com/tokayops/tokayops/internal/store"
 )
 
-// Provider is what this package needs from a channel: the four calls the job
-// executors make. The channels live in internal/outbound/providers and know
+// Provider is what this package needs from a channel: the one call the handoff
+// executor makes. The channels live in internal/outbound/providers and know
 // nothing about jobs - this is the consumer's half of that boundary.
 //
-// Send returns an OPTIONAL provider payload that is persisted to
-// notification_deliveries.provider_payload and later handed back to Update/Resolve.
-// For fire-and-forget sends (Editable=false) an empty payload is valid.
+// It was four calls once. Update, Resolve and Permalink existed for the loops
+// that kept an alert group's messages current, and those messages are the
+// delivery domain's now: it addresses them by the receipt it recorded, not by a
+// notification_deliveries row, and it needs nothing from here.
+//
+// Send returns an OPTIONAL provider payload. A handoff is fire-and-forget, so
+// an empty one is valid.
 type Provider interface {
 	Send(ctx context.Context, req providers.NotificationRequest) (string, error)
-	Update(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) (string, error)
-	Resolve(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) error
-	Permalink(d *model.NotificationDelivery) string
 }
 
 type Dispatcher struct {
@@ -61,15 +61,13 @@ func NewDispatcher(s store.StoreInterface, cfg *config.Config) (*Dispatcher, err
 		WorkerID:  uuid.New().String(),
 	}
 
-	// The "dm", "channel" and "firehose" step types are gone with the
-	// escalation executor: an escalation is a set of commitments in the
-	// outbound domain now, and nothing builds job steps for one. A job step
-	// left over from before this change finds no executor and fails, which is
-	// what the upgrade's stop-the-world cutover exists to make impossible.
-	resolutionExec := NewResolutionExecutor(s, d.providers, cfg)
-	d.RegisterExecutor("resolve", resolutionExec)
-	d.RegisterExecutor("update", resolutionExec) // update uses same executor with Operation field
-
+	// Only one step type is left. "dm", "channel" and "firehose" went with the
+	// escalation executor, and "update" and "resolve" with the loops that
+	// produced them: what a message has to show is a revision of the alert
+	// group now, applied by the delivery worker, and nothing builds job steps
+	// for it. A job step left over from before this change finds no executor
+	// and fails, which is what the upgrade's stop-the-world cutover exists to
+	// make impossible.
 	handoffExec := NewHandoffExecutor(d.providers)
 	d.RegisterExecutor("handoff_notify", handoffExec)
 
@@ -110,9 +108,6 @@ func (d *Dispatcher) RegisterExecutor(stepType string, e StepExecutor) {
 func (d *Dispatcher) Run(ctx context.Context) {
 	log.Printf("StepWorker (WorkerID: %s) started", d.WorkerID)
 	go d.jobProcessingLoop(ctx)
-	go d.ackUpdateProcessingLoop(ctx)
-	go d.resolutionProcessingLoop(ctx)
-	go d.alertUpdateProcessingLoop(ctx)
 	<-ctx.Done()
 }
 
@@ -329,211 +324,6 @@ func (d *Dispatcher) logAdvanceResult(step *model.JobStep, res model.AdvanceResu
 		log.Printf("StepWorker: Step %s skipped, stage already advanced", step.ID)
 	case model.AdvanceLeaseLost:
 		log.Printf("StepWorker: Step %s lease lost", step.ID)
-	}
-}
-
-// =================================================================================
-// Ack Update Logic - Updates Slack messages when AG is acknowledged
-// =================================================================================
-
-func (d *Dispatcher) ackUpdateProcessingLoop(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			d.ProcessAcknowledgedAlertGroups(ctx)
-		}
-	}
-}
-
-func (d *Dispatcher) ProcessAcknowledgedAlertGroups(ctx context.Context) {
-	alertGroups, err := d.store.GetAcknowledgedAlertGroups()
-	if err != nil {
-		log.Printf("JobController: Error fetching acknowledged alert groups: %v", err)
-		return
-	}
-
-	builder, err := builders.NewUpdateJobBuilder(d.cfg, d.store)
-	if err != nil {
-		log.Printf("JobController: Failed to init update job builder: %v", err)
-		return
-	}
-
-	gate := d.ackUpdateGate()
-
-	for _, ag := range alertGroups {
-		// Nothing to cancel here any more: acknowledging a group withdraws what
-		// it still owes in the same commit as the status change, so a delivery
-		// cannot survive the acknowledgement it was too late for.
-		//
-		// Build the update that turns the message yellow.
-		job, stages, steps, err := builder.Build(ag)
-		if err != nil {
-			if errors.Is(err, builders.ErrNoUpdatableDeliveries) {
-				// Nothing to update, so the gate comes down - and here that is
-				// the right trade, where for an alert update it is not.
-				//
-				// What is given up is narrow: a message whose sending straddled
-				// the acknowledgement was rendered before it and will keep
-				// saying "triggered" until the next alert refreshes it. What is
-				// bought is that this loop, which runs every two seconds and
-				// cancels an escalation on each pass, stops looking at a group
-				// it can do nothing for. An alert update makes the opposite
-				// trade because what it carries is an alert, not a colour.
-				log.Printf("JobController: No updatable deliveries for acknowledged %s", ag.ID)
-				gate.lower(ag)
-				continue
-			}
-			// Other errors (e.g., ListDeliveries DB error) - transient, allow retry
-			log.Printf("JobController: Build failed for %s (will retry): %v", ag.ID, err)
-			continue
-		}
-
-		// Defensive nil check - Build contract guarantees job != nil when err == nil,
-		// but guard against future changes to builder
-		if job == nil {
-			// Invariant violation - Build should never return (nil, _, nil).
-			// The gate stays up: retry and investigation.
-			log.Printf("JobController: ERROR Build returned nil job for %s (will retry)", ag.ID)
-			continue
-		}
-
-		// 3. Offer it. Whether it was admitted or found already in flight, the
-		// gate comes down - see jobGate.lowerOnDuplicate.
-		d.offer(gate, ag, job, stages, steps)
-	}
-}
-
-// =================================================================================
-// Resolution Logic (Legacy / Cleanup?)
-// =================================================================================
-// NOTE: Ideally Resolution should also be a Job, but preserving legacy loop for now.
-
-func (d *Dispatcher) resolutionProcessingLoop(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			d.ProcessResolvedAlertGroups(ctx)
-		}
-	}
-}
-
-func (d *Dispatcher) ProcessResolvedAlertGroups(ctx context.Context) {
-	alertGroups, err := d.store.GetResolvedAlertGroups()
-	if err != nil {
-		log.Printf("JobController: Error fetching resolved alert groups: %v", err)
-		return
-	}
-
-	builder := builders.NewResolutionJobBuilder(d.cfg, d.store)
-	gate := d.resolutionGate()
-
-	for _, ag := range alertGroups {
-		// Resolving withdraws what the group owes in the same commit as the
-		// status change, so there is nothing to cancel here.
-		//
-		// Build the resolution
-		job, stages, steps, err := builder.Build(ag)
-		if err != nil {
-			log.Printf("JobController: Build failed for resolved AG %s (will retry): %v", ag.ID, err)
-			continue // transient error, the gate stays up
-		}
-
-		if job == nil {
-			// Nobody to tell: no delivery this group produced can be updated.
-			// The group is still resolved, and closing it is the only thing
-			// left to do.
-			gate.lower(ag)
-			continue
-		}
-
-		// 3. Offer it, and close the group once its resolution is someone's.
-		d.offer(gate, ag, job, stages, steps)
-	}
-}
-
-// =================================================================================
-// Alert Update Logic — Updates Slack messages when alerts change in existing groups
-// =================================================================================
-
-func (d *Dispatcher) alertUpdateProcessingLoop(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			d.ProcessAlertUpdates(ctx)
-		}
-	}
-}
-
-func (d *Dispatcher) ProcessAlertUpdates(ctx context.Context) {
-	alertGroups, err := d.store.GetAlertGroupsPendingSlackUpdate()
-	if err != nil {
-		log.Printf("JobController: Error fetching alert groups pending Slack update: %v", err)
-		return
-	}
-
-	if len(alertGroups) == 0 {
-		return
-	}
-
-	builder, err := builders.NewUpdateJobBuilder(d.cfg, d.store)
-	if err != nil {
-		log.Printf("JobController: Failed to init update job builder for alert updates: %v", err)
-		return
-	}
-
-	gate := d.alertUpdateGate()
-
-	for _, ag := range alertGroups {
-		job, stages, steps, err := builder.BuildAlertUpdate(ag)
-		if errors.Is(err, builders.ErrNoUpdatableDeliveries) {
-			// Nothing this group has sent can be updated - as of the moment
-			// that listing was taken. The gate stays up, and it stays up
-			// silently: this tick will repeat every few seconds for as long as
-			// the group is open, and a line per tick would bury everything
-			// else in the log.
-			//
-			// It used to come down here, on the evidence of a second listing
-			// of the deliveries: "some exist, so no more are coming". That
-			// evidence is not sound. Deliveries are written by escalation
-			// steps, and one written a moment later - by a step still running
-			// after its job was canceled, or after the listing the build was
-			// working from - would find the gate already down and the alert
-			// that raised it in no message at all.
-			//
-			// There is no cheaper proof available, so no proof is claimed. The
-			// cost is bounded: the group leaves this queue when it is resolved.
-			// If it ever shows up in measurements, the queue can select on a
-			// delivery that supports updates instead - the gate stays up either
-			// way, so the alert is safe with or without that filter. Until it
-			// does show up, one rule fewer.
-			continue
-		}
-		if err != nil {
-			// Transient error - the gate stays up, retry next tick
-			log.Printf("JobController: Build failed for alert update %s (will retry): %v", ag.ID, err)
-			continue
-		}
-
-		if job == nil {
-			log.Printf("JobController: ERROR Build returned nil job for alert update %s (will retry)", ag.ID)
-			continue
-		}
-
-		// Offered, and the gate comes down only if this update was admitted and
-		// no further alert arrived meanwhile - see jobGate.
-		d.offer(gate, ag, job, stages, steps)
 	}
 }
 

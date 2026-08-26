@@ -4,98 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
-
-// TestOTPFlow / TestOTPFlow_NoRetry removed in Sprint 4 (Epic 7): the
-// job-based OTP path (OTPExecutor / OTPJobBuilder / OTPStepData / step type
-// "slack_dm_otp") was dead code — the production OTP flow at
-// POST /me/slack/request-code sends the Slack DM synchronously inside the API
-// handler, and Sprint 3's link-token service replaced the OTP indirection
-// entirely. Removing the executor here removes the only producer of these
-// tests' input.
-
-func TestResolutionFlow(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d := mustNewDispatcher(t, s, cfg)
-
-	resolveCalled := false
-	mp := &MockProvider{
-		ResolveFunc: func(ctx context.Context, ag *model.AlertGroup) error {
-			resolveCalled = true
-			if ag.ID != "ag_res" {
-				t.Errorf("Expected resolve for ag_res, got %s", ag.ID)
-			}
-			return nil
-		},
-	}
-	d.RegisterProvider("slack", mp)
-
-	// Seed Resolved AG
-	ag := &model.AlertGroup{
-		ID:       "ag_res",
-		Status:   model.AlertGroupStatusResolved, // Ready for processing
-		PolicyID: "p1",
-		AlertKey: "dk_res",
-		PolicySnapshot: &model.EscalationPolicySnapshot{
-			Name: "p1",
-			Steps: []*model.EscalationStepSnapshot{
-				{Provider: "slack", TargetKind: "channel", TargetID: "C1"},
-			},
-		},
-	}
-	s.CreateAlertGroup(ag)
-	s.UpsertNotificationDelivery(&model.NotificationDelivery{
-		AlertGroupID:    ag.ID,
-		Provider:        "slack",
-		Kind:            "channel",
-		ProviderPayload: "{\"channel_id\":\"C1\",\"timestamp\":\"123.456\"}",
-		SupportsUpdate:  true,
-		IsPrimary:       true,
-		CreatedAt:       time.Now(),
-	})
-
-	// Trigger Resolution Processing
-	d.ProcessResolvedAlertGroups(context.Background())
-
-	// 1. Verify AG is Closed
-	updatedAG, _ := s.GetAlertGroupByID("ag_res")
-	if updatedAG.Status != model.AlertGroupStatusClosed {
-		t.Errorf("Expected AG to be Closed, got %s", updatedAG.Status)
-	}
-
-	// 2. Verify Job Created
-	job, err := s.FindJobByIdentity(jobdedup.Resolution("ag_res"))
-	if err != nil {
-		t.Fatalf("Failed to find resolution job: %v", err)
-	}
-
-	if resolveCalled {
-		t.Error("Resolve called internally? Should be async via Job")
-	}
-
-	// 3. Process Step
-	// MockStore doesn't automatically populate NextRunAt correctly for pending steps unless we claim them,
-	// but processStep takes the step object directly.
-	// We need to fetch step 0.
-	fetchedSteps := s.GetJobStepsByJobID(job.ID)
-	step := fetchedSteps[0]
-	// Simulate it being picked up (status running)
-	step.Status = model.JobStepStatusRunning
-
-	d.processStep(context.Background(), step)
-
-	// 4. Verify Executor Called
-	if !resolveCalled {
-		t.Error("Executor did not call Resolve")
-	}
-}
 
 func TestUnknownExecutor_FailsJob(t *testing.T) {
 	s := store.NewMockStore()

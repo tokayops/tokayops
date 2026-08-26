@@ -719,16 +719,17 @@ func TestPipeline_FullResolve(t *testing.T) {
 		t.Errorf("Expected status Resolved, got %s", status)
 	}
 
-	// Dispatcher Resolution Loop. It still closes the alert group; editing the
-	// cards it sent is the half that moves with the update path, and until it
-	// does what this asserts is that the alert owes nobody anything.
-	env.Disp.ProcessResolvedAlertGroups(ctx)
+	// A resolved alert owes nobody anything: no page goes out about an alert
+	// that is already over.
 	waitForNothingOwed(t, env.S, "test_resolve_1")
 
-	// Verify Closed
+	// And it stays resolved. Closing it was the resolution loop's last act,
+	// and that loop is gone: "resolution delivered" is a fact about a
+	// commitment now, kept in its own journal, and the two statuses rendered
+	// the same anyway.
 	env.S.GetDB().QueryRow("SELECT status FROM alert_groups WHERE alert_key = $1", "test_resolve_1").Scan(&status)
-	if status != string(model.AlertGroupStatusClosed) {
-		t.Errorf("Expected status Closed, got %s", status)
+	if status != string(model.AlertGroupStatusResolved) {
+		t.Errorf("Expected status Resolved, got %s", status)
 	}
 }
 
@@ -935,21 +936,13 @@ func TestPipeline_ResolutionAllDeliveries(t *testing.T) {
 	}`
 	sendWebhook(t, env.Echo, resolvePayload)
 
-	// 4. Process resolution (dispatcher loop is already running)
-	env.Disp.ProcessResolvedAlertGroups(ctx)
-
-	// Bringing the cards to their resolved state is the piece of work that has
-	// not moved yet: the resolution loop still edits from
-	// notification_deliveries, which the admitted path does not write. What
-	// holds today is that a resolved alert owes nobody anything - no page goes
-	// out about an alert that is already over.
+	// 4. A resolved alert owes nobody anything.
 	waitForNothingOwed(t, env.S, "test_resolve_all_1")
 
-	// Verify AG is closed
 	var status string
 	env.S.GetDB().QueryRow("SELECT status FROM alert_groups WHERE alert_key = $1", "test_resolve_all_1").Scan(&status)
-	if status != string(model.AlertGroupStatusClosed) {
-		t.Errorf("Expected status Closed, got %s", status)
+	if status != string(model.AlertGroupStatusResolved) {
+		t.Errorf("Expected status Resolved, got %s", status)
 	}
 }
 
@@ -1601,10 +1594,8 @@ func TestPipeline_EscalationUnlinked(t *testing.T) {
 // TestPipeline_CancelDuringExecution tests the real ack-driven cancellation path.
 //
 // The cancellation happens inside AckAlertGroupAtomic itself, in the same
-// transaction as the status change - not in the ProcessAcknowledgedAlertGroups
-// pass that follows, whose own cancel is a second, idempotent one. The comment
-// used to credit the later pass, which made this test look like it covered a
-// path it does not.
+// transaction as the status change. There is no later pass to credit it to any
+// more: the loop that used to run one is gone.
 //
 // The DM step (stage 1) has a delay, so it is still blocked/pending when ack
 // fires - which is what verifies that cancel reaches pending stages.
@@ -1672,14 +1663,9 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 		t.Fatal("Expected ack to succeed")
 	}
 
-	// Stop dispatcher loop before ack processing to avoid race
+	// Stop the dispatcher loop so nothing is running while this is read.
 	cancel()
 	time.Sleep(200 * time.Millisecond) // let goroutine drain
-
-	// Run the ack processing. Its own cancel is the second, idempotent one: the
-	// job was already cancelled inside AckAlertGroupAtomic above.
-	ackCtx := context.Background()
-	env.Disp.ProcessAcknowledgedAlertGroups(ackCtx)
 
 	// Verify the delayed page was withdrawn. It had not gone out - it was five
 	// minutes away - so acknowledging the alert takes it back rather than

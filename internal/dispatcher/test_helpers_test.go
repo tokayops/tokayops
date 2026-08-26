@@ -71,29 +71,27 @@ func withLegacySteps(d *Dispatcher) *Dispatcher {
 // escalation executor - so none of them would notice production putting one
 // back. This one asks the real constructor.
 //
-// A step type that resolves is a step type something can execute, and an
-// escalation is not the job engine's work any more. A leftover job from before
-// the cutover has to FAIL on its first step, so that it stops without producing
-// the effect it was written for - not so that its group is escalated again,
-// which a destructive upgrade does not promise.
+// A step type that resolves is a step type something can execute, and neither
+// an escalation nor the state of its cards is the job engine's work any more. A
+// leftover job from before the cutover has to FAIL on its first step, so that
+// it stops without producing the effect it was written for - not so that its
+// group is escalated again, which a destructive upgrade does not promise.
 func TestTheEscalationStepTypesAreGone(t *testing.T) {
 	d, err := NewDispatcher(store.NewMockStore(), &config.Config{})
 	if err != nil {
 		t.Fatalf("NewDispatcher: %v", err)
 	}
 
-	for _, stepType := range []string{"dm", "channel", "firehose"} {
+	for _, stepType := range []string{"dm", "channel", "firehose", "update", "resolve"} {
 		if _, registered := d.executors[stepType]; registered {
-			t.Errorf("%q still has an executor, so an escalation job would run "+
-				"beside the outbound domain", stepType)
+			t.Errorf("%q still has an executor, so a job would run beside the "+
+				"outbound domain", stepType)
 		}
 	}
 
-	// And the ones that are still the job engine's work are still there, so
-	// this test fails for the right reason if the registry is emptied wholesale.
-	for _, stepType := range []string{"resolve", "update", "handoff_notify"} {
-		if _, registered := d.executors[stepType]; !registered {
-			t.Errorf("%q lost its executor", stepType)
-		}
+	// And the one that is still the job engine's work is still there, so this
+	// test fails for the right reason if the registry is emptied wholesale.
+	if _, registered := d.executors["handoff_notify"]; !registered {
+		t.Error("handoff_notify lost its executor")
 	}
 }
