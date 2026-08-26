@@ -46,6 +46,18 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   It does NOT block the upgrade, and the note below is about something else. An
   escalation still running is recognised, so the startup check lets it through;
   it is its first remaining step that fails, once the new version is up.
+- **Update and resolve jobs in flight do not survive this upgrade either, and
+  the cards they were going to edit stay as they are.** Keeping an alert group's
+  messages current is no longer a background job: what a message has to show is
+  a revision of the alert group, applied by the delivery worker that made the
+  message. The old jobs are still classifiable, so the startup check lets them
+  through, and each one fails on its first step once the new version is up.
+
+  What that costs is one edit, not an alert: the card keeps whatever it last
+  showed. Cards posted by the version before the escalation cutover are not
+  brought up to date by this version at all - it addresses a message by the
+  receipt the commitment recorded, and those cards have none. Alerts that arrive
+  afterwards get new cards, which are kept current.
 - The upgrade refuses to run while a job it cannot classify is still executing,
   and names the job in the message. That job either finishes or is cancelled,
   and the upgrade is started again. The alternative would be to let it run on

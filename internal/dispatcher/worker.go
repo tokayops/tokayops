@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
@@ -34,7 +33,6 @@ type Provider interface {
 
 type Dispatcher struct {
 	store     store.StoreInterface
-	cfg       *config.Config
 	providers *ProviderRegistry
 	// WorkerID is a per-process identity used only for log correlation. It is
 	// NOT the lease token: ClaimNextJobSteps generates locked_by in the DB
@@ -45,17 +43,13 @@ type Dispatcher struct {
 	executors map[string]StepExecutor
 }
 
-func NewDispatcher(s store.StoreInterface, cfg *config.Config) (*Dispatcher, error) {
+func NewDispatcher(s store.StoreInterface) (*Dispatcher, error) {
 	if s == nil {
 		return nil, errors.New("dispatcher requires store")
-	}
-	if cfg == nil {
-		cfg = &config.Config{}
 	}
 
 	d := &Dispatcher{
 		store:     s,
-		cfg:       cfg,
 		providers: NewProviderRegistry(s),
 		executors: make(map[string]StepExecutor),
 		WorkerID:  uuid.New().String(),
@@ -65,9 +59,15 @@ func NewDispatcher(s store.StoreInterface, cfg *config.Config) (*Dispatcher, err
 	// escalation executor, and "update" and "resolve" with the loops that
 	// produced them: what a message has to show is a revision of the alert
 	// group now, applied by the delivery worker, and nothing builds job steps
-	// for it. A job step left over from before this change finds no executor
-	// and fails, which is what the upgrade's stop-the-world cutover exists to
-	// make impossible.
+	// for one.
+	//
+	// A step of the old kinds left over from before the cutover finds no
+	// executor and fails. Stopping every instance does not prevent that - the
+	// rows are durable, and the start-up check classifies them and lets them
+	// through - so the cost is accepted rather than defended against: the work
+	// those jobs carried is lost, and the CHANGELOG says so. Failing loudly on
+	// the first step is the point. The alternative, a step type that resolves
+	// to something, would mean the new build sending what an old one planned.
 	handoffExec := NewHandoffExecutor(d.providers)
 	d.RegisterExecutor("handoff_notify", handoffExec)
 
