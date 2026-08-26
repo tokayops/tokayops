@@ -271,25 +271,32 @@ func TestARepeatedPayloadCostsNothing(t *testing.T) {
 	intentID := changeableCard(t, s, agID)
 
 	same := []model.Alert{{
-		Fingerprint: "fp-1", Status: model.AlertStatusFiring,
-		StartsAt: time.Unix(1700000000, 0),
-		Labels:   map[string]string{"alertname": "DiskWillFill"},
+		Fingerprint: "fp-2", Status: model.AlertStatusFiring,
+		StartsAt: time.Unix(1700000600, 0),
+		Labels:   map[string]string{"alertname": "DiskSlow"},
 	}}
-	// The first one is what the group already holds, so it is already a repeat.
+	// One real payload first, so that what is stored is what this group renders
+	// to. Without it every comparison below is against the state the fixture
+	// admitted from, and a repeat would look like news for that reason instead
+	// of being caught by the rule under test.
+	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
+		"desired-"+agID, same, "ingester"); err != nil {
+		t.Fatalf("the first payload: %v", err)
+	}
+
 	before := readCard(t, s, intentID)
-	var attemptsBefore, eventsBefore int
-	countWork := func() (int, int) {
+	countWork := func() (attempts, events int, version int64) {
 		t.Helper()
-		var attempts, events int
-		if err := s.db.QueryRow(
-			`SELECT (SELECT count(*) FROM outbound_attempts WHERE intent_id = $1),
-			        (SELECT count(*) FROM outbound_intent_events WHERE intent_id = $1)`,
-			intentID).Scan(&attempts, &events); err != nil {
+		if err := s.db.QueryRow(`
+			SELECT (SELECT count(*) FROM outbound_attempts WHERE intent_id = $1),
+			       (SELECT count(*) FROM outbound_intent_events WHERE intent_id = $1),
+			       (SELECT render_source_version FROM alert_groups WHERE id = $2)`,
+			intentID, agID).Scan(&attempts, &events, &version); err != nil {
 			t.Fatalf("count the work: %v", err)
 		}
-		return attempts, events
+		return attempts, events, version
 	}
-	attemptsBefore, eventsBefore = countWork()
+	attemptsBefore, eventsBefore, versionBefore := countWork()
 
 	for i := 0; i < 3; i++ {
 		result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
@@ -305,9 +312,20 @@ func TestARepeatedPayloadCostsNothing(t *testing.T) {
 	if now := readCard(t, s, intentID); now != before {
 		t.Errorf("three repeats moved the commitment: %+v -> %+v", before, now)
 	}
-	if attempts, events := countWork(); attempts != attemptsBefore || events != eventsBefore {
+	attempts, events, versionAfter := countWork()
+	if attempts != attemptsBefore || events != eventsBefore {
 		t.Errorf("three repeats produced %d attempt(s) and %d journal line(s)",
 			attempts-attemptsBefore, events-eventsBefore)
+	}
+
+	// And nothing was WRITTEN either. Every check above is downstream of the
+	// digest, which would answer "unchanged" for a rewrite of the same alerts
+	// just as it does for no write at all - so the alert group's own version is
+	// what separates the two. It counts every write that could change what a
+	// message says, so a repeat that reached the row moves it.
+	if versionAfter != versionBefore {
+		t.Errorf("three repeats rewrote the alert group %d time(s)",
+			versionAfter-versionBefore)
 	}
 }
 

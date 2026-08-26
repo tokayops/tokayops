@@ -73,11 +73,12 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   messages have to show, and each message is brought to that on its own. In
   practice: fewer edits, and the ones that happen say the right thing.
 - **The Ack and Resolve buttons in Slack answer with a short confirmation, and
-  the card turns yellow a moment later** rather than being replaced on the
+  the card is brought up to date separately** rather than being replaced on the
   spot. Replacing it immediately meant two things writing the same message with
   nothing deciding the order, and an alert that arrived at that moment could be
   rubbed out of the card until the next one came. The confirmation is still
-  instant; the card follows within about a second.
+  instant; the card follows once the delivery worker picks the change up, which
+  is usually the next second and can be longer when there is a backlog.
 - **A resolved alert group stays "resolved".** The extra "closed" state it moved
   to afterwards no longer happens. It rendered identically, every filter that
   excluded one excluded the other, and what it really recorded - that the
@@ -196,7 +197,9 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   fire on a decision that was made on purpose. `outbound_card_staleness_seconds`
   is how long the oldest one still owed has been behind, and leaves `abandoned`
   out for the same reason. `outbound_desired_revisions_total` counts what came
-  of each change to an alert, by what caused it: only `applied` created work.
+  of each change to an alert, by what caused it: only `applied` can create
+  work - an alert group with no editable message applies a change that reaches
+  nobody, which is normal and still counted.
 - `storage_contract_failures_total` counts durable rows that no longer parse.
   Any increase is a data problem to look at, not a transient failure.
 
