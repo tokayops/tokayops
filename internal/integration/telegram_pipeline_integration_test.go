@@ -348,9 +348,10 @@ func TestTelegramPipeline_StartLinkingAndSecretGuard(t *testing.T) {
 	}
 }
 
-// deliverCardForLinkedUser ingests a critical alert, runs the pipeline to deliver
-// the telegram channel card, links an admin user's telegram id, and starts the
-// dispatcher loop (so ack/resolution update jobs execute). Returns the AG.
+// deliverCardForLinkedUser ingests a critical alert, runs the pipeline to
+// deliver the telegram channel card and links an admin user's telegram id.
+// Bringing the card to a later revision is the delivery worker's, not the
+// dispatcher's. Returns the AG.
 func deliverCardForLinkedUser(t *testing.T, env *tgPipelineEnv, ctx context.Context, dedup, email, externalID string) *model.AlertGroup {
 	t.Helper()
 	user := testutil.SeedUser(t, env.S, email)

@@ -110,13 +110,12 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   identified by the shift change it announces, and that identity is kept for
   good rather than for as long as the notification takes to send.
 - An alert that arrives while the group's message is being updated is no longer
-  left out of it. Three things could lose one: the mark that said "this message
-  is out of date" was cleared by an update that had been built before the alert
-  arrived; it was written separately from the alert itself, so an interruption
-  in between kept the alert and dropped the mark; and a notification that
-  appeared while the update was being prepared was taken as proof that no update
-  was needed. An alert and the mark are now recorded together, and the mark is
-  cleared only once an update job has accepted that change.
+  left out of it. The mark that said "this message is out of date" was written
+  separately from the alert itself and could be cleared by an update prepared
+  before the alert arrived, so an alert could land in no message at all. There
+  is no mark and no update job any more: applying an alert raises, in the same
+  commit, the revision its messages have to show, and each message is brought to
+  that revision by the worker that made it.
 - An alert no longer loses its page when the on-call state cannot be read. A
   policy step aimed at a schedule used to escalate to nobody if the read failed
   at that moment, and nothing retried it, so the person on duty was never told.

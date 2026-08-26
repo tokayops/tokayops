@@ -101,9 +101,9 @@ func NewProvider(tokenSource TokenSource, selfURL string, opts ...Option) *Provi
 	return p
 }
 
-// Data is the opaque provider payload stored in a delivery row: the
-// coordinates needed to edit the message later. No timeline ts (Telegram v1 has
-// no threads) and no stored permalink (derived on demand in Permalink).
+// Data is what a commitment records about the message it made: the coordinates
+// needed to edit it later. Nothing else - Telegram has no thread, and a
+// permalink exists only for a public chat and has no reader in this build.
 type Data struct {
 	ChatID    string `json:"chat_id"`
 	MessageID int    `json:"message_id"`

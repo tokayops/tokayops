@@ -891,7 +891,10 @@ func TestPipeline_FirehoseOnly(t *testing.T) {
 	}
 }
 
-// TestPipeline_ResolutionAllDeliveries verifies that resolution job resolves ALL updatable deliveries
+// TestPipeline_ResolutionAllDeliveries: an alert with two commitments under it,
+// resolved. What it holds today is that the group owes nobody anything and
+// stays resolved - no job resolves anything, and each card is brought to the
+// resolving revision by the worker that made it.
 func TestPipeline_ResolutionAllDeliveries(t *testing.T) {
 	env := setupIntegrationTest(t)
 

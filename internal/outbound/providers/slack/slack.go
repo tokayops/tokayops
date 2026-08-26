@@ -28,10 +28,11 @@ var ErrUserNotFound = errors.New("slack user not found")
 // client, no lease over it and no retry - simply stops syncing until the
 // process is restarted.
 //
-// It bounds a CALL, not a delivery, and duplicates are not what it fixes.
-// sendCard makes three calls, so a step can still outlive the 60s job lease and
-// be re-claimed; and a timeout can fire on a request Slack already accepted,
-// which the retry then sends again. Both are accepted - see the register.
+// It bounds a CALL, not a delivery, and duplicates are not what it fixes: a
+// timeout can fire on a request Slack already accepted, and the retry then
+// sends it again. That is accepted - see the register. An attempt is one call
+// now, so the older half of this note, about a step outliving its job lease
+// while making three, no longer applies.
 const HTTPTimeout = 30 * time.Second
 
 // NewClient is the only place a Slack client is built, so the timeout
