@@ -227,16 +227,29 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 
 	batchID := uuid.New().String()
 	var admittedAt time.Time
+	// The state this set was admitted from, frozen with the claim. It is what a
+	// one-shot message renders forever after: the group's own snapshot moves
+	// on, and a direct message that followed it would send different bytes
+	// under a key that says they are the same request.
+	frozen, err := json.Marshal(admission.Snapshot)
+	if err != nil {
+		return outbound.SubmitResult{}, fmt.Errorf("freeze the admitted state: %w", err)
+	}
+
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO outbound_batches
 			(id, batch_key, key_kind, delivery_family, grammar_version, alert_group_id,
-			 fingerprint, fingerprint_version, admission_outcome, intent_count)
-		VALUES ($1, $2, $3, 'notification', $4, $5, $6, $7, $8, $9)
+			 fingerprint, fingerprint_version, admission_outcome, intent_count,
+			 admission_snapshot, admission_digest, admission_schema_version,
+			 admission_revision)
+		VALUES ($1, $2, $3, 'notification', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (batch_key) DO NOTHING
 		RETURNING id, admitted_at`,
 		batchID, admission.BatchKey, string(admission.Kind), admission.GrammarVersion,
 		admission.AlertGroupID, admission.Fingerprint, admission.FingerprintVersion,
 		string(admission.Outcome), len(admission.Commitments),
+		frozen, admission.Snapshot.Digest(), admission.SnapshotSchemaVersion,
+		admission.Revision,
 	).Scan(&batchID, &admittedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1129,6 +1142,59 @@ func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (sto
 	if err != nil {
 		return storedSnapshot{}, err
 	}
+	return checkedSnapshot(raw, revision, schemaVersion, digest, final, alertGroupID)
+}
+
+// admittedSnapshotTx reads the state a batch was admitted from - the one a
+// one-shot message renders forever.
+//
+// A direct message is one external effect under one provider key. If it
+// rendered the group's current state, a retry would carry different bytes under
+// the identity of the first request, and a provider that lost its answer to
+// that request would receive a different one as though it were the same. The
+// card is the opposite case and reads the group: bringing it up to date is what
+// it is for.
+func admittedSnapshotTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent) (storedSnapshot, error) {
+	var (
+		raw           []byte
+		revision      sql.NullInt64
+		schemaVersion sql.NullInt64
+		digest        []byte
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT b.admission_snapshot, b.admission_revision, b.admission_schema_version,
+		       b.admission_digest
+		FROM outbound_batches b
+		JOIN outbound_intents i ON i.batch_id = b.id
+		WHERE i.id = $1`, intent.ID).Scan(&raw, &revision, &schemaVersion, &digest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storedSnapshot{}, undeliverablef(
+			"commitment %s has no admission to render from", intent.ID)
+	}
+	if err != nil {
+		return storedSnapshot{}, err
+	}
+	if raw == nil {
+		return storedSnapshot{}, undeliverablef(
+			"the admission of %s froze no state, and this commitment renders from one", intent.ID)
+	}
+	return checkedSnapshot(raw, revision.Int64, int(schemaVersion.Int64), digest,
+		false, intent.AlertGroupID)
+}
+
+// attemptStateTx is the state one attempt renders, chosen by what the
+// commitment is: a card follows the alert, a message does not.
+func attemptStateTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent) (storedSnapshot, error) {
+	if intent.Form == outbound.FormEditable {
+		return lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+	}
+	return admittedSnapshotTx(ctx, tx, intent)
+}
+
+// checkedSnapshot proves a stored snapshot is the same thing that went in,
+// whichever row it came out of.
+func checkedSnapshot(raw []byte, revision int64, schemaVersion int, digest []byte,
+	final bool, alertGroupID string) (storedSnapshot, error) {
 
 	// A version this build does not know is a deployment that is behind, not a
 	// broken alert: the instance that wrote it renders it perfectly well. It

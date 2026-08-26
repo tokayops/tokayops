@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/integrations"
 	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/model"
@@ -265,18 +266,91 @@ func (m *MockStore) UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResu
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) UpdateAlertGroupAlerts(id string, alerts []model.Alert) error {
+// ApplyAlertmanagerUpdateAtomic mirrors the store: the incident that is open
+// decides what the payload means, and it decides while holding it.
+//
+// One lock over the whole call, which is the guarantee the row lock gives - a
+// second payload for the same alert cannot read the set this one is about to
+// change and then act on what it read.
+//
+// What it does NOT model, and what therefore may not be asserted through it:
+// the withdrawal of what an incident still owes when it ends, and the revision
+// its messages are brought to. There are no commitments in here to withdraw and
+// no snapshot to raise. The outcomes ARE the same as the database's, and a test
+// proves that - see TestTheMockAndTheDatabaseAnswerAPayloadAlike; anything
+// beyond the outcome has to be asserted against a real one.
+func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
+	incoming []model.Alert, actor string) (alertgroup.MergeResult, error) {
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ag, ok := m.alertGroups[id]; ok {
-		ag.Alerts = make([]model.Alert, len(alerts))
-		copy(ag.Alerts, alerts)
-		ag.UpdatedAt = time.Now()
-		ag.RenderSourceVersion++
-		return nil
+	var group *model.AlertGroup
+	for _, ag := range m.alertGroups {
+		if ag.AlertKey == alertKey &&
+			ag.Status != model.AlertGroupStatusResolved &&
+			ag.Status != model.AlertGroupStatusClosed {
+			group = ag
+			break
+		}
 	}
-	return sql.ErrNoRows
+	if group == nil {
+		return alertgroup.MergeResult{Outcome: alertgroup.MergeNoActive}, nil
+	}
+
+	held := alertgroup.FingerprintsOf(group.Alerts)
+	relevant := alertgroup.FilterMergeable(incoming, held)
+	if len(relevant) == 0 {
+		return alertgroup.MergeResult{
+			Outcome: alertgroup.MergeIgnored, AlertGroupID: group.ID,
+		}, nil
+	}
+
+	merged := alertgroup.MergeAlerts(group.Alerts, relevant)
+	resolving := alertgroup.AllResolved(merged)
+	if !resolving && alertgroup.SameAlerts(group.Alerts, merged) {
+		return alertgroup.MergeResult{
+			Outcome: alertgroup.MergeUnchanged, AlertGroupID: group.ID,
+		}, nil
+	}
+
+	now := time.Now()
+	events := alertgroup.MergeTimelineEvents(group.ID, relevant, held, now)
+	group.Alerts = merged
+	group.UpdatedAt = now
+	group.RenderSourceVersion++
+
+	outcome := alertgroup.MergeMerged
+	if resolving {
+		events = append(events, &model.TimelineEvent{
+			ID:           uuid.New().String(),
+			AlertGroupID: group.ID,
+			Type:         model.TimelineEventResolved,
+			Message:      "Alert group resolved: all alerts cleared",
+			Actor:        actor,
+			CreatedAt:    now.Add(time.Duration(len(events)+1) * time.Microsecond),
+		})
+		group.Status = model.AlertGroupStatusResolved
+		group.ResolvedBy = actor
+		group.ResolvedAt = &now
+
+		payload, err := model.BuildWebhookEventPayload(
+			model.OutboxEventResolved, group, group.TeamNameSnapshot, actor, "", now)
+		if err != nil {
+			return alertgroup.MergeResult{}, err
+		}
+		m.insertOutboxEvent(&model.OutboxEvent{
+			EventType:    model.OutboxEventResolved,
+			AlertGroupID: group.ID,
+			TeamID:       group.TeamID,
+			Actor:        actor,
+			Payload:      payload,
+		})
+		outcome = alertgroup.MergeResolved
+	}
+	m.timelineEvents[group.ID] = append(m.timelineEvents[group.ID], events...)
+
+	return alertgroup.MergeResult{Outcome: outcome, AlertGroupID: group.ID}, nil
 }
 
 func (m *MockStore) GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, error) {
@@ -750,43 +824,6 @@ func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]st
 	return true, nil
 }
 
-func (m *MockStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ag, ok := m.alertGroups[id]
-	if !ok {
-		return false, nil
-	}
-	if ag.Status != model.AlertGroupStatusNew &&
-		ag.Status != model.AlertGroupStatusProcessing &&
-		ag.Status != model.AlertGroupStatusTriggered &&
-		ag.Status != model.AlertGroupStatusAcknowledged {
-		return false, nil
-	}
-
-	now := time.Now()
-	ag.Alerts = make([]model.Alert, len(alerts))
-	copy(ag.Alerts, alerts)
-	ag.Status = model.AlertGroupStatusResolved
-	ag.ResolvedBy = "system"
-	ag.ResolvedAt = &now
-	ag.UpdatedAt = now
-	ag.RenderSourceVersion++
-
-	for _, e := range timelineEvents {
-		eventCopy := *e
-		if eventCopy.CreatedAt.IsZero() {
-			eventCopy.CreatedAt = now
-		}
-		m.timelineEvents[id] = append(m.timelineEvents[id], &eventCopy)
-	}
-
-	m.insertOutboxEvent(outboxEvent)
-
-	return true, nil
-}
-
 func (m *MockStore) TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -816,24 +853,6 @@ func (m *MockStore) MarkAckProcessed(agID string) error {
 		return nil
 	}
 	return sql.ErrNoRows
-}
-
-// UpdateAlertGroupAlertsAndRaiseSlackUpdate mirrors the store: the alerts, the
-// flag and its version move in one write, so no state exists in which the alert
-// is recorded and the gate is down.
-func (m *MockStore) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ag, ok := m.alertGroups[id]
-	if !ok {
-		return sql.ErrNoRows
-	}
-	ag.Alerts = append([]model.Alert(nil), alerts...)
-	ag.SlackUpdatePending = true
-	ag.RenderSourceVersion++
-	ag.UpdatedAt = time.Now()
-	return nil
 }
 
 // ClearSlackUpdate mirrors the store's conditional clear, including the answer

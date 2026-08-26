@@ -3,9 +3,12 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/metrics"
+	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
@@ -233,8 +236,20 @@ func TestEveryDoorIntoATerminalStateIsCounted(t *testing.T) {
 			open: func(t *testing.T) {
 				agID := outboundGroup(t, s)
 				admitOne(t, s, agID, channelCommitment("C0001", 0), dmCommitment("U0001"))
-				if changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, nil, nil, nil); err != nil || !changed {
-					t.Fatalf("auto-resolve: %v %v", changed, err)
+				var alertKey string
+				if err := s.db.QueryRow(
+					`SELECT alert_key FROM alert_groups WHERE id = $1`, agID).
+					Scan(&alertKey); err != nil {
+					t.Fatalf("read the alert key: %v", err)
+				}
+				result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
+					[]model.Alert{{
+						Fingerprint: "fp-1", Status: model.AlertStatusResolved,
+						StartsAt: time.Unix(1700000000, 0),
+						Labels:   map[string]string{"alertname": "DiskWillFill"},
+					}}, "system")
+				if err != nil || result.Outcome != alertgroup.MergeResolved {
+					t.Fatalf("auto-resolve came back %s (%v)", result.Outcome, err)
 				}
 			},
 		},

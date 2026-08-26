@@ -1,6 +1,7 @@
 package ingester
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -12,24 +13,31 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
-// errLookupStore wraps MockStore but returns a DB error from GetActiveAlertGroup.
-// Simulates transient DB failures (connection timeout, deadlock, etc.)
+// errLookupStore wraps MockStore and fails the one call a payload arrives
+// through. Simulates transient DB failures (connection timeout, deadlock).
+//
+// It used to fail the lookup that preceded the decision. There is no such
+// lookup any more: what a payload means is worked out inside the command, under
+// the lock, so that is where a database that is having a bad minute shows up.
 type errLookupStore struct {
 	*store.MockStore
 	lookupErr error
 }
 
-func (s *errLookupStore) GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error) {
+func (s *errLookupStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
+	incoming []model.Alert, actor string) (alertgroup.MergeResult, error) {
+
 	if s.lookupErr != nil {
-		return nil, s.lookupErr
+		return alertgroup.MergeResult{}, s.lookupErr
 	}
-	return s.MockStore.GetActiveAlertGroupByAlertKey(alertKey)
+	return s.MockStore.ApplyAlertmanagerUpdateAtomic(ctx, alertKey, incoming, actor)
 }
 
 // duplicateKeyStore simulates a race condition:
@@ -231,8 +239,8 @@ func TestRegression_MergeDoesNotRegressTriggeredStatus(t *testing.T) {
 	}
 
 	// Verify: slack_update_pending should be true
-	if !storedAG.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be true after merge")
+	if storedAG.RenderSourceVersion == 0 {
+		t.Error("the version a producer reads did not move for a new alert")
 	}
 }
 
@@ -333,68 +341,54 @@ func TestRegression_TeamDBError_Returns500(t *testing.T) {
 	}
 }
 
-// concurrentResolveStore simulates a race condition where another request
-// (manual/slack resolve) wins the CAS race and resolves the AG between
-// the ingester's GetActiveAlertGroup read and the atomic resolve call.
-type concurrentResolveStore struct {
-	*store.MockStore
-}
-
-func (s *concurrentResolveStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
-	// Simulate: another request resolved the AG between our read and this call
-	return false, nil
-}
-
-// TestRegression_ConcurrentResolve_AlertsConverge verifies that when the atomic
-// resolve returns changed=false (concurrent manual resolve won), the ingester
-// still syncs alerts_data via best-effort UpdateAlertGroupAlerts.
-func TestRegression_ConcurrentResolve_AlertsConverge(t *testing.T) {
+// TestAResolvePayloadThatLostTheRaceBelongsToNobody.
+//
+// A person resolved the incident while Alertmanager was sending its own
+// resolution. The payload then finds nothing open: a resolved incident is
+// finished, and a payload carrying only resolutions has no next incident to
+// start either.
+//
+// So nothing is written - not the alerts, not an event. The alert set of a
+// finished incident is what it was when it ended, which is the cost named with
+// the sync that used to happen here: the card never changed because of it
+// anyway, since a resolved incident takes no further revisions.
+func TestAResolvePayloadThatLostTheRaceBelongsToNobody(t *testing.T) {
 	mock := store.NewMockStore()
 
-	// Pre-create an active AG with a firing alert
-	ag := &model.AlertGroup{
+	mock.CreateAlertGroup(&model.AlertGroup{
 		ID: "ag-race-resolve", AlertKey: "race-resolve-group",
-		Status: model.AlertGroupStatusTriggered, TeamID: "triage", TeamNameSnapshot: "triage",
+		Status: model.AlertGroupStatusResolved, TeamID: "triage", TeamNameSnapshot: "triage",
 		Severity: "warning",
 		Alerts: []model.Alert{
-			{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "TestAlert"}},
+			{Fingerprint: "fp1", Status: model.AlertStatusFiring,
+				Labels: map[string]string{"alertname": "TestAlert"}},
 		},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
-	}
-	mock.CreateAlertGroup(ag)
-
-	raceStore := &concurrentResolveStore{MockStore: mock}
+	})
 
 	validator := &mockSecretValidator{secrets: map[string]bool{"secret": true}}
-	ing := NewIngester(raceStore, &config.Config{}, validator)
+	ing := NewIngester(mock, &config.Config{}, validator)
 	e := echo.New()
 	ing.RegisterRoutes(e)
 
-	// Send resolve webhook — atomic call returns changed=false, but alerts should still sync
 	payload := `{"status":"resolved","groupKey":"race-resolve-group","alerts":[{"status":"resolved","labels":{"alertname":"TestAlert"},"fingerprint":"fp1"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret", strings.NewReader(payload))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
 
-	// Must be 200 (idempotent)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("Expected 200, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
-	if rec.Body.String() != "Resolved" {
-		t.Errorf("Expected 'Resolved', got '%s'", rec.Body.String())
+	if rec.Body.String() != "Ignored Resolved" {
+		t.Errorf("Expected 'Ignored Resolved', got '%s'", rec.Body.String())
 	}
 
-	// Verify alerts_data was synced via best-effort UpdateAlertGroupAlerts
+	// The finished incident is not rewritten, and nobody is told twice.
 	storedAG, _ := mock.GetAlertGroupByID("ag-race-resolve")
-	if len(storedAG.Alerts) != 1 {
-		t.Fatalf("Expected 1 alert, got %d", len(storedAG.Alerts))
+	if storedAG.Status != model.AlertGroupStatusResolved {
+		t.Errorf("the incident is %s", storedAG.Status)
 	}
-	if storedAG.Alerts[0].Status != model.AlertStatusResolved {
-		t.Errorf("Expected alert status 'resolved' (data converged), got '%s'", storedAG.Alerts[0].Status)
-	}
-
-	// No outbox events — the race loser shouldn't create duplicate events
 	events, _ := mock.GetPendingOutboxEvents(10)
 	if len(events) != 0 {
 		t.Errorf("Expected 0 outbox events (race loser), got %d", len(events))
@@ -659,8 +653,8 @@ func TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp(t *testing.T)
 	if got := fingerprints(stored); len(got) != 1 || got["A"] != model.AlertStatusFiring {
 		t.Errorf("group holds %v, want only A firing", got)
 	}
-	if stored.SlackUpdatePending {
-		t.Error("SlackUpdatePending = true, want false - nothing changed, so no card re-render")
+	if stored.RenderSourceVersion != 0 {
+		t.Error("a payload that changed nothing moved the version anyway")
 	}
 	// Both MockStore writes bump UpdatedAt, so an untouched timestamp proves neither ran.
 	if !stored.UpdatedAt.Equal(created) {

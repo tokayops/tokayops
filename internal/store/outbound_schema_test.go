@@ -25,11 +25,19 @@ func outboundGroup(t *testing.T, s *Store) string {
 	t.Helper()
 	id := uuid.New().String()
 	if err := s.CreateAlertGroup(&model.AlertGroup{
-		ID:        id,
-		AlertKey:  "outbound-" + id,
-		Status:    model.AlertGroupStatusProcessing,
-		Title:     "outbound schema fixture",
-		Severity:  "critical",
+		ID:       id,
+		AlertKey: "outbound-" + id,
+		Status:   model.AlertGroupStatusProcessing,
+		Title:    "outbound schema fixture",
+		Severity: "critical",
+		// One firing alert, because a group without any cannot be resolved by
+		// an Alertmanager payload: a resolution for a fingerprint the incident
+		// has never held belongs to an incident that is already over.
+		Alerts: []model.Alert{{
+			Fingerprint: "fp-1", Status: model.AlertStatusFiring,
+			StartsAt: time.Unix(1700000000, 0),
+			Labels:   map[string]string{"alertname": "DiskWillFill"},
+		}},
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}); err != nil {

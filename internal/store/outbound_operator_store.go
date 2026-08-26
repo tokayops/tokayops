@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 )
@@ -32,6 +34,20 @@ import (
 // rolled back would report an ending that never happened - and the alert on
 // that counter fires on any increment at all.
 func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, actor string) (int, error) {
+	return cancelIntentsAtTx(ctx, tx, alertGroupID, reason, actor, time.Time{})
+}
+
+// cancelIntentsAtTx is the same withdrawal with the instant its history line
+// takes.
+//
+// A caller that has already written history in this transaction has to hand one
+// in. Those lines carry microsecond offsets from a single instant, and a line
+// that took now() instead would sort BEFORE them - so the history would say the
+// notifications were withdrawn before the alert that withdrew them cleared. The
+// zero value means "whenever this lands", which is right for a transition that
+// wrote nothing before it.
+func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, actor string,
+	at time.Time) (int, error) {
 	// Nothing has gone out and nothing will: these are withdrawn outright, and
 	// the lease goes with them so the worker holding one finds out at its next
 	// compare-and-set.
@@ -95,8 +111,20 @@ func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, acto
 	// One line in the alert's history, and a line each in the commitments' own:
 	// the group's timeline says what happened to the alert, and the journal says
 	// what happened to every promise it had made.
-	if err := addTimelineTx(ctx, tx, alertGroupID, model.TimelineEventNotificationFailed,
-		fmt.Sprintf("%d pending notification(s) withdrawn: %s", touched, reason), actor); err != nil {
+	line := fmt.Sprintf("%d pending notification(s) withdrawn: %s", touched, reason)
+	if at.IsZero() {
+		if err := addTimelineTx(ctx, tx, alertGroupID,
+			model.TimelineEventNotificationFailed, line, actor); err != nil {
+			return 0, err
+		}
+	} else if err := addTimelineEventsTx(ctx, tx, []*model.TimelineEvent{{
+		ID:           uuid.New().String(),
+		AlertGroupID: alertGroupID,
+		Type:         model.TimelineEventNotificationFailed,
+		Message:      line,
+		Actor:        actor,
+		CreatedAt:    at,
+	}}); err != nil {
 		return 0, err
 	}
 	return withdrawn, nil
@@ -219,7 +247,8 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	// nothing and sends nothing, and state nobody can read must not be able to
 	// trap a commitment whose one remaining option is to be called off.
 	final := false
-	if intent.GroupBound() && decisionNeedsState(req.Decision, intent.Form) {
+	if intent.Form == outbound.FormEditable && intent.GroupBound() &&
+		decisionNeedsState(req.Decision, intent.Form) {
 		stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
 		if err != nil {
 			return outbound.ResolveAmbiguityResult{}, err
@@ -296,10 +325,11 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 func decisionNeedsState(decision outbound.Decision, form outbound.Form) bool {
 	switch decision {
 	case outbound.DecisionAssumeAccepted:
-		// It claims a message arrived. Which revision that message carried,
-		// and whether it was the last one, are facts of the state - not of the
-		// person deciding.
-		return true
+		// It claims a message arrived. Whether that was the LAST revision is a
+		// fact of the state rather than of the person deciding - and only a
+		// card has later revisions, so only a card has to ask. A one-shot
+		// message renders what its admission froze and is done either way.
+		return form == outbound.FormEditable
 	case outbound.DecisionRetryCurrentGeneration:
 		// A card that is going to be sent again has to be aimed at where the
 		// alert is now. A one-shot has nothing to re-aim.

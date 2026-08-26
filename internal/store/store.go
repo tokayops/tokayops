@@ -1381,6 +1381,16 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 		return false, err
 	}
 
+	// 5. And what the group still HAS out there is told that the alert moved.
+	// The card is the domain's to keep current; this is where it learns there
+	// is something new to show.
+	if _, err := setDesiredStateTx(context.Background(), tx, s.render,
+		outbound.DesiredStateRequest{
+			AlertGroupID: id, Reason: outbound.DesiredAck, Actor: actor,
+		}); err != nil {
+		return false, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
@@ -1453,77 +1463,14 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 		return false, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	countWithdrawn(withdrawn)
-	return true, nil
-}
-
-// ResolveAlertGroupWithAlertsAtomic atomically resolves an alert group while updating its alerts data.
-// Used by the ingester when all incoming alerts are resolved (auto-resolve).
-// Allows transition from new/processing/triggered/acknowledged → resolved.
-// Returns (true, nil) if applied, (false, nil) if already resolved (idempotent).
-func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-
-	now := time.Now()
-	alertsJSON, _ := json.Marshal(alerts)
-
-	// 1. Conditional UPDATE — alerts_data + status + resolved fields
-	res, err := tx.Exec(
-		`UPDATE alert_groups
-		 SET alerts_data = $1, status = $2, resolved_by = 'system', resolved_at = $3, updated_at = $3,
-		     render_source_version = render_source_version + 1
-		 WHERE id = $4 AND status IN ($5, $6, $7, $8)`,
-		string(alertsJSON), model.AlertGroupStatusResolved, now, id,
-		model.AlertGroupStatusNew, model.AlertGroupStatusProcessing,
-		model.AlertGroupStatusTriggered, model.AlertGroupStatusAcknowledged,
-	)
-	if err != nil {
-		return false, err
-	}
-
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if rows == 0 {
-		return false, nil
-	}
-
-	// 2. INSERT timeline events
-	for _, e := range timelineEvents {
-		metaJSON := "{}"
-		if e.Metadata != nil {
-			if b, err := json.Marshal(e.Metadata); err == nil {
-				metaJSON = string(b)
-			}
-		}
-		_, err = tx.Exec(
-			`INSERT INTO timeline_events (id, alert_group_id, type, message, actor, metadata, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			e.ID, e.AlertGroupID, e.Type, e.Message, e.Actor, metaJSON, e.CreatedAt,
-		)
-		if err != nil {
-			return false, err
-		}
-	}
-
-	// 3. INSERT outbox event
-	if err := insertOutboxEventTx(tx, outboxEvent); err != nil {
-		return false, err
-	}
-
-	// 4. Withdraw what the group still owes: the alerts resolved themselves,
-	// and paging somebody about them now would be paging them about nothing.
-	withdrawn, err := cancelIntentsTx(context.Background(), tx, id,
-		"every alert in the group resolved", "system")
-	if err != nil {
+	// 5. The last revision a message will ever be brought to. It is raised even
+	// when nothing else about the alert changed: a commitment parked at an
+	// equal revision takes no further attempt, and the resolution would never
+	// reach the card.
+	if _, err := setDesiredStateTx(context.Background(), tx, s.render,
+		outbound.DesiredStateRequest{
+			AlertGroupID: id, Reason: outbound.DesiredResolve, Actor: actor,
+		}); err != nil {
 		return false, err
 	}
 
@@ -1766,15 +1713,6 @@ func scanNotificationDelivery(scanner notificationDeliveryScanner) (*model.Notif
 	return &d, nil
 }
 
-func (s *Store) UpdateAlertGroupAlerts(id string, alerts []model.Alert) error {
-	data, _ := json.Marshal(alerts)
-	query := `UPDATE alert_groups SET alerts_data = $1, updated_at = $2,
-	                 render_source_version = render_source_version + 1
-	          WHERE id = $3`
-	_, err := s.db.Exec(query, string(data), time.Now(), id)
-	return err
-}
-
 func (s *Store) GetProcessingAlertGroups() ([]*model.AlertGroup, error) {
 	// Include both processing and acknowledged (for Slack updates after Ack)
 	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups WHERE status IN ($1, $2)`
@@ -1843,47 +1781,6 @@ func (s *Store) MarkAckProcessed(agID string) error {
 		WHERE id = $1
 	`, agID)
 	return err
-}
-
-// UpdateAlertGroupAlertsAndRaiseSlackUpdate records a changed alert set and
-// says, in the same write, that the group's message no longer shows it.
-//
-// One statement rather than two calls, and that is the whole point: they used
-// to be an alerts write followed by a flag write, and a process that stopped
-// between them left the new alert stored with the gate down. Nothing would
-// raise it again either - Alertmanager repeating the payload finds the alerts
-// already recorded and merges nothing.
-//
-// The version goes up with every such write, monotonically, so a producer can
-// tell the state it read from the state that arrived while it worked.
-//
-// A group that is not there is an error and not a quiet no-op: the alerts have
-// to land somewhere, and a caller that is told nothing would answer its webhook
-// with 200 for a change it lost.
-func (s *Store) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error {
-	data, err := json.Marshal(alerts)
-	if err != nil {
-		return err
-	}
-	res, err := s.db.Exec(`
-		UPDATE alert_groups
-		   SET alerts_data = $1,
-		       slack_update_pending = TRUE,
-		       render_source_version = render_source_version + 1,
-		       updated_at = $2
-		 WHERE id = $3
-	`, string(data), time.Now(), id)
-	if err != nil {
-		return err
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
 }
 
 // ClearSlackUpdate lowers the gate for the version the caller read, and reports

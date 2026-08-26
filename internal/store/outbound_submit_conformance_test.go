@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 )
@@ -26,7 +27,8 @@ type admitting interface {
 	// scenario asks the store rather than the database.
 	eraseUser(t *testing.T, userID string)
 	TransitionAlertGroupStatus(id string, from, to model.AlertGroupStatus) (bool, error)
-	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
+	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
+		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
 	SubmitEscalationBatch(ctx context.Context,
 		adm outbound.EscalationAdmission) (outbound.SubmitResult, error)
 }
@@ -54,10 +56,8 @@ func TestBothStoresAdmitTheSameWay(t *testing.T) {
 			run: func(t *testing.T, s admitting, agID string) []outbound.SubmitOutcome {
 				adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
 				first := submitTo(t, s, adm)
-				if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(agID, []model.Alert{{
-					Fingerprint: "fp-late", Status: "firing", StartsAt: time.Now(),
-				}}); err != nil {
-					t.Fatalf("change the alert group: %v", err)
+				if err := alertJoins(s, agID); err != nil {
+					t.Fatalf("an alert joining the group: %v", err)
 				}
 				repeat := submitTo(t, s, adm)
 				sameClaim(t, first, repeat)
@@ -68,10 +68,8 @@ func TestBothStoresAdmitTheSameWay(t *testing.T) {
 			name: "a plan built before an alert joined is refused",
 			run: func(t *testing.T, s admitting, agID string) []outbound.SubmitOutcome {
 				adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
-				if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(agID, []model.Alert{{
-					Fingerprint: "fp-late", Status: "firing", StartsAt: time.Now(),
-				}}); err != nil {
-					t.Fatalf("change the alert group: %v", err)
+				if err := alertJoins(s, agID); err != nil {
+					t.Fatalf("an alert joining the group: %v", err)
 				}
 				stale := submitTo(t, s, adm)
 
@@ -163,6 +161,18 @@ func conformanceGroup(t *testing.T, s admitting) string {
 		t.Fatalf("create the alert group: %v", err)
 	}
 	return id
+}
+
+// alertJoins is a new alert arriving for the group, through the door a payload
+// actually comes in by. Both implementations answer it, which is what makes the
+// conformance meaningful.
+func alertJoins(s admitting, agID string) error {
+	_, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), "conformance-"+agID,
+		[]model.Alert{{
+			Fingerprint: "fp-late", Status: model.AlertStatusFiring,
+			StartsAt: time.Now(), Labels: map[string]string{"alertname": "Late"},
+		}}, "system")
+	return err
 }
 
 func submitTo(t *testing.T, s admitting, adm outbound.EscalationAdmission) outbound.SubmitResult {

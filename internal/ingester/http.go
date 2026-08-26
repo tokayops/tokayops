@@ -1,6 +1,7 @@
 package ingester
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
@@ -43,15 +45,16 @@ type Ingester struct {
 // the "this message is out of date" mark in the same write as the alerts
 // themselves, so no interruption can keep the alert and drop the mark.
 type alertIntake interface {
-	GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error)
 	CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) error
-	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
 
-	// The resolved-group path syncs alerts without raising anything: the
-	// message is updated by the resolution, not by this write.
-	UpdateAlertGroupAlerts(id string, alerts []model.Alert) error
-	ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (changed bool, err error)
-	AddTimelineEvent(e *model.TimelineEvent) error
+	// ApplyAlertmanagerUpdateAtomic applies a payload to the incident that is
+	// open, and decides under its lock whether that is a merge or the end of
+	// it. This layer does not decide: the read it would decide from is taken
+	// before anything is held, and two webhooks for one alert would then act on
+	// the same starting point and disagree.
+	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
+		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
+
 	GetTeamByID(id string) (*model.Team, error)
 }
 
@@ -105,15 +108,26 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	metrics.AlertsReceivedTotal.WithLabelValues(teamID, severity).Inc()
 	log.Printf("Ingester: Group %s (Team: %s, Sev: %s, Alerts: %d)", alertKey, teamID, severity, len(payload.Alerts))
 
-	// 3. Find Active Alert Group
-	active, err := i.store.GetActiveAlertGroupByAlertKey(alertKey)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		// Real DB error (not "not found") — return 500 so Alertmanager retries
-		log.Printf("Ingester: DB error looking up group %s: %v", alertKey, err)
-		return c.String(http.StatusInternalServerError, "DB lookup failed")
+	// 3. Apply it to the incident that is open, if there is one. What that
+	// means - a merge, the end of the incident, or nothing at all - is decided
+	// under the lock on the row, not here.
+	result, err := i.store.ApplyAlertmanagerUpdateAtomic(
+		c.Request().Context(), alertKey, payload.Alerts, "system")
+	if err != nil {
+		log.Printf("Ingester: Failed to apply the payload for %s: %v", alertKey, err)
+		return c.String(http.StatusInternalServerError, "Failed to persist")
 	}
-	if active != nil {
-		return i.mergeIntoGroup(c, active, payload.Alerts)
+	switch result.Outcome {
+	case alertgroup.MergeIgnored:
+		return c.String(http.StatusOK, "Ignored Resolved")
+	case alertgroup.MergeUnchanged:
+		return c.String(http.StatusOK, "Unchanged")
+	case alertgroup.MergeMerged:
+		log.Printf("Ingester: Updated alert group %s", result.AlertGroupID)
+		return c.String(http.StatusOK, "Updated")
+	case alertgroup.MergeResolved:
+		log.Printf("Ingester: All alerts cleared, resolved %s", result.AlertGroupID)
+		return c.String(http.StatusOK, "Resolved")
 	}
 
 	// 4. Create New Alert Group
@@ -206,14 +220,22 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		isDuplicateKey := (errors.As(err, &pqErr) && pqErr.Code == "23505") ||
 			strings.Contains(err.Error(), "duplicate key")
 		if isDuplicateKey {
-			log.Printf("Ingester: Duplicate key for %s, retrying as merge", alertKey)
-			active, retryErr := i.store.GetActiveAlertGroupByAlertKey(alertKey)
+			// Somebody else opened the incident between the answer above and
+			// this insert. The partial unique index is what serialises that,
+			// and the payload now belongs to their incident.
+			log.Printf("Ingester: Duplicate key for %s, applying to the incident that won", alertKey)
+			retry, retryErr := i.store.ApplyAlertmanagerUpdateAtomic(
+				c.Request().Context(), alertKey, payload.Alerts, "system")
 			if retryErr != nil {
-				log.Printf("Ingester: Retry lookup failed for %s: %v", alertKey, retryErr)
+				log.Printf("Ingester: Retry failed for %s: %v", alertKey, retryErr)
 				return c.String(http.StatusInternalServerError, "Failed to persist")
 			}
-			if active != nil {
-				return i.mergeIntoGroup(c, active, payload.Alerts)
+			// Anything but "there is no open incident" means it was applied. If
+			// the winner has ALREADY resolved by now, the alert this payload
+			// carries belongs to the next incident, and Alertmanager will send
+			// it again - which is the same answer as any other lost race.
+			if retry.Outcome != alertgroup.MergeNoActive {
+				return c.String(http.StatusOK, "Updated")
 			}
 		}
 		log.Printf("Ingester: Failed to create alert group: %v", err)
@@ -231,155 +253,6 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	return c.String(http.StatusOK, "Created")
 }
 
-// mergeIntoGroup merges incoming alerts into an existing alert group and updates state.
-func (i *Ingester) mergeIntoGroup(c echo.Context, active *model.AlertGroup, incomingAlerts []model.Alert) error {
-	existingFingerprints := make(map[string]model.AlertStatus)
-	for _, a := range active.Alerts {
-		existingFingerprints[a.Fingerprint] = a.Status
-	}
-
-	relevant := filterMergeableAlerts(incomingAlerts, existingFingerprints)
-	if len(relevant) == 0 {
-		// Nothing in this payload belongs to the group. Skip the alerts_data
-		// rewrite and the Slack re-render it would trigger.
-		return c.String(http.StatusOK, "Ignored Resolved")
-	}
-
-	updatedAlerts := mergeAlerts(active.Alerts, relevant)
-	active.Alerts = updatedAlerts
-
-	// Check statuses
-	allResolved := true
-	for _, a := range active.Alerts {
-		if a.Status == model.AlertStatusFiring {
-			allResolved = false
-			break
-		}
-	}
-
-	if allResolved {
-		log.Printf("Ingester: All alerts resolved. Resolving alert group %s", active.ID)
-
-		now := time.Now()
-		timelineEvents := buildMergeTimelineEvents(active.ID, relevant, existingFingerprints, now)
-		timelineEvents = append(timelineEvents, &model.TimelineEvent{
-			ID:           uuid.New().String(),
-			AlertGroupID: active.ID,
-			Type:         model.TimelineEventResolved,
-			Message:      "Alert group resolved: all alerts cleared",
-			Actor:        "system",
-			CreatedAt:    now.Add(time.Duration(len(timelineEvents)+1) * time.Microsecond),
-		})
-
-		eventPayload, err := model.BuildWebhookEventPayload(
-			model.OutboxEventResolved, active, active.TeamNameSnapshot, "system", "", now,
-		)
-		if err != nil {
-			log.Printf("Ingester: Failed to build resolve event payload: %v", err)
-			return c.String(http.StatusInternalServerError, "Failed to persist")
-		}
-		outboxEvent := &model.OutboxEvent{
-			EventType:    model.OutboxEventResolved,
-			AlertGroupID: active.ID,
-			TeamID:       active.TeamID,
-			Actor:        "system",
-			Payload:      eventPayload,
-		}
-
-		changed, err := i.store.ResolveAlertGroupWithAlertsAtomic(
-			active.ID, active.Alerts, timelineEvents, outboxEvent,
-		)
-		if err != nil {
-			log.Printf("Ingester: Failed to resolve group %s: %v", active.ID, err)
-			return c.String(http.StatusInternalServerError, "Failed to persist")
-		}
-		if !changed {
-			// AG was resolved concurrently (manual/slack resolve won the CAS race).
-			// Best-effort sync of alerts_data so resolved AG reflects latest Alertmanager state.
-			log.Printf("Ingester: Group %s already resolved (syncing alerts)", active.ID)
-			if err := i.store.UpdateAlertGroupAlerts(active.ID, active.Alerts); err != nil {
-				log.Printf("Ingester: Failed to sync alerts for %s: %v", active.ID, err)
-			}
-		}
-
-		return c.String(http.StatusOK, "Resolved")
-	}
-
-	log.Printf("Ingester: Updating alert group %s (Partial State)", active.ID)
-
-	// The alerts and the "this message is out of date" gate go down in one
-	// write. Two writes had a gap in them, and a process that stopped there
-	// left the alert recorded with the gate down - after which Alertmanager
-	// repeating the payload merges nothing and never raises it again.
-	//
-	// Don't regress status - the ingester only records alerts. Status
-	// transitions are owned by the engine (new->processing) and by user
-	// actions (ack/resolve).
-	if err := i.store.UpdateAlertGroupAlertsAndRaiseSlackUpdate(active.ID, active.Alerts); err != nil {
-		log.Printf("Ingester: Failed to update alerts for %s: %v", active.ID, err)
-		return c.String(http.StatusInternalServerError, "Failed to update alerts")
-	}
-
-	// Timeline events only after successful store writes (avoids duplicates on AM retry)
-	now := time.Now()
-	for _, e := range buildMergeTimelineEvents(active.ID, relevant, existingFingerprints, now) {
-		if err := i.store.AddTimelineEvent(e); err != nil {
-			log.Printf("Ingester: Failed to add timeline event: %v", err)
-		}
-	}
-
-	return c.String(http.StatusOK, "Updated")
-}
-
-// buildMergeTimelineEvents builds timeline events for new/changed alerts during a merge.
-// Pure function — no side effects. Microsecond offsets from baseTime ensure deterministic ordering.
-func buildMergeTimelineEvents(alertGroupID string, incomingAlerts []model.Alert, existingFingerprints map[string]model.AlertStatus, baseTime time.Time) []*model.TimelineEvent {
-	var events []*model.TimelineEvent
-	for _, a := range incomingAlerts {
-		prevStatus, existed := existingFingerprints[a.Fingerprint]
-		var eventType model.TimelineEventType
-		var message string
-		if !existed && a.Status == model.AlertStatusFiring {
-			eventType = model.TimelineEventAlertAdded
-			message = "Alert added: " + a.Labels["alertname"]
-		} else if existed && prevStatus == model.AlertStatusFiring && a.Status == model.AlertStatusResolved {
-			eventType = model.TimelineEventAlertResolved
-			message = "Alert resolved: " + a.Labels["alertname"]
-		} else if existed && prevStatus == model.AlertStatusResolved && a.Status == model.AlertStatusFiring {
-			eventType = model.TimelineEventAlertAdded
-			message = "Alert re-fired: " + a.Labels["alertname"]
-		} else {
-			continue
-		}
-		events = append(events, &model.TimelineEvent{
-			ID:           uuid.New().String(),
-			AlertGroupID: alertGroupID,
-			Type:         eventType,
-			Message:      message,
-			Actor:        "system",
-			Metadata:     map[string]string{"fingerprint": a.Fingerprint},
-			CreatedAt:    baseTime.Add(time.Duration(len(events)+1) * time.Microsecond),
-		})
-	}
-	return events
-}
-
-func mergeAlerts(existing, incoming []model.Alert) []model.Alert {
-	state := make(map[string]model.Alert)
-	for _, a := range existing {
-		state[a.Fingerprint] = a
-	}
-	for _, a := range incoming {
-		state[a.Fingerprint] = a // Overwrite with latest status
-	}
-
-	result := make([]model.Alert, 0, len(state))
-	for _, a := range state {
-		result = append(result, a)
-	}
-	return result
-}
-
 func (i *Ingester) generateTitle(p *AMPayload) string {
 	if name, ok := p.CommonLabels["alertname"]; ok {
 		return name
@@ -388,20 +261,4 @@ func (i *Ingester) generateTitle(p *AMPayload) string {
 		return p.Alerts[0].Labels["alertname"]
 	}
 	return "Unknown Alert Group"
-}
-
-// filterMergeableAlerts drops incoming alerts that do not belong to the group.
-// Alertmanager re-sends alerts it resolved earlier for the same aggregation
-// group; those were closed together with a previous alert group carrying the
-// same dedup key, so only a firing alert may introduce a fingerprint the group
-// has never seen. Mirrors the firing-only filter the create path applies.
-func filterMergeableAlerts(incoming []model.Alert, existingFingerprints map[string]model.AlertStatus) []model.Alert {
-	var relevant []model.Alert
-	for _, a := range incoming {
-		if _, known := existingFingerprints[a.Fingerprint]; !known && a.Status != model.AlertStatusFiring {
-			continue
-		}
-		relevant = append(relevant, a)
-	}
-	return relevant
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,28 @@ import (
 // The read a plan is built from has to be a picture of one moment, and it has
 // to say which moment. Everything an escalation ever shows is frozen out of it,
 // once, and no later revision corrects a card that was drawn from a collage.
+
+// recordAlerts writes an alert set the way a merge would, and moves the version
+// a producer reads with it.
+//
+// Tests used to reach for the store method the ingester called. That method is
+// gone: what a payload means is decided inside one command now, and a test that
+// only needs the row to have moved says so directly rather than pretending to
+// be Alertmanager.
+func recordAlerts(t *testing.T, s *Store, agID string, alerts []model.Alert) {
+	t.Helper()
+	encoded, err := json.Marshal(alerts)
+	if err != nil {
+		t.Fatalf("encode the alerts: %v", err)
+	}
+	if _, err := s.db.Exec(`
+		UPDATE alert_groups
+		SET alerts_data = $2, updated_at = now(),
+		    render_source_version = render_source_version + 1
+		WHERE id = $1`, agID, string(encoded)); err != nil {
+		t.Fatalf("record the alerts of %s: %v", agID, err)
+	}
+}
 
 // TestEscalationSourcesReadTheWholeAlert. The group, the alerts on it and the
 // version they were read at, in one read.
@@ -57,12 +80,10 @@ func TestEscalationSourcesReadTheWholeAlert(t *testing.T) {
 
 	// The group has been updated once since it was created, so its version is
 	// not the default and a producer that never read one would disagree.
-	if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(agID, []model.Alert{{
+	recordAlerts(t, s, agID, []model.Alert{{
 		Fingerprint: "fp-1", Status: "firing", StartsAt: time.Unix(1700000000, 0),
 		Labels: map[string]string{"alertname": "DiskWillFill"},
-	}}); err != nil {
-		t.Fatalf("update the alerts: %v", err)
-	}
+	}})
 
 	sources, err := s.GetEscalationSources(ctx)
 	if err != nil {
@@ -114,11 +135,9 @@ func TestSubmitRefusesAPlanBuiltFromStateThatMoved(t *testing.T) {
 	adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
 
 	// The producer read version 0; the group is now at 1.
-	if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(agID, []model.Alert{{
+	recordAlerts(t, s, agID, []model.Alert{{
 		Fingerprint: "fp-late", Status: "firing", StartsAt: time.Now(),
-	}}); err != nil {
-		t.Fatalf("change the alert group: %v", err)
-	}
+	}})
 
 	result := mustSubmit(t, s, adm)
 	if result.Outcome != outbound.SubmitSourceChanged {
@@ -369,59 +388,5 @@ func TestInstancesStartingTogetherMigrateOnce(t *testing.T) {
 	}
 	if columns != 1 {
 		t.Fatalf("the table has %d version columns", columns)
-	}
-}
-
-// TestTheAlertUpdateLoopLeavesOutboundGroupsAlone. That loop updates a card by
-// finding the delivery that produced it, and the outbound path writes no such
-// row - so for an admitted group it finds nothing to update, leaves its gate up
-// and comes back with the same answer every two seconds until the alert
-// resolves. Sprint 2 gives the card to the outbound domain; until then an
-// admitted group's card is not this loop's to keep current (S1-D24).
-func TestTheAlertUpdateLoopLeavesOutboundGroupsAlone(t *testing.T) {
-	s := setupTestDB(t)
-	ctx := context.Background()
-
-	admitted := outboundGroup(t, s)
-	mustSubmit(t, s, outboundAdmission(t, admitted, "first", channelCommitment("C0001", 0)))
-
-	// A group of the old shape: nothing was admitted for it, so the loop is
-	// still the only thing that can keep its card current.
-	legacy := outboundGroup(t, s)
-
-	for _, agID := range []string{admitted, legacy} {
-		if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(agID, []model.Alert{{
-			Fingerprint: "fp-late", Status: "firing", StartsAt: time.Now(),
-		}}); err != nil {
-			t.Fatalf("raise the gate on %s: %v", agID, err)
-		}
-	}
-
-	pending, err := s.GetAlertGroupsPendingSlackUpdate()
-	if err != nil {
-		t.Fatalf("read the groups waiting for an update: %v", err)
-	}
-
-	seen := map[string]bool{}
-	for _, ag := range pending {
-		seen[ag.ID] = true
-	}
-	if seen[admitted] {
-		t.Error("an admitted group was picked up by the loop that cannot update it")
-	}
-	if !seen[legacy] {
-		t.Error("a group with no admission was skipped, so its card stops being updated")
-	}
-
-	// The gate is still up on the admitted group, which is the honest state:
-	// its card IS behind, and Sprint 2 is what starts updating it.
-	var raised bool
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT slack_update_pending FROM alert_groups WHERE id = $1`, admitted).
-		Scan(&raised); err != nil {
-		t.Fatalf("read the gate: %v", err)
-	}
-	if !raised {
-		t.Error("the admitted group's gate was lowered by nobody")
 	}
 }

@@ -18,6 +18,30 @@ import (
 
 // stuckInReview drives a commitment to the state that waits for a person: a
 // call whose fate is unknown, under a policy that refuses to guess.
+// cardStuckInReview is the same, for the form that has later revisions: a card
+// waiting for a person, with a message already out there.
+func cardStuckInReview(t *testing.T, s *Store, agID string) string {
+	t.Helper()
+
+	commitment := channelCommitment("C0001", 0)
+	commitment.AmbiguityPolicy = keys.PolicyManualReview
+	intentID := admitOne(t, s, agID, commitment)[0]
+
+	token := claimOne(t, s, intentID)
+	begun := beginOne(t, s, intentID, token)
+
+	if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token,
+		Conclusion: concluded(outbound.OutcomeAmbiguous, "no_response"),
+	}); err != nil {
+		t.Fatalf("finalize as ambiguous: %v", err)
+	}
+	if got := statusOf(t, s, intentID); got != outbound.StatusManualReview {
+		t.Fatalf("the card is %s, want manual_review", got)
+	}
+	return intentID
+}
+
 func stuckInReview(t *testing.T, s *Store, agID string) string {
 	t.Helper()
 

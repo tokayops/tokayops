@@ -658,11 +658,9 @@ func TestSubmitRepeatSurvivesTheWorldMovingOn(t *testing.T) {
 			name:    "an alert joined the group",
 			expires: time.Hour,
 			moveOn: func(t *testing.T, agID string, deadline time.Time) {
-				if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(agID, []model.Alert{{
+				recordAlerts(t, s, agID, []model.Alert{{
 					Fingerprint: "fp-late", Status: "firing", StartsAt: time.Now(),
-				}}); err != nil {
-					t.Fatalf("change the alert group: %v", err)
-				}
+				}})
 			},
 		},
 		{

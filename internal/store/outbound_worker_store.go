@@ -487,7 +487,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return s.recordPreparation(ctx, tx, req, *intent, plan)
 	}
 
-	stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+	stored, err := attemptStateTx(ctx, tx, *intent)
 	if err != nil {
 		if errors.Is(err, ErrUndeliverable) {
 			return s.refuseAttempt(ctx, tx, req, *intent, plan, "state_unreadable", err.Error())
@@ -1034,7 +1034,11 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	// only for one-shot messages - and a one-shot has no later revision to be
 	// waiting for.
 	final := false
-	if intent.GroupBound() && concluded.Outcome == keys.OutcomeAccepted {
+	if intent.Form == outbound.FormEditable && intent.GroupBound() &&
+		concluded.Outcome == keys.OutcomeAccepted {
+		// Only a card can apply a last revision. A one-shot message renders the
+		// state its admission froze, and asking the group whether THAT was the
+		// final revision compares two different things.
 		stored, err := lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
 		if err != nil {
 			return outbound.FinalizeResult{}, err

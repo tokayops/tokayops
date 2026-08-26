@@ -67,9 +67,11 @@ func TestIngester_PartialUpdate_KeepsStatusAndFlagsSlackUpdate(t *testing.T) {
 		t.Errorf("Expected status to stay triggered, got %s", updatedAG.Status)
 	}
 
-	// SlackUpdatePending should be flagged for dispatcher to pick up
-	if !updatedAG.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be true after merge")
+	// The version a producer reads has to move, so a plan built from the state
+	// before this alert is refused rather than admitted stale. The card itself
+	// is told by the delivery domain, in the same commit.
+	if updatedAG.RenderSourceVersion == 0 {
+		t.Error("the version a producer reads did not move for a new alert")
 	}
 
 	// Should have 2 alerts now

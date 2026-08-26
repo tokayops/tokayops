@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
@@ -15,7 +16,6 @@ type StoreInterface interface {
 	CreateAlertGroup(ag *model.AlertGroup) error
 	UpdateAlertGroupPolicy(id string, policyID string, snapshot *model.EscalationPolicySnapshot) error
 	UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResult) error
-	UpdateAlertGroupAlerts(id string, alerts []model.Alert) error
 	// GetEscalationSources is the read a producer plans from: the groups
 	// nobody has been paged for, with the alerts and the history their cards
 	// are drawn from, and the version they were read at - all from one
@@ -30,7 +30,6 @@ type StoreInterface interface {
 	// separate the alert from the fact that the message is stale - and lowered
 	// for one version, which is how a producer avoids clearing away a change
 	// that arrived while it worked.
-	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
 	ClearSlackUpdate(id string, observedVersion int64) (bool, error)
 	GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error)
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
@@ -50,7 +49,7 @@ type StoreInterface interface {
 	ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
 
 	// Atomic resolve with alerts update (ingester auto-resolve: alerts + status + timeline + outbox in one transaction)
-	ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string, incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
 
 	// Conditional status transition (CAS semantics)
 	TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error)

@@ -331,13 +331,11 @@ func TestDesiredStateRefusesToMoveAfterFinal(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 
-	if err := s.UpdateAlertGroupAlerts(agID, []model.Alert{{
+	recordAlerts(t, s, agID, []model.Alert{{
 		Fingerprint: "fp-2", Status: model.AlertStatusFiring,
 		StartsAt: time.Unix(1700000600, 0),
 		Labels:   map[string]string{"alertname": "DiskSlow"},
-	}}); err != nil {
-		t.Fatalf("record the late alerts: %v", err)
-	}
+	}})
 
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
 		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: "nina",

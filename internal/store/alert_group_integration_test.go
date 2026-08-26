@@ -2,12 +2,14 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 )
@@ -1295,122 +1297,100 @@ func TestAckAtomicConcurrent_WithOutbox(t *testing.T) {
 
 // TestResolveAlertGroupWithAlertsAtomic_FromNew verifies atomic resolve from "new" status
 // with alerts_data update, timeline events, outbox event, and job cancellation.
-func TestResolveAlertGroupWithAlertsAtomic_FromNew(t *testing.T) {
+func TestAPayloadThatClearsEverythingEndsTheIncident(t *testing.T) {
 	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
 
 	teamID := "team-resolve-alerts"
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Resolve Team", CreatedAt: time.Now()})
 
 	agID := uuid.New().String()
 	alertKey := "dk-resolve-" + agID
-	ag := &model.AlertGroup{
+	if err := s.CreateAlertGroup(&model.AlertGroup{
 		ID: agID, AlertKey: alertKey, Status: model.AlertGroupStatusNew,
 		TeamID: teamID, TeamNameSnapshot: "Resolve Team", Severity: "warning",
-		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "CPU"}}},
+		Alerts: []model.Alert{{
+			Fingerprint: "fp1", Status: model.AlertStatusFiring,
+			StartsAt: time.Unix(1700000000, 0), Labels: map[string]string{"alertname": "CPU"},
+		}},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
-	}
-	if err := s.CreateAlertGroup(ag); err != nil {
+	}); err != nil {
 		t.Fatalf("CreateAlertGroup: %v", err)
 	}
 
-	// Resolved alerts
-	resolvedAlerts := []model.Alert{
-		{Fingerprint: "fp1", Status: model.AlertStatusResolved, Labels: map[string]string{"alertname": "CPU"}},
-	}
-
-	timelineEvents := []*model.TimelineEvent{
-		{
-			ID: uuid.New().String(), AlertGroupID: agID,
-			Type: model.TimelineEventAlertResolved, Message: "Alert resolved: CPU",
-			Actor: "system", Metadata: map[string]string{"fingerprint": "fp1"},
-			CreatedAt: time.Now(),
-		},
-		{
-			ID: uuid.New().String(), AlertGroupID: agID,
-			Type: model.TimelineEventResolved, Message: "Alert group resolved: all alerts cleared",
-			Actor: "system", CreatedAt: time.Now().Add(time.Microsecond),
-		},
-	}
-
-	outboxEvent := &model.OutboxEvent{
-		EventType:    model.OutboxEventResolved,
-		AlertGroupID: agID,
-		TeamID:       teamID,
-		Actor:        "system",
-		Payload:      []byte(`{"event":"alert_group.resolved"}`),
-	}
-
-	changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, resolvedAlerts, timelineEvents, outboxEvent)
+	result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
+		[]model.Alert{{
+			Fingerprint: "fp1", Status: model.AlertStatusResolved,
+			StartsAt: time.Unix(1700000000, 0), Labels: map[string]string{"alertname": "CPU"},
+		}}, "system")
 	if err != nil {
-		t.Fatalf("ResolveAlertGroupWithAlertsAtomic: %v", err)
+		t.Fatalf("apply the payload: %v", err)
 	}
-	if !changed {
-		t.Error("Expected changed=true for new->resolved")
+	if result.Outcome != alertgroup.MergeResolved || result.AlertGroupID != agID {
+		t.Fatalf("the payload came back %s for %s", result.Outcome, result.AlertGroupID)
 	}
 
-	// Verify status + resolved fields
-	fetched, err := s.GetAlertGroupByID(agID)
+	var status, resolvedBy string
+	var resolvedAt sql.NullTime
+	if err := s.db.QueryRow(
+		`SELECT status, resolved_by, resolved_at FROM alert_groups WHERE id = $1`, agID).
+		Scan(&status, &resolvedBy, &resolvedAt); err != nil {
+		t.Fatalf("read the incident: %v", err)
+	}
+	if status != string(model.AlertGroupStatusResolved) || resolvedBy != "system" || !resolvedAt.Valid {
+		t.Fatalf("the incident is %s, resolved by %q at %v", status, resolvedBy, resolvedAt)
+	}
+
+	// The history says the alert cleared and that the incident ended with it.
+	events, err := s.GetTimelineEvents(agID)
 	if err != nil {
-		t.Fatalf("GetAlertGroupByID: %v", err)
+		t.Fatalf("read the history: %v", err)
 	}
-	if fetched.Status != model.AlertGroupStatusResolved {
-		t.Errorf("Expected status 'resolved', got '%s'", fetched.Status)
-	}
-	if fetched.ResolvedAt == nil {
-		t.Error("Expected resolved_at to be set")
-	}
-	if fetched.ResolvedBy != "system" {
-		t.Errorf("Expected resolved_by 'system', got '%s'", fetched.ResolvedBy)
-	}
-
-	// Verify alerts_data updated
-	if len(fetched.Alerts) != 1 || fetched.Alerts[0].Status != model.AlertStatusResolved {
-		t.Errorf("Expected 1 resolved alert, got %v", fetched.Alerts)
-	}
-
-	// Verify timeline events
-	events, _ := s.GetTimelineEvents(agID)
-	var resolveCount, alertResolveCount int
-	for _, ev := range events {
-		if ev.Type == model.TimelineEventResolved {
-			resolveCount++
-		}
-		if ev.Type == model.TimelineEventAlertResolved {
-			alertResolveCount++
+	var cleared, ended bool
+	for _, e := range events {
+		switch e.Type {
+		case model.TimelineEventAlertResolved:
+			cleared = true
+		case model.TimelineEventResolved:
+			ended = true
 		}
 	}
-	if resolveCount != 1 {
-		t.Errorf("Expected 1 resolve timeline event, got %d", resolveCount)
-	}
-	if alertResolveCount != 1 {
-		t.Errorf("Expected 1 alert_resolved timeline event, got %d", alertResolveCount)
+	if !cleared || !ended {
+		t.Errorf("the history says cleared=%v ended=%v", cleared, ended)
 	}
 
-	// Verify outbox event
-	outboxEvents, _ := s.GetPendingOutboxEvents(10)
-	var found bool
-	for _, oe := range outboxEvents {
-		if oe.AlertGroupID == agID && oe.EventType == model.OutboxEventResolved {
-			found = true
-		}
+	// And the subscribers are told, in the same commit.
+	var events2 int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM event_outbox WHERE alert_group_id = $1 AND event_type = $2`,
+		agID, model.OutboxEventResolved).Scan(&events2); err != nil {
+		t.Fatalf("read the outbox: %v", err)
 	}
-	if !found {
-		t.Error("Expected outbox event with type alert_group.resolved")
+	if events2 != 1 {
+		t.Errorf("the outbox holds %d resolutions", events2)
 	}
 }
 
-// TestResolveAlertGroupWithAlertsAtomic_AlreadyResolved verifies idempotent behavior.
-func TestResolveAlertGroupWithAlertsAtomic_AlreadyResolved(t *testing.T) {
+// TestAPayloadForAnIncidentThatIsOverBelongsToTheNextOne. A resolved incident
+// is finished: the alert firing again is the next one, and the payload finds
+// nothing open to apply itself to.
+func TestAPayloadForAnIncidentThatIsOverBelongsToTheNextOne(t *testing.T) {
 	s := setupTestDB(t)
 
 	agID := createTestTeamAndAG(t, s, "team-resolve-idem", model.AlertGroupStatusResolved)
-
-	changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("ResolveAlertGroupWithAlertsAtomic: %v", err)
+	var alertKey string
+	if err := s.db.QueryRow(`SELECT alert_key FROM alert_groups WHERE id = $1`, agID).
+		Scan(&alertKey); err != nil {
+		t.Fatalf("read the alert key: %v", err)
 	}
-	if changed {
-		t.Error("Expected changed=false for already resolved AG")
+
+	result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
+		[]model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}}, "system")
+	if err != nil {
+		t.Fatalf("apply the payload: %v", err)
+	}
+	if result.Outcome != alertgroup.MergeNoActive {
+		t.Fatalf("a payload for a finished incident came back %s", result.Outcome)
 	}
 }
 
@@ -1535,9 +1515,19 @@ func TestTheDoorsThatStopADeliveryStopAllOfIt(t *testing.T) {
 			}
 		},
 		"every alert resolved itself": func(t *testing.T, agID string) {
-			changed, err := s.ResolveAlertGroupWithAlertsAtomic(agID, nil, nil, nil)
-			if err != nil || !changed {
-				t.Fatalf("ResolveAlertGroupWithAlertsAtomic = %v, %v", changed, err)
+			var alertKey string
+			if err := s.db.QueryRow(`SELECT alert_key FROM alert_groups WHERE id = $1`, agID).
+				Scan(&alertKey); err != nil {
+				t.Fatalf("read the alert key: %v", err)
+			}
+			result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
+				[]model.Alert{{
+					Fingerprint: "fp-1", Status: model.AlertStatusResolved,
+					StartsAt: time.Unix(1700000000, 0),
+					Labels:   map[string]string{"alertname": "DiskWillFill"},
+				}}, "system")
+			if err != nil || result.Outcome != alertgroup.MergeResolved {
+				t.Fatalf("the payload came back %s (%v)", result.Outcome, err)
 			}
 		},
 	}

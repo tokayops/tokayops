@@ -72,6 +72,21 @@ CREATE TABLE IF NOT EXISTS outbound_batches (
 	-- is reading meaning out of an absence.
 	admission_outcome   TEXT NOT NULL,
 	intent_count        INT  NOT NULL,
+	-- The state this set was admitted from, frozen and never superseded.
+	--
+	-- The group's own snapshot moves forward: an editable card is brought to
+	-- the latest revision, which is the whole point of it. A one-shot message
+	-- is not. It is one external effect under one provider key, and a retry of
+	-- it has to carry the bytes the admission accepted - otherwise the same key
+	-- names two different requests, and a provider that lost its answer to the
+	-- first receives the second under the identity of the first.
+	--
+	-- Every commitment of a batch shares this, because they were admitted from
+	-- one reading of one moment: that is what the batch IS.
+	admission_snapshot  JSONB,
+	admission_digest    BYTEA,
+	admission_schema_version INT,
+	admission_revision  BIGINT,
 	admitted_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 	CONSTRAINT outbound_batches_outcome_known
 		CHECK (admission_outcome IN ('admitted', 'no_targets')),
@@ -83,7 +98,18 @@ CREATE TABLE IF NOT EXISTS outbound_batches (
 	-- an empty bytea is a value, and a producer that computed nothing would
 	-- otherwise match every other producer that computed nothing.
 	CONSTRAINT outbound_batches_fingerprint_len
-		CHECK (octet_length(fingerprint) = 32)
+		CHECK (octet_length(fingerprint) = 32),
+	-- The four halves of the frozen state are one fact: a row holding some of
+	-- them describes a moment nobody can reconstruct. Families with no render
+	-- snapshot - handoff, webhook - hold none of them.
+	CONSTRAINT outbound_batches_admission_snapshot_shape CHECK (
+		(admission_snapshot IS NULL AND admission_digest IS NULL
+			AND admission_schema_version IS NULL AND admission_revision IS NULL)
+		OR
+		(admission_snapshot IS NOT NULL AND admission_digest IS NOT NULL
+			AND admission_schema_version IS NOT NULL AND admission_revision IS NOT NULL
+			AND octet_length(admission_digest) = 32 AND admission_revision >= 0)
+	)
 );
 
 -- One FIRST admission per group. Scoped to that kind on purpose: a later

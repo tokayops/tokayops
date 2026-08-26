@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -790,6 +791,145 @@ func TestStateNobodyCanReadEndsTheCommitment(t *testing.T) {
 	}
 }
 
+// A one-shot message renders the state its admission froze, and a card renders
+// the state the alert is in now. The two tests below are the reason that split
+// exists.
+//
+// One provider key names one external effect. If a direct message rendered the
+// group's current state, two attempts under that key would be two different
+// requests - and a provider that lost its answer to the first would receive the
+// second as though it were the same one. The alert moving is not a reason to
+// change what an accepted commitment says.
+
+// TestADirectMessageIgnoresAnAlertThatMovedBeforeItWasSent. The group changes
+// between the admission and the FIRST attempt. Freezing the bytes when an
+// attempt opens would be too late for exactly this.
+func TestADirectMessageIgnoresAnAlertThatMovedBeforeItWasSent(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	intentID := admitOne(t, s, agID, dmCommitment("U0001"))[0]
+	admitted := admittedDigest(t, s, intentID)
+
+	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
+	if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+	}); err != nil {
+		t.Fatalf("raise the desired state: %v", err)
+	}
+
+	token := claimOne(t, s, intentID)
+	begun := beginOne(t, s, intentID, token)
+	if got := attemptFingerprint(t, s, begun.AttemptID); !bytes.Equal(got, admitted) {
+		t.Fatalf("the first attempt rendered state the admission never accepted")
+	}
+	if begun.AppliedRevision != 0 {
+		t.Fatalf("the message carries revision %d, and it was admitted at 0",
+			begun.AppliedRevision)
+	}
+}
+
+// TestADirectMessageRetriesWithTheBytesItWasAdmittedWith. The group changes
+// between two attempts of one effect. Both carry the same provider key, so both
+// have to carry the same request.
+func TestADirectMessageRetriesWithTheBytesItWasAdmittedWith(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	intentID := admitOne(t, s, agID, dmCommitment("U0001"))[0]
+	admitted := admittedDigest(t, s, intentID)
+
+	token := claimOne(t, s, intentID)
+	first := beginOne(t, s, intentID, token)
+	if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+		AttemptID: first.AttemptID, LeaseToken: token,
+		Conclusion: concluded(outbound.OutcomeRetryableRejection, "rate_limited"),
+	}); err != nil {
+		t.Fatalf("finalize as retryable: %v", err)
+	}
+
+	// The alert moves on between the two attempts.
+	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
+	if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+	}); err != nil {
+		t.Fatalf("raise the desired state: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE outbound_intents SET next_attempt_at = now() WHERE id = $1`,
+		intentID); err != nil {
+		t.Fatalf("make the retry due: %v", err)
+	}
+
+	retryToken := claimOne(t, s, intentID)
+	retry := beginOne(t, s, intentID, retryToken)
+
+	if got := attemptFingerprint(t, s, retry.AttemptID); !bytes.Equal(got, admitted) {
+		t.Fatalf("the retry sent different bytes than the admission")
+	}
+	if retry.AppliedRevision != first.AppliedRevision {
+		t.Fatalf("the retry carries revision %d, the first carried %d",
+			retry.AppliedRevision, first.AppliedRevision)
+	}
+	// And the two attempts are one effect, under one key.
+	if firstKey, retryKey := attemptKey(t, s, first.AttemptID),
+		attemptKey(t, s, retry.AttemptID); firstKey != retryKey {
+		t.Fatalf("the two attempts used different keys: %s and %s", firstKey, retryKey)
+	}
+}
+
+// admittedDigest is the content identity of the state a batch was admitted
+// from, which is what every attempt of its one-shot commitments has to render.
+func admittedDigest(t *testing.T, s *Store, intentID string) []byte {
+	t.Helper()
+	var digest []byte
+	if err := s.db.QueryRow(`
+		SELECT b.admission_digest FROM outbound_batches b
+		JOIN outbound_intents i ON i.batch_id = b.id WHERE i.id = $1`, intentID).
+		Scan(&digest); err != nil {
+		t.Fatalf("read the admitted digest: %v", err)
+	}
+	return digest
+}
+
+func attemptFingerprint(t *testing.T, s *Store, attemptID string) []byte {
+	t.Helper()
+	var fingerprint []byte
+	if err := s.db.QueryRow(
+		`SELECT request_fingerprint FROM outbound_attempts WHERE id = $1`, attemptID).
+		Scan(&fingerprint); err != nil {
+		t.Fatalf("read the request fingerprint: %v", err)
+	}
+	return fingerprint
+}
+
+func attemptKey(t *testing.T, s *Store, attemptID string) string {
+	t.Helper()
+	var key string
+	if err := s.db.QueryRow(
+		`SELECT provider_key FROM outbound_attempts WHERE id = $1`, attemptID).
+		Scan(&key); err != nil {
+		t.Fatalf("read the provider key: %v", err)
+	}
+	return key
+}
+
+// corruptAdmittedState breaks the state a batch was admitted from, so that what
+// comes back out no longer matches the digest its commitments were keyed
+// against.
+func corruptAdmittedState(t *testing.T, s *Store, intentID string) {
+	t.Helper()
+	if _, err := s.db.Exec(`
+		UPDATE outbound_batches b
+		SET admission_snapshot = jsonb_set(b.admission_snapshot, '{title}', '"a different alert"')
+		FROM outbound_intents i
+		WHERE i.id = $1 AND i.batch_id = b.id`, intentID); err != nil {
+		t.Fatalf("corrupt the admitted state: %v", err)
+	}
+}
+
 // TestARetryIntoUnreadableStateStillEnds is the same rule reached the other
 // way: a person deciding to retry does not have to know whether the state can
 // still be rendered, because the attempt that cannot be made ends the
@@ -799,12 +939,10 @@ func TestARetryIntoUnreadableStateStillEnds(t *testing.T) {
 	agID := outboundGroup(t, s)
 	intentID := stuckInReview(t, s, agID)
 
-	if _, err := s.db.Exec(`
-		UPDATE outbound_group_snapshots
-		SET snapshot = jsonb_set(snapshot, '{title}', '"a different alert"')
-		WHERE alert_group_id = $1`, agID); err != nil {
-		t.Fatalf("corrupt the state: %v", err)
-	}
+	// A one-shot message renders the state its ADMISSION froze - the group's
+	// own snapshot belongs to the card, which follows the alert. So that is the
+	// row a broken state has to be broken in.
+	corruptAdmittedState(t, s, intentID)
 
 	if result := resolve(t, s, outbound.ResolveAmbiguityRequest{
 		IntentID: intentID, Decision: outbound.DecisionRetryCurrentGeneration,
@@ -918,7 +1056,10 @@ func TestALateResultIsKeptAsTheAttemptHadIt(t *testing.T) {
 func TestAWithdrawalDoesNotNeedTheState(t *testing.T) {
 	s := setupTestDB(t)
 	agID := outboundGroup(t, s)
-	intentID := stuckInReview(t, s, agID)
+	// A card, because assuming a delivery reads the state only where there are
+	// later revisions to be the last of: a one-shot message is done either way
+	// and never asks.
+	intentID := cardStuckInReview(t, s, agID)
 
 	if _, err := s.db.Exec(`
 		UPDATE outbound_group_snapshots

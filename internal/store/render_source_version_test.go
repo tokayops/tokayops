@@ -1,10 +1,12 @@
 package store
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
 )
 
@@ -33,20 +35,19 @@ func TestWhatMovesTheRenderSourceVersion(t *testing.T) {
 		{
 			name: "an alert joins the group", moves: true,
 			do: func(t *testing.T, agID string) {
-				if err := s.UpdateAlertGroupAlertsAndRaiseSlackUpdate(agID, []model.Alert{{
-					Fingerprint: "fp-late", Status: "firing", StartsAt: time.Now(),
-				}}); err != nil {
-					t.Fatalf("update the alerts: %v", err)
+				var alertKey string
+				if err := s.db.QueryRow(
+					`SELECT alert_key FROM alert_groups WHERE id = $1`, agID).
+					Scan(&alertKey); err != nil {
+					t.Fatalf("read the alert key: %v", err)
 				}
-			},
-		},
-		{
-			name: "the alerts are rewritten without raising the gate", moves: true,
-			do: func(t *testing.T, agID string) {
-				if err := s.UpdateAlertGroupAlerts(agID, []model.Alert{{
-					Fingerprint: "fp-late", Status: "firing", StartsAt: time.Now(),
-				}}); err != nil {
-					t.Fatalf("update the alerts: %v", err)
+				result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
+					[]model.Alert{{
+						Fingerprint: "fp-late", Status: model.AlertStatusFiring,
+						StartsAt: time.Now(), Labels: map[string]string{"alertname": "Late"},
+					}}, "system")
+				if err != nil || result.Outcome != alertgroup.MergeMerged {
+					t.Fatalf("the payload came back %s (%v)", result.Outcome, err)
 				}
 			},
 		},
@@ -71,11 +72,20 @@ func TestWhatMovesTheRenderSourceVersion(t *testing.T) {
 		{
 			name: "the alerts stop firing and the group resolves", moves: true,
 			do: func(t *testing.T, agID string) {
-				moved, err := s.ResolveAlertGroupWithAlertsAtomic(agID, []model.Alert{{
-					Fingerprint: "fp-1", Status: "resolved", StartsAt: time.Now(),
-				}}, nil, nil)
-				if err != nil || !moved {
-					t.Fatalf("resolve with alerts: moved=%v err=%v", moved, err)
+				var alertKey string
+				if err := s.db.QueryRow(
+					`SELECT alert_key FROM alert_groups WHERE id = $1`, agID).
+					Scan(&alertKey); err != nil {
+					t.Fatalf("read the alert key: %v", err)
+				}
+				result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
+					[]model.Alert{{
+						Fingerprint: "fp-1", Status: model.AlertStatusResolved,
+						StartsAt: time.Unix(1700000000, 0),
+						Labels:   map[string]string{"alertname": "DiskWillFill"},
+					}}, "system")
+				if err != nil || result.Outcome != alertgroup.MergeResolved {
+					t.Fatalf("the payload came back %s (%v)", result.Outcome, err)
 				}
 			},
 		},

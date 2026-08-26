@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
@@ -1622,32 +1623,27 @@ func TestProcessAcknowledgedAlertGroups_NoDeliveries_UsesError(t *testing.T) {
 // =================================================================================
 // Alert Update Loop Tests
 // =================================================================================
-
-func TestProcessAlertUpdates_CreatesUpdateJob(t *testing.T) {
+// TestTheAlertUpdateLoopHasNothingLeftToDo.
+//
+// The loop reads a flag on the alert group, and after the merge door moved into
+// the outbound domain nothing raises that flag any more: an alert arriving is
+// applied by one command, which tells the group's own messages that what they
+// show has moved. The card is the delivery domain's to keep current.
+//
+// So the loop is inert rather than merely unused, and this is what says so
+// until it is removed with the rest of the old path.
+func TestTheAlertUpdateLoopHasNothingLeftToDo(t *testing.T) {
 	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d, _ := NewDispatcher(s, cfg)
-	d.RegisterProvider("slack", &MockProvider{
-		SendFunc: func(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
-			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
-		},
-		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
-			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
-		},
-	})
+	d, _ := NewDispatcher(s, &config.Config{})
 
-	// Setup: create AG in processing state with slack_update_pending
-	ag := &model.AlertGroup{
+	s.CreateAlertGroup(&model.AlertGroup{
 		ID:       "ag_update",
 		AlertKey: "dk_update",
 		Status:   model.AlertGroupStatusProcessing,
 		Title:    "Test",
 		Severity: "critical",
-	}
-	s.CreateAlertGroup(ag)
-	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_update", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
-
-	// Create a delivery so UpdateJobBuilder can find it
+		Alerts:   []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}},
+	})
 	s.UpsertNotificationDelivery(&model.NotificationDelivery{
 		ID:              "del1",
 		AlertGroupID:    "ag_update",
@@ -1656,420 +1652,26 @@ func TestProcessAlertUpdates_CreatesUpdateJob(t *testing.T) {
 		ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
 	})
 
-	// Run ProcessAlertUpdates
-	ctx := context.Background()
-	d.ProcessAlertUpdates(ctx)
-
-	// Verify: job was created
-	job, err := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_update"))
-	if err != nil {
-		t.Fatalf("Job not found: %v", err)
+	// An alert arrives through the door a payload actually comes in by.
+	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), "dk_update",
+		[]model.Alert{{
+			Fingerprint: "fp2", Status: model.AlertStatusFiring,
+			Labels: map[string]string{"alertname": "Late"},
+		}}, "system"); err != nil {
+		t.Fatalf("apply the payload: %v", err)
 	}
-	if job == nil {
-		t.Fatal("Expected update job to be created")
-	}
-	if job.Type != "update" {
-		t.Errorf("Expected job type 'update', got '%s'", job.Type)
-	}
-
-	// Verify: flag was cleared
-	updated, _ := s.GetAlertGroupByID("ag_update")
-	if updated.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be false after job creation")
-	}
-}
-
-// TestProcessAlertUpdates_KeepsFlagWhenNothingCanBeUpdatedYet: nothing has been
-// delivered yet, so there is no message to refresh - and no way to know that a
-// message will not appear a moment later. The gate stays up for it.
-func TestProcessAlertUpdates_KeepsFlagWhenNothingCanBeUpdatedYet(t *testing.T) {
-	s := store.NewMockStore()
-	d, _ := NewDispatcher(s, &config.Config{})
-
-	s.CreateAlertGroup(&model.AlertGroup{
-		ID:       "ag_no_del",
-		AlertKey: "dk_no_del",
-		Status:   model.AlertGroupStatusProcessing,
-		Title:    "Test",
-		Severity: "info",
-	})
-	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_no_del", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
 
 	d.ProcessAlertUpdates(context.Background())
 
-	updated, _ := s.GetAlertGroupByID("ag_no_del")
-	if !updated.SlackUpdatePending {
-		t.Error("the gate came down although no message has been sent that could carry this alert")
+	// No job, and "no rows" is how the store says so.
+	job, err := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_update"))
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("look for a job: %v", err)
 	}
-}
-
-// deliveringStore writes a delivery at the moment the producer reads the ones
-// that exist - the interleaving in which the escalation records what it has
-// just sent while the update is being built.
-//
-// This is the race the producer used to lose: it asked a second time whether
-// any deliveries existed, saw the new one, and took that as proof no update was
-// needed. The card had been rendered before the alert arrived, so the alert
-// reached no message at all.
-type deliveringStore struct {
-	store.StoreInterface
-	mock  *store.MockStore
-	agID  string
-	built bool
-}
-
-// ListDeliveries answers with what the escalation had sent when the build
-// started, and only then records the message it was busy sending. The build
-// therefore sees nothing to update, and a delivery that can be updated exists
-// a moment later.
-func (ds *deliveringStore) ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error) {
-	existing, err := ds.StoreInterface.ListDeliveries(alertGroupID)
-	if !ds.built && alertGroupID == ds.agID {
-		ds.built = true
-		ds.mock.UpsertNotificationDelivery(&model.NotificationDelivery{
-			ID:              "del_late",
-			AlertGroupID:    ds.agID,
-			Provider:        "slack",
-			SupportsUpdate:  true,
-			ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
-		})
+	if job != nil {
+		t.Fatal("the old loop built an update for a card the delivery domain owns")
 	}
-	return existing, err
-}
-
-// TestProcessAlertUpdates_KeepsFlagWhenADeliveryLandsMidBuild: a delivery
-// written between the producer's reads must not take the gate down.
-func TestProcessAlertUpdates_KeepsFlagWhenADeliveryLandsMidBuild(t *testing.T) {
-	s := store.NewMockStore()
-	racing := &deliveringStore{StoreInterface: s, mock: s, agID: "ag_late"}
-	d, _ := NewDispatcher(racing, &config.Config{})
-	d.RegisterProvider("slack", &MockProvider{
-		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
-			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
-		},
-	})
-
-	s.CreateAlertGroup(&model.AlertGroup{
-		ID:       "ag_late",
-		AlertKey: "dk_late",
-		Status:   model.AlertGroupStatusProcessing,
-		Title:    "Test",
-		Severity: "info",
-	})
-	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_late", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
-
-	ctx := context.Background()
-	d.ProcessAlertUpdates(ctx)
-
-	updated, _ := s.GetAlertGroupByID("ag_late")
-	if !updated.SlackUpdatePending {
-		t.Fatal("the gate came down for a delivery the build never saw; this alert reached no message")
-	}
-
-	// The next tick sees the delivery and gives the alert its update.
-	d.ProcessAlertUpdates(ctx)
-	if job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_late")); job == nil {
-		t.Error("no update job was created once the delivery was there")
-	}
-	settled, _ := s.GetAlertGroupByID("ag_late")
-	if settled.SlackUpdatePending {
-		t.Error("the gate is still up after the update was admitted")
-	}
-}
-
-// TestProcessAlertUpdates_KeepsFlagWhenNoUpdatableDeliveries: a group whose
-// messages refuse updates keeps its gate up.
-//
-// This test asserted the opposite until the gate was looked at properly. The
-// old reading - "deliveries exist, so no more are coming, so nothing will ever
-// be updatable" - is not something this producer can know: a delivery written a
-// moment later, by a step still running after its job was canceled, would find
-// the gate already down and the alert that raised it in no message.
-//
-// The gate stays up instead. It costs a listing per tick for as long as the
-// group is open, and it says something true: that message really is out of
-// date.
-func TestProcessAlertUpdates_KeepsFlagWhenNoUpdatableDeliveries(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d, _ := NewDispatcher(s, cfg)
-
-	// Setup: AG with flag and a delivery that does NOT support updates
-	ag := &model.AlertGroup{
-		ID:       "ag_no_upd",
-		AlertKey: "dk_no_upd",
-		Status:   model.AlertGroupStatusProcessing,
-		Title:    "Test",
-		Severity: "info",
-	}
-	s.CreateAlertGroup(ag)
-	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_no_upd", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
-
-	s.UpsertNotificationDelivery(&model.NotificationDelivery{
-		ID:             "del_no_upd",
-		AlertGroupID:   "ag_no_upd",
-		Provider:       "slack",
-		SupportsUpdate: false, // delivery exists but not updatable
-	})
-
-	ctx := context.Background()
-	d.ProcessAlertUpdates(ctx)
-
-	updated, _ := s.GetAlertGroupByID("ag_no_upd")
-	if !updated.SlackUpdatePending {
-		t.Error("the gate came down on the evidence that some delivery exists, which proves nothing about the next one")
-	}
-}
-
-// TestProcessAlertUpdates_KeepsFlagOnDedupHit: an update that was not admitted
-// does not lower the gate.
-//
-// This test used to assert the opposite, and the opposite is how an alert got
-// lost: the running job had already rendered the message, the new alert raised
-// the flag, and the tick took the flag down for a job it never created. The
-// alert then waited for the next one to arrive, which may never happen.
-func TestProcessAlertUpdates_KeepsFlagOnDedupHit(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d, _ := NewDispatcher(s, cfg)
-	d.RegisterProvider("slack", &MockProvider{
-		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
-			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
-		},
-	})
-
-	// Setup: AG with delivery and flag
-	ag := &model.AlertGroup{
-		ID:       "ag_dedup",
-		AlertKey: "dk_dedup",
-		Status:   model.AlertGroupStatusProcessing,
-		Title:    "Test",
-		Severity: "info",
-	}
-	s.CreateAlertGroup(ag)
-	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_dedup", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
-
-	s.UpsertNotificationDelivery(&model.NotificationDelivery{
-		ID:              "del_dedup",
-		AlertGroupID:    "ag_dedup",
-		Provider:        "slack",
-		SupportsUpdate:  true,
-		ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
-	})
-
-	// First run — creates job with dedup key "update_alert_ag_dedup"
-	ctx := context.Background()
-	d.ProcessAlertUpdates(ctx)
-
-	// Verify first job was created and flag cleared
-	job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_dedup"))
-	if job == nil {
-		t.Fatal("Expected job to be created on first run")
-	}
-	if job.Status != model.JobStatusPending {
-		t.Fatalf("Expected job status pending, got %s", job.Status)
-	}
-
-	// A new alert arrives while the first job is still pending.
-	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_dedup", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
-
-	// Second run — the job is still pending, so CreateJobWithDedup reports
-	// created=false and nothing was admitted for this alert.
-	d.ProcessAlertUpdates(ctx)
-
-	updated, _ := s.GetAlertGroupByID("ag_dedup")
-	if !updated.SlackUpdatePending {
-		t.Error("the gate came down for an update that was never created; this alert is now lost")
-	}
-
-	// Nothing new was written either - the running job holds the identity.
-	jobAfter, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_dedup"))
-	if jobAfter == nil {
-		t.Fatal("Expected job to still exist")
-	}
-	if jobAfter.ID != job.ID {
-		t.Errorf("Expected same job ID %s after dedup hit, got %s", job.ID, jobAfter.ID)
-	}
-
-	// Once it finishes, the flag that stayed up is what gets the alert onto the
-	// message: the next tick is admitted and lowers the gate itself.
-	s.MarkJobSucceeded(jobdedup.AlertUpdate("ag_dedup"))
-	d.ProcessAlertUpdates(ctx)
-
-	settled, _ := s.GetAlertGroupByID("ag_dedup")
-	if settled.SlackUpdatePending {
-		t.Error("the gate is still up after an update was admitted for it")
-	}
-}
-
-// gateRacingStore raises the update gate at the exact moment a job is
-// admitted, which is the interleaving that loses an alert. It is injected here
-// rather than raced for: the window is a scheduling accident in production and
-// would be a flaky test if reproduced by timing.
-type gateRacingStore struct {
-	store.StoreInterface
-	onAdmit func()
-}
-
-func (g *gateRacingStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
-	steps []*model.JobStep) (bool, error) {
-	created, err := g.StoreInterface.CreateJobWithDedup(job, stages, steps)
-	if created && g.onAdmit != nil {
-		g.onAdmit()
-	}
-	return created, err
-}
-
-// TestProcessAlertUpdates_KeepsFlagWhenAnAlertArrivesDuringAdmission: admitting
-// the job and lowering the gate are two writes, and an alert that lands between
-// them belongs to neither.
-//
-// The admitted job renders the message at some point of its own; whether it
-// happens to include this alert is not something the producer can know. What it
-// can know is that the gate it is about to lower is no longer the one it read -
-// so it leaves it up, and the alert gets an update of its own.
-func TestProcessAlertUpdates_KeepsFlagWhenAnAlertArrivesDuringAdmission(t *testing.T) {
-	s := store.NewMockStore()
-	racing := &gateRacingStore{StoreInterface: s}
-	d, _ := NewDispatcher(racing, &config.Config{})
-	d.RegisterProvider("slack", &MockProvider{
-		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
-			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
-		},
-	})
-
-	s.CreateAlertGroup(&model.AlertGroup{
-		ID:       "ag_race",
-		AlertKey: "dk_race",
-		Status:   model.AlertGroupStatusProcessing,
-		Title:    "Test",
-		Severity: "info",
-	})
-	s.UpsertNotificationDelivery(&model.NotificationDelivery{
-		ID:              "del_race",
-		AlertGroupID:    "ag_race",
-		Provider:        "slack",
-		SupportsUpdate:  true,
-		ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
-	})
-	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_race", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
-
-	// The new alert lands after the job is admitted and before the gate comes
-	// down.
-	racing.onAdmit = func() {
-		s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_race", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
-	}
-
-	ctx := context.Background()
-	d.ProcessAlertUpdates(ctx)
-
-	if job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_race")); job == nil {
-		t.Fatal("no update job was created for the first alert")
-	}
-	ag, _ := s.GetAlertGroupByID("ag_race")
-	if !ag.SlackUpdatePending {
-		t.Fatal("the gate came down for a version that was already stale; the second alert is now lost")
-	}
-
-	// The in-flight job finishes, the next tick is admitted, and the gate comes
-	// down for the version that raised it.
-	racing.onAdmit = nil
-	s.MarkJobSucceeded(jobdedup.AlertUpdate("ag_race"))
-	d.ProcessAlertUpdates(ctx)
-
-	settled, _ := s.GetAlertGroupByID("ag_race")
-	if settled.SlackUpdatePending {
-		t.Error("the gate is still up after the second alert got an update of its own")
-	}
-}
-
-func TestProcessAlertUpdates_HandlesTriggeredGroups(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d, _ := NewDispatcher(s, cfg)
-	d.RegisterProvider("slack", &MockProvider{
-		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
-			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
-		},
-	})
-
-	// Setup: triggered AG with slack_update_pending
-	ag := &model.AlertGroup{
-		ID:       "ag_triggered",
-		AlertKey: "dk_triggered",
-		Status:   model.AlertGroupStatusTriggered,
-		Title:    "Test Triggered",
-		Severity: "critical",
-	}
-	s.CreateAlertGroup(ag)
-	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_triggered", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
-
-	s.UpsertNotificationDelivery(&model.NotificationDelivery{
-		ID:              "del_triggered",
-		AlertGroupID:    "ag_triggered",
-		Provider:        "slack",
-		SupportsUpdate:  true,
-		ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
-	})
-
-	ctx := context.Background()
-	d.ProcessAlertUpdates(ctx)
-
-	// Verify: job created for triggered group
-	job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_triggered"))
-	if job == nil {
-		t.Fatal("Expected alert update job to be created for triggered group")
-	}
-
-	// Verify: flag cleared
-	updated, _ := s.GetAlertGroupByID("ag_triggered")
-	if updated.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be false after job creation")
-	}
-}
-
-func TestProcessAlertUpdates_HandlesAcknowledgedGroups(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{}
-	d, _ := NewDispatcher(s, cfg)
-	d.RegisterProvider("slack", &MockProvider{
-		UpdateFunc: func(ctx context.Context, ag *model.AlertGroup) (string, error) {
-			return `{"channel_id":"C123","timestamp":"100.200"}`, nil
-		},
-	})
-
-	// Setup: acknowledged AG with ack already processed + new flag
-	ag := &model.AlertGroup{
-		ID:       "ag_acked",
-		AlertKey: "dk_acked",
-		Status:   model.AlertGroupStatusAcknowledged,
-		Title:    "Test",
-		Severity: "critical",
-	}
-	s.CreateAlertGroup(ag)
-	s.MarkAckProcessed("ag_acked")
-	s.UpdateAlertGroupAlertsAndRaiseSlackUpdate("ag_acked", []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}})
-
-	s.UpsertNotificationDelivery(&model.NotificationDelivery{
-		ID:              "del_acked",
-		AlertGroupID:    "ag_acked",
-		Provider:        "slack",
-		SupportsUpdate:  true,
-		ProviderPayload: `{"channel_id":"C123","timestamp":"100.200"}`,
-	})
-
-	ctx := context.Background()
-	d.ProcessAlertUpdates(ctx)
-
-	// Verify: job created for acknowledged group
-	job, _ := s.FindJobByIdentity(jobdedup.AlertUpdate("ag_acked"))
-	if job == nil {
-		t.Fatal("Expected alert update job to be created for acknowledged group")
-	}
-
-	// Verify: flag cleared
-	updated, _ := s.GetAlertGroupByID("ag_acked")
-	if updated.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be false after job creation")
+	if updated, _ := s.GetAlertGroupByID("ag_update"); updated.SlackUpdatePending {
+		t.Error("something raised the flag the loop reads")
 	}
 }
