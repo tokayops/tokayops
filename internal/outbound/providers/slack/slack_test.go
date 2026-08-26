@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf8"
 
 	slackapi "github.com/slack-go/slack"
@@ -39,59 +38,6 @@ func newSlackProviderForTest(token, apiURL, selfURL string) *Provider {
 		selfURL:     selfURL,
 		client:      slackapi.New(token, slackapi.OptionAPIURL(apiURL)),
 		cachedToken: token,
-	}
-}
-
-func TestSlackSendPostsTheCard(t *testing.T) {
-	// Mock Slack API
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		if r.URL.Path == "/chat.postMessage" {
-			// Return successful response
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":      true,
-				"channel": "C123",
-				"ts":      "123.456",
-			})
-			return
-		}
-		if r.URL.Path == "/chat.getPermalink" {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":        true,
-				"permalink": "https://slackapi.test/archives/C123/p123456",
-			})
-			return
-		}
-		t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
-	}))
-	defer server.Close()
-
-	// Initialize Provider with test factory
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-
-	ctx := context.Background()
-	ag := &model.AlertGroup{
-		ID:       "ag-1",
-		Title:    "Test Alert Group",
-		Severity: "critical",
-		Alerts: []model.Alert{
-			{Labels: map[string]string{"alertname": "A1"}, Status: "firing"},
-		},
-	}
-
-	// 1. Send
-	dataStr, err := provider.Send(ctx, providers.NotificationRequest{
-		Kind:       "channel",
-		Target:     providers.NotificationTarget{Kind: "channel", ID: "C123"},
-		AlertGroup: ag,
-		Editable:   true,
-	})
-	if err != nil {
-		t.Fatalf("Send failed: %v", err)
-	}
-	if dataStr == "" {
-		t.Error("Send returned empty data")
 	}
 }
 
@@ -210,123 +156,16 @@ func TestSlackProvider_MissingToken(t *testing.T) {
 	provider := &Provider{tokenSource: &mockTokenSource{token: ""}}
 
 	if _, err := provider.Send(context.Background(), providers.NotificationRequest{
-		Kind: "channel", Target: providers.NotificationTarget{Kind: "channel", ID: "C1"}, AlertGroup: &model.AlertGroup{}, Editable: true,
-	}); !errors.Is(err, ErrNoToken) {
-		t.Errorf("channel send: expected ErrNoToken, got %v", err)
-	}
-	if _, err := provider.Send(context.Background(), providers.NotificationRequest{
 		Kind: "slack_dm", Target: providers.NotificationTarget{Kind: "user", ID: "U1"}, Message: "x",
 	}); !errors.Is(err, ErrNoToken) {
 		t.Errorf("dm send: expected ErrNoToken, got %v", err)
 	}
-}
-
-// TestACardSendIsOneExternalEffect. Posting the card used to be followed by a
-// second message - the history, in the card's thread - and that made one
-// attempt carry two external effects. An attempt performs one (NFR-6): the
-// second had no journal entry of its own, no receipt, and no way to be retried
-// without duplicating the first.
-//
-// The thread went with tag 14 on 2026-08-25. What is left is the assertion that
-// it did not come back.
-func TestACardSendIsOneExternalEffect(t *testing.T) {
-	// Mock Slack API to track calls
-	var postMessageCalls int
-	var lastChannel, lastText, lastThreadTS string
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		if r.URL.Path == "/chat.postMessage" {
-			postMessageCalls++
-
-			// Capture request data
-			var payload struct {
-				Channel  string `json:"channel"`
-				Text     string `json:"text"`
-				ThreadTS string `json:"thread_ts"`
-			}
-
-			// Try decoding as JSON first
-			if r.Header.Get("Content-Type") == "application/json" {
-				json.NewDecoder(r.Body).Decode(&payload)
-			} else {
-				// Fallback to Form parsing
-				r.ParseForm()
-				payload.Channel = r.FormValue("channel")
-				payload.Text = r.FormValue("text")
-				payload.ThreadTS = r.FormValue("thread_ts")
-			}
-
-			lastChannel = payload.Channel
-			lastText = payload.Text
-			lastThreadTS = payload.ThreadTS
-
-			// Return successful response
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":      true,
-				"channel": "C123",
-				"ts":      "100.200", // Main message TS
-			})
-			return
-		}
-		if r.URL.Path == "/chat.getPermalink" {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":        true,
-				"permalink": "https://slackapi.test/archives/C123/p100200",
-			})
-			return
-		}
-
-		t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
-	}))
-	defer server.Close()
-
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	ctx := context.Background()
-
-	ag := &model.AlertGroup{
-		ID:       "ag-timeline-1",
-		Title:    "Timeline Test",
-		Severity: "critical",
-		TimelineEvents: []*model.TimelineEvent{
-			{
-				Type:      model.TimelineEventCreated,
-				Message:   "Group created",
-				CreatedAt: time.Now(),
-			},
-		},
-	}
-
-	dataStr, err := provider.Send(ctx, providers.NotificationRequest{
-		Kind:       "channel",
-		Target:     providers.NotificationTarget{Kind: "channel", ID: "C123"},
-		AlertGroup: ag,
-		Editable:   true,
-	})
-	if err != nil {
-		t.Fatalf("Send failed: %v", err)
-	}
-
-	if postMessageCalls != 1 {
-		t.Errorf("one send made %d calls to chat.postMessage, want 1", postMessageCalls)
-	}
-	if lastChannel != "C123" {
-		t.Errorf("the card went to %s, want C123", lastChannel)
-	}
-	if lastThreadTS != "" {
-		t.Errorf("something was posted in thread %s", lastThreadTS)
-	}
-	if strings.Contains(lastText, "Group created") {
-		t.Errorf("the history reached the message: %s", lastText)
-	}
-
-	var data Data
-	if err := json.Unmarshal([]byte(dataStr), &data); err != nil {
-		t.Fatalf("read the payload back: %v", err)
-	}
-	if data.ChannelID == "" || data.Timestamp == "" {
-		t.Errorf("the payload does not name the message: %+v", data)
+	// And a channel target is refused before the token is even looked at: a
+	// card posted from here would be one nothing can update.
+	if _, err := provider.Send(context.Background(), providers.NotificationRequest{
+		Kind: "channel", Target: providers.NotificationTarget{Kind: "channel", ID: "C1"}, AlertGroup: &model.AlertGroup{}, Editable: true,
+	}); err == nil || errors.Is(err, ErrNoToken) {
+		t.Errorf("channel send: expected a refusal of the target kind, got %v", err)
 	}
 }
 
@@ -555,69 +394,6 @@ func TestRenderTitleAndBody_WithExternalURL(t *testing.T) {
 	titleBlock := title[0].(*slackapi.SectionBlock)
 	if !strings.Contains(titleBlock.Text.Text, "https://alertmanager.example.com/alerts/1") {
 		t.Errorf("title should contain external URL as link, got %q", titleBlock.Text.Text)
-	}
-}
-
-func TestSendProducesBlockKit(t *testing.T) {
-	var postAttachments, postBlocks, postText string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/chat.postMessage":
-			r.ParseForm()
-			postAttachments = r.FormValue("attachments")
-			postBlocks = r.FormValue("blocks")
-			postText = r.FormValue("text")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok": true, "channel": "C123", "ts": "111.222",
-			})
-		case "/chat.getPermalink":
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok": true, "permalink": "https://slackapi.test/p",
-			})
-		}
-	}))
-	defer server.Close()
-
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	dataStr, err := provider.Send(context.Background(), providers.NotificationRequest{
-		Kind:       "channel",
-		Target:     providers.NotificationTarget{Kind: "channel", ID: "C123"},
-		AlertGroup: &model.AlertGroup{ID: "ag-fmt", Title: "FmtTest", Severity: "critical"},
-		Editable:   true,
-	})
-	if err != nil {
-		t.Fatalf("Send failed: %v", err)
-	}
-
-	// Persisted data still parses cleanly and carries channel + timestamp.
-	var data Data
-	if err := json.Unmarshal([]byte(dataStr), &data); err != nil {
-		t.Fatalf("unmarshal Data: %v", err)
-	}
-	if data.ChannelID == "" || data.Timestamp == "" {
-		t.Errorf("expected non-empty ChannelID/Timestamp, got %+v", data)
-	}
-
-	// chat.postMessage payload must carry Block Kit content (section block inside the attachment).
-	if !strings.Contains(postAttachments, `"type":"section"`) {
-		t.Errorf("chat.postMessage attachments should contain Block Kit section, got: %s", postAttachments)
-	}
-
-	// Top-level blocks should contain the title
-	if postBlocks == "" {
-		t.Error("chat.postMessage should have non-empty blocks (title)")
-	}
-	if !strings.Contains(postBlocks, "FmtTest") {
-		t.Errorf("chat.postMessage blocks should contain alert title, got: %s", postBlocks)
-	}
-
-	// Fallback text should be populated and contain the title
-	if postText == "" {
-		t.Error("chat.postMessage should have non-empty text (fallback)")
-	}
-	if !strings.Contains(postText, "FmtTest") {
-		t.Errorf("chat.postMessage text should contain alert title, got: %s", postText)
 	}
 }
 

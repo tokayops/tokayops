@@ -272,25 +272,18 @@ func (t *Provider) sendMessage(ctx context.Context, client *http.Client, token, 
 	return r.MessageID, nil
 }
 
-// Send dispatches on the target kind: a "user" target is a fire-and-forget DM
-// (returns no payload), a "channel" target posts an editable alert card and
-// returns its Data payload. Behaviour keys on Target.Kind — never on
-// req.Kind. An unknown kind is rejected rather than silently treated as a card.
+// Send is the job engine's one remaining call into this channel: a
+// fire-and-forget direct message. The same rule as Slack's, for the same
+// reason - a card posted from here would be one nothing can update, because
+// nothing here records where it landed.
 func (t *Provider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
-	switch req.Target.Kind {
-	case "user":
-		if req.Message == "" {
-			return "", fmt.Errorf("telegram: user send requires a message")
-		}
-		return "", t.sendDM(ctx, req.Target.ID, req.Message)
-	case "channel":
-		if req.AlertGroup == nil {
-			return "", fmt.Errorf("telegram: channel send requires an alert group")
-		}
-		return t.sendCard(ctx, req.Target.ID, req.AlertGroup)
-	default:
-		return "", fmt.Errorf("telegram: unsupported target kind %q", req.Target.Kind)
+	if req.Target.Kind != "user" {
+		return "", fmt.Errorf("telegram: %q is not sent from here any more", req.Target.Kind)
 	}
+	if req.Message == "" {
+		return "", fmt.Errorf("telegram: user send requires a message")
+	}
+	return "", t.sendDM(ctx, req.Target.ID, req.Message)
 }
 
 // sendDM sends a fire-and-forget plain-text DM. Not deliverable until Sprint 3
@@ -305,35 +298,6 @@ func (t *Provider) sendDM(ctx context.Context, chatID, message string) error {
 		return err
 	}
 	return nil
-}
-
-// sendCard posts an alert-group card to a channel/group and returns the
-// Data payload needed to edit it later.
-func (t *Provider) sendCard(ctx context.Context, chatID string, ag *model.AlertGroup) (string, error) {
-	if ag == nil {
-		return "", fmt.Errorf("telegram: channel send requires an alert group")
-	}
-	client, token, err := t.getClient()
-	if err != nil {
-		return "", err
-	}
-
-	messageID, err := t.sendMessage(ctx, client, token, chatID, t.renderCard(ag, false), "HTML", t.keyboardFor(ag, false))
-	if err != nil {
-		return "", err
-	}
-	// The editable card's payload must carry valid coordinates; without them the
-	// delivery row would be unusable for Update/Resolve (recordDelivery rejects
-	// an editable delivery with an empty payload).
-	if chatID == "" || messageID == 0 {
-		return "", fmt.Errorf("telegram: sendMessage returned empty chat/message id (chat=%q id=%d)", chatID, messageID)
-	}
-
-	log.Printf("Provider: Sent message to %s (message_id: %d)", chatID, messageID)
-
-	data := Data{ChatID: chatID, MessageID: messageID}
-	bytes, _ := json.Marshal(data)
-	return string(bytes), nil
 }
 
 // keyboardFor returns the inline keyboard for a card.

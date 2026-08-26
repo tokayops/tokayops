@@ -58,33 +58,6 @@ func testAlertGroup() *model.AlertGroup {
 	}
 }
 
-func TestTelegram_SendPostsTheCard(t *testing.T) {
-	counts := map[string]int{}
-	server := fakeBotAPI(t, 42, counts)
-	defer server.Close()
-
-	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL(server.URL))
-	ctx := context.Background()
-	ag := testAlertGroup()
-
-	payload, err := p.Send(ctx, providers.NotificationRequest{
-		Target:     providers.NotificationTarget{Kind: "channel", ID: "@chan"},
-		AlertGroup: ag,
-		Editable:   true,
-	})
-	if err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	data, ok := parseData(payload)
-	if !ok || data.ChatID != "@chan" || data.MessageID != 42 {
-		t.Fatalf("payload = %q, parsed=%+v ok=%v", payload, data, ok)
-	}
-
-	if counts["sendMessage"] != 1 || counts["editMessageText"] != 0 {
-		t.Errorf("call counts = %v, want sendMessage=1 and nothing else", counts)
-	}
-}
-
 func TestTelegram_Send_EmptyMessageID_Errors(t *testing.T) {
 	counts := map[string]int{}
 	server := fakeBotAPI(t, 0, counts) // message_id 0 → editable contract violation
@@ -141,9 +114,10 @@ func TestTelegram_MissingToken_Permanent(t *testing.T) {
 	p := NewProvider(&mockTelegramTokenSource{token: ""}, "", WithBaseURL("http://unused.invalid"))
 	ctx := context.Background()
 
-	_, err := p.Send(ctx, providers.NotificationRequest{Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true})
+	_, err := p.Send(ctx, providers.NotificationRequest{
+		Target: providers.NotificationTarget{Kind: "user", ID: "12345"}, Message: "you are on call"})
 	if !errors.Is(err, ErrNoToken) {
-		t.Errorf("channel send: got %v, want ErrNoToken", err)
+		t.Errorf("direct message: got %v, want ErrNoToken", err)
 	}
 	// Whether the dispatcher treats that as permanent is the dispatcher's rule
 	// and is asserted there: a channel that classified its own errors for its
@@ -206,86 +180,6 @@ func TestTelegram_RenderCard_SafeTruncation(t *testing.T) {
 	}
 	if !strings.Contains(out, `href="https://tokay.example/#/ops/alert-groups/ag-big"`) {
 		t.Errorf("footer link missing/truncated: %q", out[len(out)-120:])
-	}
-}
-
-func TestTelegram_CardHasAckResolveKeyboard(t *testing.T) {
-	var sentBody map[string]interface{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
-			_ = json.NewDecoder(r.Body).Decode(&sentBody)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"message_id": 5}})
-			return
-		}
-		t.Errorf("unexpected request: %s", r.URL.Path)
-	}))
-	defer server.Close()
-
-	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL(server.URL))
-	if _, err := p.Send(context.Background(), providers.NotificationRequest{
-		Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
-	}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if sentBody["reply_markup"] == nil {
-		t.Fatalf("card sendMessage has no reply_markup: %v", sentBody)
-	}
-	b, _ := json.Marshal(sentBody["reply_markup"])
-	if !strings.Contains(string(b), "ack:ag-1") || !strings.Contains(string(b), "res:ag-1") {
-		t.Errorf("keyboard missing ack/res callback_data: %s", b)
-	}
-}
-
-// A card posted while interactivity is off never gets a keyboard in the first
-// place.
-func TestTelegram_InteractiveOff_SendHasEmptyKeyboard(t *testing.T) {
-	var sentBody map[string]interface{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
-			_ = json.NewDecoder(r.Body).Decode(&sentBody)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"message_id": 8}})
-			return
-		}
-		t.Errorf("unexpected request: %s", r.URL.Path)
-	}))
-	defer server.Close()
-
-	p := NewProvider(&mockTelegramTokenSource{token: "tok", interactiveOff: true}, "https://tokay.example", WithBaseURL(server.URL))
-	if _, err := p.Send(context.Background(), providers.NotificationRequest{
-		Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
-	}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	b, _ := json.Marshal(sentBody["reply_markup"])
-	if string(b) != `{"inline_keyboard":[]}` {
-		t.Errorf("reply_markup = %s, want an empty inline_keyboard", b)
-	}
-}
-
-func TestTelegram_NoButtonsWithoutSelfURL(t *testing.T) {
-	var sentBody map[string]interface{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
-			_ = json.NewDecoder(r.Body).Decode(&sentBody)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"message_id": 9}})
-			return
-		}
-		t.Errorf("unexpected request: %s", r.URL.Path)
-	}))
-	defer server.Close()
-
-	// Empty selfURL ⇒ no public webhook possible ⇒ omit the (dead) keyboard.
-	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
-	if _, err := p.Send(context.Background(), providers.NotificationRequest{
-		Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: testAlertGroup(), Editable: true,
-	}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if _, ok := sentBody["reply_markup"]; ok {
-		t.Errorf("card must have no reply_markup when selfURL is empty, got %v", sentBody["reply_markup"])
 	}
 }
 

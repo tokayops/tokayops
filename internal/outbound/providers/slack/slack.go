@@ -249,79 +249,24 @@ func (s *Provider) GetEmailBySlackID(ctx context.Context, slackUserID string) (s
 	return user.Profile.Email, nil
 }
 
-// Send dispatches on the target kind: a "user" target is a fire-and-forget DM
-// (returns no payload), a "channel" target posts an editable alert card and
-// returns its Data payload. Behaviour keys on Target.Kind / AlertGroup /
-// Message — never on req.Kind. An unknown kind is rejected rather than silently
-// treated as a channel card.
+// Send is the job engine's one remaining call into this channel: a
+// fire-and-forget direct message, which is what a handover announcement is. It
+// returns no payload because nothing edits it afterwards.
+//
+// A channel target is refused rather than posted. It used to post an alert
+// card, and that is the delivery domain's work now - it goes through
+// ExecuteAttempt, which records where the card landed so a later revision can
+// reach it. Posting one from here would make a card nothing can update, and
+// the fact that no caller does it today is not a reason to leave the branch
+// open. Behaviour keys on Target.Kind, never on req.Kind.
 func (s *Provider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
-	switch req.Target.Kind {
-	case "user":
-		if req.Message == "" {
-			return "", fmt.Errorf("slack: user send requires a message")
-		}
-		return "", s.sendDM(ctx, req.Target.ID, req.Message)
-	case "channel":
-		if req.AlertGroup == nil {
-			return "", fmt.Errorf("slack: channel send requires an alert group")
-		}
-		return s.sendCard(ctx, req.Target.ID, req.AlertGroup)
-	default:
-		return "", fmt.Errorf("slack: unsupported target kind %q", req.Target.Kind)
+	if req.Target.Kind != "user" {
+		return "", fmt.Errorf("slack: %q is not sent from here any more", req.Target.Kind)
 	}
-}
-
-// sendCard posts an alert-group card (title blocks + colored attachment) to a
-// channel and returns the Data payload needed to update/resolve it later.
-func (s *Provider) sendCard(ctx context.Context, targetID string, ag *model.AlertGroup) (string, error) {
-	if ag == nil {
-		return "", fmt.Errorf("slack: channel send requires an alert group")
+	if req.Message == "" {
+		return "", fmt.Errorf("slack: user send requires a message")
 	}
-	client, err := s.getClient()
-	if err != nil {
-		return "", err
-	}
-
-	state := s.freeze(ag, false)
-	card := Render(state, s.interactive())
-
-	channelID, timestamp, err := client.PostMessageContext(ctx, targetID,
-		slackapi.MsgOptionText(card.Text, false),
-		slackapi.MsgOptionBlocks(card.Blocks...),
-		slackapi.MsgOptionAttachments(card.Attachment),
-	)
-	if err != nil {
-		return "", err
-	}
-	// The editable card's payload must carry valid coordinates; without them the
-	// delivery row would be unusable for Update/Resolve.
-	if channelID == "" || timestamp == "" {
-		return "", fmt.Errorf("slack: postMessage returned empty channel/timestamp (channel=%q ts=%q)", channelID, timestamp)
-	}
-
-	permalink := ""
-	if channelID != "" && timestamp != "" {
-		link, err := client.GetPermalinkContext(ctx, &slackapi.PermalinkParameters{
-			Channel: channelID,
-			Ts:      timestamp,
-		})
-		if err != nil {
-			log.Printf("Provider: Failed to get permalink for %s: %v", channelID, err)
-		} else {
-			permalink = link
-		}
-	}
-
-	log.Printf("Provider: Sent message to %s (ts: %s)", channelID, timestamp)
-
-	// Return data to be saved for updates
-	data := Data{
-		ChannelID: channelID,
-		Timestamp: timestamp,
-		Permalink: permalink,
-	}
-	bytes, _ := json.Marshal(data)
-	return string(bytes), nil
+	return "", s.sendDM(ctx, req.Target.ID, req.Message)
 }
 
 // providers.MessageStatus holds the resolved title and color for a Slack message.

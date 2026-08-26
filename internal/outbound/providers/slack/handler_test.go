@@ -164,6 +164,34 @@ func TestAnAttemptEndsWhenTheCardExists(t *testing.T) {
 	}
 }
 
+// TestTheCardGoesOutAsBlockKit. The wire shape Slack needs, and the shape a
+// message-link unfurl needs: a section block inside the coloured attachment,
+// the title in the top-level blocks, and a plain fallback text for the places
+// that render no blocks at all - the notification, and a screen reader.
+func TestTheCardGoesOutAsBlockKit(t *testing.T) {
+	api := newSlackAPI(t)
+	handler := handlerFor(api)
+
+	if _, err := handler.ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"}, true)); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	post := api.posts[0]
+	attachments, _ := post["attachments"].(string)
+	if !strings.Contains(attachments, `"type":"section"`) {
+		t.Errorf("the attachment carries no Block Kit section: %s", attachments)
+	}
+	blocks, _ := post["blocks"].(string)
+	if !strings.Contains(blocks, "Disk filling up") {
+		t.Errorf("the top-level blocks do not carry the title: %s", blocks)
+	}
+	text, _ := post["text"].(string)
+	if !strings.Contains(text, "Disk filling up") {
+		t.Errorf("the fallback text does not carry the title: %s", text)
+	}
+}
+
 // TestADirectMessageIsOneCallToo. conversations.open is gone: chat.postMessage
 // takes the user id in `channel` and opens the conversation itself, so a DM has
 // no second place to fail before the message exists.

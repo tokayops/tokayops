@@ -145,6 +145,22 @@ func TestButtonsFollowTheAdmission(t *testing.T) {
 	if rows, _ := markup["inline_keyboard"].([]any); len(rows) != 0 {
 		t.Fatalf("a delivery admitted without buttons sent %d rows", len(rows))
 	}
+
+	// And the other way: admitted with buttons, the card goes out carrying the
+	// two a person can press, addressed to the alert group they answer for.
+	withButtons := newBotAPI(t)
+	if _, err := handlerFor(withButtons).ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.TargetChannel, true)); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	offered, err := json.Marshal(withButtons.calls[0]["reply_markup"])
+	if err != nil {
+		t.Fatalf("read the keyboard: %v", err)
+	}
+	if !strings.Contains(string(offered), "ack:ag-1") ||
+		!strings.Contains(string(offered), "res:ag-1") {
+		t.Fatalf("the keyboard offers %s", offered)
+	}
 }
 
 // TestAChangeCarriesTheKeyboardTheAdmissionFroze. Telegram leaves the existing
