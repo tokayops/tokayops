@@ -16,10 +16,12 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -1308,11 +1310,20 @@ func TestSlackInteractiveHandlerAnswersTheClicker(t *testing.T) {
 
 	// Somebody else got there first, and the answer says which of the two
 	// things they did - which is read from the group rather than guessed.
+	//
+	// From the group the SERVICE already read, and not from a second query.
+	// Slack allows this handler three seconds, and the arguments of a `go` call
+	// are evaluated before the goroutine starts: a read written that way looks
+	// asynchronous and is not.
 	t.Run("a click that came too late says what was already done", func(t *testing.T) {
 		api, s, e, agID := setup(t)
+		counting := &countingReads{StoreInterface: s}
+		api.store = counting
+		api.agService = alertgroup.NewService(counting)
 		captured := newCapturedEphemeral()
 		api.respondEphemeral = captured.post
 		s.AckAlertGroupAtomic(agID, "Other User", nil, nil)
+		counting.reads.Store(0)
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec := httptest.NewRecorder()
@@ -1325,5 +1336,23 @@ func TestSlackInteractiveHandlerAnswersTheClicker(t *testing.T) {
 		if !strings.Contains(msg, "already acknowledged") {
 			t.Errorf("Expected ephemeral about an acknowledged group, got %q", msg)
 		}
+		// Two, and both are decisions: the handler reads the group to know
+		// which team to check permission against, and the service reads it to
+		// decide whether there is anything to do. A third would be the handler
+		// asking the database a question it already has the answer to.
+		if got := counting.reads.Load(); got != 2 {
+			t.Errorf("the click read the alert group %d times, want 2", got)
+		}
 	})
+}
+
+// countingReads counts what a request costs in reads of the alert group.
+type countingReads struct {
+	store.StoreInterface
+	reads atomic.Int32
+}
+
+func (c *countingReads) GetAlertGroupByID(id string) (*model.AlertGroup, error) {
+	c.reads.Add(1)
+	return c.StoreInterface.GetAlertGroupByID(id)
 }

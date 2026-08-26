@@ -253,12 +253,12 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 	case alertgroup.OutcomeAlreadyDone:
 		metrics.SlackInteractionTotal.WithLabelValues(slackActionLabel(actionID), "already_done").Inc()
 		// Somebody got there first, and which of the two things they did is
-		// worth saying exactly - so the group is read once for the answer.
-		already := "Alert group is already acknowledged or resolved."
-		if isResolve {
-			already = "Alert group is already resolved."
-		}
-		go a.respondEphemeral(responseURL, a.alreadyDoneFallback(alertGroupID, already))
+		// worth saying exactly. The group that says so is already in hand: the
+		// service read it to decide, and hands it back on this outcome. Reading
+		// it again would put a query on the three-second budget Slack allows
+		// this handler - and not inside the goroutine either, because the
+		// argument of a `go` call is evaluated before the goroutine starts.
+		go a.respondEphemeral(responseURL, fallbackFromAG(result.AlertGroup))
 	}
 
 	// 11. Return 200 empty body: the card is the delivery domain's to update.
@@ -305,16 +305,6 @@ func postResponseURL(responseURL, text string) {
 		return // fire-and-forget
 	}
 	resp.Body.Close()
-}
-
-// alreadyDoneFallback re-fetches the AG once and builds a specific message for
-// a click that came too late.
-func (a *API) alreadyDoneFallback(alertGroupID, defaultText string) string {
-	current, err := a.store.GetAlertGroupByID(alertGroupID)
-	if err != nil {
-		return defaultText
-	}
-	return fallbackFromAG(current)
 }
 
 // fallbackFromAG builds a human-readable ephemeral message from an already-fetched alert group.
