@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/tokayops/tokayops/internal/metrics"
+	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 )
 
@@ -89,6 +91,167 @@ func TestACardBehindItsAlertIsCountedByWhoCanFixIt(t *testing.T) {
 	if snap.OutboundCardStalenessSeconds > 3600 {
 		t.Errorf("the age is %.0fs, so the withdrawn card is being counted",
 			snap.OutboundCardStalenessSeconds)
+	}
+}
+
+// aimAgain raises the desired state a second time with an alert set that is
+// genuinely different, so the revision is a real one rather than "unchanged".
+func aimAgain(t *testing.T, s *Store, agID, alertName string) int64 {
+	t.Helper()
+	recordAlerts(t, s, agID, []model.Alert{{
+		Fingerprint: "fp-" + alertName, Status: model.AlertStatusFiring,
+		StartsAt: time.Unix(1700001200, 0),
+		Labels:   map[string]string{"alertname": alertName},
+	}})
+	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
+		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: "ingester",
+	})
+	if err != nil || result.Outcome != outbound.DesiredApplied {
+		t.Fatalf("raise the desired state again: %s (%v)", result.Outcome, err)
+	}
+	return result.Revision
+}
+
+// ageRevisions back-dates the journal so a wait can be asserted exactly.
+//
+// It moves the events, not the commitment. Everything else that could be
+// mistaken for an answer - the commitment's own updated_at, the snapshot row -
+// stays at now, so a build that measured any of those reports nothing instead
+// of the hour these tests set up.
+func ageRevisions(t *testing.T, s *Store, intentID string, above int64, ago string) {
+	t.Helper()
+	res, err := s.db.Exec(`
+		UPDATE outbound_intent_events
+		SET created_at = now() - $3::interval
+		WHERE intent_id = $1 AND kind = 'desired_raised'
+		  AND (detail->>'revision')::bigint > $2`, intentID, above, ago)
+	if err != nil {
+		t.Fatalf("age the journal: %v", err)
+	}
+	if moved, _ := res.RowsAffected(); moved == 0 {
+		t.Fatalf("no revision above %d to age", above)
+	}
+}
+
+func staleness(t *testing.T, s *Store) float64 {
+	t.Helper()
+	snap, err := s.GetMetricsSnapshot()
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	return snap.OutboundCardStalenessSeconds
+}
+
+// TestASupersedeDoesNotResetTheWait. The card fell behind an hour ago and a
+// second revision arrived just now.
+//
+// The wait is measured from the first, and it has to be: the alert has been
+// misrepresented for an hour, and the newer revision is a further change to
+// what it should say, not a fresh start. Reading anything the supersede touched
+// - the commitment row, the snapshot - reports a card that has been wrong for
+// an hour as one second old.
+func TestASupersedeDoesNotResetTheWait(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	intentID := changeableCard(t, s, agID)
+	aim(t, s, agID)
+	ageRevisions(t, s, intentID, 0, "1 hour")
+
+	// The second revision, now, before anything has attempted the first.
+	aimAgain(t, s, agID, "DiskLoud")
+
+	if age := staleness(t, s); age < 3000 {
+		t.Errorf("the wait is %.0fs; the card has been behind for an hour", age)
+	}
+}
+
+// TestARefusalBeforeTheNetworkIsStuckAndHasAnAge.
+//
+// Nothing is ever attempted here: the recipient is not linked, so preparation
+// refuses and no call is made. There is no attempt row to read a time from, and
+// the earlier design that measured from the attempts would have shown this
+// commitment as stuck forever with no age at all - the one case where somebody
+// most needs to know how long it has been.
+func TestARefusalBeforeTheNetworkIsStuckAndHasAnAge(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	intentID := changeableCard(t, s, agID)
+	aim(t, s, agID)
+	ageRevisions(t, s, intentID, 0, "1 hour")
+
+	token := claimOne(t, s, intentID)
+	refused, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+		Preparation: outbound.PreparationPermanent,
+		ErrorClass:  "identity_not_linked",
+		Summary:     "the recipient has no Slack account linked",
+	})
+	if err != nil {
+		t.Fatalf("refuse the preparation: %v", err)
+	}
+	if refused.Outcome != outbound.BeginPreparedPermanent {
+		t.Fatalf("the preparation came back %s", refused.Outcome)
+	}
+
+	snap, err := s.GetMetricsSnapshot()
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	behind := map[string]int{}
+	for _, b := range snap.OutboundCardsBehind {
+		behind[b.State] = b.Count
+	}
+	if behind["stuck"] != 1 {
+		t.Errorf("a commitment that will never attempt is %v", behind)
+	}
+	if snap.OutboundCardStalenessSeconds < 3000 {
+		t.Errorf("the wait is %.0fs, and there is no attempt to read it from",
+			snap.OutboundCardStalenessSeconds)
+	}
+}
+
+// TestCatchingUpMovesTheWaitToWhatIsStillOwed.
+//
+// The card applied the revision it was an hour behind on, and a new one arrived
+// a moment ago. The hour is over; what is owed now is a moment old. A measure
+// that kept the earliest event of all would go on reporting an hour for a card
+// that is up to date but for the last second.
+func TestCatchingUpMovesTheWaitToWhatIsStillOwed(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	intentID := changeableCard(t, s, agID)
+	revision := aim(t, s, agID)
+	ageRevisions(t, s, intentID, 0, "1 hour")
+
+	token := claimOne(t, s, intentID)
+	begun := beginOne(t, s, intentID, token)
+	if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token,
+		Conclusion: mutationAccepted(t, begun.ReceiptRef, outbound.Receipt{}),
+	}); err != nil {
+		t.Fatalf("apply the revision: %v", err)
+	}
+	if age := staleness(t, s); age != 0 {
+		t.Fatalf("the card caught up and is still %.0fs behind", age)
+	}
+
+	// And falls behind again, just now.
+	next := aimAgain(t, s, agID, "DiskLoud")
+	if next <= revision {
+		t.Fatalf("the second revision is %d and the first was %d", next, revision)
+	}
+	age := staleness(t, s)
+	if age <= 0 {
+		t.Error("the card is behind again and the wait is zero")
+	}
+	if age > 600 {
+		t.Errorf("the wait is %.0fs, so the revision it already applied is still counted", age)
 	}
 }
 

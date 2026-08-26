@@ -211,6 +211,52 @@ func TestBusinessCollector_OutboxDeliveriesByStatus(t *testing.T) {
 // --------------- helpers ---------------
 
 // collectMetrics registers a fresh collector in a temporary registry, gathers, and returns families.
+// snapshotStub is a store that answers with exactly one snapshot.
+//
+// The gauges below are about what the collector EMITS, which the store tests
+// cannot see: they read the snapshot struct, and a collector that dropped a
+// series would leave every one of them green.
+type snapshotStub struct{ snap *model.MetricsSnapshot }
+
+func (s snapshotStub) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
+	return s.snap, nil
+}
+
+// TestBusinessCollector_CardsBehind. Three series, one of them zero, and an age
+// reported exactly as given.
+//
+// The zero one is the point of the test as much as the others: a gauge nobody
+// writes keeps its last value in Prometheus, so a state that stops being
+// emitted when it empties goes on reporting the backlog it had.
+func TestBusinessCollector_CardsBehind(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics.RegisterCollectorWith(reg, snapshotStub{snap: &model.MetricsSnapshot{
+		OutboundCardsBehind: []model.OutboundCardsBehind{
+			{State: "queued", Count: 3},
+			{State: "stuck", Count: 1},
+			{State: "abandoned", Count: 0},
+		},
+		OutboundCardStalenessSeconds: 91.5,
+	}})
+
+	collected, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+
+	for state, want := range map[string]float64{"queued": 3, "stuck": 1, "abandoned": 0} {
+		got := findGaugeValue(t, collected, "outbound_cards_behind",
+			map[string]string{"state": state})
+		if got != want {
+			t.Errorf("outbound_cards_behind{state=%q} = %v, want %v", state, got, want)
+		}
+	}
+
+	if got := findGaugeValue(t, collected, "outbound_card_staleness_seconds", nil); got != 91.5 {
+		t.Errorf("outbound_card_staleness_seconds = %v, want 91.5", got)
+	}
+}
+
 func collectMetrics(t *testing.T, s store.StoreInterface) []*dto.MetricFamily {
 	t.Helper()
 	reg := prometheus.NewRegistry()

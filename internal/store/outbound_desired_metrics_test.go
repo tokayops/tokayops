@@ -103,7 +103,7 @@ func TestWhatCameOfARevisionIsCounted(t *testing.T) {
 	// that has already ended. The outcome exists because the command must
 	// answer something when the snapshot is already final, and it is proven
 	// where it is produced - see the command's own tests.
-	t.Run("a resolution", func(t *testing.T) {
+	t.Run("a person resolving the alert", func(t *testing.T) {
 		agID := desiredGroup(t, s, "Disk noisy")
 		changeableCard(t, s, agID)
 
@@ -111,6 +111,32 @@ func TestWhatCameOfARevisionIsCounted(t *testing.T) {
 		changed, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
 		if err != nil || !changed {
 			t.Fatalf("resolve: changed=%v err=%v", changed, err)
+		}
+		rose(t, outbound.DesiredResolve, outbound.DesiredApplied, before)
+	})
+
+	// The other resolving door, and it is a different one: this is Alertmanager
+	// saying everything cleared, decided inside the merge rather than by
+	// anybody pressing anything. Both raise the last revision a card will ever
+	// be brought to, and each has to count it.
+	t.Run("the alerts all clearing by themselves", func(t *testing.T) {
+		agID := desiredGroup(t, s, "Disk quiet again")
+		changeableCard(t, s, agID)
+
+		cleared := []model.Alert{{
+			Fingerprint: "fp-1", Status: model.AlertStatusResolved,
+			StartsAt: time.Unix(1700000000, 0),
+			EndsAt:   time.Unix(1700003600, 0),
+			Labels:   map[string]string{"alertname": "DiskWillFill"},
+		}}
+		before := count(outbound.DesiredResolve, outbound.DesiredApplied)
+		result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
+			"desired-"+agID, cleared, "ingester")
+		if err != nil {
+			t.Fatalf("the resolving payload: %v", err)
+		}
+		if result.Outcome != alertgroup.MergeResolved {
+			t.Fatalf("the payload came back %s", result.Outcome)
 		}
 		rose(t, outbound.DesiredResolve, outbound.DesiredApplied, before)
 	})
