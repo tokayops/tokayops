@@ -1114,45 +1114,90 @@ func TestARowCannotBeInTwoReceiptStates(t *testing.T) {
 	}
 
 	// Every combination the three columns can be put in that means nothing.
+	//
+	// Each carries the name that goes with its coordinates, so that the rule
+	// under test is the one that fires: a commitment keeps the object's name
+	// beside them, and a row with coordinates and no name would be refused by
+	// THAT rule first and prove nothing about these three states. The name rule
+	// is checked on its own below.
 	nonsense := []struct {
 		name string
 		set  string
+		ref  string
 	}{
 		{
 			name: "nothing was sent, and here are its coordinates",
 			set:  `receipt_recorded = FALSE, receipt = '{"a":1}'::jsonb, receipt_redacted_at = NULL`,
+			ref:  `'C0001/1700000000.000100'`,
 		},
 		{
 			name: "nothing was sent, and its coordinates were redacted",
 			set:  `receipt_recorded = FALSE, receipt = NULL, receipt_redacted_at = now()`,
+			ref:  `NULL`,
 		},
 		{
 			name: "something was sent, and there is neither a receipt nor a redaction",
 			set:  `receipt_recorded = TRUE, receipt = NULL, receipt_redacted_at = NULL`,
+			ref:  `NULL`,
 		},
 		{
 			name: "the coordinates are both present and redacted",
 			set:  `receipt_recorded = TRUE, receipt = '{"a":1}'::jsonb, receipt_redacted_at = now()`,
+			ref:  `'C0001/1700000000.000100'`,
 		},
 	}
 
 	for table, shape := range rows {
 		for _, bad := range nonsense {
 			t.Run(table+": "+bad.name, func(t *testing.T) {
-				_, err := s.db.ExecContext(ctx, fmt.Sprintf(shape, bad.set))
+				set := bad.set
+				if table == "outbound_intents" {
+					set += `, receipt_ref = ` + bad.ref
+				}
+				_, err := s.db.ExecContext(ctx, fmt.Sprintf(shape, set))
 				if err == nil {
 					t.Fatal("the database accepted a row in no receipt state at all")
 				}
-				// Either rule may be the one that fires, and both are about
-				// the same three states: a commitment also carries the name
-				// of the object beside its coordinates, so a row with
-				// coordinates and no name is refused there first.
-				if !strings.Contains(err.Error(), outboundReceiptStateConstraint) &&
-					!strings.Contains(err.Error(), outboundReceiptNameConstraint) {
+				if !strings.Contains(err.Error(), outboundReceiptStateConstraint) {
 					t.Fatalf("refused by something else: %v", err)
 				}
 			})
 		}
+	}
+
+	// And the rule beside it, on the two halves that have to travel together.
+	// Coordinates nobody can address are a card no change can reach; a name
+	// with nothing behind it is a row that would send one to an object it
+	// cannot describe.
+	for _, half := range []struct {
+		name string
+		set  string
+	}{
+		{
+			name: "coordinates with no name",
+			set: `receipt_recorded = TRUE, receipt = '{"a":1}'::jsonb, ` +
+				`receipt_redacted_at = NULL, receipt_ref = NULL`,
+		},
+		{
+			name: "a name with no coordinates",
+			set: `receipt_recorded = TRUE, receipt = NULL, ` +
+				`receipt_redacted_at = now(), receipt_ref = 'C0001/1700000000.000100'`,
+		},
+		{
+			name: "a name that says nothing",
+			set: `receipt_recorded = TRUE, receipt = '{"a":1}'::jsonb, ` +
+				`receipt_redacted_at = NULL, receipt_ref = ''`,
+		},
+	} {
+		t.Run("outbound_intents: "+half.name, func(t *testing.T) {
+			_, err := s.db.ExecContext(ctx, fmt.Sprintf(rows["outbound_intents"], half.set))
+			if err == nil {
+				t.Fatal("the database accepted a message half of which is missing")
+			}
+			if !strings.Contains(err.Error(), outboundReceiptNameConstraint) {
+				t.Fatalf("refused by something else: %v", err)
+			}
+		})
 	}
 
 	// The observations table has no row of its own here, so it is checked by

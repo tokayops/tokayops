@@ -31,6 +31,9 @@ func previousOutboundShape(t *testing.T, s *Store) {
 			DROP COLUMN IF EXISTS admission_digest,
 			DROP COLUMN IF EXISTS admission_schema_version,
 			DROP COLUMN IF EXISTS admission_revision`,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+			outboundReceiptNameConstraint,
+		`ALTER TABLE outbound_intents DROP COLUMN IF EXISTS receipt_ref`,
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
 			t.Fatalf("build the previous shape: %v", err)
@@ -99,6 +102,12 @@ func TestAStartUpgradesADatabaseFromThePreviousVersion(t *testing.T) {
 	}
 	if !hasNamedConstraint(t, s, "outbound_batches", outboundAdmittedStateConstraint) {
 		t.Errorf("%s did not arrive", outboundAdmittedStateConstraint)
+	}
+	if !hasColumn(t, s, "outbound_intents", "receipt_ref") {
+		t.Error("receipt_ref did not arrive")
+	}
+	if !hasNamedConstraint(t, s, "outbound_intents", outboundReceiptNameConstraint) {
+		t.Errorf("%s did not arrive", outboundReceiptNameConstraint)
 	}
 
 	// The claim was filled in from the state it was admitted from - which is
@@ -199,6 +208,59 @@ func TestAStartRefusesSnapshotsItCannotRender(t *testing.T) {
 	// the state it refused.
 	if hasColumn(t, s, "outbound_batches", "admission_snapshot") {
 		t.Error("the refusal added the columns anyway")
+	}
+}
+
+// TestAStartRefusesAMessageItCannotName is the second thing an upgrade can
+// meet that no amount of repair fixes.
+//
+// The previous version wrote the coordinates of a message and nothing else. A
+// change to that message needs the name the channel gave it, and that name is
+// the channel's to give: it is in the answer that came back, which is gone. So
+// a card left over from that version could be updated by nobody, and the start
+// says so rather than letting the first escalation discover it.
+func TestAStartRefusesAMessageItCannotName(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	changeableCard(t, s, agID)
+
+	t.Cleanup(func() {
+		for _, statement := range []string{
+			`DELETE FROM outbound_intent_events e USING outbound_intents i
+			 WHERE e.intent_id = i.id AND i.alert_group_id = $1`,
+			`DELETE FROM outbound_attempts a USING outbound_intents i
+			 WHERE a.intent_id = i.id AND i.alert_group_id = $1`,
+			`UPDATE outbound_intents SET current_attempt_id = NULL
+			 WHERE alert_group_id = $1`,
+			`DELETE FROM outbound_intents WHERE alert_group_id = $1`,
+		} {
+			if _, err := s.db.Exec(statement, agID); err != nil {
+				t.Fatalf("clear the unnameable message: %v", err)
+			}
+		}
+		if err := s.applyOutboundSchema(); err != nil {
+			t.Fatalf("put the schema back: %v", err)
+		}
+	})
+
+	previousOutboundShape(t, s)
+	if hasColumn(t, s, "outbound_intents", "receipt_ref") {
+		t.Fatal("the previous shape still has the column this test is about")
+	}
+
+	err := s.applyOutboundSchema()
+	if err == nil {
+		t.Fatal("a start accepted a message no change could ever address")
+	}
+	if !strings.Contains(err.Error(), "1 message(s)") {
+		t.Fatalf("the refusal does not say how much is wrong: %v", err)
+	}
+	// A refusal that half-applied would leave the column behind and pass on the
+	// next start, with the same rows still unnameable.
+	if hasColumn(t, s, "outbound_intents", "receipt_ref") {
+		t.Error("the refusal added the column anyway")
 	}
 }
 
