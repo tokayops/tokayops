@@ -607,42 +607,89 @@ func TestTheCallIsDecidedByTheRecord(t *testing.T) {
 		}
 	})
 
-	t.Run("an object that already exists is not created again", func(t *testing.T) {
+	t.Run("an object that already exists is changed, not made again", func(t *testing.T) {
 		agID := outboundGroup(t, s)
 		intentID := admitOne(t, s, agID)[0]
 		token := claimOne(t, s, intentID)
 
-		// A card that has already been posted. Changing one is a call this
-		// build does not make, so nothing is sent - and the record says which
-		// call was needed rather than quietly creating a second object at the
-		// same address.
+		// A card that has already been posted. The next call changes it: the
+		// same commitment, the same message, a different revision of what it
+		// says. Creating a second object at the same address is what the
+		// receipt exists to prevent.
 		if _, err := s.db.Exec(
-			`UPDATE outbound_intents SET receipt = $2::jsonb, receipt_recorded = TRUE
-			 WHERE id = $1`,
-			intentID, `{"channel":"C0001","ts":"1700000000.000100"}`); err != nil {
+			`UPDATE outbound_intents SET receipt = $2::jsonb, receipt_ref = $3,
+			 receipt_recorded = TRUE WHERE id = $1`,
+			intentID, `{"channel_id":"C0001","timestamp":"1700000000.000100"}`,
+			"C0001/1700000000.000100"); err != nil {
+			t.Fatalf("give the commitment an object: %v", err)
+		}
+
+		begun, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+			Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
+		})
+		if err != nil {
+			t.Fatalf("begin the change: %v", err)
+		}
+		if begun.AttemptKind != outbound.AttemptMutation ||
+			begun.Operation != outbound.OperationUpdate {
+			t.Fatalf("the call was planned as %s/%s", begun.AttemptKind, begun.Operation)
+		}
+		// The coordinates go with it: a change to a message nobody named is
+		// not a change anybody can make.
+		if len(begun.Receipt) == 0 {
+			t.Fatal("the call carries no coordinates for the message it changes")
+		}
+
+		// And it is keyed as a change rather than as the creation it is not.
+		// The create key belongs to the object; this one belongs to the
+		// revision, so applying that revision twice is the same key twice.
+		var kind, operation, key string
+		if err := s.db.QueryRow(`
+			SELECT attempt_kind, operation, provider_key FROM outbound_attempts
+			WHERE id = $1`, begun.AttemptID).Scan(&kind, &operation, &key); err != nil {
+			t.Fatalf("read the journal: %v", err)
+		}
+		if kind != string(outbound.AttemptMutation) ||
+			operation != string(outbound.OperationUpdate) {
+			t.Fatalf("the journal records a %s/%s", kind, operation)
+		}
+		var bound string
+		if err := s.db.QueryRow(
+			`SELECT create_key FROM outbound_intents WHERE id = $1`, intentID).
+			Scan(&bound); err != nil {
+			t.Fatalf("read the effect's key: %v", err)
+		}
+		if key == bound {
+			t.Fatal("the change went out under the key that created the message")
+		}
+	})
+
+	t.Run("a message that is finished is not changed at all", func(t *testing.T) {
+		agID := outboundGroup(t, s)
+		intentID := admitOne(t, s, agID, dmCommitment("U0001"))[0]
+		token := claimOne(t, s, intentID)
+
+		// A direct message with coordinates is done. Nothing brings one back
+		// with something to change, so reaching this is a commitment revived
+		// by something that had no business doing it.
+		if _, err := s.db.Exec(
+			`UPDATE outbound_intents SET receipt = $2::jsonb, receipt_ref = $3,
+			 receipt_recorded = TRUE WHERE id = $1`,
+			intentID, `{"channel_id":"D0001","timestamp":"1700000000.000100"}`,
+			"D0001/1700000000.000100"); err != nil {
 			t.Fatalf("give the commitment an object: %v", err)
 		}
 
 		written := countJournalRows(t, s, intentID)
-		_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		if _, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
-			Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
-		})
-		if !errors.Is(err, ErrOutboundContract) {
-			t.Fatalf("a second object was created for the same commitment: %v", err)
-		}
-		// It stops THIS build, not the work. The commitment is untouched: a
-		// build that can change an object will find it exactly as it was, and
-		// this one has no business ending it.
-		if errors.Is(err, ErrUndeliverable) {
-			t.Fatal("a call this build cannot make was recorded as a broken commitment")
-		}
-		if got := statusOf(t, s, intentID); got != outbound.StatusPending {
-			t.Fatalf("the commitment is %s after a build that could not serve it looked at it", got)
+			Preparation: outbound.PreparationReady, BoundEndpoint: "D0001",
+		}); !errors.Is(err, ErrOutboundContract) {
+			t.Fatalf("a finished message was changed: %v", err)
 		}
 		if got := countJournalRows(t, s, intentID); got != written {
-			t.Fatalf("the refusal wrote %d rows about a call nobody decided to make",
-				got-written)
+			t.Fatalf("the refusal wrote %d journal records", got-written)
 		}
 	})
 }

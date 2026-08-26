@@ -844,6 +844,11 @@ type transitionWrite struct {
 	// while the attempt was in flight, and recording that as applied would
 	// claim the card shows something it does not.
 	AppliedRevision int64
+	// ReceiptRef is the name the channel gives the object the attempt produced.
+	// Stored beside the coordinates so that a later change can say what it is
+	// aimed at without anything in the domain reading a provider's JSON.
+	ReceiptRef string
+
 	// AttemptIsFinal says the settled attempt applied the last revision this
 	// commitment will ever have, which is what makes an editable card done
 	// rather than merely up to date.
@@ -891,6 +896,11 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 				WHEN $7 AND $8::jsonb IS NOT NULL AND recipient_erased_at IS NULL THEN $8::jsonb
 				WHEN $7 AND $8::jsonb IS NOT NULL THEN NULL
 				ELSE receipt END,
+			receipt_ref = CASE
+				WHEN $6 THEN NULL
+				WHEN $7 AND $8::jsonb IS NOT NULL AND recipient_erased_at IS NULL THEN $19
+				WHEN $7 AND $8::jsonb IS NOT NULL THEN NULL
+				ELSE receipt_ref END,
 			receipt_recorded = CASE
 				WHEN $6 THEN FALSE
 				WHEN $7 AND $8::jsonb IS NOT NULL THEN TRUE
@@ -922,7 +932,7 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 		e.ResetFailureStreak, e.BumpFailureStreak,
 		e.ScheduleRetry, w.Backoff.Seconds(), e.ScheduleNow,
 		e.ApplyRevision, w.AppliedRevision, w.AttemptIsFinal, e.RecordDuplicateRisk,
-		w.NewExpires,
+		w.NewExpires, nilIfEmpty(w.ReceiptRef),
 	); err != nil {
 		return fmt.Errorf("apply %s to commitment %s: %w", w.Transition.Row, w.Intent.ID, err)
 	}

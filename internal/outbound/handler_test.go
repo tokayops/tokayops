@@ -22,6 +22,7 @@ type wilfulHandler struct {
 	outcome Outcome
 	class   string
 	known   bool
+	detail  *keys.ProviderResultDetail
 	asked   int
 }
 
@@ -29,9 +30,9 @@ func (h *wilfulHandler) ExecuteAttempt(context.Context, Call) (Result, error) {
 	return Result{}, nil
 }
 
-func (h *wilfulHandler) ClassifyResponse(Result) (Outcome, string, bool) {
+func (h *wilfulHandler) ClassifyResponse(Result) (Classification, bool) {
 	h.asked++
-	return h.outcome, h.class, h.known
+	return Classification{Outcome: h.outcome, Class: h.class, Detail: h.detail}, h.known
 }
 
 // TestSilenceIsNotTheHandlersToClassify. A request that never left can be
@@ -59,7 +60,7 @@ func TestSilenceIsNotTheHandlersToClassify(t *testing.T) {
 				handler.outcome = OutcomeAccepted
 			}
 
-			concluded, breach := Conclude(handler, Result{Evidence: tc.evidence}, nil)
+			concluded, breach := Conclude(handler, createCall(), Result{Evidence: tc.evidence}, nil)
 			if concluded.Outcome() != tc.want {
 				t.Fatalf("%s was concluded as %q, want %q",
 					tc.evidence, concluded.Outcome(), tc.want)
@@ -82,8 +83,7 @@ func TestAnAnswerNobodyRecognisesIsDoubt(t *testing.T) {
 		// A handler that does not recognise a status says so rather than
 		// guessing, and what it half-said is discarded.
 		handler := &wilfulHandler{outcome: OutcomePermanentRejection, class: "guessed"}
-		concluded, breach := Conclude(handler,
-			Result{Evidence: ProviderResponse, Status: status}, nil)
+		concluded, breach := Conclude(handler, createCall(), Result{Evidence: ProviderResponse, Status: status}, nil)
 
 		if concluded.Outcome() != OutcomeAmbiguous {
 			t.Fatalf("status %q was concluded as %q; an unrecognised answer is doubt",
@@ -105,8 +105,7 @@ func TestAnAnswerNobodyRecognisesIsDoubt(t *testing.T) {
 func TestAHandlerCannotInventAnOutcome(t *testing.T) {
 	for _, outcome := range []Outcome{"delivered_probably", OutcomeCanceled, ""} {
 		handler := &wilfulHandler{outcome: outcome, class: "whatever", known: true}
-		concluded, breach := Conclude(handler,
-			Result{Evidence: ProviderResponse, Status: "ok"}, nil)
+		concluded, breach := Conclude(handler, createCall(), Result{Evidence: ProviderResponse, Status: "ok"}, nil)
 
 		if concluded.Outcome() != OutcomeAmbiguous {
 			t.Fatalf("a handler answering %q produced %q", outcome, concluded.Outcome())
@@ -122,7 +121,7 @@ func TestAHandlerCannotInventAnOutcome(t *testing.T) {
 // is doubt.
 func TestAHandlerThatWillNotSayWhatItProved(t *testing.T) {
 	handler := &wilfulHandler{outcome: OutcomeAccepted, known: true}
-	concluded, breach := Conclude(handler, Result{Status: "ok"}, nil)
+	concluded, breach := Conclude(handler, createCall(), Result{Status: "ok"}, nil)
 
 	if concluded.Outcome() != OutcomeAmbiguous {
 		t.Fatalf("a result with no evidence was concluded as %q", concluded.Outcome())
@@ -142,7 +141,7 @@ func TestAHandlerThatWillNotSayWhatItProved(t *testing.T) {
 func TestAnAcceptanceHasToSayWhatItMade(t *testing.T) {
 	accepting := &wilfulHandler{outcome: OutcomeAccepted, known: true}
 
-	bare, breach := Conclude(accepting, Result{Evidence: ProviderResponse, Status: "ok"}, nil)
+	bare, breach := Conclude(accepting, createCall(), Result{Evidence: ProviderResponse, Status: "ok"}, nil)
 	if breach != BreachAcceptanceWithoutReceipt {
 		t.Fatalf("an acceptance with no receipt was reported as %q", breach)
 	}
@@ -158,7 +157,7 @@ func TestAnAcceptanceHasToSayWhatItMade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build a receipt: %v", err)
 	}
-	whole, breach := Conclude(accepting, Result{
+	whole, breach := Conclude(accepting, createCall(), Result{
 		Evidence: ProviderResponse, Status: "ok", Receipt: receipt,
 	}, nil)
 	if breach != BreachNone {
@@ -211,8 +210,7 @@ func TestAReceiptIsWholeOrNothing(t *testing.T) {
 
 	// And what a handler cannot build, it cannot smuggle past the fold: an
 	// acceptance carrying the zero value is doubt.
-	concluded, breach := Conclude(&wilfulHandler{outcome: OutcomeAccepted, known: true},
-		Result{Evidence: ProviderResponse, Status: "ok", Receipt: Receipt{}}, nil)
+	concluded, breach := Conclude(&wilfulHandler{outcome: OutcomeAccepted, known: true}, createCall(), Result{Evidence: ProviderResponse, Status: "ok", Receipt: Receipt{}}, nil)
 	if concluded.Outcome() != OutcomeAmbiguous || breach != BreachAcceptanceWithoutReceipt {
 		t.Fatalf("an acceptance with an empty receipt concluded %q (%q)",
 			concluded.Outcome(), breach)
@@ -226,7 +224,7 @@ func TestAConclusionCarriesWhatTheProviderSaid(t *testing.T) {
 	handler := &wilfulHandler{
 		outcome: OutcomeRetryableRejection, class: "rate_limited", known: true,
 	}
-	concluded, _ := Conclude(handler, Result{
+	concluded, _ := Conclude(handler, createCall(), Result{
 		Evidence: ProviderResponse, Status: "ratelimited",
 	}, nil)
 	completion := concluded.Completion()
@@ -366,10 +364,22 @@ func TestASummaryIsTruncatedWhereverItComesFrom(t *testing.T) {
 		t.Fatalf("a summary of %d runes was kept whole", len(runes))
 	}
 
-	folded, _ := Conclude(&wilfulHandler{}, Result{
+	folded, _ := Conclude(&wilfulHandler{}, createCall(), Result{
 		Evidence: PossiblySent, Summary: long,
 	}, nil)
 	if runes := []rune(folded.Summary()); len(runes) > SummaryLimit+3 {
 		t.Fatalf("the fold kept %d runes", len(runes))
+	}
+}
+
+// createCall is what most of these are about: making a message, with nothing
+// out there yet.
+func createCall() Call { return Call{AttemptKind: AttemptCreate, Operation: OperationSend} }
+
+// mutationCall is a change to a message that exists, named by its coordinates.
+func mutationCall(ref string) Call {
+	return Call{
+		AttemptKind: AttemptMutation, Operation: OperationUpdate,
+		Receipt: []byte(`{"channel_id":"` + ref + `","timestamp":"100.200"}`),
 	}
 }

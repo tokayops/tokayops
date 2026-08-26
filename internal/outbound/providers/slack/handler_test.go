@@ -227,15 +227,15 @@ func TestSlackAnswersAreTranslatedNotInterpreted(t *testing.T) {
 	}
 
 	for status, want := range cases {
-		outcome, _, known := handler.ClassifyResponse(outbound.Result{
+		answer, known := handler.ClassifyResponse(outbound.Result{
 			Evidence: outbound.ProviderResponse, Status: status,
 		})
 		if known != want.known {
 			t.Errorf("status %q: known=%v, want %v", status, known, want.known)
 			continue
 		}
-		if known && outcome != want.want {
-			t.Errorf("status %q classified %q, want %q", status, outcome, want.want)
+		if known && answer.Outcome != want.want {
+			t.Errorf("status %q classified %q, want %q", status, answer.Outcome, want.want)
 		}
 	}
 }
@@ -398,7 +398,7 @@ func TestARedirectIsAnAnswerNotADeadEnd(t *testing.T) {
 		t.Fatalf("a message that may exist was recorded as never sent: %+v", result)
 	}
 
-	concluded, _ := outbound.Conclude(handler, result, err)
+	concluded, _ := outbound.Conclude(handler, outbound.Call{AttemptKind: outbound.AttemptCreate}, result, err)
 	if concluded.Outcome() == outbound.OutcomeRetryableRejection {
 		t.Fatal("the attempt was called a clean failure, so the retry posts a second card")
 	}

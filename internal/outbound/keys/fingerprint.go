@@ -426,6 +426,15 @@ type Completion struct {
 	ProviderResultDetail *ProviderResultDetail
 }
 
+// ReceiptRefOrEmpty is the name of the object this attempt settled, or nothing
+// when it settled none.
+func (c Completion) ReceiptRefOrEmpty() string {
+	if c.ReceiptRef == nil {
+		return ""
+	}
+	return *c.ReceiptRef
+}
+
 // Fingerprint identifies what an attempt concluded, under the protocol version
 // the attempt was started with.
 //

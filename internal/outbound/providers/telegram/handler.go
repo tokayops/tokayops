@@ -155,7 +155,24 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 		}
 	}
 
-	answer, err := callBotAPI(ctx, h.client, h.baseURL, token, "sendMessage", body)
+	method := "sendMessage"
+	if call.AttemptKind == outbound.AttemptMutation {
+		// A change goes to the message this commitment already made, named by
+		// the coordinates it holds. The chat is part of that name rather than a
+		// place to send to: editing never moves a message.
+		coordinates, ok := messageAt(call.Receipt)
+		if !ok {
+			return outbound.Result{
+				Evidence: outbound.DefinitelyNotSent,
+				Summary:  "the coordinates of the message to change cannot be read",
+			}, ErrNoReceipt
+		}
+		method = "editMessageText"
+		body["chat_id"] = coordinates.ChatID
+		body["message_id"] = coordinates.MessageID
+	}
+
+	answer, err := callBotAPI(ctx, h.client, h.baseURL, token, method, body)
 	if err != nil {
 		// No envelope came back at all: whether the request was written is what
 		// decides, and only the transport can say.
@@ -168,8 +185,8 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 				Evidence: outbound.ProviderResponse,
 				Status:   statusOf(answer),
 				Summary:  answer.Description,
-			}, fmt.Errorf("telegram sendMessage failed (code %d): %s",
-				answer.ErrorCode, answer.Description)
+			}, fmt.Errorf("telegram %s failed (code %d): %s",
+				method, answer.ErrorCode, answer.Description)
 	}
 
 	var sent struct {
@@ -211,43 +228,92 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 // Telegram answers with an HTTP-ish code and a sentence, and only some of those
 // sentences prove the message was not created. Those are named here; everything
 // else is doubt, decided by the domain.
-func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Outcome, string, bool) {
+func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification, bool) {
 	if res.Status == "ok" {
-		return outbound.OutcomeAccepted, "", true
+		return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
 	}
 
 	code, description, ok := strings.Cut(res.Status, ":")
 	if !ok {
-		return "", "", false
+		return outbound.Classification{}, false
 	}
+	lower := strings.ToLower(description)
 
 	switch code {
 	case "429":
 		// Telegram says outright that it did not process it, and for how long.
-		return outbound.OutcomeRetryableRejection, "rate_limited", true
+		return outbound.Classification{
+			Outcome: outbound.OutcomeRetryableRejection, Class: "rate_limited",
+		}, true
 
 	case "403":
 		// Blocked, kicked, or never allowed: the message was not delivered and
 		// nothing about retrying changes that.
-		return outbound.OutcomePermanentRejection, "forbidden", true
+		return outbound.Classification{
+			Outcome: outbound.OutcomePermanentRejection, Class: "forbidden",
+		}, true
 
 	case "400":
+		// The one 400 that is not a refusal at all. Telegram answers a change
+		// that would leave the message exactly as it is with an error, and what
+		// it is saying is that the outside ALREADY shows what we are asking
+		// for - which is the revision applied, not a failure to apply it.
+		if strings.Contains(lower, "message is not modified") {
+			return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
+		}
+		if strings.Contains(lower, "message to edit not found") {
+			// The message is gone. The one fact an ordinary answer proves about
+			// the object, and the only ground for making a second one.
+			absent := keys.DetailDefinitelyAbsent
+			return outbound.Classification{
+				Outcome: outbound.OutcomePermanentRejection, Class: "message_gone",
+				Detail: &absent,
+			}, true
+		}
+		if strings.Contains(lower, "message can't be edited") {
+			// It is there and will not change: the opposite fact, and stated as
+			// no fact at all, because nobody may create a second message
+			// without proof that the first is gone.
+			return outbound.Classification{
+				Outcome: outbound.OutcomePermanentRejection, Class: "not_editable",
+			}, true
+		}
 		for _, refusal := range []string{
 			"chat not found", "bot was blocked", "user is deactivated",
 			"peer_id_invalid", "message is too long",
 		} {
-			if strings.Contains(strings.ToLower(description), refusal) {
-				return outbound.OutcomePermanentRejection, "rejected", true
+			if strings.Contains(lower, refusal) {
+				return outbound.Classification{
+					Outcome: outbound.OutcomePermanentRejection, Class: "rejected",
+				}, true
 			}
 		}
 		// Some other 400. Telegram validates before it acts, but this build
 		// does not know that this one did.
-		return "", "", false
+		return outbound.Classification{}, false
 
 	case "500", "502", "503", "504":
-		return outbound.OutcomeAmbiguous, "provider_unavailable", true
+		return outbound.Classification{
+			Outcome: outbound.OutcomeAmbiguous, Class: "provider_unavailable",
+		}, true
 	}
-	return "", "", false
+	return outbound.Classification{}, false
+}
+
+// messageAt reads back the coordinates a commitment holds. They are the name of
+// the message, not a place to send to.
+func messageAt(raw json.RawMessage) (Data, bool) {
+	if len(raw) == 0 {
+		return Data{}, false
+	}
+	var data Data
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return Data{}, false
+	}
+	if data.ChatID == "" || data.MessageID == 0 {
+		return Data{}, false
+	}
+	return data, true
 }
 
 // directMessage is what a person is told, in plain text.

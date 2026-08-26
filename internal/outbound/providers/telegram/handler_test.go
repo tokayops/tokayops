@@ -170,15 +170,15 @@ func TestTelegramAnswersAreTranslatedNotInterpreted(t *testing.T) {
 	}
 
 	for status, want := range cases {
-		outcome, _, known := handler.ClassifyResponse(outbound.Result{
+		answer, known := handler.ClassifyResponse(outbound.Result{
 			Evidence: outbound.ProviderResponse, Status: status,
 		})
 		if known != want.known {
 			t.Errorf("status %q: known=%v, want %v", status, known, want.known)
 			continue
 		}
-		if known && outcome != want.want {
-			t.Errorf("status %q classified %q, want %q", status, outcome, want.want)
+		if known && answer.Outcome != want.want {
+			t.Errorf("status %q classified %q, want %q", status, answer.Outcome, want.want)
 		}
 	}
 }
@@ -204,9 +204,9 @@ func TestARejectedSendCarriesWhatTelegramSaid(t *testing.T) {
 	if result.Evidence != outbound.ProviderResponse {
 		t.Fatalf("Telegram answered and it was recorded as %q", result.Evidence)
 	}
-	outcome, _, known := handler.ClassifyResponse(result)
-	if !known || outcome != outbound.OutcomePermanentRejection {
-		t.Fatalf("a blocked bot classified %q (known=%v)", outcome, known)
+	answer, known := handler.ClassifyResponse(result)
+	if !known || answer.Outcome != outbound.OutcomePermanentRejection {
+		t.Fatalf("a blocked bot classified %q (known=%v)", answer.Outcome, known)
 	}
 	if !strings.Contains(result.Summary, "blocked") {
 		t.Fatalf("the journal does not say why: %q", result.Summary)
@@ -374,7 +374,7 @@ func TestARedirectIsAnAnswerNotADeadEnd(t *testing.T) {
 		t.Fatalf("a message that may exist was recorded as never sent: %+v", result)
 	}
 
-	concluded, _ := outbound.Conclude(handler, result, err)
+	concluded, _ := outbound.Conclude(handler, outbound.Call{AttemptKind: outbound.AttemptCreate}, result, err)
 	if concluded.Outcome() != outbound.OutcomeAmbiguous {
 		t.Fatalf("a redirect concluded %q", concluded.Outcome())
 	}

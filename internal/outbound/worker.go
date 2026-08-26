@@ -324,7 +324,7 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 	}
 
 	attemptCtx, cancelAttempt := context.WithTimeout(detached, NotificationAttemptDeadline)
-	result, execErr := channel.ExecuteAttempt(attemptCtx, Call{
+	call := Call{
 		IntentID:             leased.Intent.ID,
 		AttemptID:            begun.AttemptID,
 		Provider:             leased.Intent.Provider,
@@ -332,14 +332,17 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 		Operation:            begun.Operation,
 		Endpoint:             begun.BoundEndpoint,
 		ProviderKey:          begun.ProviderKey,
+		Receipt:              begun.Receipt,
+		ReceiptRef:           begun.ReceiptRef,
 		Revision:             begun.AppliedRevision,
 		State:                begun.Snapshot,
 		Payload:              begun.Payload,
 		PayloadSchemaVersion: begun.PayloadSchemaVersion,
-	})
+	}
+	result, execErr := channel.ExecuteAttempt(attemptCtx, call)
 	cancelAttempt()
 
-	concluded, breach := Conclude(channel, result, execErr)
+	concluded, breach := Conclude(channel, call, result, execErr)
 	if breach != BreachNone {
 		// Not fatal to the delivery - the conclusion above is already the safe
 		// one - but a channel that does this is wrong, and silence here would

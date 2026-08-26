@@ -475,23 +475,34 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{Outcome: outbound.BeginLeaseLost}, nil
 	}
 
-	// What the call has to be, decided before anything is written and from the
-	// commitment alone. A refusal is recorded under the same shape: the journal
-	// says which call did not happen.
-	plan, err := planAttempt(*intent)
-	if err != nil {
-		return outbound.BeginAttemptResult{}, err
-	}
-
+	// A refusal comes before the state is read, because it is true whatever the
+	// state says: nothing was going to be sent either way, and reporting "the
+	// state is unreadable" for a commitment whose identity is not even linked
+	// would send whoever reads it to the wrong place.
 	if req.Preparation != outbound.PreparationReady {
-		return s.recordPreparation(ctx, tx, req, *intent, plan)
+		shape, err := refusalShape(*intent)
+		if err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+		return s.recordPreparation(ctx, tx, req, *intent, shape)
 	}
 
 	stored, err := attemptStateTx(ctx, tx, *intent)
 	if err != nil {
-		if errors.Is(err, ErrUndeliverable) {
-			return s.refuseAttempt(ctx, tx, req, *intent, plan, "state_unreadable", err.Error())
+		shape, shapeErr := refusalShape(*intent)
+		if shapeErr != nil {
+			return outbound.BeginAttemptResult{}, shapeErr
 		}
+		if errors.Is(err, ErrUndeliverable) {
+			return s.refuseAttempt(ctx, tx, req, *intent, shape, "state_unreadable", err.Error())
+		}
+		return outbound.BeginAttemptResult{}, err
+	}
+
+	// What the call has to be, now that the state it renders has been read and
+	// proved.
+	plan, err := planAttempt(*intent, stored)
+	if err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
 
@@ -516,11 +527,41 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{}, err
 	}
 
+	// The key this call is made under. A create carries the generation's own
+	// key, which every retry of it reuses; a change carries one of its own,
+	// keyed by the revision it applies - so applying a revision twice is the
+	// same key twice, and a provider that deduplicates can say so. Adding the
+	// generation to it would make the second application look new, which is
+	// precisely the defect the key exists to reveal.
+	providerKey := effect.ProviderKey
+	if plan.Kind == outbound.AttemptMutation {
+		providerKey, err = keys.MutationKey(intent.ID, plan.Operation,
+			stored.Revision, intent.ProviderKeyCodecVersion)
+		if err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+	}
+
 	var payload json.RawMessage
+	// NULL is the ordinary case here - a commitment that has not made anything
+	// yet - so it is scanned as something that can be absent rather than as
+	// bytes that must be there.
+	var coordinates, name sql.NullString
 	if err := tx.QueryRowContext(ctx,
-		`SELECT payload FROM outbound_intents WHERE id = $1`, req.IntentID).
-		Scan(&payload); err != nil {
+		`SELECT payload, receipt, receipt_ref FROM outbound_intents WHERE id = $1`,
+		req.IntentID).Scan(&payload, &coordinates, &name); err != nil {
 		return outbound.BeginAttemptResult{}, err
+	}
+	var receipt json.RawMessage
+	if coordinates.Valid {
+		receipt = json.RawMessage(coordinates.String)
+	}
+	// A change to a message nobody can find is not a change anybody can make.
+	// The coordinates are erased with the recipient, and a commitment that lost
+	// them ends here rather than at the provider.
+	if plan.Kind == outbound.AttemptMutation && (len(receipt) == 0 || name.String == "") {
+		return s.refuseAttempt(ctx, tx, req, *intent, plan, "receipt_lost",
+			"the message this change is for has no coordinates any more")
 	}
 
 	attemptNo, err := nextAttemptNoTx(ctx, tx, req.IntentID)
@@ -548,7 +589,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		VALUES ($1, $2, $3, 'attempt', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), $14)`,
 		attemptID, req.IntentID, attemptNo, intent.GenerationNo, string(plan.Kind),
 		string(plan.Operation), stored.Revision, intent.Provider, effect.Endpoint,
-		effect.ProviderKey, stored.Snapshot.Digest(), req.LeaseToken,
+		providerKey, stored.Snapshot.Digest(), req.LeaseToken,
 		nilIfEmpty(req.WorkerID), fingerprintVersion,
 	); err != nil {
 		return outbound.BeginAttemptResult{}, fmt.Errorf("open the attempt: %w", err)
@@ -607,7 +648,9 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		AttemptKind:                  plan.Kind,
 		Operation:                    plan.Operation,
 		BoundEndpoint:                effect.Endpoint,
-		ProviderKey:                  effect.ProviderKey,
+		ProviderKey:                  providerKey,
+		Receipt:                      receipt,
+		ReceiptRef:                   name.String,
 		AppliedRevision:              stored.Revision,
 		Snapshot:                     stored.Snapshot,
 		Payload:                      payload,
@@ -646,32 +689,65 @@ type plannedAttempt struct {
 
 // planAttempt decides the shape of the next call.
 //
-// The rule is the receipt. Nothing out there yet means a create; an object that
-// already exists is changed, never created a second time. The revision is not
-// here at all - it comes from the state the attempt renders, read under the
-// same lock, so the content and the key that names it cannot disagree.
+// Two questions, answered from durable state rather than from anything a worker
+// says. Is there something out there already - the receipt - and if so, is the
+// state it has to be brought to the last one this commitment will ever apply.
 //
-// Changing an object that already exists is not something this build does, and
-// it stops the caller rather than the commitment. Nothing in this build brings
-// a commitment that has a receipt back into the queue, so the only way to be
-// here is a deployment that is behind - and ending perfectly good work because
-// this instance is the wrong one to do it is exactly the mistake the two error
-// kinds above exist to keep apart.
+//	no receipt                  create    send
+//	receipt, state not final    mutation  update
+//	receipt, state final        mutation  resolve
 //
-// What Sprint 2 adds is the call itself and the choice between an update and a
-// resolve, which is a question about the stored state - is this the last
-// revision? - and so can only be answered after that state has been read and
-// proved. Recording a guess here would put a call in the journal that the
-// system never decided to make.
-func planAttempt(intent outbound.Intent) (plannedAttempt, error) {
-	if intent.HasReceipt {
+// The revision is not here. It comes from the state the attempt renders, read
+// under the same lock, so the content and the key that names it cannot
+// disagree.
+//
+// A resolve and an update make the same call to the same provider - the
+// difference is in the journal and in the key, and in what the commitment does
+// afterwards. Only the state may say which it is: a worker that could declare
+// an attempt final would be able to retire a card the alert is still using.
+func planAttempt(intent outbound.Intent, stored storedSnapshot) (plannedAttempt, error) {
+	if !intent.HasReceipt {
+		return plannedAttempt{
+			Kind:      outbound.AttemptCreate,
+			Operation: outbound.OperationSend,
+		}, nil
+	}
+	if intent.Form != outbound.FormEditable {
+		// Nothing brings a one-shot back with coordinates: it is done when it
+		// has them. Reaching here means a commitment was revived by something
+		// that should not have been able to.
 		return plannedAttempt{}, outboundContractf(
-			"commitment %s needs a change to an object that already exists, "+
-				"and this build only creates them", intent.ID)
+			"commitment %s already has a message and is not one anybody may change",
+			intent.ID)
+	}
+
+	operation := outbound.OperationUpdate
+	if stored.Final {
+		operation = outbound.OperationResolve
+	}
+	return plannedAttempt{Kind: outbound.AttemptMutation, Operation: operation}, nil
+}
+
+// refusalShape is what the journal records for a call that never happened.
+//
+// It is what can be known without the state: whether the commitment was going
+// to create something or change something that exists. Which change it would
+// have been - an update or the last one - is a fact of the state, and a refusal
+// that never read it must not claim to know. So a mutation nobody made is
+// recorded as an update, and the kind carries what is actually true.
+func refusalShape(intent outbound.Intent) (plannedAttempt, error) {
+	if !intent.HasReceipt {
+		return plannedAttempt{
+			Kind: outbound.AttemptCreate, Operation: outbound.OperationSend,
+		}, nil
+	}
+	if intent.Form != outbound.FormEditable {
+		return plannedAttempt{}, outboundContractf(
+			"commitment %s already has a message and is not one anybody may change",
+			intent.ID)
 	}
 	return plannedAttempt{
-		Kind:      outbound.AttemptCreate,
-		Operation: outbound.OperationSend,
+		Kind: outbound.AttemptMutation, Operation: outbound.OperationUpdate,
 	}, nil
 }
 
@@ -945,10 +1021,15 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	// which the next revision reads as "never sent" and creates a second
 	// message for.
 	//
-	// Only a create is held to it. A change to an object that already exists
-	// keeps the receipt the commitment already has, and Sprint 2 will need
-	// exactly that.
-	if (concluded.ReceiptRef != nil) != (len(receipt) > 0) {
+	// Only a create is held to it, and now that changes exist the difference is
+	// worth stating: a change names the object it was applied to, which the
+	// commitment already holds, and records nothing of its own. Half the
+	// providers say nothing at all when there was nothing to alter.
+	kind, err := attemptKindOf(ctx, tx, req.AttemptID)
+	if err != nil {
+		return outbound.FinalizeResult{}, err
+	}
+	if kind == outbound.AttemptCreate && (concluded.ReceiptRef != nil) != (len(receipt) > 0) {
 		return outbound.FinalizeResult{}, outboundContractf(
 			"the result of attempt %s names an object it did not record, or records "+
 				"one it will not name", req.AttemptID)
@@ -1075,12 +1156,13 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		        ELSE NULL END,
 		    response_summary = CASE WHEN i.recipient_erased_at IS NULL THEN $6 ELSE NULL END,
 		    finish_reason = 'worker',
-		    completion_fingerprint = $7
+		    completion_fingerprint = $7,
+		    provider_result_detail = $8
 		FROM outbound_intents i
 		WHERE a.id = $1 AND a.finished_at IS NULL AND i.id = a.intent_id`,
 		req.AttemptID, string(completion.Outcome), completion.ErrorClass,
 		completion.ProviderStatus, nullableJSON(receipt), nilIfEmpty(req.Conclusion.Summary()),
-		fingerprint,
+		fingerprint, detailOf(completion.ProviderResultDetail),
 	); err != nil {
 		return outbound.FinalizeResult{}, fmt.Errorf("close the attempt: %w", err)
 	}
@@ -1092,6 +1174,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		AppliedRevision: applied,
 		AttemptIsFinal:  final,
 		Receipt:         receipt,
+		ReceiptRef:      completion.ReceiptRefOrEmpty(),
 		Actor:           "worker",
 	}); err != nil {
 		return outbound.FinalizeResult{}, err
@@ -1175,6 +1258,26 @@ func recordObservationTx(ctx context.Context, tx *sql.Tx, o observation) (bool, 
 	return true, nil
 }
 
+// attemptKindOf says what the attempt being closed was trying to do. It is read
+// from the row rather than taken from the caller: what a result has to prove
+// depends on it, and a worker that could state it could state the easier rule.
+func attemptKindOf(ctx context.Context, tx *sql.Tx, attemptID string) (outbound.AttemptKind, error) {
+	var kind string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT attempt_kind FROM outbound_attempts WHERE id = $1`, attemptID).
+		Scan(&kind); err != nil {
+		return "", fmt.Errorf("read what attempt %s was doing: %w", attemptID, err)
+	}
+	return outbound.AttemptKind(kind), nil
+}
+
+// detailOf is the typed thing an answer proved about the object, for the column
+// that keeps it.
+//
+// Almost always nothing. The one this build writes is proof that the object is
+// gone, and it is written because it exists only at the moment of the attempt:
+// an operator deciding weeks later whether a second message may be created has
+// nothing else to read.
 func detailOf(detail *keys.ProviderResultDetail) any {
 	if detail == nil {
 		return nil

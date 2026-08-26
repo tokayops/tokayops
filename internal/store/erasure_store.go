@@ -366,12 +366,17 @@ func (t *erasureTx) ScrubOutboundEndpointsForUser(ctx context.Context, userID st
 		UPDATE outbound_intents
 		SET bound_endpoint = NULL,
 		    receipt = NULL,
+		    -- The name goes with the coordinates: it is a channel and a
+		    -- timestamp, or a chat and a message, which is an address by
+		    -- another spelling.
+		    receipt_ref = NULL,
 		    receipt_redacted_at = CASE
 		        WHEN receipt_recorded THEN COALESCE(receipt_redacted_at, now())
 		        ELSE NULL END,
 		    updated_at = now()
 		WHERE target_kind = 'user' AND target_ref = $1
-		  AND (bound_endpoint IS NOT NULL OR receipt IS NOT NULL)`, userID); err != nil {
+		  AND (bound_endpoint IS NOT NULL OR receipt IS NOT NULL
+		       OR receipt_ref IS NOT NULL)`, userID); err != nil {
 		return fmt.Errorf("scrub the commitment endpoints of an erased user: %w", err)
 	}
 

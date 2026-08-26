@@ -173,6 +173,12 @@ CREATE TABLE IF NOT EXISTS outbound_intents (
 	-- state machine reads "is there something out there" from receipt_recorded,
 	-- never from the coordinates themselves.
 	receipt                    JSONB,
+	-- The name the external object is known by, as the channel that made it
+	-- spells one. It is kept beside the coordinates so that the domain can say
+	-- WHICH object a change is aimed at without reading a provider's JSON:
+	-- parsing that here would put Slack's field names, and Telegram's, inside
+	-- rules that are supposed to hold for every channel there will ever be.
+	receipt_ref                TEXT,
 	receipt_recorded           BOOLEAN NOT NULL DEFAULT FALSE,
 	receipt_redacted_at        TIMESTAMPTZ,
 	-- When the recipient of this commitment was erased. A durable prohibition
@@ -268,6 +274,10 @@ CREATE TABLE IF NOT EXISTS outbound_attempts (
 	-- clears it along with the coordinates.
 	response_summary              TEXT,
 	finish_reason                 TEXT,
+	-- What the answer PROVED about the object, where it proved anything. It
+	-- exists only at the moment of the attempt: an operator deciding weeks
+	-- later whether a second message may be made has nothing else to read.
+	provider_result_detail        TEXT,
 	completion_fingerprint        BYTEA,
 	-- Fixed when the attempt starts rather than when it finishes: an attempt
 	-- can outlive a deployment, and the encoder that closes it has to be the
@@ -524,6 +534,53 @@ BEGIN
 END $$;
 `
 
+// outboundReceiptRefDDL adds the object's name beside its coordinates, for
+// databases created before it was written.
+const outboundReceiptRefDDL = `
+DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+	               WHERE table_name = 'outbound_intents'
+	                 AND column_name = 'receipt_ref') THEN
+		ALTER TABLE outbound_intents ADD COLUMN receipt_ref TEXT;
+	END IF;
+END $$;
+`
+
+const outboundResultDetailConstraint = "outbound_attempts_result_detail_known"
+
+// outboundResultDetailDDL adds the column that keeps what an answer proved
+// about the object, and closes its vocabulary.
+//
+// The words are reconciliation's, and this build asks no reconciliation
+// question - so the only one it ever writes is that the object is gone. The
+// rule is on the whole set anyway: the column is read by an operator deciding
+// whether a second message may exist, and a value from nowhere read as though
+// it were one of these would be read as permission.
+const outboundResultDetailDDL = `
+DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+	               WHERE table_name = 'outbound_attempts'
+	                 AND column_name = 'provider_result_detail') THEN
+		ALTER TABLE outbound_attempts ADD COLUMN provider_result_detail TEXT;
+	END IF;
+
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = '` + outboundResultDetailConstraint + `'
+		  AND conrelid = 'outbound_attempts'::regclass
+	) THEN
+		ALTER TABLE outbound_attempts
+			ADD CONSTRAINT ` + outboundResultDetailConstraint + ` CHECK (
+				provider_result_detail IS NULL
+				OR provider_result_detail IN ('acceptance_proven', 'delivery_proven',
+					'definitely_absent', 'inconclusive')
+			);
+	END IF;
+END $$;
+`
+
 const outboundFormKnownConstraint = "outbound_intents_form_known"
 
 // outboundFormKnownDDL closes the set of forms in the database as well as in
@@ -754,6 +811,12 @@ func (s *Store) applyOutboundSchema() error {
 	}
 	if _, err := tx.Exec(outboundFormKnownDDL); err != nil {
 		return fmt.Errorf("failed to add %s: %w", outboundFormKnownConstraint, err)
+	}
+	if _, err := tx.Exec(outboundResultDetailDDL); err != nil {
+		return fmt.Errorf("failed to add %s: %w", outboundResultDetailConstraint, err)
+	}
+	if _, err := tx.Exec(outboundReceiptRefDDL); err != nil {
+		return fmt.Errorf("failed to add the receipt's name: %w", err)
 	}
 	for _, table := range []string{
 		"outbound_intents", "outbound_attempts", "outbound_attempt_observations",

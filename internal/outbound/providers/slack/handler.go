@@ -154,6 +154,10 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 	state := call.State.Content()
 	options := messageFor(state, payload)
 
+	if call.AttemptKind == outbound.AttemptMutation {
+		return updateMessage(ctx, client, call, options)
+	}
+
 	channelID, timestamp, err := client.PostMessageContext(ctx, call.Endpoint, options...)
 	if err != nil {
 		evidence, status := answerOf(err)
@@ -184,6 +188,66 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 	return result, nil
 }
 
+// updateMessage brings the message this commitment already made to the state it
+// is now supposed to show.
+//
+// One call, to the coordinates the commitment holds. The channel is part of
+// those coordinates rather than a place to send to: Slack's own documentation
+// says it identifies the message, and a message is never moved by an update.
+//
+// It is the same call for an update and for a resolution, and that is not an
+// omission - the last revision of a card is a revision like any other. What
+// makes it the last is the state, not the request.
+func updateMessage(ctx context.Context, client *slackapi.Client, call outbound.Call,
+	options []slackapi.MsgOption) (outbound.Result, error) {
+
+	data, ok := parseData(string(call.Receipt))
+	if !ok {
+		// The store refuses to make this call without coordinates, so reaching
+		// here means the stored ones cannot be read - a broken row rather than
+		// a message that moved.
+		return outbound.Result{
+			Evidence: outbound.DefinitelyNotSent,
+			Summary:  "the coordinates of the message to change cannot be read",
+		}, ErrNoReceipt
+	}
+
+	channelID, timestamp, _, err := client.UpdateMessageContext(
+		ctx, data.ChannelID, data.Timestamp, options...)
+	if err != nil {
+		evidence, status := answerOf(err)
+		return outbound.Result{
+			Evidence: evidence, Status: status, Summary: err.Error(),
+		}, err
+	}
+
+	result := outbound.Result{Evidence: outbound.ProviderResponse, Status: "ok"}
+	if channelID == "" || timestamp == "" {
+		// Accepted, and it did not repeat the coordinates back. That is fine
+		// for a change: the object it was applied to is the one the commitment
+		// already holds, and nothing new was made to be named.
+		result.Summary = "the message was updated"
+		return result, nil
+	}
+
+	raw, err := json.Marshal(Data{ChannelID: channelID, Timestamp: timestamp})
+	if err != nil {
+		result.Summary = "the coordinates could not be recorded: " + err.Error()
+		return result, nil
+	}
+	receipt, err := outbound.NewReceipt(channelID+"/"+timestamp, raw)
+	if err != nil {
+		result.Summary = "the coordinates could not be recorded: " + err.Error()
+		return result, nil
+	}
+	// Handed back so the domain can compare them with the ones it asked about.
+	// A change that answers with a different message is a channel that has lost
+	// track of what it was asked to do, and following it would take this card
+	// to somebody else's message.
+	result.Receipt = receipt
+	return result, nil
+}
+
 // ClassifyResponse says what Slack's own answer means, and says "I do not know"
 // rather than guessing.
 //
@@ -192,30 +256,56 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 // Everything else - including its own internal errors, about which the
 // documentation says some part of the operation may have succeeded - is doubt,
 // and doubt is the domain's default for anything not named here.
-func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Outcome, string, bool) {
+func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification, bool) {
 	switch res.Status {
 	case "ok":
-		return outbound.OutcomeAccepted, "", true
+		return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
 
 	case "ratelimited", "rate_limited", "request_timeout":
 		// Slack answered that it did not process the request.
-		return outbound.OutcomeRetryableRejection, res.Status, true
+		return outbound.Classification{
+			Outcome: outbound.OutcomeRetryableRejection, Class: res.Status,
+		}, true
 
 	case "fatal_error", "internal_error", "service_unavailable":
 		// "It's possible some aspect of the operation succeeded before the
 		// error was raised" - Slack's own words.
-		return outbound.OutcomeAmbiguous, res.Status, true
+		return outbound.Classification{
+			Outcome: outbound.OutcomeAmbiguous, Class: res.Status,
+		}, true
+
+	case "message_not_found":
+		// The message this change is for is gone. It is the one thing an
+		// ordinary answer proves about the object, and the only ground on
+		// which an operator may be allowed to make a second one.
+		absent := keys.DetailDefinitelyAbsent
+		return outbound.Classification{
+			Outcome: outbound.OutcomePermanentRejection, Class: res.Status,
+			Detail: &absent,
+		}, true
+
+	case "cant_update_message", "edit_window_closed":
+		// The message is there and will not change - which is the opposite
+		// fact, and deliberately stated as no fact at all: without proof of
+		// absence, nobody may create a second message beside it.
+		return outbound.Classification{
+			Outcome: outbound.OutcomePermanentRejection, Class: res.Status,
+		}, true
 
 	case "channel_not_found", "not_in_channel", "is_archived", "invalid_auth",
 		"account_inactive", "token_revoked", "no_permission", "msg_too_long",
 		"invalid_blocks", "restricted_action", "cannot_dm_bot", "user_not_found":
-		return outbound.OutcomePermanentRejection, res.Status, true
+		return outbound.Classification{
+			Outcome: outbound.OutcomePermanentRejection, Class: res.Status,
+		}, true
 	}
 
 	if strings.HasPrefix(res.Status, "http_5") {
-		return outbound.OutcomeAmbiguous, res.Status, true
+		return outbound.Classification{
+			Outcome: outbound.OutcomeAmbiguous, Class: res.Status,
+		}, true
 	}
-	return "", "", false
+	return outbound.Classification{}, false
 }
 
 // messageFor turns the snapshot into the call's content: a card for a channel,

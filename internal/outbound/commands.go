@@ -398,6 +398,19 @@ type BeginAttemptResult struct {
 	BoundEndpoint string
 	ProviderKey   string
 
+	// Receipt is where the external object is, for the calls that change one.
+	// Empty for a create: there is nothing out there yet.
+	//
+	// It is the commitment's OWN receipt, read under the same lock as
+	// everything else here. A handler never reads a neighbouring one - the text
+	// of one message must not depend on which of its siblings has been sent.
+	Receipt json.RawMessage
+
+	// ReceiptRef is what the channel calls that object. It travels with the
+	// coordinates so that the rules about changing one can say WHICH object
+	// without reading a provider's own field names.
+	ReceiptRef string
+
 	// AppliedRevision is the revision of the state below, and the one the
 	// attempt is recorded as applying. The worker never names it: it renders
 	// the snapshot it is given and reports what the provider said.
@@ -493,10 +506,6 @@ type ResolveAmbiguityRequest struct {
 	// second message may exist. Required for a new effect after an attempt
 	// whose fate is unknown.
 	AcceptedDuplicateRisk bool
-
-	// ResourceLossConfirmed is the operator saying the previous external object
-	// is definitely gone, which is the other way a new effect is allowed.
-	ResourceLossConfirmed bool
 
 	// NewExpiresAt is required to revive something that expired: without a new
 	// deadline the first claim would expire it again.

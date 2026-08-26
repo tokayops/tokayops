@@ -517,6 +517,19 @@ type intentState struct {
 	currentAttemp sql.NullString
 }
 
+// dueNow asks the database whether the commitment is claimable, because the
+// database is the only clock that decides it.
+func dueNow(t *testing.T, s *Store, intentID string) bool {
+	t.Helper()
+	var due bool
+	if err := s.db.QueryRow(
+		`SELECT next_attempt_at <= now() FROM outbound_intents WHERE id = $1`,
+		intentID).Scan(&due); err != nil {
+		t.Fatalf("ask whether %s is due: %v", intentID, err)
+	}
+	return due
+}
+
 func readIntentState(t *testing.T, s *Store, intentID string) intentState {
 	t.Helper()
 	var out intentState
@@ -748,7 +761,10 @@ func TestARaiseTouchesExactlyTheFourRowsOfTheTable(t *testing.T) {
 
 			switch {
 			case tc.claimed:
-				if now.nextAttempt.After(time.Now()) {
+				// Asked of the database, not of this process. The two clocks
+				// agree to within a fraction of a second, and "is it due yet"
+				// is precisely the question that fraction decides.
+				if !dueNow(t, s, byTarget[tc.ref]) {
 					t.Errorf("it is not claimable until %s", now.nextAttempt)
 				}
 			default:

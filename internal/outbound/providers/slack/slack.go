@@ -151,6 +151,11 @@ func (s *Provider) interactive() bool {
 // ErrNoToken is returned when Slack token is not configured
 var ErrNoToken = fmt.Errorf("slack integration not configured (no token)")
 
+// ErrNoReceipt is a change to a message whose stored coordinates cannot be
+// read. The store refuses to ask for one without them, so this is a damaged
+// row rather than a message that went missing.
+var ErrNoReceipt = fmt.Errorf("slack: the message to change has no readable coordinates")
+
 // (ErrNoSlackUserID was removed in Epic 7 Sprint 3 — the dispatcher-level
 // ErrIdentityNotLinked in identity.go covers it generically.)
 

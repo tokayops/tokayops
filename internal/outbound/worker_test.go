@@ -237,10 +237,10 @@ func (c *fakeChannel) ExecuteAttempt(ctx context.Context, call Call) (Result, er
 	return result, err
 }
 
-func (c *fakeChannel) ClassifyResponse(Result) (Outcome, string, bool) {
+func (c *fakeChannel) ClassifyResponse(Result) (Classification, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.outcome, c.class, c.known
+	return Classification{Outcome: c.outcome, Class: c.class}, c.known
 }
 
 func (c *fakeChannel) made() []Call {

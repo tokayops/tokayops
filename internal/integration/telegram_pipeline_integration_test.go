@@ -296,17 +296,30 @@ func TestTelegramPipeline_SendCallbackAck(t *testing.T) {
 		t.Errorf("AG status = %s, want acknowledged", acked.Status)
 	}
 
-	// Bringing the card itself to the acknowledged revision is the next piece
-	// of work: the update loop still reads notification_deliveries, which the
-	// admitted path does not write. What this test can say today is that the
-	// acknowledgement reached the alert and took the commitment with it.
+	// And the card is owed a new revision: the acknowledgement moved what its
+	// messages have to show, so the commitment is back in the queue aimed at
+	// it. Whether the worker has got there yet is a matter of timing; that it
+	// was aimed is not.
 	var intentStatus string
-	if err := env.S.GetDB().QueryRow(
-		`SELECT status FROM outbound_intents WHERE alert_group_id = $1`, ag.ID).
-		Scan(&intentStatus); err != nil {
+	var desired, applied int64
+	if err := env.S.GetDB().QueryRow(`
+		SELECT status, desired_revision, COALESCE(applied_revision, -1)
+		FROM outbound_intents WHERE alert_group_id = $1`, ag.ID).
+		Scan(&intentStatus, &desired, &applied); err != nil {
 		t.Fatalf("read the commitment: %v", err)
 	}
-	if intentStatus != "idle" && intentStatus != "succeeded" && intentStatus != "canceled" {
+	switch intentStatus {
+	case "pending", "sending":
+		if desired <= applied {
+			t.Errorf("the commitment is %q with nothing left to apply (%d applied of %d)",
+				intentStatus, applied, desired)
+		}
+	case "idle", "succeeded", "canceled":
+		if applied != desired {
+			t.Errorf("the commitment settled as %q at revision %d, and %d is desired",
+				intentStatus, applied, desired)
+		}
+	default:
 		t.Errorf("the commitment is %q after the alert was acknowledged", intentStatus)
 	}
 }
@@ -382,20 +395,29 @@ func TestTelegramPipeline_ResolveCallback(t *testing.T) {
 		t.Errorf("AG status = %s, want resolved", resolved.Status)
 	}
 
-	// Bringing the card to its resolved state is the piece of work that has not
-	// moved yet: the resolution loop still edits from notification_deliveries,
-	// which the admitted path does not write. What holds today is that
-	// resolving the alert withdraws what it still owed - nobody is paged about
-	// an alert somebody has already closed.
-	var owing int
+	// Two things follow, and they are different things. Nothing that had not
+	// gone out is owed any more - nobody is paged about an alert somebody has
+	// already closed. And the card that DID go out is owed its last revision:
+	// it is still out there saying the alert is firing.
+	var unsent int
 	if err := env.S.GetDB().QueryRow(`
 		SELECT count(*) FROM outbound_intents
-		WHERE alert_group_id = $1 AND status IN ('pending', 'sending')`, ag.ID).
-		Scan(&owing); err != nil {
+		WHERE alert_group_id = $1 AND status IN ('pending', 'sending')
+		  AND NOT receipt_recorded`, ag.ID).Scan(&unsent); err != nil {
 		t.Fatalf("read the commitments: %v", err)
 	}
-	if owing != 0 {
-		t.Errorf("%d commitments are still owed for a resolved alert", owing)
+	if unsent != 0 {
+		t.Errorf("%d unsent notifications are still owed for a resolved alert", unsent)
+	}
+
+	var final bool
+	if err := env.S.GetDB().QueryRow(
+		`SELECT final FROM outbound_group_snapshots WHERE alert_group_id = $1`, ag.ID).
+		Scan(&final); err != nil {
+		t.Fatalf("read the state the card is brought to: %v", err)
+	}
+	if !final {
+		t.Error("the resolution did not settle what the card has to show")
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
 // Withdrawal and operator decisions: the two ways a commitment ends without the
@@ -279,7 +280,7 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 		LastAttemptKind:       facts.Kind,
 		AmbiguousInGeneration: facts.Ambiguous,
 		AcceptedDuplicateRisk: req.AcceptedDuplicateRisk,
-		ResourceLossConfirmed: req.ResourceLossConfirmed,
+		ResourceLossConfirmed: facts.ResourceLost,
 		NewExpiryProvided:     req.NewExpiresAt != nil,
 	})
 	if errors.Is(err, outbound.ErrInvalidTransition) {
@@ -386,6 +387,11 @@ type attemptFacts struct {
 	Kind      outbound.AttemptKind
 	Revision  int64
 	Ambiguous bool
+
+	// ResourceLost is proof, from the journal, that the message this commitment
+	// made is gone. It is what a decision to make a second one rests on, and it
+	// is not something the person deciding may assert.
+	ResourceLost bool
 }
 
 // lastAttemptFactsTx reads them, for the CURRENT generation only.
@@ -398,6 +404,41 @@ type attemptFacts struct {
 // The last attempt is chosen by its number rather than by its timestamp: two
 // records written in one transaction share a clock reading, and "the last one"
 // has to be an answer rather than a coin toss.
+// resourceLostTx is the proof that the object this commitment made is gone.
+//
+// Read from the journal rather than taken from whoever is deciding. It is what
+// allows a second external message to be created, and a person cannot be asked
+// to remember whether a provider once said the first had disappeared - the
+// answer existed for one moment, at one attempt, and this is where it was
+// written down.
+//
+// Both places count. An attempt closed by its own worker holds its result; one
+// closed by recovery as doubtful holds nothing, and the answer that arrived
+// afterwards is in the observation beside it. Within a generation the fact does
+// not expire either: nothing this build does can put the object back, so proof
+// found anywhere in it stands until the generation ends.
+func resourceLostTx(ctx context.Context, tx *sql.Tx, intentID string,
+	generation int) (bool, error) {
+
+	var lost bool
+	err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM outbound_attempts a
+			WHERE a.intent_id = $1 AND a.generation_no = $2
+			  AND a.outcome = $3 AND a.provider_result_detail = $4
+			UNION ALL
+			SELECT 1 FROM outbound_attempt_observations o
+			JOIN outbound_attempts a ON a.id = o.attempt_id
+			WHERE a.intent_id = $1 AND a.generation_no = $2
+			  AND o.outcome = $3 AND o.provider_result_detail = $4
+		)`, intentID, generation, string(outbound.OutcomePermanentRejection),
+		string(keys.DetailDefinitelyAbsent)).Scan(&lost)
+	if err != nil {
+		return false, fmt.Errorf("read what became of the message of %s: %w", intentID, err)
+	}
+	return lost, nil
+}
+
 func lastAttemptFactsTx(ctx context.Context, tx *sql.Tx, intentID string,
 	generation int) (attemptFacts, error) {
 
@@ -423,10 +464,16 @@ func lastAttemptFactsTx(ctx context.Context, tx *sql.Tx, intentID string,
 		return attemptFacts{}, err
 	}
 
+	lost, err := resourceLostTx(ctx, tx, intentID, generation)
+	if err != nil {
+		return attemptFacts{}, err
+	}
+
 	return attemptFacts{
-		Kind:      outbound.AttemptKind(kind.String),
-		Revision:  revision.Int64,
-		Ambiguous: ambiguous,
+		Kind:         outbound.AttemptKind(kind.String),
+		Revision:     revision.Int64,
+		Ambiguous:    ambiguous,
+		ResourceLost: lost,
 	}, nil
 }
 

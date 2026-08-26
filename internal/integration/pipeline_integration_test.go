@@ -421,8 +421,15 @@ func (c *recordingChannel) ExecuteAttempt(_ context.Context,
 		return told, toldErr
 	}
 
-	receipt, err := outbound.NewReceipt(fmt.Sprintf("%s/%d", call.Endpoint, sent),
-		json.RawMessage(fmt.Sprintf(`{"channel":%q,"ts":"%d"}`, call.Endpoint, sent)))
+	// A change answers about the message it was given, never about a new one.
+	// A real provider that did otherwise would be moving somebody's card to
+	// another message, and the domain treats it as exactly that.
+	name := fmt.Sprintf("%s/%d", call.Endpoint, sent)
+	if call.AttemptKind == outbound.AttemptMutation {
+		name = call.ReceiptRef
+	}
+	receipt, err := outbound.NewReceipt(name,
+		json.RawMessage(fmt.Sprintf(`{"channel":%q,"name":%q}`, call.Endpoint, name)))
 	if err != nil {
 		return outbound.Result{}, err
 	}
@@ -431,16 +438,20 @@ func (c *recordingChannel) ExecuteAttempt(_ context.Context,
 	}, nil
 }
 
-func (c *recordingChannel) ClassifyResponse(res outbound.Result) (outbound.Outcome, string, bool) {
+func (c *recordingChannel) ClassifyResponse(res outbound.Result) (outbound.Classification, bool) {
 	switch res.Status {
 	case "ok":
-		return outbound.OutcomeAccepted, "", true
+		return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
 	case "rate_limited":
-		return outbound.OutcomeRetryableRejection, "rate_limited", true
+		return outbound.Classification{
+			Outcome: outbound.OutcomeRetryableRejection, Class: "rate_limited",
+		}, true
 	case "channel_not_found":
-		return outbound.OutcomePermanentRejection, "channel_not_found", true
+		return outbound.Classification{
+			Outcome: outbound.OutcomePermanentRejection, Class: "channel_not_found",
+		}, true
 	}
-	return "", "", false
+	return outbound.Classification{}, false
 }
 
 // SentTo is what this channel was asked to send to ONE address, in order.
@@ -632,17 +643,39 @@ func TestPipeline_PartialUpdate(t *testing.T) {
 	}`
 	sendWebhook(t, env.Echo, payload2)
 
-	// Ingester keeps status as triggered (no regression) and flags Slack update.
+	// The ingester records alerts and does not move the status: transitions
+	// belong to the engine and to the people acting on the alert.
 	active, _ := env.S.GetActiveAlertGroupByAlertKey("test_partial_1")
 	if active.Status != model.AlertGroupStatusTriggered {
 		t.Errorf("Expected status to stay triggered, got %s", active.Status)
 	}
-	if !active.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be true after partial update")
+	if len(active.Alerts) != 2 {
+		t.Errorf("the incident holds %d alerts, want both", len(active.Alerts))
 	}
 
-	// Note: We skip Update notification verification as discussed
-	t.Skip("Partial Update notification logic not yet migrated to Job Controller (TODO)")
+	// And the card is told, in the same commit that recorded them. It used to
+	// be a flag for a loop to notice; it is a revision now, and the commitment
+	// that made the card is aimed at it.
+	var revision int64
+	if err := env.S.GetDB().QueryRow(
+		`SELECT revision FROM outbound_group_snapshots WHERE alert_group_id = $1`,
+		active.ID).Scan(&revision); err != nil {
+		t.Fatalf("read the state the card has to show: %v", err)
+	}
+	if revision == 0 {
+		t.Error("an alert cleared and another joined, and the card was told nothing")
+	}
+
+	var aimed int
+	if err := env.S.GetDB().QueryRow(`
+		SELECT count(*) FROM outbound_intents
+		WHERE alert_group_id = $1 AND form = 'editable' AND desired_revision = $2`,
+		active.ID, revision).Scan(&aimed); err != nil {
+		t.Fatalf("read the commitments: %v", err)
+	}
+	if aimed == 0 {
+		t.Error("no card is aimed at the revision the alerts produced")
+	}
 }
 
 func TestPipeline_FullResolve(t *testing.T) {

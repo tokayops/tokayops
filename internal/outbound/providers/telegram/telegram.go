@@ -23,6 +23,11 @@ import (
 // ErrNoToken is returned when the Telegram bot token is not configured.
 var ErrNoToken = fmt.Errorf("telegram integration not configured (no token)")
 
+// ErrNoReceipt is a change to a message whose stored coordinates cannot be
+// read. The store refuses to ask for one without them, so this is a damaged
+// row rather than a message that went missing.
+var ErrNoReceipt = fmt.Errorf("telegram: the message to change has no readable coordinates")
+
 const (
 	// telegramDefaultBaseURL is the public Bot API host; overridable in tests via WithBaseURL.
 	telegramDefaultBaseURL = "https://api.telegram.org"
