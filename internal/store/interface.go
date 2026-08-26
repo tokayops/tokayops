@@ -44,10 +44,14 @@ type StoreInterface interface {
 	// notification_deliveries is not reachable through this interface any more.
 	// It had one reader and one writer, both in the job path that kept an alert
 	// group's messages current, and both are gone: what was delivered and where
-	// it landed is an outbound commitment now. The table and the concrete
-	// methods survive until the destructive migration; nothing may start
-	// depending on them again in the meantime, which is what taking them off
-	// the interface enforces.
+	// it landed is an outbound commitment now.
+	//
+	// The table and the concrete *Store methods survive until the destructive
+	// migration, so this enforces nothing: a consumer port that named them
+	// would be satisfied by *Store as it stands. What it does is take them off
+	// the inventory everybody reads, so reaching for them is a deliberate act
+	// rather than an autocomplete. Nothing depends on them today, and what
+	// keeps it that way is that no version shipping in between is planned.
 
 	// Incidents (stub for future, business-level events)
 	CreateIncident(i *model.Incident) error
