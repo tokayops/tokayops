@@ -118,6 +118,141 @@ func TestADoorThatCannotRaiseItsRevisionDoesNotOpen(t *testing.T) {
 	}
 }
 
+// refuseTheCommit installs a deferred constraint trigger that fires when the
+// transaction COMMITS, not when it writes.
+//
+// This is the fault the earlier one cannot reach. Damaging the state makes the
+// command refuse, which proves the transition rolls back around a refusal; it
+// says nothing about the window after the command has succeeded, where the
+// snapshot, the revisions and the journal are all written and the commit is
+// still to come. A door that treated a failed Commit as "well, it mostly
+// worked" would leave a caller believing an alert was acknowledged while the
+// database says it never was.
+//
+// It hangs off outbound_group_snapshots because every one of these transitions
+// writes that row, which is the point: the fault is in the commit, not in any
+// particular door.
+func refuseTheCommit(t *testing.T, s *Store) {
+	t.Helper()
+	for _, statement := range []string{
+		`CREATE OR REPLACE FUNCTION test_refuse_commit() RETURNS trigger
+		 LANGUAGE plpgsql AS $$ BEGIN
+		     RAISE EXCEPTION 'the commit was refused by the test';
+		 END $$`,
+		`CREATE CONSTRAINT TRIGGER test_refuse_commit
+		 AFTER INSERT OR UPDATE ON outbound_group_snapshots
+		 DEFERRABLE INITIALLY DEFERRED
+		 FOR EACH ROW EXECUTE FUNCTION test_refuse_commit()`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatalf("install the commit fault: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, statement := range []string{
+			`DROP TRIGGER IF EXISTS test_refuse_commit ON outbound_group_snapshots`,
+			`DROP FUNCTION IF EXISTS test_refuse_commit()`,
+		} {
+			if _, err := s.db.Exec(statement); err != nil {
+				t.Fatalf("remove the commit fault: %v", err)
+			}
+		}
+	})
+}
+
+// TestTheCommitFaultLandsWhereItIsMeantTo. The test above is only worth
+// anything if the refusal happens at the commit rather than at the write - a
+// trigger that fired early would make it a copy of the test before it.
+func TestTheCommitFaultLandsWhereItIsMeantTo(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	changeableCard(t, s, agID)
+	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
+	refuseTheCommit(t, s)
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	result, err := setDesiredStateTx(context.Background(), tx, s.render,
+		outbound.DesiredStateRequest{
+			AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+		})
+	if err != nil || result.Outcome != outbound.DesiredApplied {
+		t.Fatalf("the raise was refused before the commit: %s (%v)", result.Outcome, err)
+	}
+	if err := tx.Commit(); err == nil {
+		t.Fatal("the commit was accepted, so the fault is not where this test needs it")
+	}
+}
+
+// TestADoorWhoseCommitFailsReportsIt. The whole transition is written and then
+// the commit is refused.
+//
+// Every door has to come back with an error. The alternative is the worst
+// failure this design has: the caller is told the alert was acknowledged, the
+// webhook says so, and the database has none of it - so no later transition
+// has anything to change and the cards say "triggered" until the alert ends.
+func TestADoorWhoseCommitFailsReportsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		open func(t *testing.T, s *Store, agID string) error
+	}{
+		{
+			name: "an acknowledgement",
+			open: func(t *testing.T, s *Store, agID string) error {
+				_, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+				return err
+			},
+		},
+		{
+			name: "a resolution",
+			open: func(t *testing.T, s *Store, agID string) error {
+				_, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+				return err
+			},
+		},
+		{
+			name: "an alert that arrived",
+			open: func(t *testing.T, s *Store, agID string) error {
+				_, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
+					"desired-"+agID, []model.Alert{{
+						Fingerprint: "fp-9", Status: model.AlertStatusFiring,
+						StartsAt: time.Unix(1700000600, 0),
+						Labels:   map[string]string{"alertname": "DiskSlow"},
+					}}, "ingester")
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := setupTestDB(t)
+			s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+			agID := desiredGroup(t, s, "Disk filling up")
+			changeableCard(t, s, agID)
+			moveGroup(t, s, agID, model.AlertGroupStatusTriggered)
+
+			was := groupFacts(t, s, agID)
+			refuseTheCommit(t, s)
+
+			if err := tc.open(t, s, agID); err == nil {
+				t.Fatal("a transition whose commit was refused came back as done")
+			}
+
+			now := groupFacts(t, s, agID)
+			if now != was {
+				t.Errorf("the database kept part of a transition that never committed:\n"+
+					"  was %+v\n  now %+v", was, now)
+			}
+		})
+	}
+}
+
 // TestAnAcknowledgementDuringTheFirstSendEndsAcknowledgedEitherWay.
 //
 // The acknowledgement arrives while the card is being posted for the first

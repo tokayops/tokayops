@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -125,7 +126,7 @@ func TestTheCardOnlyEverMovesForward(t *testing.T) {
 				was = now
 			}
 
-			var raised, attempted, overtook int
+			var raised, attempted, overtook, appliedOvertaken int
 			for i := 0; i < 24; i++ {
 				switch rng.Intn(3) {
 				case 0:
@@ -155,7 +156,9 @@ func TestTheCardOnlyEverMovesForward(t *testing.T) {
 					begun := beginOne(t, s, intentID, token)
 					step++
 					raiseFor(t, s, agID, step)
-					finishOne(t, s, intentID, token, begun, rng)
+					if finishOne(t, s, intentID, token, begun, rng) {
+						appliedOvertaken++
+					}
 					check("after a revision overtook an attempt")
 				}
 			}
@@ -163,10 +166,14 @@ func TestTheCardOnlyEverMovesForward(t *testing.T) {
 			// A generated sequence that never reached the interesting states
 			// would pass while asserting nothing, so what it reached is
 			// asserted too.
-			if raised+overtook < 5 || attempted+overtook < 3 || overtook < 1 {
+			//
+			// An overtaken attempt that was REFUSED proves nothing about any of
+			// this: it applied no revision, so the number it would have
+			// recorded was never written. At least one has to be taken.
+			if raised+overtook < 5 || attempted+overtook < 3 || appliedOvertaken < 1 {
 				t.Fatalf("this sequence did too little to prove anything: "+
-					"%d revisions, %d attempts, %d of them overtaken",
-					raised+overtook, attempted+overtook, overtook)
+					"%d revisions, %d attempts, %d overtaken, %d of those applied",
+					raised+overtook, attempted+overtook, overtook, appliedOvertaken)
 			}
 
 			// And it catches up. Nothing raises a revision now, so a card that
@@ -194,14 +201,14 @@ func TestTheCardOnlyEverMovesForward(t *testing.T) {
 }
 
 // finishOne ends an attempt the way a provider might: taken, or refused in a
-// way that will be tried again.
+// way that will be tried again. It reports whether the revision was applied.
 func finishOne(t *testing.T, s *Store, intentID, token string,
-	begun outbound.BeginAttemptResult, rng *rand.Rand) {
+	begun outbound.BeginAttemptResult, rng *rand.Rand) bool {
 
 	t.Helper()
 	if rng.Intn(2) == 0 {
 		applyOne(t, s, intentID, token, begun)
-		return
+		return true
 	}
 	if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 		AttemptID: begun.AttemptID, LeaseToken: token,
@@ -211,6 +218,7 @@ func finishOne(t *testing.T, s *Store, intentID, token string,
 	}
 	// The backoff is real time, and this test is not waiting it out.
 	due(t, s, intentID)
+	return false
 }
 
 // applyOne ends an attempt as taken, and checks the half of the property that
@@ -226,15 +234,18 @@ func applyOne(t *testing.T, s *Store, intentID, token string,
 		t.Fatalf("apply the revision: %v", err)
 	}
 	var recorded int64
-	if err := s.db.QueryRow(
-		`SELECT applied_revision FROM outbound_attempts WHERE id = $1`,
-		begun.AttemptID).Scan(&recorded); err != nil {
+	var requested []byte
+	if err := s.db.QueryRow(`
+		SELECT applied_revision, request_fingerprint
+		FROM outbound_attempts WHERE id = $1`, begun.AttemptID).
+		Scan(&recorded, &requested); err != nil {
 		t.Fatalf("read what the attempt applied: %v", err)
 	}
 	if recorded != begun.AppliedRevision {
 		t.Fatalf("the attempt rendered revision %d and recorded %d",
 			begun.AppliedRevision, recorded)
 	}
+	renderedIsWhatIsRecorded(t, begun, requested)
 
 	// And the card is at the revision this attempt showed - not at whatever
 	// the alert has moved to since. Taking the newer number here is the
@@ -244,5 +255,32 @@ func applyOne(t *testing.T, s *Store, intentID, token string,
 	if now := readCard(t, s, intentID); now.Applied != begun.AppliedRevision {
 		t.Fatalf("the card shows revision %d and records %d",
 			begun.AppliedRevision, now.Applied)
+	}
+}
+
+// renderedIsWhatIsRecorded ties the number to the bytes.
+//
+// Every check above compares numbers the store itself produced, and numbers
+// agreeing with each other is not the property. What has to hold is that the
+// state handed to the worker - the bytes it will actually draw the card from -
+// is the state that number names. A build that returned the newest revision
+// beside the previous snapshot would satisfy every arithmetic check here and
+// leave the old card recorded under the new revision, permanently, with
+// nothing outstanding to correct it.
+//
+// The attempt's request_fingerprint is the same claim written down: it is the
+// digest of the state the call was made from, and it has to be the digest of
+// the state that was handed over.
+func renderedIsWhatIsRecorded(t *testing.T, begun outbound.BeginAttemptResult,
+	requested []byte) {
+
+	t.Helper()
+	if shown := begun.Snapshot.Content().Revision; shown != begun.AppliedRevision {
+		t.Fatalf("the worker was handed revision %d to draw and told it is applying %d",
+			shown, begun.AppliedRevision)
+	}
+	if digest := begun.Snapshot.Digest(); !bytes.Equal(digest, requested) {
+		t.Fatalf("the attempt records the digest of a state other than the one "+
+			"it was handed: %x vs %x", requested, digest)
 	}
 }
