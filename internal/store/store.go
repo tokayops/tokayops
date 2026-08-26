@@ -1327,7 +1327,14 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	}
 	defer tx.Rollback()
 
-	now := time.Now()
+	// One instant for everything this transaction writes, and it comes from the
+	// database. The history is read in (created_at, id) order, so a line taken
+	// from the process clock and another from the server's can be returned in
+	// an order neither of them happened in.
+	var now time.Time
+	if err := tx.QueryRow(`SELECT now()`).Scan(&now); err != nil {
+		return false, err
+	}
 
 	// 1. Conditional UPDATE — from 'processing' or 'triggered' (single-winner semantics)
 	res, err := tx.Exec(
@@ -1376,7 +1383,10 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	// change, because "acknowledged" and "nobody is being paged any more" are
 	// one fact: split in two, a crash between them pages somebody for an alert
 	// that is already being handled.
-	withdrawn, err := cancelIntentsTx(context.Background(), tx, id, "the alert was acknowledged", actor)
+	// After the line above, and said so: the withdrawal happened because of the
+	// acknowledgement, and a history that puts it first says the opposite.
+	withdrawn, err := cancelIntentsAtTx(context.Background(), tx, id,
+		"the alert was acknowledged", actor, now.Add(time.Microsecond))
 	if err != nil {
 		return false, err
 	}
@@ -1409,7 +1419,10 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	}
 	defer tx.Rollback()
 
-	now := time.Now()
+	var now time.Time
+	if err := tx.QueryRow(`SELECT now()`).Scan(&now); err != nil {
+		return false, err
+	}
 
 	// 1. Conditional UPDATE — from 'processing', 'triggered', or 'acknowledged'
 	res, err := tx.Exec(
@@ -1458,7 +1471,8 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	// change, because "acknowledged" and "nobody is being paged any more" are
 	// one fact: split in two, a crash between them pages somebody for an alert
 	// that is already being handled.
-	withdrawn, err := cancelIntentsTx(context.Background(), tx, id, "the alert was resolved", actor)
+	withdrawn, err := cancelIntentsAtTx(context.Background(), tx, id,
+		"the alert was resolved", actor, now.Add(time.Microsecond))
 	if err != nil {
 		return false, err
 	}

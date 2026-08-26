@@ -1184,11 +1184,24 @@ func admittedSnapshotTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent)
 
 // attemptStateTx is the state one attempt renders, chosen by what the
 // commitment is: a card follows the alert, a message does not.
+//
+// The set is closed, and an unrecognised form stops here rather than taking a
+// default. A default would be the one-shot branch, so a form this build does
+// not know - a damaged row, or one written by a version that has more of them -
+// would open an effect and reach the provider before anything looked at it
+// again. It is refused before an attempt exists, which is the only point at
+// which refusing is free.
 func attemptStateTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent) (storedSnapshot, error) {
-	if intent.Form == outbound.FormEditable {
+	switch intent.Form {
+	case outbound.FormEditable:
 		return lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+	case outbound.FormOneShot:
+		return admittedSnapshotTx(ctx, tx, intent)
+	default:
+		return storedSnapshot{}, outboundContractf(
+			"commitment %s is a %q, which is not a form this build delivers",
+			intent.ID, intent.Form)
 	}
-	return admittedSnapshotTx(ctx, tx, intent)
 }
 
 // checkedSnapshot proves a stored snapshot is the same thing that went in,

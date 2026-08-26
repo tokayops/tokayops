@@ -927,9 +927,13 @@ func TestGetEscalationSources_SkipsAGAlreadyAdmitted(t *testing.T) {
 	_, err = s.GetDB().Exec(`
 		INSERT INTO outbound_batches
 			(id, batch_key, key_kind, delivery_family, grammar_version, alert_group_id,
-			 fingerprint, fingerprint_version, admission_outcome, intent_count)
-		VALUES ($1, $2, 'escalation', 'notification', 1, $3, $4, 1, 'admitted', 1)`,
-		uuid.New().String(), "batch-"+agID, agID, digest32(0x20))
+			 fingerprint, fingerprint_version, admission_outcome, intent_count,
+			 admission_snapshot, admission_digest, admission_schema_version,
+			 admission_revision)
+		VALUES ($1, $2, 'escalation', 'notification', 1, $3, $4, 1, 'admitted', 1,
+			$5, $6, 1, 0)`,
+		uuid.New().String(), "batch-"+agID, agID, digest32(0x20),
+		`{"frozen":true}`, digest32(0x21))
 	if err != nil {
 		t.Fatalf("Failed to record the admission: %v", err)
 	}

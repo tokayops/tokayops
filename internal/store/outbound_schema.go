@@ -14,10 +14,13 @@ import (
 //     the row is what makes admission idempotent: a repeat of the same set is a
 //     no-op, a repeat with different content is a conflict reported to the
 //     producer rather than a merged audience.
-//   - outbound_group_snapshots holds the state a message is rendered from, one
-//     row per alert group, superseded forward. An attempt renders from here and
-//     never from the live group, so a retry sends what was accepted rather than
-//     what the group happens to look like now.
+//   - outbound_group_snapshots holds the state a CARD is rendered from, one row
+//     per alert group, superseded forward: bringing a message up to date is
+//     what an editable one is for. A one-shot message renders the state its
+//     admission froze instead - kept on the batch, never superseded - because
+//     one provider key names one external effect, and a retry that followed the
+//     group would put two different requests under it. Neither reads the live
+//     group.
 //   - outbound_intents is one commitment to one recipient: what to send, where
 //     it stands, and who holds the lease over it right now.
 //   - outbound_attempts is the journal. It carries two kinds of record: a
@@ -98,18 +101,10 @@ CREATE TABLE IF NOT EXISTS outbound_batches (
 	-- an empty bytea is a value, and a producer that computed nothing would
 	-- otherwise match every other producer that computed nothing.
 	CONSTRAINT outbound_batches_fingerprint_len
-		CHECK (octet_length(fingerprint) = 32),
-	-- The four halves of the frozen state are one fact: a row holding some of
-	-- them describes a moment nobody can reconstruct. Families with no render
-	-- snapshot - handoff, webhook - hold none of them.
-	CONSTRAINT outbound_batches_admission_snapshot_shape CHECK (
-		(admission_snapshot IS NULL AND admission_digest IS NULL
-			AND admission_schema_version IS NULL AND admission_revision IS NULL)
-		OR
-		(admission_snapshot IS NOT NULL AND admission_digest IS NOT NULL
-			AND admission_schema_version IS NOT NULL AND admission_revision IS NOT NULL
-			AND octet_length(admission_digest) = 32 AND admission_revision >= 0)
-	)
+		CHECK (octet_length(fingerprint) = 32)
+	-- Two more rules about this table - that the frozen state is whole, and
+	-- that an escalation has one - are added by their own statements below, so
+	-- that they reach databases created before those columns existed.
 );
 
 -- One FIRST admission per group. Scoped to that kind on purpose: a later
@@ -498,6 +493,139 @@ BEGIN
 END $$;
 `
 
+const outboundAdmittedStateShape = "outbound_batches_admission_snapshot_shape"
+
+// outboundAdmittedStateShapeDDL says the frozen state is whole or absent.
+//
+// Four columns describing one moment: a row holding some of them describes a
+// moment nobody can reconstruct, and the reader that meets it can only guess
+// which half is missing. Families with no render snapshot - handoff, webhook -
+// hold none of the four.
+const outboundAdmittedStateShapeDDL = `
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = '` + outboundAdmittedStateShape + `'
+		  AND conrelid = 'outbound_batches'::regclass
+	) THEN
+		ALTER TABLE outbound_batches
+			ADD CONSTRAINT ` + outboundAdmittedStateShape + ` CHECK (
+				(admission_snapshot IS NULL AND admission_digest IS NULL
+					AND admission_schema_version IS NULL AND admission_revision IS NULL)
+				OR
+				(admission_snapshot IS NOT NULL AND admission_digest IS NOT NULL
+					AND admission_schema_version IS NOT NULL
+					AND admission_revision IS NOT NULL
+					AND octet_length(admission_digest) = 32
+					AND admission_revision >= 0)
+			);
+	END IF;
+END $$;
+`
+
+const outboundFormKnownConstraint = "outbound_intents_form_known"
+
+// outboundFormKnownDDL closes the set of forms in the database as well as in
+// the code.
+//
+// The form decides which state an attempt renders - a card follows the alert, a
+// message keeps what its admission froze - so a third value would have to be
+// silently treated as one of the two. The code refuses it before an attempt
+// exists; this makes the row unwritable in the first place.
+const outboundFormKnownDDL = `
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = '` + outboundFormKnownConstraint + `'
+		  AND conrelid = 'outbound_intents'::regclass
+	) THEN
+		ALTER TABLE outbound_intents
+			ADD CONSTRAINT ` + outboundFormKnownConstraint + `
+			CHECK (form IN ('editable', 'one_shot'));
+	END IF;
+END $$;
+`
+
+const outboundAdmittedStateConstraint = "outbound_batches_admission_snapshot_present"
+
+// outboundAdmittedStateDDL brings the frozen admission state to databases the
+// previous version created, and fills it in for the claims already in them.
+//
+// The four columns cannot arrive with the table: it is created by CREATE TABLE
+// IF NOT EXISTS, so on a database that already has one they would simply never
+// appear - and the first admission afterwards would fail on a column that does
+// not exist.
+//
+// The backfill is exact rather than approximate, and only because of when it
+// runs. The previous version had nothing that could raise a group's revision,
+// so every snapshot it wrote is revision 0 - which IS the state its admission
+// froze. Copying it across is therefore not a guess about what was admitted; it
+// is the same row. A group whose snapshot has moved past 0 cannot exist here:
+// the only thing that moves it is the code this migration ships with, and it
+// runs before that code can.
+//
+// What is deliberately NOT done: leaving the old claims empty. A one-shot
+// commitment renders the state its admission froze, so an empty one is a
+// message that ends as undeliverable at the moment somebody needed it.
+const outboundAdmittedStateDDL = `
+DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+	               WHERE table_name = 'outbound_batches'
+	                 AND column_name = 'admission_snapshot') THEN
+		ALTER TABLE outbound_batches
+			ADD COLUMN admission_snapshot JSONB,
+			ADD COLUMN admission_digest BYTEA,
+			ADD COLUMN admission_schema_version INT,
+			ADD COLUMN admission_revision BIGINT;
+
+		UPDATE outbound_batches b
+		SET admission_snapshot = g.snapshot,
+		    admission_digest = g.snapshot_digest,
+		    admission_schema_version = g.snapshot_schema_version,
+		    admission_revision = g.revision
+		FROM outbound_group_snapshots g
+		WHERE g.alert_group_id = b.alert_group_id
+		  AND b.admission_snapshot IS NULL
+		  AND g.revision = 0;
+	END IF;
+END $$;
+`
+
+// outboundAdmittedStateConstraintDDL insists that an escalation names the state
+// it was admitted from.
+//
+// Every commitment of such a batch renders from it - a card until the alert
+// moves, a direct message forever - so a claim without it admits work that is
+// guaranteed to end as unrenderable. Families with no render snapshot are
+// exempt by name rather than by silence: handoff and webhook carry their own
+// content and have nothing to freeze.
+//
+// It is added by its own statement, after the backfill above, so that a
+// database from the previous version is repaired before the rule is applied to
+// it. A row that cannot be repaired fails the ALTER and the start with it,
+// which is the loud half of the same decision.
+const outboundAdmittedStateConstraintDDL = `
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = '` + outboundAdmittedStateConstraint + `'
+		  AND conrelid = 'outbound_batches'::regclass
+	) THEN
+		ALTER TABLE outbound_batches
+			ADD CONSTRAINT ` + outboundAdmittedStateConstraint + ` CHECK (
+				key_kind NOT IN ('escalation', 'escalation_replay')
+				OR (admission_snapshot IS NOT NULL AND admission_digest IS NOT NULL
+					AND admission_schema_version IS NOT NULL
+					AND admission_revision IS NOT NULL)
+			);
+	END IF;
+END $$;
+`
+
 const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_the_target"
 
 // outboundTargetAgreementDDL states that a commitment may only name its
@@ -574,6 +702,18 @@ func (s *Store) applyOutboundSchema() error {
 	}
 	if _, err := tx.Exec(outboundRecipientErasedDDL); err != nil {
 		return fmt.Errorf("failed to add the erasure marker: %w", err)
+	}
+	if _, err := tx.Exec(outboundAdmittedStateDDL); err != nil {
+		return fmt.Errorf("failed to add the admitted state: %w", err)
+	}
+	if _, err := tx.Exec(outboundAdmittedStateShapeDDL); err != nil {
+		return fmt.Errorf("failed to add %s: %w", outboundAdmittedStateShape, err)
+	}
+	if _, err := tx.Exec(outboundAdmittedStateConstraintDDL); err != nil {
+		return fmt.Errorf("failed to add %s: %w", outboundAdmittedStateConstraint, err)
+	}
+	if _, err := tx.Exec(outboundFormKnownDDL); err != nil {
+		return fmt.Errorf("failed to add %s: %w", outboundFormKnownConstraint, err)
 	}
 	for _, table := range []string{
 		"outbound_intents", "outbound_attempts", "outbound_attempt_observations",

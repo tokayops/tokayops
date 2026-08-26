@@ -84,14 +84,19 @@ func newBatch(agID string) batchFixture {
 }
 
 func (b batchFixture) insert(s *Store) error {
+	// The frozen admission state goes in with every escalation claim, because
+	// the schema says so: a commitment of one renders from it, and a claim
+	// without it admits work that cannot be delivered.
 	_, err := s.db.Exec(`
 		INSERT INTO outbound_batches
 			(id, batch_key, key_kind, delivery_family, grammar_version,
 			 alert_group_id, fingerprint, fingerprint_version,
-			 admission_outcome, intent_count)
-		VALUES ($1, $2, $3, $4, 1, $5, $6, 1, $7, $8)`,
+			 admission_outcome, intent_count,
+			 admission_snapshot, admission_digest, admission_schema_version,
+			 admission_revision)
+		VALUES ($1, $2, $3, $4, 1, $5, $6, 1, $7, $8, $9, $10, 1, 0)`,
 		b.ID, b.Key, b.Kind, b.Family, b.AlertGroupID, b.Fingerprint,
-		b.Outcome, b.IntentCount)
+		b.Outcome, b.IntentCount, `{"frozen":true}`, digest32(0x11))
 	return err
 }
 

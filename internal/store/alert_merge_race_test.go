@@ -231,3 +231,85 @@ func TestAResolvingPayloadAgainstAnAcknowledgementEndsTheIncidentOnce(t *testing
 		}
 	}
 }
+
+// The two orders, settled rather than raced.
+//
+// The concurrent tests above prove the two sides cannot lose an alert between
+// them, but nothing in them decides which side commits first - so neither can
+// say what a given order has to produce. These do: the first transaction
+// commits before the second begins.
+
+// TestAMergeThatCommitsFirstIsInTheIncidentThatEnds.
+func TestAMergeThatCommitsFirstIsInTheIncidentThatEnds(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID, key := mergeRaceGroup(t, s)
+
+	applied, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
+		[]model.Alert{firingAlert("fp-a", time.Unix(1700000100, 0))}, "system")
+	if err != nil || applied.Outcome != alertgroup.MergeMerged {
+		t.Fatalf("the merge came back %s (%v)", applied.Outcome, err)
+	}
+
+	resolved, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+	if err != nil || !resolved {
+		t.Fatalf("resolve: %v %v", resolved, err)
+	}
+
+	held := heldFingerprints(t, s, agID)
+	if !held["fp-a"] {
+		t.Fatal("the alert that arrived first is not in the incident that ended")
+	}
+	// And the incident ended once, with the alert in it.
+	var status string
+	if err := s.db.QueryRow(`SELECT status FROM alert_groups WHERE id = $1`, agID).
+		Scan(&status); err != nil {
+		t.Fatalf("read the incident: %v", err)
+	}
+	if status != string(model.AlertGroupStatusResolved) {
+		t.Fatalf("the incident is %s", status)
+	}
+}
+
+// TestAResolutionThatCommitsFirstSendsTheAlertToTheNextIncident.
+//
+// The store's half is the answer "there is nothing open". What that answer is
+// FOR is the other half, and it is asserted at the level that acts on it: the
+// ingester opens the next incident, and the alert nobody could merge is in it.
+func TestAResolutionThatCommitsFirstSendsTheAlertToTheNextIncident(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID, key := mergeRaceGroup(t, s)
+
+	resolved, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+	if err != nil || !resolved {
+		t.Fatalf("resolve: %v %v", resolved, err)
+	}
+
+	applied, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
+		[]model.Alert{firingAlert("fp-a", time.Unix(1700000100, 0))}, "system")
+	if err != nil {
+		t.Fatalf("apply the payload: %v", err)
+	}
+	if applied.Outcome != alertgroup.MergeNoActive {
+		t.Fatalf("a payload for a finished incident came back %s", applied.Outcome)
+	}
+	if heldFingerprints(t, s, agID)["fp-a"] {
+		t.Fatal("a firing alert was written into an incident that had ended")
+	}
+
+	// The alert key is free again, which is what lets the next incident open.
+	var open int
+	if err := s.db.QueryRow(`
+		SELECT count(*) FROM alert_groups
+		WHERE alert_key = $1 AND status NOT IN ($2, $3)`,
+		key, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed).
+		Scan(&open); err != nil {
+		t.Fatalf("count the open incidents: %v", err)
+	}
+	if open != 0 {
+		t.Fatalf("%d incidents are still open for the alert", open)
+	}
+}
