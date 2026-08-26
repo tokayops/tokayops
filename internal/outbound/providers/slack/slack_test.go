@@ -42,7 +42,7 @@ func newSlackProviderForTest(token, apiURL, selfURL string) *Provider {
 	}
 }
 
-func TestSlackSendUpdateResolve(t *testing.T) {
+func TestSlackSendPostsTheCard(t *testing.T) {
 	// Mock Slack API
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -63,15 +63,6 @@ func TestSlackSendUpdateResolve(t *testing.T) {
 			})
 			return
 		}
-		if r.URL.Path == "/chat.update" {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":      true,
-				"channel": "C123",
-				"ts":      "123.456",
-			})
-			return
-		}
-
 		t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
 	}))
 	defer server.Close()
@@ -101,21 +92,6 @@ func TestSlackSendUpdateResolve(t *testing.T) {
 	}
 	if dataStr == "" {
 		t.Error("Send returned empty data")
-	}
-
-	// The delivery carries the provider payload Update/Resolve operate on.
-	delivery := &model.NotificationDelivery{ID: "del-1", ProviderPayload: dataStr}
-
-	// 2. Update
-	_, err = provider.Update(ctx, delivery, ag)
-	if err != nil {
-		t.Errorf("Update failed: %v", err)
-	}
-
-	// 3. Resolve
-	err = provider.Resolve(ctx, delivery, ag)
-	if err != nil {
-		t.Errorf("Resolve failed: %v", err)
 	}
 }
 
@@ -225,24 +201,6 @@ func TestSlackProvider_EmailBySlackID(t *testing.T) {
 	}
 	if _, err := provider.GetEmailBySlackID(context.Background(), "U_NOEMAIL"); err == nil {
 		t.Error("info no-email: expected an error for a user with no profile email")
-	}
-}
-
-// TestSlackProvider_UpdateResolve_InvalidPayload verifies Update/Resolve reject a
-// malformed provider payload before making any Slack API call.
-func TestSlackProvider_UpdateResolve_InvalidPayload(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("no Slack API call expected for an invalid payload, got %s", r.URL.Path)
-	}))
-	defer server.Close()
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-
-	bad := &model.NotificationDelivery{ID: "del-bad", ProviderPayload: "{ not valid json"}
-	if _, err := provider.Update(context.Background(), bad, &model.AlertGroup{}); err == nil {
-		t.Error("expected Update to reject an invalid provider payload")
-	}
-	if err := provider.Resolve(context.Background(), bad, &model.AlertGroup{}); err == nil {
-		t.Error("expected Resolve to reject an invalid provider payload")
 	}
 }
 
@@ -369,108 +327,6 @@ func TestACardSendIsOneExternalEffect(t *testing.T) {
 	}
 	if data.ChannelID == "" || data.Timestamp == "" {
 		t.Errorf("the payload does not name the message: %+v", data)
-	}
-}
-func TestResolve_ReturnsErrorOnMainMessageUpdateFailure(t *testing.T) {
-	// Mock Slack API: thread reply succeeds, main message update fails
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		if r.URL.Path == "/chat.postMessage" {
-			// Thread reply succeeds
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":      true,
-				"channel": "C123",
-				"ts":      "999.000",
-			})
-			return
-		}
-		if r.URL.Path == "/chat.update" {
-			// Main message update FAILS
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":    false,
-				"error": "channel_not_found",
-			})
-			return
-		}
-	}))
-	defer server.Close()
-
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	ctx := context.Background()
-
-	slackData := Data{
-		ChannelID: "C123",
-		Timestamp: "123.456",
-	}
-	dataBytes, _ := json.Marshal(slackData)
-
-	ag := &model.AlertGroup{
-		ID:       "ag-resolve-fail",
-		Title:    "Resolve Fail Test",
-		Severity: "critical",
-	}
-	delivery := &model.NotificationDelivery{ID: "del-1", ProviderPayload: string(dataBytes)}
-
-	err := provider.Resolve(ctx, delivery, ag)
-	if err == nil {
-		t.Fatal("Expected error from Resolve when main message update fails, got nil")
-	}
-	if !strings.Contains(err.Error(), "failed to update main message") {
-		t.Errorf("Expected 'failed to update main message' in error, got: %v", err)
-	}
-}
-
-func TestResolve_SucceedsWhenThreadReplyFails(t *testing.T) {
-	// Mock Slack API: thread reply fails, main message update succeeds
-	var callCount int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		if r.URL.Path == "/chat.postMessage" {
-			callCount++
-			// Thread reply fails
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":    false,
-				"error": "too_many_attachments",
-			})
-			return
-		}
-		if r.URL.Path == "/chat.update" {
-			// Main message update succeeds
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":      true,
-				"channel": "C123",
-				"ts":      "123.456",
-			})
-			return
-		}
-	}))
-	defer server.Close()
-
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	ctx := context.Background()
-
-	slackData := Data{
-		ChannelID: "C123",
-		Timestamp: "123.456",
-	}
-	dataBytes, _ := json.Marshal(slackData)
-
-	ag := &model.AlertGroup{
-		ID:       "ag-resolve-thread-fail",
-		Title:    "Thread Fail Test",
-		Severity: "critical",
-		TimelineEvents: []*model.TimelineEvent{
-			{Type: model.TimelineEventCreated, Message: "created", CreatedAt: time.Now()},
-		},
-	}
-	delivery := &model.NotificationDelivery{ID: "del-1", ProviderPayload: string(dataBytes)}
-
-	// Should succeed even though thread reply failed — thread is non-critical
-	err := provider.Resolve(ctx, delivery, ag)
-	if err != nil {
-		t.Errorf("Expected Resolve to succeed when only thread reply fails, got: %v", err)
 	}
 }
 
@@ -763,135 +619,6 @@ func TestSendProducesBlockKit(t *testing.T) {
 	if !strings.Contains(postText, "FmtTest") {
 		t.Errorf("chat.postMessage text should contain alert title, got: %s", postText)
 	}
-}
-
-func TestUpdateProducesBlockKit(t *testing.T) {
-	var lastUpdateAttachments, lastUpdateBlocks, lastUpdateText string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/chat.update" {
-			r.ParseForm()
-			lastUpdateAttachments = r.FormValue("attachments")
-			lastUpdateBlocks = r.FormValue("blocks")
-			lastUpdateText = r.FormValue("text")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok": true, "channel": "C123", "ts": "111.222",
-			})
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "channel": "C123", "ts": "111.222"})
-	}))
-	defer server.Close()
-
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	ag := &model.AlertGroup{
-		ID: "ag-dispatch", Title: "DispatchTest", Severity: "critical",
-		Status: model.AlertGroupStatusAcknowledged,
-	}
-
-	// Data no longer carries a format flag — the renderer is always Block Kit.
-	// Legacy persisted rows that contained "format":"" or "format":"v1" simply
-	// have the unknown field ignored on unmarshal.
-	t.Run("fresh row", func(t *testing.T) {
-		data := Data{ChannelID: "C123", Timestamp: "111.222"}
-		b, _ := json.Marshal(data)
-		delivery := &model.NotificationDelivery{ID: "del-1", ProviderPayload: string(b)}
-
-		_, err := provider.Update(context.Background(), delivery, ag)
-		if err != nil {
-			t.Fatalf("Update failed: %v", err)
-		}
-		if !strings.Contains(lastUpdateAttachments, `"type":"section"`) {
-			t.Errorf("update attachments should contain Block Kit section, got: %s", lastUpdateAttachments)
-		}
-		if lastUpdateBlocks == "" {
-			t.Error("update should have non-empty blocks (title)")
-		}
-		if !strings.Contains(lastUpdateBlocks, "DispatchTest") {
-			t.Errorf("update blocks should contain alert title, got: %s", lastUpdateBlocks)
-		}
-		if lastUpdateText == "" {
-			t.Error("update should have non-empty text (fallback)")
-		}
-		if !strings.Contains(lastUpdateText, "DispatchTest") {
-			t.Errorf("update text should contain alert title, got: %s", lastUpdateText)
-		}
-	})
-
-	t.Run("legacy row with stray format field", func(t *testing.T) {
-		// Hand-rolled JSON simulating a pre-deletion payload row.
-		// Unknown "format" key is ignored by json.Unmarshal — the row is
-		// still rendered with the (now sole) Block Kit renderer.
-		delivery := &model.NotificationDelivery{ID: "del-2", ProviderPayload: `{"channel_id":"C123","timestamp":"111.222","format":"v1"}`}
-
-		_, err := provider.Update(context.Background(), delivery, ag)
-		if err != nil {
-			t.Fatalf("Update failed: %v", err)
-		}
-		if !strings.Contains(lastUpdateAttachments, `"type":"section"`) {
-			t.Errorf("legacy row should still upgrade to Block Kit on update, got: %s", lastUpdateAttachments)
-		}
-	})
-}
-
-func TestResolveProducesBlockKit(t *testing.T) {
-	var lastUpdateAttachments, lastUpdateBlocks, lastUpdateText string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/chat.update" {
-			r.ParseForm()
-			lastUpdateAttachments = r.FormValue("attachments")
-			lastUpdateBlocks = r.FormValue("blocks")
-			lastUpdateText = r.FormValue("text")
-		}
-		// All calls succeed (postMessage for thread reply, update for main message)
-		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "channel": "C123", "ts": "111.222"})
-	}))
-	defer server.Close()
-
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	ag := &model.AlertGroup{
-		ID: "ag-resolve-dispatch", Title: "ResolveDispatch", Severity: "critical",
-		Status: model.AlertGroupStatusResolved,
-	}
-
-	t.Run("fresh row", func(t *testing.T) {
-		data := Data{ChannelID: "C123", Timestamp: "111.222"}
-		b, _ := json.Marshal(data)
-		delivery := &model.NotificationDelivery{ID: "del-1", ProviderPayload: string(b)}
-
-		err := provider.Resolve(context.Background(), delivery, ag)
-		if err != nil {
-			t.Fatalf("Resolve failed: %v", err)
-		}
-		if !strings.Contains(lastUpdateAttachments, `"type":"section"`) {
-			t.Errorf("resolve attachments should contain Block Kit section, got: %s", lastUpdateAttachments)
-		}
-		if lastUpdateBlocks == "" {
-			t.Error("resolve should have non-empty blocks (title)")
-		}
-		if !strings.Contains(lastUpdateBlocks, "ResolveDispatch") {
-			t.Errorf("resolve blocks should contain alert title, got: %s", lastUpdateBlocks)
-		}
-		if lastUpdateText == "" {
-			t.Error("resolve should have non-empty text (fallback)")
-		}
-		if !strings.Contains(lastUpdateText, "ResolveDispatch") {
-			t.Errorf("resolve text should contain alert title, got: %s", lastUpdateText)
-		}
-	})
-
-	t.Run("legacy row with stray format field", func(t *testing.T) {
-		delivery := &model.NotificationDelivery{ID: "del-2", ProviderPayload: `{"channel_id":"C123","timestamp":"111.222","format":""}`}
-
-		err := provider.Resolve(context.Background(), delivery, ag)
-		if err != nil {
-			t.Fatalf("Resolve failed: %v", err)
-		}
-		if !strings.Contains(lastUpdateAttachments, `"type":"section"`) {
-			t.Errorf("legacy row should still upgrade to Block Kit on resolve, got: %s", lastUpdateAttachments)
-		}
-	})
 }
 
 func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {

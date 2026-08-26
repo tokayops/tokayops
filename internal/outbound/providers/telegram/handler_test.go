@@ -147,6 +147,37 @@ func TestButtonsFollowTheAdmission(t *testing.T) {
 	}
 }
 
+// TestAChangeCarriesTheKeyboardTheAdmissionFroze. Telegram leaves the existing
+// keyboard in place when reply_markup is absent, so a change to a card admitted
+// without buttons has to carry an explicitly empty one - otherwise buttons
+// posted before the switch was flipped stay live in the chat, and pressing one
+// reaches a build that no longer answers it.
+func TestAChangeCarriesTheKeyboardTheAdmissionFroze(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	change := handlerCall(t, keys.TargetChannel, false)
+	change.AttemptKind = outbound.AttemptMutation
+	change.Operation = outbound.OperationUpdate
+	change.Receipt = json.RawMessage(`{"chat_id":"-1001","message_id":42}`)
+	change.ReceiptRef = "-1001/42"
+
+	if _, err := handler.ExecuteAttempt(context.Background(), change); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if method := api.calls[0]["_method"]; method != "editMessageText" {
+		t.Fatalf("a change called %v", method)
+	}
+	markup, ok := api.calls[0]["reply_markup"].(map[string]any)
+	if !ok {
+		t.Fatalf("the change omitted reply_markup, so the old buttons survive: %v",
+			api.calls[0])
+	}
+	if rows, _ := markup["inline_keyboard"].([]any); len(rows) != 0 {
+		t.Fatalf("a change to a card admitted without buttons sent %d rows", len(rows))
+	}
+}
+
 // TestTelegramAnswersAreTranslatedNotInterpreted walks the capability matrix.
 func TestTelegramAnswersAreTranslatedNotInterpreted(t *testing.T) {
 	handler := &Handler{}

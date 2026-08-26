@@ -58,7 +58,7 @@ func testAlertGroup() *model.AlertGroup {
 	}
 }
 
-func TestTelegram_SendUpdateResolve(t *testing.T) {
+func TestTelegram_SendPostsTheCard(t *testing.T) {
 	counts := map[string]int{}
 	server := fakeBotAPI(t, 42, counts)
 	defer server.Close()
@@ -80,15 +80,8 @@ func TestTelegram_SendUpdateResolve(t *testing.T) {
 		t.Fatalf("payload = %q, parsed=%+v ok=%v", payload, data, ok)
 	}
 
-	delivery := &model.NotificationDelivery{ID: "del-1", ProviderPayload: payload}
-	if _, err := p.Update(ctx, delivery, ag); err != nil {
-		t.Errorf("Update: %v", err)
-	}
-	if err := p.Resolve(ctx, delivery, ag); err != nil {
-		t.Errorf("Resolve: %v", err)
-	}
-	if counts["sendMessage"] != 1 || counts["editMessageText"] != 2 {
-		t.Errorf("call counts = %v, want sendMessage=1 editMessageText=2", counts)
+	if counts["sendMessage"] != 1 || counts["editMessageText"] != 0 {
+		t.Errorf("call counts = %v, want sendMessage=1 and nothing else", counts)
 	}
 }
 
@@ -144,24 +137,6 @@ func TestTelegram_Send_Guards(t *testing.T) {
 	}
 }
 
-func TestTelegram_UpdateResolve_InvalidPayload_NoHTTP(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("no HTTP call expected for invalid payload, got %s", r.URL.Path)
-	}))
-	defer server.Close()
-
-	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
-	ctx := context.Background()
-	bad := &model.NotificationDelivery{ID: "del-x", ProviderPayload: `{"not":"valid"}`}
-
-	if _, err := p.Update(ctx, bad, testAlertGroup()); err == nil {
-		t.Error("Update with invalid payload should error")
-	}
-	if err := p.Resolve(ctx, bad, testAlertGroup()); err == nil {
-		t.Error("Resolve with invalid payload should error")
-	}
-}
-
 func TestTelegram_MissingToken_Permanent(t *testing.T) {
 	p := NewProvider(&mockTelegramTokenSource{token: ""}, "", WithBaseURL("http://unused.invalid"))
 	ctx := context.Background()
@@ -173,24 +148,6 @@ func TestTelegram_MissingToken_Permanent(t *testing.T) {
 	// Whether the dispatcher treats that as permanent is the dispatcher's rule
 	// and is asserted there: a channel that classified its own errors for its
 	// caller would be two answers to one question.
-}
-
-func TestTelegram_EditNotModified_IsSuccess(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"ok":          false,
-			"error_code":  400,
-			"description": "Bad Request: message is not modified",
-		})
-	}))
-	defer server.Close()
-
-	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
-	delivery := &model.NotificationDelivery{ID: "d", ProviderPayload: `{"chat_id":"@c","message_id":5}`}
-	if _, err := p.Update(context.Background(), delivery, testAlertGroup()); err != nil {
-		t.Errorf("'message is not modified' should be treated as success, got %v", err)
-	}
 }
 
 func TestTelegram_RenderCard_HTMLEscaping(t *testing.T) {
@@ -252,19 +209,6 @@ func TestTelegram_RenderCard_SafeTruncation(t *testing.T) {
 	}
 }
 
-func TestTelegram_Permalink(t *testing.T) {
-	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL("http://unused.invalid"))
-
-	pub := &model.NotificationDelivery{ProviderPayload: `{"chat_id":"@mychan","message_id":42}`}
-	if got := p.Permalink(pub); got != "https://t.me/mychan/42" {
-		t.Errorf("public permalink = %q", got)
-	}
-	priv := &model.NotificationDelivery{ProviderPayload: `{"chat_id":"-100123","message_id":42}`}
-	if got := p.Permalink(priv); got != "" {
-		t.Errorf("private permalink = %q, want empty", got)
-	}
-}
-
 func TestTelegram_CardHasAckResolveKeyboard(t *testing.T) {
 	var sentBody map[string]interface{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -290,58 +234,6 @@ func TestTelegram_CardHasAckResolveKeyboard(t *testing.T) {
 	b, _ := json.Marshal(sentBody["reply_markup"])
 	if !strings.Contains(string(b), "ack:ag-1") || !strings.Contains(string(b), "res:ag-1") {
 		t.Errorf("keyboard missing ack/res callback_data: %s", b)
-	}
-}
-
-// Switching interactivity off must strip the buttons from a card that was
-// already posted with them. editMessageText leaves the existing keyboard alone
-// when reply_markup is absent, so the update has to carry an explicitly empty
-// inline_keyboard - sending nil would strand live buttons in the chat.
-func TestTelegram_InteractiveOff_UpdateClearsKeyboard(t *testing.T) {
-	var sentBody, editedBody map[string]interface{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
-			_ = json.NewDecoder(r.Body).Decode(&sentBody)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": map[string]interface{}{"message_id": 7}})
-		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
-			_ = json.NewDecoder(r.Body).Decode(&editedBody)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "result": true})
-		default:
-			t.Errorf("unexpected request: %s", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	src := &mockTelegramTokenSource{token: "tok"}
-	p := NewProvider(src, "https://tokay.example", WithBaseURL(server.URL))
-	ctx := context.Background()
-	ag := testAlertGroup()
-
-	payload, err := p.Send(ctx, providers.NotificationRequest{
-		Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}, AlertGroup: ag, Editable: true,
-	})
-	if err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if sentBody["reply_markup"] == nil {
-		t.Fatalf("card was posted without a keyboard, nothing to clear later: %v", sentBody)
-	}
-
-	src.interactiveOff = true
-
-	if _, err := p.Update(ctx, &model.NotificationDelivery{ID: "del-1", ProviderPayload: payload}, ag); err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-
-	markup, ok := editedBody["reply_markup"]
-	if !ok {
-		t.Fatalf("editMessageText omitted reply_markup, so the old buttons survive: %v", editedBody)
-	}
-	b, _ := json.Marshal(markup)
-	if string(b) != `{"inline_keyboard":[]}` {
-		t.Errorf("reply_markup = %s, want an empty inline_keyboard", b)
 	}
 }
 

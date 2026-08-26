@@ -272,34 +272,6 @@ func (t *Provider) sendMessage(ctx context.Context, client *http.Client, token, 
 	return r.MessageID, nil
 }
 
-// editMessageText edits an existing message in place. A 400 "message is not
-// modified" is treated as success (idempotent re-edit to identical content).
-// replyMarkup nil leaves the existing keyboard untouched; a non-nil value
-// (including an empty inline_keyboard) replaces it.
-func (t *Provider) editMessageText(ctx context.Context, client *http.Client, token, chatID string, messageID int, text string, replyMarkup interface{}) error {
-	body := map[string]interface{}{
-		"chat_id":                  chatID,
-		"message_id":               messageID,
-		"text":                     text,
-		"parse_mode":               "HTML",
-		"disable_web_page_preview": true,
-	}
-	if replyMarkup != nil {
-		body["reply_markup"] = replyMarkup
-	}
-	tgr, err := t.callBotAPI(ctx, client, token, "editMessageText", body)
-	if err != nil {
-		return err
-	}
-	if !tgr.OK {
-		if tgr.ErrorCode == 400 && strings.Contains(tgr.Description, "message is not modified") {
-			return nil
-		}
-		return fmt.Errorf("telegram editMessageText failed (code %d): %s", tgr.ErrorCode, tgr.Description)
-	}
-	return nil
-}
-
 // Send dispatches on the target kind: a "user" target is a fire-and-forget DM
 // (returns no payload), a "channel" target posts an editable alert card and
 // returns its Data payload. Behaviour keys on Target.Kind — never on
@@ -362,56 +334,6 @@ func (t *Provider) sendCard(ctx context.Context, chatID string, ag *model.AlertG
 	data := Data{ChatID: chatID, MessageID: messageID}
 	bytes, _ := json.Marshal(data)
 	return string(bytes), nil
-}
-
-func (t *Provider) Update(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) (string, error) {
-	if d == nil || d.ProviderPayload == "" {
-		return "", nil
-	}
-	data, ok := parseData(d.ProviderPayload)
-	if !ok {
-		return "", fmt.Errorf("telegram: invalid provider payload for delivery %s", d.ID)
-	}
-	client, token, err := t.getClient()
-	if err != nil {
-		return "", err
-	}
-	if err := t.editMessageText(ctx, client, token, data.ChatID, data.MessageID, t.renderCard(ag, false), t.keyboardFor(ag, false)); err != nil {
-		return "", err
-	}
-	// Payload is unchanged (no timeline ts to track).
-	return d.ProviderPayload, nil
-}
-
-func (t *Provider) Resolve(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) error {
-	if d == nil || d.ProviderPayload == "" {
-		return nil
-	}
-	data, ok := parseData(d.ProviderPayload)
-	if !ok {
-		return fmt.Errorf("telegram: invalid provider payload for delivery %s", d.ID)
-	}
-	client, token, err := t.getClient()
-	if err != nil {
-		return err
-	}
-	return t.editMessageText(ctx, client, token, data.ChatID, data.MessageID, t.renderCard(ag, true), t.keyboardFor(ag, true))
-}
-
-// Permalink returns a t.me link only for public targets (a chat addressed by
-// @username). Private chats/groups have no public permalink → "".
-func (t *Provider) Permalink(d *model.NotificationDelivery) string {
-	if d == nil {
-		return ""
-	}
-	data, ok := parseData(d.ProviderPayload)
-	if !ok {
-		return ""
-	}
-	if strings.HasPrefix(data.ChatID, "@") {
-		return fmt.Sprintf("https://t.me/%s/%d", strings.TrimPrefix(data.ChatID, "@"), data.MessageID)
-	}
-	return ""
 }
 
 // keyboardFor returns the inline keyboard for a card.

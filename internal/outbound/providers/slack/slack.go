@@ -14,7 +14,6 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
-	"github.com/tokayops/tokayops/internal/slackcard"
 )
 
 // ErrUserNotFound means the email has no matching Slack account.
@@ -108,17 +107,6 @@ func NewProvider(tokenSource TokenSource, selfURL string, teamLookup providers.T
 		selfURL:     selfURL,
 		teamLookup:  teamLookup,
 	}
-}
-
-// RenderCard returns the full card payload for Slack message
-// rendering/replacement.
-//
-// This is the path that still starts from a live row: it freezes the group into
-// a snapshot here and then renders from that, so the card is drawn by exactly
-// the same pure function the outbound handlers use. What differs is only where
-// the inputs came from.
-func (s *Provider) RenderCard(ag *model.AlertGroup, isResolved bool) slackcard.Card {
-	return Render(s.freeze(ag, isResolved), s.interactive())
 }
 
 // freeze takes the snapshot the renderers work from, reading the configuration,
@@ -334,79 +322,6 @@ func (s *Provider) sendCard(ctx context.Context, targetID string, ag *model.Aler
 	}
 	bytes, _ := json.Marshal(data)
 	return string(bytes), nil
-}
-
-func (s *Provider) Update(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) (string, error) {
-	if d == nil || d.ProviderPayload == "" {
-		return "", nil
-	}
-
-	client, err := s.getClient()
-	if err != nil {
-		return "", err
-	}
-
-	data, ok := parseData(d.ProviderPayload)
-	if !ok {
-		return "", fmt.Errorf("slack: invalid provider payload for delivery %s", d.ID)
-	}
-
-	// 1. Update Main Message
-	state := s.freeze(ag, false)
-	card := Render(state, s.interactive())
-	_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, data.Timestamp,
-		slackapi.MsgOptionText(card.Text, false),
-		slackapi.MsgOptionBlocks(card.Blocks...),
-		slackapi.MsgOptionAttachments(card.Attachment),
-	)
-	if err != nil {
-		return "", err
-	}
-
-	bytes, _ := json.Marshal(data)
-	return string(bytes), nil
-}
-
-func (s *Provider) Resolve(ctx context.Context, d *model.NotificationDelivery, ag *model.AlertGroup) error {
-	if d == nil || d.ProviderPayload == "" {
-		return nil
-	}
-
-	client, err := s.getClient()
-	if err != nil {
-		return err
-	}
-
-	data, ok := parseData(d.ProviderPayload)
-	if !ok {
-		return fmt.Errorf("slack: invalid provider payload for delivery %s", d.ID)
-	}
-
-	state := s.freeze(ag, true)
-	card := Render(state, s.interactive())
-
-	_, _, _, err = client.UpdateMessageContext(ctx, data.ChannelID, data.Timestamp,
-		slackapi.MsgOptionText(card.Text, false),
-		slackapi.MsgOptionBlocks(card.Blocks...),
-		slackapi.MsgOptionAttachments(card.Attachment),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update main message: %w", err)
-	}
-	return nil
-}
-
-// Permalink returns the stored permalink for a delivery, if any. It lets the
-// executor build "Open in Slack" links without parsing the provider payload.
-func (s *Provider) Permalink(d *model.NotificationDelivery) string {
-	if d == nil {
-		return ""
-	}
-	data, ok := parseData(d.ProviderPayload)
-	if !ok {
-		return ""
-	}
-	return data.Permalink
 }
 
 // providers.MessageStatus holds the resolved title and color for a Slack message.

@@ -1,90 +1,13 @@
 package slack
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
 	slackapi "github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
 )
-
-// TestRegression_Resolve_ErrorLeak verifies that Provider.Resolve()
-// returns nil even when the timeline update fails.
-// Bug: return err on the last line leaked the timeline update error,
-// causing the resolution job step to fail permanently.
-func TestRegression_Resolve_ErrorLeak(t *testing.T) {
-	// Mock Slack API: postMessage succeeds, but chat.update fails
-	updateCalls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		if r.URL.Path == "/chat.postMessage" {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":      true,
-				"channel": "C123",
-				"ts":      "100.200",
-			})
-			return
-		}
-		if r.URL.Path == "/chat.update" {
-			updateCalls++
-			// First update (main message) succeeds
-			if updateCalls == 1 {
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"ok":      true,
-					"channel": "C123",
-					"ts":      "100.200",
-				})
-				return
-			}
-			// Second update (timeline) fails with msg_too_long
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":    false,
-				"error": "msg_too_long",
-			})
-			return
-		}
-
-		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
-	}))
-	defer server.Close()
-
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	ctx := context.Background()
-
-	data := Data{
-		ChannelID: "C123",
-		Timestamp: "100.200",
-	}
-	dataBytes, _ := json.Marshal(data)
-
-	ag := &model.AlertGroup{
-		ID:       "ag-resolve-err",
-		Title:    "Test Resolve Error",
-		Severity: "critical",
-		Status:   model.AlertGroupStatusResolved,
-		Alerts: []model.Alert{
-			{Labels: map[string]string{"alertname": "A1"}, Status: model.AlertStatusResolved},
-		},
-		TimelineEvents: []*model.TimelineEvent{
-			{Type: model.TimelineEventCreated, Message: "created"},
-		},
-	}
-	delivery := &model.NotificationDelivery{ID: "del-1", ProviderPayload: string(dataBytes)}
-
-	err := provider.Resolve(ctx, delivery, ag)
-
-	// EXPECTED: nil (timeline error is non-critical, logged but not returned)
-	// BUG (unfixed): returns "msg_too_long" error → step fails permanently
-	if err != nil {
-		t.Errorf("Resolve() should return nil even when timeline update fails, got: %v", err)
-	}
-}
 
 // alertsBlockText extracts the markdown text from the severity+alerts section
 // inside the body attachment returned by renderBodyAttachment. The layout is:

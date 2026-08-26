@@ -36,21 +36,6 @@ func TestSlackSend_EmptyTimestamp_Errors(t *testing.T) {
 	}
 }
 
-// P2.3: Update/Resolve reject a non-empty but invalid payload (missing coordinates)
-// before making any Slack call.
-func TestSlackUpdateResolve_InvalidPayload_Errors(t *testing.T) {
-	provider := newSlackProviderForTest("test-token", "http://invalid.local/", "")
-	ag := &model.AlertGroup{ID: "ag", Title: "T", Severity: "critical"}
-	bad := &model.NotificationDelivery{ID: "d1", ProviderPayload: `{"permalink":"x"}`}
-
-	if _, err := provider.Update(context.Background(), bad, ag); err == nil {
-		t.Error("Update should reject an invalid provider payload")
-	}
-	if err := provider.Resolve(context.Background(), bad, ag); err == nil {
-		t.Error("Resolve should reject an invalid provider payload")
-	}
-}
-
 // P3: Send validates the target shape and rejects unknown kinds instead of silently
 // posting a channel card.
 func TestSlackSend_KindValidation(t *testing.T) {
