@@ -22,16 +22,6 @@ type StoreInterface interface {
 	// consistent view of the database.
 	GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, error)
 	GetProcessingAlertGroups() ([]*model.AlertGroup, error)
-	GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error)
-	GetResolvedAlertGroups() ([]*model.AlertGroup, error)
-	MarkAckProcessed(agID string) error
-	// The two halves of one gate, and they are not symmetrical. It is raised by
-	// the write that changes the group - in the same statement, so no crash can
-	// separate the alert from the fact that the message is stale - and lowered
-	// for one version, which is how a producer avoids clearing away a change
-	// that arrived while it worked.
-	ClearSlackUpdate(id string, observedVersion int64) (bool, error)
-	GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error)
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
 	GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset int) ([]*model.AlertGroup, int, error)
 	GetAlertGroupsByTeam(teamID string, limit, offset int) ([]*model.AlertGroup, int, error)
@@ -50,9 +40,6 @@ type StoreInterface interface {
 
 	// Atomic resolve with alerts update (ingester auto-resolve: alerts + status + timeline + outbox in one transaction)
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string, incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
-
-	// Conditional status transition (CAS semantics)
-	TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error)
 
 	// Notification Deliveries
 	UpsertNotificationDelivery(d *model.NotificationDelivery) error

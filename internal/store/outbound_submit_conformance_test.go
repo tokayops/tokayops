@@ -26,7 +26,8 @@ type admitting interface {
 	// differently - one writes deleted_at, the other keeps a set - so the
 	// scenario asks the store rather than the database.
 	eraseUser(t *testing.T, userID string)
-	TransitionAlertGroupStatus(id string, from, to model.AlertGroupStatus) (bool, error)
+	AckAlertGroupAtomic(id, actor string, meta map[string]string,
+		outboxEvent *model.OutboxEvent) (bool, error)
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
 		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
 	SubmitEscalationBatch(ctx context.Context,
@@ -186,12 +187,11 @@ func submitTo(t *testing.T, s admitting, adm outbound.EscalationAdmission) outbo
 
 func acknowledge(t *testing.T, s admitting, agID string) {
 	t.Helper()
-	moved, err := s.TransitionAlertGroupStatus(agID,
-		model.AlertGroupStatusProcessing, model.AlertGroupStatusAcknowledged)
+	changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
 	if err != nil {
 		t.Fatalf("acknowledge the group: %v", err)
 	}
-	if !moved {
+	if !changed {
 		t.Fatal("the group did not move to acknowledged")
 	}
 }

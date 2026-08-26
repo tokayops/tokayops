@@ -50,7 +50,6 @@ type escalationStore interface {
 	// the database. A group read here, a history read there and a version read
 	// somewhere else could already describe three different alerts.
 	GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, error)
-	TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error)
 	GetTeamByID(id string) (*model.Team, error)
 	GetUsersByIDs(ids []string) ([]*model.User, error)
 

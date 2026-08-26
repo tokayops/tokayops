@@ -167,7 +167,11 @@ func TestHandleWebhook(t *testing.T) {
 		}
 
 		// Verify Resolution in Store
-		resolved, _ := s.GetResolvedAlertGroups()
+		resolvedStatus := model.AlertGroupStatusResolved
+		resolved, _, err := s.GetAllAlertGroups(&resolvedStatus, 100, 0)
+		if err != nil {
+			t.Fatalf("read the resolved groups: %v", err)
+		}
 		found := false
 		for _, r := range resolved {
 			if r.AlertKey == "g1" {
@@ -176,7 +180,7 @@ func TestHandleWebhook(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Error("Alert group 'g1' not found in Resolved list")
+			t.Error("Alert group 'g1' is not resolved")
 		}
 	})
 }

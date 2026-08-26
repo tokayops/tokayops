@@ -92,10 +92,9 @@ func TestWhatMovesTheRenderSourceVersion(t *testing.T) {
 		{
 			name: "the group changes status", moves: true,
 			do: func(t *testing.T, agID string) {
-				moved, err := s.TransitionAlertGroupStatus(agID,
-					model.AlertGroupStatusProcessing, model.AlertGroupStatusTriggered)
-				if err != nil || !moved {
-					t.Fatalf("transition: moved=%v err=%v", moved, err)
+				changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+				if err != nil || !changed {
+					t.Fatalf("acknowledge: changed=%v err=%v", changed, err)
 				}
 			},
 		},

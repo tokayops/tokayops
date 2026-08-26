@@ -733,20 +733,3 @@ func TestRegression_CompleteStep_UnlockFailure(t *testing.T) {
 		t.Errorf("Expected job status Failed after FinishStepAndAdvance retries exhausted, got %s", updatedJob.Status)
 	}
 }
-
-// closeFailingStore lets the resolution job be created and then loses the write
-// that closes the group - the one interleaving in which the producer sees a
-// group it has already built a job for.
-type closeFailingStore struct {
-	store.StoreInterface
-	failClose bool
-}
-
-func (c *closeFailingStore) TransitionAlertGroupStatus(id string,
-	fromStatus, toStatus model.AlertGroupStatus) (bool, error) {
-	if c.failClose && toStatus == model.AlertGroupStatusClosed {
-		c.failClose = false
-		return false, errors.New("closing the group failed")
-	}
-	return c.StoreInterface.TransitionAlertGroupStatus(id, fromStatus, toStatus)
-}

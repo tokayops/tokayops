@@ -419,38 +419,6 @@ func (m *MockStore) GetProcessingAlertGroups() ([]*model.AlertGroup, error) {
 	return alertGroups, nil
 }
 
-func (m *MockStore) GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	// Only return acknowledged alert groups that haven't been processed yet
-	var alertGroups []*model.AlertGroup
-	for _, ag := range m.alertGroups {
-		if ag.Status == model.AlertGroupStatusAcknowledged && ag.AckProcessedAt == nil {
-			alertGroups = append(alertGroups, m.copyAlertGroup(ag))
-		}
-	}
-
-	for _, ag := range alertGroups {
-		events, _ := m.GetTimelineEvents(ag.ID)
-		ag.TimelineEvents = events
-	}
-	return alertGroups, nil
-}
-
-func (m *MockStore) GetResolvedAlertGroups() ([]*model.AlertGroup, error) {
-	alertGroups, err := m.getAlertGroupsByStatus(model.AlertGroupStatusResolved)
-	if err != nil {
-		return nil, err
-	}
-	// Populate timeline
-	for _, ag := range alertGroups {
-		events, _ := m.GetTimelineEvents(ag.ID)
-		ag.TimelineEvents = events
-	}
-	return alertGroups, nil
-}
-
 func (m *MockStore) getAlertGroupsByStatus(status model.AlertGroupStatus) ([]*model.AlertGroup, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -822,76 +790,6 @@ func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]st
 	m.insertOutboxEvent(outboxEvent)
 
 	return true, nil
-}
-
-func (m *MockStore) TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ag, ok := m.alertGroups[id]
-	if !ok {
-		return false, nil
-	}
-	if ag.Status != fromStatus {
-		return false, nil
-	}
-
-	ag.Status = toStatus
-	ag.UpdatedAt = time.Now()
-	ag.RenderSourceVersion++
-	return true, nil
-}
-
-func (m *MockStore) MarkAckProcessed(agID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if ag, ok := m.alertGroups[agID]; ok {
-		now := time.Now()
-		ag.AckProcessedAt = &now
-		ag.UpdatedAt = now
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
-// ClearSlackUpdate mirrors the store's conditional clear, including the answer
-// it gives when a newer raise has overtaken the caller.
-func (m *MockStore) ClearSlackUpdate(id string, observedVersion int64) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ag, ok := m.alertGroups[id]
-	if !ok {
-		// The store answers the same way: nothing was lowered, and saying so is
-		// not an error either implementation reports.
-		return false, nil
-	}
-	if ag.RenderSourceVersion != observedVersion {
-		return false, nil
-	}
-	ag.SlackUpdatePending = false
-	ag.UpdatedAt = time.Now()
-	return true, nil
-}
-
-func (m *MockStore) GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var alertGroups []*model.AlertGroup
-	for _, ag := range m.alertGroups {
-		if ag.SlackUpdatePending &&
-			(ag.Status == model.AlertGroupStatusProcessing ||
-				ag.Status == model.AlertGroupStatusAcknowledged ||
-				ag.Status == model.AlertGroupStatusTriggered) &&
-			// An admitted group's card belongs to the outbound domain, and this
-			// loop has no delivery of its own to update - see the store.
-			!m.admittedLocked(ag.ID) {
-			alertGroups = append(alertGroups, m.copyAlertGroup(ag))
-		}
-	}
-	return alertGroups, nil
 }
 
 // ========================================
