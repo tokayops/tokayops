@@ -148,9 +148,13 @@ type Classification struct {
 // Call is everything a handler needs to make one call, and deliberately not the
 // commitment it belongs to.
 //
-// The state to render is the snapshot the admission froze, never the live alert
-// group: a retry has to send what was accepted, and two instances have to send
-// the same thing.
+// The state to render is a stored snapshot, never the live alert group: two
+// instances have to send the same thing, and a retry has to send what its
+// commitment is for. WHICH stored snapshot depends on what the commitment is. A
+// one-shot message renders the state its admission froze, so every attempt of
+// it carries the bytes that were accepted. A card renders the state the alert
+// is in now, because bringing it up to date is the whole reason it can be
+// changed at all.
 type Call struct {
 	IntentID  string
 	AttemptID string
@@ -403,17 +407,14 @@ func Conclude(h Handler, call Call, res Result, err error) (Conclusion, Breach) 
 		ref = receipt.Ref()
 	}
 
-	// A mutation never writes coordinates back onto the commitment: they are
-	// what it was aimed at, not something it produced. What the provider
-	// returned is kept on the attempt, where the journal can show it.
-	stored := receipt
-	if call.AttemptKind == AttemptMutation {
-		stored = Receipt{}
-	}
-
+	// What the provider returned is kept whole, including when it is the
+	// evidence of a channel answering about the wrong message. Where it must
+	// NOT go is onto the commitment: a change did not produce those
+	// coordinates, it was aimed at them. Keeping the two apart is the store's
+	// job, and it has the attempt kind to do it with.
 	concluded, buildErr := NewConclusion(ConclusionInput{
 		Outcome: outcome, Class: class, Status: res.Status,
-		Receipt: stored, ReceiptRef: ref, Detail: detail,
+		Receipt: receipt, ReceiptRef: ref, Detail: detail,
 		Summary: Summarise(res.Summary, err),
 	})
 	if buildErr != nil {

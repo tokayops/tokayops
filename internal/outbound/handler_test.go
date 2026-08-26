@@ -376,10 +376,177 @@ func TestASummaryIsTruncatedWhereverItComesFrom(t *testing.T) {
 // out there yet.
 func createCall() Call { return Call{AttemptKind: AttemptCreate, Operation: OperationSend} }
 
-// mutationCall is a change to a message that exists, named by its coordinates.
+// mutationCall is a change to a message that exists, named by the channel that
+// made it.
 func mutationCall(ref string) Call {
 	return Call{
 		AttemptKind: AttemptMutation, Operation: OperationUpdate,
-		Receipt: []byte(`{"channel_id":"` + ref + `","timestamp":"100.200"}`),
+		Receipt:    []byte(`{"channel_id":"C0001","timestamp":"100.200"}`),
+		ReceiptRef: ref,
 	}
+}
+
+// TestWhatAnAcceptanceHasToProveDependsOnWhatWasAsked is the four cases of the
+// receipt contract, in one place.
+//
+// Making a message and changing one are different claims. A create that will
+// not say what it made leaves a commitment that looks unsent, and the next
+// revision makes a second message beside the one that exists. A change has
+// nothing to name - the object was named before the call - and half the
+// providers say nothing at all when there was nothing to alter.
+func TestWhatAnAcceptanceHasToProveDependsOnWhatWasAsked(t *testing.T) {
+	accepting := &wilfulHandler{outcome: OutcomeAccepted, known: true}
+	made := mustReceipt("C0001/100.200", `{"channel_id":"C0001","timestamp":"100.200"}`)
+	elsewhere := mustReceipt("C0002/999.999", `{"channel_id":"C0002","timestamp":"999.999"}`)
+
+	cases := []struct {
+		name    string
+		call    Call
+		got     Receipt
+		outcome Outcome
+		breach  Breach
+		ref     string
+		stored  bool
+	}{
+		{
+			name: "a create that names what it made", call: createCall(),
+			got: made, outcome: OutcomeAccepted, breach: BreachNone,
+			ref: "C0001/100.200", stored: true,
+		},
+		{
+			name: "a create that will not say", call: createCall(),
+			outcome: OutcomeAmbiguous, breach: BreachAcceptanceWithoutReceipt,
+		},
+		{
+			name: "a change accepted with nothing to say",
+			call: mutationCall("C0001/100.200"),
+			// Telegram answers exactly this to a change that would leave the
+			// message as it is, and what it means is that the revision is
+			// applied.
+			outcome: OutcomeAccepted, breach: BreachNone, ref: "C0001/100.200",
+		},
+		{
+			name: "a change that repeats the coordinates back",
+			call: mutationCall("C0001/100.200"), got: made,
+			outcome: OutcomeAccepted, breach: BreachNone,
+			ref: "C0001/100.200", stored: true,
+		},
+		{
+			name: "a change that answers about another message",
+			call: mutationCall("C0001/100.200"), got: elsewhere,
+			// Following it would move this card to somebody else's message.
+			// The evidence is kept, and the fingerprint names what came back so
+			// that two different wrong answers are two different results.
+			outcome: OutcomeAmbiguous, breach: BreachMutationRetargeted,
+			ref: "C0002/999.999", stored: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			concluded, breach := Conclude(accepting, tc.call,
+				Result{Evidence: ProviderResponse, Status: "ok", Receipt: tc.got}, nil)
+
+			if concluded.Outcome() != tc.outcome {
+				t.Errorf("concluded %q, want %q", concluded.Outcome(), tc.outcome)
+			}
+			if breach != tc.breach {
+				t.Errorf("breach %q, want %q", breach, tc.breach)
+			}
+			ref := concluded.Completion().ReceiptRefOrEmpty()
+			if ref != tc.ref {
+				t.Errorf("the conclusion names %q, want %q", ref, tc.ref)
+			}
+			if stored := len(concluded.Receipt()) > 0; stored != tc.stored {
+				t.Errorf("the answer was %skept", map[bool]string{true: "", false: "not "}[stored])
+			}
+		})
+	}
+}
+
+// TestOnlyAChangeMayProveAMessageIsGone is the whole outcome x detail x kind
+// space, and almost all of it is refused.
+//
+// The word belongs to reconciliation, which this build never performs. The one
+// thing an ordinary answer can prove is that the object is not there, and it is
+// the only ground on which an operator may create a second message - so a
+// channel able to state it about anything else could licence a duplicate.
+func TestOnlyAChangeMayProveAMessageIsGone(t *testing.T) {
+	details := []*keys.ProviderResultDetail{
+		nil,
+		detailOf(keys.DetailDefinitelyAbsent),
+		detailOf(keys.DetailAcceptanceProven),
+		detailOf(keys.DetailDeliveryProven),
+		detailOf(keys.DetailInconclusive),
+	}
+	outcomes := []Outcome{
+		OutcomeAccepted, OutcomeRetryableRejection,
+		OutcomePermanentRejection, OutcomeAmbiguous,
+	}
+	kinds := []AttemptKind{AttemptCreate, AttemptMutation}
+
+	for _, kind := range kinds {
+		for _, outcome := range outcomes {
+			for _, detail := range details {
+				name := string(kind) + "/" + string(outcome) + "/" + detailName(detail)
+				t.Run(name, func(t *testing.T) {
+					call := createCall()
+					if kind == AttemptMutation {
+						call = mutationCall("C0001/100.200")
+					}
+					handler := &wilfulHandler{outcome: outcome, known: true, detail: detail}
+
+					// An acceptance needs something to name, and that is a
+					// different rule; give it one so this test is only about
+					// the detail.
+					got := mustReceipt("C0001/100.200", `{"channel_id":"C0001","timestamp":"100.200"}`)
+					concluded, breach := Conclude(handler, call,
+						Result{Evidence: ProviderResponse, Status: "s", Receipt: got}, nil)
+
+					allowed := detail == nil ||
+						(*detail == keys.DetailDefinitelyAbsent &&
+							kind == AttemptMutation &&
+							outcome == OutcomePermanentRejection)
+
+					if allowed {
+						if breach != BreachNone {
+							t.Fatalf("a legal pair was refused: %q", breach)
+						}
+						if got := concluded.Completion().ProviderResultDetail; !sameDetail(got, detail) {
+							t.Fatalf("the conclusion carries %v, want %v", got, detail)
+						}
+						return
+					}
+
+					if breach != BreachDetailNotAllowed {
+						t.Fatalf("the pair was accepted with breach %q", breach)
+					}
+					if concluded.Outcome() != OutcomeAmbiguous {
+						t.Fatalf("a refused pair concluded %q", concluded.Outcome())
+					}
+					// And nothing false is written down: the detail is the one
+					// durable ground for making a second message.
+					if concluded.Completion().ProviderResultDetail != nil {
+						t.Fatal("a detail nobody may state was recorded anyway")
+					}
+				})
+			}
+		}
+	}
+}
+
+func detailOf(d keys.ProviderResultDetail) *keys.ProviderResultDetail { return &d }
+
+func detailName(d *keys.ProviderResultDetail) string {
+	if d == nil {
+		return "none"
+	}
+	return string(*d)
+}
+
+func sameDetail(got, want *keys.ProviderResultDetail) bool {
+	if got == nil || want == nil {
+		return got == want
+	}
+	return *got == *want
 }

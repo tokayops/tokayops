@@ -1143,7 +1143,12 @@ func TestARowCannotBeInTwoReceiptStates(t *testing.T) {
 				if err == nil {
 					t.Fatal("the database accepted a row in no receipt state at all")
 				}
-				if !strings.Contains(err.Error(), outboundReceiptStateConstraint) {
+				// Either rule may be the one that fires, and both are about
+				// the same three states: a commitment also carries the name
+				// of the object beside its coordinates, so a row with
+				// coordinates and no name is refused there first.
+				if !strings.Contains(err.Error(), outboundReceiptStateConstraint) &&
+					!strings.Contains(err.Error(), outboundReceiptNameConstraint) {
 					t.Fatalf("refused by something else: %v", err)
 				}
 			})

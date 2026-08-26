@@ -80,6 +80,19 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 			"Slack is not configured on this installation")
 	}
 
+	// A change is aimed at a message this commitment already made, and the
+	// coordinates of it are read HERE for the same reason the payload is. Read
+	// inside the call instead, coordinates nobody can parse become an attempt
+	// that never touched the network, retried on the family's backoff - and a
+	// card has no deadline, so that is forever. Refused here it is what it is:
+	// a deterministic refusal, recorded, in front of somebody who can act.
+	if intent.HasReceipt {
+		if _, ok := parseData(string(intent.Receipt)); !ok {
+			return outbound.Impossible("receipt_unreadable",
+				"the coordinates of the message to change cannot be read")
+		}
+	}
+
 	switch intent.TargetKind {
 	case keys.TargetChannel:
 		return outbound.Ready(intent.TargetRef)
@@ -125,7 +138,9 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 // thread. The permalink has no reader in this build - a direct message links to
 // the alert in TokayOps, not to a card - and the timeline post is not
 // enrichment at all: it is a SECOND message, which is a second external effect
-// and belongs to a commitment of its own. Sprint 2 adds it as one.
+// and would need a commitment of its own. Nothing here adds one, and the
+// history left the render snapshot with it; bringing either back is a decision
+// somebody makes on purpose, not a line added to this function.
 func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbound.Result, error) {
 	payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
 	if err != nil {

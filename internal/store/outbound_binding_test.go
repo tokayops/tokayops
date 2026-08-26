@@ -11,6 +11,8 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
+	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
 )
 
 // What a delivery is allowed to trust. The worker resolves an address, names a
@@ -976,6 +978,138 @@ func corruptAdmittedState(t *testing.T, s *Store, intentID string) {
 		t.Fatalf("corrupt the admitted state: %v", err)
 	}
 }
+
+// TestCoordinatesNobodyCanReadEndTheCommitment. A card whose stored
+// coordinates are damaged cannot be changed, and no amount of retrying repairs
+// a row.
+//
+// The refusal has to happen in preparation, before an attempt exists. Made
+// inside the call it would be a network attempt that never touched the network:
+// recorded as doubtful, retried on the family's backoff - and a card has no
+// deadline, so that is forever, silently, while the alert it belongs to shows
+// something out of date.
+func TestCoordinatesNobodyCanReadEndTheCommitment(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	for _, tc := range []struct {
+		name     string
+		provider string
+		prepare  outbound.Preparer
+	}{
+		{
+			name: "slack", provider: "slack",
+			prepare: slackprovider.NewHandler(staticSlackToken{}, nil),
+		},
+		{
+			name: "telegram", provider: "telegram",
+			prepare: telegramprovider.NewHandler(staticTelegramToken{}, nil),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agID := desiredGroup(t, s, "Disk filling up")
+			commitment := channelCommitment("C0001", 0)
+			commitment.Provider = tc.provider
+			intentID := admitOne(t, s, agID, commitment)[0]
+
+			if _, err := s.db.Exec(`
+				UPDATE outbound_intents
+				SET receipt = $2::jsonb, receipt_ref = $3, receipt_recorded = TRUE
+				WHERE id = $1`, intentID, `{"nothing":"nobody can use"}`,
+				"C0001/100.200"); err != nil {
+				t.Fatalf("damage the coordinates: %v", err)
+			}
+
+			intent, err := s.GetIntent(context.Background(), intentID)
+			if err != nil {
+				t.Fatalf("read the commitment: %v", err)
+			}
+
+			// The channel refuses before anything is opened, and says why.
+			preparation := tc.prepare.Prepare(context.Background(), *intent)
+			if preparation.Outcome() != outbound.PreparationPermanent {
+				t.Fatalf("the channel answered %q", preparation.Outcome())
+			}
+
+			// And what the store makes of that: proof that no call happened,
+			// and a commitment that stops where a person can see it. The
+			// request is built by the preparation itself, so a test cannot
+			// assemble one production could not.
+			token := claimOneFrom(t, s, tc.provider, intentID)
+			request := preparation.Request(intentID, token, "worker-1")
+			if request.ErrorClass != "receipt_unreadable" {
+				t.Fatalf("refused as %q", request.ErrorClass)
+			}
+			result, err := s.BeginAttempt(context.Background(), request)
+			if err != nil {
+				t.Fatalf("record the refusal: %v", err)
+			}
+			if result.Outcome != outbound.BeginPreparedPermanent {
+				t.Fatalf("the refusal was recorded as %q", result.Outcome)
+			}
+			if got := statusOf(t, s, intentID); got != outbound.StatusPermanentFailed {
+				t.Fatalf("the commitment is %s", got)
+			}
+
+			var kind, reason string
+			if err := s.db.QueryRow(`
+				SELECT record_kind, COALESCE(finish_reason, '') FROM outbound_attempts
+				WHERE intent_id = $1 ORDER BY attempt_no DESC LIMIT 1`, intentID).
+				Scan(&kind, &reason); err != nil {
+				t.Fatalf("read the journal: %v", err)
+			}
+			if kind != string(outbound.RecordPreparation) || reason != "preparation" {
+				t.Fatalf("the journal recorded a %s/%s", kind, reason)
+			}
+
+			// It is not handed out again: a row nobody can read is not work.
+			leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+				Family: testFamily, Provider: tc.provider, Phase: outbound.ClaimRetriesFirst,
+				Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+			})
+			if err != nil {
+				t.Fatalf("claim: %v", err)
+			}
+			for _, l := range leased {
+				if l.Intent.ID == intentID {
+					t.Fatal("the ended commitment was claimed again")
+				}
+			}
+		})
+	}
+}
+
+// claimOneFrom is claimOne for a provider other than the usual one: the queue
+// is partitioned by provider, so a Telegram commitment is not in Slack's.
+func claimOneFrom(t *testing.T, s *Store, provider, intentID string) string {
+	t.Helper()
+	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: testFamily, Provider: provider, Phase: outbound.ClaimRetriesFirst,
+		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	for _, l := range leased {
+		if l.Intent.ID == intentID {
+			return l.LeaseToken
+		}
+	}
+	t.Fatalf("the claim did not include %s (%d came back)", intentID, len(leased))
+	return ""
+}
+
+// staticSlackToken and staticTelegramToken are configured installations: the
+// test is about the coordinates, not about whether a token exists.
+type staticSlackToken struct{}
+
+func (staticSlackToken) GetSlackToken() string     { return "xoxb-test" }
+func (staticSlackToken) GetSlackInteractive() bool { return true }
+
+type staticTelegramToken struct{}
+
+func (staticTelegramToken) GetTelegramToken() string     { return "test-token" }
+func (staticTelegramToken) GetTelegramInteractive() bool { return true }
 
 // TestARetryIntoUnreadableStateStillEnds is the same rule reached the other
 // way: a person deciding to retry does not have to know whether the state can

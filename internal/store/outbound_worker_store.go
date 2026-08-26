@@ -1029,6 +1029,23 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	if err != nil {
 		return outbound.FinalizeResult{}, err
 	}
+	// And what the answer claims about the object is checked against what the
+	// attempt was, from the row rather than from the caller. The domain refuses
+	// the impossible pairs already, but this is the guard that matters: proof
+	// that a message is gone is the one thing that lets an operator create a
+	// second one, and it may only come from a change to a message that existed.
+	// A create that recorded it would licence a duplicate of something it had
+	// just made.
+	if detail := concluded.ProviderResultDetail; detail != nil {
+		if *detail != keys.DetailDefinitelyAbsent ||
+			kind != outbound.AttemptMutation ||
+			concluded.Outcome != keys.OutcomePermanentRejection {
+			return outbound.FinalizeResult{}, outboundContractf(
+				"attempt %s was a %s that ended %s, and states %q about the message",
+				req.AttemptID, kind, concluded.Outcome, *detail)
+		}
+	}
+
 	if kind == outbound.AttemptCreate && (concluded.ReceiptRef != nil) != (len(receipt) > 0) {
 		return outbound.FinalizeResult{}, outboundContractf(
 			"the result of attempt %s names an object it did not record, or records "+
@@ -1167,14 +1184,23 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		return outbound.FinalizeResult{}, fmt.Errorf("close the attempt: %w", err)
 	}
 
+	// The attempt keeps what the provider said; the commitment keeps what it is
+	// aimed at. A change never writes coordinates back: it did not make that
+	// message, and a provider repeating them - or, when it is wrong, somebody
+	// else's - must not be able to move the card.
+	settledReceipt, settledRef := receipt, completion.ReceiptRefOrEmpty()
+	if kind == outbound.AttemptMutation {
+		settledReceipt, settledRef = nil, ""
+	}
+
 	if err := applyTransitionTx(ctx, tx, transitionWrite{
 		Intent:          *intent,
 		Transition:      transition,
 		Backoff:         outbound.Backoff(intent.FailureStreak + 1),
 		AppliedRevision: applied,
 		AttemptIsFinal:  final,
-		Receipt:         receipt,
-		ReceiptRef:      completion.ReceiptRefOrEmpty(),
+		Receipt:         settledReceipt,
+		ReceiptRef:      settledRef,
 		Actor:           "worker",
 	}); err != nil {
 		return outbound.FinalizeResult{}, err

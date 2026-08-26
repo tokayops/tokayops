@@ -534,15 +534,58 @@ BEGIN
 END $$;
 `
 
-// outboundReceiptRefDDL adds the object's name beside its coordinates, for
-// databases created before it was written.
+const outboundReceiptNameConstraint = "outbound_intents_receipt_is_named"
+
+// outboundReceiptRefDDL adds the object's name beside its coordinates, and
+// insists the two agree.
+//
+// A usable receipt without a name is not a smaller problem than no receipt at
+// all: the first change aimed at it is refused for coordinates that are
+// perfectly good, and the card stops being brought up to date for a reason
+// nobody can see from the row.
+//
+// Nothing can supply the name after the fact - it is the channel's own spelling
+// of what it made, and this build does not know which channel wrote a row it
+// did not write. So a database holding one stops the start and says what to do
+// about it, exactly like the snapshots that predate the protocol. Nothing is
+// deployed from that version anywhere, so a local reset is the honest answer.
 const outboundReceiptRefDDL = `
 DO $$
+DECLARE
+	unnamed INT;
 BEGIN
 	IF NOT EXISTS (SELECT 1 FROM information_schema.columns
 	               WHERE table_name = 'outbound_intents'
 	                 AND column_name = 'receipt_ref') THEN
 		ALTER TABLE outbound_intents ADD COLUMN receipt_ref TEXT;
+
+		SELECT count(*) INTO unnamed
+		FROM outbound_intents
+		WHERE receipt_recorded AND receipt IS NOT NULL;
+
+		IF unnamed > 0 THEN
+			RAISE EXCEPTION 'this database holds % message(s) whose coordinates were '
+				'written before the name beside them existed. Nothing can supply that '
+				'name after the fact - it is the channel''s own spelling of what it '
+				'made - and the first change aimed at one would be refused. Drop the '
+				'outbound_* tables and let this version create them, or start from a '
+				'fresh database.', unnamed;
+		END IF;
+	END IF;
+
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = '` + outboundReceiptNameConstraint + `'
+		  AND conrelid = 'outbound_intents'::regclass
+	) THEN
+		ALTER TABLE outbound_intents
+			ADD CONSTRAINT ` + outboundReceiptNameConstraint + ` CHECK (
+				-- Coordinates and a name arrive together and leave together.
+				-- Erasure takes both and leaves the FACT behind, which is the
+				-- third state and the one with neither.
+				(receipt IS NOT NULL AND receipt_ref IS NOT NULL AND receipt_ref <> '')
+				OR (receipt IS NULL AND receipt_ref IS NULL)
+			);
 	END IF;
 END $$;
 `

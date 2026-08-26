@@ -1831,13 +1831,14 @@ func (s *Store) ClearSlackUpdate(id string, observedVersion int64) (bool, error)
 // GetAlertGroupsPendingSlackUpdate finds the groups whose card is behind the
 // alerts on it.
 //
-// Outbound groups are excluded, and not as an optimisation. This loop updates a
-// card by finding the delivery that produced it in `notification_deliveries`,
-// and the outbound path writes no rows there - so for an admitted group it
-// finds nothing to update, leaves the gate up and comes back with the same
-// answer every two seconds until the group resolves. Sprint 2 gives the card to
-// the outbound domain; until then, an outbound group's card is not this loop's
-// to keep current (S1-D24).
+// It finds nothing, and cannot: the flag it reads is no longer raised by
+// anything. An alert arriving is applied by one command now, which tells the
+// group's own messages that what they show has moved - the card belongs to the
+// delivery domain, and it is brought to each revision by the worker that made
+// it.
+//
+// The filter on admitted groups is what kept this loop off them while both
+// existed. It stays until the loop does.
 func (s *Store) GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error) {
 	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups ag
 	          WHERE slack_update_pending = TRUE AND status IN ($1, $2, $3)

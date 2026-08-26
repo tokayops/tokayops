@@ -212,16 +212,22 @@ func TestSlackAnswersAreTranslatedNotInterpreted(t *testing.T) {
 		want  outbound.Outcome
 		known bool
 	}{
-		"ok":                              {outbound.OutcomeAccepted, true},
-		"ratelimited":                     {outbound.OutcomeRetryableRejection, true},
-		"request_timeout":                 {outbound.OutcomeRetryableRejection, true},
-		"internal_error":                  {outbound.OutcomeAmbiguous, true},
-		"fatal_error":                     {outbound.OutcomeAmbiguous, true},
-		"service_unavailable":             {outbound.OutcomeAmbiguous, true},
-		"http_503":                        {outbound.OutcomeAmbiguous, true},
-		"channel_not_found":               {outbound.OutcomePermanentRejection, true},
-		"token_revoked":                   {outbound.OutcomePermanentRejection, true},
-		"msg_too_long":                    {outbound.OutcomePermanentRejection, true},
+		"ok":                  {outbound.OutcomeAccepted, true},
+		"ratelimited":         {outbound.OutcomeRetryableRejection, true},
+		"request_timeout":     {outbound.OutcomeRetryableRejection, true},
+		"internal_error":      {outbound.OutcomeAmbiguous, true},
+		"fatal_error":         {outbound.OutcomeAmbiguous, true},
+		"service_unavailable": {outbound.OutcomeAmbiguous, true},
+		"http_503":            {outbound.OutcomeAmbiguous, true},
+		"channel_not_found":   {outbound.OutcomePermanentRejection, true},
+		"token_revoked":       {outbound.OutcomePermanentRejection, true},
+		"msg_too_long":        {outbound.OutcomePermanentRejection, true},
+		// The statuses a change gets back. The first is the one an operator's
+		// hands are tied by: it is the only answer that proves the message is
+		// not there any more.
+		"message_not_found":               {outbound.OutcomePermanentRejection, true},
+		"cant_update_message":             {outbound.OutcomePermanentRejection, true},
+		"edit_window_closed":              {outbound.OutcomePermanentRejection, true},
 		"some_code_slack_added_last_week": {"", false},
 		"":                                {"", false},
 	}
@@ -236,6 +242,33 @@ func TestSlackAnswersAreTranslatedNotInterpreted(t *testing.T) {
 		}
 		if known && answer.Outcome != want.want {
 			t.Errorf("status %q classified %q, want %q", status, answer.Outcome, want.want)
+		}
+	}
+}
+
+// TestOnlyAMissingMessageProvesAnythingAboutIt. Two refusals that read alike
+// and mean opposite things: the message is gone, and the message is there but
+// will not change. Only the first may licence a second message.
+func TestOnlyAMissingMessageProvesAnythingAboutIt(t *testing.T) {
+	handler := NewHandler(nil, nil)
+
+	gone, known := handler.ClassifyResponse(outbound.Result{
+		Evidence: outbound.ProviderResponse, Status: "message_not_found",
+	})
+	if !known || gone.Detail == nil || *gone.Detail != keys.DetailDefinitelyAbsent {
+		t.Fatalf("a missing message proved %v", gone.Detail)
+	}
+
+	for _, status := range []string{"cant_update_message", "edit_window_closed"} {
+		stuck, known := handler.ClassifyResponse(outbound.Result{
+			Evidence: outbound.ProviderResponse, Status: status,
+		})
+		if !known {
+			t.Fatalf("%s was not recognised", status)
+		}
+		if stuck.Detail != nil {
+			t.Errorf("%s claimed %v about a message that is still there",
+				status, *stuck.Detail)
 		}
 	}
 }

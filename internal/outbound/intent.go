@@ -228,6 +228,15 @@ type Intent struct {
 	// that read the coordinates instead would decide it never happened.
 	HasReceipt bool
 
+	// Receipt and ReceiptRef are the coordinates of that object and the name
+	// the channel gives it. Both travel with the commitment so a channel can
+	// check, BEFORE anything opens an attempt, that it can still find what it
+	// is being asked to change: coordinates it cannot read are a refusal, and a
+	// refusal discovered after the attempt exists is a retry loop over a row
+	// nobody is going to fix by trying again.
+	Receipt    json.RawMessage
+	ReceiptRef string
+
 	// RecipientErased is the durable prohibition. The person this commitment
 	// was for has been erased, so nothing may put their address back: no
 	// retry, no new generation, no coordinates written by a call that was

@@ -82,6 +82,16 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 			"Telegram is not configured on this installation")
 	}
 
+	// The same rule as the payload above, for the same reason: a change aimed
+	// at coordinates nobody can read is a refusal, not a call to retry. A card
+	// has no deadline, so a retry loop over a broken row never ends.
+	if intent.HasReceipt {
+		if _, ok := messageAt(intent.Receipt); !ok {
+			return outbound.Impossible("receipt_unreadable",
+				"the coordinates of the message to change cannot be read")
+		}
+	}
+
 	switch intent.TargetKind {
 	case keys.TargetChannel:
 		return outbound.Ready(intent.TargetRef)

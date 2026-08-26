@@ -213,6 +213,53 @@ func TestARejectedSendCarriesWhatTelegramSaid(t *testing.T) {
 	}
 }
 
+// TestWhatTelegramSaysAboutAChange. Three answers to an edit, and they mean
+// three different things - one of them is not a failure at all.
+func TestWhatTelegramSaysAboutAChange(t *testing.T) {
+	handler := NewHandler(nil, nil)
+
+	for _, tc := range []struct {
+		name    string
+		status  string
+		outcome outbound.Outcome
+		absent  bool
+	}{
+		{
+			// The outside already shows what we are asking for. That is the
+			// revision applied, not a failure to apply it.
+			name: "nothing to change", status: "400:Bad Request: message is not modified",
+			outcome: outbound.OutcomeAccepted,
+		},
+		{
+			name: "the message is gone", status: "400:Bad Request: message to edit not found",
+			outcome: outbound.OutcomePermanentRejection, absent: true,
+		},
+		{
+			// There and unchangeable: the opposite fact, and stated as none,
+			// because nobody may make a second message without proof of the
+			// first being gone.
+			name: "the message will not change", status: "400:Bad Request: message can't be edited",
+			outcome: outbound.OutcomePermanentRejection,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			answer, known := handler.ClassifyResponse(outbound.Result{
+				Evidence: outbound.ProviderResponse, Status: tc.status,
+			})
+			if !known {
+				t.Fatalf("%q was not recognised", tc.status)
+			}
+			if answer.Outcome != tc.outcome {
+				t.Errorf("classified %q, want %q", answer.Outcome, tc.outcome)
+			}
+			proved := answer.Detail != nil && *answer.Detail == keys.DetailDefinitelyAbsent
+			if proved != tc.absent {
+				t.Errorf("proof that the message is gone: %v, want %v", proved, tc.absent)
+			}
+		})
+	}
+}
+
 // TestPreparationResolvesAPersonEveryAttempt.
 func TestPreparationResolvesAPersonEveryAttempt(t *testing.T) {
 	handler := NewHandler(&mockTelegramTokenSource{token: "tok"},

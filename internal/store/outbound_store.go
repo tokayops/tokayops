@@ -738,7 +738,7 @@ const outboundIntentColumns = `
 	       cancellation_requested,
 	       accepted_duplicate_risk, not_before, next_attempt_at, expires_at,
 	       create_key IS NOT NULL, payload_schema_version,
-	       provider_key_codec_version, payload,
+	       provider_key_codec_version, payload, receipt, receipt_ref,
 	       COALESCE(expires_at <= now(), FALSE)`
 
 // scanIntent turns one row of outboundIntentColumns into a commitment, and is
@@ -751,6 +751,8 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		applied        sql.NullInt64
 		expiresAt      sql.NullTime
 		payload        []byte
+		coordinates    []byte
+		name           sql.NullString
 		deadlinePassed bool
 	)
 	if err := row.Scan(
@@ -762,7 +764,8 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		&intent.CancellationRequested,
 		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt, &expiresAt,
 		&intent.GenerationBound, &intent.PayloadSchemaVersion,
-		&intent.ProviderKeyCodecVersion, &payload, &deadlinePassed); err != nil {
+		&intent.ProviderKeyCodecVersion, &payload, &coordinates, &name,
+		&deadlinePassed); err != nil {
 		return nil, false, err
 	}
 
@@ -778,6 +781,10 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 	if len(payload) > 0 {
 		intent.Payload = json.RawMessage(payload)
 	}
+	if len(coordinates) > 0 {
+		intent.Receipt = json.RawMessage(coordinates)
+	}
+	intent.ReceiptRef = name.String
 	return &intent, deadlinePassed, nil
 }
 
@@ -1301,6 +1308,7 @@ func journalAttemptsTx(ctx context.Context, tx *sql.Tx,
 		       provider, COALESCE(bound_endpoint, ''), COALESCE(provider_key, ''),
 		       applied_revision, started_at, finished_at, COALESCE(outcome, ''),
 		       COALESCE(error_class, ''), COALESCE(provider_status, ''),
+		       COALESCE(provider_result_detail, ''),
 		       receipt, receipt_recorded, receipt_redacted_at,
 		       COALESCE(response_summary, ''), COALESCE(finish_reason, ''),
 		       COALESCE(completion_fingerprint_version, 0)
@@ -1324,6 +1332,7 @@ func journalAttemptsTx(ctx context.Context, tx *sql.Tx,
 			&record.GenerationNo, &record.AttemptKind, &record.Operation, &record.Provider,
 			&record.BoundEndpoint, &record.ProviderKey, &revision, &started, &finished,
 			&record.Outcome, &record.ErrorClass, &record.ProviderStatus,
+			&record.ResultDetail,
 			&receipt, &record.ReceiptRecorded, &redacted,
 			&record.Summary, &record.FinishReason,
 			&record.CompletionFingerprintVersion); err != nil {

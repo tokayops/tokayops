@@ -572,6 +572,13 @@ type AttemptRecord struct {
 	Outcome         Outcome
 	ErrorClass      string
 	ProviderStatus  string
+
+	// ResultDetail is what the answer PROVED about the object, where it proved
+	// anything - which is almost never. It is on the record and on the
+	// observation beside it, because whether a late answer arrived before or
+	// after recovery closed the attempt is a race, and a fact that appeared in
+	// one and not the other would be visible or invisible by luck.
+	ResultDetail string
 	// Receipt, ReceiptRecorded and ReceiptRedactedAt are the three states an
 	// external object can be in, and the journal has to show all three: a
 	// receipt that never existed and one whose coordinates were removed by an
