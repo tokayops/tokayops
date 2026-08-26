@@ -273,6 +273,25 @@ var (
 		Help: "Escalation admissions by outcome. no_targets is an accepted admission that promised nothing.",
 	}, []string{"outcome"})
 
+	// OutboundDesiredRevisionsTotal counts proposals to move what an alert's
+	// messages have to show, by what raised it and what came of it.
+	//
+	// reason is ack | resolve | merge - the transition that raised it. outcome
+	// is applied | unchanged | stale_after_final | no_snapshot, and the two are
+	// different questions: the first says who asked, the second whether a
+	// revision now exists. Only "applied" means work was created.
+	//
+	// "unchanged" is the healthy majority for a busy alert - a payload that
+	// repeats the same alerts changes nothing a message shows - and it is
+	// counted rather than dropped so that a build that stopped noticing real
+	// changes looks different from a quiet one.
+	//
+	// Incremented after the transaction commits, like every other counter here.
+	OutboundDesiredRevisionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_desired_revisions_total",
+		Help: "Proposals to move what an alert group's messages have to show, by reason and outcome. Only applied created work.",
+	}, []string{"reason", "outcome"})
+
 	// OutboundAdmissionLatencySeconds measures the promise: from the commit
 	// that admitted an escalation to the start of the FIRST attempt of a
 	// commitment that was due immediately.
@@ -358,6 +377,7 @@ func init() {
 	prometheus.MustRegister(OutboundIntentsTerminalTotal)
 	prometheus.MustRegister(OutboundContractViolationsTotal)
 	prometheus.MustRegister(OutboundAdmissionsTotal)
+	prometheus.MustRegister(OutboundDesiredRevisionsTotal)
 	prometheus.MustRegister(OutboundAdmissionLatencySeconds)
 	prometheus.MustRegister(StorageContractFailuresTotal)
 }

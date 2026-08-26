@@ -113,6 +113,8 @@ func (s *Store) mergeAlertsTx(ctx context.Context, tx *sql.Tx, group *model.Aler
 		return alertgroup.MergeResult{}, err
 	}
 
+	countDesired(outbound.DesiredMerge, desired.Outcome)
+
 	outcome := alertgroup.MergeMerged
 	if desired.Outcome == outbound.DesiredUnchanged {
 		// The alerts moved in a way no message shows - a resolved alert whose
@@ -185,9 +187,10 @@ func (s *Store) resolveByAlertmanagerTx(ctx context.Context, tx *sql.Tx,
 	if err != nil {
 		return alertgroup.MergeResult{}, err
 	}
-	if _, err := setDesiredStateTx(ctx, tx, s.render, outbound.DesiredStateRequest{
+	desired, err := setDesiredStateTx(ctx, tx, s.render, outbound.DesiredStateRequest{
 		AlertGroupID: group.ID, Reason: outbound.DesiredResolve, Actor: actor,
-	}); err != nil {
+	})
+	if err != nil {
 		return alertgroup.MergeResult{}, err
 	}
 
@@ -195,6 +198,7 @@ func (s *Store) resolveByAlertmanagerTx(ctx context.Context, tx *sql.Tx,
 		return alertgroup.MergeResult{}, err
 	}
 	countWithdrawn(withdrawn)
+	countDesired(outbound.DesiredResolve, desired.Outcome)
 	return alertgroup.MergeResult{
 		Outcome: alertgroup.MergeResolved, AlertGroupID: group.ID,
 	}, nil

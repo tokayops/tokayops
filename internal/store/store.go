@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -1365,10 +1366,11 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	// 5. And what the group still HAS out there is told that the alert moved.
 	// The card is the domain's to keep current; this is where it learns there
 	// is something new to show.
-	if _, err := setDesiredStateTx(context.Background(), tx, s.render,
+	desired, err := setDesiredStateTx(context.Background(), tx, s.render,
 		outbound.DesiredStateRequest{
 			AlertGroupID: id, Reason: outbound.DesiredAck, Actor: actor,
-		}); err != nil {
+		})
+	if err != nil {
 		return false, err
 	}
 
@@ -1376,6 +1378,7 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 		return false, err
 	}
 	countWithdrawn(withdrawn)
+	countDesired(outbound.DesiredAck, desired.Outcome)
 	return true, nil
 }
 
@@ -1452,10 +1455,11 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	// when nothing else about the alert changed: a commitment parked at an
 	// equal revision takes no further attempt, and the resolution would never
 	// reach the card.
-	if _, err := setDesiredStateTx(context.Background(), tx, s.render,
+	desired, err := setDesiredStateTx(context.Background(), tx, s.render,
 		outbound.DesiredStateRequest{
 			AlertGroupID: id, Reason: outbound.DesiredResolve, Actor: actor,
-		}); err != nil {
+		})
+	if err != nil {
 		return false, err
 	}
 
@@ -1463,7 +1467,18 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 		return false, err
 	}
 	countWithdrawn(withdrawn)
+	countDesired(outbound.DesiredResolve, desired.Outcome)
 	return true, nil
+}
+
+// countDesired records what came of a proposal to move what an alert's messages
+// have to show.
+//
+// Called after the transaction commits, like countWithdrawn beside it: a
+// rollback would otherwise report a revision that does not exist.
+func countDesired(reason outbound.DesiredReason, outcome outbound.DesiredOutcome) {
+	metrics.OutboundDesiredRevisionsTotal.
+		WithLabelValues(string(reason), string(outcome)).Inc()
 }
 
 // countWithdrawn records commitments that ended because the alert did.
@@ -3116,7 +3131,123 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 			model.OutboundLateness{Family: outbound.FamilyNotification})
 	}
 
+	if err := s.readCardsBehind(snap); err != nil {
+		return nil, err
+	}
+
 	return snap, nil
+}
+
+// cardStates is every status an editable commitment can be in while its message
+// is behind, and what that status means for somebody reading the gauge.
+//
+// Exhaustive on purpose. A CASE with a default would let a status nobody
+// thought about fall into one of the three buckets silently, and this gauge is
+// the one that says whether a card anybody is looking at is out of date. The
+// two statuses that CANNOT appear here are named too, as "contract": idle means
+// applied equals desired, and an editable commitment that succeeded applied the
+// final revision, after which there are no more.
+const cardStates = `CASE i.status
+	WHEN 'pending'          THEN 'queued'
+	WHEN 'sending'          THEN 'queued'
+	WHEN 'manual_review'    THEN 'stuck'
+	WHEN 'permanent_failed' THEN 'stuck'
+	WHEN 'canceled'         THEN 'abandoned'
+	WHEN 'expired'          THEN 'abandoned'
+	ELSE 'contract'
+END`
+
+// behindSince is when a message stopped matching its alert.
+//
+// It is the earliest revision event the commitment has not applied, and it is
+// read from the journal because nothing else survives to answer the question:
+// the snapshot row is overwritten by the next revision, and the commitment's
+// own updated_at is moved by every claim and attempt.
+//
+// It answers in all four situations. Before the first attempt there is no
+// attempt to ask. When preparation refused - no integration, an unlinked
+// recipient - there will never be one. When a revision supersedes another the
+// older event stays the minimum, so the wait is measured from when the card
+// first fell behind and not from the last thing that happened to it. And once
+// the commitment catches up, the events stop passing the predicate by
+// themselves.
+const behindSince = `(
+	SELECT MIN(e.created_at) FROM outbound_intent_events e
+	WHERE e.intent_id = i.id AND e.kind = 'desired_raised'
+	  AND (e.detail->>'revision')::bigint > COALESCE(i.applied_revision, -1)
+)`
+
+// readCardsBehind counts the messages that are showing something older than the
+// alert they are about, and how long the oldest has been that way.
+//
+// Staleness covers queued and stuck only. An abandoned card is one a person
+// decided not to catch up; counting its age would leave the gauge high forever
+// after a single operator decision, and nothing would ever bring it down.
+func (s *Store) readCardsBehind(snap *model.MetricsSnapshot) error {
+	rows, err := s.db.Query(`
+		SELECT state, count(*),
+		       COALESCE(MAX(EXTRACT(EPOCH FROM (now() - since))), 0)::double precision,
+		       (array_agg(id ORDER BY id))[1]
+		FROM (
+			SELECT i.id, `+cardStates+` AS state, `+behindSince+` AS since
+			FROM outbound_intents i
+			WHERE i.form = $1 AND i.receipt_recorded
+			  AND i.desired_revision > COALESCE(i.applied_revision, -1)
+		) behind
+		GROUP BY state`, string(outbound.FormEditable))
+	if err != nil {
+		return fmt.Errorf("outbound cards behind query: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			state   string
+			count   int
+			seconds float64
+			anyOfIt string
+		)
+		if err := rows.Scan(&state, &count, &seconds, &anyOfIt); err != nil {
+			return err
+		}
+		if state == "contract" {
+			// idle or succeeded with a revision outstanding. Not damage to work
+			// around - an invariant asserted where it is cheap to check, so
+			// that a build which breaks it says so instead of quietly under-
+			// reporting a stale card.
+			metrics.StorageContractFailuresTotal.WithLabelValues("desired_revision").Add(float64(count))
+			log.Printf("outbound: %d settled commitment(s) are behind their alert, "+
+				"which cannot happen; one of them is %s", count, anyOfIt)
+			continue
+		}
+		snap.OutboundCardsBehind = append(snap.OutboundCardsBehind,
+			model.OutboundCardsBehind{State: state, Count: count})
+		if state != "abandoned" && seconds > snap.OutboundCardStalenessSeconds {
+			snap.OutboundCardStalenessSeconds = seconds
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Every state reports, zero included: a gauge nobody touches keeps its last
+	// value, and a backlog that has been caught up would go on ringing.
+	for _, state := range []string{"queued", "stuck", "abandoned"} {
+		if !hasCardState(snap.OutboundCardsBehind, state) {
+			snap.OutboundCardsBehind = append(snap.OutboundCardsBehind,
+				model.OutboundCardsBehind{State: state})
+		}
+	}
+	return nil
+}
+
+func hasCardState(rows []model.OutboundCardsBehind, state string) bool {
+	for _, row := range rows {
+		if row.State == state {
+			return true
+		}
+	}
+	return false
 }
 
 func hasFamily(rows []model.OutboundLateness, family string) bool {

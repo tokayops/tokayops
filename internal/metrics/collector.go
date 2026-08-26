@@ -54,6 +54,18 @@ var (
 			"Work scheduled for later is not late; leased work is included, because a worker that hung is what this must not hide.",
 		[]string{"family"}, nil,
 	)
+	outboundCardsBehindDesc = prometheus.NewDesc(
+		"outbound_cards_behind",
+		"Editable messages showing something older than the alert they are about. "+
+			"queued will be caught up by a worker, stuck needs a person, abandoned is a person having decided not to - which is a normal end, not a fault.",
+		[]string{"state"}, nil,
+	)
+	outboundCardStalenessDesc = prometheus.NewDesc(
+		"outbound_card_staleness_seconds",
+		"How long the oldest message still due to be caught up has been behind its alert. "+
+			"Abandoned messages are excluded: nobody is going to catch those up, and counting them would leave this high forever.",
+		nil, nil,
+	)
 )
 
 // BusinessCollector queries the store on each Prometheus scrape.
@@ -71,6 +83,8 @@ func (c *BusinessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- outboxDeliveriesByStatusDesc
 	ch <- outboundIntentsByStatusDesc
 	ch <- outboundQueueLatenessDesc
+	ch <- outboundCardsBehindDesc
+	ch <- outboundCardStalenessDesc
 }
 
 func (c *BusinessCollector) Collect(ch chan<- prometheus.Metric) {
@@ -134,6 +148,18 @@ func (c *BusinessCollector) Collect(ch chan<- prometheus.Metric) {
 			l.Seconds, l.Family,
 		)
 	}
+
+	for _, b := range snap.OutboundCardsBehind {
+		ch <- prometheus.MustNewConstMetric(
+			outboundCardsBehindDesc, prometheus.GaugeValue,
+			float64(b.Count), b.State,
+		)
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		outboundCardStalenessDesc, prometheus.GaugeValue,
+		snap.OutboundCardStalenessSeconds,
+	)
 }
 
 // RegisterCollector registers the business metrics collector with the default Prometheus registry.
