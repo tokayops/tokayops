@@ -6,15 +6,14 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
-func mustNewDispatcher(t *testing.T, s store.StoreInterface, cfg *config.Config) *Dispatcher {
+func mustNewDispatcher(t *testing.T, s store.StoreInterface) *Dispatcher {
 	t.Helper()
-	d, err := NewDispatcher(s, cfg)
+	d, err := NewDispatcher(s)
 	if err != nil {
 		t.Fatalf("NewDispatcher failed: %v", err)
 	}
@@ -77,7 +76,7 @@ func withLegacySteps(d *Dispatcher) *Dispatcher {
 // it stops without producing the effect it was written for - not so that its
 // group is escalated again, which a destructive upgrade does not promise.
 func TestTheEscalationStepTypesAreGone(t *testing.T) {
-	d, err := NewDispatcher(store.NewMockStore(), &config.Config{})
+	d, err := NewDispatcher(store.NewMockStore())
 	if err != nil {
 		t.Fatalf("NewDispatcher: %v", err)
 	}

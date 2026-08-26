@@ -198,7 +198,7 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
 	renderer := schedulerender.New(s.ScheduleReadRepository())
 	eng := engine.NewEngine(s, renderer, &testSettings{}, cfg)
-	disp, err := dispatcher.NewDispatcher(s, cfg)
+	disp, err := dispatcher.NewDispatcher(s)
 	if err != nil {
 		t.Fatalf("NewDispatcher failed: %v", err)
 	}

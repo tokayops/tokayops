@@ -203,11 +203,12 @@ func (m *MockStore) insertOutboxEvent(event *model.OutboxEvent) {
 
 // SetAlertGroupStatus puts a group into a status whatever it is in now.
 //
-// A test fixture, deliberately absent from StoreInterface: production changes a
-// group's status through TransitionAlertGroupStatus, which has to say what it
-// expected to find. Tests that rewind a group to set up the next assertion have
-// no such expectation to state, and saying so here is better than keeping an
-// unconditional setter in the contract for their sake.
+// A test fixture, deliberately absent from StoreInterface: production moves a
+// group through the door that owns the move - AckAlertGroupAtomic,
+// ResolveAlertGroupAtomic - each of which states what it expected to find and
+// carries everything that goes with the change. Tests that rewind a group to
+// set up the next assertion have no such expectation to state, and saying so
+// here is better than keeping an unconditional setter in the contract.
 func (m *MockStore) SetAlertGroupStatus(id string, status model.AlertGroupStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -734,7 +735,6 @@ func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string
 	now := time.Now()
 	ag.Status = model.AlertGroupStatusAcknowledged
 	ag.AcknowledgedBy = actor
-	ag.AckProcessedAt = nil
 	ag.UpdatedAt = now
 	ag.RenderSourceVersion++
 

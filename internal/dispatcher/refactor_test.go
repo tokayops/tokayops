@@ -5,14 +5,13 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
 func TestUnknownExecutor_FailsJob(t *testing.T) {
 	s := store.NewMockStore()
-	d := mustNewDispatcher(t, s, &config.Config{})
+	d := mustNewDispatcher(t, s)
 
 	leaseToken := "lease-unknown"
 	job := &model.Job{ID: "job_u", Status: model.JobStatusRunning, Dedup: testJobIdentity("job_u")}
@@ -51,7 +50,7 @@ func TestUnknownExecutor_FailsJob(t *testing.T) {
 
 func TestJobCompletion_Succeeds(t *testing.T) {
 	s := store.NewMockStore()
-	d := mustNewDispatcher(t, s, &config.Config{})
+	d := mustNewDispatcher(t, s)
 
 	// Job with 2 steps in 2 stages.
 	// Step 0: Done (stage 0 succeeded).
@@ -104,7 +103,7 @@ func (n *NoopExecutor) Execute(ctx context.Context, job *model.Job, step *model.
 
 func TestJobFailure_MaxRetries(t *testing.T) {
 	s := store.NewMockStore()
-	d := mustNewDispatcher(t, s, &config.Config{})
+	d := mustNewDispatcher(t, s)
 
 	leaseToken := "lease-fail"
 	job := &model.Job{ID: "job_fail", Status: model.JobStatusRunning, Dedup: testJobIdentity("job_fail")}

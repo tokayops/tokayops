@@ -30,12 +30,3 @@ type HandoffStepData struct {
 	ScheduleID   string `json:"schedule_id"`   // For audit
 	TeamID       string `json:"team_id"`       // For audit
 }
-
-// ResolutionStepData contains specific data for resolution/update notification steps
-type ResolutionStepData struct {
-	AlertGroupID string `json:"alert_group_id"`
-	DeliveryID   string `json:"delivery_id"` // specific delivery to resolve/update
-	ProviderName string `json:"provider_name"`
-	IsFirehose   bool   `json:"is_firehose"`
-	Operation    string `json:"operation,omitempty"` // "resolve" or "update", default "resolve"
-}

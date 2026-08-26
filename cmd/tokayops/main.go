@@ -341,7 +341,7 @@ func main() {
 	eng := engine.NewEngine(st, scheduleRenderer, integrationCache, cfg)
 
 	// Dispatcher
-	disp, err := dispatcher.NewDispatcher(st, cfg)
+	disp, err := dispatcher.NewDispatcher(st)
 	if err != nil {
 		log.Fatalf("Failed to initialize dispatcher: %v", err)
 	}

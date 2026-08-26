@@ -159,7 +159,7 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
 	eng := engine.NewEngine(s, schedulerender.New(s.ScheduleReadRepository()), &testSettings{}, cfg)
-	disp, err := dispatcher.NewDispatcher(s, cfg)
+	disp, err := dispatcher.NewDispatcher(s)
 	if err != nil {
 		t.Fatalf("NewDispatcher: %v", err)
 	}

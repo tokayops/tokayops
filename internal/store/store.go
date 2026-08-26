@@ -1310,7 +1310,7 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	// 1. Conditional UPDATE — from 'processing' or 'triggered' (single-winner semantics)
 	res, err := tx.Exec(
 		`UPDATE alert_groups
-		 SET status = $1, acknowledged_by = $2, ack_processed_at = NULL, updated_at = $3,
+		 SET status = $1, acknowledged_by = $2, updated_at = $3,
 		     render_source_version = render_source_version + 1
 		 WHERE id = $4 AND status IN ($5, $6)`,
 		model.AlertGroupStatusAcknowledged, actor, now, id,
