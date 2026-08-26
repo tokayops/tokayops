@@ -995,14 +995,17 @@ func TestCoordinatesNobodyCanReadEndTheCommitment(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		provider string
+		damaged  string
 		prepare  outbound.Preparer
 	}{
 		{
 			name: "slack", provider: "slack",
+			damaged: `{"nothing":"nobody can use"}`,
 			prepare: slackprovider.NewHandler(staticSlackToken{}, nil),
 		},
 		{
 			name: "telegram", provider: "telegram",
+			damaged: `{"nothing":"nobody can use"}`,
 			prepare: telegramprovider.NewHandler(staticTelegramToken{}, nil),
 		},
 	} {
@@ -1015,8 +1018,7 @@ func TestCoordinatesNobodyCanReadEndTheCommitment(t *testing.T) {
 			if _, err := s.db.Exec(`
 				UPDATE outbound_intents
 				SET receipt = $2::jsonb, receipt_ref = $3, receipt_recorded = TRUE
-				WHERE id = $1`, intentID, `{"nothing":"nobody can use"}`,
-				"C0001/100.200"); err != nil {
+				WHERE id = $1`, intentID, tc.damaged, "C0001/100.200"); err != nil {
 				t.Fatalf("damage the coordinates: %v", err)
 			}
 
@@ -1074,6 +1076,74 @@ func TestCoordinatesNobodyCanReadEndTheCommitment(t *testing.T) {
 				if l.Intent.ID == intentID {
 					t.Fatal("the ended commitment was claimed again")
 				}
+			}
+		})
+	}
+}
+
+// TestCoordinatesThatDisagreeWithTheirNameEndTheCommitment.
+//
+// Both are written together and nothing rewrites one without the other, so a
+// row where they disagree is damaged - and the damage is invisible at the call.
+// The change would go to the message the COORDINATES name and be recorded
+// against the one the NAME does: two messages, one of them quietly wrong, and a
+// journal that matches neither. Telegram makes it worse by answering "message
+// is not modified" to a change that did nothing, which would settle the
+// revision as applied under the wrong identity.
+func TestCoordinatesThatDisagreeWithTheirNameEndTheCommitment(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	for _, tc := range []struct {
+		name        string
+		provider    string
+		coordinates string
+		calledIt    string
+		prepare     outbound.Preparer
+	}{
+		{
+			name: "slack", provider: "slack",
+			coordinates: `{"channel_id":"C_A","timestamp":"1"}`, calledIt: "C_B/2",
+			prepare: slackprovider.NewHandler(staticSlackToken{}, nil),
+		},
+		{
+			name: "telegram", provider: "telegram",
+			coordinates: `{"chat_id":"111","message_id":1}`, calledIt: "222/2",
+			prepare: telegramprovider.NewHandler(staticTelegramToken{}, nil),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agID := desiredGroup(t, s, "Disk filling up")
+			commitment := channelCommitment("C0001", 0)
+			commitment.Provider = tc.provider
+			intentID := admitOne(t, s, agID, commitment)[0]
+
+			if _, err := s.db.Exec(`
+				UPDATE outbound_intents
+				SET receipt = $2::jsonb, receipt_ref = $3, receipt_recorded = TRUE
+				WHERE id = $1`, intentID, tc.coordinates, tc.calledIt); err != nil {
+				t.Fatalf("write the disagreeing row: %v", err)
+			}
+
+			intent, err := s.GetIntent(context.Background(), intentID)
+			if err != nil {
+				t.Fatalf("read the commitment: %v", err)
+			}
+			preparation := tc.prepare.Prepare(context.Background(), *intent)
+			if preparation.Outcome() != outbound.PreparationPermanent {
+				t.Fatalf("the channel answered %q", preparation.Outcome())
+			}
+
+			token := claimOneFrom(t, s, tc.provider, intentID)
+			request := preparation.Request(intentID, token, "worker-1")
+			if request.ErrorClass != "receipt_mismatch" {
+				t.Fatalf("refused as %q", request.ErrorClass)
+			}
+			if _, err := s.BeginAttempt(context.Background(), request); err != nil {
+				t.Fatalf("record the refusal: %v", err)
+			}
+			if got := statusOf(t, s, intentID); got != outbound.StatusPermanentFailed {
+				t.Fatalf("the commitment is %s", got)
 			}
 		})
 	}

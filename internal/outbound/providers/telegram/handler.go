@@ -86,9 +86,18 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// at coordinates nobody can read is a refusal, not a call to retry. A card
 	// has no deadline, so a retry loop over a broken row never ends.
 	if intent.HasReceipt {
-		if _, ok := messageAt(intent.Receipt); !ok {
+		data, ok := messageAt(intent.Receipt)
+		if !ok {
 			return outbound.Impossible("receipt_unreadable",
 				"the coordinates of the message to change cannot be read")
+		}
+		// The same rule as Slack's, for the same reason: coordinates and name
+		// that disagree send the change to one message and record it against
+		// another.
+		if named := fmt.Sprintf("%s/%d", data.ChatID, data.MessageID); named != intent.ReceiptRef {
+			return outbound.Impossible("receipt_mismatch", fmt.Sprintf(
+				"the commitment holds the coordinates of %s and calls it %s",
+				named, intent.ReceiptRef))
 		}
 	}
 
@@ -117,9 +126,12 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	}
 }
 
-// ExecuteAttempt sends one message: sendMessage to the bound chat, and nothing
-// else. Telegram has no thread and no permalink, so there is no enrichment
-// either - what comes back is already the whole receipt.
+// ExecuteAttempt makes one call to the bound chat and nothing else: sendMessage
+// when there is nothing out there yet, editMessageText when the attempt is a
+// change to a message that exists.
+//
+// Telegram has no thread and no permalink, so there is no enrichment either -
+// what comes back is already the whole receipt.
 func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbound.Result, error) {
 	payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
 	if err != nil {

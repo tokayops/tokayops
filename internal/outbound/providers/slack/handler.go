@@ -87,9 +87,22 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// card has no deadline, so that is forever. Refused here it is what it is:
 	// a deterministic refusal, recorded, in front of somebody who can act.
 	if intent.HasReceipt {
-		if _, ok := parseData(string(intent.Receipt)); !ok {
+		data, ok := parseData(string(intent.Receipt))
+		if !ok {
 			return outbound.Impossible("receipt_unreadable",
 				"the coordinates of the message to change cannot be read")
+		}
+		// The coordinates and the name have to be the same message. They are
+		// written together and nothing rewrites one without the other, so a row
+		// where they disagree is damaged - and the damage is invisible at the
+		// call: the change would go to the message the COORDINATES name, and
+		// the revision would be recorded as applied to the one the NAME does.
+		// Two messages, one of them quietly wrong, and a journal that agrees
+		// with neither.
+		if named := data.ChannelID + "/" + data.Timestamp; named != intent.ReceiptRef {
+			return outbound.Impossible("receipt_mismatch", fmt.Sprintf(
+				"the commitment holds the coordinates of %s and calls it %s",
+				named, intent.ReceiptRef))
 		}
 	}
 
@@ -119,8 +132,12 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	}
 }
 
-// ExecuteAttempt makes the one external effect of an attempt: a single
-// chat.postMessage, to the address the generation is bound to.
+// ExecuteAttempt makes the one external effect of an attempt: a single call to
+// Slack, to the address the generation is bound to.
+//
+// Which call is decided by the attempt, not by this handler: chat.postMessage
+// when there is nothing out there yet, chat.update when the attempt is a change
+// to a card that exists. Either way it is one call and one effect.
 //
 // A direct message is the same call. conversations.open is gone: chat.postMessage
 // takes a user id in `channel` and opens the conversation itself, so a DM has no
