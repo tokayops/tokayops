@@ -224,7 +224,7 @@ const (
 )
 
 // Conclusion is what one attempt concluded: the answer the protocol
-// fingerprints and the object the provider made, as ONE value.
+// fingerprints and whatever coordinates came back with it, as ONE value.
 //
 // They were two arguments once, and the pair could be assembled wrong - an
 // acceptance naming a message beside a receipt of nothing. The store took it,
@@ -232,6 +232,12 @@ const (
 // of the alert, finding none, would have created a second message beside the
 // one that already existed. The invariant only holds if the halves cannot be
 // carried separately.
+//
+// What the two halves mean depends on what the attempt was. A create names the
+// object it made and carries its coordinates. A change names an object that
+// already exists, through the effect receipt it was handed, and may carry no
+// coordinates at all - half the providers answer a change that altered nothing
+// with nothing.
 type Conclusion struct {
 	completion keys.Completion
 	receipt    Receipt
@@ -336,8 +342,14 @@ func NewConclusion(in ConclusionInput) (Conclusion, error) {
 // is no longer the one it was accepted as.
 func (c Conclusion) Completion() keys.Completion { return c.completion.Clone() }
 
-// Receipt is what gets stored about the object, and it is present exactly when
-// the completion names one.
+// Receipt is the coordinates the provider returned FROM THIS CALL, for the
+// attempt's own row. They are optional: a change accepted with nothing to alter
+// returns none, and the object it was applied to is named by the completion
+// instead.
+//
+// The coordinates OF THE COMMITMENT are a different thing, decided by the store
+// from the kind of the attempt - a create records them, a change never
+// rewrites them.
 func (c Conclusion) Receipt() json.RawMessage { return c.receipt.Raw() }
 
 // Summary is the short account for the journal.
