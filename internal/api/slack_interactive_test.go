@@ -20,9 +20,7 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
-	"github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/slackcard"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -1253,89 +1251,15 @@ func TestSlackInteractiveEmailMatch(t *testing.T) {
 	})
 }
 
-// ---------- Instant Card Replacement Tests ----------
-
-// capturedReplace collects card replacements sent via replaceOriginal.
-type capturedReplace struct {
-	mu    sync.Mutex
-	cards []slackcard.Card
-	ch    chan slackcard.Card
-	err   error // if set, post returns this error
-}
-
-func newCapturedReplace() *capturedReplace {
-	return &capturedReplace{ch: make(chan slackcard.Card, 100)}
-}
-
-func (c *capturedReplace) post(_ string, card slackcard.Card) error {
-	if c.err != nil {
-		return c.err
-	}
-	c.mu.Lock()
-	c.cards = append(c.cards, card)
-	c.mu.Unlock()
-	c.ch <- card
-	return nil
-}
-
-func (c *capturedReplace) last() slackcard.Card {
-	return c.cards[len(c.cards)-1]
-}
-
-func (c *capturedReplace) waitOne(t *testing.T) slackcard.Card {
-	t.Helper()
-	select {
-	case card := <-c.ch:
-		return card
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for card replacement")
-		return slackcard.Card{}
-	}
-}
-
-// mockCardRenderer implements SlackCardRenderer for tests.
-type mockCardRenderer struct {
-	mu    sync.Mutex
-	calls []mockRenderCall
-}
-
-type mockRenderCall struct {
-	AlertGroupID   string
-	IsResolved     bool
-	Status         string
-	AcknowledgedBy string
-	ResolvedBy     string
-}
-
-func (m *mockCardRenderer) RenderCard(ag *model.AlertGroup, isResolved bool) slackcard.Card {
-	m.mu.Lock()
-	m.calls = append(m.calls, mockRenderCall{
-		AlertGroupID:   ag.ID,
-		IsResolved:     isResolved,
-		Status:         string(ag.Status),
-		AcknowledgedBy: ag.AcknowledgedBy,
-		ResolvedBy:     ag.ResolvedBy,
-	})
-	m.mu.Unlock()
-	color := "#FF0000"
-	if isResolved {
-		color = "#36a64f"
-	} else if ag.Status == model.AlertGroupStatusAcknowledged {
-		color = "#FFA500"
-	}
-	return slackcard.Card{
-		Text: ag.Title,
-		Blocks: []slack.Block{
-			slack.NewSectionBlock(
-				slack.NewTextBlockObject(slack.MarkdownType, ag.Title, false, false),
-				nil, nil,
-			),
-		},
-		Attachment: slack.Attachment{Color: color, Fallback: ag.Title},
-	}
-}
-
-func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
+// TestSlackInteractiveHandlerAnswersTheClicker. The button says what happened
+// to the person who pressed it and touches nothing else.
+//
+// It used to replace the card itself, rendered from the live group. That made
+// two writers of one message with no order between them: an alert arriving
+// between the click and the replacement would be rendered out of the card until
+// the next revision put it back. The card is the delivery domain's now, and it
+// brings it to the acknowledged revision within a claim cycle.
+func TestSlackInteractiveHandlerAnswersTheClicker(t *testing.T) {
 	const secret = "handler-test-secret"
 
 	setup := func(t *testing.T) (*API, *store.MockStore, *echo.Echo, string) {
@@ -1364,127 +1288,10 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		return api, s, e, agID
 	}
 
-	t.Run("ack with cardRenderer replaces card with orange", func(t *testing.T) {
-		api, s, e, agID := setup(t)
-		renderer := &mockCardRenderer{}
-		replace := newCapturedReplace()
-		api.cardRenderer = renderer
-		api.replaceOriginal = replace.post
-
-		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("Expected 200, got %d", rec.Code)
-		}
-
-		// Verify card replacement (not ephemeral)
-		card := replace.waitOne(t)
-		if card.Attachment.Color != "#FFA500" {
-			t.Errorf("Expected orange card (#FFA500), got %s", card.Attachment.Color)
-		}
-		if card.Text == "" {
-			t.Error("Expected non-empty Card.Text")
-		}
-		if len(card.Blocks) == 0 {
-			t.Error("Expected non-empty Card.Blocks")
-		}
-
-		// Verify DB state
-		ag, _ := s.GetAlertGroupByID(agID)
-		if ag.Status != model.AlertGroupStatusAcknowledged {
-			t.Errorf("Expected acknowledged, got %s", ag.Status)
-		}
-
-		// Verify renderer was called with correct args
-		renderer.mu.Lock()
-		defer renderer.mu.Unlock()
-		if len(renderer.calls) != 1 {
-			t.Fatalf("Expected 1 render call, got %d", len(renderer.calls))
-		}
-		if renderer.calls[0].IsResolved {
-			t.Error("Expected isResolved=false for ack")
-		}
-		if renderer.calls[0].Status != string(model.AlertGroupStatusAcknowledged) {
-			t.Errorf("Expected status acknowledged in render call, got %s", renderer.calls[0].Status)
-		}
-		if renderer.calls[0].AcknowledgedBy != "Denis" {
-			t.Errorf("Expected AcknowledgedBy 'Denis' in render call, got %q", renderer.calls[0].AcknowledgedBy)
-		}
-	})
-
-	t.Run("resolve with cardRenderer replaces card with green", func(t *testing.T) {
-		api, _, e, agID := setup(t)
-		renderer := &mockCardRenderer{}
-		replace := newCapturedReplace()
-		api.cardRenderer = renderer
-		api.replaceOriginal = replace.post
-
-		req := signedSlackInteractiveRequest(t, secret, SlackActionResolveAlertGroup, agID, "U_DENIS")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("Expected 200, got %d", rec.Code)
-		}
-
-		card := replace.waitOne(t)
-		if card.Attachment.Color != "#36a64f" {
-			t.Errorf("Expected green card (#36a64f), got %s", card.Attachment.Color)
-		}
-		if card.Text == "" {
-			t.Error("Expected non-empty Card.Text")
-		}
-		if len(card.Blocks) == 0 {
-			t.Error("Expected non-empty Card.Blocks")
-		}
-
-		renderer.mu.Lock()
-		defer renderer.mu.Unlock()
-		if len(renderer.calls) != 1 {
-			t.Fatalf("Expected 1 render call, got %d", len(renderer.calls))
-		}
-		if !renderer.calls[0].IsResolved {
-			t.Error("Expected isResolved=true for resolve")
-		}
-		if renderer.calls[0].ResolvedBy != "Denis" {
-			t.Errorf("Expected ResolvedBy 'Denis' in render call, got %q", renderer.calls[0].ResolvedBy)
-		}
-	})
-
-	t.Run("replaceOriginal failure falls back to ephemeral", func(t *testing.T) {
-		api, _, e, agID := setup(t)
-		renderer := &mockCardRenderer{}
-		replace := &capturedReplace{
-			ch:  make(chan slackcard.Card, 10),
-			err: errors.New("slack API unavailable"),
-		}
-		captured := newCapturedEphemeral()
-		api.cardRenderer = renderer
-		api.replaceOriginal = replace.post
-		api.respondEphemeral = captured.post
-
-		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("Expected 200, got %d", rec.Code)
-		}
-
-		// Should fall back to ephemeral
-		msg := captured.waitOne(t)
-		if !strings.Contains(msg, "acknowledged by Denis") {
-			t.Errorf("Expected fallback ephemeral containing 'acknowledged by Denis', got %q", msg)
-		}
-	})
-
-	t.Run("no cardRenderer uses ephemeral (backward compat)", func(t *testing.T) {
+	t.Run("the click is confirmed", func(t *testing.T) {
 		api, _, e, agID := setup(t)
 		captured := newCapturedEphemeral()
 		api.respondEphemeral = captured.post
-		// cardRenderer and replaceOriginal are nil by default
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec := httptest.NewRecorder()
@@ -1493,21 +1300,18 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("Expected 200, got %d", rec.Code)
 		}
-
 		msg := captured.waitOne(t)
 		if !strings.Contains(msg, "acknowledged by Denis") {
 			t.Errorf("Expected ephemeral containing 'acknowledged by Denis', got %q", msg)
 		}
 	})
 
-	t.Run("already acked with cardRenderer re-fetches and replaces card", func(t *testing.T) {
+	// Somebody else got there first, and the answer says which of the two
+	// things they did - which is read from the group rather than guessed.
+	t.Run("a click that came too late says what was already done", func(t *testing.T) {
 		api, s, e, agID := setup(t)
-		renderer := &mockCardRenderer{}
-		replace := newCapturedReplace()
-		api.cardRenderer = renderer
-		api.replaceOriginal = replace.post
-
-		// Pre-ack the alert group
+		captured := newCapturedEphemeral()
+		api.respondEphemeral = captured.post
 		s.AckAlertGroupAtomic(agID, "Other User", nil, nil)
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
@@ -1517,12 +1321,9 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("Expected 200, got %d", rec.Code)
 		}
-
-		// Should still replace the card (re-fetched from DB)
-		card := replace.waitOne(t)
-		if card.Attachment.Color != "#FFA500" {
-			t.Errorf("Expected orange card from re-fetch, got %s", card.Attachment.Color)
+		msg := captured.waitOne(t)
+		if !strings.Contains(msg, "already acknowledged") {
+			t.Errorf("Expected ephemeral about an acknowledged group, got %q", msg)
 		}
 	})
-
 }

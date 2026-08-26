@@ -360,9 +360,9 @@ func main() {
 		return true, nil
 	}
 
-	// The concrete slackProvider instance is also used by the API layer (SlackMessenger
-	// + SlackCardRenderer below), so the dispatcher factory returns that same instance;
-	// the registry keys it by integration ID.
+	// The concrete slackProvider instance is also used by the API layer as its
+	// SlackMessenger, so the dispatcher factory returns that same instance; the
+	// registry keys it by integration ID.
 	slackProvider := slackprovider.NewProvider(integrationCache, cfg.Global.SelfURL, teamLookup)
 	disp.RegisterProviderFactory("slack", model.IntegrationTypeSlack, func(integ *model.Integration) (dispatcher.Provider, error) {
 		return slackProvider, nil
@@ -411,7 +411,6 @@ func main() {
 
 	// 8. API
 	apiService := api.NewAPI(st, oidcProvider, slackProvider, integrationCache, cfg.Global.SelfURL, api.NewProviderCapsAdapter(disp.Providers()))
-	apiService.SetCardRenderer(slackProvider)
 
 	// Schedule configuration (revision model). The command service, the read
 	// side and the renderer are built from the store's narrow repositories

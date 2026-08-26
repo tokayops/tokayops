@@ -20,7 +20,6 @@ import (
 	"github.com/tokayops/tokayops/internal/rbac"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
-	"github.com/tokayops/tokayops/internal/slackcard"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -29,11 +28,6 @@ type SlackMessenger interface {
 	SendDM(ctx context.Context, userID, message string) error
 	GetSlackUserIDByEmail(ctx context.Context, email string) (string, error)
 	GetEmailBySlackID(ctx context.Context, slackUserID string) (string, error)
-}
-
-// SlackCardRenderer renders alert group cards for immediate Slack message replacement.
-type SlackCardRenderer interface {
-	RenderCard(ag *model.AlertGroup, isResolved bool) slackcard.Card
 }
 
 // TelegramAPI is the slice of the Telegram provider the API layer needs:
@@ -58,11 +52,9 @@ type API struct {
 	syncerManager    *dispatcher.UsergroupSyncerManager
 	syncerCtx        context.Context
 	respondEphemeral func(responseURL, text string)
-	cardRenderer     SlackCardRenderer                                   // optional, nil = no instant card updates
-	replaceOriginal  func(responseURL string, card slackcard.Card) error // injectable for tests
-	selfURL          string                                              // TokayOps base URL for manifest generation
-	providerCaps     ProviderCapabilitiesLookup                          // capability registry view (read-only)
-	telegram         TelegramAPI                                         // optional, nil = telegram interactivity disabled
+	selfURL          string                     // TokayOps base URL for manifest generation
+	providerCaps     ProviderCapabilitiesLookup // capability registry view (read-only)
+	telegram         TelegramAPI                // optional, nil = telegram interactivity disabled
 
 	// Schedule configuration is deliberately NOT reached through
 	// store.StoreInterface. The revision model is not mirrored into MockStore,
@@ -116,12 +108,6 @@ func (a *API) SetScheduleRenderer(svc *schedulerender.Service) {
 // safe implementation and refuses rather than falling back to a hard delete.
 func (a *API) SetUserEraser(svc *erasure.Service) {
 	a.userEraser = svc
-}
-
-// SetCardRenderer enables instant Slack card replacement on Ack/Resolve button clicks.
-func (a *API) SetCardRenderer(r SlackCardRenderer) {
-	a.cardRenderer = r
-	a.replaceOriginal = postResponseURLReplace
 }
 
 // SetTelegram wires the Telegram provider into the API layer so the webhook
