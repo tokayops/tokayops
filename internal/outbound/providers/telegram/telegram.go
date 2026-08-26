@@ -300,22 +300,6 @@ func (t *Provider) sendDM(ctx context.Context, chatID, message string) error {
 	return nil
 }
 
-// keyboardFor returns the inline keyboard for a card.
-//
-// Without a public selfURL the webhook can't be registered, so the Ack/Resolve
-// buttons would be dead - we omit the keyboard entirely (the card still sends as
-// a plain notification, consistent with the footer degrading to plain text).
-// Returning nil here is deliberate: no keyboard was ever sent, so there is
-// nothing to take back.
-//
-// When interactivity is switched off the card HAS to carry an empty keyboard
-// rather than nil, because editMessageText leaves the existing keyboard in place
-// when reply_markup is absent. Sending nil would strand live buttons on cards
-// posted before the switch was flipped.
-func (t *Provider) keyboardFor(ag *model.AlertGroup, isResolved bool) interface{} {
-	return KeyboardFor(t.freeze(ag, isResolved), t.interactive())
-}
-
 // KeyboardFor decides the keyboard from the snapshot and from whether this
 // delivery was admitted with buttons. Both are frozen: buttons that appear or
 // vanish between two attempts of one delivery are two different messages under
@@ -468,13 +452,6 @@ func (t *Provider) DeleteWebhook(ctx context.Context, token string) error {
 		return fmt.Errorf("telegram deleteWebhook failed (code %d): %s", tgr.ErrorCode, tgr.Description)
 	}
 	return nil
-}
-
-// renderCard builds the HTML message body. Dynamic values are escaped with
-// html.EscapeString (covers & < > ' " — safe for both text and href attributes).
-// Telegram has no threads, so the card is a single self-contained message.
-func (t *Provider) renderCard(ag *model.AlertGroup, isResolved bool) string {
-	return RenderCard(t.freeze(ag, isResolved))
 }
 
 // RenderCard draws the card from a snapshot and from nothing else. Telegram has

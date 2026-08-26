@@ -122,7 +122,7 @@ func TestTelegram_RenderCard_HTMLEscaping(t *testing.T) {
 			{Labels: map[string]string{"alertname": `A & B <prod> "x"`, "severity": "critical"}, Status: model.AlertStatusFiring},
 		},
 	}
-	out := p.renderCard(ag, false)
+	out := RenderCard(p.freeze(ag, false))
 
 	if strings.Contains(out, "<prod>") || strings.Contains(out, `B "x"`) {
 		t.Errorf("dynamic text not escaped: %q", out)
@@ -156,7 +156,7 @@ func TestTelegram_RenderCard_SafeTruncation(t *testing.T) {
 	ag := &model.AlertGroup{ID: "ag-big", Title: "Big", Severity: "critical", Alerts: alerts}
 	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "https://tokay.example", WithBaseURL("http://unused.invalid"))
 
-	out := p.renderCard(ag, false)
+	out := RenderCard(p.freeze(ag, false))
 
 	if len(out) > telegramMaxMessageLen {
 		t.Fatalf("rendered length %d exceeds limit %d", len(out), telegramMaxMessageLen)
@@ -321,7 +321,7 @@ func TestTelegram_TeamGate(t *testing.T) {
 			ag := testAlertGroup()
 			ag.TeamID = "payments"
 
-			b, err := json.Marshal(p.keyboardFor(ag, tt.isResolved))
+			b, err := json.Marshal(KeyboardFor(p.freeze(ag, tt.isResolved), p.interactive()))
 			if err != nil {
 				t.Fatalf("marshal keyboard: %v", err)
 			}

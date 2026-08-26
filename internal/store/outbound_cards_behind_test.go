@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
@@ -252,6 +253,61 @@ func TestCatchingUpMovesTheWaitToWhatIsStillOwed(t *testing.T) {
 	}
 	if age > 600 {
 		t.Errorf("the wait is %.0fs, so the revision it already applied is still counted", age)
+	}
+}
+
+// TestARepeatedPayloadCostsNothing. Alertmanager resends the same alerts every
+// few minutes for as long as they fire.
+//
+// Each resend used to be a fresh edit of every message about that alert. What
+// has to hold now is that nothing happens at all: no revision, no commitment
+// back in the queue, no attempt, no line in the journal. A card is edited when
+// what it says changes, and a repeat changes nothing.
+func TestARepeatedPayloadCostsNothing(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	intentID := changeableCard(t, s, agID)
+
+	same := []model.Alert{{
+		Fingerprint: "fp-1", Status: model.AlertStatusFiring,
+		StartsAt: time.Unix(1700000000, 0),
+		Labels:   map[string]string{"alertname": "DiskWillFill"},
+	}}
+	// The first one is what the group already holds, so it is already a repeat.
+	before := readCard(t, s, intentID)
+	var attemptsBefore, eventsBefore int
+	countWork := func() (int, int) {
+		t.Helper()
+		var attempts, events int
+		if err := s.db.QueryRow(
+			`SELECT (SELECT count(*) FROM outbound_attempts WHERE intent_id = $1),
+			        (SELECT count(*) FROM outbound_intent_events WHERE intent_id = $1)`,
+			intentID).Scan(&attempts, &events); err != nil {
+			t.Fatalf("count the work: %v", err)
+		}
+		return attempts, events
+	}
+	attemptsBefore, eventsBefore = countWork()
+
+	for i := 0; i < 3; i++ {
+		result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
+			"desired-"+agID, same, "ingester")
+		if err != nil {
+			t.Fatalf("repeat %d: %v", i, err)
+		}
+		if result.Outcome != alertgroup.MergeUnchanged {
+			t.Fatalf("repeat %d came back %s", i, result.Outcome)
+		}
+	}
+
+	if now := readCard(t, s, intentID); now != before {
+		t.Errorf("three repeats moved the commitment: %+v -> %+v", before, now)
+	}
+	if attempts, events := countWork(); attempts != attemptsBefore || events != eventsBefore {
+		t.Errorf("three repeats produced %d attempt(s) and %d journal line(s)",
+			attempts-attemptsBefore, events-eventsBefore)
 	}
 }
 

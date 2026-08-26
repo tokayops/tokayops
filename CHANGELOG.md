@@ -66,6 +66,33 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ### Changed
 
+- **The message about an alert is now kept up to date by the part of TokayOps
+  that sent it.** Before, a separate background job edited it, and the two could
+  disagree about what it should say. Every change to an alert - an alert
+  arriving, somebody acknowledging it, the alert clearing - now records what its
+  messages have to show, and each message is brought to that on its own. In
+  practice: fewer edits, and the ones that happen say the right thing.
+- **The Ack and Resolve buttons in Slack answer with a short confirmation, and
+  the card turns yellow a moment later** rather than being replaced on the
+  spot. Replacing it immediately meant two things writing the same message with
+  nothing deciding the order, and an alert that arrived at that moment could be
+  rubbed out of the card until the next one came. The confirmation is still
+  instant; the card follows within about a second.
+- **A resolved alert group stays "resolved".** The extra "closed" state it moved
+  to afterwards no longer happens. It rendered identically, every filter that
+  excluded one excluded the other, and what it really recorded - that the
+  resolution reached the messages - is now kept per message, where it can be
+  read precisely.
+- **The alerts of a resolved incident are what they were when it resolved.** A
+  payload that arrives afterwards is not merged into it: that alert firing again
+  is the next incident, and it starts one. Previously a late payload could still
+  change an incident that was over.
+- **There is no thread under a card any more.** The alert's history is not
+  posted as replies, and a resolution is not announced as a second message. Both
+  were extra messages nobody could retry or point at, and the history is on the
+  alert's own page. Cards themselves say more instead: each alert now carries
+  its description and when it started on a second line, the same in Slack and
+  Telegram.
 - **An escalation step goes out when the policy said it would.** A step's delay
   is now counted from the moment the alert was picked up, not from the moment
   the previous step finished. A policy that says "the channel now, the on-call
@@ -94,6 +121,15 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ### Fixed
 
+- An Alertmanager payload and somebody pressing Acknowledge can no longer
+  produce two different answers about the same incident. Whether a payload adds
+  alerts to the open incident or ends it is now decided while holding that
+  incident, so two payloads arriving together cannot both win, and a firing
+  alert that lost the race starts the next incident instead of disappearing.
+- A payload that repeats what TokayOps already knows no longer redraws anything.
+  Alertmanager resends the same alerts every few minutes; each resend used to be
+  a fresh edit of every message about that alert. Nothing is sent now unless
+  what a message would say has actually changed.
 - Two unrelated pieces of background work no longer cancel each other out by
   accident. Deduplication used to compare one opaque key across every kind of
   job, so a collision between, say, an escalation and a message update silently
@@ -153,6 +189,14 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   `outbound_admission_latency_seconds` cover the rest, and
   `outbound_contract_violations_total` should stay at zero - it counts things
   that indicate a bug rather than a failed delivery.
+- Metrics for messages that are behind the alert they are about.
+  `outbound_cards_behind` counts them by whether anything is going to fix that:
+  `queued` will be caught up on its own, `stuck` needs somebody, and `abandoned`
+  is somebody having decided not to - so an alert written on the total would
+  fire on a decision that was made on purpose. `outbound_card_staleness_seconds`
+  is how long the oldest one still owed has been behind, and leaves `abandoned`
+  out for the same reason. `outbound_desired_revisions_total` counts what came
+  of each change to an alert, by what caused it: only `applied` created work.
 - `storage_contract_failures_total` counts durable rows that no longer parse.
   Any increase is a data problem to look at, not a transient failure.
 
