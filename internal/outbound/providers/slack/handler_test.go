@@ -192,6 +192,56 @@ func TestTheCardGoesOutAsBlockKit(t *testing.T) {
 	}
 }
 
+// TestAnAcceptanceThatNamesNothingIsDoubt. Slack answered ok and would not say
+// what it made.
+//
+// The card may well exist, so this is not a clean failure: calling it one would
+// send the retry to post a second card beside the first. It is doubt, and the
+// breach names what was wrong with the answer - an acceptance with nothing to
+// address afterwards. A person decides what happens next.
+func TestAnAcceptanceThatNamesNothingIsDoubt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		channel string
+		ts      string
+	}{
+		{name: "no timestamp", channel: "C0001", ts: ""},
+		{name: "no channel", channel: "", ts: "1700000000.000100"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newSlackAPI(t)
+			api.answer = func(path string, _ map[string]any) map[string]any {
+				if !strings.HasSuffix(path, "chat.postMessage") {
+					return nil
+				}
+				return map[string]any{"ok": true, "channel": tc.channel, "ts": tc.ts}
+			}
+			handler := handlerFor(api)
+
+			result, err := handler.ExecuteAttempt(context.Background(),
+				handlerCall(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"}, true))
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if result.Receipt.Recorded() {
+				t.Fatalf("coordinates were recorded from %+v", result)
+			}
+
+			concluded, breach := outbound.Conclude(handler,
+				outbound.Call{AttemptKind: outbound.AttemptCreate}, result, err)
+			if concluded.Outcome() != outbound.OutcomeAmbiguous {
+				t.Fatalf("an acceptance naming nothing concluded %q", concluded.Outcome())
+			}
+			if breach != outbound.BreachAcceptanceWithoutReceipt {
+				t.Fatalf("the breach recorded is %q", breach)
+			}
+			if concluded.Receipt() != nil {
+				t.Fatal("something was recorded as the card's coordinates")
+			}
+		})
+	}
+}
+
 // TestADirectMessageIsOneCallToo. conversations.open is gone: chat.postMessage
 // takes the user id in `channel` and opens the conversation itself, so a DM has
 // no second place to fail before the message exists.

@@ -58,22 +58,6 @@ func testAlertGroup() *model.AlertGroup {
 	}
 }
 
-func TestTelegram_Send_EmptyMessageID_Errors(t *testing.T) {
-	counts := map[string]int{}
-	server := fakeBotAPI(t, 0, counts) // message_id 0 → editable contract violation
-	defer server.Close()
-
-	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL(server.URL))
-	_, err := p.Send(context.Background(), providers.NotificationRequest{
-		Target:     providers.NotificationTarget{Kind: "channel", ID: "@chan"},
-		AlertGroup: testAlertGroup(),
-		Editable:   true,
-	})
-	if err == nil {
-		t.Fatal("expected error when sendMessage returns message_id 0")
-	}
-}
-
 func TestTelegram_SendDM_FireAndForget(t *testing.T) {
 	counts := map[string]int{}
 	server := fakeBotAPI(t, 7, counts)
@@ -95,12 +79,16 @@ func TestTelegram_SendDM_FireAndForget(t *testing.T) {
 	}
 }
 
+// TestTelegram_Send_Guards. What is left of Send is the handoff announcement: a
+// direct message, and nothing else. A card sent from here would record nothing
+// about where it landed, so no revision could ever reach it - cards come from
+// ExecuteAttempt.
 func TestTelegram_Send_Guards(t *testing.T) {
 	p := NewProvider(&mockTelegramTokenSource{token: "tok"}, "", WithBaseURL("http://unused.invalid"))
 	ctx := context.Background()
 
 	if _, err := p.Send(ctx, providers.NotificationRequest{Target: providers.NotificationTarget{Kind: "channel", ID: "@c"}}); err == nil {
-		t.Error("channel send with nil AlertGroup should error")
+		t.Error("a card is not sent from here any more, and was accepted")
 	}
 	if _, err := p.Send(ctx, providers.NotificationRequest{Target: providers.NotificationTarget{Kind: "user", ID: "1"}}); err == nil {
 		t.Error("user send with empty Message should error")

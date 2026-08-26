@@ -194,6 +194,58 @@ func TestAChangeCarriesTheKeyboardTheAdmissionFroze(t *testing.T) {
 	}
 }
 
+// TestAnAcceptanceThatNamesNothingIsDoubt. Telegram answered ok and would not
+// say what it made.
+//
+// The message may well exist, so this is not a clean failure: calling it one
+// would send the retry to post a second one. It is doubt, and the breach names
+// what was wrong with the answer - an acceptance with nothing to address
+// afterwards.
+func TestAnAcceptanceThatNamesNothingIsDoubt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result map[string]any
+	}{
+		{
+			name:   "no message id",
+			result: map[string]any{"message_id": 0, "chat": map[string]any{"id": -1001}},
+		},
+		{
+			name:   "no chat",
+			result: map[string]any{"message_id": 42},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newBotAPI(t)
+			api.answer = func(map[string]any) (int, map[string]any) {
+				return http.StatusOK, map[string]any{"ok": true, "result": tc.result}
+			}
+			handler := handlerFor(api)
+
+			result, err := handler.ExecuteAttempt(context.Background(),
+				handlerCall(t, keys.TargetChannel, true))
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if result.Receipt.Recorded() {
+				t.Fatalf("coordinates were recorded from %+v", result)
+			}
+
+			concluded, breach := outbound.Conclude(handler,
+				outbound.Call{AttemptKind: outbound.AttemptCreate}, result, err)
+			if concluded.Outcome() != outbound.OutcomeAmbiguous {
+				t.Fatalf("an acceptance naming nothing concluded %q", concluded.Outcome())
+			}
+			if breach != outbound.BreachAcceptanceWithoutReceipt {
+				t.Fatalf("the breach recorded is %q", breach)
+			}
+			if concluded.Receipt() != nil {
+				t.Fatal("something was recorded as the message's coordinates")
+			}
+		})
+	}
+}
+
 // TestTelegramAnswersAreTranslatedNotInterpreted walks the capability matrix.
 func TestTelegramAnswersAreTranslatedNotInterpreted(t *testing.T) {
 	handler := &Handler{}
