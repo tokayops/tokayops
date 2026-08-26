@@ -418,10 +418,11 @@ type attemptFacts struct {
 // not expire either: nothing this build does can put the object back, so proof
 // found anywhere in it stands until the generation ends.
 //
-// Only a CHANGE may prove it. A create that claimed the message was gone would
-// be licensing a second copy of something it had just made, and the store
-// refuses to record such a pair - this is the same rule read back, so that
-// neither half depends on the other having held.
+// Only a CHANGE can have proved it. A create that claimed the message was gone
+// would be licensing a second copy of something it had just made, and the pair
+// is refused where it is written, in one place, for both tables. So the read
+// asks what the attempt ended as and not what it was: re-deriving the rule here
+// would defend a row that no writer in this build can produce.
 func resourceLostTx(ctx context.Context, tx *sql.Tx, intentID string,
 	generation int) (bool, error) {
 
@@ -430,16 +431,14 @@ func resourceLostTx(ctx context.Context, tx *sql.Tx, intentID string,
 		SELECT EXISTS (
 			SELECT 1 FROM outbound_attempts a
 			WHERE a.intent_id = $1 AND a.generation_no = $2
-			  AND a.attempt_kind = $5
 			  AND a.outcome = $3 AND a.provider_result_detail = $4
 			UNION ALL
 			SELECT 1 FROM outbound_attempt_observations o
 			JOIN outbound_attempts a ON a.id = o.attempt_id
 			WHERE a.intent_id = $1 AND a.generation_no = $2
-			  AND a.attempt_kind = $5
 			  AND o.outcome = $3 AND o.provider_result_detail = $4
 		)`, intentID, generation, string(outbound.OutcomePermanentRejection),
-		string(keys.DetailDefinitelyAbsent), string(outbound.AttemptMutation)).Scan(&lost)
+		string(keys.DetailDefinitelyAbsent)).Scan(&lost)
 	if err != nil {
 		return false, fmt.Errorf("read what became of the message of %s: %w", intentID, err)
 	}
