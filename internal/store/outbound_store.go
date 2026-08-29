@@ -1281,6 +1281,8 @@ func contentFormOf(kind keys.Kind) outbound.ContentForm {
 	switch kind {
 	case keys.KindEscalation, keys.KindEscalationReplay:
 		return outbound.ContentSnapshot
+	case keys.KindHandoff:
+		return outbound.ContentPayload
 	default:
 		return ""
 	}

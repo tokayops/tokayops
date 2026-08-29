@@ -2,7 +2,9 @@ package keys
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -25,15 +27,28 @@ func sampleOccurrence() Occurrence {
 }
 
 func samplePayload(user string) HandoffPayloadV1 {
-	return HandoffPayloadV1{
-		Kind:            HandoffShiftChange,
-		TeamName:        "Backend",
-		ScheduleID:      "sched-1",
-		Timezone:        "UTC",
-		GridSlotStart:   time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC),
-		AssignmentStart: time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC),
-		AssignmentEnd:   time.Date(2026, 5, 4, 19, 0, 0, 0, time.UTC),
-		Target:          Target{Kind: TargetUser, Ref: user},
+	return sampleBatch().announcementFor(user)
+}
+
+func sampleBatch(recipients ...HandoffRecipient) HandoffBatch {
+	return HandoffBatch{
+		Occurrence:         sampleOccurrence(),
+		TeamName:           "Backend",
+		Timezone:           "UTC",
+		GridSlotStart:      time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC),
+		AssignmentEnd:      time.Date(2026, 5, 4, 19, 0, 0, 0, time.UTC),
+		GrammarVersion:     GrammarV1,
+		FingerprintVersion: CurrentBatchFingerprintVersion(),
+		Recipients:         recipients,
+	}
+}
+
+func sampleRecipient(provider, user string) HandoffRecipient {
+	return HandoffRecipient{
+		Provider: provider, UserID: user,
+		Timing:          TimingSpec{Kind: TimingRelativeToAdmission},
+		CompletionMode:  CompletionOnAcceptance,
+		AmbiguityPolicy: PolicyRetry,
 	}
 }
 
@@ -41,10 +56,15 @@ func samplePayload(user string) HandoffPayloadV1 {
 // across, not recomputed.
 //
 // The value below is the one `jobdedup.TestHandoffOccurrenceGoldenVector` has
-// pinned since Epic 11, and it is here for one reason: a running installation
-// has already announced shift changes under these keys. A digest that shifted
-// during the move would announce every one of them a second time, and the rows
-// already written would sit in the table claiming nothing.
+// pinned since Epic 11, reproduced here by hand from the written grammar.
+//
+// It is NOT what keeps a shift change from being announced twice across the
+// upgrade: the old claims are rows in `jobs` and the new ones are rows in
+// `outbound_batches`, and no uniqueness spans two tables - what prevents the
+// duplicate is the detector warming up on the current composition. What this
+// holds is the grammar itself, which is normative in the gates and will have
+// readers outside this package. A digest that drifted while the code moved
+// between packages would be a change of identity nobody could see.
 //
 // If this fails and the change was deliberate, the change is a new protocol
 // string, not a new expected value here.
@@ -252,30 +272,15 @@ func TestAStoredAnnouncementIsReadStrictly(t *testing.T) {
 
 // TestAHandoffAdmissionDerivesEverythingFromTheOccurrence.
 func TestAHandoffAdmissionDerivesEverythingFromTheOccurrence(t *testing.T) {
-	occurrence := sampleOccurrence()
-	admission, err := HandoffBatch{
-		Occurrence: occurrence, GrammarVersion: GrammarV1,
-		FingerprintVersion: CurrentBatchFingerprintVersion(),
-		Commitments: []HandoffCommitment{
-			{
-				Provider: "telegram", UserID: "u-bob", Payload: samplePayload("u-bob"),
-				Timing:          TimingSpec{Kind: TimingRelativeToAdmission},
-				CompletionMode:  CompletionOnAcceptance,
-				AmbiguityPolicy: PolicyRetry,
-			},
-			{
-				Provider: "slack", UserID: "u-alice", Payload: samplePayload("u-alice"),
-				Timing:          TimingSpec{Kind: TimingRelativeToAdmission},
-				CompletionMode:  CompletionOnAcceptance,
-				AmbiguityPolicy: PolicyRetry,
-			},
-		},
-	}.Admit()
+	admission, err := sampleBatch(
+		sampleRecipient("telegram", "u-bob"),
+		sampleRecipient("slack", "u-alice"),
+	).Admit()
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
 
-	wantKey, _ := occurrence.Key()
+	wantKey, _ := sampleOccurrence().Key()
 	if admission.BatchKey != wantKey {
 		t.Fatalf("the claim is held under %q", admission.BatchKey)
 	}
@@ -299,9 +304,37 @@ func TestAHandoffAdmissionDerivesEverythingFromTheOccurrence(t *testing.T) {
 		t.Fatal("the commitments came back unordered")
 	}
 	for _, c := range admission.Commitments {
-		if _, ok := c.Payload.(HandoffPayloadV1); !ok {
+		payload, ok := c.Payload.(HandoffPayloadV1)
+		if !ok {
 			t.Fatalf("an announcement was admitted carrying a %T", c.Payload)
 		}
+		// The event the message describes is the event the claim is held for.
+		// It is not checked so much as made: these fields are read off the
+		// occurrence inside Admit and are not the producer's to supply.
+		if payload.Kind != sampleOccurrence().Kind ||
+			payload.ScheduleID != sampleOccurrence().ScheduleID ||
+			!payload.AssignmentStart.Equal(sampleOccurrence().AssignmentStart) {
+			t.Fatalf("the message describes another event: %+v", payload)
+		}
+		if payload.Target.Ref != c.Target.Ref {
+			t.Fatalf("the message is addressed to %s and the commitment to %s",
+				payload.Target.Ref, c.Target.Ref)
+		}
+	}
+}
+
+// TestAnAnnouncementGoesOnlyToPeopleTheShiftChangeIsAbout.
+//
+// The occurrence names who came on duty, and the claim is held for exactly that
+// event. Announcing to somebody outside it would tell a person about a shift
+// they are not on, under a key that then holds the real announcement out.
+func TestAnAnnouncementGoesOnlyToPeopleTheShiftChangeIsAbout(t *testing.T) {
+	_, err := sampleBatch(sampleRecipient("slack", "u-carol")).Admit()
+	if err == nil {
+		t.Fatal("an announcement went to somebody the shift change is not about")
+	}
+	if !strings.Contains(err.Error(), "u-carol") {
+		t.Fatalf("the refusal does not say who: %v", err)
 	}
 }
 
@@ -309,10 +342,7 @@ func TestAHandoffAdmissionDerivesEverythingFromTheOccurrence(t *testing.T) {
 // is a result, not a failure, and it has to be expressible: without it the
 // occurrence would be re-proposed on every tick forever.
 func TestAnAnnouncementToNobodyIsAnAnswer(t *testing.T) {
-	admission, err := HandoffBatch{
-		Occurrence: sampleOccurrence(), GrammarVersion: GrammarV1,
-		FingerprintVersion: CurrentBatchFingerprintVersion(),
-	}.Admit()
+	admission, err := sampleBatch().Admit()
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
@@ -321,49 +351,6 @@ func TestAnAnnouncementToNobodyIsAnAnswer(t *testing.T) {
 	}
 	if len(admission.Fingerprint) != 32 {
 		t.Fatalf("an admission of nobody has a %d-byte fingerprint", len(admission.Fingerprint))
-	}
-}
-
-// TestACommitmentAboutAnotherScheduleIsRefused. The schedule is named in the
-// occurrence and again in every payload, and a batch where they disagree would
-// announce one schedule's shift under another's claim.
-func TestACommitmentAboutAnotherScheduleIsRefused(t *testing.T) {
-	payload := samplePayload("u-alice")
-	payload.ScheduleID = "sched-9"
-	_, err := HandoffBatch{
-		Occurrence: sampleOccurrence(), GrammarVersion: GrammarV1,
-		FingerprintVersion: CurrentBatchFingerprintVersion(),
-		Commitments: []HandoffCommitment{{
-			Provider: "slack", UserID: "u-alice", Payload: payload,
-			Timing:          TimingSpec{Kind: TimingRelativeToAdmission},
-			CompletionMode:  CompletionOnAcceptance,
-			AmbiguityPolicy: PolicyRetry,
-		}},
-	}.Admit()
-	if err == nil {
-		t.Fatal("an announcement about another schedule was admitted")
-	}
-	if !strings.Contains(err.Error(), "sched-9") {
-		t.Fatalf("the refusal does not say which: %v", err)
-	}
-}
-
-// TestARecipientNamedTwiceHasToAgree. The commitment names the person and so
-// does its payload; a row where they differ sends to one and is deduplicated
-// as the other.
-func TestARecipientNamedTwiceHasToAgree(t *testing.T) {
-	_, err := HandoffBatch{
-		Occurrence: sampleOccurrence(), GrammarVersion: GrammarV1,
-		FingerprintVersion: CurrentBatchFingerprintVersion(),
-		Commitments: []HandoffCommitment{{
-			Provider: "slack", UserID: "u-alice", Payload: samplePayload("u-bob"),
-			Timing:          TimingSpec{Kind: TimingRelativeToAdmission},
-			CompletionMode:  CompletionOnAcceptance,
-			AmbiguityPolicy: PolicyRetry,
-		}},
-	}.Admit()
-	if err == nil {
-		t.Fatal("a commitment for one person carrying a payload for another was admitted")
 	}
 }
 
@@ -451,5 +438,254 @@ func TestABoundedDeadlineNeedsBothHalves(t *testing.T) {
 		if err := spec.Validate(); err == nil {
 			t.Fatalf("a %s spec carrying a maximum age was accepted", spec.Kind)
 		}
+	}
+}
+
+// The wire vectors. Every value below was written out by hand from the
+// protocol in epic12-gates.md, over inputs the test supplies - not captured
+// from this implementation. A vector taken from the code it checks moves with
+// the code and proves nothing.
+
+// TestTheHandoffBatchFingerprintIsGolden pins both outcomes.
+//
+// The empty one matters most, as it does for escalations: an admission that
+// found nobody to announce to has no commitments to hash, so everything telling
+// two such proposals apart has to be in the material before the list. For a
+// handover that is the occurrence digest, and if it were dropped every "nobody
+// to tell" on every schedule would fingerprint identically.
+func TestTheHandoffBatchFingerprintIsGolden(t *testing.T) {
+	admitted, err := sampleBatch(
+		boundedRecipient("slack", "u-alice"),
+		boundedRecipient("telegram", "u-bob"),
+	).Admit()
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	if got, want := hex.EncodeToString(admitted.Fingerprint),
+		"65efc48987a66680bb22755b678e0bf872b114614e17ded247d140611eceb733"; got != want {
+		t.Errorf("admitted proposal\n got: %s\nwant: %s", got, want)
+	}
+
+	empty, err := sampleBatch().Admit()
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	if got, want := hex.EncodeToString(empty.Fingerprint),
+		"5195c241c60946ef9717db06dc213b15101e1426177986d2942e15cd518e5a47"; got != want {
+		t.Errorf("empty proposal\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestTheHandoffSubmitIntentIsGolden pins the whole commitment material, all
+// fourteen fields, with a bounded deadline in the tenth.
+//
+// The field test above proves the deadline encodes as the protocol says. This
+// proves it reaches the fingerprint: a build that computed the deadline
+// correctly and then dropped it on the way into the material would pass that
+// test and fail this one.
+func TestTheHandoffSubmitIntentIsGolden(t *testing.T) {
+	digest, err := sampleOccurrence().Digest()
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	deadline := TimingSpec{
+		Kind:   TimingBounded,
+		At:     time.Date(2026, 5, 4, 19, 0, 0, 0, time.UTC),
+		MaxAge: time.Hour,
+	}
+	material, err := submitIntent{
+		Kind:            KindHandoff,
+		GrammarVersion:  GrammarV1,
+		Provider:        "slack",
+		Target:          Target{Kind: TargetUser, Ref: "u-alice"},
+		Operation:       OperationSend,
+		Editable:        false,
+		Content:         occurrenceRef{Digest: digest},
+		Timing:          TimingSpec{Kind: TimingRelativeToAdmission},
+		Expiry:          &deadline,
+		CompletionMode:  CompletionOnAcceptance,
+		AmbiguityPolicy: PolicyRetry,
+		Payload:         samplePayload("u-alice"),
+	}.encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	sum := sha256.Sum256(material)
+	if got, want := hex.EncodeToString(sum[:]),
+		"1228ea97775a8da759d9542ebd4bab757f855c6885f86d870ce0047bbd4a9a8d"; got != want {
+		t.Errorf("handover commitment\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestAnEscalationWithADeadlineIsUnchanged is the other half of the extension's
+// promise, and the expensive half to get wrong.
+//
+// Adding a third kind to the expiry field had to leave the two older ones
+// exactly as they were. These are whole commitment materials, not just the
+// field: had the extension shifted anything - a length, an order, a marker -
+// every escalation fingerprint ever computed would change, every stored
+// admission would read as a conflict with its own repeat, and the repair would
+// be a protocol version.
+//
+// The content reference is supplied directly rather than through a render
+// snapshot, so what these vectors pin is the commitment encoding and nothing
+// about how a snapshot happens to hash today.
+func TestAnEscalationWithADeadlineIsUnchanged(t *testing.T) {
+	content := contentRef{
+		AlertGroupID: "ag-0001", Revision: 3,
+		SnapshotDigest: sequentialDigest(),
+	}
+	build := func(t *testing.T, expiry TimingSpec) string {
+		t.Helper()
+		material, err := submitIntent{
+			Kind:            KindEscalation,
+			GrammarVersion:  GrammarV1,
+			Provider:        "slack",
+			Target:          Target{Kind: TargetChannel, Ref: "C0001"},
+			Operation:       OperationSend,
+			Editable:        true,
+			Content:         content,
+			Timing:          TimingSpec{Kind: TimingRelativeToAdmission},
+			Expiry:          &expiry,
+			CompletionMode:  CompletionOnAcceptance,
+			AmbiguityPolicy: PolicyRetry,
+			Payload: EscalationPayloadV1{
+				Slot:        Slot{Kind: SlotPolicy, Index: 2},
+				Target:      Target{Kind: TargetChannel, Ref: "C0001"},
+				Interactive: true,
+			},
+		}.encode()
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		sum := sha256.Sum256(material)
+		return hex.EncodeToString(sum[:])
+	}
+
+	if got, want := build(t, TimingSpec{
+		Kind: TimingAbsolute, At: time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC),
+	}), "f2be9fb27c32f99ff027a6ae716a19aecf64d1657765278edf981ad54d9cb22b"; got != want {
+		t.Errorf("escalation with an absolute deadline\n got: %s\nwant: %s", got, want)
+	}
+
+	if got, want := build(t, TimingSpec{
+		Kind: TimingRelativeToAdmission, Offset: 90 * time.Second,
+	}), "55ed5c13e9c0b3b76199b6d9deabe672e2a49f929212e4da94727aca8f26f55f"; got != want {
+		t.Errorf("escalation with a relative deadline\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// boundedRecipient is a recipient whose announcement expires the way a handover
+// does: the earlier of the shift ending and an hour from admission.
+func boundedRecipient(provider, user string) HandoffRecipient {
+	deadline := TimingSpec{
+		Kind:   TimingBounded,
+		At:     time.Date(2026, 5, 4, 19, 0, 0, 0, time.UTC),
+		MaxAge: time.Hour,
+	}
+	recipient := sampleRecipient(provider, user)
+	recipient.Expiry = &deadline
+	return recipient
+}
+
+// sequentialDigest is a 32-byte value chosen for being easy to write down: the
+// vectors above are computed by hand, and a real snapshot digest would make
+// that impossible to check.
+func sequentialDigest() []byte {
+	digest := make([]byte, 32)
+	for i := range digest {
+		digest[i] = byte(i)
+	}
+	return digest
+}
+
+// TestAStoredAnnouncementSurvivesARoundTrip.
+//
+// The durable spelling and the canonical material are two different wire forms
+// of one value, and equal digests do not prove equal reading: two builds can
+// agree on the material and disagree about the JSON. What goes into the column
+// has to come back out as the same announcement.
+func TestAStoredAnnouncementSurvivesARoundTrip(t *testing.T) {
+	original := samplePayload("u-alice")
+	stored, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("store the announcement: %v", err)
+	}
+	read, err := DecodeHandoffPayloadV1(1, stored)
+	if err != nil {
+		t.Fatalf("read the announcement back: %v", err)
+	}
+	if read != original {
+		t.Fatalf("the announcement changed in storage:\n  was %+v\n  now %+v", original, read)
+	}
+
+	// And the same digest, which is the other half: the two wire forms describe
+	// one value or neither is trustworthy.
+	first, err := PayloadDigest(KindHandoff, 1, stored)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	again, err := json.Marshal(read)
+	if err != nil {
+		t.Fatalf("store it again: %v", err)
+	}
+	second, err := PayloadDigest(KindHandoff, 1, again)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if hex.EncodeToString(first) != hex.EncodeToString(second) {
+		t.Fatal("a round trip changed the digest")
+	}
+}
+
+// TestAnAnnouncementNeedsAllThreeMoments. A missing one decodes as year zero
+// and renders as a shift that started in the year 1: the channel shows it,
+// because nothing downstream re-checks what the payload already said.
+func TestAnAnnouncementNeedsAllThreeMoments(t *testing.T) {
+	for _, missing := range []string{"grid_slot_start", "assignment_start", "assignment_end"} {
+		t.Run("without "+missing, func(t *testing.T) {
+			fields := map[string]any{
+				"kind": "handoff", "team_name": "Backend", "schedule_id": "sched-1",
+				"timezone":         "UTC",
+				"grid_slot_start":  "2026-05-04T11:00:00Z",
+				"assignment_start": "2026-05-04T11:00:00Z",
+				"assignment_end":   "2026-05-04T19:00:00Z",
+				"target":           map[string]string{"kind": "user", "ref": "u-alice"},
+			}
+			delete(fields, missing)
+			raw, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatalf("build the payload: %v", err)
+			}
+			if _, err := DecodeHandoffPayloadV1(1, raw); err == nil {
+				t.Fatalf("an announcement with no %s was read back", missing)
+			}
+		})
+	}
+}
+
+// TestAnAnnouncementIsStoredInUTC. A producer that wrote its instants with an
+// offset wrote the same moments, and the canonical material says so - but the
+// stored JSON would be a second spelling of one announcement, which is what a
+// person reading the row and a build diffing two rows would both trip over.
+func TestAnAnnouncementIsStoredInUTC(t *testing.T) {
+	moscow := time.FixedZone("MSK", 3*60*60)
+	raw, err := json.Marshal(map[string]any{
+		"kind": "handoff", "team_name": "Backend", "schedule_id": "sched-1",
+		"timezone":         "UTC",
+		"grid_slot_start":  time.Date(2026, 5, 4, 14, 0, 0, 0, moscow),
+		"assignment_start": time.Date(2026, 5, 4, 14, 0, 0, 0, moscow),
+		"assignment_end":   time.Date(2026, 5, 4, 22, 0, 0, 0, moscow),
+		"target":           map[string]string{"kind": "user", "ref": "u-alice"},
+	})
+	if err != nil {
+		t.Fatalf("build the payload: %v", err)
+	}
+	read, err := DecodeHandoffPayloadV1(1, raw)
+	if err != nil {
+		t.Fatalf("read the announcement: %v", err)
+	}
+	if read != samplePayload("u-alice") {
+		t.Fatalf("an announcement written with an offset read back as %+v", read)
 	}
 }

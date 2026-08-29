@@ -1200,7 +1200,8 @@ func TestAKindThisBuildDoesNotKnowIsLeftAlone(t *testing.T) {
 	}
 	attemptsBefore, eventsBefore = count()
 
-	// A kind from a build that is ahead of this one.
+	// A kind from a build that is ahead of this one. Not `handoff`: that one
+	// this build now knows, and knowing it is what test 10g proves.
 	for _, statement := range []string{
 		`UPDATE outbound_batches SET key_kind = 'something_newer'
 		 WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)`,
@@ -1234,5 +1235,26 @@ func TestAKindThisBuildDoesNotKnowIsLeftAlone(t *testing.T) {
 	if status := statusOf(t, s, intentID); status != outbound.StatusPending {
 		t.Fatalf("the commitment is %s; an instance that knows the kind will never take it",
 			status)
+	}
+}
+
+// TestAHandoverDrawsFromItsPayload. The other side of the closed switch: a kind
+// this build DOES know, whose content is its own payload rather than a frozen
+// state.
+//
+// Without this the classification is only proven in the negative - unknown
+// kinds refused - and a build that classified handoff as a snapshot kind would
+// pass every test above while refusing every announcement it ever admitted.
+func TestAHandoverDrawsFromItsPayload(t *testing.T) {
+	if got := contentFormOf(keys.KindHandoff); got != outbound.ContentPayload {
+		t.Fatalf("a handover draws from %q", got)
+	}
+	for _, kind := range []keys.Kind{keys.KindEscalation, keys.KindEscalationReplay} {
+		if got := contentFormOf(kind); got != outbound.ContentSnapshot {
+			t.Fatalf("a %s draws from %q", kind, got)
+		}
+	}
+	if got := contentFormOf(keys.Kind("something_newer")); got != "" {
+		t.Fatalf("a kind nobody declared draws from %q", got)
 	}
 }

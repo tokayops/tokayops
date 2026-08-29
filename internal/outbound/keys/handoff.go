@@ -14,10 +14,16 @@ import (
 // The identity of a handover announcement.
 //
 // Inherited whole from the job engine that used to produce these, down to the
-// domain separator the material opens with: the digest a running installation
-// has already announced under has to stay the same digest, or the first upgrade
-// announces every shift change a second time. The golden vector is what holds
-// that, and it was carried across rather than recomputed.
+// domain separator the material opens with, and the golden vector was carried
+// across rather than recomputed.
+//
+// Not for deduplication across the upgrade - there is none. The old claims are
+// rows in `jobs` and the new ones are rows in `outbound_batches`, and no
+// uniqueness spans two tables; what keeps an already-announced shift from being
+// announced again is the detector warming up on the current composition. What
+// the vector holds is the GRAMMAR: it is normative in the gates, it will have
+// readers outside this package, and a digest that drifted while the code moved
+// between packages would be a silent change of identity nobody could see.
 
 // occurrenceProtocol is the domain separator of the occurrence material. It is
 // the namespace the previous implementation wrote, kept for that reason alone.
@@ -210,8 +216,20 @@ func (p HandoffPayloadV1) validate() error {
 	if err := checkDisplayTimezone(p.Timezone); err != nil {
 		return err
 	}
-	if p.AssignmentStart.IsZero() {
-		return contractf("a handover payload with no assignment start")
+	// All three instants, not just one. A missing moment decodes as year zero
+	// and renders as a shift that started in the year 1: the channel would show
+	// it, because nothing downstream re-checks what the payload already said.
+	for _, moment := range []struct {
+		name string
+		at   time.Time
+	}{
+		{"grid slot start", p.GridSlotStart},
+		{"assignment start", p.AssignmentStart},
+		{"assignment end", p.AssignmentEnd},
+	} {
+		if moment.at.IsZero() {
+			return contractf("a handover payload with no %s", moment.name)
+		}
 	}
 	if err := p.Target.validate(); err != nil {
 		return err
@@ -248,6 +266,14 @@ func DecodeHandoffPayloadV1(schemaVersion int, raw []byte) (HandoffPayloadV1, er
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return payload, contractf("the payload does not end where the value does")
 	}
+	// Normalised to UTC on the way in. A payload written with a +03:00 offset
+	// is the same instant, and the canonical material encodes it as such - but
+	// two builds comparing the STORED JSON, or a person reading it, would see
+	// two different spellings of one announcement.
+	payload.GridSlotStart = payload.GridSlotStart.UTC()
+	payload.AssignmentStart = payload.AssignmentStart.UTC()
+	payload.AssignmentEnd = payload.AssignmentEnd.UTC()
+
 	if err := payload.validate(); err != nil {
 		return payload, err
 	}
@@ -270,60 +296,86 @@ func (p HandoffPayloadV1) encode(buf *bytes.Buffer) error {
 	return nil
 }
 
-// HandoffCommitment is one announcement this batch wants accepted.
-type HandoffCommitment struct {
+// HandoffRecipient is one person, through one channel, and nothing about the
+// event itself.
+//
+// What the announcement SAYS is a property of the batch: one shift change is
+// one message, told to several people. A recipient that carried its own copy
+// of the event could describe a different one - a different kind, a different
+// instant, a different person - and the claim would be held forever by the
+// first while the message said the second.
+type HandoffRecipient struct {
 	Provider string
-	// UserID is the recipient as this system names them. The address the
-	// channel will be handed is preparation's business and is not identity.
+	// UserID is the recipient as this system names them, and it must be one of
+	// the people the occurrence is about. The address the channel will be
+	// handed is preparation's business and is not identity.
 	UserID          string
-	Payload         HandoffPayloadV1
 	Timing          TimingSpec
 	Expiry          *TimingSpec
 	CompletionMode  CompletionMode
 	AmbiguityPolicy AmbiguityPolicy
 }
 
-func (c HandoffCommitment) validate() error {
-	if c.Provider == "" {
+func (r HandoffRecipient) validate() error {
+	if r.Provider == "" {
 		return contractf("a handover commitment with no provider")
 	}
-	if c.UserID == "" {
+	if r.UserID == "" {
 		return contractf("a handover commitment with no recipient")
 	}
-	if err := c.Payload.validate(); err != nil {
+	if err := r.Timing.validate(); err != nil {
 		return err
 	}
-	// The recipient is named twice - in the commitment and inside the payload -
-	// and a row where the two disagree would announce to one person and be
-	// deduplicated as an announcement to another.
-	if c.Payload.Target.Ref != c.UserID {
-		return contractf("a handover commitment for %s carrying a payload addressed to %s",
-			c.UserID, c.Payload.Target.Ref)
-	}
-	if err := c.Timing.validate(); err != nil {
-		return err
-	}
-	if c.Expiry != nil {
-		if err := c.Expiry.validate(); err != nil {
+	if r.Expiry != nil {
+		if err := r.Expiry.validate(); err != nil {
 			return err
 		}
 	}
-	if err := c.CompletionMode.validate(); err != nil {
+	if err := r.CompletionMode.validate(); err != nil {
 		return err
 	}
-	return c.AmbiguityPolicy.validate()
+	return r.AmbiguityPolicy.validate()
 }
 
 // HandoffBatch is one shift change as a producer proposes it.
 //
 // The occurrence comes in whole rather than as a digest beside a schedule id:
 // the batch key, the content reference and every commitment key are derived
-// from it here, so they cannot describe different shift changes.
+// from it here, so they cannot describe different shift changes. The payload
+// each recipient gets is BUILT here for the same reason - the fields that say
+// which event this is are read off the occurrence and are not the producer's to
+// supply twice.
 type HandoffBatch struct {
-	Occurrence         Occurrence
+	Occurrence Occurrence
+
+	// TeamName, Timezone, GridSlotStart and AssignmentEnd are the parts of the
+	// message that are not identity: what the announcement shows, as observed
+	// at admission. They are the same for every recipient.
+	TeamName      string
+	Timezone      string
+	GridSlotStart time.Time
+	AssignmentEnd time.Time
+
 	GrammarVersion     int
 	FingerprintVersion int
-	Commitments        []HandoffCommitment
+	Recipients         []HandoffRecipient
+}
+
+// announcementFor builds the payload one recipient gets.
+//
+// Kind, ScheduleID, AssignmentStart and the target come from the occurrence and
+// the recipient; nothing here is supplied twice, so nothing here can disagree.
+func (b HandoffBatch) announcementFor(userID string) HandoffPayloadV1 {
+	return HandoffPayloadV1{
+		Kind:            b.Occurrence.Kind,
+		TeamName:        b.TeamName,
+		ScheduleID:      b.Occurrence.ScheduleID,
+		Timezone:        b.Timezone,
+		GridSlotStart:   b.GridSlotStart.UTC(),
+		AssignmentStart: b.Occurrence.AssignmentStart.UTC(),
+		AssignmentEnd:   b.AssignmentEnd.UTC(),
+		Target:          Target{Kind: TargetUser, Ref: userID},
+	}
 }
 
 // Admit derives every identity in one pass, exactly as an escalation does.
@@ -349,25 +401,37 @@ func (b HandoffBatch) Admit() (Admission, error) {
 	}
 	content := occurrenceRef{Digest: digest}
 
-	admitted := make([]AdmittedCommitment, 0, len(b.Commitments))
-	encoded := make([][]byte, 0, len(b.Commitments))
-	seen := make(map[string]bool, len(b.Commitments))
+	// Who the occurrence is about, so a recipient outside it is refused rather
+	// than announced to. An announcement to somebody the shift change does not
+	// concern is a message about a shift they are not on.
+	onDuty := make(map[string]bool, len(b.Occurrence.UserIDs))
+	for _, id := range b.Occurrence.UserIDs {
+		onDuty[id] = true
+	}
 
-	for _, c := range b.Commitments {
-		if err := c.validate(); err != nil {
+	admitted := make([]AdmittedCommitment, 0, len(b.Recipients))
+	encoded := make([][]byte, 0, len(b.Recipients))
+	seen := make(map[string]bool, len(b.Recipients))
+
+	for _, r := range b.Recipients {
+		if err := r.validate(); err != nil {
 			return Admission{}, err
 		}
-		if c.Payload.ScheduleID != b.Occurrence.ScheduleID {
+		if !onDuty[r.UserID] {
 			return Admission{}, contractf(
-				"a commitment about schedule %s in an admission about %s",
-				c.Payload.ScheduleID, b.Occurrence.ScheduleID)
+				"an announcement to %s about a shift change that is not theirs", r.UserID)
+		}
+
+		payload := b.announcementFor(r.UserID)
+		if err := payload.validate(); err != nil {
+			return Admission{}, err
 		}
 
 		key, err := handoffIntent{
 			ScheduleID:       b.Occurrence.ScheduleID,
 			OccurrenceDigest: digest,
-			Provider:         c.Provider,
-			UserID:           c.UserID,
+			Provider:         r.Provider,
+			UserID:           r.UserID,
 		}.key(b.GrammarVersion)
 		if err != nil {
 			return Admission{}, err
@@ -378,20 +442,20 @@ func (b HandoffBatch) Admit() (Admission, error) {
 		}
 		seen[key] = true
 
-		expiry := cloneTiming(c.Expiry)
+		expiry := cloneTiming(r.Expiry)
 		material, err := submitIntent{
 			Kind:            KindHandoff,
 			GrammarVersion:  b.GrammarVersion,
-			Provider:        c.Provider,
-			Target:          c.Payload.Target,
+			Provider:        r.Provider,
+			Target:          payload.Target,
 			Operation:       OperationSend,
 			Editable:        false,
 			Content:         content,
-			Timing:          c.Timing,
+			Timing:          r.Timing,
 			Expiry:          expiry,
-			CompletionMode:  c.CompletionMode,
-			AmbiguityPolicy: c.AmbiguityPolicy,
-			Payload:         c.Payload,
+			CompletionMode:  r.CompletionMode,
+			AmbiguityPolicy: r.AmbiguityPolicy,
+			Payload:         payload,
 		}.encode()
 		if err != nil {
 			return Admission{}, err
@@ -399,16 +463,16 @@ func (b HandoffBatch) Admit() (Admission, error) {
 
 		admitted = append(admitted, AdmittedCommitment{
 			IdempotencyKey:       key,
-			Provider:             c.Provider,
-			Target:               c.Payload.Target,
+			Provider:             r.Provider,
+			Target:               payload.Target,
 			Editable:             false,
 			Operation:            OperationSend,
-			CompletionMode:       c.CompletionMode,
-			AmbiguityPolicy:      c.AmbiguityPolicy,
-			Timing:               c.Timing,
+			CompletionMode:       r.CompletionMode,
+			AmbiguityPolicy:      r.AmbiguityPolicy,
+			Timing:               r.Timing,
 			Expiry:               expiry,
-			Payload:              c.Payload,
-			PayloadSchemaVersion: c.Payload.SchemaVersion(),
+			Payload:              payload,
+			PayloadSchemaVersion: payload.SchemaVersion(),
 		})
 		encoded = append(encoded, material)
 	}
