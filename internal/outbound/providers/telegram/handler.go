@@ -152,7 +152,19 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 		}, ErrNoToken
 	}
 
-	state := call.State.Content()
+	snapshot, drawn := call.Content.Snapshot()
+	if !drawn {
+		// This channel draws an alert card from a frozen state, and this
+		// commitment has none. Not an empty card: a message about nothing is
+		// worse than a message that did not go.
+		return outbound.Result{
+			Evidence: outbound.DefinitelyNotSent,
+			Summary: fmt.Sprintf(
+				"a %s commitment renders from a state, and this one carries none",
+				call.KeyKind),
+		}, ErrNoContent
+	}
+	state := snapshot.Content()
 	body := map[string]interface{}{
 		"chat_id":                  call.Endpoint,
 		"disable_web_page_preview": true,

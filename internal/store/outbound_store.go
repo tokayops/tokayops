@@ -730,7 +730,7 @@ func intentIDsOfBatch(ctx context.Context, tx *sql.Tx, batchID string) ([]string
 // in Go, because the process clock is not the one the leases are written
 // against.
 const outboundIntentColumns = `
-	SELECT id, COALESCE(alert_group_id, ''), delivery_family, provider, target_kind, target_ref,
+	SELECT id, COALESCE(alert_group_id, ''), delivery_family, key_kind, provider, target_kind, target_ref,
 	       form, completion_mode,
 	       ambiguity_policy, status, generation_no, attempts_in_generation,
 	       failure_streak, desired_revision, applied_revision,
@@ -756,7 +756,8 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		deadlinePassed bool
 	)
 	if err := row.Scan(
-		&intent.ID, &groupID, &intent.Family, &intent.Provider, &intent.TargetKind, &intent.TargetRef,
+		&intent.ID, &groupID, &intent.Family, &intent.KeyKind, &intent.Provider,
+		&intent.TargetKind, &intent.TargetRef,
 		&intent.Form, &intent.CompletionMode,
 		&intent.AmbiguityPolicy, &intent.Status, &intent.GenerationNo,
 		&intent.AttemptsInGeneration, &intent.FailureStreak, &intent.DesiredRevision,
@@ -1208,16 +1209,64 @@ func admittedSnapshotTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent)
 // would open an effect and reach the provider before anything looked at it
 // again. It is refused before an attempt exists, which is the only point at
 // which refusing is free.
-func attemptStateTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent) (storedSnapshot, error) {
+// attemptContentTx reads what an attempt will be made from, in whichever of the
+// two forms this commitment has.
+//
+// The FORM decides, not the emptiness of what comes back. A card and a one-shot
+// escalation are drawn from a frozen snapshot with a revision of its own; a
+// handover announcement is drawn from its own payload and has no revisions at
+// all. Answering the second with an empty snapshot would record a commitment as
+// having applied revision 0 of nothing, and would hand a channel a card about
+// no alert.
+func attemptContentTx(ctx context.Context, tx *sql.Tx,
+	intent outbound.Intent) (outbound.AttemptContent, error) {
+
+	if drawsFromPayload(intent.KeyKind) {
+		digest, err := keys.PayloadDigest(intent.KeyKind, intent.PayloadSchemaVersion, intent.Payload)
+		if err != nil {
+			// The payload on the row is not the shape its commitment says it
+			// is. Undeliverable rather than a contract error: it is durable
+			// data that a person fixes, and the commitment ends visibly rather
+			// than retrying against a row that will never parse.
+			return outbound.AttemptContent{}, undeliverablef(
+				"the payload of %s cannot be canonicalised: %v", intent.ID, err)
+		}
+		return outbound.NewPayloadContent(digest)
+	}
+
+	var stored storedSnapshot
+	var err error
 	switch intent.Form {
 	case outbound.FormEditable:
-		return lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+		stored, err = lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
 	case outbound.FormOneShot:
-		return admittedSnapshotTx(ctx, tx, intent)
+		stored, err = admittedSnapshotTx(ctx, tx, intent)
 	default:
-		return storedSnapshot{}, outboundContractf(
+		return outbound.AttemptContent{}, outboundContractf(
 			"commitment %s is a %q, which is not a form this build delivers",
 			intent.ID, intent.Form)
+	}
+	if err != nil {
+		return outbound.AttemptContent{}, err
+	}
+	return outbound.NewSnapshotContent(stored.Snapshot, stored.Revision, stored.Final)
+}
+
+// drawsFromPayload says which content form a kind of claim has.
+//
+// Stated in the positive for both sides rather than as a default: a kind this
+// build does not know falls through to the snapshot branch and is refused there
+// by name, which is the answer a build meeting a newer row should give. Reading
+// a payload it has no shape for would be worse - it would send something.
+func drawsFromPayload(kind keys.Kind) bool {
+	switch kind {
+	case keys.KindEscalation, keys.KindEscalationReplay:
+		return false
+	default:
+		// Every other kind carries its own content. Today that is handoff,
+		// which arrives with its own key kind; a kind nobody has declared gets
+		// here too, and PayloadDigest refuses it by name.
+		return true
 	}
 }
 

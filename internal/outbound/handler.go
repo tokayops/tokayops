@@ -184,8 +184,20 @@ type Call struct {
 	// else's.
 	ReceiptRef string
 
-	Revision             int64
-	State                keys.RenderSnapshot
+	// KeyKind and Family say what this commitment IS, read from its row rather
+	// than inferred. A handler picks its decoder and its renderer from them:
+	// two kinds can both be at payload schema 1 and mean different things, and
+	// "not an escalation, so try the other one" is a guess that becomes wrong
+	// the day a third kind exists. Reading the emptiness of Content instead
+	// would be the same guess wearing a different hat.
+	KeyKind keys.Kind
+	Family  string
+
+	// Content is the state this call renders, in whichever of the two forms
+	// this commitment has. A handler that needs a snapshot asks for one and is
+	// told when there is none.
+	Content AttemptContent
+
 	Payload              json.RawMessage
 	PayloadSchemaVersion int
 }

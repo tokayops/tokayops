@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"log"
 	"os"
 	"strings"
@@ -62,7 +63,7 @@ func newFakeStore() *fakeStore {
 			Operation:            OperationSend,
 			BoundEndpoint:        "C-bound",
 			ProviderKey:          "create-key",
-			AppliedRevision:      3,
+			Content:              mustSnapshotContent(3),
 			PayloadSchemaVersion: 1,
 			Payload:              json.RawMessage(`{"text":"disk will fill"}`),
 		},
@@ -351,8 +352,8 @@ func TestAnAttemptIsMadeFromWhatTheStoreSaid(t *testing.T) {
 	if call.Endpoint != "C-bound" || call.ProviderKey != "create-key" {
 		t.Fatalf("the call went to %q under %q", call.Endpoint, call.ProviderKey)
 	}
-	if call.Revision != 3 {
-		t.Fatalf("the call carried revision %d", call.Revision)
+	if revision, has := call.Content.Revision(); !has || revision != 3 {
+		t.Fatalf("the call carried revision %d (present: %v)", revision, has)
 	}
 	if call.AttemptKind != AttemptCreate || call.Operation != OperationSend {
 		t.Fatalf("the call is a %s/%s", call.AttemptKind, call.Operation)
@@ -846,4 +847,25 @@ func TestTheLatencyOfACallThatNeverCameBackIsStillMeasured(t *testing.T) {
 
 	close(channel.block)
 	w.running.Wait()
+}
+
+// mustSnapshotContent is the content a real BeginAttempt hands back for a
+// commitment drawn from a frozen state.
+func mustSnapshotContent(revision int64) AttemptContent {
+	state, err := keys.NewRenderSnapshot(keys.SnapshotInput{
+		AlertGroupID: "ag-1", Status: keys.GroupTriggered, Title: "Disk filling up",
+		Severity: "critical", Revision: revision, DisplayTimezone: "UTC",
+		Alerts: []keys.AlertSnapshot{{
+			Fingerprint: "fp-1", Status: keys.AlertFiring,
+			StartsAt: time.Unix(1700000000, 0).UTC(), AlertName: "DiskWillFill",
+		}},
+	})
+	if err != nil {
+		panic(err)
+	}
+	content, err := NewSnapshotContent(state, revision, false)
+	if err != nil {
+		panic(err)
+	}
+	return content
 }

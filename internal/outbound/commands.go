@@ -411,12 +411,12 @@ type BeginAttemptResult struct {
 	// without reading a provider's own field names.
 	ReceiptRef string
 
-	// AppliedRevision is the revision of the state below, and the one the
-	// attempt is recorded as applying. The worker never names it: it renders
-	// the snapshot it is given and reports what the provider said.
-	AppliedRevision int64
-	Snapshot        keys.RenderSnapshot
-	Payload         json.RawMessage
+	// Content is what this attempt is made from, in one of the two forms a
+	// commitment can have: a frozen snapshot with a revision, or the
+	// commitment's own payload with none. The worker never names either: it
+	// renders what it is given and reports what the provider said.
+	Content AttemptContent
+	Payload json.RawMessage
 	// PayloadSchemaVersion says which shape the payload is in, so a handler
 	// reads it rather than assuming the current one.
 	PayloadSchemaVersion int

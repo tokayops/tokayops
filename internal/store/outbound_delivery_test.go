@@ -68,6 +68,29 @@ func claimOne(t *testing.T, s *Store, intentID string) string {
 	return ""
 }
 
+// revisionOf is the revision an attempt applies, and it FAILS when there is
+// none: every commitment in these tests is drawn from a snapshot, so "no
+// revision" is a bug in the fixture rather than a case to handle.
+func revisionOf(t *testing.T, begun outbound.BeginAttemptResult) int64 {
+	t.Helper()
+	revision, has := begun.Content.Revision()
+	if !has {
+		t.Fatalf("the attempt carries no revision: content is %s", begun.Content.Form())
+	}
+	return revision
+}
+
+// snapshotOf is the state an attempt renders, and it FAILS when there is none,
+// for the same reason.
+func snapshotOf(t *testing.T, begun outbound.BeginAttemptResult) keys.RenderSnapshot {
+	t.Helper()
+	snapshot, drawn := begun.Content.Snapshot()
+	if !drawn {
+		t.Fatalf("the attempt carries no state: content is %s", begun.Content.Form())
+	}
+	return snapshot
+}
+
 func beginOne(t *testing.T, s *Store, intentID, token string) outbound.BeginAttemptResult {
 	t.Helper()
 
@@ -166,7 +189,7 @@ func TestDeliveryHappyPath(t *testing.T) {
 	if begun.Outcome != outbound.BeginStarted {
 		t.Fatalf("beginning an attempt answered %q", begun.Outcome)
 	}
-	if begun.Snapshot.Content().AlertGroupID != agID {
+	if snapshotOf(t, begun).Content().AlertGroupID != agID {
 		t.Fatal("the attempt was handed content belonging to another group")
 	}
 	if statusOf(t, s, intentID) != outbound.StatusSending {
@@ -1139,5 +1162,62 @@ func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
 				t.Errorf("the claim does not walk an index at all:\n%s", plan)
 			}
 		})
+	}
+}
+
+// TestAKindThisBuildCannotDrawFromStopsBeforeTheNetwork.
+//
+// A commitment whose claim is of a kind this build has no content shape for
+// gets a deterministic refusal naming the kind, before any call. The two
+// branches of attemptContentTx are chosen by the KIND, not by whether a
+// snapshot happens to be there: a kind that draws from its own payload asks the
+// payload codec, and a codec that does not know it says so.
+//
+// The refusal matters more than it looks. The alternative - falling through to
+// the snapshot branch - would report "the admission froze no state" about a
+// commitment that was never supposed to have one, and send whoever read it to
+// look for a missing snapshot instead of a missing shape.
+func TestAKindThisBuildCannotDrawFromStopsBeforeTheNetwork(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := outboundGroup(t, s)
+	intentID := admitOne(t, s, agID)[0]
+
+	// The claim and the commitment are re-labelled as a kind that draws from
+	// its own payload - the shape a handover announcement will have, and which
+	// this build does not yet know.
+	for _, statement := range []string{
+		`UPDATE outbound_batches SET key_kind = 'handoff'
+		 WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)`,
+		`UPDATE outbound_intents SET key_kind = 'handoff' WHERE id = $1`,
+	} {
+		if _, err := s.db.Exec(statement, intentID); err != nil {
+			t.Fatalf("re-label the claim: %v", err)
+		}
+	}
+
+	token := claimOne(t, s, intentID)
+	result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+		Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
+	})
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if result.Outcome != outbound.BeginPreparedPermanent {
+		t.Fatalf("the commitment answered %q", result.Outcome)
+	}
+
+	// And it says which kind, not which snapshot is missing.
+	var summary string
+	if err := s.db.QueryRow(`
+		SELECT COALESCE(response_summary, '') FROM outbound_attempts
+		WHERE intent_id = $1 ORDER BY attempt_no DESC LIMIT 1`, intentID).
+		Scan(&summary); err != nil {
+		t.Fatalf("read the refusal: %v", err)
+	}
+	if !strings.Contains(summary, "handoff") {
+		t.Fatalf("the refusal does not name the kind: %q", summary)
 	}
 }

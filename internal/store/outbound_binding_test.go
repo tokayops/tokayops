@@ -317,9 +317,9 @@ func TestFinalizeBelievesTheAttemptRatherThanTheWorker(t *testing.T) {
 			Scan(&applied); err != nil {
 			t.Fatalf("read the applied revision: %v", err)
 		}
-		if !applied.Valid || applied.Int64 != begun.AppliedRevision {
+		if !applied.Valid || applied.Int64 != revisionOf(t, begun) {
 			t.Fatalf("the commitment records revision %v, the attempt carried %d",
-				applied, begun.AppliedRevision)
+				applied, revisionOf(t, begun))
 		}
 	})
 
@@ -569,9 +569,9 @@ func TestTheCallIsDecidedByTheRecord(t *testing.T) {
 
 		// The revision is the one in the state that was rendered, which is
 		// also the one the key was computed over. Nothing else can name it.
-		if revision != begun.AppliedRevision {
+		if revision != revisionOf(t, begun) {
 			t.Fatalf("the attempt carries revision %d and reports %d",
-				revision, begun.AppliedRevision)
+				revision, revisionOf(t, begun))
 		}
 		var stored int64
 		if err := s.db.QueryRow(
@@ -873,9 +873,9 @@ func TestADirectMessageIgnoresAnAlertThatMovedBeforeItWasSent(t *testing.T) {
 	if got := attemptFingerprint(t, s, begun.AttemptID); !bytes.Equal(got, admitted) {
 		t.Fatalf("the first attempt rendered state the admission never accepted")
 	}
-	if begun.AppliedRevision != 0 {
+	if revisionOf(t, begun) != 0 {
 		t.Fatalf("the message carries revision %d, and it was admitted at 0",
-			begun.AppliedRevision)
+			revisionOf(t, begun))
 	}
 }
 
@@ -918,9 +918,9 @@ func TestADirectMessageRetriesWithTheBytesItWasAdmittedWith(t *testing.T) {
 	if got := attemptFingerprint(t, s, retry.AttemptID); !bytes.Equal(got, admitted) {
 		t.Fatalf("the retry sent different bytes than the admission")
 	}
-	if retry.AppliedRevision != first.AppliedRevision {
+	if revisionOf(t, retry) != revisionOf(t, first) {
 		t.Fatalf("the retry carries revision %d, the first carried %d",
-			retry.AppliedRevision, first.AppliedRevision)
+			revisionOf(t, retry), revisionOf(t, first))
 	}
 	// And the two attempts are one effect, under one key.
 	if firstKey, retryKey := attemptKey(t, s, first.AttemptID),

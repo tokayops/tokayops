@@ -52,9 +52,20 @@ func handlerCall(t *testing.T, kind keys.TargetKind, interactive bool) outbound.
 		IntentID: "intent-1", AttemptID: "attempt-1", Provider: "telegram",
 		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
 		Endpoint: "-1001", ProviderKey: "create-key",
-		State: handlerState(t), Payload: payload,
+		KeyKind: keys.KindEscalation, Family: outbound.FamilyNotification,
+		Content: snapshotContent(t, handlerState(t)), Payload: payload,
 		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
 	}
+}
+
+// snapshotContent wraps a frozen state the way BeginAttempt does.
+func snapshotContent(t *testing.T, state keys.RenderSnapshot) outbound.AttemptContent {
+	t.Helper()
+	content, err := outbound.NewSnapshotContent(state, state.Content().Revision, false)
+	if err != nil {
+		t.Fatalf("build the content: %v", err)
+	}
+	return content
 }
 
 type botAPI struct {
@@ -523,5 +534,41 @@ func TestARedirectIsAnAnswerNotADeadEnd(t *testing.T) {
 	concluded, _ := outbound.Conclude(handler, outbound.Call{AttemptKind: outbound.AttemptCreate}, result, err)
 	if concluded.Outcome() != outbound.OutcomeAmbiguous {
 		t.Fatalf("a redirect concluded %q", concluded.Outcome())
+	}
+}
+
+// TestACallWithNoStateToRenderIsRefused.
+//
+// This channel draws an alert card from a frozen state. A commitment that
+// carries none is one the delivery domain routed here by mistake, and the
+// answer is a deterministic refusal in front of a person - not an empty card.
+//
+// The check asks the content whether it HAS a state rather than looking at
+// whether the state is empty: a zero snapshot renders a message about no alert,
+// with a title of nothing and no link, and it would go out.
+func TestACallWithNoStateToRenderIsRefused(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	call := handlerCall(t, keys.TargetChannel, true)
+	payloadOnly, err := outbound.NewPayloadContent(handlerState(t).Digest())
+	if err != nil {
+		t.Fatalf("build the content: %v", err)
+	}
+	call.Content = payloadOnly
+	call.KeyKind = keys.Kind("handoff")
+
+	result, err := handler.ExecuteAttempt(context.Background(), call)
+	if err == nil {
+		t.Fatal("a commitment with no state to render was sent anyway")
+	}
+	if result.Evidence != outbound.DefinitelyNotSent {
+		t.Fatalf("a call that never went out is recorded as %q", result.Evidence)
+	}
+	if !strings.Contains(result.Summary, "handoff") {
+		t.Fatalf("the refusal does not say what it was: %q", result.Summary)
+	}
+	if len(api.calls) != 0 {
+		t.Fatal("the channel was called anyway")
 	}
 }

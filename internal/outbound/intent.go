@@ -177,7 +177,13 @@ type Intent struct {
 	// with the commitment because everything that ends one - a finalisation, an
 	// expiry, an operator, an alert being acknowledged - has to be able to say
 	// which queue just got shorter without being told separately.
-	Family   string
+	Family string
+	// KeyKind is what sort of claim this commitment came out of. It decides
+	// which shape its payload is in and which of the two content forms an
+	// attempt renders - and it is read from the row rather than inferred,
+	// because two kinds can both be at payload schema 1 and mean different
+	// things.
+	KeyKind  keys.Kind
 	Provider string
 	// TargetKind and TargetRef are the recipient as THIS system names them - a
 	// channel by its provider id, a person by their user id here. Turning the

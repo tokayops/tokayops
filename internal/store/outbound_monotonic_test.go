@@ -241,9 +241,9 @@ func applyOne(t *testing.T, s *Store, intentID, token string,
 		Scan(&recorded, &requested); err != nil {
 		t.Fatalf("read what the attempt applied: %v", err)
 	}
-	if recorded != begun.AppliedRevision {
+	if recorded != revisionOf(t, begun) {
 		t.Fatalf("the attempt rendered revision %d and recorded %d",
-			begun.AppliedRevision, recorded)
+			revisionOf(t, begun), recorded)
 	}
 	renderedIsWhatIsRecorded(t, begun, requested)
 
@@ -252,9 +252,9 @@ func applyOne(t *testing.T, s *Store, intentID, token string,
 	// failure this whole test is about: the card would be permanently showing
 	// an older state with nothing outstanding to fix it, because desired and
 	// applied would already agree.
-	if now := readCard(t, s, intentID); now.Applied != begun.AppliedRevision {
+	if now := readCard(t, s, intentID); now.Applied != revisionOf(t, begun) {
 		t.Fatalf("the card shows revision %d and records %d",
-			begun.AppliedRevision, now.Applied)
+			revisionOf(t, begun), now.Applied)
 	}
 }
 
@@ -275,11 +275,11 @@ func renderedIsWhatIsRecorded(t *testing.T, begun outbound.BeginAttemptResult,
 	requested []byte) {
 
 	t.Helper()
-	if shown := begun.Snapshot.Content().Revision; shown != begun.AppliedRevision {
+	if shown := snapshotOf(t, begun).Content().Revision; shown != revisionOf(t, begun) {
 		t.Fatalf("the worker was handed revision %d to draw and told it is applying %d",
-			shown, begun.AppliedRevision)
+			shown, revisionOf(t, begun))
 	}
-	if digest := begun.Snapshot.Digest(); !bytes.Equal(digest, requested) {
+	if digest := snapshotOf(t, begun).Digest(); !bytes.Equal(digest, requested) {
 		t.Fatalf("the attempt records the digest of a state other than the one "+
 			"it was handed: %x vs %x", requested, digest)
 	}

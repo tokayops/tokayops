@@ -183,7 +183,19 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 	}
 	client := h.newClient(token)
 
-	state := call.State.Content()
+	snapshot, drawn := call.Content.Snapshot()
+	if !drawn {
+		// This channel draws an alert card from a frozen state, and this
+		// commitment has none. Not an empty card: a message about nothing is
+		// worse than a message that did not go.
+		return outbound.Result{
+			Evidence: outbound.DefinitelyNotSent,
+			Summary: fmt.Sprintf(
+				"a %s commitment renders from a state, and this one carries none",
+				call.KeyKind),
+		}, ErrNoContent
+	}
+	state := snapshot.Content()
 	options := messageFor(state, payload)
 
 	if call.AttemptKind == outbound.AttemptMutation {

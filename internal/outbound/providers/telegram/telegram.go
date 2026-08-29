@@ -28,6 +28,11 @@ var ErrNoToken = fmt.Errorf("telegram integration not configured (no token)")
 // row rather than a message that went missing.
 var ErrNoReceipt = fmt.Errorf("telegram: the message to change has no readable coordinates")
 
+// ErrNoContent: the commitment carries no frozen state, and a card is drawn
+// from one. It is a contract violation rather than a delivery failure - the
+// commitment was routed to a channel that cannot render it.
+var ErrNoContent = fmt.Errorf("telegram: this commitment carries no state to render")
+
 const (
 	// telegramDefaultBaseURL is the public Bot API host; overridable in tests via WithBaseURL.
 	telegramDefaultBaseURL = "https://api.telegram.org"

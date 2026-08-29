@@ -145,6 +145,11 @@ var ErrNoToken = fmt.Errorf("slack integration not configured (no token)")
 // row rather than a message that went missing.
 var ErrNoReceipt = fmt.Errorf("slack: the message to change has no readable coordinates")
 
+// ErrNoContent: the commitment carries no frozen state, and a card is drawn
+// from one. It is a contract violation rather than a delivery failure - the
+// commitment was routed to a channel that cannot render it.
+var ErrNoContent = fmt.Errorf("slack: this commitment carries no state to render")
+
 // (ErrNoSlackUserID was removed in Epic 7 Sprint 3 — the dispatcher-level
 // ErrIdentityNotLinked in identity.go covers it generically.)
 

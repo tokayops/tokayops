@@ -403,10 +403,10 @@ func (c *recordingChannel) ExecuteAttempt(_ context.Context,
 	c.mu.Lock()
 	c.targets = append(c.targets, call.Endpoint)
 	// What the provider was actually asked to send, so a test can prove two
-	// attempts of one commitment carried the same message. The digest is the
-	// whole frozen state rather than one field of it: the alerts are what a
-	// group's row changes between attempts, and a title would not notice.
-	c.bytes = append(c.bytes, fmt.Sprintf("%x|%s", call.State.Digest(), call.Payload))
+	// attempts of one commitment carried the same message. The digest is of the
+	// whole content rather than one field of it: the alerts are what a group's
+	// row changes between attempts, and a title would not notice.
+	c.bytes = append(c.bytes, fmt.Sprintf("%x|%s", call.Content.Digest(), call.Payload))
 	sent := len(c.targets)
 	told, failing := c.answer[call.Endpoint]
 	toldErr := c.answerErr[call.Endpoint]

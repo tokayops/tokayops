@@ -49,10 +49,22 @@ func handlerCall(t *testing.T, target keys.Target, interactive bool) outbound.Ca
 	return outbound.Call{
 		IntentID: "intent-1", AttemptID: "attempt-1", Provider: "slack",
 		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
-		Endpoint: "C0001", ProviderKey: "create-key", Revision: 0,
-		State: handlerState(t), Payload: payload,
+		Endpoint: "C0001", ProviderKey: "create-key",
+		KeyKind: keys.KindEscalation, Family: outbound.FamilyNotification,
+		Content: snapshotContent(t, handlerState(t)), Payload: payload,
 		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
 	}
+}
+
+// snapshotContent wraps a frozen state the way BeginAttempt does, so a test
+// call carries what a real one carries.
+func snapshotContent(t *testing.T, state keys.RenderSnapshot) outbound.AttemptContent {
+	t.Helper()
+	content, err := outbound.NewSnapshotContent(state, state.Content().Revision, false)
+	if err != nil {
+		t.Fatalf("build the content: %v", err)
+	}
+	return content
 }
 
 // slackAPI is a fake Slack that records what it was asked and answers however
@@ -559,5 +571,41 @@ func TestACommitmentAddressedTwiceHasToAgree(t *testing.T) {
 				t.Fatalf("the refusal says %q", got)
 			}
 		})
+	}
+}
+
+// TestACallWithNoStateToRenderIsRefused.
+//
+// This channel draws an alert card from a frozen state. A commitment that
+// carries none is one the delivery domain routed here by mistake, and the
+// answer is a deterministic refusal in front of a person - not an empty card.
+//
+// The check asks the content whether it HAS a state rather than looking at
+// whether the state is empty: a zero snapshot renders a message about no alert,
+// with a title of nothing and no link, and it would go out.
+func TestACallWithNoStateToRenderIsRefused(t *testing.T) {
+	api := newSlackAPI(t)
+	handler := handlerFor(api)
+
+	call := handlerCall(t, keys.Target{Kind: keys.TargetChannel, Ref: "C0001"}, true)
+	payloadOnly, err := outbound.NewPayloadContent(handlerState(t).Digest())
+	if err != nil {
+		t.Fatalf("build the content: %v", err)
+	}
+	call.Content = payloadOnly
+	call.KeyKind = keys.Kind("handoff")
+
+	result, err := handler.ExecuteAttempt(context.Background(), call)
+	if err == nil {
+		t.Fatal("a commitment with no state to render was sent anyway")
+	}
+	if result.Evidence != outbound.DefinitelyNotSent {
+		t.Fatalf("a call that never went out is recorded as %q", result.Evidence)
+	}
+	if !strings.Contains(result.Summary, "handoff") {
+		t.Fatalf("the refusal does not say what it was: %q", result.Summary)
+	}
+	if len(api.posts) != 0 {
+		t.Fatal("the channel was called anyway")
 	}
 }

@@ -487,7 +487,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return s.recordPreparation(ctx, tx, req, *intent, shape)
 	}
 
-	stored, err := attemptStateTx(ctx, tx, *intent)
+	content, err := attemptContentTx(ctx, tx, *intent)
 	if err != nil {
 		shape, shapeErr := refusalShape(*intent)
 		if shapeErr != nil {
@@ -501,7 +501,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 
 	// What the call has to be, now that the state it renders has been read and
 	// proved.
-	plan, err := planAttempt(*intent, stored)
+	plan, err := planAttempt(*intent, content)
 	if err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
@@ -535,8 +535,9 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	// precisely the defect the key exists to reveal.
 	providerKey := effect.ProviderKey
 	if plan.Kind == outbound.AttemptMutation {
+		revision, _ := content.Revision()
 		providerKey, err = keys.MutationKey(intent.ID, plan.Operation,
-			stored.Revision, intent.ProviderKeyCodecVersion)
+			revision, intent.ProviderKeyCodecVersion)
 		if err != nil {
 			return outbound.BeginAttemptResult{}, err
 		}
@@ -588,8 +589,8 @@ func (s *Store) BeginAttempt(ctx context.Context,
 			completion_fingerprint_version)
 		VALUES ($1, $2, $3, 'attempt', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), $14)`,
 		attemptID, req.IntentID, attemptNo, intent.GenerationNo, string(plan.Kind),
-		string(plan.Operation), stored.Revision, intent.Provider, effect.Endpoint,
-		providerKey, stored.Snapshot.Digest(), req.LeaseToken,
+		string(plan.Operation), appliedRevision(content), intent.Provider, effect.Endpoint,
+		providerKey, content.Digest(), req.LeaseToken,
 		nilIfEmpty(req.WorkerID), fingerprintVersion,
 	); err != nil {
 		return outbound.BeginAttemptResult{}, fmt.Errorf("open the attempt: %w", err)
@@ -651,8 +652,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		ProviderKey:                  providerKey,
 		Receipt:                      receipt,
 		ReceiptRef:                   name.String,
-		AppliedRevision:              stored.Revision,
-		Snapshot:                     stored.Snapshot,
+		Content:                      content,
 		Payload:                      payload,
 		PayloadSchemaVersion:         intent.PayloadSchemaVersion,
 		CompletionFingerprintVersion: fingerprintVersion,
@@ -705,7 +705,7 @@ type plannedAttempt struct {
 // difference is in the journal and in the key, and in what the commitment does
 // afterwards. Only the state may say which it is: a worker that could declare
 // an attempt final would be able to retire a card the alert is still using.
-func planAttempt(intent outbound.Intent, stored storedSnapshot) (plannedAttempt, error) {
+func planAttempt(intent outbound.Intent, content outbound.AttemptContent) (plannedAttempt, error) {
 	if !intent.HasReceipt {
 		return plannedAttempt{
 			Kind:      outbound.AttemptCreate,
@@ -722,7 +722,7 @@ func planAttempt(intent outbound.Intent, stored storedSnapshot) (plannedAttempt,
 	}
 
 	operation := outbound.OperationUpdate
-	if stored.Final {
+	if content.Final() {
 		operation = outbound.OperationResolve
 	}
 	return plannedAttempt{Kind: outbound.AttemptMutation, Operation: operation}, nil
@@ -1309,4 +1309,17 @@ func detailOf(detail *keys.ProviderResultDetail) any {
 		return nil
 	}
 	return string(*detail)
+}
+
+// appliedRevision is what the attempt row records as the revision it applies,
+// and NULL when the commitment has no revisions at all.
+//
+// Not zero. A commitment drawn from its own payload has no series to be at a
+// position in, and a row saying it applied revision 0 would be claiming to have
+// caught up with a state nobody ever froze.
+func appliedRevision(content outbound.AttemptContent) any {
+	if revision, has := content.Revision(); has {
+		return revision
+	}
+	return nil
 }

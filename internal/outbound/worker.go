@@ -334,8 +334,9 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 		ProviderKey:          begun.ProviderKey,
 		Receipt:              begun.Receipt,
 		ReceiptRef:           begun.ReceiptRef,
-		Revision:             begun.AppliedRevision,
-		State:                begun.Snapshot,
+		KeyKind:              leased.Intent.KeyKind,
+		Family:               w.family,
+		Content:              begun.Content,
 		Payload:              begun.Payload,
 		PayloadSchemaVersion: begun.PayloadSchemaVersion,
 	}
