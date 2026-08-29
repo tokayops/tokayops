@@ -1260,10 +1260,11 @@ func attemptContentTx(ctx context.Context, tx *sql.Tx,
 	//
 	// Not undeliverable: that ends the commitment for good, and a build that
 	// killed work it merely did not understand would destroy exactly what the
-	// newer build was going to deliver. The transaction rolls back, the
-	// commitment stays pending with its lease released, and the instance that
-	// knows the kind picks it up. Same rule as a render snapshot written under
-	// a schema version this build cannot read.
+	// newer build was going to deliver. This transaction rolls back and the
+	// commitment stays pending. Its lease is NOT released by that rollback -
+	// the claim committed it earlier - so the instance that knows the kind
+	// takes it once locked_until passes. Same rule as a render snapshot
+	// written under a schema version this build cannot read.
 	return outbound.AttemptContent{}, outboundContractf(
 		"commitment %s is a %q, which is not a kind of claim this build executes",
 		intent.ID, intent.KeyKind)
