@@ -172,13 +172,22 @@ func (s *Store) SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound
 	if err := contextMatchesKind(admission.Kind, batch.Context.Form()); err != nil {
 		return outbound.SubmitResult{}, err
 	}
+	if err := admissionCarriesWhatItsKindHas(admission); err != nil {
+		return outbound.SubmitResult{}, err
+	}
 
 	switch batch.Context.Form() {
 	case outbound.ContextEscalation:
 		about, _ := batch.Context.Escalation()
 		return s.submitEscalation(ctx, batch, about, string(family))
-	default:
+	case outbound.ContextHandoff:
 		return s.submitHandoff(ctx, batch, string(family))
+	default:
+		// Unreachable while contextMatchesKind is exhaustive, and written out
+		// anyway: a third context added to the pairing above and forgotten here
+		// would otherwise be admitted silently as a handover.
+		return outbound.SubmitResult{}, outboundContractf(
+			"an admission whose context is a %q", batch.Context.Form())
 	}
 }
 
@@ -202,6 +211,49 @@ func contextMatchesKind(kind keys.Kind, form outbound.ContextForm) error {
 		return outboundContractf(
 			"an admission of kind %q offered as a %q; %q admissions are %q",
 			kind, form, kind, want)
+	}
+	return nil
+}
+
+// admissionCarriesWhatItsKindHas checks the alert-specific four together, in
+// both directions.
+//
+// An escalation is ABOUT a state: the group, the frozen snapshot, its schema
+// version and its revision. They travel as one - a claim with three of them is
+// a claim nothing can render from - and a handover has none of them at all.
+//
+// Both directions, because each failure is silent in its own way. A handover
+// carrying a snapshot would have it dropped on the floor here and the claim
+// written without it, so the producer's belief and the row would differ with
+// nobody the wiser. An escalation missing one is caught today by a CHECK in the
+// schema, which reports a constraint name rather than the thing that is wrong -
+// and only after a transaction has been opened and rows attempted.
+func admissionCarriesWhatItsKindHas(admission keys.Admission) error {
+	hasGroup := admission.AlertGroupID != ""
+	hasState := len(admission.Snapshot.Digest()) > 0
+	hasSchema := admission.SnapshotSchemaVersion != 0
+
+	switch admission.Kind {
+	case keys.KindEscalation, keys.KindEscalationReplay:
+		if !hasGroup || !hasState || !hasSchema {
+			return outboundContractf(
+				"an escalation admission is about a state: group=%v snapshot=%v schema=%v",
+				hasGroup, hasState, hasSchema)
+		}
+		if admission.Revision < 0 {
+			return outboundContractf(
+				"an escalation admission at revision %d", admission.Revision)
+		}
+	case keys.KindHandoff:
+		if hasGroup || hasState || hasSchema || admission.Revision != 0 {
+			return outboundContractf(
+				"a handover admission carrying an alert group's state: "+
+					"group=%v snapshot=%v schema=%v revision=%d",
+				hasGroup, hasState, hasSchema, admission.Revision)
+		}
+	default:
+		return outboundContractf(
+			"an admission of kind %q, which this build does not admit", admission.Kind)
 	}
 	return nil
 }

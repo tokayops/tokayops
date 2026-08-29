@@ -86,6 +86,15 @@ func ValidateHandoffAdmission(adm keys.Admission, now time.Time) error {
 		if c.Expiry == nil {
 			return notAdmissiblef("a handover announcement with no deadline")
 		}
+		if c.Expiry.Kind != keys.TimingBounded {
+			// The form matters, not only that there is one. The grammar
+			// fingerprints a bounded deadline's two atoms; a spec swapped to
+			// absolute or relative after the admission was built would still
+			// match that fingerprint while the stored expires_at came out of
+			// entirely different arithmetic.
+			return notAdmissiblef(
+				"a handover deadline is bounded, and this one is %q", c.Expiry.Kind)
+		}
 		if err := c.Expiry.Validate(); err != nil {
 			return notAdmissiblef("expiry: %v", err)
 		}

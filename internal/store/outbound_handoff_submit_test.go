@@ -440,3 +440,82 @@ func TestOnlyAHandoverMayCarryABoundedDeadline(t *testing.T) {
 		}
 	})
 }
+
+// TestAnAdmissionCarriesWhatItsKindHas, both directions.
+//
+// An escalation is about a state - the group, the frozen snapshot, its schema
+// version and its revision - and they travel as one. A handover has none of
+// them.
+//
+// Both halves fail silently in their own way without this. A handover carrying
+// a snapshot has it dropped on the floor, and the claim is written without it:
+// the producer's belief and the row differ with nobody the wiser. An escalation
+// missing one reaches a CHECK in the schema, which names a constraint rather
+// than the thing that is wrong, and only after a transaction has been opened.
+func TestAnAdmissionCarriesWhatItsKindHas(t *testing.T) {
+	t.Run("a handover carrying a state", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.SetRenderEnvironment("https://tokay.example", "UTC")
+		seedUsers(t, s, "u-alice")
+		agID := outboundGroup(t, s)
+
+		batch := handoffBatch(t, "sched-1", announceTo("slack", "u-alice"))
+		// A real snapshot, the way an escalation's admission carries one.
+		batch.Admission.Snapshot = outboundSnapshot(t, agID, "borrowed")
+		batch.Admission.SnapshotSchemaVersion = keys.RenderSnapshotSchemaV1
+
+		before := alertDomainState(t, s)
+		if _, err := s.SubmitBatch(context.Background(), batch); err == nil {
+			t.Fatal("a handover carrying an alert group's state was admitted")
+		} else if !errors.Is(err, ErrOutboundContract) {
+			t.Fatalf("the refusal is not a contract violation: %v", err)
+		}
+		assertNothingAdmitted(t, s, before)
+	})
+
+	t.Run("an escalation missing its state", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.SetRenderEnvironment("https://tokay.example", "UTC")
+		agID := outboundGroup(t, s)
+
+		batch := outboundAdmission(t, agID, "first")
+		batch.Admission.Snapshot = keys.RenderSnapshot{}
+		batch.Admission.SnapshotSchemaVersion = 0
+
+		before := alertDomainState(t, s)
+		_, err := s.SubmitBatch(context.Background(), batch)
+		if err == nil {
+			t.Fatal("an escalation with no state to render from was admitted")
+		}
+		// Refused by the contract layer, which says what is missing - not by a
+		// constraint downstream, which says a constraint name.
+		if !errors.Is(err, ErrOutboundContract) {
+			t.Fatalf("the refusal is not a contract violation: %v", err)
+		}
+		if !strings.Contains(err.Error(), "snapshot") {
+			t.Fatalf("the refusal does not say what is missing: %v", err)
+		}
+		assertNothingAdmitted(t, s, before)
+	})
+}
+
+// TestAHandoverDeadlineIsBounded. Not merely present: the grammar fingerprints
+// a bounded deadline's two atoms, so a spec swapped to absolute or relative
+// after the admission was built still matches that fingerprint while the stored
+// deadline comes out of entirely different arithmetic.
+func TestAHandoverDeadlineIsBounded(t *testing.T) {
+	s := setupTestDB(t)
+	seedUsers(t, s, "u-alice")
+
+	batch := handoffBatch(t, "sched-1", announceTo("slack", "u-alice"))
+	swapped := *batch.Admission.Commitments[0].Expiry
+	swapped.Kind = keys.TimingAbsolute
+	swapped.MaxAge = 0
+	batch.Admission.Commitments[0].Expiry = &swapped
+
+	before := alertDomainState(t, s)
+	if _, err := s.SubmitBatch(context.Background(), batch); err == nil {
+		t.Fatal("a handover carrying another kind of deadline was admitted")
+	}
+	assertNothingAdmitted(t, s, before)
+}
