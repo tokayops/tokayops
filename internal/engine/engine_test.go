@@ -145,8 +145,8 @@ func TestTheTeamDecidesTheRouting(t *testing.T) {
 				t.Fatalf("build the plan: %v", err)
 			}
 
-			if admission.PolicyID != tt.want {
-				t.Errorf("the alert escalates by %q, want %q", admission.PolicyID, tt.want)
+			if escalationOf(t, admission).PolicyID != tt.want {
+				t.Errorf("the alert escalates by %q, want %q", escalationOf(t, admission).PolicyID, tt.want)
 			}
 			// From the same read: a team that answered the routing also answers
 			// whether its people can act on the card.
@@ -314,12 +314,12 @@ func TestEngine_StepWithNoTarget_IsRecordedNotFailed(t *testing.T) {
 		t.Fatalf("expected the firehose alone, got %d commitments",
 			len(admission.Admission.Commitments))
 	}
-	if len(admission.Unpromised) != 1 {
-		t.Fatalf("the step that named nobody was not recorded: %v", admission.Unpromised)
+	if len(escalationOf(t, admission).Unpromised) != 1 {
+		t.Fatalf("the step that named nobody was not recorded: %v", escalationOf(t, admission).Unpromised)
 	}
 	// The reason matters: a step with no recipient sends a reader to the
 	// policy, and "nobody on call" sends them to the schedule.
-	if got := admission.Unpromised[0].Reason; got != outbound.ReasonNoTarget {
+	if got := escalationOf(t, admission).Unpromised[0].Reason; got != outbound.ReasonNoTarget {
 		t.Errorf("the step was recorded as %q", got)
 	}
 }
@@ -1183,7 +1183,7 @@ func (f *fakeSettings) GetSlackInteractive() bool    { return f.slack }
 func (f *fakeSettings) GetTelegramInteractive() bool { return f.telegram }
 
 // promisedUsers is who an admission promises to page, in key order.
-func promisedUsers(admission outbound.EscalationAdmission) []string {
+func promisedUsers(admission outbound.Batch) []string {
 	var out []string
 	for _, commitment := range admission.Admission.Commitments {
 		if commitment.Target.Kind == keys.TargetUser {
@@ -1222,4 +1222,14 @@ func TestAnAdmissionThatPromisedNothingIsCountedAsSuch(t *testing.T) {
 				tt.outcome, tt.commitments, got, tt.want)
 		}
 	}
+}
+
+// escalationOf reads the alert-group half of a batch the engine built.
+func escalationOf(t *testing.T, batch outbound.Batch) outbound.EscalationContext {
+	t.Helper()
+	about, ok := batch.Context.Escalation()
+	if !ok {
+		t.Fatalf("the engine built a %q batch", batch.Context.Form())
+	}
+	return about
 }

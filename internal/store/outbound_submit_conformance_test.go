@@ -30,8 +30,7 @@ type admitting interface {
 		outboxEvent *model.OutboxEvent) (bool, error)
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
 		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
-	SubmitEscalationBatch(ctx context.Context,
-		adm outbound.EscalationAdmission) (outbound.SubmitResult, error)
+	SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound.SubmitResult, error)
 }
 
 func TestBothStoresAdmitTheSameWay(t *testing.T) {
@@ -75,7 +74,7 @@ func TestBothStoresAdmitTheSameWay(t *testing.T) {
 				stale := submitTo(t, s, adm)
 
 				// And replanned against what is there now, it is admitted.
-				adm.SourceVersion = 1
+				adm = withEscalation(adm, func(about *outbound.EscalationContext) { about.SourceVersion = 1 })
 				return []outbound.SubmitOutcome{stale.Outcome, submitTo(t, s, adm).Outcome}
 			},
 		},
@@ -176,9 +175,9 @@ func alertJoins(s admitting, agID string) error {
 	return err
 }
 
-func submitTo(t *testing.T, s admitting, adm outbound.EscalationAdmission) outbound.SubmitResult {
+func submitTo(t *testing.T, s admitting, adm outbound.Batch) outbound.SubmitResult {
 	t.Helper()
-	result, err := s.SubmitEscalationBatch(context.Background(), adm)
+	result, err := s.SubmitBatch(context.Background(), adm)
 	if err != nil {
 		t.Fatalf("submit the admission: %v", err)
 	}

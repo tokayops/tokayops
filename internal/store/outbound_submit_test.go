@@ -56,7 +56,7 @@ func channelCommitment(ref string, offset time.Duration) keys.EscalationCommitme
 }
 
 func outboundAdmission(t *testing.T, groupID, title string,
-	commitments ...keys.EscalationCommitment) outbound.EscalationAdmission {
+	commitments ...keys.EscalationCommitment) outbound.Batch {
 	t.Helper()
 
 	admission, err := keys.EscalationBatch{
@@ -70,15 +70,18 @@ func outboundAdmission(t *testing.T, groupID, title string,
 		t.Fatalf("admit the batch: %v", err)
 	}
 
-	return outbound.EscalationAdmission{
-		Admission:      admission,
-		PolicyID:       "policy-" + title,
-		PolicySnapshot: json.RawMessage(`{"name":"` + title + `"}`),
-		// Who this producer believed was on duty. It travels with the admission
-		// so the winner writes it and the loser does not - the group must not
-		// display one set of people while another set is being paged.
-		OnCallSnapshot: json.RawMessage(`{"l1_users":[],"source":"` + title + `"}`),
-		Actor:          "engine",
+	return outbound.Batch{
+		Admission: admission,
+		Context: outbound.EscalatingAlertGroup(outbound.EscalationContext{
+			PolicyID:       "policy-" + title,
+			PolicySnapshot: json.RawMessage(`{"name":"` + title + `"}`),
+			// Who this producer believed was on duty. It travels with the
+			// admission so the winner writes it and the loser does not - the
+			// group must not display one set of people while another set is
+			// being paged.
+			OnCallSnapshot: json.RawMessage(`{"l1_users":[],"source":"` + title + `"}`),
+		}),
+		Actor: "engine",
 	}
 }
 
@@ -95,9 +98,9 @@ func storedOnCall(t *testing.T, s *Store, agID string) string {
 	return source.String
 }
 
-func mustSubmit(t *testing.T, s *Store, adm outbound.EscalationAdmission) outbound.SubmitResult {
+func mustSubmit(t *testing.T, s *Store, adm outbound.Batch) outbound.SubmitResult {
 	t.Helper()
-	result, err := s.SubmitEscalationBatch(context.Background(), adm)
+	result, err := s.SubmitBatch(context.Background(), adm)
 	if err != nil {
 		t.Fatalf("submit the admission: %v", err)
 	}
@@ -348,7 +351,7 @@ func TestSubmitConcurrentProducers(t *testing.T) {
 }
 
 func submitConcurrently(t *testing.T, s *Store,
-	admissions ...outbound.EscalationAdmission) map[outbound.SubmitOutcome]int {
+	admissions ...outbound.Batch) map[outbound.SubmitOutcome]int {
 	t.Helper()
 
 	var wg sync.WaitGroup
@@ -358,10 +361,10 @@ func submitConcurrently(t *testing.T, s *Store,
 
 	for i, adm := range admissions {
 		wg.Add(1)
-		go func(i int, adm outbound.EscalationAdmission) {
+		go func(i int, adm outbound.Batch) {
 			defer wg.Done()
 			<-start
-			results[i], errs[i] = s.SubmitEscalationBatch(context.Background(), adm)
+			results[i], errs[i] = s.SubmitBatch(context.Background(), adm)
 		}(i, adm)
 	}
 	close(start)
@@ -411,9 +414,11 @@ func TestSubmitRecordsAnAdmissionWithNobodyToNotify(t *testing.T) {
 	agID := outboundGroup(t, s)
 
 	adm := outboundAdmission(t, agID, "first")
-	adm.Unpromised = []outbound.UnpromisedStep{{
-		Step: "schedule sched-1", Reason: outbound.ReasonNobodyOnCall,
-	}}
+	adm = withEscalation(adm, func(about *outbound.EscalationContext) {
+		about.Unpromised = []outbound.UnpromisedStep{{
+			Step: "schedule sched-1", Reason: outbound.ReasonNobodyOnCall,
+		}}
+	})
 
 	result := mustSubmit(t, s, adm)
 	if result.Outcome != outbound.SubmitCreated {
@@ -516,7 +521,7 @@ func TestSubmitRefusesWhatThisBuildCannotDeliver(t *testing.T) {
 			commitment := channelCommitment("C0001", 0)
 			tc.change(&commitment)
 
-			_, err := s.SubmitEscalationBatch(context.Background(),
+			_, err := s.SubmitBatch(context.Background(),
 				outboundAdmission(t, agID, "first", commitment))
 			if err == nil {
 				t.Fatal("the admission gate accepted a delivery this build cannot make")
@@ -565,7 +570,7 @@ func TestSubmitWithoutAnOnCallAnswerRecordsNothing(t *testing.T) {
 	t.Run("a fresh group is left empty", func(t *testing.T) {
 		agID := outboundGroup(t, s)
 		adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
-		adm.OnCallSnapshot = nil
+		adm = withEscalation(adm, func(about *outbound.EscalationContext) { about.OnCallSnapshot = nil })
 
 		mustSubmit(t, s, adm)
 
@@ -589,7 +594,7 @@ func TestSubmitWithoutAnOnCallAnswerRecordsNothing(t *testing.T) {
 		}
 
 		adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
-		adm.OnCallSnapshot = nil
+		adm = withEscalation(adm, func(about *outbound.EscalationContext) { about.OnCallSnapshot = nil })
 		mustSubmit(t, s, adm)
 
 		if got := storedOnCall(t, s, agID); got != "earlier" {
@@ -794,7 +799,7 @@ func TestSubmitRefusesAClaimThatIsNotAboutThisAdmission(t *testing.T) {
 
 			damage(t, agID)
 
-			_, err := s.SubmitEscalationBatch(ctx, adm)
+			_, err := s.SubmitBatch(ctx, adm)
 			if !errors.Is(err, ErrOutboundContract) {
 				t.Fatalf("a claim that is not about this admission answered %v", err)
 			}
@@ -807,4 +812,14 @@ func exec(t *testing.T, s *Store, query string, args ...any) {
 	if _, err := s.db.Exec(query, args...); err != nil {
 		t.Fatalf("run %s: %v", query, err)
 	}
+}
+
+// withEscalation edits the alert-group half of a batch a test has built. The
+// context is a closed form, so a test cannot reach inside it - and that is the
+// point; this is the one place that rebuilds it.
+func withEscalation(batch outbound.Batch, edit func(*outbound.EscalationContext)) outbound.Batch {
+	about, _ := batch.Context.Escalation()
+	edit(&about)
+	batch.Context = outbound.EscalatingAlertGroup(about)
+	return batch
 }

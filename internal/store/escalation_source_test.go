@@ -171,7 +171,7 @@ func TestSubmitRefusesAPlanBuiltFromStateThatMoved(t *testing.T) {
 
 	// And the same plan, rebuilt against the version that is actually there, is
 	// admitted - the refusal is a "not yet", not a dead end.
-	adm.SourceVersion = 1
+	adm = withEscalation(adm, func(about *outbound.EscalationContext) { about.SourceVersion = 1 })
 	if got := mustSubmit(t, s, adm).Outcome; got != outbound.SubmitCreated {
 		t.Fatalf("the replanned admission answered %q", got)
 	}

@@ -75,17 +75,17 @@ const firehoseProvider = "slack"
 // and handed in: the snapshot stored on the group and the people paged have to
 // be the same answer, and two reads a moment apart can straddle a handoff.
 func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup,
-	teamOnCall schedulerender.TeamOnCallResult) (outbound.EscalationAdmission, error) {
+	teamOnCall schedulerender.TeamOnCallResult) (outbound.Batch, error) {
 
 	team, err := p.teamFor(ag.TeamID)
 	if err != nil {
-		return outbound.EscalationAdmission{}, err
+		return outbound.Batch{}, err
 	}
 
 	policyID := team.route(ag.Severity)
 	policy, err := p.policyFor(policyID)
 	if err != nil {
-		return outbound.EscalationAdmission{}, err
+		return outbound.Batch{}, err
 	}
 	if policy == nil {
 		policyID = ""
@@ -93,7 +93,7 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup,
 
 	state, err := p.freeze(ag, team)
 	if err != nil {
-		return outbound.EscalationAdmission{}, err
+		return outbound.Batch{}, err
 	}
 
 	plan := *p
@@ -107,7 +107,7 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup,
 
 	planned, unpromised, err := plan.commitments(ctx, people, policy, teamOnCall)
 	if err != nil {
-		return outbound.EscalationAdmission{}, err
+		return outbound.Batch{}, err
 	}
 
 	commitments := make([]keys.EscalationCommitment, 0, len(planned))
@@ -123,20 +123,22 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup,
 		Commitments:        commitments,
 	}.Admit()
 	if err != nil {
-		return outbound.EscalationAdmission{}, fmt.Errorf("build the admission for %s: %w", ag.ID, err)
+		return outbound.Batch{}, fmt.Errorf("build the admission for %s: %w", ag.ID, err)
 	}
 
-	return outbound.EscalationAdmission{
+	return outbound.Batch{
 		Admission: admission,
-		// What the snapshot above was frozen from, checked again under the
-		// lock that decides the admission: a plan built a moment too early is
-		// refused whole rather than held forever.
-		SourceVersion:  ag.RenderSourceVersion,
-		PolicyID:       policyID,
-		PolicySnapshot: policySnapshot(policyID, policy, planned),
-		OnCallSnapshot: plan.onCallSnapshot(ag.ID, people, teamOnCall),
-		Unpromised:     unpromised,
-		Actor:          "engine",
+		Context: outbound.EscalatingAlertGroup(outbound.EscalationContext{
+			// What the snapshot above was frozen from, checked again under the
+			// lock that decides the admission: a plan built a moment too early
+			// is refused whole rather than held forever.
+			SourceVersion:  ag.RenderSourceVersion,
+			PolicyID:       policyID,
+			PolicySnapshot: policySnapshot(policyID, policy, planned),
+			OnCallSnapshot: plan.onCallSnapshot(ag.ID, people, teamOnCall),
+			Unpromised:     unpromised,
+		}),
+		Actor: "engine",
 	}, nil
 }
 

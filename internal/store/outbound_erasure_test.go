@@ -486,7 +486,7 @@ func TestAdmissionWaitsForAnErasureItCannotSee(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		result, err := s.SubmitEscalationBatch(ctx, adm)
+		result, err := s.SubmitBatch(ctx, adm)
 		if err != nil {
 			failed <- err
 			return

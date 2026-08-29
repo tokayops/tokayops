@@ -49,6 +49,50 @@ func DeliversThrough(provider string) bool { return notificationProviders[provid
 // checked at admission rather than at delivery because that is the last moment
 // a refusal costs nothing: afterwards the promise exists, and the only ways out
 // of it are a failed delivery and an operator.
+// ValidateHandoffAdmission is the same gate for a shift-change announcement.
+//
+// The shared half is shared, and the differences are named rather than
+// inherited: a handover is one-shot by definition, so nothing here asks about
+// editability; and its deadline is allowed to be in the past, because a shift
+// that began and ended while the system was stopped is a fact, and an
+// announcement about it should be admitted and expire at once rather than be
+// refused at the door - refusing it would lose the record that it was owed.
+func ValidateHandoffAdmission(adm keys.Admission, now time.Time) error {
+	if adm.BatchKey == "" {
+		return notAdmissiblef("an admission with no claim")
+	}
+	if len(adm.Fingerprint) == 0 {
+		return notAdmissiblef("an admission with no fingerprint")
+	}
+	for _, c := range adm.Commitments {
+		if !notificationProviders[c.Provider] {
+			return notAdmissiblef("provider %q is not one this build delivers through", c.Provider)
+		}
+		if c.CompletionMode != keys.CompletionOnAcceptance {
+			return notAdmissiblef(
+				"completion mode %q needs provider receipts, which this build cannot receive",
+				c.CompletionMode)
+		}
+		switch c.AmbiguityPolicy {
+		case keys.PolicyRetry, keys.PolicyManualReview:
+		default:
+			return notAdmissiblef(
+				"ambiguity policy %q is not one a handover announcement may carry",
+				c.AmbiguityPolicy)
+		}
+		if c.Editable {
+			return notAdmissiblef("a handover announcement that claims to be editable")
+		}
+		if c.Expiry == nil {
+			return notAdmissiblef("a handover announcement with no deadline")
+		}
+		if err := c.Expiry.Validate(); err != nil {
+			return notAdmissiblef("expiry: %v", err)
+		}
+	}
+	return nil
+}
+
 func ValidateEscalationAdmission(adm keys.Admission, now time.Time) error {
 	if adm.BatchKey == "" {
 		return notAdmissiblef("an admission with no claim")

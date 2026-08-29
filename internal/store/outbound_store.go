@@ -118,14 +118,68 @@ func undeliverablef(format string, args ...any) error {
 // wrote the policy snapshot before knowing whether it won would let the loser
 // overwrite the winner's, leaving a group describing one escalation and
 // executing another.
-func (s *Store) SubmitEscalationBatch(ctx context.Context,
-	adm outbound.EscalationAdmission) (outbound.SubmitResult, error) {
-
-	admission := adm.Admission
+// SubmitBatch admits one batch of commitments, whatever the batch is about.
+//
+// One command with two closed forms of context rather than two commands: the
+// half that is the same for both - what is already claimed, locking the
+// recipients, writing the claim and the commitments - is the half where a
+// second implementation would eventually disagree with the first, and the
+// disagreement would be about idempotency.
+//
+// The ORDER of operations differs between the two, and deliberately:
+//
+//	escalation                      handoff
+//	----------                      -------
+//	1. lock the alert group         1. existing / conflict
+//	2. existing / conflict          2. lock the recipients
+//	3. lock the recipients          3. checks of its own kind
+//	4. checks: status, source       4. claim + commitments
+//	5. claim + commitments
+//	   + writes to the group
+//
+// An escalation locks its group first because everything it decides is about
+// that group and the lock is what makes those decisions consistent; moving the
+// existing-claim read above it would buy an extra read and a recheck for a
+// branch that is already cheap. A handover has no group, so the claim is read
+// first, and two producers that both find nothing are separated by the unique
+// index on the claim - which is what it is for.
+func (s *Store) SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound.SubmitResult, error) {
+	admission := batch.Admission
 	if len(admission.Commitments) != 0 && admission.Outcome != keys.OutcomeAdmitted {
 		return outbound.SubmitResult{}, outboundContractf(
 			"an admission of %d commitments carrying outcome %q",
 			len(admission.Commitments), admission.Outcome)
+	}
+
+	// The family is DERIVED from the kind of claim, never taken from the
+	// caller. Given both, a caller could write a paging key into the handover
+	// partition, and the row would then be executed by the wrong worker, be
+	// counted in the wrong series and be alerted on by the wrong rule.
+	family, err := keys.FamilyOf(admission.Kind)
+	if err != nil {
+		return outbound.SubmitResult{}, outboundContractf("%v", err)
+	}
+
+	switch batch.Context.Form() {
+	case outbound.ContextEscalation:
+		about, _ := batch.Context.Escalation()
+		return s.submitEscalation(ctx, batch, about, string(family))
+	case outbound.ContextHandoff:
+		return s.submitHandoff(ctx, batch, string(family))
+	default:
+		return outbound.SubmitResult{}, outboundContractf(
+			"an admission whose context is a %q", batch.Context.Form())
+	}
+}
+
+// submitEscalation admits an alert group's escalation.
+func (s *Store) submitEscalation(ctx context.Context, batch outbound.Batch,
+	about outbound.EscalationContext, family string) (outbound.SubmitResult, error) {
+
+	admission := batch.Admission
+	if admission.AlertGroupID == "" {
+		return outbound.SubmitResult{}, outboundContractf(
+			"an escalation admission that is about no alert group")
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -173,24 +227,13 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 		return held, nil
 	}
 
-	// Nobody is promised a message who is not there to receive one.
-	//
-	// The one-time sweep an erasure performs cannot cover this on its own: a
-	// producer can have built its plan BEFORE the erasure and be inserting it
-	// after, and the commitments it inserts would be aimed at an address that
-	// was just deleted. So admission asks, under a lock, and refuses the whole
-	// batch - the next tick plans the group again without that person.
-	//
-	// After the existing-claim read on purpose: a repeat of an admission that
-	// was accepted before the erasure is still that admission, and answering it
-	// with a refusal would make a lost reply look like a rejected plan.
-	if erased, err := erasedRecipients(ctx, tx, admission); err != nil {
+	if settled, done, err := lockRecipients(ctx, tx, admission); err != nil {
 		return outbound.SubmitResult{}, err
-	} else if len(erased) > 0 {
+	} else if done {
 		if err := tx.Commit(); err != nil {
 			return outbound.SubmitResult{}, err
 		}
-		return outbound.SubmitResult{Outcome: outbound.SubmitRecipientErased}, nil
+		return settled, nil
 	}
 
 	if err := outbound.ValidateEscalationAdmission(admission, now); err != nil {
@@ -218,15 +261,13 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 	// Nothing is written and nothing is claimed. A batch inserted here would
 	// hold the group's one escalation under a plan built from stale state, and
 	// no later revision would ever correct it.
-	if adm.SourceVersion != version {
+	if about.SourceVersion != version {
 		if err := tx.Commit(); err != nil {
 			return outbound.SubmitResult{}, err
 		}
 		return outbound.SubmitResult{Outcome: outbound.SubmitSourceChanged}, nil
 	}
 
-	batchID := uuid.New().String()
-	var admittedAt time.Time
 	// The state this set was admitted from, frozen with the claim. It is what a
 	// one-shot message renders forever after: the group's own snapshot moves
 	// on, and a direct message that followed it would send different bytes
@@ -236,23 +277,13 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 		return outbound.SubmitResult{}, fmt.Errorf("freeze the admitted state: %w", err)
 	}
 
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO outbound_batches
-			(id, batch_key, key_kind, delivery_family, grammar_version, alert_group_id,
-			 fingerprint, fingerprint_version, admission_outcome, intent_count,
-			 admission_snapshot, admission_digest, admission_schema_version,
-			 admission_revision)
-		VALUES ($1, $2, $3, 'notification', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-		ON CONFLICT (batch_key) DO NOTHING
-		RETURNING id, admitted_at`,
-		batchID, admission.BatchKey, string(admission.Kind), admission.GrammarVersion,
-		admission.AlertGroupID, admission.Fingerprint, admission.FingerprintVersion,
-		string(admission.Outcome), len(admission.Commitments),
-		frozen, admission.Snapshot.Digest(), admission.SnapshotSchemaVersion,
-		admission.Revision,
-	).Scan(&batchID, &admittedAt)
-
-	if errors.Is(err, sql.ErrNoRows) {
+	batchID, admittedAt, won, err := claimBatchTx(ctx, tx, admission, family,
+		admission.AlertGroupID, frozen, admission.Snapshot.Digest(),
+		admission.SnapshotSchemaVersion, admission.Revision)
+	if err != nil {
+		return outbound.SubmitResult{}, err
+	}
+	if !won {
 		// Somebody else holds this claim. Nothing about the group is written on
 		// this path - the winner already said what the group is escalating by.
 		result, lostErr := lostAdmission(ctx, tx, admission)
@@ -264,11 +295,8 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 		}
 		return result, nil
 	}
-	if err != nil {
-		return outbound.SubmitResult{}, fmt.Errorf("claim the admission: %w", err)
-	}
 
-	intentIDs, err := insertCommitmentsTx(ctx, tx, batchID, admission, admittedAt, adm.Actor)
+	intentIDs, err := insertCommitmentsTx(ctx, tx, batchID, admission, family, admittedAt, batch.Actor)
 	if err != nil {
 		return outbound.SubmitResult{}, err
 	}
@@ -276,16 +304,12 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 	// The state the commitments are about. Written even when there is nobody to
 	// notify: a group that was admitted has a snapshot, or a later re-admission
 	// would start from nothing.
-	snapshot, err := json.Marshal(admission.Snapshot)
-	if err != nil {
-		return outbound.SubmitResult{}, fmt.Errorf("store the snapshot: %w", err)
-	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO outbound_group_snapshots
 			(alert_group_id, revision, snapshot_schema_version, snapshot, snapshot_digest)
 		VALUES ($1, $2, $3, $4, $5)`,
 		admission.AlertGroupID, admission.Revision, admission.SnapshotSchemaVersion,
-		snapshot, admission.Snapshot.Digest()); err != nil {
+		frozen, admission.Snapshot.Digest()); err != nil {
 		return outbound.SubmitResult{}, fmt.Errorf("store the snapshot: %w", err)
 	}
 
@@ -306,13 +330,13 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 		    updated_at = now()
 		WHERE id = $6`,
 		model.AlertGroupStatusNew, model.AlertGroupStatusProcessing,
-		adm.PolicyID, nullableJSON(adm.PolicySnapshot),
-		nullableJSON(adm.OnCallSnapshot), admission.AlertGroupID,
+		about.PolicyID, nullableJSON(about.PolicySnapshot),
+		nullableJSON(about.OnCallSnapshot), admission.AlertGroupID,
 	); err != nil {
 		return outbound.SubmitResult{}, fmt.Errorf("record the escalation on the group: %w", err)
 	}
 
-	if err := admissionTimelineTx(ctx, tx, adm, admission); err != nil {
+	if err := admissionTimelineTx(ctx, tx, batch, about, admission); err != nil {
 		return outbound.SubmitResult{}, err
 	}
 
@@ -324,6 +348,179 @@ func (s *Store) SubmitEscalationBatch(ctx context.Context,
 		BatchID:   batchID,
 		IntentIDs: intentIDs,
 	}, nil
+}
+
+// submitHandoff admits a shift change announcement.
+//
+// It writes nothing in the alert domain: no snapshot row, no timeline line, no
+// column on any alert group. That is not an omission to be checked for later -
+// it is the whole difference between the two contexts, and it is asserted by a
+// test rather than left to the shape of the code.
+func (s *Store) submitHandoff(ctx context.Context, batch outbound.Batch,
+	family string) (outbound.SubmitResult, error) {
+
+	admission := batch.Admission
+	if admission.AlertGroupID != "" {
+		return outbound.SubmitResult{}, outboundContractf(
+			"a handover admission claiming to be about alert group %s", admission.AlertGroupID)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return outbound.SubmitResult{}, err
+	}
+	defer tx.Rollback()
+
+	// There is no group to take the clock from, so it is asked for directly -
+	// the same clock, in the same transaction, for the same reason: nothing
+	// this transaction decides about time may come from a process.
+	var now time.Time
+	if err := tx.QueryRowContext(ctx, `SELECT now()`).Scan(&now); err != nil {
+		return outbound.SubmitResult{}, err
+	}
+
+	// The claim first. Two producers that both find nothing here are separated
+	// by the unique index below, and the loser goes down the same path an
+	// escalation's loser does.
+	if held, found, err := existingAdmission(ctx, tx, admission); err != nil {
+		return outbound.SubmitResult{}, err
+	} else if found {
+		if err := tx.Commit(); err != nil {
+			return outbound.SubmitResult{}, err
+		}
+		return held, nil
+	}
+
+	if settled, done, err := lockRecipients(ctx, tx, admission); err != nil {
+		return outbound.SubmitResult{}, err
+	} else if done {
+		if err := tx.Commit(); err != nil {
+			return outbound.SubmitResult{}, err
+		}
+		return settled, nil
+	}
+
+	if err := outbound.ValidateHandoffAdmission(admission, now); err != nil {
+		return outbound.SubmitResult{}, err
+	}
+
+	batchID, admittedAt, won, err := claimBatchTx(ctx, tx, admission, family,
+		"", nil, nil, 0, 0)
+	if err != nil {
+		return outbound.SubmitResult{}, err
+	}
+	if !won {
+		result, lostErr := lostAdmission(ctx, tx, admission)
+		if lostErr != nil {
+			return outbound.SubmitResult{}, lostErr
+		}
+		if err := tx.Commit(); err != nil {
+			return outbound.SubmitResult{}, err
+		}
+		return result, nil
+	}
+
+	intentIDs, err := insertCommitmentsTx(ctx, tx, batchID, admission, family, admittedAt, batch.Actor)
+	if err != nil {
+		return outbound.SubmitResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return outbound.SubmitResult{}, err
+	}
+	return outbound.SubmitResult{
+		Outcome:   outbound.SubmitCreated,
+		BatchID:   batchID,
+		IntentIDs: intentIDs,
+	}, nil
+}
+
+// claimBatchTx writes the claim, and reports whether this producer won it.
+//
+// The frozen state is optional because only some kinds have one: an escalation
+// freezes the alert group's snapshot, a handover has nothing to freeze. The
+// schema refuses the wrong combination for each kind, so the four values travel
+// together or not at all.
+func claimBatchTx(ctx context.Context, tx *sql.Tx, admission keys.Admission,
+	family, alertGroupID string, frozen, digest []byte,
+	schemaVersion int, revision int64) (string, time.Time, bool, error) {
+
+	batchID := uuid.New().String()
+	var admittedAt time.Time
+	err := tx.QueryRowContext(ctx, `
+		INSERT INTO outbound_batches
+			(id, batch_key, key_kind, delivery_family, grammar_version, alert_group_id,
+			 fingerprint, fingerprint_version, admission_outcome, intent_count,
+			 admission_snapshot, admission_digest, admission_schema_version,
+			 admission_revision)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		ON CONFLICT (batch_key) DO NOTHING
+		RETURNING id, admitted_at`,
+		batchID, admission.BatchKey, string(admission.Kind), family,
+		admission.GrammarVersion, nilIfEmpty(alertGroupID),
+		admission.Fingerprint, admission.FingerprintVersion,
+		string(admission.Outcome), len(admission.Commitments),
+		nullableJSON(frozen), nilIfEmptyBytes(digest),
+		nilIfZero(schemaVersion), nilIfZeroRevision(schemaVersion, revision),
+	).Scan(&batchID, &admittedAt)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, fmt.Errorf("claim the admission: %w", err)
+	}
+	return batchID, admittedAt, true, nil
+}
+
+// nilIfEmptyBytes keeps an absent digest absent rather than storing an empty
+// one, which the length rule would refuse anyway.
+func nilIfEmptyBytes(value []byte) any {
+	if len(value) == 0 {
+		return nil
+	}
+	return value
+}
+
+func nilIfZero(value int) any {
+	if value == 0 {
+		return nil
+	}
+	return value
+}
+
+// nilIfZeroRevision keeps the revision absent exactly when the rest of the
+// frozen state is. Revision zero is a real revision, so it cannot decide for
+// itself; the schema version is what says whether there is a state at all.
+func nilIfZeroRevision(schemaVersion int, revision int64) any {
+	if schemaVersion == 0 {
+		return nil
+	}
+	return revision
+}
+
+// subjectLabel names what a claim is about, so a refusal can say "no alert
+// group" instead of the empty string.
+func subjectLabel(present bool, id string) string {
+	if !present {
+		return "no alert group"
+	}
+	return "alert group " + id
+}
+
+// lockRecipients locks every person this admission promises to reach and
+// reports whether the batch has to be refused because one of them is gone.
+func lockRecipients(ctx context.Context, tx *sql.Tx,
+	admission keys.Admission) (outbound.SubmitResult, bool, error) {
+
+	erased, err := erasedRecipients(ctx, tx, admission)
+	if err != nil {
+		return outbound.SubmitResult{}, false, err
+	}
+	if len(erased) > 0 {
+		return outbound.SubmitResult{Outcome: outbound.SubmitRecipientErased}, true, nil
+	}
+	return outbound.SubmitResult{}, false, nil
 }
 
 // erasedRecipients locks EVERY person this admission promises to reach and
@@ -420,7 +617,8 @@ func lostAdmission(ctx context.Context, tx *sql.Tx,
 func existingAdmission(ctx context.Context, tx *sql.Tx,
 	admission keys.Admission) (outbound.SubmitResult, bool, error) {
 
-	var existingID, existingGroup, existingKind string
+	var existingID, existingKind string
+	var existingGroup sql.NullString
 	var existingGrammar int
 	var existingFingerprint []byte
 	var existingVersion int
@@ -445,10 +643,21 @@ func existingAdmission(ctx context.Context, tx *sql.Tx,
 	//
 	// This is the grammar and the stored row disagreeing, which no producer can
 	// fix and no retry improves.
-	if existingGroup != admission.AlertGroupID {
+	// The subject is nullable now, and both directions are covered by one
+	// comparison: a claim of a kind that has a subject must name the same one,
+	// and a claim of a kind that has none must name nothing.
+	//
+	// One comparison is enough because the empty string is how "no alert group"
+	// is spelled on both sides - a scanned NULL gives "", and an admission with
+	// no subject carries "". A separate NULL check would defend nothing: a
+	// stored row cannot hold an empty group id, the foreign key sees to that.
+	// What could not be left to SQL is the comparison itself, since NULL is
+	// neither equal nor unequal to NULL.
+	if existingGroup.String != admission.AlertGroupID {
 		return outbound.SubmitResult{}, false, outboundContractf(
-			"admission %s is held for alert group %s, this one is for %s",
-			admission.BatchKey, existingGroup, admission.AlertGroupID)
+			"admission %s is held for %s, this one is for %s",
+			admission.BatchKey, subjectLabel(existingGroup.Valid, existingGroup.String),
+			subjectLabel(admission.AlertGroupID != "", admission.AlertGroupID))
 	}
 	if existingKind != string(admission.Kind) {
 		return outbound.SubmitResult{}, false, outboundContractf(
@@ -488,7 +697,8 @@ func existingAdmission(ctx context.Context, tx *sql.Tx,
 // rows in the same sequence, so a violation of the key grammar surfaces as one
 // deterministic unique-violation instead of as a deadlock nobody can read.
 func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
-	admission keys.Admission, admittedAt time.Time, actor string) ([]string, error) {
+	admission keys.Admission, family string, admittedAt time.Time,
+	actor string) ([]string, error) {
 
 	ids := make([]string, 0, len(admission.Commitments))
 	for _, c := range admission.Commitments {
@@ -519,7 +729,7 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 				ambiguity_policy, payload_schema_version, payload, provider_key_codec_version,
 				status, desired_revision, not_before, next_attempt_at, expires_at)
 			VALUES (
-				$1, $2, $3, 'notification', $4, $5,
+				$1, $2, $3, $20, $4, $5,
 				$6, $7, $8, $9, $10, $11,
 				$12, $13, $14, $15,
 				'pending', $16,
@@ -528,12 +738,12 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 				$19)`,
 			id, batchID, c.IdempotencyKey,
 			string(admission.Kind), admission.GrammarVersion,
-			c.Provider, string(c.Target.Kind), c.Target.Ref, admission.AlertGroupID,
+			c.Provider, string(c.Target.Kind), c.Target.Ref, nilIfEmpty(admission.AlertGroupID),
 			string(form), string(c.CompletionMode),
 			string(c.AmbiguityPolicy), c.PayloadSchemaVersion, payload, keys.ProviderKeyCodecV1,
 			admission.Revision,
 			admittedAt, offset.Seconds(),
-			expiresAt,
+			expiresAt, family,
 		); err != nil {
 			return nil, fmt.Errorf("write the commitment %s: %w", c.IdempotencyKey, err)
 		}
@@ -575,6 +785,24 @@ func expiryOf(spec *keys.TimingSpec, admittedAt time.Time) (*time.Time, error) {
 	case keys.TimingRelativeToAdmission:
 		at := admittedAt.Add(spec.Offset)
 		return &at, nil
+	case keys.TimingBounded:
+		// The earlier of the two, computed here because one half of it is
+		// measured from admission and only this transaction knows when that
+		// was. The RESULT is what is stored; the two atoms are what were
+		// fingerprinted, so a repeat computing a different result is still the
+		// same admission.
+		//
+		// A result already in the past is kept, not clamped. It says the work
+		// arrived too late to be worth doing, and the sweep ends it visibly -
+		// which is a different fact from "expires in a moment", and the one an
+		// operator needs.
+		domain := spec.At.UTC()
+		age := admittedAt.Add(spec.MaxAge)
+		at := domain
+		if age.Before(at) {
+			at = age
+		}
+		return &at, nil
 	default:
 		return nil, outboundContractf("unknown expiry kind %q", spec.Kind)
 	}
@@ -582,19 +810,19 @@ func expiryOf(spec *keys.TimingSpec, admittedAt time.Time) (*time.Time, error) {
 
 // admissionTimelineTx records what the admission decided in the group's own
 // history - including, and especially, that it found nobody to notify.
-func admissionTimelineTx(ctx context.Context, tx *sql.Tx,
-	adm outbound.EscalationAdmission, admission keys.Admission) error {
+func admissionTimelineTx(ctx context.Context, tx *sql.Tx, batch outbound.Batch,
+	about outbound.EscalationContext, admission keys.Admission) error {
 
 	if admission.Outcome == keys.OutcomeNoTargets {
 		if err := addTimelineTx(ctx, tx, admission.AlertGroupID,
 			model.TimelineEventNotificationFailed,
-			"Escalation admitted with nobody to notify", adm.Actor); err != nil {
+			"Escalation admitted with nobody to notify", batch.Actor); err != nil {
 			return err
 		}
 	}
-	for _, step := range adm.Unpromised {
+	for _, step := range about.Unpromised {
 		if err := addTimelineWithTx(ctx, tx, admission.AlertGroupID,
-			model.TimelineEventNotificationFailed, unpromisedMessage(step), adm.Actor,
+			model.TimelineEventNotificationFailed, unpromisedMessage(step), batch.Actor,
 			map[string]string{"step": step.Step, "reason": string(step.Reason)}); err != nil {
 			return err
 		}

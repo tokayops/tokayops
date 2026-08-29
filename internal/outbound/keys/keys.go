@@ -112,6 +112,14 @@ func CurrentGrammarVersion(kind Kind) (int, error) {
 // it identifies cannot be recorded at all, so it is refused up front instead.
 const MaxClientRequestID = 128
 
+// FamilyOf answers which worker partition a kind is executed in.
+//
+// Exported because the store derives the column from the kind rather than
+// taking both: given both, a caller could write a paging key into the handover
+// partition, and the row would be executed by the wrong worker and alerted on
+// by the wrong rule.
+func FamilyOf(kind Kind) (Family, error) { return familyOf(kind) }
+
 // familyOf answers which worker partition a kind is executed in. It is derived
 // rather than passed in: a caller free to name both is a caller free to write a
 // notification key into the webhook partition.

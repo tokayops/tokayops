@@ -39,7 +39,7 @@ type Engine struct {
 // escalationStore is the store as the escalation engine needs it: find the
 // groups nobody has been paged for, learn who to page, and admit the escalation.
 //
-// SubmitEscalationBatch is the one that carries the boundary, and everything the
+// SubmitBatch is the one that carries the boundary, and everything the
 // engine decides about a group goes through it. Anything written beside it -
 // the policy, who was on duty - would be written by producers that lost the
 // claim as readily as by the one that won.
@@ -58,14 +58,13 @@ type escalationStore interface {
 	// it: whatever the builder may read, the engine may read.
 	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
 
-	// SubmitEscalationBatch admits the whole escalation in one commit: the
+	// SubmitBatch admits the whole escalation in one commit: the
 	// claim over the group, its commitments, the state they render from, the
 	// policy they were built against and who was on duty when the alert
 	// arrived. Split into separate calls, a crash between them leaves a group
 	// that looks handled and is not - and a loser of the claim describing an
 	// escalation somebody else is running.
-	SubmitEscalationBatch(ctx context.Context,
-		adm outbound.EscalationAdmission) (outbound.SubmitResult, error)
+	SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound.SubmitResult, error)
 }
 
 // NewEngine builds the alert engine. The on-call projection is shared with the
@@ -193,7 +192,7 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 			continue
 		}
 
-		result, err := e.store.SubmitEscalationBatch(ctx, admission)
+		result, err := e.store.SubmitBatch(ctx, admission)
 		if err != nil {
 			log.Printf("AlertEngine: Failed to admit the escalation for %s (will retry): %v", ag.ID, err)
 			continue
@@ -221,9 +220,10 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		// how many messages this alert is going to produce. Nobody to notify is
 		// an answer rather than a failure, and it reads as commitments=0 with
 		// the reasons in the alert's own history.
+		about, _ := admission.Context.Escalation()
 		log.Printf("AlertEngine: %s admission=%s policy=%s commitments=%d unpromised=%d",
 			ag.ID, admissionLabel(result.Outcome, len(admission.Admission.Commitments)),
-			admission.PolicyID, len(result.IntentIDs), len(admission.Unpromised))
+			about.PolicyID, len(result.IntentIDs), len(about.Unpromised))
 	}
 
 	if deferred > 0 {

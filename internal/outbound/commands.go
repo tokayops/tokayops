@@ -107,12 +107,74 @@ type DesiredStateResult struct {
 // EscalationAdmission is what a producer hands the store: the identities the
 // grammar derived, plus the two things about the alert group that are settled
 // at the same moment.
-type EscalationAdmission struct {
-	// Admission carries the batch key, the fingerprint, the snapshot and every
-	// commitment with its key and payload. It is produced in one pass by the
-	// grammar so the parts cannot disagree.
+// Batch is one admission offered to the store, whatever it is about.
+//
+// The parts every admission has - the identities the grammar derived, and who
+// is asking - sit here; everything that belongs to ONE sort of claim sits in
+// the context. Written as one struct with optional fields instead, the
+// escalation half would be a set of nil-able values that a handover has to
+// leave empty and nothing would refuse an escalation that left them empty too.
+type Batch struct {
+	// Admission carries the batch key, the fingerprint, the snapshot if this
+	// kind has one, and every commitment with its key and payload. It is
+	// produced in one pass by the grammar so the parts cannot disagree.
 	Admission keys.Admission
 
+	// Context is what this admission is about, in one of the two closed forms.
+	Context BatchContext
+
+	Actor string
+}
+
+// ContextForm says which sort of claim a batch is.
+type ContextForm string
+
+const (
+	// ContextEscalation: an alert group is being escalated. The admission is
+	// about a state of that group, and the group itself is written to.
+	ContextEscalation ContextForm = "escalation"
+
+	// ContextHandoff: a shift change is being announced. There is no alert
+	// group, and nothing in the alert domain is touched.
+	ContextHandoff ContextForm = "handoff"
+)
+
+// BatchContext is the closed pair. Built through the two constructors, so a
+// context cannot be half-filled: an escalation without its policy, or a
+// handover carrying one.
+type BatchContext struct {
+	form       ContextForm
+	escalation EscalationContext
+}
+
+// EscalatingAlertGroup is the context of an escalation.
+func EscalatingAlertGroup(about EscalationContext) BatchContext {
+	return BatchContext{form: ContextEscalation, escalation: about}
+}
+
+// AnnouncingShiftChange is the context of a handover announcement. It carries
+// nothing: everything a handover is about is already in its admission.
+func AnnouncingShiftChange() BatchContext {
+	return BatchContext{form: ContextHandoff}
+}
+
+// Form says which of the two this is.
+func (c BatchContext) Form() ContextForm { return c.form }
+
+// Escalation is the alert-group half, and false when this is not one. A caller
+// that reads it without asking would get a zero policy and a zero version, and
+// the version is compared against the group's own.
+func (c BatchContext) Escalation() (EscalationContext, bool) {
+	if c.form != ContextEscalation {
+		return EscalationContext{}, false
+	}
+	return c.escalation, true
+}
+
+// EscalationContext is everything about an escalation that is not in its
+// admission: what plan it was built from, what the producer saw, and what it
+// could not promise.
+type EscalationContext struct {
 	// PolicyID and PolicySnapshot are the escalation policy this admission was
 	// built against, recorded on the group by the winner of the admission and
 	// by nobody else.
@@ -135,9 +197,6 @@ type EscalationAdmission struct {
 	//
 	// Zero is a version, not "unset": a group nothing has changed is at zero,
 	// and it is compared like any other.
-	//
-	// What moves it, and the two things deliberately left out, are the store's
-	// to say: see model.AlertGroup.RenderSourceVersion.
 	SourceVersion int64
 
 	// OnCallSnapshot is who was on duty when this alert arrived, recorded on
@@ -160,8 +219,6 @@ type EscalationAdmission struct {
 	// reason travels with them, because "nobody was on call" and "nothing here
 	// can deliver to that provider" send a reader to two different places.
 	Unpromised []UnpromisedStep
-
-	Actor string
 }
 
 // UnpromisedStep is one step of a plan that promised nothing.

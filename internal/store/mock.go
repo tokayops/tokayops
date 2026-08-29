@@ -2771,11 +2771,11 @@ var _ StoreInterface = (*MockStore)(nil)
 // admittedBatch is what the double remembers about one admission, so a test can
 // ask what an escalation promised instead of what it happened to write.
 type admittedBatch struct {
-	Admission outbound.EscalationAdmission
+	Admission outbound.Batch
 	IntentIDs []string
 }
 
-// SubmitEscalationBatch admits an escalation the way the store does: the group
+// SubmitBatch admits an escalation the way the store does: the group
 // is claimed, its commitments are recorded, and a second producer for the same
 // group is told which of the two answers it got.
 //
@@ -2783,11 +2783,20 @@ type admittedBatch struct {
 // be new or processing, the claim is once and forever, and the same batch
 // submitted twice is the same batch - and none of the parts that are about
 // storage.
-func (m *MockStore) SubmitEscalationBatch(ctx context.Context,
-	adm outbound.EscalationAdmission) (outbound.SubmitResult, error) {
+func (m *MockStore) SubmitBatch(ctx context.Context,
+	adm outbound.Batch) (outbound.SubmitResult, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	about, isEscalation := adm.Context.Escalation()
+	if !isEscalation {
+		// The double models the alert-group half only. A handover admission has
+		// no group to claim, and answering it here with something plausible
+		// would let a test pass against a path this double does not have.
+		return outbound.SubmitResult{}, fmt.Errorf(
+			"this double admits escalations; %q belongs to the real store", adm.Context.Form())
+	}
 
 	admission := adm.Admission
 	ag, ok := m.alertGroups[admission.AlertGroupID]
@@ -2841,7 +2850,7 @@ func (m *MockStore) SubmitEscalationBatch(ctx context.Context,
 	// The alert moved after the producer read it, so the snapshot describes a
 	// state it is no longer in. Nothing is claimed and the next tick plans it
 	// again.
-	if adm.SourceVersion != ag.RenderSourceVersion {
+	if about.SourceVersion != ag.RenderSourceVersion {
 		return outbound.SubmitResult{Outcome: outbound.SubmitSourceChanged}, nil
 	}
 
@@ -2855,19 +2864,19 @@ func (m *MockStore) SubmitEscalationBatch(ctx context.Context,
 	// engine's loop whether or not anybody was found to notify.
 	ag.Status = model.AlertGroupStatusProcessing
 	ag.UpdatedAt = time.Now()
-	ag.PolicyID = adm.PolicyID
-	if len(adm.PolicySnapshot) > 0 {
+	ag.PolicyID = about.PolicyID
+	if len(about.PolicySnapshot) > 0 {
 		var snapshot model.EscalationPolicySnapshot
-		if err := json.Unmarshal(adm.PolicySnapshot, &snapshot); err == nil {
+		if err := json.Unmarshal(about.PolicySnapshot, &snapshot); err == nil {
 			ag.PolicySnapshot = &snapshot
 		}
 	}
 	// Who was on duty, from the same admission. Nothing recorded leaves what is
 	// already there: the producer could not read the people, which is not a
 	// claim that there were none.
-	if len(adm.OnCallSnapshot) > 0 {
+	if len(about.OnCallSnapshot) > 0 {
 		var snapshot model.OnCallResult
-		if err := json.Unmarshal(adm.OnCallSnapshot, &snapshot); err == nil {
+		if err := json.Unmarshal(about.OnCallSnapshot, &snapshot); err == nil {
 			ag.OnCallSnapshot = &snapshot
 		}
 	}
@@ -2879,11 +2888,11 @@ func (m *MockStore) SubmitEscalationBatch(ctx context.Context,
 }
 
 // AdmittedBatches is every admission this double accepted, for a test to read.
-func (m *MockStore) AdmittedBatches() []outbound.EscalationAdmission {
+func (m *MockStore) AdmittedBatches() []outbound.Batch {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	out := make([]outbound.EscalationAdmission, 0, len(m.admissions))
+	out := make([]outbound.Batch, 0, len(m.admissions))
 	for _, batch := range m.admissions {
 		out = append(out, batch.Admission)
 	}
@@ -2892,7 +2901,7 @@ func (m *MockStore) AdmittedBatches() []outbound.EscalationAdmission {
 
 // AdmissionFor is the admission held for one alert group, or false if nothing
 // was admitted for it.
-func (m *MockStore) AdmissionFor(agID string) (outbound.EscalationAdmission, bool) {
+func (m *MockStore) AdmissionFor(agID string) (outbound.Batch, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -2901,5 +2910,5 @@ func (m *MockStore) AdmissionFor(agID string) (outbound.EscalationAdmission, boo
 			return batch.Admission, true
 		}
 	}
-	return outbound.EscalationAdmission{}, false
+	return outbound.Batch{}, false
 }

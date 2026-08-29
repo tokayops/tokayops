@@ -18,7 +18,7 @@ import (
 // One statement makes it a picture. Everything a card is drawn from - the
 // alerts included - lives on the group's own row, and the version it was at is
 // read WITH it, so the admission can refuse a plan built from state that has
-// moved since: see SubmitEscalationBatch, which checks it again under the lock
+// moved since: see SubmitBatch, which checks it again under the lock
 // that decides the escalation.
 //
 // The group's history used to be read here too, inside a repeatable-read

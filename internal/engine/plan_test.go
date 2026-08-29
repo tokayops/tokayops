@@ -129,8 +129,8 @@ func TestWhatIsNotThereIsAnAnswer(t *testing.T) {
 			t.Fatalf("expected the firehose alone, got %d commitments",
 				len(admission.Admission.Commitments))
 		}
-		if admission.PolicyID != "" {
-			t.Errorf("the group records policy %q, which does not exist", admission.PolicyID)
+		if escalationOf(t, admission).PolicyID != "" {
+			t.Errorf("the group records policy %q, which does not exist", escalationOf(t, admission).PolicyID)
 		}
 	})
 
@@ -210,7 +210,7 @@ func TestTheAuditKeepsBothVocabularies(t *testing.T) {
 	}
 
 	var snapshot model.EscalationPolicySnapshot
-	if err := json.Unmarshal(admission.PolicySnapshot, &snapshot); err != nil {
+	if err := json.Unmarshal(escalationOf(t, admission).PolicySnapshot, &snapshot); err != nil {
 		t.Fatalf("read the policy snapshot: %v", err)
 	}
 
@@ -264,9 +264,9 @@ func TestASecondPromiseToTheSamePersonIsRecorded(t *testing.T) {
 	if promises != 1 {
 		t.Fatalf("the same person was promised %d times", promises)
 	}
-	if len(admission.Unpromised) != 1 ||
-		admission.Unpromised[0].Reason != outbound.ReasonDuplicate {
-		t.Fatalf("the repeat was recorded as %v", admission.Unpromised)
+	if len(escalationOf(t, admission).Unpromised) != 1 ||
+		escalationOf(t, admission).Unpromised[0].Reason != outbound.ReasonDuplicate {
+		t.Fatalf("the repeat was recorded as %v", escalationOf(t, admission).Unpromised)
 	}
 }
 
@@ -292,9 +292,9 @@ func TestThePlanCarriesTheVersionItWasReadAt(t *testing.T) {
 		t.Fatalf("build the plan: %v", err)
 	}
 
-	if admission.SourceVersion != 7 {
+	if escalationOf(t, admission).SourceVersion != 7 {
 		t.Fatalf("the plan says it was built from version %d, the group is at 7",
-			admission.SourceVersion)
+			escalationOf(t, admission).SourceVersion)
 	}
 }
 
@@ -395,8 +395,8 @@ func TestTheTeamIsReadOnce(t *testing.T) {
 	if store.teamReads != 1 {
 		t.Fatalf("the plan read the team %d times, want 1", store.teamReads)
 	}
-	if admission.PolicyID != "policy-1" {
-		t.Errorf("the alert escalates by %q", admission.PolicyID)
+	if escalationOf(t, admission).PolicyID != "policy-1" {
+		t.Errorf("the alert escalates by %q", escalationOf(t, admission).PolicyID)
 	}
 	if !admission.Admission.Snapshot.Content().TeamOnboarded {
 		t.Error("the card says the team is not set up here")
@@ -435,7 +435,7 @@ func TestThePeoplePagedAreThePeopleRecorded(t *testing.T) {
 	}
 
 	var recorded model.OnCallResult
-	if err := json.Unmarshal(admission.OnCallSnapshot, &recorded); err != nil {
+	if err := json.Unmarshal(escalationOf(t, admission).OnCallSnapshot, &recorded); err != nil {
 		t.Fatalf("read the on-call snapshot: %v", err)
 	}
 	if len(recorded.L1Users) != 1 || recorded.L1Users[0].ID != alice.ID {
@@ -475,14 +475,14 @@ func TestTwoStepsOnOneScheduleAreToldApart(t *testing.T) {
 		t.Fatalf("build the plan: %v", err)
 	}
 
-	if len(admission.Unpromised) != 2 {
-		t.Fatalf("the history records %d steps, want 2", len(admission.Unpromised))
+	if len(escalationOf(t, admission).Unpromised) != 2 {
+		t.Fatalf("the history records %d steps, want 2", len(escalationOf(t, admission).Unpromised))
 	}
-	first, second := admission.Unpromised[0], admission.Unpromised[1]
+	first, second := escalationOf(t, admission).Unpromised[0], escalationOf(t, admission).Unpromised[1]
 	if first.Step == second.Step {
 		t.Fatalf("both lines read %q, so the two steps are indistinguishable", first.Step)
 	}
-	for i, step := range admission.Unpromised {
+	for i, step := range escalationOf(t, admission).Unpromised {
 		if !strings.Contains(step.Step, fmt.Sprintf("%d", i)) {
 			t.Errorf("line %d names the step as %q, without its index", i, step.Step)
 		}
