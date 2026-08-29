@@ -140,6 +140,18 @@ func ValidateEscalationAdmission(adm keys.Admission, now time.Time) error {
 			if err := c.Expiry.Validate(); err != nil {
 				return notAdmissiblef("expiry: %v", err)
 			}
+			if c.Expiry.Kind == keys.TimingBounded {
+				// A bounded deadline is the handover form: the earlier of a
+				// domain instant and an age from admission, for work nobody can
+				// acknowledge. An escalation IS acknowledged, so it does not
+				// need one - and it would arrive with the handover's rule
+				// attached, which allows an instant already past. That would
+				// admit an escalation, move the group to processing and leave a
+				// commitment the sweep ends before any provider is called: a
+				// page that never happens, from an alert that looks handled.
+				return notAdmissiblef(
+					"a bounded deadline is a handover's; an escalation ends by acknowledgement")
+			}
 			if c.Expiry.Kind == keys.TimingAbsolute && !c.Expiry.At.After(now) {
 				// A deadline already in the past would make the commitment
 				// expire on its first claim, which is a delivery that never

@@ -160,16 +160,50 @@ func (s *Store) SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound
 		return outbound.SubmitResult{}, outboundContractf("%v", err)
 	}
 
+	// The kind and the context have to be the same claim, and the pair is
+	// checked before anything is written.
+	//
+	// They are two exported halves of one fact, and nothing in the type system
+	// holds them together: an escalation admission with its kind swapped to
+	// handoff would be written into the handover family and yet update the
+	// alert group, its snapshot and its timeline - and the worker would then
+	// read an escalation payload as a handover one. The work would stick, or
+	// end, and nobody would be paged.
+	if err := contextMatchesKind(admission.Kind, batch.Context.Form()); err != nil {
+		return outbound.SubmitResult{}, err
+	}
+
 	switch batch.Context.Form() {
 	case outbound.ContextEscalation:
 		about, _ := batch.Context.Escalation()
 		return s.submitEscalation(ctx, batch, about, string(family))
-	case outbound.ContextHandoff:
-		return s.submitHandoff(ctx, batch, string(family))
 	default:
-		return outbound.SubmitResult{}, outboundContractf(
-			"an admission whose context is a %q", batch.Context.Form())
+		return s.submitHandoff(ctx, batch, string(family))
 	}
+}
+
+// contextMatchesKind is the closed pairing of a claim's kind and its context.
+//
+// Exhaustive in both directions rather than a default: a kind this build does
+// not know reaches neither arm and is refused by name, which is the answer a
+// build meeting a row from a newer one should give.
+func contextMatchesKind(kind keys.Kind, form outbound.ContextForm) error {
+	var want outbound.ContextForm
+	switch kind {
+	case keys.KindEscalation, keys.KindEscalationReplay:
+		want = outbound.ContextEscalation
+	case keys.KindHandoff:
+		want = outbound.ContextHandoff
+	default:
+		return outboundContractf(
+			"an admission of kind %q, which this build does not admit", kind)
+	}
+	if form != want {
+		return outboundContractf(
+			"an admission of kind %q offered as a %q; %q admissions are %q",
+			kind, form, kind, want)
+	}
+	return nil
 }
 
 // submitEscalation admits an alert group's escalation.
@@ -647,13 +681,17 @@ func existingAdmission(ctx context.Context, tx *sql.Tx,
 	// comparison: a claim of a kind that has a subject must name the same one,
 	// and a claim of a kind that has none must name nothing.
 	//
-	// One comparison is enough because the empty string is how "no alert group"
-	// is spelled on both sides - a scanned NULL gives "", and an admission with
-	// no subject carries "". A separate NULL check would defend nothing: a
-	// stored row cannot hold an empty group id, the foreign key sees to that.
-	// What could not be left to SQL is the comparison itself, since NULL is
-	// neither equal nor unequal to NULL.
-	if existingGroup.String != admission.AlertGroupID {
+	// PRESENCE and value, not value alone. A scanned NULL and a scanned empty
+	// string both give "", and the two are different claims: `alert_groups.id`
+	// is a plain TEXT primary key with nothing forbidding an empty one, so a
+	// row holding `alert_group_id = ''` is representable - and comparing values
+	// only, it would answer as "the claim about no alert group", which is the
+	// answer a handover repeat is waiting for.
+	//
+	// What could not be left to SQL is the comparison itself: NULL is neither
+	// equal nor unequal to NULL.
+	if existingGroup.Valid != (admission.AlertGroupID != "") ||
+		existingGroup.String != admission.AlertGroupID {
 		return outbound.SubmitResult{}, false, outboundContractf(
 			"admission %s is held for %s, this one is for %s",
 			admission.BatchKey, subjectLabel(existingGroup.Valid, existingGroup.String),

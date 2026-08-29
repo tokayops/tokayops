@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -262,4 +263,180 @@ func TestAClaimOfOneKindIsNotAnAnswerAboutAnother(t *testing.T) {
 	if !strings.Contains(err.Error(), "no alert group") {
 		t.Fatalf("the refusal does not say what it is about: %v", err)
 	}
+}
+
+// TestTheKindAndTheContextHaveToBeTheSameClaim.
+//
+// They are two exported halves of one fact and nothing in the type system holds
+// them together. The family is derived from the KIND and the execution branch
+// is chosen by the CONTEXT, so a pair that disagrees writes rows into one
+// family while updating the alert group, its snapshot and its timeline as
+// though for another - and the worker then reads an escalation payload as a
+// handover one. The work sticks or ends, and nobody is paged.
+//
+// Only ONE half of a correct batch is changed in each case, and it is the kind:
+// changing the context instead is caught by the subject rules inside each arm,
+// which is a different guard and would leave this one unproven.
+func TestTheKindAndTheContextHaveToBeTheSameClaim(t *testing.T) {
+	t.Run("an escalation whose kind says handover", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.SetRenderEnvironment("https://tokay.example", "UTC")
+		agID := outboundGroup(t, s)
+
+		batch := outboundAdmission(t, agID, "first")
+		batch.Admission.Kind = keys.KindHandoff
+
+		before := alertDomainState(t, s)
+		if _, err := s.SubmitBatch(context.Background(), batch); err == nil {
+			t.Fatal("an escalation was written into the handover family")
+		} else if !errors.Is(err, ErrOutboundContract) {
+			t.Fatalf("the refusal is not a contract violation: %v", err)
+		}
+		assertNothingAdmitted(t, s, before)
+	})
+
+	t.Run("an announcement whose kind says escalation", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.SetRenderEnvironment("https://tokay.example", "UTC")
+		seedUsers(t, s, "u-alice")
+		outboundGroup(t, s)
+
+		batch := handoffBatch(t, "sched-1", announceTo("slack", "u-alice"))
+		batch.Admission.Kind = keys.KindEscalation
+
+		before := alertDomainState(t, s)
+		if _, err := s.SubmitBatch(context.Background(), batch); err == nil {
+			t.Fatal("an announcement was written into the paging family")
+		} else if !errors.Is(err, ErrOutboundContract) {
+			t.Fatalf("the refusal is not a contract violation: %v", err)
+		}
+		assertNothingAdmitted(t, s, before)
+	})
+}
+
+// assertNothingAdmitted: no claim, no commitment, and the alert domain exactly
+// as it was.
+func assertNothingAdmitted(t *testing.T, s *Store, before domainState) {
+	t.Helper()
+	var batches, intents int
+	if err := s.db.QueryRow(`
+		SELECT (SELECT count(*) FROM outbound_batches),
+		       (SELECT count(*) FROM outbound_intents)`).Scan(&batches, &intents); err != nil {
+		t.Fatalf("count what was written: %v", err)
+	}
+	if batches != 0 || intents != 0 {
+		t.Errorf("a refused admission left %d claim(s) and %d commitment(s)", batches, intents)
+	}
+	if now := alertDomainState(t, s); now != before {
+		t.Errorf("a refused admission wrote in the alert domain:\n  was %+v\n  now %+v",
+			before, now)
+	}
+}
+
+// TestAClaimHoldingAnEmptyAlertGroupIsNotAnAnswerAboutNone.
+//
+// `alert_groups.id` is a plain TEXT primary key, so a row holding
+// `alert_group_id = ”` is representable. Compared by value alone it reads as
+// "the claim about no alert group" - which is exactly the answer a handover
+// repeat is waiting for, and it would be told its work exists on the strength
+// of somebody else's row.
+func TestAClaimHoldingAnEmptyAlertGroupIsNotAnAnswerAboutNone(t *testing.T) {
+	s := setupTestDB(t)
+	seedUsers(t, s, "u-alice")
+
+	batch := handoffBatch(t, "sched-1", announceTo("slack", "u-alice"))
+	result, err := s.SubmitBatch(context.Background(), batch)
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+
+	// An alert group whose id is the empty string, and a claim pointed at it.
+	if _, err := s.db.Exec(`
+		INSERT INTO alert_groups (id, alert_key, team_id, team_name_snapshot, status,
+		                          title, severity, created_at, updated_at)
+		VALUES ('', 'empty-id', 'team-1', 'Team One', 'new', 'nameless', 'critical',
+		        now(), now())`); err != nil {
+		t.Fatalf("create the nameless group: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE outbound_batches SET alert_group_id = '' WHERE id = $1`, result.BatchID); err != nil {
+		t.Fatalf("point the claim at it: %v", err)
+	}
+
+	if _, err := s.SubmitBatch(context.Background(), batch); err == nil {
+		t.Fatal("a claim about a group answered for an announcement about none")
+	} else if !errors.Is(err, ErrOutboundContract) {
+		t.Fatalf("the refusal is not a contract violation: %v", err)
+	}
+}
+
+// TestOnlyAHandoverMayCarryABoundedDeadline.
+//
+// The bounded form is the handover's: the earlier of a domain instant and an
+// age from admission, for work nobody can acknowledge. An escalation ends by
+// acknowledgement, and the form arrives with the handover's rule attached -
+// which allows an instant already past. Admitted, it would move the group to
+// processing and leave a commitment the sweep ends before any provider is
+// called: a page that never happens, from an alert that looks handled.
+func TestOnlyAHandoverMayCarryABoundedDeadline(t *testing.T) {
+	past := time.Now().Add(-time.Hour).UTC()
+
+	t.Run("an escalation is refused", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.SetRenderEnvironment("https://tokay.example", "UTC")
+		agID := outboundGroup(t, s)
+
+		commitment := channelCommitment("C-ops", 0)
+		commitment.Expiry = &keys.TimingSpec{
+			Kind: keys.TimingBounded, At: past, MaxAge: time.Hour,
+		}
+		batch := outboundAdmission(t, agID, "first", commitment)
+		before := alertDomainState(t, s)
+		if _, err := s.SubmitBatch(context.Background(), batch); err == nil {
+			t.Fatal("an escalation with a bounded deadline was admitted")
+		}
+		assertNothingAdmitted(t, s, before)
+	})
+
+	t.Run("a handover keeps a deadline already past", func(t *testing.T) {
+		s := setupTestDB(t)
+		seedUsers(t, s, "u-alice")
+
+		// A shift that began and ended while the system was stopped. The
+		// announcement is admitted and expires at once: refusing it at the door
+		// would lose the record that it was owed.
+		admission, err := keys.HandoffBatch{
+			Occurrence:         handoffOccurrence("sched-1"),
+			TeamName:           "Backend",
+			Timezone:           "UTC",
+			GridSlotStart:      past.Add(-8 * time.Hour),
+			AssignmentEnd:      past,
+			MaxAge:             time.Hour,
+			GrammarVersion:     keys.GrammarV1,
+			FingerprintVersion: keys.CurrentBatchFingerprintVersion(),
+			Recipients:         []keys.HandoffRecipient{announceTo("slack", "u-alice")},
+		}.Admit()
+		if err != nil {
+			t.Fatalf("build the admission: %v", err)
+		}
+		result, err := s.SubmitBatch(context.Background(), outbound.Batch{
+			Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: "notifier",
+		})
+		if err != nil {
+			t.Fatalf("admit: %v", err)
+		}
+		if result.Outcome != outbound.SubmitCreated {
+			t.Fatalf("a late announcement answered %q", result.Outcome)
+		}
+
+		var expired bool
+		if err := s.db.QueryRow(
+			`SELECT expires_at <= now() FROM outbound_intents WHERE batch_id = $1`,
+			result.BatchID).Scan(&expired); err != nil {
+			t.Fatalf("read the deadline: %v", err)
+		}
+		if !expired {
+			t.Fatal("an announcement about a shift that is over has a deadline in the future")
+		}
+	})
 }
