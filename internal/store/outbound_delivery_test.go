@@ -1258,3 +1258,87 @@ func TestAHandoverDrawsFromItsPayload(t *testing.T) {
 		t.Fatalf("a kind nobody declared draws from %q", got)
 	}
 }
+
+// TestTheTwoWaysAPayloadCanBeUnusable, and they end differently.
+//
+// A schema this build has no shape for is a deployment that is behind: the
+// instance that wrote the row renders it perfectly well, and ending the
+// commitment here would destroy the work that instance was about to do. Bytes
+// that will not parse under a shape this build DOES have are damage, and the
+// commitment ends visibly so somebody looks at the row.
+//
+// Collapsing the two - which is what asking the codec alone does - makes the
+// first look like the second, and a rollback then kills every announcement the
+// newer build admitted.
+func TestTheTwoWaysAPayloadCanBeUnusable(t *testing.T) {
+	handover := func(t *testing.T, s *Store, schemaVersion int, payload string) string {
+		t.Helper()
+		agID := outboundGroup(t, s)
+		intentID := admitOne(t, s, agID)[0]
+		for _, statement := range []string{
+			`UPDATE outbound_batches SET key_kind = 'handoff'
+			 WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)`,
+			`UPDATE outbound_intents SET key_kind = 'handoff',
+			     payload_schema_version = $2, payload = $3::jsonb WHERE id = $1`,
+		} {
+			args := []any{intentID}
+			if strings.Contains(statement, "payload_schema_version") {
+				args = append(args, schemaVersion, payload)
+			}
+			if _, err := s.db.Exec(statement, args...); err != nil {
+				t.Fatalf("write the commitment: %v", err)
+			}
+		}
+		return intentID
+	}
+
+	const announcement = `{"kind":"handoff","team_name":"Backend","schedule_id":"sched-1",` +
+		`"timezone":"UTC","grid_slot_start":"2026-05-04T11:00:00Z",` +
+		`"assignment_start":"2026-05-04T11:00:00Z","assignment_end":"2026-05-04T19:00:00Z",` +
+		`"target":{"kind":"user","ref":"u-alice"}}`
+
+	t.Run("a schema from a newer build", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.SetRenderEnvironment("https://tokay.example", "UTC")
+		intentID := handover(t, s, 2, announcement)
+
+		token := claimOne(t, s, intentID)
+		_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+			Preparation: outbound.PreparationReady, BoundEndpoint: "U0001",
+		})
+		if err == nil {
+			t.Fatal("a payload schema this build cannot render was executed")
+		}
+		if !errors.Is(err, ErrOutboundContract) {
+			t.Fatalf("the refusal is not a contract violation: %v", err)
+		}
+		if status := statusOf(t, s, intentID); status != outbound.StatusPending {
+			t.Fatalf("the commitment is %s; the build that wrote it will never get it back",
+				status)
+		}
+	})
+
+	t.Run("bytes this build cannot read", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.SetRenderEnvironment("https://tokay.example", "UTC")
+		// The schema this build knows, carrying an announcement with no
+		// recipient - damage, not a newer protocol.
+		intentID := handover(t, s, 1, `{"kind":"handoff","team_name":"Backend"}`)
+
+		token := claimOne(t, s, intentID)
+		result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+			Preparation: outbound.PreparationReady, BoundEndpoint: "U0001",
+		})
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if result.Outcome != outbound.BeginPreparedPermanent {
+			t.Fatalf("a damaged payload answered %q", result.Outcome)
+		}
+		if status := statusOf(t, s, intentID); status != outbound.StatusPermanentFailed {
+			t.Fatalf("the commitment is %s, and nobody will be sent to look at it", status)
+		}
+	})
+}

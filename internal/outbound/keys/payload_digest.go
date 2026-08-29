@@ -5,6 +5,28 @@ import (
 	"crypto/sha256"
 )
 
+// KnowsPayloadSchema says whether this build has a shape for the pair.
+//
+// Asked BEFORE the payload is read, and separately, because the two failures
+// are not the same failure. A pair this build has no shape for is almost
+// certainly a row from a newer one - the upgrade is stop-the-world, a rollback
+// is not - and ending that commitment destroys work the newer build was about
+// to do. Bytes that will not parse under a shape this build DOES have are
+// damage a person fixes, and the commitment ends visibly.
+//
+// Collapsing them, which is what asking PayloadDigest alone does, makes the
+// first look like the second.
+func KnowsPayloadSchema(kind Kind, schemaVersion int) bool {
+	switch kind {
+	case KindEscalation, KindEscalationReplay:
+		return schemaVersion == EscalationPayloadV1{}.SchemaVersion()
+	case KindHandoff:
+		return schemaVersion == HandoffPayloadV1{}.SchemaVersion()
+	default:
+		return false
+	}
+}
+
 // payloadDigestProtocol is the domain separator of the standalone payload
 // digest. Its own, and not shared with the intent fingerprint: a digest that
 // reused another protocol's material would collide with a slice of it.

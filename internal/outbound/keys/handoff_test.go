@@ -37,6 +37,7 @@ func sampleBatch(recipients ...HandoffRecipient) HandoffBatch {
 		Timezone:           "UTC",
 		GridSlotStart:      time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC),
 		AssignmentEnd:      time.Date(2026, 5, 4, 19, 0, 0, 0, time.UTC),
+		MaxAge:             time.Hour,
 		GrammarVersion:     GrammarV1,
 		FingerprintVersion: CurrentBatchFingerprintVersion(),
 		Recipients:         recipients,
@@ -455,8 +456,8 @@ func TestABoundedDeadlineNeedsBothHalves(t *testing.T) {
 // to tell" on every schedule would fingerprint identically.
 func TestTheHandoffBatchFingerprintIsGolden(t *testing.T) {
 	admitted, err := sampleBatch(
-		boundedRecipient("slack", "u-alice"),
-		boundedRecipient("telegram", "u-bob"),
+		sampleRecipient("slack", "u-alice"),
+		sampleRecipient("telegram", "u-bob"),
 	).Admit()
 	if err != nil {
 		t.Fatalf("admit: %v", err)
@@ -575,19 +576,6 @@ func TestAnEscalationWithADeadlineIsUnchanged(t *testing.T) {
 	}
 }
 
-// boundedRecipient is a recipient whose announcement expires the way a handover
-// does: the earlier of the shift ending and an hour from admission.
-func boundedRecipient(provider, user string) HandoffRecipient {
-	deadline := TimingSpec{
-		Kind:   TimingBounded,
-		At:     time.Date(2026, 5, 4, 19, 0, 0, 0, time.UTC),
-		MaxAge: time.Hour,
-	}
-	recipient := sampleRecipient(provider, user)
-	recipient.Expiry = &deadline
-	return recipient
-}
-
 // sequentialDigest is a 32-byte value chosen for being easy to write down: the
 // vectors above are computed by hand, and a real snapshot digest would make
 // that impossible to check.
@@ -687,5 +675,90 @@ func TestAnAnnouncementIsStoredInUTC(t *testing.T) {
 	}
 	if read != samplePayload("u-alice") {
 		t.Fatalf("an announcement written with an offset read back as %+v", read)
+	}
+}
+
+// TestOneShiftChangeHasOneDeadline.
+//
+// The announcement stops being worth making at a moment, and that moment is a
+// property of the shift change - not of the channel it goes through. A
+// recipient able to carry its own deadline could be given none at all, or one
+// later than the shift it announces, and two people would be told about one
+// event under two different rules while both messages showed the same end time.
+func TestOneShiftChangeHasOneDeadline(t *testing.T) {
+	admission, err := sampleBatch(
+		sampleRecipient("slack", "u-alice"),
+		sampleRecipient("telegram", "u-bob"),
+	).Admit()
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+
+	want := TimingSpec{
+		Kind:   TimingBounded,
+		At:     time.Date(2026, 5, 4, 19, 0, 0, 0, time.UTC),
+		MaxAge: time.Hour,
+	}
+	for _, c := range admission.Commitments {
+		if c.Expiry == nil {
+			t.Fatalf("the announcement to %s never expires", c.Target.Ref)
+		}
+		if c.Expiry.Kind != want.Kind || !c.Expiry.At.Equal(want.At) ||
+			c.Expiry.MaxAge != want.MaxAge {
+			t.Fatalf("the announcement to %s expires by %+v, and the shift ends at %s",
+				c.Target.Ref, *c.Expiry, want.At)
+		}
+	}
+
+	// And it is a copy: a caller still holding the batch cannot move a deadline
+	// that has already been fingerprinted.
+	first, second := admission.Commitments[0].Expiry, admission.Commitments[1].Expiry
+	if first == second {
+		t.Fatal("two commitments share one deadline value")
+	}
+}
+
+// TestAnAnnouncementWithNoDeadlineIsRefused. There is no acknowledgement to end
+// it, so a handover without a deadline is one that retries until it is
+// delivered - to somebody whose shift may have ended hours ago.
+func TestAnAnnouncementWithNoDeadlineIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		alter func(*HandoffBatch)
+	}{
+		{"no maximum age", func(b *HandoffBatch) { b.MaxAge = 0 }},
+		{"a negative maximum age", func(b *HandoffBatch) { b.MaxAge = -time.Hour }},
+		{"no end to the shift", func(b *HandoffBatch) { b.AssignmentEnd = time.Time{} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			batch := sampleBatch(sampleRecipient("slack", "u-alice"))
+			tc.alter(&batch)
+			if _, err := batch.Admit(); err == nil {
+				t.Fatal("an announcement that never expires was admitted")
+			}
+		})
+	}
+}
+
+// TestThisBuildKnowsWhichPayloadSchemasItHas. The question is asked before the
+// bytes are read, and it has to answer "no" for a version from a newer build -
+// otherwise an unreadable payload and an unsupported one look the same, and the
+// first ends work the second would have delivered.
+func TestThisBuildKnowsWhichPayloadSchemasItHas(t *testing.T) {
+	for _, tc := range []struct {
+		kind    Kind
+		version int
+		known   bool
+	}{
+		{KindEscalation, 1, true},
+		{KindEscalationReplay, 1, true},
+		{KindHandoff, 1, true},
+		{KindHandoff, 2, false},
+		{KindEscalation, 2, false},
+		{Kind("something_newer"), 1, false},
+	} {
+		if got := KnowsPayloadSchema(tc.kind, tc.version); got != tc.known {
+			t.Errorf("%s schema %d: known=%v, want %v", tc.kind, tc.version, got, tc.known)
+		}
 	}
 }

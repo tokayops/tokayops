@@ -311,7 +311,6 @@ type HandoffRecipient struct {
 	// handed is preparation's business and is not identity.
 	UserID          string
 	Timing          TimingSpec
-	Expiry          *TimingSpec
 	CompletionMode  CompletionMode
 	AmbiguityPolicy AmbiguityPolicy
 }
@@ -325,11 +324,6 @@ func (r HandoffRecipient) validate() error {
 	}
 	if err := r.Timing.validate(); err != nil {
 		return err
-	}
-	if r.Expiry != nil {
-		if err := r.Expiry.validate(); err != nil {
-			return err
-		}
 	}
 	if err := r.CompletionMode.validate(); err != nil {
 		return err
@@ -356,9 +350,26 @@ type HandoffBatch struct {
 	GridSlotStart time.Time
 	AssignmentEnd time.Time
 
+	// MaxAge is the second half of every commitment's deadline, and it belongs
+	// to the batch because the deadline does. One shift change is one
+	// announcement, and it stops being worth making at one moment - not at a
+	// different moment per channel.
+	MaxAge time.Duration
+
 	GrammarVersion     int
 	FingerprintVersion int
 	Recipients         []HandoffRecipient
+}
+
+// deadline is when every announcement of this shift change stops being worth
+// making: the earlier of the shift ending and an age from admission.
+//
+// Derived here rather than supplied per recipient, and that is the point. A
+// recipient free to carry its own could be given none at all, or one later than
+// the shift it announces - and two people would be told about one shift change
+// under two different rules while both messages showed the same end time.
+func (b HandoffBatch) deadline() TimingSpec {
+	return TimingSpec{Kind: TimingBounded, At: b.AssignmentEnd.UTC(), MaxAge: b.MaxAge}
 }
 
 // announcementFor builds the payload one recipient gets.
@@ -401,6 +412,14 @@ func (b HandoffBatch) Admit() (Admission, error) {
 	}
 	content := occurrenceRef{Digest: digest}
 
+	// One deadline for the whole announcement, checked once. A batch whose
+	// deadline does not validate is a batch that cannot be admitted at all,
+	// rather than one that quietly admits some recipients.
+	deadline := b.deadline()
+	if err := deadline.validate(); err != nil {
+		return Admission{}, err
+	}
+
 	// Who the occurrence is about, so a recipient outside it is refused rather
 	// than announced to. An announcement to somebody the shift change does not
 	// concern is a message about a shift they are not on.
@@ -442,7 +461,6 @@ func (b HandoffBatch) Admit() (Admission, error) {
 		}
 		seen[key] = true
 
-		expiry := cloneTiming(r.Expiry)
 		material, err := submitIntent{
 			Kind:            KindHandoff,
 			GrammarVersion:  b.GrammarVersion,
@@ -452,7 +470,7 @@ func (b HandoffBatch) Admit() (Admission, error) {
 			Editable:        false,
 			Content:         content,
 			Timing:          r.Timing,
-			Expiry:          expiry,
+			Expiry:          &deadline,
 			CompletionMode:  r.CompletionMode,
 			AmbiguityPolicy: r.AmbiguityPolicy,
 			Payload:         payload,
@@ -470,7 +488,7 @@ func (b HandoffBatch) Admit() (Admission, error) {
 			CompletionMode:       r.CompletionMode,
 			AmbiguityPolicy:      r.AmbiguityPolicy,
 			Timing:               r.Timing,
-			Expiry:               expiry,
+			Expiry:               cloneTiming(&deadline),
 			Payload:              payload,
 			PayloadSchemaVersion: payload.SchemaVersion(),
 		})

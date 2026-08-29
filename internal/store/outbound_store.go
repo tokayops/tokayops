@@ -1223,12 +1223,23 @@ func attemptContentTx(ctx context.Context, tx *sql.Tx,
 
 	switch contentFormOf(intent.KeyKind) {
 	case outbound.ContentPayload:
+		// The version first, and on its own. A schema this build has no shape
+		// for is a deployment that is behind, not a broken commitment: the
+		// instance that wrote it renders it perfectly well, and ending the work
+		// here would destroy exactly what that instance was about to deliver.
+		// Nothing is written, the commitment stays pending, and a build that
+		// knows the schema takes it. Same split as a render snapshot, where an
+		// unknown schema version stops and unreadable bytes end the commitment.
+		if !keys.KnowsPayloadSchema(intent.KeyKind, intent.PayloadSchemaVersion) {
+			return outbound.AttemptContent{}, outboundContractf(
+				"the payload of %s is at %s schema %d, which this build cannot render",
+				intent.ID, intent.KeyKind, intent.PayloadSchemaVersion)
+		}
 		digest, err := keys.PayloadDigest(intent.KeyKind, intent.PayloadSchemaVersion, intent.Payload)
 		if err != nil {
-			// The payload on the row is not the shape its commitment says it
-			// is. Undeliverable rather than a contract error: it is durable
-			// data that a person fixes, and the commitment ends visibly rather
-			// than retrying against a row that will never parse.
+			// A shape this build HAS, carrying bytes it cannot read. Durable
+			// data a person fixes, and the commitment ends visibly rather than
+			// retrying against a row that will never parse.
 			return outbound.AttemptContent{}, undeliverablef(
 				"the payload of %s cannot be canonicalised: %v", intent.ID, err)
 		}
