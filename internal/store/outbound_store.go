@@ -1221,7 +1221,8 @@ func admittedSnapshotTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent)
 func attemptContentTx(ctx context.Context, tx *sql.Tx,
 	intent outbound.Intent) (outbound.AttemptContent, error) {
 
-	if drawsFromPayload(intent.KeyKind) {
+	switch contentFormOf(intent.KeyKind) {
+	case outbound.ContentPayload:
 		digest, err := keys.PayloadDigest(intent.KeyKind, intent.PayloadSchemaVersion, intent.Payload)
 		if err != nil {
 			// The payload on the row is not the shape its commitment says it
@@ -1232,41 +1233,55 @@ func attemptContentTx(ctx context.Context, tx *sql.Tx,
 				"the payload of %s cannot be canonicalised: %v", intent.ID, err)
 		}
 		return outbound.NewPayloadContent(digest)
+
+	case outbound.ContentSnapshot:
+		var stored storedSnapshot
+		var err error
+		switch intent.Form {
+		case outbound.FormEditable:
+			stored, err = lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+		case outbound.FormOneShot:
+			stored, err = admittedSnapshotTx(ctx, tx, intent)
+		default:
+			return outbound.AttemptContent{}, outboundContractf(
+				"commitment %s is a %q, which is not a form this build delivers",
+				intent.ID, intent.Form)
+		}
+		if err != nil {
+			return outbound.AttemptContent{}, err
+		}
+		return outbound.NewSnapshotContent(stored.Snapshot, stored.Final)
 	}
 
-	var stored storedSnapshot
-	var err error
-	switch intent.Form {
-	case outbound.FormEditable:
-		stored, err = lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
-	case outbound.FormOneShot:
-		stored, err = admittedSnapshotTx(ctx, tx, intent)
-	default:
-		return outbound.AttemptContent{}, outboundContractf(
-			"commitment %s is a %q, which is not a form this build delivers",
-			intent.ID, intent.Form)
-	}
-	if err != nil {
-		return outbound.AttemptContent{}, err
-	}
-	return outbound.NewSnapshotContent(stored.Snapshot, stored.Revision, stored.Final)
+	// A kind this build has never heard of, and the answer is to change
+	// nothing. It is almost certainly a row written by a NEWER build - the
+	// upgrade is stop-the-world, but a rollback is not - and the work is
+	// perfectly good work that this instance cannot do.
+	//
+	// Not undeliverable: that ends the commitment for good, and a build that
+	// killed work it merely did not understand would destroy exactly what the
+	// newer build was going to deliver. The transaction rolls back, the
+	// commitment stays pending with its lease released, and the instance that
+	// knows the kind picks it up. Same rule as a render snapshot written under
+	// a schema version this build cannot read.
+	return outbound.AttemptContent{}, outboundContractf(
+		"commitment %s is a %q, which is not a kind of claim this build executes",
+		intent.ID, intent.KeyKind)
 }
 
-// drawsFromPayload says which content form a kind of claim has.
+// contentFormOf says which of the two forms a kind of claim is drawn from.
 //
-// Stated in the positive for both sides rather than as a default: a kind this
-// build does not know falls through to the snapshot branch and is refused there
-// by name, which is the answer a build meeting a newer row should give. Reading
-// a payload it has no shape for would be worse - it would send something.
-func drawsFromPayload(kind keys.Kind) bool {
+// A CLOSED switch with no default arm: an unknown kind gets neither form, and
+// the caller refuses without touching the commitment. Defaulting either way
+// would be wrong in a different direction - to snapshot, and a payload-drawn
+// commitment reports a missing state it never had; to payload, and a build
+// meeting a newer kind ends work it does not understand.
+func contentFormOf(kind keys.Kind) outbound.ContentForm {
 	switch kind {
 	case keys.KindEscalation, keys.KindEscalationReplay:
-		return false
+		return outbound.ContentSnapshot
 	default:
-		// Every other kind carries its own content. Today that is handoff,
-		// which arrives with its own key kind; a kind nobody has declared gets
-		// here too, and PayloadDigest refuses it by name.
-		return true
+		return ""
 	}
 }
 

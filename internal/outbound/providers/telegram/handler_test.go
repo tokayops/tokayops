@@ -61,7 +61,7 @@ func handlerCall(t *testing.T, kind keys.TargetKind, interactive bool) outbound.
 // snapshotContent wraps a frozen state the way BeginAttempt does.
 func snapshotContent(t *testing.T, state keys.RenderSnapshot) outbound.AttemptContent {
 	t.Helper()
-	content, err := outbound.NewSnapshotContent(state, state.Content().Revision, false)
+	content, err := outbound.NewSnapshotContent(state, false)
 	if err != nil {
 		t.Fatalf("build the content: %v", err)
 	}

@@ -1,7 +1,6 @@
 package outbound
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -62,7 +61,7 @@ func TestContentDrawnFromAPayloadHasNoRevision(t *testing.T) {
 // fails here rather than passing quietly.
 func TestContentDrawnFromASnapshotAnswersAllThree(t *testing.T) {
 	state := testSnapshot(t, 7)
-	content, err := NewSnapshotContent(state, 7, true)
+	content, err := NewSnapshotContent(state, true)
 	if err != nil {
 		t.Fatalf("build the content: %v", err)
 	}
@@ -123,14 +122,31 @@ func TestTheContentCannotBeChangedFromOutside(t *testing.T) {
 	}
 }
 
-// TestANegativeRevisionIsRefused, because a revision is a position in a series
-// that starts at zero, and a negative one would sort before every real state.
-func TestANegativeRevisionIsRefused(t *testing.T) {
-	_, err := NewSnapshotContent(testSnapshot(t, 0), -1, false)
-	if err == nil {
-		t.Fatal("a negative revision was accepted")
-	}
-	if !strings.Contains(err.Error(), "negative") {
-		t.Fatalf("the refusal says %v", err)
+// TestTheRevisionComesFromTheStateAndNowhereElse.
+//
+// The number and the bytes cannot be given separately, which is what makes the
+// bad pair unrepresentable rather than merely rejected. A state of revision 4
+// with the number 7 beside it would have the channel draw 4 and the journal
+// record 7, next to the digest of 4: the commitment settles as caught up while
+// showing something older, and nothing later corrects it because the numbers
+// already agree.
+//
+// If this test ever has to be rewritten because the constructor grew a revision
+// argument back, that is the change to argue with, not the test.
+func TestTheRevisionComesFromTheStateAndNowhereElse(t *testing.T) {
+	for _, revision := range []int64{0, 1, 9} {
+		state := testSnapshot(t, revision)
+		content, err := NewSnapshotContent(state, false)
+		if err != nil {
+			t.Fatalf("build the content: %v", err)
+		}
+		got, has := content.Revision()
+		if !has || got != revision {
+			t.Fatalf("a state of revision %d produced %d (present: %v)",
+				revision, got, has)
+		}
+		if string(content.Digest()) != string(state.Digest()) {
+			t.Fatalf("the content of revision %d records another state's digest", revision)
+		}
 	}
 }

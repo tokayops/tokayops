@@ -60,7 +60,7 @@ func handlerCall(t *testing.T, target keys.Target, interactive bool) outbound.Ca
 // call carries what a real one carries.
 func snapshotContent(t *testing.T, state keys.RenderSnapshot) outbound.AttemptContent {
 	t.Helper()
-	content, err := outbound.NewSnapshotContent(state, state.Content().Revision, false)
+	content, err := outbound.NewSnapshotContent(state, false)
 	if err != nil {
 		t.Fatalf("build the content: %v", err)
 	}

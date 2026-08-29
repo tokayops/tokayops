@@ -46,11 +46,20 @@ type AttemptContent struct {
 }
 
 // NewSnapshotContent is an attempt drawn from a frozen state.
-func NewSnapshotContent(snapshot keys.RenderSnapshot, revision int64, final bool) (AttemptContent, error) {
+//
+// The revision is READ FROM the snapshot, never passed beside it. Taken as an
+// argument it could disagree: a state of revision 4 with the number 7 would
+// have the channel draw revision 4 and the journal record having applied 7,
+// beside the digest of 4 - the commitment settles as caught up while showing
+// something older, and no later revision corrects it because the numbers
+// already agree. That is precisely the state this closed form exists to make
+// unrepresentable, and an argument would hand it back.
+func NewSnapshotContent(snapshot keys.RenderSnapshot, final bool) (AttemptContent, error) {
 	digest := snapshot.Digest()
 	if len(digest) == 0 {
 		return AttemptContent{}, contentContractf("a snapshot with no digest")
 	}
+	revision := snapshot.Content().Revision
 	if revision < 0 {
 		return AttemptContent{}, contentContractf("revision %d is negative", revision)
 	}

@@ -863,7 +863,7 @@ func mustSnapshotContent(revision int64) AttemptContent {
 	if err != nil {
 		panic(err)
 	}
-	content, err := NewSnapshotContent(state, revision, false)
+	content, err := NewSnapshotContent(state, false)
 	if err != nil {
 		panic(err)
 	}

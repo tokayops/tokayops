@@ -1165,32 +1165,46 @@ func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
 	}
 }
 
-// TestAKindThisBuildCannotDrawFromStopsBeforeTheNetwork.
+// TestAKindThisBuildDoesNotKnowIsLeftAlone.
 //
-// A commitment whose claim is of a kind this build has no content shape for
-// gets a deterministic refusal naming the kind, before any call. The two
-// branches of attemptContentTx are chosen by the KIND, not by whether a
-// snapshot happens to be there: a kind that draws from its own payload asks the
-// payload codec, and a codec that does not know it says so.
+// A commitment whose claim is of a kind this build has never heard of is almost
+// certainly a row written by a NEWER build: the upgrade is stop-the-world, but
+// a rollback is not, and one instance can meet work another instance planned.
 //
-// The refusal matters more than it looks. The alternative - falling through to
-// the snapshot branch - would report "the admission froze no state" about a
-// commitment that was never supposed to have one, and send whoever read it to
-// look for a missing snapshot instead of a missing shape.
-func TestAKindThisBuildCannotDrawFromStopsBeforeTheNetwork(t *testing.T) {
+// The answer is to change nothing. Ending it - which is what treating an
+// unreadable payload as undeliverable would do - destroys exactly the work the
+// newer build was about to deliver, permanently and in a state no retry
+// reaches. So: a contract error, no attempt, no journal line, and the
+// commitment left pending for an instance that knows the kind.
+//
+// Same rule as a render snapshot written under a schema version this build
+// cannot read, and for the same reason.
+func TestAKindThisBuildDoesNotKnowIsLeftAlone(t *testing.T) {
 	s := setupTestDB(t)
 	s.SetRenderEnvironment("https://tokay.example", "UTC")
 
 	agID := outboundGroup(t, s)
 	intentID := admitOne(t, s, agID)[0]
 
-	// The claim and the commitment are re-labelled as a kind that draws from
-	// its own payload - the shape a handover announcement will have, and which
-	// this build does not yet know.
+	var attemptsBefore, eventsBefore int
+	count := func() (int, int) {
+		t.Helper()
+		var attempts, events int
+		if err := s.db.QueryRow(
+			`SELECT (SELECT count(*) FROM outbound_attempts WHERE intent_id = $1),
+			        (SELECT count(*) FROM outbound_intent_events WHERE intent_id = $1)`,
+			intentID).Scan(&attempts, &events); err != nil {
+			t.Fatalf("count the journal: %v", err)
+		}
+		return attempts, events
+	}
+	attemptsBefore, eventsBefore = count()
+
+	// A kind from a build that is ahead of this one.
 	for _, statement := range []string{
-		`UPDATE outbound_batches SET key_kind = 'handoff'
+		`UPDATE outbound_batches SET key_kind = 'something_newer'
 		 WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)`,
-		`UPDATE outbound_intents SET key_kind = 'handoff' WHERE id = $1`,
+		`UPDATE outbound_intents SET key_kind = 'something_newer' WHERE id = $1`,
 	} {
 		if _, err := s.db.Exec(statement, intentID); err != nil {
 			t.Fatalf("re-label the claim: %v", err)
@@ -1198,26 +1212,27 @@ func TestAKindThisBuildCannotDrawFromStopsBeforeTheNetwork(t *testing.T) {
 	}
 
 	token := claimOne(t, s, intentID)
-	result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+	_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 		Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
 	})
-	if err != nil {
-		t.Fatalf("begin: %v", err)
+	if err == nil {
+		t.Fatal("a kind this build does not know was executed")
 	}
-	if result.Outcome != outbound.BeginPreparedPermanent {
-		t.Fatalf("the commitment answered %q", result.Outcome)
+	if !errors.Is(err, ErrOutboundContract) {
+		t.Fatalf("the refusal is not a contract violation: %v", err)
+	}
+	if !strings.Contains(err.Error(), "something_newer") {
+		t.Fatalf("the refusal does not name the kind: %v", err)
 	}
 
-	// And it says which kind, not which snapshot is missing.
-	var summary string
-	if err := s.db.QueryRow(`
-		SELECT COALESCE(response_summary, '') FROM outbound_attempts
-		WHERE intent_id = $1 ORDER BY attempt_no DESC LIMIT 1`, intentID).
-		Scan(&summary); err != nil {
-		t.Fatalf("read the refusal: %v", err)
+	// Nothing was written, and the work is still owed.
+	if attempts, events := count(); attempts != attemptsBefore || events != eventsBefore {
+		t.Errorf("a refusal left %d attempt(s) and %d journal line(s) behind",
+			attempts-attemptsBefore, events-eventsBefore)
 	}
-	if !strings.Contains(summary, "handoff") {
-		t.Fatalf("the refusal does not name the kind: %q", summary)
+	if status := statusOf(t, s, intentID); status != outbound.StatusPending {
+		t.Fatalf("the commitment is %s; an instance that knows the kind will never take it",
+			status)
 	}
 }
