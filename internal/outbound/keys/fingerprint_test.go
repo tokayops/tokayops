@@ -132,13 +132,13 @@ func TestOneCommitmentOneIdentity(t *testing.T) {
 		t.Fatalf("the key does not describe the commitment:\n got: %s\nwant: %s",
 			got.IdempotencyKey, expectedKey)
 	}
-	if got.Payload.Target != commitment.Target {
+	if escalationPayload(t, got.Payload).Target != commitment.Target {
 		t.Fatalf("the payload targets %v, the commitment targets %v",
-			got.Payload.Target, commitment.Target)
+			escalationPayload(t, got.Payload).Target, commitment.Target)
 	}
-	if got.Payload.Slot != commitment.Slot {
+	if escalationPayload(t, got.Payload).Slot != commitment.Slot {
 		t.Fatalf("the payload is for slot %v, the commitment for %v",
-			got.Payload.Slot, commitment.Slot)
+			escalationPayload(t, got.Payload).Slot, commitment.Slot)
 	}
 	if got.Operation != OperationSend {
 		t.Fatalf("an admission produced operation %q", got.Operation)
@@ -166,8 +166,8 @@ func TestAdmittedCommitmentDoesNotShareItsOptionals(t *testing.T) {
 	override = "page somebody else"
 	expiry.At = time.Unix(1800000000, 0)
 
-	if *got.Payload.MessageOverride != "page the on-call" {
-		t.Fatalf("the payload followed the caller's edit: %q", *got.Payload.MessageOverride)
+	if *escalationPayload(t, got.Payload).MessageOverride != "page the on-call" {
+		t.Fatalf("the payload followed the caller's edit: %q", *escalationPayload(t, got.Payload).MessageOverride)
 	}
 	if !got.Expiry.At.Equal(time.Unix(1700000000, 0).UTC()) &&
 		!got.Expiry.At.Equal(time.Unix(1700000000, 0)) {
@@ -602,4 +602,16 @@ func TestAStoredPayloadHasToEndWhereItsValueDoes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// escalationPayload reads an admitted payload as the shape an escalation has.
+// The interface is sealed, so this assertion is a check that the admission put
+// the right shape in - not a cast that could go anywhere.
+func escalationPayload(t *testing.T, p Payload) EscalationPayloadV1 {
+	t.Helper()
+	payload, ok := p.(EscalationPayloadV1)
+	if !ok {
+		t.Fatalf("an escalation was admitted carrying a %T", p)
+	}
+	return payload
 }

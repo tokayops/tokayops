@@ -92,11 +92,11 @@ func TestADifferentPayloadIsADifferentDigest(t *testing.T) {
 // version 1 and mean entirely different things, so guessing would decode one as
 // the other and send it.
 func TestAKindWithNoShapeIsRefusedByName(t *testing.T) {
-	_, err := PayloadDigest(Kind("handoff"), 1, []byte(`{"anything":1}`))
+	_, err := PayloadDigest(Kind("something_newer"), 1, []byte(`{"anything":1}`))
 	if err == nil {
 		t.Fatal("a kind this build has no shape for was canonicalised anyway")
 	}
-	if !strings.Contains(err.Error(), "handoff") {
+	if !strings.Contains(err.Error(), "something_newer") {
 		t.Fatalf("the refusal does not say which kind: %v", err)
 	}
 }

@@ -81,6 +81,18 @@ const (
 	// TimingAbsolute is a time that comes from the domain and cannot move - the
 	// start of an on-call assignment, for instance. Never a process clock.
 	TimingAbsolute TimingKind = "absolute"
+
+	// TimingBounded is a deadline that is the earlier of two things: an instant
+	// the domain supplies, and an age measured from admission.
+	//
+	// It exists because neither half alone is a deadline for an announcement
+	// nobody can acknowledge. The domain instant answers "this is about a shift
+	// that has ended"; the age answers "this has been true for long enough that
+	// saying it is no longer news". Both atoms enter the fingerprint and the
+	// RESULT does not: the result is computed from the database's clock at
+	// admission and differs between two attempts at the same admission, so a
+	// repeat carrying it would be told it conflicts with itself.
+	TimingBounded TimingKind = "bounded"
 )
 
 // TimingSpec is when a commitment becomes due, in the form that stays the same
@@ -94,6 +106,10 @@ type TimingSpec struct {
 	Kind   TimingKind
 	Offset time.Duration
 	At     time.Time
+	// MaxAge is the second half of a bounded deadline, and is used by no other
+	// kind. Absent from the encoding of the other two, so their bytes are what
+	// they always were.
+	MaxAge time.Duration
 }
 
 // Validate reports whether this spec is one the grammar can encode. Exported
@@ -110,12 +126,28 @@ func (t TimingSpec) validate() error {
 		if !t.At.IsZero() {
 			return contractf("a relative timing spec also carrying an instant")
 		}
+		if t.MaxAge != 0 {
+			return contractf("a relative timing spec also carrying a maximum age")
+		}
 	case TimingAbsolute:
 		if t.At.IsZero() {
 			return contractf("an absolute timing spec with no time")
 		}
 		if t.Offset != 0 {
 			return contractf("an absolute timing spec also carrying an offset")
+		}
+		if t.MaxAge != 0 {
+			return contractf("an absolute timing spec also carrying a maximum age")
+		}
+	case TimingBounded:
+		if t.At.IsZero() {
+			return contractf("a bounded deadline with no domain instant")
+		}
+		if t.MaxAge <= 0 {
+			return contractf("a bounded deadline with a maximum age of %s", t.MaxAge)
+		}
+		if t.Offset != 0 {
+			return contractf("a bounded deadline also carrying an offset")
 		}
 	default:
 		return contractf("unknown timing kind %q", t.Kind)
@@ -128,11 +160,18 @@ func (t TimingSpec) encode(buf *bytes.Buffer) error {
 		return err
 	}
 	encStr(buf, string(t.Kind))
-	if t.Kind == TimingRelativeToAdmission {
+	switch t.Kind {
+	case TimingRelativeToAdmission:
 		enc(buf, int64Bytes(int64(t.Offset)))
-		return nil
+	case TimingBounded:
+		// Both atoms, in a fixed order. The two older kinds keep exactly the
+		// bytes they had: this is an extension of the field, not a new shape
+		// for it, and every existing escalation fingerprint has to survive it.
+		enc(buf, int64Bytes(t.At.UTC().UnixNano()))
+		enc(buf, int64Bytes(int64(t.MaxAge)))
+	default:
+		enc(buf, int64Bytes(t.At.UTC().UnixNano()))
 	}
-	enc(buf, int64Bytes(t.At.UTC().UnixNano()))
 	return nil
 }
 
@@ -256,12 +295,35 @@ type submitIntent struct {
 	Target          Target
 	Operation       Operation
 	Editable        bool
-	Content         contentRef
+	Content         contentReference
 	Timing          TimingSpec
 	Expiry          *TimingSpec
 	CompletionMode  CompletionMode
 	AmbiguityPolicy AmbiguityPolicy
-	Payload         EscalationPayloadV1
+	Payload         Payload
+}
+
+// contentReference is what a commitment is about, in whichever shape its kind
+// has one. Both shapes are TAGGED with a literal of their own, so the bytes of
+// one can never be read as the bytes of the other.
+type contentReference interface {
+	encode(buf *bytes.Buffer) error
+}
+
+// occurrenceRef is what a handover announcement is about: the shift change,
+// and nothing else. There is no revision and no snapshot to point at.
+type occurrenceRef struct {
+	Digest []byte
+}
+
+func (o occurrenceRef) encode(buf *bytes.Buffer) error {
+	if len(o.Digest) != sha256.Size {
+		return contractf("an occurrence reference of %d bytes, expected %d",
+			len(o.Digest), sha256.Size)
+	}
+	encStr(buf, "occurrence")
+	enc(buf, o.Digest)
+	return nil
 }
 
 // encode writes the frozen wire form of one proposed commitment.

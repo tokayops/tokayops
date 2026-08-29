@@ -14,6 +14,17 @@ type Family string
 
 const FamilyNotification Family = "notification"
 
+// FamilyHandoff is the partition a handover announcement runs in.
+//
+// Its own, and not notification's, for two reasons that both had to hold. A
+// shift boundary produces schedules x new people x providers commitments at
+// once and nothing bounds any of the three, so sharing a pool would let an
+// announcement burst delay a page. And the alerting rules differ: an expired
+// page is an incident, an expired announcement is the normal end of something
+// nobody can acknowledge - a difference that cannot be expressed inside one
+// family label.
+const FamilyHandoff Family = "handoff"
+
 // Kind is the identity grammar a key is written in.
 type Kind string
 
@@ -29,6 +40,14 @@ const (
 	// alternative - one that cannot express a re-admission - is what would make
 	// the promise of one impossible to keep later.
 	KindEscalationReplay Kind = "escalation_replay"
+
+	// KindHandoff is an announcement that somebody has come on call.
+	//
+	// It is about an occurrence rather than an alert group: a shift change on
+	// one schedule, identified by who is on duty and from when. It has no
+	// render snapshot - everything it says is in its own payload - and no
+	// acknowledgement, which is why it is the first kind to carry a deadline.
+	KindHandoff Kind = "handoff"
 )
 
 // GrammarV1 is the only version either escalation grammar has.
@@ -51,6 +70,8 @@ func supportedVersions(kind Kind) ([]int, error) {
 	case KindEscalation:
 		return []int{GrammarV1}, nil
 	case KindEscalationReplay:
+		return []int{GrammarV1}, nil
+	case KindHandoff:
 		return []int{GrammarV1}, nil
 	default:
 		return nil, contractf("unknown key kind %q", kind)
@@ -98,6 +119,8 @@ func familyOf(kind Kind) (Family, error) {
 	switch kind {
 	case KindEscalation, KindEscalationReplay:
 		return FamilyNotification, nil
+	case KindHandoff:
+		return FamilyHandoff, nil
 	default:
 		return "", contractf("unknown key kind %q", kind)
 	}

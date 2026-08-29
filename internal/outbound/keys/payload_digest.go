@@ -44,10 +44,16 @@ func PayloadDigest(kind Kind, schemaVersion int, raw []byte) ([]byte, error) {
 	return digest[:], nil
 }
 
-// payload is a stored payload that can be canonicalised. Unexported: the set
-// of shapes is closed, and a caller able to supply its own encoder could give
-// two commitments one digest.
-type payload interface {
+// Payload is a stored payload that can be canonicalised.
+//
+// The set of shapes is CLOSED even though the interface is exported: encode is
+// unexported, so only this package can satisfy it. A caller free to supply its
+// own encoder would be a caller free to give two different commitments one
+// digest, which is the one thing the codec exists to prevent.
+type Payload interface {
+	// SchemaVersion is the shape this payload is in, stored on the commitment
+	// so a later schema is readable rather than guessed at.
+	SchemaVersion() int
 	encode(buf *bytes.Buffer) error
 }
 
@@ -56,10 +62,16 @@ type payload interface {
 // The pair decides, not the schema version alone: two kinds may both be at
 // version 1 and mean entirely different things, and picking the decoder by
 // version would read one as the other.
-func decodePayload(kind Kind, schemaVersion int, raw []byte) (payload, error) {
+func decodePayload(kind Kind, schemaVersion int, raw []byte) (Payload, error) {
 	switch kind {
 	case KindEscalation, KindEscalationReplay:
 		decoded, err := DecodeEscalationPayloadV1(schemaVersion, raw)
+		if err != nil {
+			return nil, err
+		}
+		return decoded, nil
+	case KindHandoff:
+		decoded, err := DecodeHandoffPayloadV1(schemaVersion, raw)
 		if err != nil {
 			return nil, err
 		}

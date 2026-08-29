@@ -152,17 +152,21 @@ type EscalationBatch struct {
 // AdmittedCommitment is one commitment with everything derived from it: the key
 // it is deduplicated by and the payload it will be executed from.
 type AdmittedCommitment struct {
-	IdempotencyKey       string
-	Provider             string
-	Target               Target
-	Slot                 Slot
-	Editable             bool
-	Operation            Operation
-	CompletionMode       CompletionMode
-	AmbiguityPolicy      AmbiguityPolicy
-	Timing               TimingSpec
-	Expiry               *TimingSpec
-	Payload              EscalationPayloadV1
+	IdempotencyKey  string
+	Provider        string
+	Target          Target
+	Slot            Slot
+	Editable        bool
+	Operation       Operation
+	CompletionMode  CompletionMode
+	AmbiguityPolicy AmbiguityPolicy
+	Timing          TimingSpec
+	Expiry          *TimingSpec
+	// Payload is what the handler executes from, in the shape this kind of
+	// claim has. Which shape it is follows from the kind, and the store keeps
+	// PayloadSchemaVersion beside it so a later schema is readable rather than
+	// guessed at.
+	Payload              Payload
 	PayloadSchemaVersion int
 }
 
