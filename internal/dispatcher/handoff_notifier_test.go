@@ -124,7 +124,7 @@ func newNotifierEnv(t *testing.T, slackIDs map[string]string) *notifierEnv {
 		t:        t,
 		store:    st,
 		oncall:   oncall,
-		notifier: NewHandoffNotifier(st, oncall, staticDmProviders{"slack"}, time.Minute),
+		notifier: NewHandoffNotifier(st, oncall, staticDmProviders("slack"), time.Minute),
 	}
 }
 
@@ -914,7 +914,7 @@ func TestAFailedIdentityReadLeavesTheScheduleAlone(t *testing.T) {
 func TestSkippedRecipientsAreCountedOnceForTheOccurrence(t *testing.T) {
 	skipped := func() float64 {
 		return counterValue(t,
-			metrics.HandoffRecipientsSkippedTotal.WithLabelValues(string(skipUnlinked)))
+			metrics.HandoffRecipientsSkippedTotal.WithLabelValues(string(skipNoIdentity)))
 	}
 
 	// carol is linked, bob is not.

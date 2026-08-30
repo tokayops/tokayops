@@ -34,26 +34,37 @@ const announcementMaxAge = time.Hour
 
 // skipReason says why one person new to a shift was not announced to.
 //
-// The reasons are ordered, and the order is part of the contract: a person can
-// answer to more than one of them at once, and a counter whose label depends on
-// which check happened to run first is a counter nobody can read.
+// The reasons are ordered, and the order is part of the contract. A person can
+// answer to more than one at once - a link to a channel that was removed, a
+// half-finished link to one that is still here - and the reason describes the
+// PERSON rather than any one link, so a counter whose label depended on which
+// link was walked first would give two instances two series for one skip.
+//
+// The order is by how much it tells whoever has to act. A provider that is here
+// and does not carry a direct message is a configuration somebody can change; a
+// provider this build does not know is a channel that was taken away; an empty
+// address is a link somebody began; no links at all is a person who never
+// began. First match from the top wins.
 type skipReason string
 
 const (
-	// skipUnlinked is nothing at all: this person has no external identity, so
+	// skipNoDMCapability is a channel that is registered here and does not
+	// carry a direct message. Nothing is wrong with the link or the person.
+	skipNoDMCapability skipReason = "no_dm_capability"
+
+	// skipUnknownProvider is a link to a provider this build has no channel
+	// for - one that was removed, or one that was never a channel at all. Told
+	// apart from the above on purpose: the two look identical from the "cannot
+	// send" end and mean opposite things to whoever fixes them.
+	skipUnknownProvider skipReason = "unknown_provider"
+
+	// skipIdentityIncomplete is a link with no address on it, which is what a
+	// link somebody started and never finished looks like.
+	skipIdentityIncomplete skipReason = "identity_incomplete"
+
+	// skipNoIdentity is nothing at all: this person has linked no account, so
 	// no channel here has any way to reach them.
-	skipUnlinked skipReason = "unlinked"
-
-	// skipNoAddress is a link to somewhere a message could go, with nothing to
-	// address it to. A link that was started and never finished looks exactly
-	// like this, which is why it is told apart from having no link: one is
-	// somebody halfway through, the other is somebody who never began.
-	skipNoAddress skipReason = "no_address"
-
-	// skipNoDMProvider is linked and addressable, to nothing that sends a
-	// direct message here - an identity from a provider that was removed, or
-	// one that was never a channel at all.
-	skipNoDMProvider skipReason = "no_dm_provider"
+	skipNoIdentity skipReason = "no_identity"
 )
 
 // skipped is one person left out, and the single reason given for it.
@@ -77,7 +88,7 @@ type addressBook interface {
 // announcementBuilder turns one detected transition into one admission.
 type announcementBuilder struct {
 	identities addressBook
-	providers  dmProviderLookup
+	providers  providerLookup
 }
 
 // build assembles the admission for one shift change.
@@ -101,19 +112,14 @@ func (b announcementBuilder) build(sc schedulerender.ScheduleOnCall, kind string
 		return outbound.Batch{}, nil, fmt.Errorf("read where the incoming shift can be reached: %w", err)
 	}
 
-	dm := map[string]bool{}
-	if b.providers != nil {
-		for _, p := range b.providers.ProvidersSupporting("dm") {
-			dm[p] = true
-		}
-	}
-
 	var recipients []keys.HandoffRecipient
 	var left []skipped
 	for _, userID := range notify {
-		providers := reachableThrough(identities[userID], dm)
+		providers := b.reachableThrough(identities[userID])
 		if len(providers) == 0 {
-			left = append(left, skipped{UserID: userID, Reason: whyUnreachable(identities[userID], dm)})
+			left = append(left, skipped{
+				UserID: userID, Reason: b.whyUnreachable(identities[userID]),
+			})
 			continue
 		}
 		for _, provider := range providers {
@@ -156,10 +162,10 @@ func (b announcementBuilder) build(sc schedulerender.ScheduleOnCall, kind string
 // reachableThrough is the providers that can carry this announcement to one
 // person, sorted, so that one composition produces one set of commitment keys
 // whatever order the identities came back in.
-func reachableThrough(linked []*model.ExternalIdentity, dm map[string]bool) []string {
+func (b announcementBuilder) reachableThrough(linked []*model.ExternalIdentity) []string {
 	var out []string
 	for _, ei := range linked {
-		if ei == nil || ei.ExternalID == "" || !dm[ei.Provider] {
+		if ei == nil || ei.ExternalID == "" || !b.carriesDM(ei.Provider) {
 			continue
 		}
 		out = append(out, ei.Provider)
@@ -168,23 +174,56 @@ func reachableThrough(linked []*model.ExternalIdentity, dm map[string]bool) []st
 	return out
 }
 
-// whyUnreachable picks the one reason reported for a person nothing can reach.
+// whyUnreachable picks the one reason reported for a person nothing can reach,
+// by the order the reasons are declared in.
 //
-// Asked only after reachableThrough has answered with nothing, and answered in
-// a fixed order rather than by whichever check is written first: somebody with
-// a half-finished Slack link and a stale identity from a provider that is gone
-// answers to two of these, and the counter has to say the same thing about them
-// every time.
-func whyUnreachable(linked []*model.ExternalIdentity, dm map[string]bool) skipReason {
-	if len(linked) == 0 {
-		return skipUnlinked
-	}
+// Asked only after reachableThrough has answered with nothing. Four passes
+// rather than one, because the answer is about the person and the passes are
+// the priority: a link to a channel that was removed outranks a half-finished
+// link to one that is still here, whichever order they came back in.
+func (b announcementBuilder) whyUnreachable(linked []*model.ExternalIdentity) skipReason {
 	for _, ei := range linked {
-		if ei != nil && ei.ExternalID == "" && dm[ei.Provider] {
-			return skipNoAddress
+		if ei != nil && b.registered(ei.Provider) && !b.carriesDM(ei.Provider) {
+			return skipNoDMCapability
 		}
 	}
-	return skipNoDMProvider
+	for _, ei := range linked {
+		if ei != nil && !b.registered(ei.Provider) {
+			return skipUnknownProvider
+		}
+	}
+	for _, ei := range linked {
+		if ei != nil && ei.ExternalID == "" {
+			return skipIdentityIncomplete
+		}
+	}
+	// Everything above has been ruled out, so there is nothing here: a person
+	// with a usable link would have been reachable and never asked about.
+	return skipNoIdentity
+}
+
+func (b announcementBuilder) registered(provider string) bool {
+	if b.providers == nil {
+		return false
+	}
+	_, known := b.providers.Capabilities(provider)
+	return known
+}
+
+func (b announcementBuilder) carriesDM(provider string) bool {
+	if b.providers == nil {
+		return false
+	}
+	capabilities, known := b.providers.Capabilities(provider)
+	if !known {
+		return false
+	}
+	for _, kind := range capabilities.SupportedTargetKinds {
+		if kind == "dm" {
+			return true
+		}
+	}
+	return false
 }
 
 // announcementKind maps what the detector saw onto what the grammar names.

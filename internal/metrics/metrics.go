@@ -262,16 +262,25 @@ var (
 		Help: "Refusals that indicate a broken contract rather than a failed delivery.",
 	}, []string{"op", "kind"})
 
-	// OutboundAdmissionsTotal counts what happened to each escalation offered
-	// for admission.
+	// OutboundAdmissionsTotal counts what happened to each admission offered to
+	// the domain.
 	//
 	// "no_targets" is not one of the store's outcomes - it is an admission that
 	// was accepted and promised nothing, and it is broken out because it is the
-	// one success that means nobody was paged.
+	// one success that means nobody was told.
+	//
+	// The family is what makes the series readable at all. Two partitions offer
+	// work here and their answers mean different things: a paging admission
+	// that promised nobody is an alert nobody will see, and a handover one is a
+	// shift change nobody will hear about. Counted together they are one number
+	// that no alert can be written against, because neither rate can be
+	// separated from the other's noise. It is a closed set - derived from the
+	// kind of claim, never taken from a caller - so a producer cannot invent a
+	// partition by mislabelling.
 	OutboundAdmissionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "outbound_admissions_total",
-		Help: "Escalation admissions by outcome. no_targets is an accepted admission that promised nothing.",
-	}, []string{"outcome"})
+		Help: "Admissions by execution family and outcome. no_targets is an accepted admission that promised nothing.",
+	}, []string{"family", "outcome"})
 
 	// OutboundDesiredRevisionsTotal counts proposals to move what an alert's
 	// messages have to show, by what raised it and what came of it.

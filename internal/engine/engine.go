@@ -197,9 +197,6 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 			log.Printf("AlertEngine: Failed to admit the escalation for %s (will retry): %v", ag.ID, err)
 			continue
 		}
-		metrics.OutboundAdmissionsTotal.WithLabelValues(
-			outbound.AdmissionLabel(result.Outcome, len(admission.Admission.Commitments))).Inc()
-
 		if result.Outcome == outbound.SubmitSourceChanged {
 			// The alert changed between being read and being admitted, so this
 			// plan describes a state it is no longer in. Nothing was claimed;

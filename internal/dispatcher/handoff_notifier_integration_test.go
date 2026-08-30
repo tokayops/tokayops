@@ -84,7 +84,7 @@ func setupHandoffEnv(t *testing.T) *handoffEnv {
 	env.config = scheduleconfig.NewService(s.ScheduleConfigRepository(),
 		scheduleconfig.WithClock(clock))
 	env.renderer = schedulerender.New(s.ScheduleReadRepository(), schedulerender.WithClock(clock))
-	env.notifier = NewHandoffNotifier(s, env.renderer, staticDmProviders{"slack"}, time.Minute)
+	env.notifier = NewHandoffNotifier(s, env.renderer, staticDmProviders("slack"), time.Minute)
 	return env
 }
 
@@ -336,7 +336,7 @@ func TestHandoffNotifierTwoInstancesCreateOneJob(t *testing.T) {
 		group(handoffGroupB, "U_B"),
 	))
 
-	second := NewHandoffNotifier(env.s, env.renderer, staticDmProviders{"slack"}, time.Minute)
+	second := NewHandoffNotifier(env.s, env.renderer, staticDmProviders("slack"), time.Minute)
 
 	// Both instances warm up on the same state.
 	env.warmUp()
@@ -381,7 +381,7 @@ func TestHandoffNotifierSecondInstanceAfterTheJobFinished(t *testing.T) {
 		group(handoffGroupB, "U_B"),
 	))
 
-	second := NewHandoffNotifier(env.s, env.renderer, staticDmProviders{"slack"}, time.Minute)
+	second := NewHandoffNotifier(env.s, env.renderer, staticDmProviders("slack"), time.Minute)
 
 	env.warmUp()
 	if !second.checkAll(context.Background()) {
@@ -538,7 +538,7 @@ func TestHandoffNotifierPartialIdentities(t *testing.T) {
 func TestHandoffNotifierMultiProviderFanOut(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.notifier = NewHandoffNotifier(env.s, env.renderer,
-		staticDmProviders{"slack", "telegram"}, time.Minute)
+		staticDmProviders("slack", "telegram"), time.Minute)
 
 	testutil.BindIdentity(t, env.s, "U_B", "telegram", "T_B")
 	testutil.BindIdentity(t, env.s, "U_B", "email", "E_B")

@@ -12,12 +12,21 @@ import (
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
-// dmProviderLookup is the slice of the capability registry that
-// HandoffNotifier needs: enumerate providers that advertise the "dm" target
-// kind. Read-only; defined here so unit tests don't have to spin up a full
+// providerLookup is the slice of the capability registry the announcement
+// builder needs: what one named provider can do here, and whether this build
+// knows it at all.
+//
+// Per name rather than a list of the dm-capable, because the two ways a
+// provider fails to qualify are different things to whoever has to fix them. A
+// channel that is registered and does not carry a direct message is configured
+// that way; a channel this build has never heard of was taken away. A list of
+// the qualifying providers answers neither question - everything absent from it
+// looks the same.
+//
+// Read-only, and defined here so unit tests do not have to spin up a full
 // ProviderRegistry.
-type dmProviderLookup interface {
-	ProvidersSupporting(targetKind string) []string
+type providerLookup interface {
+	Capabilities(name string) (ProviderCapabilities, bool)
 }
 
 // onCallLister is the slice of the schedule projection the notifier needs: who
@@ -59,7 +68,7 @@ type notifierStore interface {
 	SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound.SubmitResult, error)
 }
 
-// HandoffNotifier detects on-call changes and creates notification jobs.
+// HandoffNotifier detects on-call changes and offers an announcement for each.
 type HandoffNotifier struct {
 	store         notifierStore
 	oncall        onCallLister
@@ -85,7 +94,9 @@ type HandoffNotifier struct {
 // NewHandoffNotifier creates a new HandoffNotifier. oncall is the schedule
 // projection; providers is the capability registry view used to filter linked
 // identities down to those served by a registered dm-capable provider.
-func NewHandoffNotifier(st notifierStore, oncall onCallLister, providers dmProviderLookup, interval time.Duration) *HandoffNotifier {
+func NewHandoffNotifier(st notifierStore, oncall onCallLister, providers providerLookup,
+	interval time.Duration) *HandoffNotifier {
+
 	return &HandoffNotifier{
 		store:         st,
 		oncall:        oncall,
@@ -99,9 +110,9 @@ func NewHandoffNotifier(st notifierStore, oncall onCallLister, providers dmProvi
 func (n *HandoffNotifier) Run(ctx context.Context) {
 	log.Printf("[HandoffNotifier] Starting with %v interval", n.checkInterval)
 
-	// Warm-up: populate the cache without creating jobs. It is retried until a
-	// tick completes as a call - see checkAll for why one damaged schedule is
-	// not allowed to hold it up.
+	// Warm-up: populate the cache without announcing anything. It is retried
+	// until a tick completes as a call - see checkAll for why one damaged
+	// schedule is not allowed to hold it up.
 	ticker := time.NewTicker(n.checkInterval)
 	defer ticker.Stop()
 
@@ -177,9 +188,10 @@ func (n *HandoffNotifier) checkAll(ctx context.Context) bool {
 
 	teams, err := n.store.GetAllTeams()
 	if err != nil {
-		// The team name is only how the message addresses the reader, but a
-		// tick that cannot read teams cannot read jobs either; treat it as the
-		// read failure it is instead of DMing people about team "t-1234".
+		// The team name is what the announcement is about, but a tick that
+		// cannot read teams is a tick that cannot read anything; treat it as
+		// the read failure it is instead of telling people they are on call
+		// for team "t-1234".
 		log.Printf("[HandoffNotifier] Failed to get teams: %v", err)
 		return false
 	}
@@ -257,7 +269,6 @@ func (n *HandoffNotifier) handleHandoff(ctx context.Context, sc schedulerender.S
 	}
 	promised := len(batch.Admission.Commitments)
 	label := outbound.AdmissionLabel(result.Outcome, promised)
-	metrics.OutboundAdmissionsTotal.WithLabelValues(label).Inc()
 
 	switch result.Outcome {
 	case outbound.SubmitCreated:

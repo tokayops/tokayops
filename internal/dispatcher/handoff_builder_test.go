@@ -37,12 +37,17 @@ func identity(provider, external string) *model.ExternalIdentity {
 	return &model.ExternalIdentity{Provider: provider, ExternalID: external}
 }
 
-// builderOver is a builder over a fixed address book, with slack and telegram
-// as the channels that carry a direct message.
+// builderOver is a builder over a fixed address book. Slack and telegram carry
+// a direct message, email is registered here and does not, and anything else -
+// hipchat, say - this build has never heard of.
 func builderOver(linked map[string][]*model.ExternalIdentity) announcementBuilder {
 	return announcementBuilder{
 		identities: &fakeAddressBook{linked: linked},
-		providers:  staticDmProviders{"slack", "telegram"},
+		providers: staticCapabilities{
+			"slack":    {"dm", "channel"},
+			"telegram": {"dm", "channel"},
+			"email":    {"channel"},
+		},
 	}
 }
 
@@ -50,9 +55,14 @@ func builderOver(linked map[string][]*model.ExternalIdentity) announcementBuilde
 //
 // A person left out is a person who came on call and was not told, so the
 // reason is what an operator has to act on. Somebody can answer to more than
-// one of these at once - a Slack link half finished and a stale identity from a
-// provider that is gone - and the answer has to be the same every time, or the
-// counter is a rate over whichever check happened to run first.
+// one at once, and the answer has to be the same every time - two instances
+// walking the same links in different orders must not produce two series for
+// one skip.
+//
+// The four are separate because they send whoever reads them to four different
+// places: a channel that does not do direct messages is a setting, a channel
+// this build has never heard of was removed from under a link, an empty address
+// is a link half made, and no links at all is a person who made none.
 func TestAnnouncementSkipsAreReportedWithOneReasonEach(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -61,27 +71,45 @@ func TestAnnouncementSkipsAreReportedWithOneReasonEach(t *testing.T) {
 	}{
 		{
 			name: "nothing linked at all",
-			want: skipUnlinked,
-		},
-		{
-			name:   "linked to nothing that carries a message",
-			linked: []*model.ExternalIdentity{identity("email", "b@example.test")},
-			want:   skipNoDMProvider,
+			want: skipNoIdentity,
 		},
 		{
 			name:   "a link that was started and not finished",
 			linked: []*model.ExternalIdentity{identity("slack", "")},
-			want:   skipNoAddress,
+			want:   skipIdentityIncomplete,
 		},
 		{
-			// Both apply. The half-finished link is the one reported, because
-			// it is the one somebody can finish.
-			name: "half a link, and an identity from nowhere",
+			name:   "a channel that was taken away from under the link",
+			linked: []*model.ExternalIdentity{identity("hipchat", "H-BOB")},
+			want:   skipUnknownProvider,
+		},
+		{
+			name:   "a channel that is here and writes to nobody in private",
+			linked: []*model.ExternalIdentity{identity("email", "b@example.test")},
+			want:   skipNoDMCapability,
+		},
+		{
+			// Three at once. The channel that could be configured to carry a
+			// direct message is the answer, because it is the one somebody can
+			// change without touching the person or their links.
+			name: "a setting, a removal and half a link",
 			linked: []*model.ExternalIdentity{
-				identity("email", "b@example.test"),
+				identity("hipchat", "H-BOB"),
 				identity("slack", ""),
+				identity("email", "b@example.test"),
 			},
-			want: skipNoAddress,
+			want: skipNoDMCapability,
+		},
+		{
+			// The removed channel outranks the half-made link for the same
+			// reason: nobody finishing that link would help, because what it
+			// points at is gone.
+			name: "a removal and half a link",
+			linked: []*model.ExternalIdentity{
+				identity("slack", ""),
+				identity("hipchat", "H-BOB"),
+			},
+			want: skipUnknownProvider,
 		},
 	}
 
@@ -141,7 +169,7 @@ func TestAnAnnouncementNobodyCanReceiveIsStillAnAnnouncement(t *testing.T) {
 func TestAFailedIdentityReadIsNotAnEmptyAnswer(t *testing.T) {
 	b := announcementBuilder{
 		identities: &fakeAddressBook{err: errors.New("connection reset")},
-		providers:  staticDmProviders{"slack"},
+		providers:  staticDmProviders("slack"),
 	}
 
 	batch, left, err := b.build(rotationDuty("sched-1", "g-b", "bob"), kindHandoff,

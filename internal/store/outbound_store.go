@@ -168,12 +168,13 @@ func (s *Store) SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound
 		return outbound.SubmitResult{}, err
 	}
 
+	var result outbound.SubmitResult
 	switch batch.Context.Form() {
 	case outbound.ContextEscalation:
 		about, _ := batch.Context.Escalation()
-		return s.submitEscalation(ctx, batch, about, string(family))
+		result, err = s.submitEscalation(ctx, batch, about, string(family))
 	case outbound.ContextHandoff:
-		return s.submitHandoff(ctx, batch, string(family))
+		result, err = s.submitHandoff(ctx, batch, string(family))
 	default:
 		// Unreachable while contextMatchesKind is exhaustive, and written out
 		// anyway: a third context added to the pairing above and forgotten here
@@ -181,6 +182,19 @@ func (s *Store) SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound
 		return outbound.SubmitResult{}, outboundContractf(
 			"an admission whose context is a %q", batch.Context.Form())
 	}
+	if err != nil {
+		return result, err
+	}
+
+	// Counted here rather than by each producer, because this is where the
+	// family is a fact. A producer counting its own admissions has to name the
+	// partition it thinks it is in, and the one thing the derivation above
+	// exists to prevent is a caller naming that at all. One call site also
+	// means a producer that ignores what it was told is still counted, which is
+	// what the series is for.
+	metrics.OutboundAdmissionsTotal.WithLabelValues(string(family),
+		outbound.AdmissionLabel(result.Outcome, len(admission.Commitments))).Inc()
+	return result, nil
 }
 
 // contextMatchesKind is the closed pairing of a claim's kind and its context.
