@@ -58,8 +58,15 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// attempt that never touched the network: recorded as a call whose fate is
 	// unknown, retried on the family's backoff, and repeated for as long as the
 	// commitment lives. Refused here it is what it actually is - a
-	// deterministic refusal with a record saying so, and a commitment that
-	// stops where a person can see it.
+	// deterministic refusal, in front of somebody who can act.
+	//
+	// What that refusal MEANS is not this channel's to say. A decoder that will
+	// not read something cannot tell a damaged payload from one written in a
+	// shape it has never been taught, and the two want opposite answers: the
+	// first ends the commitment, the second belongs to whichever build knows
+	// the shape. So the domain asks that question itself before it records
+	// anything, and this refusal reaches the journal only when the shape is one
+	// this build does know.
 	payload, err := keys.DecodeEscalationPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
 	if err != nil {
 		return outbound.Impossible("payload_unreadable", err.Error())
