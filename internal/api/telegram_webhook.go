@@ -52,7 +52,7 @@ type telegramUpdate struct {
 
 // TelegramSecretMiddleware verifies the X-Telegram-Bot-Api-Secret-Token header
 // (set when we call setWebhook) against the configured secret via a constant-time
-// compare. Unlike Slack this is NOT an HMAC — Telegram echoes the secret verbatim.
+// compare. Unlike Slack this is NOT an HMAC - Telegram echoes the secret verbatim.
 // Returns 503 when no secret is configured (mirrors SlackSignatureMiddleware).
 func (a *API) TelegramSecretMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
@@ -138,7 +138,7 @@ func (a *API) handleTelegramStart(ctx context.Context, upd *telegramUpdate) {
 	}
 }
 
-// handleTelegramCallback handles an Ack/Resolve button — mirror of HandleSlackInteractive.
+// handleTelegramCallback handles an Ack/Resolve button - mirror of HandleSlackInteractive.
 func (a *API) handleTelegramCallback(ctx context.Context, upd *telegramUpdate) {
 	cb := upd.CallbackQuery
 

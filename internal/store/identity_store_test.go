@@ -12,7 +12,7 @@ import (
 )
 
 // TestStore_IdentityLink_HappyPath issues a Slack OTP via IssueLinkToken and
-// confirms it via ConfirmIdentityLink — the Sprint 3 replacement for SaveSlackOTP/ConfirmSlackOTP.
+// confirms it via ConfirmIdentityLink - what replaced SaveSlackOTP/ConfirmSlackOTP.
 // `testutil.SeedUser` itself binds a `slack` identity, so we use a fresh provider name
 // to exercise the link flow end-to-end without conflicting with the seed binding.
 func TestStore_IdentityLink_HappyPath(t *testing.T) {
@@ -128,7 +128,7 @@ func TestStore_BindIfAbsent_GuardSemantics(t *testing.T) {
 	if err != nil || !changed {
 		t.Fatalf("first bind: changed=%v err=%v", changed, err)
 	}
-	// Same user, second call — no-op (don't overwrite).
+	// Same user, second call - no-op (don't overwrite).
 	changed, err = s.BindExternalIdentityIfAbsent(u1.ID, provider, "U_GUARD_B", "")
 	if err != nil || changed {
 		t.Errorf("re-bind for same user should be no-op: changed=%v err=%v", changed, err)
@@ -144,7 +144,7 @@ func TestStore_BindIfAbsent_GuardSemantics(t *testing.T) {
 }
 
 // TestStore_BindIfAbsent_DoesNotOverwrite_RealDB verifies the atomic
-// `INSERT ... ON CONFLICT (user_id, provider) DO NOTHING` semantics — the previous
+// `INSERT ... ON CONFLICT (user_id, provider) DO NOTHING` semantics - the previous
 // check-then-bind implementation overwrote an existing identity via DO UPDATE.
 func TestStore_BindIfAbsent_DoesNotOverwrite_RealDB(t *testing.T) {
 	s := testutil.SetupDB(t)
@@ -197,15 +197,15 @@ func TestStore_UnbindExternalIdentity(t *testing.T) {
 }
 
 // TestStore_ConsumeLinkToken_DeepLink issues a deep-link token (empty external_id)
-// and consumes it bot-side by (provider, token), writing chat_id/display_name — the
-// Epic 8 Sprint 3 path where the bot has no logged-in user.
+// and consumes it bot-side by (provider, token), writing chat_id/display_name - the
+// path where the bot has no logged-in user.
 func TestStore_ConsumeLinkToken_DeepLink(t *testing.T) {
 	s := testutil.SetupDB(t)
 	user := testutil.SeedUser(t, s, "consume-happy@example.com")
 	const provider = "tgtest"
 	const token = "deeplink-secret-abc"
 
-	// Issue with empty external_id — from.id is unknown until /start.
+	// Issue with empty external_id - from.id is unknown until /start.
 	if err := s.IssueLinkToken(user.ID, provider, "", token, time.Now().Add(5*time.Minute)); err != nil {
 		t.Fatalf("IssueLinkToken: %v", err)
 	}

@@ -17,8 +17,8 @@ var ErrUnknownProvider = errors.New("unknown provider")
 var ErrProviderNotConfigured = errors.New("provider not configured")
 
 // ErrMissingProvider means a job step reached an executor with no provider name.
-// Every builder sets one post-Sprint-4, so an empty value is a build-invariant
-// violation — permanent (see worker.go isPermanentError); retrying cannot help.
+// Every builder sets one, so an empty value is a build-invariant violation -
+// permanent (see worker.go isPermanentError); retrying cannot help.
 var ErrMissingProvider = errors.New("step has no provider")
 
 // ProviderResolver resolves a provider name to a Provider instance. Executors depend
@@ -28,7 +28,7 @@ type ProviderResolver interface {
 	Provider(name string) (Provider, error)
 }
 
-// staticProviders is a ProviderResolver backed by a fixed map — used by tests and
+// staticProviders is a ProviderResolver backed by a fixed map - used by tests and
 // simple wiring where no per-integration resolution is needed.
 type staticProviders map[string]Provider
 
@@ -40,10 +40,11 @@ func (s staticProviders) Provider(name string) (Provider, error) {
 	return p, nil
 }
 
-// providerFactory builds a Provider bound to a specific integration. The integ arg is
-// the Sprint-5 seam: today the Slack factory ignores it (the shared IntegrationCache is
-// the token source), but the registry still keys instances by integ.ID so multiple
-// integrations of one type become possible without touching call sites.
+// providerFactory builds a Provider bound to a specific integration. The integ
+// arg is the seam for several integrations of one type: today the Slack factory
+// ignores it (the shared IntegrationCache is the token source), but the registry
+// still keys instances by integ.ID, so that day arrives without touching call
+// sites.
 type providerFactory func(integ *model.Integration) (Provider, error)
 
 type factoryReg struct {
@@ -57,7 +58,7 @@ type factoryReg struct {
 // runtime resolution. Splitting the two means policy validation never returns
 // a 400 just because the Slack integration was temporarily disabled.
 type ProviderCapabilities struct {
-	Name                 string                // provider key — e.g. "slack"
+	Name                 string                // provider key - e.g. "slack"
 	IntegrationType      model.IntegrationType // backing integration type
 	SupportedTargetKinds []string              // sorted; e.g. ["channel","dm"]
 }
@@ -102,7 +103,7 @@ func (r *ProviderRegistry) RegisterFactory(name string, integType model.Integrat
 // available step types without touching the DB or trying to construct the
 // provider.
 //
-// Panics on duplicate Name — declaration is a startup-time concern and a
+// Panics on duplicate Name - declaration is a startup-time concern and a
 // duplicate is a programming error, not a runtime condition.
 func (r *ProviderRegistry) RegisterCapabilities(c ProviderCapabilities) {
 	if c.Name == "" {
@@ -173,7 +174,7 @@ func (r *ProviderRegistry) Provider(name string) (Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve integration for provider %q: %w", name, err)
 	}
-	// Check Enabled here rather than trusting the query filter — not every store
+	// Check Enabled here rather than trusting the query filter - not every store
 	// implementation filters disabled rows.
 	if integ == nil || !integ.Enabled {
 		return nil, fmt.Errorf("provider %q has no enabled integration: %w", name, ErrProviderNotConfigured)

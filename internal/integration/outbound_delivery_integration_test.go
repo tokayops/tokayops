@@ -116,7 +116,7 @@ func TestARetryCarriesWhatWasAdmitted(t *testing.T) {
 	}
 }
 
-// TestARetryableFailureHasNoDeathCounter is epic check 3.
+// TestARetryableFailureHasNoDeathCounter.
 //
 // The job engine gave every step a MaxAttempts, and a page that hit it was
 // simply never delivered - the alert stayed unanswered and nothing said so. A
@@ -183,7 +183,7 @@ func TestARetryableFailureHasNoDeathCounter(t *testing.T) {
 	}
 }
 
-// TestOneRecipientFailingLeavesTheOthersAlone is epic check 7.
+// TestOneRecipientFailingLeavesTheOthersAlone.
 //
 // In the job engine a fan-out was a stage, and what a stage did when one step
 // failed was a policy flag. Here there is no stage: each promise is its own
@@ -223,7 +223,7 @@ func TestOneRecipientFailingLeavesTheOthersAlone(t *testing.T) {
 	}
 }
 
-// TestWorkOutlivesTheProcessThatTookIt is epic check 14.
+// TestWorkOutlivesTheProcessThatTookIt.
 //
 // Every instance goes away - a deploy, a crash, a node draining - and what is
 // owed has to survive it. Nothing owed lives in a process: the commitment is a

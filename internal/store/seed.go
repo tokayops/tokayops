@@ -281,7 +281,7 @@ func (s *Store) seedAlertGroups() error {
 
 		alerts := generateSeedAlerts(ag.Title, ag.Alerts, ag.Severity)
 
-		// Resolve team name for snapshot — teams are seeded before alert groups
+		// Resolve team name for snapshot - teams are seeded before alert groups
 		teamName := ag.TeamID
 		if team, err := s.GetTeamByID(ag.TeamID); err == nil {
 			teamName = team.Name

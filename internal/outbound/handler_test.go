@@ -272,7 +272,7 @@ func TestAConclusionCannotNameARevision(t *testing.T) {
 
 // TestAnOutcomeNobodyDeclaredIsRefused: the constructor is the boundary for
 // callers that are not a provider handler at all - a test, an operator tool,
-// whatever Sprint 4 adds.
+// whatever comes next.
 func TestAnOutcomeNobodyDeclaredIsRefused(t *testing.T) {
 	for _, outcome := range []Outcome{"", "delivered_probably", OutcomeCanceled} {
 		if _, err := NewConclusion(ConclusionInput{Outcome: outcome}); err == nil {

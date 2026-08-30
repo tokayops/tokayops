@@ -319,7 +319,7 @@ func (s *Store) FinishStepAndAdvance(
 	}
 	defer tx.Rollback()
 
-	// 0. Load step metadata (stage_id, job_id, continue_on_failure) — no locks
+	// 0. Load step metadata (stage_id, job_id, continue_on_failure) - no locks
 	var stageID, jobID string
 	var continueOnFailure bool
 	err = tx.QueryRow(`
@@ -331,7 +331,7 @@ func (s *Store) FinishStepAndAdvance(
 		return 0, fmt.Errorf("step %s not found: %w", stepID, err)
 	}
 
-	// 1. FOR UPDATE on job row — first lock
+	// 1. FOR UPDATE on job row - first lock
 	var jobStatus string
 	err = tx.QueryRow(`SELECT status FROM jobs WHERE id = $1 FOR UPDATE`, jobID).Scan(&jobStatus)
 	if err != nil {
@@ -345,7 +345,7 @@ func (s *Store) FinishStepAndAdvance(
 		return model.AdvanceJobAlreadyTerminal, nil
 	}
 
-	// 2. FOR UPDATE on stage row — second lock
+	// 2. FOR UPDATE on stage row - second lock
 	var stageStatus string
 	var stageIndex int
 	err = tx.QueryRow(`SELECT status, stage_index FROM job_stages WHERE id = $1 FOR UPDATE`,
@@ -359,7 +359,7 @@ func (s *Store) FinishStepAndAdvance(
 		return model.AdvanceAlreadyAdvanced, tx.Commit()
 	}
 
-	// 3. CAS: finalize step only if lease is ours — third lock
+	// 3. CAS: finalize step only if lease is ours - third lock
 	var resultVal *string
 	if result != "" {
 		quoted := fmt.Sprintf("%q", result)
@@ -416,7 +416,7 @@ func (s *Store) FinishStepAndAdvance(
 		return model.AdvanceJobFinished, tx.Commit()
 	}
 
-	// 7. Stage completed — determine status
+	// 7. Stage completed - determine status
 	var hasAnyFailed bool
 	tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM job_steps WHERE stage_id = $1 AND status = 'failed')`,
 		stageID).Scan(&hasAnyFailed)
@@ -434,7 +434,7 @@ func (s *Store) FinishStepAndAdvance(
 		jobID, stageIndex+1).Scan(&nextStageID)
 
 	if err == sql.ErrNoRows {
-		// Last stage — finish job
+		// Last stage - finish job
 		var jobHasFailed bool
 		tx.QueryRow(`
 			SELECT EXISTS (SELECT 1 FROM job_steps WHERE stage_id IN

@@ -7,7 +7,7 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// mergeSecrets is a pure function (no DB) — unit-test the telegram case directly.
+// mergeSecrets is a pure function (no DB) - unit-test the telegram case directly.
 func TestMergeSecrets_Telegram(t *testing.T) {
 	existing := json.RawMessage(`{"bot_token":"123:real","secret_token":"realsecret","default_chat_id":"-100999"}`)
 

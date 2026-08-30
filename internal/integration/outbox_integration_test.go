@@ -249,7 +249,7 @@ func TestOutbox_WorkerDeliversToRealHTTP(t *testing.T) {
 		t.Error("X-Tokay-Event-ID is empty")
 	}
 
-	// X-Tokay-Signature — recompute and verify
+	// X-Tokay-Signature - recompute and verify
 	ts := req.Header.Get("X-Tokay-Timestamp")
 	sig := req.Header.Get("X-Tokay-Signature")
 	if ts == "" || sig == "" {

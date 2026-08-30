@@ -103,7 +103,7 @@ func TestRegistry_DisabledIntegration_NotConfigured(t *testing.T) {
 	}
 }
 
-// Sprint 4: capability lookup is independent of runtime resolution. A
+// Capability lookup is independent of runtime resolution. A
 // provider registered only via RegisterCapabilities (no factory, no static)
 // is discoverable for the policy editor even when no integration exists.
 func TestRegistry_Capabilities_DoNotRequireRuntimeResolution(t *testing.T) {
@@ -129,7 +129,7 @@ func TestRegistry_Capabilities_DoNotRequireRuntimeResolution(t *testing.T) {
 		}
 	}
 
-	// Runtime resolution still fails — no factory and no static instance.
+	// Runtime resolution still fails - no factory and no static instance.
 	if _, err := r.Provider("slack"); !errors.Is(err, ErrUnknownProvider) {
 		t.Fatalf("Provider(slack) without factory: want ErrUnknownProvider, got %v", err)
 	}

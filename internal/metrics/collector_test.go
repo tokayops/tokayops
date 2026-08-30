@@ -26,7 +26,7 @@ func TestBusinessCollector_ActiveAlertGroups(t *testing.T) {
 		ID: "ag3", AlertKey: "k3", TeamID: "devops", Severity: "warning",
 		Status: model.AlertGroupStatusAcknowledged,
 	})
-	// Resolved — should NOT count
+	// Resolved - should NOT count
 	s.CreateAlertGroup(&model.AlertGroup{
 		ID: "ag4", AlertKey: "k4", TeamID: "devops", Severity: "critical",
 		Status: model.AlertGroupStatusResolved,

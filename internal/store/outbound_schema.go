@@ -685,7 +685,7 @@ const outboundAdmittedStateConstraint = "outbound_batches_admission_snapshot_pre
 //     nothing else to do. This is every database that has not escalated yet;
 //   - claims whose snapshots are in the current format: filled in from the
 //     group's own snapshot at revision 0, which IS what they were admitted
-//     from - nothing before this sprint could move a revision off zero;
+//     from - nothing that wrote them could move a revision off zero;
 //   - claims whose snapshots still carry the history: the start stops and says
 //     so. This build cannot deliver those commitments, and pretending
 //     otherwise would hide it until a page failed. TokayOps is not deployed

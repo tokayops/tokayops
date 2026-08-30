@@ -211,7 +211,7 @@ const (
 // User represents an individual who can be notified and assigned to incidents.
 //
 // External account links (Slack user IDs, Telegram chat IDs, ...) live in
-// `external_identities` and are surfaced via Identities on demand by handlers —
+// `external_identities` and are surfaced via Identities on demand by handlers -
 // they are NOT loaded by the user-row scan (mirrors AlertGroup.TimelineEvents).
 type User struct {
 	ID           string              `json:"id"`                      // UUID
@@ -240,7 +240,7 @@ type ExternalIdentity struct {
 // LinkToken is a short-lived, single-use token for linking an external account.
 // For Slack OTP, Token is the 6-digit code DM'd to the user; for Telegram deep-link
 // it is the opaque token in the /start <token> URL. The store persists only the
-// SHA-256 hash — Token is never stored at rest.
+// SHA-256 hash - Token is never stored at rest.
 type LinkToken struct {
 	ID         string    `json:"id"`
 	UserID     string    `json:"user_id"`
@@ -362,10 +362,10 @@ type EscalationPolicy struct {
 
 // EscalationStep defines a single step in an escalation policy.
 //
-// Sprint 4 (Epic 7 L6) replaced the flat StepType enum with
-// (Provider, TargetKind):
+// A flat StepType enum used to say both of these at once. It is
+// (Provider, TargetKind) now:
 //   - Provider: provider key (e.g. "slack"); resolved at dispatch time.
-//   - TargetKind: "dm" or "channel" — what kind of recipient the step targets.
+//   - TargetKind: "dm" or "channel" - what kind of recipient the step targets.
 //     The pair must be supported by the provider's capabilities.
 //
 // The legacy combined enum (`slack_dm` / `slack_channel`) was a one-provider

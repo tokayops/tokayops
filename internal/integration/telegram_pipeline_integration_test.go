@@ -105,7 +105,7 @@ type tgPipelineEnv struct {
 // the inbound /telegram/webhook is reachable on the same echo. Mirrors
 // pipeline_integration_test.go's harness, swapping MockProvider for telegram.
 func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
-	// Integration config is encrypted at rest — provide a deterministic test key.
+	// Integration config is encrypted at rest - provide a deterministic test key.
 	key := make([]byte, 32)
 	for i := range key {
 		key[i] = byte(i)

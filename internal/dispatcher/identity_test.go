@@ -42,9 +42,9 @@ func TestResolveRecipient_NoIdentity_Permanent(t *testing.T) {
 }
 
 // TestResolveRecipient_Generic_AnyProvider replaces the old
-// TestResolveRecipient_UnknownProvider_Permanent. After Sprint 4 (Epic 7 L7)
-// resolveRecipient is generic over external_identities, so an unknown provider
-// is the same shape of failure as "no identity for known provider" — the user
+// TestResolveRecipient_UnknownProvider_Permanent. resolveRecipient is generic
+// over external_identities now, so an unknown provider
+// is the same shape of failure as "no identity for known provider" - the user
 // is simply not linked to that provider, regardless of whether that provider
 // is registered with the dispatcher.
 func TestResolveRecipient_Generic_AnyProvider(t *testing.T) {

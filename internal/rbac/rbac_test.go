@@ -226,7 +226,7 @@ func TestNonAdminCannotManageGlobalIntegration(t *testing.T) {
 	s := store.NewMockStore()
 	c := NewChecker(s)
 
-	// alex is regular user — with GlobalScope, integration actions should be denied
+	// alex is regular user - with GlobalScope, integration actions should be denied
 	actions := []Action{
 		ActionIntegrationList,
 		ActionIntegrationView,

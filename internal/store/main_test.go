@@ -16,7 +16,7 @@ var testStore *Store
 
 func TestMain(m *testing.M) {
 	// Integration tests that exercise encrypted integration configs require an
-	// encryption key — notably Seed(), which creates Slack + Alertmanager webhook
+	// encryption key - notably Seed(), which creates Slack + Alertmanager webhook
 	// integrations. CI sets ENCRYPTION_KEY in the job env; set a deterministic
 	// default here so local runs (make test-integration) behave identically no
 	// matter how the package is invoked. An explicitly provided key still wins.
@@ -39,7 +39,7 @@ func TestMain(m *testing.M) {
 			log.Fatalf("Failed to init test DB schema: %v", err)
 		}
 	} else {
-		fmt.Println("TEST_DB_DSN not set — skipping integration tests, running mock tests only")
+		fmt.Println("TEST_DB_DSN not set - skipping integration tests, running mock tests only")
 	}
 
 	code := m.Run()

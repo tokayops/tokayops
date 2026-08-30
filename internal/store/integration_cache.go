@@ -138,8 +138,8 @@ func (c *IntegrationCache) GetTelegramToken() string {
 }
 
 // GetTelegramSecretToken returns the cached Telegram webhook secret token
-// (X-Telegram-Bot-Api-Secret-Token). Consumed by the webhook middleware in
-// Sprint 3; lives on the concrete cache, not the provider TokenSource interface.
+// (X-Telegram-Bot-Api-Secret-Token). Consumed by the webhook middleware; lives
+// on the concrete cache, not on the provider TokenSource interface.
 func (c *IntegrationCache) GetTelegramSecretToken() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

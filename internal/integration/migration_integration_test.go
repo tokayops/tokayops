@@ -40,7 +40,7 @@ func TestMigration_Idempotent(t *testing.T) {
 		t.Fatalf("CreateAlertGroup failed: %v", err)
 	}
 
-	// Third call — existing data must survive
+	// Third call - existing data must survive
 	if err := s.InitDB(); err != nil {
 		t.Fatalf("Third InitDB call failed: %v", err)
 	}
@@ -64,11 +64,11 @@ func TestMigration_Idempotent(t *testing.T) {
 	}
 }
 
-// TestMigration_EscalationStepsStepTypeToProviderKind verifies the Epic 7 Sprint 4
-// upgrade migration: an old escalation_steps table keyed by step_type is migrated
+// TestMigration_EscalationStepsStepTypeToProviderKind verifies the upgrade
+// migration: an old escalation_steps table keyed by step_type is migrated
 // in place to (provider, target_kind), backfilling provider='slack' and mapping
 // slack_dm->dm, slack_channel->channel, and any other legacy value->dm. This is the
-// main upgrade regression from the Sprint 4 review (no automated coverage before).
+// main upgrade regression for that change, which had no automated coverage.
 func TestMigration_EscalationStepsStepTypeToProviderKind(t *testing.T) {
 	s := testutil.SetupDB(t) // InitDB created the NEW (provider, target_kind) schema
 
@@ -83,7 +83,7 @@ func TestMigration_EscalationStepsStepTypeToProviderKind(t *testing.T) {
 	}
 
 	// Revert escalation_steps to the legacy shape: drop the new columns and add
-	// step_type, simulating a DB created before Sprint 4.
+	// step_type, simulating a database created before the columns changed.
 	if _, err := s.GetDB().Exec(`
 		ALTER TABLE escalation_steps DROP COLUMN provider;
 		ALTER TABLE escalation_steps DROP COLUMN target_kind;

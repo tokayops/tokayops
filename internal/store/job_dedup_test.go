@@ -14,7 +14,7 @@ import (
 // implementations: the database below, the double under it.
 //
 // One table rather than two suites, because the double drifting from the
-// database is not hypothetical - it is what the previous sprint found, and a
+// database is not hypothetical - it is what a review found once already, and a
 // rule written out twice is a rule that drifts again.
 //
 // Both scopes are here. Escalation is absent because it left the job engine
@@ -69,8 +69,9 @@ var jobDedupCases = []struct {
 		wantCreated: true,
 	},
 	{
-		// Unreachable before this sprint: one index over dedup_key alone made
-		// two families sharing a string collide, whichever families they were.
+		// Unreachable until the index changed: one index over dedup_key alone
+		// made two families sharing a string collide, whichever families they
+		// were.
 		name:        "the same key in another namespace is other work",
 		first:       mustSpec("ack_update", "shared-key", "while_active"),
 		firstEnds:   model.JobStatusPending,

@@ -94,7 +94,7 @@ func (s *Store) BindExternalIdentity(ei *model.ExternalIdentity) error {
 // SSO/interactive auto-link cannot be overwritten between the check and the bind
 // (the previous check-then-bind sequence had this TOCTOU window). The
 // idx_external_identities_provider_external unique index is NOT named in the
-// ON CONFLICT clause, so a cross-user collision still raises a unique violation —
+// ON CONFLICT clause, so a cross-user collision still raises a unique violation -
 // we translate it to ErrExternalIdentityAlreadyLinked.
 //
 // Callers can ignore (false, nil) silently and decide whether to surface the
@@ -173,7 +173,7 @@ func (s *Store) GetUserByExternalID(provider, externalID string) (*model.User, e
 	return &u, nil
 }
 
-// GetIdentitiesForUsers batches identities by user — used to populate User.Identities
+// GetIdentitiesForUsers batches identities by user - used to populate User.Identities
 // in the users-list response and to build the slackByUser map in handoff/syncer.
 func (s *Store) GetIdentitiesForUsers(userIDs []string) (map[string][]*model.ExternalIdentity, error) {
 	out := make(map[string][]*model.ExternalIdentity)
@@ -227,7 +227,7 @@ func (s *Store) UnbindExternalIdentity(userID, provider string) error {
 // supplies the plaintext token (e.g. a freshly generated 6-digit OTP); the store
 // persists only the SHA-256 hash. On the rare (provider, token_hash) collision
 // (~1/1M for 6-digit codes), the caller is expected to regenerate the token and
-// retry — the API layer wraps this in a bounded loop.
+// retry - the API layer wraps this in a bounded loop.
 func (s *Store) IssueLinkToken(userID, provider, externalID, token string, expiresAt time.Time) error {
 	if token == "" {
 		return errors.New("token is required")
@@ -254,7 +254,7 @@ func (s *Store) IssueLinkToken(userID, provider, externalID, token string, expir
 }
 
 // ConfirmIdentityLink consumes a pending link token and binds the external identity
-// in one transaction — generalises the old ConfirmSlackOTP. Returns
+// in one transaction - generalises the old ConfirmSlackOTP. Returns
 // ErrLinkTokenInvalid (wrong code), ErrLinkTokenExpired (timed out / too many
 // attempts), or ErrExternalIdentityAlreadyLinked (target external_id taken by
 // another user). Raw DB errors stay transient and are not wrapped.
@@ -320,7 +320,7 @@ func (s *Store) ConfirmIdentityLink(userID, provider, token string) (*model.Exte
 		return nil, ErrLinkTokenInvalid
 	}
 
-	// Token matched — bind external_identity and delete the link token.
+	// Token matched - bind external_identity and delete the link token.
 	externalID := externalIDNull.String
 	if externalID == "" {
 		// Defensive: Slack OTP path requires external_id at issue; deep-link supplies
@@ -373,7 +373,7 @@ func (s *Store) ConfirmIdentityLink(userID, provider, token string) (*model.Exte
 
 // ConsumeLinkToken consumes a deep-link token (e.g. Telegram `/start <token>`)
 // and binds the external identity in one transaction. Unlike ConfirmIdentityLink
-// it is keyed by (provider, token_hash) and resolves the user FROM the token row —
+// it is keyed by (provider, token_hash) and resolves the user FROM the token row -
 // the bot side has no logged-in user. The token is a high-entropy bearer secret,
 // so a wrong token simply matches no row (ErrLinkTokenInvalid); there is no
 // attempt-counting (nothing to lock), and security rests on entropy + TTL +

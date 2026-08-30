@@ -40,8 +40,8 @@ func TestHandoffExecutor_Execute(t *testing.T) {
 	provider := &mockHandoffProvider{}
 	exec := NewHandoffExecutor(staticProviders{"slack": provider})
 
-	// Sprint 4: handoff steps now carry an explicit ProviderName populated by
-	// the notifier per linked identity; executor does not hardcode "slack".
+	// Handoff steps carry an explicit ProviderName, populated by the notifier
+	// per linked identity; the executor does not hardcode "slack".
 	stepData := model.HandoffStepData{
 		ProviderName: "slack",
 		TargetID:     "U12345",
@@ -73,7 +73,7 @@ func TestHandoffExecutor_Execute(t *testing.T) {
 }
 
 // TestHandoffExecutor_NonSlackProvider_Routed asserts the executor honors
-// ProviderName instead of hardcoding "slack" (Sprint 4 L7).
+// ProviderName instead of hardcoding "slack".
 func TestHandoffExecutor_NonSlackProvider_Routed(t *testing.T) {
 	telegramProvider := &mockHandoffProvider{}
 	slackProvider := &mockHandoffProvider{}
@@ -121,9 +121,9 @@ func TestHandoffExecutor_MissingProvider(t *testing.T) {
 	}
 }
 
-// TestHandoffExecutor_EmptyProviderName guards the defensive check — the
+// TestHandoffExecutor_EmptyProviderName guards the defensive check - the
 // handoff_notifier always sets ProviderName; a missing value is a build-invariant
-// violation that must fail permanently (Sprint 5: ErrMissingProvider), never retry.
+// violation that must fail permanently with ErrMissingProvider, never retry.
 func TestHandoffExecutor_EmptyProviderName(t *testing.T) {
 	exec := NewHandoffExecutor(staticProviders{"slack": &mockHandoffProvider{}})
 

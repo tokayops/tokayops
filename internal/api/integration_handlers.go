@@ -265,7 +265,7 @@ func (a *API) UpdateIntegration(c echo.Context) error {
 
 	// Snapshot the OLD telegram bot token before the config is overwritten below.
 	// reloadIntegrationCache() clears tokens, so deleting the old webhook after the
-	// reload would have no token — we must capture it now and pass it explicitly.
+	// reload would have no token - we must capture it now and pass it explicitly.
 	var oldTelegramCfgRaw json.RawMessage
 	if existing.Type == model.IntegrationTypeTelegram {
 		oldTelegramCfgRaw = existing.Config
@@ -336,7 +336,7 @@ func (a *API) UpdateIntegration(c echo.Context) error {
 	}
 
 	// Telegram webhook lifecycle (best-effort, merged/decrypted `existing` config).
-	// Delete the OLD webhook ONLY when it would otherwise be orphaned — the
+	// Delete the OLD webhook ONLY when it would otherwise be orphaned - the
 	// integration is now disabled, or the bot token rotated to a different bot.
 	// For a same-token edit we just re-affirm via the idempotent setWebhook, so a
 	// harmless edit can't open a delete-then-failed-set gap that kills interactivity.
@@ -433,7 +433,7 @@ func (a *API) setTelegramWebhook(ctx context.Context, integration *model.Integra
 	}
 	url := a.telegramWebhookURL()
 	if url == "" {
-		log.Printf("telegram: TOKAY_SELF_URL not configured — interactivity disabled: webhook not registered, Ack/Resolve buttons hidden")
+		log.Printf("telegram: TOKAY_SELF_URL not configured - interactivity disabled: webhook not registered, Ack/Resolve buttons hidden")
 		return
 	}
 	if err := a.telegram.SetWebhook(ctx, cfg.BotToken, url, cfg.SecretToken); err != nil {
@@ -451,7 +451,7 @@ func (a *API) RegisterTelegramWebhookOnStartup(ctx context.Context) {
 	}
 	integ, err := a.store.GetIntegrationByType(model.IntegrationTypeTelegram)
 	if err != nil {
-		// ErrIntegrationNotFound (none configured / disabled) is normal — nothing to do.
+		// ErrIntegrationNotFound (none configured / disabled) is normal - nothing to do.
 		return
 	}
 	a.setTelegramWebhook(ctx, integ)
@@ -500,7 +500,7 @@ type TestIntegrationResponse struct {
 func (a *API) TestIntegration(c echo.Context) error {
 	id := c.Param("id")
 
-	// Bind request (mode is optional — inferred from integration type)
+	// Bind request (mode is optional - inferred from integration type)
 	var req TestIntegrationRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
@@ -675,7 +675,7 @@ func (a *API) SlackManifest(c echo.Context) error {
 
 	manifest := fmt.Sprintf(`display_information:
   name: TokayOps
-  description: TokayOps — incident management & alerting gateway
+  description: TokayOps - incident management & alerting gateway
   background_color: "#2C2D30"
 features:
   bot_user:

@@ -167,8 +167,8 @@ func TestPolicyAPI_CreateValid_RoundTrips(t *testing.T) {
 }
 
 // TestPolicyAPI_CreateValid_TelegramSteps verifies telegram dm + channel steps
-// pass the capability gate and round-trip through Store -> DB -> GET — the Epic 8
-// Sprint 2 proof that registering the telegram capability is sufficient.
+// pass the capability gate and round-trip through Store -> DB -> GET: the proof
+// that registering the telegram capability is sufficient.
 func TestPolicyAPI_CreateValid_TelegramSteps(t *testing.T) {
 	env := setupPolicyAPITest(t)
 	admin := seedGlobalAdmin(t, env.S, "admin@poltelegram.test")

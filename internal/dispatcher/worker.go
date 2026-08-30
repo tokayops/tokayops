@@ -36,7 +36,7 @@ type Dispatcher struct {
 	providers *ProviderRegistry
 	// WorkerID is a per-process identity used only for log correlation. It is
 	// NOT the lease token: ClaimNextJobSteps generates locked_by in the DB
-	// (gen_random_uuid) and returns it as step.LockedBy — that value is what the
+	// (gen_random_uuid) and returns it as step.LockedBy - that value is what the
 	// owned-step CAS calls (UpdateJobStepIfOwned / ExtendStepLease /
 	// FinishStepAndAdvance) carry as leaseToken.
 	WorkerID  string
@@ -95,7 +95,7 @@ func (d *Dispatcher) RegisterProviderCapabilities(c ProviderCapabilities) {
 }
 
 // Providers exposes the registry so the API layer can read capabilities.
-// Callers must treat the result as read-only — runtime resolution is the
+// Callers must treat the result as read-only - runtime resolution is the
 // dispatcher's concern.
 func (d *Dispatcher) Providers() *ProviderRegistry {
 	return d.providers
@@ -219,7 +219,7 @@ func (d *Dispatcher) handleStepRetry(step *model.JobStep, err error) {
 	}
 
 	if step.AttemptCount >= max {
-		// Max retries exhausted — finalize through FinishStepAndAdvance
+		// Max retries exhausted - finalize through FinishStepAndAdvance
 		log.Printf("StepWorker: Step %s failed permanently: %v. Finishing step.", step.ID, err)
 		d.failStep(step, err.Error())
 	} else {

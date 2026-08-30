@@ -1,6 +1,6 @@
 display_information:
   name: TokayOps
-  description: TokayOps — incident management & alerting gateway
+  description: TokayOps - incident management & alerting gateway
   background_color: "#2C2D30"
 features:
   bot_user:

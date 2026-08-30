@@ -235,7 +235,7 @@ func TestCreateAlertGroupAtomic_Success(t *testing.T) {
 		t.Errorf("Expected status 'new', got '%s'", fetched.Status)
 	}
 
-	// Verify timeline events — ordering via µs offsets
+	// Verify timeline events - ordering via µs offsets
 	events, err := s.GetTimelineEvents(agID)
 	if err != nil {
 		t.Fatalf("GetTimelineEvents failed: %v", err)
@@ -322,7 +322,7 @@ func TestCreateAlertGroupAtomic_Rollback(t *testing.T) {
 		t.Fatalf("setup CreateAlertGroup failed: %v", err)
 	}
 
-	// Try to create duplicate AG atomically — should fail on duplicate key
+	// Try to create duplicate AG atomically - should fail on duplicate key
 	dupAG := &model.AlertGroup{
 		ID: agID, AlertKey: "key-dup", Status: model.AlertGroupStatusNew,
 		Title: "Dup", TeamID: teamID, TeamNameSnapshot: teamID, Severity: "warning",
@@ -725,22 +725,22 @@ func TestGetEscalationSources_IncludesStaleProcessing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// AG1: "new" — always returned
+	// AG1: "new" - always returned
 	ag1 := &model.AlertGroup{
 		ID: "ag-new-1", AlertKey: "dk-new-1", Status: model.AlertGroupStatusNew,
 		TeamID: teamID, TeamNameSnapshot: "Reconcile", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
-	// AG2: "processing" with fresh updated_at — should NOT be returned
+	// AG2: "processing" with fresh updated_at - should NOT be returned
 	ag2 := &model.AlertGroup{
 		ID: "ag-proc-fresh", AlertKey: "dk-proc-fresh", Status: model.AlertGroupStatusProcessing,
 		TeamID: teamID, TeamNameSnapshot: "Reconcile", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
-	// AG3: "processing" with stale updated_at (> 30s ago) — should be returned
+	// AG3: "processing" with stale updated_at (> 30s ago) - should be returned
 	ag3 := &model.AlertGroup{
 		ID: "ag-proc-stale", AlertKey: "dk-proc-stale", Status: model.AlertGroupStatusProcessing,
 		TeamID: teamID, TeamNameSnapshot: "Reconcile", CreatedAt: time.Now(), UpdatedAt: time.Now().Add(-60 * time.Second),
 	}
-	// AG4: "triggered" — should NOT be returned
+	// AG4: "triggered" - should NOT be returned
 	ag4 := &model.AlertGroup{
 		ID: "ag-triggered", AlertKey: "dk-triggered", Status: model.AlertGroupStatusTriggered,
 		TeamID: teamID, TeamNameSnapshot: "Reconcile", CreatedAt: time.Now(), UpdatedAt: time.Now().Add(-60 * time.Second),
@@ -1212,7 +1212,7 @@ func TestMigration_OrphanedTeam_BackfillSnapshot(t *testing.T) {
 		t.Fatalf("Failed to clear snapshot: %v", err)
 	}
 
-	// 4. Re-run InitDB — should NOT crash despite orphaned team_id
+	// 4. Re-run InitDB - should NOT crash despite orphaned team_id
 	if err := s.InitDB(); err != nil {
 		t.Fatalf("InitDB crashed on orphaned team_id: %v", err)
 	}
@@ -1236,7 +1236,7 @@ func TestSeed_AlertGroupHasTeamNameSnapshot(t *testing.T) {
 		t.Fatalf("Seed: %v", err)
 	}
 
-	// Seed creates AGs for teams "devops" and "platform" — check a few
+	// Seed creates AGs for teams "devops" and "platform" - check a few
 	ags, _, err := s.GetAllAlertGroups(nil, 100, 0)
 	if err != nil {
 		t.Fatalf("GetAllAlertGroups: %v", err)
@@ -1249,7 +1249,7 @@ func TestSeed_AlertGroupHasTeamNameSnapshot(t *testing.T) {
 		if ag.TeamNameSnapshot == "" {
 			t.Errorf("AG %s (%s) has empty TeamNameSnapshot", ag.ID, ag.Title)
 		}
-		// Snapshot should NOT equal teamID when team exists — it should be the team name
+		// Snapshot should NOT equal teamID when team exists - it should be the team name
 		if ag.TeamNameSnapshot == ag.TeamID {
 			t.Errorf("AG %s: TeamNameSnapshot = TeamID %q, expected resolved team name", ag.ID, ag.TeamID)
 		}

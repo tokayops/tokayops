@@ -7,7 +7,7 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// Tier 1 — HTTP
+// Tier 1 - HTTP
 var (
 	HTTPRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "http_requests_total",
@@ -21,7 +21,7 @@ var (
 	}, []string{"method", "path"})
 )
 
-// Tier 2 — Alert ingestion
+// Tier 2 - Alert ingestion
 var (
 	AlertsReceivedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "alerts_received_total",
@@ -48,7 +48,7 @@ var (
 	}, []string{"team"})
 )
 
-// Tier 3 — Dispatcher / notification delivery
+// Tier 3 - Dispatcher / notification delivery
 var (
 	JobStepsProcessedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "job_steps_processed_total",
@@ -66,7 +66,7 @@ var (
 	}, []string{"channel", "reason"})
 )
 
-// Tier 4 — Engine
+// Tier 4 - Engine
 var (
 	EngineRunsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "engine_runs_total",
@@ -106,7 +106,7 @@ var (
 	})
 )
 
-// Tier 5 — Handoff notifier
+// Tier 5 - Handoff notifier
 var (
 	HandoffWarmupNotComplete = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "handoff_warmup_not_complete_total",
@@ -114,7 +114,7 @@ var (
 	})
 )
 
-// MTTR — resolution duration
+// MTTR - resolution duration
 var (
 	AlertGroupResolutionDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "alert_group_resolution_duration_seconds",
@@ -123,7 +123,7 @@ var (
 	}, []string{"team", "severity", "oncall_user"})
 )
 
-// MTTA — ack duration
+// MTTA - ack duration
 var (
 	AlertGroupAckDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "alert_group_ack_duration_seconds",
@@ -132,7 +132,7 @@ var (
 	}, []string{"team", "severity"})
 )
 
-// Tier 6 — Slack interactivity
+// Tier 6 - Slack interactivity
 var (
 	SlackUserLinkedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "slack_user_linked_total",
@@ -150,7 +150,7 @@ var (
 	})
 )
 
-// Tier 6b — Telegram interactivity (Epic 8 Sprint 3). Mirrors the Slack counters;
+// Tier 6b - Telegram interactivity. Mirrors the Slack counters;
 // no email_match label (Telegram has no email auto-link).
 var (
 	TelegramUserLinkedTotal = prometheus.NewCounter(prometheus.CounterOpts{
@@ -169,7 +169,7 @@ var (
 	})
 )
 
-// Tier 7 — Outbox Delivery
+// Tier 7 - Outbox Delivery
 var (
 	OutboxEventsClaimedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "outbox_events_claimed_total",

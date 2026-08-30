@@ -38,13 +38,13 @@ type Namespace string
 
 const (
 	// NamespaceEscalation is history and has no constructor. The escalation
-	// left the job engine in Epic 12: it is a set of commitments in the
-	// outbound domain now, and nothing writes a job under this name any more.
+	// has left the job engine: it is a set of commitments in the outbound
+	// domain now, and nothing writes a job under this name any more.
 	//
 	// It stays declared for one reason only - the registry is how a row is
 	// READ, and PolicyOf on an unknown namespace is an error. Rows written
 	// before the cutover stay readable; that is all this name does. The whole
-	// registry goes in Sprint 3.
+	// registry goes when the job engine does.
 	//
 	// It is NOT a start-up guard. Nothing refuses to serve a database that
 	// still holds an active escalation job, and nothing needs to: the upgrade

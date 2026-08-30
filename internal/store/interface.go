@@ -83,7 +83,7 @@ type StoreInterface interface {
 	UpdateUserAuthProvider(id, provider string) error
 	DeleteUser(id string) error
 
-	// External Identities (Epic 7 Sprint 3 — replaces User.SlackUserID + slack_otp_codes)
+	// External Identities (replaces User.SlackUserID + slack_otp_codes)
 	BindExternalIdentity(ei *model.ExternalIdentity) error
 	BindExternalIdentityIfAbsent(userID, provider, externalID, displayName string) (changed bool, err error)
 	GetExternalIdentity(userID, provider string) (*model.ExternalIdentity, error)

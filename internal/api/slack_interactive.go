@@ -60,7 +60,7 @@ func (a *API) SlackSignatureMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 		}
 
 		// 2. Read raw body (capped at 1 MB to prevent memory abuse) and restore it for the handler
-		const maxBodySize = 1 << 20 // 1 MB — Slack payloads are typically <100 KB
+		const maxBodySize = 1 << 20 // 1 MB - Slack payloads are typically <100 KB
 		body, err := io.ReadAll(io.LimitReader(c.Request().Body, maxBodySize+1))
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "failed to read body"})
@@ -108,7 +108,7 @@ func (a *API) resolveSlackUser(ctx context.Context, slackUserID string) *model.U
 			user, err := a.store.GetUserByEmail(email)
 			if err == nil && user != nil {
 				// BindExternalIdentityIfAbsent returns (false, ErrExternalIdentityAlreadyLinked)
-				// if the Slack id is bound to a *different* user — we silently fall through to OTP
+				// if the Slack id is bound to a *different* user - we silently fall through to OTP
 				// rather than overwriting.
 				changed, _ := a.store.BindExternalIdentityIfAbsent(user.ID, "slack", slackUserID, "")
 				if changed {
@@ -172,7 +172,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 	case SlackActionResolveAlertGroup:
 		rbacAction = rbac.ActionAlertResolve
 	default:
-		// Unknown action — ignore gracefully
+		// Unknown action - ignore gracefully
 		return c.NoContent(http.StatusOK)
 	}
 

@@ -460,7 +460,7 @@ func TestWorker_FanoutErrorReleasesEvent(t *testing.T) {
 
 	w.processEvent(context.Background(), event)
 
-	// Event must NOT be completed — it should be released for retry
+	// Event must NOT be completed - it should be released for retry
 	updated, _ := st.GetOutboxEventByID(event.ID)
 	if updated.Status == model.OutboxEventStatusCompleted {
 		t.Fatal("event should not be completed when fan-out has errors")

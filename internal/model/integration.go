@@ -94,6 +94,6 @@ type GenericWebhookConfig struct {
 const MaskedSecret = "****"
 
 // Note: ValidIntegrationTypes / IsValidIntegrationType / GetDirectionForType
-// (Sprint 4) and MaskSecrets (Sprint 5) moved to internal/integrations. Type
-// metadata — including which config fields are secret — is declared next to the
+// and MaskSecrets moved to internal/integrations. Type
+// metadata - including which config fields are secret - is declared next to the
 // per-type Descriptor instead of as a switch here. Use integrations.MaskSecrets.

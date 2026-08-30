@@ -794,7 +794,7 @@ type MockProvider struct {
 	sentTargets []string
 }
 
-// Send satisfies the post-Sprint-1 Provider interface: it takes a typed
+// Send satisfies the Provider interface as it stands: it takes a typed
 // NotificationRequest and records the recipient under sentTargets so existing
 // assertions on SendDM (now unified into Send with Editable=false) keep
 // working. Editable=true returns a JSON payload that survives the delivery
@@ -820,8 +820,8 @@ func (m *MockProvider) Resolve(ctx context.Context, _ *model.NotificationDeliver
 	return nil
 }
 
-// Permalink — Sprint 1 made this part of the Provider interface. Static stub
-// is enough; the integration tests assert on counters, not on link shape.
+// Permalink is part of the Provider interface. A static stub is enough; the
+// integration tests assert on counters, not on link shape.
 func (m *MockProvider) Permalink(_ *model.NotificationDelivery) string {
 	return "https://slack.com/mock"
 }
@@ -1072,7 +1072,7 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 	testutil.BindSlack(t, env.S, "U_ALICE", "S_ALICE")
 	testutil.BindSlack(t, env.S, "U_BOB", "S_BOB")
 
-	// One group with both users — both should be on-call simultaneously
+	// One group with both users - both should be on-call simultaneously
 	schedID := pipelineSchedule(t, env, "devops", pipelineConfig(
 		[]rotation.RotationGroup{{ID: pipelineGroupA, Members: []string{"U_ALICE", "U_BOB"}}},
 		"",
@@ -1163,7 +1163,7 @@ func TestPipeline_ScheduleFanOut_OverrideOverGroup(t *testing.T) {
 		"",
 	), "U_ALICE", "U_BOB")
 
-	// Override for U_BOB covering the current instant — the projection overlays
+	// Override for U_BOB covering the current instant - the projection overlays
 	// it onto the layer, so the group on duty becomes U_BOB alone.
 	now := time.Now().UTC()
 	reason := "Test override"
@@ -1321,7 +1321,7 @@ func TestPipeline_ScheduleFanOut_NoL2Additive(t *testing.T) {
 }
 
 // TestPipeline_DisabledProvider_PermanentFail verifies that a DM step targeting a
-// provider with no enabled integration fails PERMANENTLY at runtime — the worker
+// provider with no enabled integration fails PERMANENTLY at runtime - the worker
 // classifies ErrProviderNotConfigured as permanent (no retry loop) and the
 // non-continue-on-failure step hard-fails the job. This is the end-to-end
 // counterpart to the unit-level TestRegistry_DisabledIntegration_NotConfigured.
@@ -1329,7 +1329,7 @@ func TestPipeline_DisabledProvider_PermanentFail(t *testing.T) {
 	env := setupIntegrationTest(t)
 
 	// Register a provider whose backing integration type has no enabled integration
-	// in this fresh DB, so resolving it yields ErrProviderNotConfigured — the same
+	// in this fresh DB, so resolving it yields ErrProviderNotConfigured - the same
 	// error a disabled Slack integration produces. The build fn is never invoked.
 	env.Disp.RegisterProviderFactory("blocked", model.IntegrationTypeAlertmanagerWebhook,
 		func(*model.Integration) (dispatcher.Provider, error) { return env.MockProv, nil })
@@ -1424,7 +1424,7 @@ func agIDForKey(t *testing.T, s *store.Store, alertKey string) string {
 }
 
 // TestPipeline_ChannelUpdate verifies a policy CHANNEL step produces an editable
-// (supports_update=true) delivery and a timeline event — the "Escalation channel"
+// (supports_update=true) delivery and a timeline event - the "Escalation channel"
 // row in the test strategy, which existing tests only covered via firehose.
 func TestPipeline_ChannelUpdate(t *testing.T) {
 	env := setupIntegrationTest(t)
@@ -1488,7 +1488,7 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 		t.Error("the delivered card does not say where it is")
 	}
 
-	// A timeline event specific to the CHANNEL step must exist — assert on its
+	// A timeline event specific to the CHANNEL step must exist - assert on its
 	// metadata (step_type=channel + the channel id) so the test fails if the
 	// channel step stops emitting it. The firehose event (step_type=firehose,
 	// channel_id=C_WARNING) must not satisfy this.
@@ -1520,7 +1520,7 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 }
 
 // TestPipeline_EscalationUnlinked verifies a DM step to a user WITHOUT a linked
-// Slack identity fails permanently (no retry) end-to-end — the pipeline-level
+// Slack identity fails permanently (no retry) end-to-end - the pipeline-level
 // counterpart to the unit test TestResolveRecipient_NoIdentity_Permanent.
 func TestPipeline_EscalationUnlinked(t *testing.T) {
 	env := setupIntegrationTest(t)
@@ -1628,7 +1628,7 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 				TargetKind:     "dm",
 				TargetType:     "user",
 				TargetID:       "U_TEST",
-				DelaySeconds:   300, // 5 min delay — step won't run before ack
+				DelaySeconds:   300, // 5 min delay - step won't run before ack
 				TimeoutSeconds: 10,
 				MaxAttempts:    1,
 			},
@@ -1660,7 +1660,7 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
-	// Wait for firehose (stage 0) to complete — DM step (stage 1) is delayed, still pending
+	// Wait for firehose (stage 0) to complete - DM step (stage 1) is delayed, still pending
 	waitForDeliveries(t, env.S, "test_cancel_exec_1", 1)
 
 	// Ack via the real production path: AckAlertGroupAtomic

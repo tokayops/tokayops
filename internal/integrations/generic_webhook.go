@@ -10,7 +10,7 @@ import (
 
 // Lifted verbatim from the old generic_webhook branch. The internal/config
 // import (for ValidateWebhookURL) is why descriptors live here, not in
-// internal/model — model is the leaf, config sits alongside it.
+// internal/model - model is the leaf, config sits alongside it.
 func init() {
 	Register(Descriptor{
 		Type:         model.IntegrationTypeGenericWebhook,

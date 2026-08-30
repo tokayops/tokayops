@@ -698,7 +698,7 @@ const Components = {
         const keyTypes = new Set(['created', 'acknowledged', 'resolved']);
         const emphasisClass = keyTypes.has(event.type) ? ' is-key' : ' is-minor';
 
-        // Build notification details from metadata. Sprint 4 renamed
+        // Build notification details from metadata. A rename moved
         // step_type values (slack_dm → dm, slack_channel → channel) and
         // introduced recipient_id in place of slack_user_id; firehose stays.
         let notificationDetails = '';
@@ -1347,7 +1347,7 @@ const Components = {
                 chips.push(`<span class="step-delay">(${delayStr})</span>`);
             }
 
-            // Sprint 4: chips read step.target_kind ("dm" / "channel").
+            // Chips read step.target_kind ("dm" / "channel").
             const isChannel = step.target_kind === 'channel';
             const icon = isChannel ? 'hash' : 'user';
             const label = isChannel ? 'Channel' : 'DM';
@@ -1366,7 +1366,7 @@ const Components = {
      * @param {string} policyTeamId - Current policy's team ID
      */
     policyStepRow: (step, index, users = [], teams = [], policyTeamId = '', scheduleId = '', providers = []) => {
-        // Sprint 4: build the type dropdown from provider capabilities. Each
+        // The type dropdown is built from provider capabilities. Each
         // <option> value is "<provider>:<target_kind>", and the human label
         // capitalizes both pieces. If the registry is empty (offline / bad
         // wiring) fall back to a single Slack DM option so the editor stays

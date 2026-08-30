@@ -446,7 +446,7 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 	state := provider.freeze(ag, false)
 	rawList := buildAlertList(state.Alerts, state.DisplayTimezone)
 	if strings.Contains(rawList, "truncated") {
-		t.Error("buildAlertList should not truncate — that's renderBodyAttachment's job")
+		t.Error("buildAlertList should not truncate - that's renderBodyAttachment's job")
 	}
 }
 

@@ -147,9 +147,9 @@ func TestIntegrationStore(t *testing.T) {
 	})
 
 	// Counterpart to the rejection above: single-outbound-per-type is the rule
-	// (1 Slack + 1 Telegram), but generic_webhook is the deliberate exception —
+	// (1 Slack + 1 Telegram), but generic_webhook is the deliberate exception -
 	// it fans out to many endpoints, so multiple outbound rows are allowed.
-	// Sprint 5 locks this contract: Epic 7 L1 multi-integration was declined.
+	// This is a locked contract: several integrations of one type was declined.
 	t.Run("multiple generic_webhook outbound allowed (intentional exception)", func(t *testing.T) {
 		s := setupTestDB(t)
 
@@ -447,7 +447,7 @@ func TestIntegrationStore(t *testing.T) {
 		}
 		s.CreateIntegration(integration)
 
-		// Update with masked secret only — other config fields should be preserved
+		// Update with masked secret only - other config fields should be preserved
 		maskedCfg, _ := json.Marshal(model.GenericWebhookConfig{Secret: model.MaskedSecret})
 		integration.Config = maskedCfg
 		integration.Name = "WH Updated"

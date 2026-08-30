@@ -144,7 +144,7 @@ func TestSlackInteractive(t *testing.T) {
 	})
 
 	t.Run("no signing secret configured returns 503", func(t *testing.T) {
-		// Use setupTestAPI which passes nil cache — middleware will see empty secret
+		// Use setupTestAPI which passes nil cache - middleware will see empty secret
 		_, _, e := setupTestAPI(t)
 
 		ts := fmt.Sprintf("%d", time.Now().Unix())
@@ -584,7 +584,7 @@ func TestSlackInteractiveHandler(t *testing.T) {
 		}
 		captured.waitOne(t) // drain first ack message
 
-		// Second ack — idempotent
+		// Second ack - idempotent
 		req2 := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec2 := httptest.NewRecorder()
 		e.ServeHTTP(rec2, req2)
@@ -629,7 +629,7 @@ func TestSlackInteractiveHandler(t *testing.T) {
 		}
 		captured.waitOne(t) // drain resolve message
 
-		// Ack after resolve — should be idempotent
+		// Ack after resolve - should be idempotent
 		req2 := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec2 := httptest.NewRecorder()
 		e.ServeHTTP(rec2, req2)
@@ -999,7 +999,7 @@ func TestTryLinkSlackUser(t *testing.T) {
 		}
 		api := NewAPI(s, nil, slack, nil, "", nil)
 
-		// Call tryLinkSlackUser directly — store-level guard must prevent overwrite
+		// Call tryLinkSlackUser directly - store-level guard must prevent overwrite
 		api.tryLinkSlackUser("alex", "alex@example.com")
 
 		ident, _ := s.GetExternalIdentity(alex.ID, "slack")
@@ -1009,8 +1009,8 @@ func TestTryLinkSlackUser(t *testing.T) {
 	})
 
 	t.Run("skips Slack API call when already linked", func(t *testing.T) {
-		// Regression guard: Sprint 3 dropped the in-process User.SlackUserID guard,
-		// so tryLinkSlackUser MUST do a cheap GetExternalIdentity pre-check before
+		// Regression guard: there is no in-process User.SlackUserID guard any
+		// more, so tryLinkSlackUser MUST do a cheap GetExternalIdentity pre-check before
 		// hitting Slack's users.lookupByEmail, or every OIDC login hits the API.
 		s := store.NewMockStore()
 		s.BindExternalIdentity(&model.ExternalIdentity{
@@ -1178,7 +1178,7 @@ func TestSlackInteractiveEmailMatch(t *testing.T) {
 	})
 
 	t.Run("Slack API error falls through to OTP ephemeral", func(t *testing.T) {
-		// Slack API is down — should gracefully fall through
+		// Slack API is down - should gracefully fall through
 		slackMsngr := &testSlackMessenger{
 			err: errors.New("network timeout"),
 		}

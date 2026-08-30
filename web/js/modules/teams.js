@@ -300,7 +300,7 @@ function bindTeamModalEvents(teamId) {
             try {
                 await API.teams.update(teamId, {
                     default_policy_id: defaultPolicyId || null,
-                    // Always send the map (even empty) so the backend replaces it —
+                    // Always send the map (even empty) so the backend replaces it -
                     // setting all severities to "Use default" must CLEAR existing
                     // routes, otherwise a stale route shadows the Default Policy.
                     severity_routes: severityRoutes

@@ -57,7 +57,8 @@ func sampleRecipient(provider, user string) HandoffRecipient {
 // across, not recomputed.
 //
 // The value below is the one `jobdedup.TestHandoffOccurrenceGoldenVector` has
-// pinned since Epic 11, reproduced here by hand from the written grammar.
+// pinned when the job engine wrote these claims, reproduced here by hand
+// from the written grammar.
 //
 // It is NOT what keeps a shift change from being announced twice across the
 // upgrade: the old claims are rows in `jobs` and the new ones are rows in

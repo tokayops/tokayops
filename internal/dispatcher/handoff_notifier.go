@@ -224,9 +224,9 @@ func (n *HandoffNotifier) checkSchedule(sc schedulerender.ScheduleOnCall, teamNa
 func (n *HandoffNotifier) handleHandoff(sc schedulerender.ScheduleOnCall, kind string,
 	notify []string, next observation, teamNames map[string]string) {
 
-	// Sprint 4 (Epic 7 L7): fan-out per linked identity instead of picking
-	// the Slack one. Restrict to providers that (a) are registered and
-	// (b) advertise the "dm" target kind — otherwise stale or unrelated
+	// The fan-out is per linked identity rather than to the Slack one.
+	// Restrict to providers that (a) are registered and
+	// (b) advertise the "dm" target kind - otherwise stale or unrelated
 	// identities (e.g. an OIDC sub stored as an identity, or a provider we
 	// removed) would create steps that immediately fail.
 	dmProviders := map[string]bool{}
@@ -239,7 +239,7 @@ func (n *HandoffNotifier) handleHandoff(sc schedulerender.ScheduleOnCall, kind s
 	identities, err := n.store.GetIdentitiesForUsers(notify)
 	if err != nil {
 		log.Printf("[HandoffNotifier] Failed to load identities for schedule %s: %v", sc.ScheduleID, err)
-		return // Don't cache — next tick retries
+		return // Don't cache - next tick retries
 	}
 
 	// Per-user list of usable identities, ordered by provider name for
@@ -275,15 +275,15 @@ func (n *HandoffNotifier) handleHandoff(sc schedulerender.ScheduleOnCall, kind s
 	}
 
 	if !n.createHandoffJob(sc, kind, notifiable, usableByUser, next, teamNames) {
-		return // Don't update cache — next tick will retry
+		return // Don't update cache - next tick will retry
 	}
 
 	n.setCache(sc.ScheduleID, next.Composition)
 }
 
 // createHandoffJob builds and persists a notification job with one stage and N
-// parallel steps. Sprint 4: N is the total number of usable linked identities
-// across all notified users — a user linked to both Slack and Telegram receives
+// parallel steps. N is the total number of usable linked identities across all
+// notified users - a user linked to both Slack and Telegram receives
 // one step per provider. The order of steps within a user follows usableByUser
 // (sorted by provider name) so step indices stay stable across retries.
 //

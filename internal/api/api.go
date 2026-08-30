@@ -239,7 +239,7 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.POST("/tokens", a.CreateAPIToken, a.Require(rbac.ActionTokenCreate, ScopeCurrentUser()))
 	v1.DELETE("/tokens/:id", a.DeleteAPIToken, a.Require(rbac.ActionTokenDelete, ScopeFromResource("token", "id")))
 
-	// Providers (Sprint 4): read-only capability discovery for the policy editor.
+	// Providers: read-only capability discovery for the policy editor.
 	v1.GET("/providers", a.ListProviders)
 
 	// Escalation Policies (Phase 4)
@@ -263,10 +263,10 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.GET("/integrations/:id/deliveries/:deliveryId", a.GetDeliveryDetail, a.Require(rbac.ActionIntegrationView, ScopeFromIntegration("id")))
 	v1.POST("/integrations/:id/deliveries/:deliveryId/replay", a.ReplayDelivery, a.Require(rbac.ActionIntegrationUpdate, ScopeFromIntegration("id")))
 
-	// Slack Interactive (Public — no AuthMiddleware, uses Slack signature verification)
+	// Slack Interactive (Public - no AuthMiddleware, uses Slack signature verification)
 	e.POST("/slack/interactive", a.HandleSlackInteractive, a.SlackSignatureMiddleware)
 
-	// Telegram webhook (Public — no AuthMiddleware, uses X-Telegram-Bot-Api-Secret-Token verification)
+	// Telegram webhook (Public - no AuthMiddleware, uses X-Telegram-Bot-Api-Secret-Token verification)
 	e.POST("/telegram/webhook", a.HandleTelegramWebhook, a.TelegramSecretMiddleware)
 }
 
@@ -1319,8 +1319,8 @@ func (a *API) GetUser(c echo.Context) error {
 
 // CreateUserRequest represents a request to create a user.
 //
-// External account links (Slack, Telegram, ...) are NOT accepted here — they are
-// established only via the link flow (POST /me/slack/request-code, …) per Epic 7 Sprint 3.
+// External account links (Slack, Telegram, ...) are NOT accepted here - they are
+// established only via the link flow (POST /me/slack/request-code, and so on).
 type CreateUserRequest struct {
 	ID       string `json:"id"`                 // Optional, will be generated if not provided
 	Email    string `json:"email"`              // Required
@@ -1396,7 +1396,7 @@ func (a *API) CreateUser(c echo.Context) error {
 }
 
 // UpdateUserRequest represents a request to update a user. External account links
-// are not editable here — use the link flow (POST /me/slack/request-code, …).
+// are not editable here - use the link flow (POST /me/slack/request-code, …).
 type UpdateUserRequest struct {
 	Email string `json:"email,omitempty"`
 	Name  string `json:"name,omitempty"`

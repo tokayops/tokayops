@@ -185,7 +185,7 @@ func TestLockTeamBlocksConcurrentScheduleInsert(t *testing.T) {
 //   - WithinTx on sql.LevelRepeatableRead: "could not serialize access due to
 //     concurrent update" - the snapshot predates the create;
 //   - reading the root before LockTeam: the raw schedule_revisions_schedule_id
-//     _fkey violation, which is the exact 500 this sprint exists to remove.
+//     _fkey violation, which is the exact 500 this locking order removes.
 //
 // Deterministic by construction, not by repetition: the create holds its
 // transaction open until the delete is provably blocked on the lock.

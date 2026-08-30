@@ -23,8 +23,8 @@ func mustNewDispatcher(t *testing.T, s store.StoreInterface) *Dispatcher {
 // legacyStepExecutor stands in for the escalation executor these tests used to
 // lean on.
 //
-// The escalation path left the job engine in Sprint 1: an escalation is a set
-// of commitments in the outbound domain now, and no production executor takes a
+// The escalation path has left the job engine: an escalation is a set of
+// commitments in the outbound domain now, and no production executor takes a
 // "dm", "channel" or "firehose" step any more. What the tests below are about
 // is the ENGINE - retries, continue_on_failure, advancing a stage, unlocking a
 // step - and they need a step that can be made to succeed or fail on demand.
@@ -33,7 +33,7 @@ func mustNewDispatcher(t *testing.T, s store.StoreInterface) *Dispatcher {
 // data, find the provider it names, send. A test that wants a failure makes the
 // provider fail, exactly as before. It carries no delivery recording, no
 // timeline and no status transitions, because none of that is what is being
-// tested here - and the whole job engine goes in Sprint 3 with these tests.
+// tested here - and the whole job engine goes when these tests do.
 type legacyStepExecutor struct{ providers ProviderResolver }
 
 func (e legacyStepExecutor) Execute(ctx context.Context, job *model.Job, step *model.JobStep) (string, error) {

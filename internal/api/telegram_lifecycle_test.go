@@ -12,7 +12,7 @@ import (
 	"github.com/tokayops/tokayops/internal/store"
 )
 
-// Locks the Sprint-3-review webhook lifecycle contract: setWebhook on enable,
+// Locks the webhook lifecycle contract: setWebhook on enable,
 // no delete on a same-token edit, delete-old + set-new on rotation, delete on
 // disable/delete. Drives the integration handlers directly over a MockStore +
 // a recording fake TelegramAPI (no DB, no real Bot API).

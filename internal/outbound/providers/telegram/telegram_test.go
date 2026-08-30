@@ -206,7 +206,7 @@ func TestTelegram_SetAndDeleteWebhook_ExplicitToken(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// tokenSource is intentionally a different token — webhook mgmt must use the
+	// tokenSource is intentionally a different token - webhook mgmt must use the
 	// EXPLICIT token argument, not the cached one.
 	p := NewProvider(&mockTelegramTokenSource{token: "CACHED"}, "", WithBaseURL(server.URL))
 	if err := p.SetWebhook(context.Background(), "BOT1", "https://x/telegram/webhook", "sek"); err != nil {

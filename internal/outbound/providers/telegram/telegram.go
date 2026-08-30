@@ -179,7 +179,7 @@ type tgResponse struct {
 }
 
 // callBotAPI POSTs a JSON body to a Bot API method and decodes the envelope.
-// It never logs the URL (which contains the token). No retry (v1 decision) —
+// It never logs the URL (which contains the token). No retry (v1 decision) -
 // transient failures bubble up to the step-level retry.
 func (t *Provider) callBotAPI(ctx context.Context, client *http.Client, token, method string, body map[string]interface{}) (*tgResponse, error) {
 	return callBotAPI(ctx, client, t.baseURL, token, method, body)
@@ -291,9 +291,9 @@ func (t *Provider) Send(ctx context.Context, req providers.NotificationRequest) 
 	return "", t.sendDM(ctx, req.Target.ID, req.Message)
 }
 
-// sendDM sends a fire-and-forget plain-text DM. Not deliverable until Sprint 3
-// (linking): without a linked identity the dm step path returns
-// ErrIdentityNotLinked before reaching here. Returns no payload (Editable=false).
+// sendDM sends a fire-and-forget plain-text DM. It needs a linked identity:
+// without one the dm step path returns ErrIdentityNotLinked before reaching
+// here. Returns no payload (Editable=false).
 func (t *Provider) sendDM(ctx context.Context, chatID, message string) error {
 	client, token, err := t.getClient()
 	if err != nil {
@@ -336,7 +336,7 @@ func emptyInlineKeyboard() map[string]interface{} {
 // ackResolveKeyboard builds the inline keyboard for an alert-group card. A
 // resolved card gets an empty keyboard (buttons removed); an active card gets
 // Resolve, plus Acknowledge when not yet acknowledged. callback_data is
-// "<prefix><agID>" — well within Telegram's 64-byte limit.
+// "<prefix><agID>" - well within Telegram's 64-byte limit.
 func ackResolveKeyboard(state keys.SnapshotInput) map[string]interface{} {
 	var row []map[string]string
 	if state.Status != keys.GroupAcknowledged {
@@ -559,7 +559,7 @@ func cardFooter(state keys.SnapshotInput) string {
 
 // assembleCard joins body lines + footer within the length limit WITHOUT
 // cutting any line. Whole pre-built lines are dropped from the end if needed (each
-// is valid HTML on its own), and the footer is always appended intact — so the
+// is valid HTML on its own), and the footer is always appended intact - so the
 // result never contains a dangling tag or partial entity.
 func assembleCard(lines []string, footer string, limit int) string {
 	const sep = "\n"

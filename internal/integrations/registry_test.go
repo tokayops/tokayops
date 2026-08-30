@@ -59,7 +59,7 @@ func TestDirectionFor(t *testing.T) {
 }
 
 // TestRegister_DuplicatePanics guards against silently overwriting a descriptor
-// — a programming error worth surfacing loudly. resetForTests gives us an
+// - a programming error worth surfacing loudly. resetForTests gives us an
 // empty slate so we don't blow up on the init()-time registrations.
 func TestRegister_DuplicatePanics(t *testing.T) {
 	saved := snapshot()

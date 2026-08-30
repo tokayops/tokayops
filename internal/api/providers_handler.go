@@ -21,7 +21,7 @@ type ProvidersResponse struct {
 // @Router /api/v1/providers [get]
 func (a *API) ListProviders(c echo.Context) error {
 	// Empty list is a valid response (e.g. fresh install with no providers
-	// wired in) — let the frontend disable policy editing rather than 500.
+	// wired in) - let the frontend disable policy editing rather than 500.
 	if a.providerCaps == nil {
 		return c.JSON(http.StatusOK, ProvidersResponse{Providers: []ProviderCapability{}})
 	}

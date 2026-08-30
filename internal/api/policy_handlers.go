@@ -13,7 +13,7 @@ import (
 
 // ProviderCapabilitiesLookup is the read-only view of the dispatcher's
 // capability registry that the API layer needs. Capability lookup is
-// compile-time data (which provider class supports which target kinds) —
+// compile-time data (which provider class supports which target kinds) -
 // it never touches the DB and never fails because an integration is
 // disabled. The dispatcher's *ProviderRegistry implements this.
 type ProviderCapabilitiesLookup interface {
@@ -45,7 +45,7 @@ type PolicyRequest struct {
 
 // PolicyStepRequest represents a step in a policy request.
 //
-// Sprint 4: provider + target_kind replace the flat step_type.
+// provider + target_kind, which replaced a flat step_type.
 //   - provider: e.g. "slack", validated against the capability registry.
 //   - target_kind: "dm" | "channel"; validated against the provider's
 //     SupportedTargetKinds.
@@ -281,7 +281,7 @@ var targetKindForTargetType = map[string]map[string]bool{
 // validatePolicyStep checks the (provider, target_kind, target_type) triple
 // is consistent and that the provider supports target_kind. caps is the
 // capability registry view (nil during tests that don't exercise the
-// registry — guarded below).
+// registry - guarded below).
 func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup) error {
 	if step.Provider == "" {
 		return fmt.Errorf("provider is required")
@@ -320,12 +320,12 @@ func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup)
 		return fmt.Errorf("%s step requires one of %v target types, got %s", step.TargetKind, keysOf(allowedTargetTypes), step.TargetType)
 	}
 
-	// target_id is required for concrete targets — schedules resolve at dispatch.
+	// target_id is required for concrete targets - schedules resolve at dispatch.
 	if (step.TargetType == "user" || step.TargetType == "channel") && step.TargetID == "" {
 		return fmt.Errorf("target_id is required for %s target type", step.TargetType)
 	}
 
-	// Timing field guards (unchanged from before Sprint 4).
+	// Timing field guards, which the step shape never touched.
 	if step.DelaySeconds < 0 {
 		return fmt.Errorf("delay_seconds must be >= 0")
 	}

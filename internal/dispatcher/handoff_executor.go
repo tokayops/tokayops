@@ -25,7 +25,7 @@ func (e *HandoffExecutor) Execute(ctx context.Context, job *model.Job, step *mod
 		return "", fmt.Errorf("invalid handoff data: %w", err)
 	}
 
-	// Sprint 4 (Epic 7 L7): provider comes from the step, not a hardcode.
+	// The provider comes from the step, not from a hardcode here:
 	// handoff_notifier populates ProviderName per linked identity.
 	if stepData.ProviderName == "" {
 		return "", fmt.Errorf("handoff step %s: %w", step.ID, ErrMissingProvider)

@@ -140,7 +140,7 @@ func TestListIntegrationDeliveries_Empty(t *testing.T) {
 func TestListIntegrationDeliveries_Pagination(t *testing.T) {
 	s, e, integID, _, _ := setupDeliveryTestEnv(t)
 
-	// Add 2 more deliveries (total 3) — need distinct event IDs for unique(event_id, integration_id)
+	// Add 2 more deliveries (total 3) - need distinct event IDs for unique(event_id, integration_id)
 	s.CreateOutboxEvent(&model.OutboxEvent{
 		ID: "evt-2", EventType: model.OutboxEventFiring, AlertGroupID: "ag-2", TeamID: "devops",
 		Payload: json.RawMessage(`{}`), Status: model.OutboxEventStatusCompleted,

@@ -88,7 +88,7 @@ async function fireAlert(
   const resp = await page.request.post(`${BASE_URL}/webhook/alertmanager?token=${token}`, {
     data: payload,
   });
-  // Must be 200 — 401 means the inbound webhook secret is not configured
+  // Must be 200 - 401 means the inbound webhook secret is not configured
   expect(resp.status()).toBe(200);
 }
 
@@ -151,7 +151,7 @@ test.describe('Integrations - Deliveries', () => {
     inboundIntegrationId = await ensureInboundWebhook(page, inboundSecret);
 
     // Create a generic_webhook integration pointing at the app itself.
-    // Echo returns 404 for unknown paths — the worker treats 4xx as immediate "failed" (no retries).
+    // Echo returns 404 for unknown paths - the worker treats 4xx as immediate "failed" (no retries).
     webhookIntegrationId = await createWebhookIntegration(
       page,
       'E2E Delivery Webhook',
@@ -224,7 +224,7 @@ test.describe('Integrations - Deliveries', () => {
     await deliveriesBtn.click();
     await expect(integrationsPage.integrationModal).toHaveClass(/active/, { timeout: 10000 });
 
-    // Delivery rows must exist — beforeAll polls until they appear
+    // Delivery rows must exist - beforeAll polls until they appear
     const deliveryTable = integrationsPage.page.locator('.delivery-table tbody tr');
     await expect(deliveryTable.first()).toBeVisible({ timeout: 15000 });
 

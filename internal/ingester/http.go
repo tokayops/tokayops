@@ -131,7 +131,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	}
 
 	// 4. Create New Alert Group
-	// Filter to firing alerts only — resolved alerts shouldn't appear in a new group.
+	// Filter to firing alerts only - resolved alerts shouldn't appear in a new group.
 	var firingAlerts []model.Alert
 	for _, a := range payload.Alerts {
 		if a.Status == model.AlertStatusFiring {
@@ -155,7 +155,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		UpdatedAt:   time.Now(),
 	}
 
-	// Build timeline events for atomic insert — µs offsets ensure deterministic ordering
+	// Build timeline events for atomic insert - µs offsets ensure deterministic ordering
 	now := time.Now()
 	timelineEvents := []*model.TimelineEvent{
 		{
@@ -181,7 +181,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	}
 
 	// Resolve team name for webhook payload snapshot.
-	// Not-found is normal (unknown team label from Alertmanager) — use teamID as snapshot.
+	// Not-found is normal (unknown team label from Alertmanager) - use teamID as snapshot.
 	// Any other DB error is transient and must fail the request so Alertmanager retries.
 	teamName := teamID
 	unknownTeam := true

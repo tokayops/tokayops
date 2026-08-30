@@ -736,7 +736,7 @@ export function bindAlertsEvents() {
         });
     }
 
-    // Severity Chips (multi-select) — reload from server
+    // Severity Chips (multi-select) - reload from server
     if (Elements.severityChips) {
         Elements.severityChips.addEventListener('click', (e) => {
             const chip = e.target.closest('.severity-chip');
@@ -774,7 +774,7 @@ export function bindAlertsEvents() {
         });
     }
 
-    // Pagination — reload from server
+    // Pagination - reload from server
     if (Elements.prevPage) {
         Elements.prevPage.addEventListener('click', () => {
             if (State.isLoading || Elements.prevPage.disabled) return;

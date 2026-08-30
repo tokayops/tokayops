@@ -97,7 +97,7 @@ func TestRegression_DBError_ResolveLost(t *testing.T) {
 	e := echo.New()
 	ing.RegisterRoutes(e)
 
-	// Send a resolve webhook — all alerts resolved
+	// Send a resolve webhook - all alerts resolved
 	payload := `{"status":"resolved","groupKey":"db-err-group","alerts":[{"status":"resolved","labels":{"alertname":"TestAlert"},"fingerprint":"fp1"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret", strings.NewReader(payload))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
@@ -105,7 +105,7 @@ func TestRegression_DBError_ResolveLost(t *testing.T) {
 	e.ServeHTTP(rec, req)
 
 	// EXPECTED: 500 so Alertmanager retries
-	// BUG (unfixed): 200 "Ignored Resolved" — resolve data lost silently
+	// BUG (unfixed): 200 "Ignored Resolved" - resolve data lost silently
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("Expected 500 on DB lookup error, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -178,7 +178,7 @@ func TestRegression_DuplicateKey_RetryMerge(t *testing.T) {
 	e.ServeHTTP(rec, req)
 
 	// EXPECTED: 200 (retry succeeded, merged into existing group)
-	// BUG (unfixed): 500 "Failed to persist" — data from second webhook lost
+	// BUG (unfixed): 500 "Failed to persist" - data from second webhook lost
 	if rec.Code != http.StatusOK {
 		t.Errorf("Expected 200 after duplicate key retry, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -263,7 +263,7 @@ func (s *errTeamLookupStore) GetTeamByID(id string) (*model.Team, error) {
 // an outbox event for global webhook fan-out.
 func TestRegression_UnknownTeam_OutboxCreated(t *testing.T) {
 	mock := store.NewMockStore()
-	// No teams seeded — GetTeamByID will return sql.ErrNoRows
+	// No teams seeded - GetTeamByID will return sql.ErrNoRows
 
 	validator := &mockSecretValidator{secrets: map[string]bool{"secret": true}}
 	ing := NewIngester(mock, &config.Config{}, validator)

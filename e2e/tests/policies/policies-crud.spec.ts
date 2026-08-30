@@ -449,14 +449,14 @@ test.describe('Policies - Step Configuration', () => {
   });
 });
 
-test.describe('Policies - Provider/Target Contracts (Epic 7)', () => {
+test.describe('Policies - Provider/Target Contracts', () => {
   test.beforeEach(async ({ policiesPage }) => {
     await policiesPage.goto();
     await policiesPage.waitForPoliciesLoad();
   });
 
   // B1: changing the step type (provider:target_kind) must repopulate the target
-  // type options — Slack Channel allows only "channel"; Slack DM allows user/schedule.
+  // type options - Slack Channel allows only "channel"; Slack DM allows user/schedule.
   test('step type switch updates target type options', async ({ policiesPage, page }) => {
     await policiesPage.openCreatePolicyModal();
     await policiesPage.addStep();

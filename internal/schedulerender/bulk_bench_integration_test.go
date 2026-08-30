@@ -25,8 +25,8 @@ const benchScheduleCount = 100
 // What it measures is round trips, not rotation math. The per-schedule reads are
 // sequential, they run on one connection inside one snapshot, and they set both
 // the duration of a tick and how long that connection is held - so ns/op here is
-// also the connection-hold time per tick. The 0.35 ms PositionAt figure from
-// Sprint 3 says nothing about any of that.
+// also the connection-hold time per tick. The 0.35 ms PositionAt figure
+// measured on its own says nothing about any of that.
 //
 // The anchor is a year old on purpose: that is where the phase anchor of a
 // schedule nobody has edited ends up, and the anchor walk is the one part of the
@@ -35,9 +35,8 @@ const benchScheduleCount = 100
 //	TEST_DB_DSN=... go test -tags integration ./internal/schedulerender/ \
 //	  -run '^$' -bench BenchmarkCurrentOnCallForAll -benchtime 10x
 //
-// The result belongs in the "Измерения" section of the sprint document, with the
-// hardware and the date. A number nobody wrote down is a number nobody can
-// compare against.
+// Write the result down with the hardware and the date. A number nobody
+// recorded is a number nobody can compare against.
 func BenchmarkCurrentOnCallForAll(b *testing.B) {
 	s := testutil.SetupDB(b)
 

@@ -122,7 +122,7 @@ type EscalationPolicySnapshot struct {
 }
 
 // EscalationStepSnapshot stores step data at job creation time. The pair
-// (Provider, TargetKind) mirrors EscalationStep — see Sprint 4 (Epic 7 L6).
+// (Provider, TargetKind) mirrors EscalationStep.
 type EscalationStepSnapshot struct {
 	Provider   string `json:"provider"`
 	TargetKind string `json:"target_kind"`

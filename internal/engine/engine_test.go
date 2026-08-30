@@ -555,7 +555,7 @@ func TestASecondTickDoesNotRestateWhatTheGroupEscalatesBy(t *testing.T) {
 	cfg := &config.Config{}
 	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 
-	// First call — should create job with V1 snapshot
+	// First call - should create job with V1 snapshot
 	eng.ProcessNewAlertGroups(context.Background())
 
 	updatedAG, _ := s.GetAlertGroupByID("ag-dedup")
@@ -578,7 +578,7 @@ func TestASecondTickDoesNotRestateWhatTheGroupEscalatesBy(t *testing.T) {
 	// Force AG back to "new" to re-trigger processing
 	s.SetAlertGroupStatus("ag-dedup", model.AlertGroupStatusNew)
 
-	// Second call — job already exists (dedup), snapshot should NOT be overwritten
+	// Second call - job already exists (dedup), snapshot should NOT be overwritten
 	eng.ProcessNewAlertGroups(context.Background())
 
 	updatedAG2, _ := s.GetAlertGroupByID("ag-dedup")
@@ -660,7 +660,7 @@ func TestAGroupIsAdmittedOnceAndNeverAgain(t *testing.T) {
 func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 	s := store.NewMockStore()
 
-	// Team with no policy — will produce job == nil
+	// Team with no policy - will produce job == nil
 	teamID := "team-no-policy"
 	s.CreateTeam(&model.Team{
 		ID:   teamID,
@@ -683,7 +683,7 @@ func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 	cfg := &config.Config{}
 	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
 
-	// First tick — should pick up stale AG and touch updated_at
+	// First tick - should pick up stale AG and touch updated_at
 	eng.ProcessNewAlertGroups(context.Background())
 
 	updated, _ := s.GetAlertGroupByID("ag-stale-touch")
@@ -694,7 +694,7 @@ func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 		t.Error("Expected updated_at to be refreshed (touched)")
 	}
 
-	// Second tick — AG should NOT be picked up again (updated_at is fresh)
+	// Second tick - AG should NOT be picked up again (updated_at is fresh)
 	beforeSecondTick := time.Now()
 	time.Sleep(10 * time.Millisecond) // ensure time difference
 	eng.ProcessNewAlertGroups(context.Background())

@@ -12,7 +12,7 @@ import (
 )
 
 // BindIdentity binds an external identity (provider + external ID) to a user via
-// the Epic 7 external_identities table. Fails the test on error. Use this so
+// the external_identities table. Fails the test on error. Use this so
 // escalation/handoff/syncer recipients resolve to a provider-specific ID.
 func BindIdentity(t *testing.T, s *store.Store, userID, provider, externalID string) {
 	t.Helper()

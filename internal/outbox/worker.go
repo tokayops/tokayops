@@ -228,7 +228,7 @@ func (w *Worker) attemptDelivery(ctx context.Context, event *model.OutboxEvent, 
 		timeout = time.Duration(cfg.TimeoutSeconds) * time.Second
 	}
 
-	// Extend lease before sending — must cover at least timeout + safety margin
+	// Extend lease before sending - must cover at least timeout + safety margin
 	const safetyMargin = 15 * time.Second
 	leaseNeeded := timeout + safetyMargin
 	if leaseNeeded < leaseDuration {

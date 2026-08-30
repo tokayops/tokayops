@@ -106,9 +106,9 @@ npm test
 ### Page Object Model (POM)
 
 Каждая страница приложения представлена классом с:
-- **Локаторами** — селекторы элементов
-- **Методами** — действия на странице
-- **Assertions** — проверки состояния
+- **Локаторами** - селекторы элементов
+- **Методами** - действия на странице
+- **Assertions** - проверки состояния
 
 ```typescript
 // pages/teams.page.ts
@@ -264,7 +264,7 @@ test('should work with existing data', async ({ teamsPage }) => {
 test.beforeEach(async ({ usersPage, page }) => {
   await usersPage.goto();
 
-  // Если редирект — нет доступа
+  // Если редирект - нет доступа
   await page.waitForTimeout(500);
   if (!page.url().includes('/cfg/users')) {
     test.skip();

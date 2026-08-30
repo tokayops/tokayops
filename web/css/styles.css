@@ -6778,7 +6778,7 @@ body::before {
     text-align: center;
 }
 
-/* Calendar-inline variant — smaller, transparent style */
+/* Calendar-inline variant - smaller, transparent style */
 .calendar-timezone .tz-picker {
     min-width: 150px;
 }

@@ -93,7 +93,7 @@ func TestProcessStep_Retry(t *testing.T) {
 		t.Error("Expected NextRunAt to be set")
 	}
 
-	// Make MaxAttempts=2 to test failure — simulate re-claim
+	// Make MaxAttempts=2 to test failure - simulate re-claim
 	step.MaxAttempts = 2
 	step.Status = model.JobStepStatusRunning
 	step.AttemptCount = 1
@@ -709,7 +709,7 @@ func TestRegression_CompleteStep_UnlockFailure(t *testing.T) {
 	}
 	realStore.CreateJobWithDedup(job, stages, []*model.JobStep{step0, step1})
 
-	// Execute step 0 — succeeds, but FinishStepAndAdvance fails after retries
+	// Execute step 0 - succeeds, but FinishStepAndAdvance fails after retries
 	d.processStep(context.Background(), step0)
 
 	// Job should be FAILED (not deadlocked with step1 blocked forever)

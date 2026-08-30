@@ -387,7 +387,7 @@ func (s *Store) buildSchema() error {
 		ON external_identities(provider, external_id);
 
 	-- Generic link tokens: issue/consume/TTL/single-use for linking external accounts.
-	-- Used by Slack OTP today (token = 6-digit code) and Telegram deep-link in Epic 8.
+	-- Used by Slack OTP (token = 6-digit code) and by the Telegram deep link.
 	CREATE TABLE IF NOT EXISTS link_tokens (
 		id           TEXT PRIMARY KEY,
 		user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -783,8 +783,8 @@ func (s *Store) buildSchema() error {
 		return err
 	}
 
-	// (Slack OTP codes and users.slack_user_id index were removed in Epic 7 Sprint 3;
-	// see external_identities + link_tokens above.)
+	// (Slack OTP codes and the users.slack_user_id index are gone; see
+	// external_identities + link_tokens above.)
 
 	// RBAC migrations
 	rbacQuery := `
@@ -851,9 +851,9 @@ func (s *Store) buildSchema() error {
 
 	-- Escalation Steps table
 	--
-	-- Sprint 4 (Epic 7 L6): step shape is (provider, target_kind) instead of
-	-- the old flat step_type. Provider validity is enforced at the API layer
-	-- against the dispatcher's capability registry — keeping it as TEXT here
+	-- The step shape is (provider, target_kind) rather than the old flat
+	-- step_type. Provider validity is enforced at the API layer
+	-- against the dispatcher's capability registry - keeping it as TEXT here
 	-- avoids re-encoding the provider catalog in the DB.
 	CREATE TABLE IF NOT EXISTS escalation_steps (
 		id TEXT PRIMARY KEY,
@@ -890,7 +890,7 @@ func (s *Store) buildSchema() error {
 			ALTER TABLE escalation_steps ADD COLUMN continue_on_failure BOOLEAN DEFAULT TRUE;
 		END IF;
 
-		-- 5. Epic 7 Sprint 4: replace step_type with (provider, target_kind).
+		-- 5. Replace step_type with (provider, target_kind).
 		--    CREATE TABLE IF NOT EXISTS above is a no-op on existing DBs, so on
 		--    an upgrade the old step_type column will still be there and the
 		--    new selects/inserts will fail. Per project policy (no backward
@@ -1035,7 +1035,7 @@ func (s *Store) buildSchema() error {
 		return err
 	}
 
-	// Drop FK on event_outbox.team_id — unknown teams are a valid runtime case
+	// Drop FK on event_outbox.team_id - unknown teams are a valid runtime case
 	// (firehose-only alerts) and global webhook subscriptions must still fan-out.
 	dropOutboxTeamFK := `ALTER TABLE event_outbox DROP CONSTRAINT IF EXISTS event_outbox_team_id_fkey`
 	if _, err := s.db.Exec(dropOutboxTeamFK); err != nil {
@@ -1308,7 +1308,7 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 		return false, err
 	}
 
-	// 1. Conditional UPDATE — from 'processing' or 'triggered' (single-winner semantics)
+	// 1. Conditional UPDATE - from 'processing' or 'triggered' (single-winner semantics)
 	res, err := tx.Exec(
 		`UPDATE alert_groups
 		 SET status = $1, acknowledged_by = $2, updated_at = $3,
@@ -1398,7 +1398,7 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 		return false, err
 	}
 
-	// 1. Conditional UPDATE — from 'processing', 'triggered', or 'acknowledged'
+	// 1. Conditional UPDATE - from 'processing', 'triggered', or 'acknowledged'
 	res, err := tx.Exec(
 		`UPDATE alert_groups
 		 SET status = $1, resolved_at = $2, resolved_by = $3, updated_at = $2,
@@ -2721,8 +2721,8 @@ func (s *Store) DeleteAPIToken(id string) error {
 	return err
 }
 
-// (The old Slack OTP methods — SaveSlackOTP, ConfirmSlackOTP, UnbindSlackUser — were
-// removed in Epic 7 Sprint 3. See external_identities + link_tokens in identity_store.go.)
+// (The old Slack OTP methods - SaveSlackOTP, ConfirmSlackOTP, UnbindSlackUser -
+// are gone. See external_identities + link_tokens in identity_store.go.)
 
 // ========================================
 // Escalation Policy CRUD (Phase 4)

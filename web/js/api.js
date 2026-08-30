@@ -681,7 +681,7 @@ const API = {
     // Policies API (Phase 4)
     // ========================================
     // ========================================
-    // Providers API (Sprint 4 / Epic 7 L6)
+    // Providers API
     // ========================================
     providers: {
         /**
@@ -842,7 +842,7 @@ window.API = API;
  * Fetch build metadata from the public /api/version endpoint and render it into
  * the element with the given id. Release builds show the tag ("v0.1.0 · abc1234");
  * untagged builds fall back to "branch@commit · date". Full detail is in the title
- * (hover tooltip). No-ops quietly if the element is missing or the request fails —
+ * (hover tooltip). No-ops quietly if the element is missing or the request fails -
  * version display is non-critical.
  * @param {string} elId - id of the target element
  */

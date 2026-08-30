@@ -110,7 +110,7 @@ func setupSyncerEnv(t *testing.T) *syncerEnv {
 	}
 	clock := func() time.Time { return env.now }
 
-	// Epic 7 moved Slack IDs out of the user row into external_identities; the
+	// Slack IDs live in external_identities rather than on the user row; the
 	// syncer resolves each on-call user's Slack ID via that table. U_NOSLACK
 	// intentionally has none.
 	users := []struct {

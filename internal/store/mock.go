@@ -584,7 +584,7 @@ func compareSummaryField(a, b *model.AlertGroupSummary, field string) int {
 		if b.ResolvedAt != nil {
 			tb = *b.ResolvedAt
 		}
-		// NULLs (zero time) sort last in DESC, first in ASC — handled by caller via direction
+		// NULLs (zero time) sort last in DESC, first in ASC - handled by caller via direction
 		return timeCmp(ta, tb)
 	default: // "created_at" or empty
 		return timeCmp(a.CreatedAt, b.CreatedAt)
@@ -1450,7 +1450,7 @@ func (m *MockStore) DeleteAPIToken(id string) error {
 }
 
 // ========================================
-// External Identities + Link Tokens (Epic 7 Sprint 3)
+// External Identities + Link Tokens
 // ========================================
 
 type mockIdentity = model.ExternalIdentity
@@ -1587,7 +1587,7 @@ func (m *MockStore) IssueLinkToken(userID, provider, externalID, token string, e
 		return ErrUserNotFound
 	}
 	hash := mockHashToken(token)
-	// (provider, token_hash) global uniqueness — collisions retry at the caller.
+	// (provider, token_hash) global uniqueness - collisions retry at the caller.
 	for k, lt := range m.linkTokens {
 		if lt.Provider == provider && lt.TokenHash == hash && k != userID+"|"+provider {
 			return errors.New("link token collision")
@@ -2029,7 +2029,7 @@ func (m *MockStore) FinishStepAndAdvance(stepID string, leaseToken string, outco
 		}
 	}
 
-	// 7. Stage completed — determine status
+	// 7. Stage completed - determine status
 	hasAnyFailed := false
 	for _, s := range m.jobSteps {
 		if s.StageID == step.StageID && s.Status == model.JobStepStatusFailed {
@@ -2054,7 +2054,7 @@ func (m *MockStore) FinishStepAndAdvance(stepID string, leaseToken string, outco
 	}
 
 	if nextStage == nil {
-		// Last stage — finish job
+		// Last stage - finish job
 		jobHasFailed := false
 		for _, s := range m.jobSteps {
 			if s.JobID == job.ID && s.Status == model.JobStepStatusFailed {
@@ -2221,7 +2221,7 @@ func (m *MockStore) CreateIntegration(i *model.Integration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Set direction and ID. Same invariant as Store.CreateIntegration —
+	// Set direction and ID. Same invariant as Store.CreateIntegration -
 	// type is validated upstream; an unknown one here is a programming error.
 	dir, ok := integrations.DirectionFor(i.Type)
 	if !ok {

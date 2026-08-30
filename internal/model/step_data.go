@@ -12,17 +12,17 @@ type EscalationStepData struct {
 	IsFirehose   bool   `json:"is_firehose"`
 }
 
-// OTPStepData has been removed (Sprint 4 / Epic 7 L7). The live OTP flow
-// (POST /me/slack/request-code → DM sent synchronously in the handler) never
-// went through a job step; the job-based path was a Sprint-1 experiment that
-// Sprint 3's link-token service replaced. Restoring an async OTP path is a
-// new feature, not a regression to fix here.
+// OTPStepData has been removed. The live OTP flow (POST
+// /me/slack/request-code -> DM sent synchronously in the handler) never went
+// through a job step; the job-based path was an experiment that the link-token
+// service replaced. Restoring an async OTP path is a new feature, not a
+// regression to fix here.
 
 // HandoffStepData contains specific data for handoff notification steps.
 //
-// Sprint 4 (Epic 7 L7): the executor reads ProviderName instead of
-// hardcoding "slack", and TargetID is the provider-specific external ID
-// (resolved by handoff_notifier via identitySendTarget).
+// The executor reads ProviderName rather than hardcoding "slack", and TargetID
+// is the provider-specific external ID, resolved by handoff_notifier via
+// identitySendTarget.
 type HandoffStepData struct {
 	ProviderName string `json:"provider_name"` // which provider sends this DM
 	TargetID     string `json:"target_id"`     // provider-specific external ID

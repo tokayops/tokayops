@@ -9,7 +9,7 @@ import (
 // MaskSecrets returns a copy of the integration with its secret config fields
 // replaced by model.MaskedSecret. Which top-level config keys are secret is
 // declared per type via Descriptor.SecretFields, so adding a new integration
-// type needs only a descriptor — no edit here (Epic 7 DoD: channel = plugin).
+// type needs only a descriptor - no edit here. A channel is a plugin.
 //
 // The original integration (and its Config bytes) is never mutated; non-secret
 // and unknown fields are preserved verbatim.
@@ -23,7 +23,7 @@ func MaskSecrets(i *model.Integration) *model.Integration {
 
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(i.Config, &fields); err != nil {
-		// Config isn't a JSON object we can introspect — return the copy
+		// Config isn't a JSON object we can introspect - return the copy
 		// unchanged rather than risk leaking a secret we can't locate.
 		return &masked
 	}

@@ -43,7 +43,7 @@ var ErrJobDedupActiveUnclassified = errors.New(
 // cheapest something available.
 //
 // The number is arbitrary and only has to stay stable: "tokay" truncated, plus
-// the epic that introduced the model.
+// a digit for the model it belongs to.
 const jobDedupAdvisoryLock int64 = 0x746F6B6111
 
 // applyJobDedupModel brings a database onto the job dedup model, in one
@@ -262,7 +262,7 @@ func migrateJobDedupModelTx(tx *sql.Tx) (int64, error) {
 	}
 
 	// Only the escalation key is rewritten. The others keep the string they
-	// have, prefix and all: Sprint 3 decides those identities for real, and
+	// have, prefix and all: those identities are decided for real later, and
 	// rewriting them twice would mean reading the same history two ways in two
 	// releases.
 	//

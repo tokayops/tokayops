@@ -55,7 +55,7 @@ func setupHandoffEnv(t *testing.T) *handoffEnv {
 	}
 	clock := func() time.Time { return env.now }
 
-	// Epic 7 moved Slack IDs out of the user row into external_identities; the
+	// Slack IDs live in external_identities rather than on the user row; the
 	// notifier resolves each on-call user's dm target through that table.
 	// U_NOSLACK intentionally has none.
 	users := []struct {

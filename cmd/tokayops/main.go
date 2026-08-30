@@ -147,7 +147,7 @@ func main() {
 	// TOKAY_SELF_URL gates all inbound-callback / clickable-link features. Warn loudly
 	// when it's unset so operators understand why interactivity is silently off.
 	if cfg.Global.SelfURL == "" {
-		log.Println("WARN: TOKAY_SELF_URL not set — clickable links and provider interactivity are disabled: " +
+		log.Println("WARN: TOKAY_SELF_URL not set - clickable links and provider interactivity are disabled: " +
 			"Slack/Telegram Ack/Resolve buttons are hidden, the Telegram webhook is not registered, " +
 			"and Telegram account linking (/start) cannot complete. Set TOKAY_SELF_URL to a public HTTPS URL to enable them.")
 	}
@@ -171,8 +171,9 @@ func main() {
 
 		case "migrate-slack-identities":
 			// Backfill external_identities(provider=slack) from the legacy
-			// users.slack_user_id column (Epic 7 upgrade — the only per-user data
-			// to carry forward). Idempotent. Pass --dry-run to preview.
+			// users.slack_user_id column, which is the only per-user data an
+			// upgrade from that shape has to carry forward. Idempotent. Pass
+			// --dry-run to preview.
 			//
 			// Accept ONLY no args (apply) or exactly "--dry-run". Reject anything
 			// else so a typo (--dryrun, --dry-run=true) cannot silently run a live
@@ -191,7 +192,7 @@ func main() {
 				log.Fatalf("Slack identity migration failed: %v", err)
 			}
 			if !res.LegacyColumnPresent {
-				log.Println("No legacy users.slack_user_id column found — nothing to migrate (fresh install).")
+				log.Println("No legacy users.slack_user_id column found - nothing to migrate (fresh install).")
 				return
 			}
 			mode := "applied"
@@ -201,7 +202,7 @@ func main() {
 			log.Printf("Slack identity migration [%s]: %d candidate(s), %d migrated, %d already linked, %d conflict(s)",
 				mode, res.Candidates, res.Migrated, res.AlreadySatisfied, len(res.Conflicts))
 			for _, c := range res.Conflicts {
-				log.Printf("  CONFLICT: user %q slack id %q is already linked to another user — skipped", c.UserID, c.SlackUserID)
+				log.Printf("  CONFLICT: user %q slack id %q is already linked to another user - skipped", c.UserID, c.SlackUserID)
 			}
 			if len(res.Conflicts) > 0 {
 				log.Printf("Resolve conflicts manually: the Slack ID belongs to a different TokayOps user.")
@@ -373,10 +374,10 @@ func main() {
 		SupportedTargetKinds: []string{"dm", "channel"},
 	})
 
-	// Telegram provider (Epic 8). No API-layer wiring in Sprint 1 — the incoming
-	// webhook + interactivity (which would need the provider in the API layer like
-	// slackProvider above) land in Sprint 3. The capability registration here is
-	// what makes telegram appear in the policy editor and handoff fan-out.
+	// The Telegram provider. The capability registration here is what makes
+	// telegram appear in the policy editor and in the handoff fan-out; the
+	// incoming webhook and interactivity need the provider in the API layer as
+	// well, the way slackProvider is wired above.
 	telegramProvider := telegramprovider.NewProvider(integrationCache, cfg.Global.SelfURL, telegramprovider.WithTeamLookup(teamLookup))
 	disp.RegisterProviderFactory("telegram", model.IntegrationTypeTelegram, func(integ *model.Integration) (dispatcher.Provider, error) {
 		return telegramProvider, nil
@@ -421,7 +422,7 @@ func main() {
 	apiService.SetScheduleReadRepository(st.ScheduleReadRepository())
 	apiService.SetScheduleRenderer(scheduleRenderer)
 	apiService.SetUserEraser(erasure.NewService(st.ErasureRepository()))
-	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle (Epic 8 Sprint 3)
+	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle
 	// Register the Telegram webhook at boot so TOKAY_SELF_URL + restart suffices (no
 	// need to re-save the integration). Best-effort; goroutine so a slow/unreachable
 	// setWebhook never blocks startup.
@@ -509,7 +510,7 @@ func main() {
 
 	// Handoff Notifier - DMs on-call user when shift starts. Provider lookup
 	// supplies the dm-capable set so the notifier doesn't fan out to
-	// identities from unregistered providers (Sprint 4 / Epic 7 L7).
+	// identities from unregistered providers.
 	handoffNotifier := dispatcher.NewHandoffNotifier(st, scheduleRenderer, disp.Providers(), 60*time.Second)
 	go handoffNotifier.Run(ctx)
 	log.Println("Handoff notifier enabled (60 second interval)")

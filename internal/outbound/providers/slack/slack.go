@@ -150,8 +150,8 @@ var ErrNoReceipt = fmt.Errorf("slack: the message to change has no readable coor
 // commitment was routed to a channel that cannot render it.
 var ErrNoContent = fmt.Errorf("slack: this commitment carries no state to render")
 
-// (ErrNoSlackUserID was removed in Epic 7 Sprint 3 — the dispatcher-level
-// ErrIdentityNotLinked in identity.go covers it generically.)
+// (ErrNoSlackUserID is gone: the dispatcher-level ErrIdentityNotLinked in
+// identity.go covers it generically.)
 
 // getClient returns a Slack client, recreating it if the token changed.
 // Returns error if no token is configured or tokenSource is nil.

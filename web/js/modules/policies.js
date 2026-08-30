@@ -159,7 +159,7 @@ export async function openPolicyEditor(policyId = null) {
         }
         State.editingPolicy = policy;
 
-        // Load required data. Sprint 4: also fetch provider capabilities so
+        // Load required data, provider capabilities included, so
         // the step-type dropdown is built from the dispatcher's registry
         // rather than the old hardcoded {slack_dm, slack_channel} pair.
         const [teamsResponse, usersResponse, providersResponse] = await Promise.all([
@@ -429,7 +429,7 @@ function bindPolicyEditorEvents() {
             // Step Type Change. The select value is encoded as
             // "<provider>:<target_kind>" (e.g. "slack:dm" / "slack:channel"),
             // so we split it to drive both the target-type select and the
-            // target selector. Sprint 4 replaced the old flat enum.
+            // target selector, which replaced the old flat enum.
             if (target.classList.contains('step-type-select')) {
                 const [, targetKind] = target.value.split(':');
                 const targetTypeSelect = row.querySelector('.target-type-select');
@@ -543,7 +543,7 @@ function addNewStep() {
     const currentTeamId = document.getElementById('policy-team-select')?.value || '';
 
     // Pass currentScheduleId for schedule target display. Default provider
-    // is the first registered one (alphabetical) — Sprint 4 makes the editor
+    // is the first registered one (alphabetical) - the editor is
     // discover providers via /providers instead of hardcoding "slack_dm".
     const defaultProvider = (State.providers || [])[0]?.name || '';
     const stepHtml = Components.policyStepRow({
@@ -647,8 +647,8 @@ function collectStepsData() {
     const stepRows = document.querySelectorAll('.policy-step-row');
 
     stepRows.forEach((row, index) => {
-        // Sprint 4: the select encodes "<provider>:<target_kind>". Split and
-        // send the two parts separately — the API now expects them as
+        // The select encodes "<provider>:<target_kind>". Split and
+        // send the two parts separately - the API now expects them as
         // distinct fields, not a combined step_type string.
         const raw = row.querySelector('.step-type-select')?.value || '';
         const [provider, targetKind] = raw.split(':');
@@ -757,7 +757,7 @@ async function openDuplicateModal(policyId) {
                     name: newName,
                     description: policy.description,
                     team_id: targetTeamId,
-                    // Sprint 4: policy steps carry (provider, target_kind)
+                    // Policy steps carry (provider, target_kind)
                     // instead of the old combined step_type.
                     steps: policy.steps.map(s => ({
                         provider: s.provider,
