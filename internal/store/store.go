@@ -528,12 +528,6 @@ func (s *Store) buildSchema() error {
 		return err
 	}
 
-	// Job dedup model: policy table, one-shot migration and the sweep for
-	// legacy indexes, in that order and under one lock.
-	if err := s.applyJobDedupModel(); err != nil {
-		return err
-	}
-
 	// team_name_snapshot migration: add column, backfill from teams, fallback orphans, enforce NOT NULL
 	snapshotMigration := `
 	ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS team_name_snapshot TEXT;

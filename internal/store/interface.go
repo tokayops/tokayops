@@ -120,22 +120,6 @@ type StoreInterface interface {
 	UpdateAPITokenLastUsed(id string) error
 	DeleteAPIToken(id string) error
 
-	// Jobs (Phase 2)
-	//
-	// CreateJobWithDedup reports whether the job was inserted: false means the
-	// identity was already claimed under its own policy and nothing was
-	// written. A caller that counts notifications actually sent needs that
-	// answer. The existing job's ID is not returned, because no caller ever
-	// read it.
-	CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (created bool, err error)
-	GetJobByID(id string) (*model.Job, error)
-	GetJobStepByID(stepID string) (*model.JobStep, error)
-	ClaimNextJobSteps(limit int, duration time.Duration) ([]*model.JobStep, error)
-	UpdateJobStepIfOwned(step *model.JobStep, leaseToken string) (bool, error)
-	FinishStepAndAdvance(stepID string, leaseToken string, outcome model.JobStepStatus, result string, stepError string) (model.AdvanceResult, error)
-	ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error
-	FailJob(jobID string, errorMsg string) error
-
 	// Escalation Policies (Phase 4)
 	CreateEscalationPolicy(p *model.EscalationPolicy) error
 	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)

@@ -629,6 +629,19 @@ func nilIfZeroRevision(schemaVersion int, revision int64) any {
 	return revision
 }
 
+// nilIfEmpty is what a nullable TEXT column takes: an empty string is a value,
+// and a column that means "there is none of this" has to hold NULL instead.
+//
+// A claim with no alert group is the reason it is here. Written as "", it would
+// be a claim about an alert group whose id is the empty string - and the
+// comparison that decides whether a repeat is the same work would answer yes.
+func nilIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 // subjectLabel names what a claim is about, so a refusal can say "no alert
 // group" instead of the empty string.
 func subjectLabel(present bool, id string) string {

@@ -1605,27 +1605,6 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	}
 }
 
-func waitForJobStatus(t *testing.T, s *store.Store, alertKey string, expected model.JobStatus) {
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		var status string
-		err := s.GetDB().QueryRow(`
-			SELECT j.status FROM jobs j
-			JOIN alert_groups ag ON j.alert_group_id = ag.id
-			WHERE ag.alert_key = $1`, alertKey).Scan(&status)
-		if err == nil && status == string(expected) {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	var actual string
-	s.GetDB().QueryRow(`
-		SELECT j.status FROM jobs j
-		JOIN alert_groups ag ON j.alert_group_id = ag.id
-		WHERE ag.alert_key = $1`, alertKey).Scan(&actual)
-	t.Fatalf("Timeout waiting for job %s to reach status %s, current: %s", alertKey, expected, actual)
-}
-
 // waitForNothingOwed waits until an alert group has no commitment left in
 // flight: everything it promised has either gone out or been withdrawn.
 func waitForNothingOwed(t *testing.T, s *store.Store, alertKey string) {

@@ -3,7 +3,6 @@ package engine
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/tokayops/tokayops/internal/outbound"
@@ -1141,23 +1140,6 @@ func TestAlertGroupIDs_CapsTheList(t *testing.T) {
 	if !strings.Contains(eleven, "(and 1 more)") {
 		t.Errorf("a batch of 11 does not say how many it left out: %q", eleven)
 	}
-}
-
-// dmTargetsOf lists what the dm steps of a built job would page.
-func dmTargetsOf(t *testing.T, steps []*model.JobStep) []string {
-	t.Helper()
-	var out []string
-	for _, step := range steps {
-		if step.StepType != "dm" {
-			continue
-		}
-		var data model.EscalationStepData
-		if err := json.Unmarshal(step.Data, &data); err != nil {
-			t.Fatalf("unmarshal step data: %v", err)
-		}
-		out = append(out, data.TargetID)
-	}
-	return out
 }
 
 // counterValue reads a counter without prometheus/testutil, which would promote
