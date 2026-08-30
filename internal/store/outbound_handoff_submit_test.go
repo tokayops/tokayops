@@ -441,62 +441,136 @@ func TestOnlyAHandoverMayCarryABoundedDeadline(t *testing.T) {
 	})
 }
 
-// TestAnAdmissionCarriesWhatItsKindHas, both directions.
+// TestAHandoverCarriesNoAlertGroupState.
 //
-// An escalation is about a state - the group, the frozen snapshot, its schema
-// version and its revision - and they travel as one. A handover has none of
-// them.
+// One forbidden atom per case. Changing several at once would leave the test
+// red after any single condition was removed, so it would not say which of them
+// is doing the work.
 //
-// Both halves fail silently in their own way without this. A handover carrying
-// a snapshot has it dropped on the floor, and the claim is written without it:
-// the producer's belief and the row differ with nobody the wiser. An escalation
-// missing one reaches a CHECK in the schema, which names a constraint rather
-// than the thing that is wrong, and only after a transaction has been opened.
-func TestAnAdmissionCarriesWhatItsKindHas(t *testing.T) {
-	t.Run("a handover carrying a state", func(t *testing.T) {
-		s := setupTestDB(t)
-		s.SetRenderEnvironment("https://tokay.example", "UTC")
-		seedUsers(t, s, "u-alice")
-		agID := outboundGroup(t, s)
+// The failure is silent without this: a snapshot handed in here is dropped on
+// the floor by a claim written without it, and the producer's belief and the
+// row differ with nobody the wiser.
+func TestAHandoverCarriesNoAlertGroupState(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		spoil func(t *testing.T, s *Store, batch *outbound.Batch)
+	}{
+		{
+			name: "an alert group",
+			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
+				batch.Admission.AlertGroupID = outboundGroup(t, s)
+			},
+		},
+		{
+			name: "a frozen state",
+			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
+				batch.Admission.Snapshot = outboundSnapshot(t, outboundGroup(t, s), "borrowed")
+			},
+		},
+		{
+			name: "a snapshot schema version",
+			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
+				batch.Admission.SnapshotSchemaVersion = keys.RenderSnapshotSchemaV1
+			},
+		},
+		{
+			name: "a revision",
+			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
+				batch.Admission.Revision = 3
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := setupTestDB(t)
+			s.SetRenderEnvironment("https://tokay.example", "UTC")
+			seedUsers(t, s, "u-alice")
 
-		batch := handoffBatch(t, "sched-1", announceTo("slack", "u-alice"))
-		// A real snapshot, the way an escalation's admission carries one.
-		batch.Admission.Snapshot = outboundSnapshot(t, agID, "borrowed")
-		batch.Admission.SnapshotSchemaVersion = keys.RenderSnapshotSchemaV1
+			batch := handoffBatch(t, "sched-1", announceTo("slack", "u-alice"))
+			tc.spoil(t, s, &batch)
 
-		before := alertDomainState(t, s)
-		if _, err := s.SubmitBatch(context.Background(), batch); err == nil {
-			t.Fatal("a handover carrying an alert group's state was admitted")
-		} else if !errors.Is(err, ErrOutboundContract) {
-			t.Fatalf("the refusal is not a contract violation: %v", err)
-		}
-		assertNothingAdmitted(t, s, before)
-	})
+			before := alertDomainState(t, s)
+			if _, err := s.SubmitBatch(context.Background(), batch); err == nil {
+				t.Fatal("a handover carrying an alert group's state was admitted")
+			} else if !errors.Is(err, ErrOutboundContract) {
+				t.Fatalf("the refusal is not a contract violation: %v", err)
+			}
+			assertNothingAdmitted(t, s, before)
+		})
+	}
+}
 
-	t.Run("an escalation missing its state", func(t *testing.T) {
-		s := setupTestDB(t)
-		s.SetRenderEnvironment("https://tokay.example", "UTC")
-		agID := outboundGroup(t, s)
+// TestAnEscalationsFourFieldsDescribeOneState.
+//
+// Present is not the same as consistent, and the difference is a lost page. All
+// four describe ONE state, so a claim naming group A beside a snapshot of group
+// B - or revision 7 beside a snapshot of 6, or a schema this build cannot
+// read - passes a presence check, writes the claim and moves group A to
+// processing. The disagreement surfaces at the first attempt, where an unknown
+// schema leaves the work waiting and a foreign group or revision ends it as
+// unreadable. By then the alert looks handled and nobody has been paged.
+//
+// One factor per case, again, so each condition is proven on its own.
+func TestAnEscalationsFourFieldsDescribeOneState(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		spoil func(t *testing.T, s *Store, batch *outbound.Batch)
+		says  string
+	}{
+		{
+			name: "nothing to render from",
+			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
+				batch.Admission.Snapshot = keys.RenderSnapshot{}
+				batch.Admission.SnapshotSchemaVersion = 0
+			},
+			says: "snapshot",
+		},
+		{
+			name: "the state of another alert group",
+			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
+				batch.Admission.Snapshot = outboundSnapshot(t, outboundGroup(t, s), "another")
+			},
+			says: "carrying the state of",
+		},
+		{
+			name: "the state of another revision",
+			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
+				batch.Admission.Revision = 7
+			},
+			says: "revision",
+		},
+		{
+			name: "a schema this build cannot render",
+			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
+				batch.Admission.SnapshotSchemaVersion = keys.RenderSnapshotSchemaV1 + 1
+			},
+			says: "schema",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := setupTestDB(t)
+			s.SetRenderEnvironment("https://tokay.example", "UTC")
+			agID := outboundGroup(t, s)
 
-		batch := outboundAdmission(t, agID, "first")
-		batch.Admission.Snapshot = keys.RenderSnapshot{}
-		batch.Admission.SnapshotSchemaVersion = 0
+			batch := outboundAdmission(t, agID, "first")
+			tc.spoil(t, s, &batch)
 
-		before := alertDomainState(t, s)
-		_, err := s.SubmitBatch(context.Background(), batch)
-		if err == nil {
-			t.Fatal("an escalation with no state to render from was admitted")
-		}
-		// Refused by the contract layer, which says what is missing - not by a
-		// constraint downstream, which says a constraint name.
-		if !errors.Is(err, ErrOutboundContract) {
-			t.Fatalf("the refusal is not a contract violation: %v", err)
-		}
-		if !strings.Contains(err.Error(), "snapshot") {
-			t.Fatalf("the refusal does not say what is missing: %v", err)
-		}
-		assertNothingAdmitted(t, s, before)
-	})
+			before := alertDomainState(t, s)
+			_, err := s.SubmitBatch(context.Background(), batch)
+			if err == nil {
+				t.Fatal("an escalation whose four fields disagree was admitted")
+			}
+			// Refused by the contract layer, which says what is wrong - not by
+			// a constraint downstream, which says a constraint name, nor at the
+			// first attempt, by which time the alert looks handled.
+			if !errors.Is(err, ErrOutboundContract) {
+				t.Fatalf("the refusal is not a contract violation: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.says) {
+				t.Fatalf("the refusal does not say what is wrong: %v", err)
+			}
+			assertNothingAdmitted(t, s, before)
+		})
+	}
 }
 
 // TestAHandoverDeadlineIsBounded. Not merely present: the grammar fingerprints

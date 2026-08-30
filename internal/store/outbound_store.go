@@ -244,6 +244,36 @@ func admissionCarriesWhatItsKindHas(admission keys.Admission) error {
 			return outboundContractf(
 				"an escalation admission at revision %d", admission.Revision)
 		}
+		// Present is not the same as consistent, and the difference is a lost
+		// page. All four describe ONE state, so a claim naming group A beside a
+		// snapshot of group B - or revision 7 beside a snapshot of 6, or a
+		// schema this build cannot read - passes a presence check, writes the
+		// claim and moves group A to processing. The disagreement then surfaces
+		// at the first attempt, where an unknown schema leaves the work waiting
+		// and a foreign group or revision ends it as unreadable. By then the
+		// alert looks handled and nobody has been paged.
+		// The digest's LENGTH is not checked here, and that is deliberate. A
+		// snapshot outside the keys package is either the zero value - already
+		// refused above as no state at all - or one its constructor made, and
+		// that one always digests to thirty-two bytes. There is no third case
+		// to defend against, and a guard for it would be a guard nothing can
+		// reach.
+		if admission.SnapshotSchemaVersion != keys.RenderSnapshotSchemaV1 {
+			return outboundContractf(
+				"an escalation admission at snapshot schema %d, which this build cannot render",
+				admission.SnapshotSchemaVersion)
+		}
+		content := admission.Snapshot.Content()
+		if content.AlertGroupID != admission.AlertGroupID {
+			return outboundContractf(
+				"an escalation admission for alert group %s carrying the state of %s",
+				admission.AlertGroupID, content.AlertGroupID)
+		}
+		if content.Revision != admission.Revision {
+			return outboundContractf(
+				"an escalation admission at revision %d carrying the state of revision %d",
+				admission.Revision, content.Revision)
+		}
 	case keys.KindHandoff:
 		if hasGroup || hasState || hasSchema || admission.Revision != 0 {
 			return outboundContractf(

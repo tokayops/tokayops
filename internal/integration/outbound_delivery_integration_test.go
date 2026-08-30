@@ -369,12 +369,19 @@ func TestNoMoreLeasesThanSlots(t *testing.T) {
 	})
 
 	// Whatever the worker does, it never holds more leases than it has slots.
+	//
+	// Counted by WORKER, not across the table. The claim is that one worker
+	// stays inside its own pool, and a whole-table count says something else: a
+	// lease left live by a neighbouring test - they share this database, and a
+	// notification lease outlives the test that took it by ninety seconds -
+	// would be read as this worker holding too many.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		var leased int
 		if err := env.S.GetDB().QueryRow(`
 			SELECT count(*) FROM outbound_intents
-			WHERE lease_token IS NOT NULL AND locked_until > now()`).Scan(&leased); err != nil {
+			WHERE lease_token IS NOT NULL AND locked_until > now()
+			  AND worker_id = $1`, "integration-worker").Scan(&leased); err != nil {
 			t.Fatalf("count the leases: %v", err)
 		}
 		if leased > outbound.NotificationPoolSize {
