@@ -198,7 +198,7 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 			continue
 		}
 		metrics.OutboundAdmissionsTotal.WithLabelValues(
-			admissionLabel(result.Outcome, len(admission.Admission.Commitments))).Inc()
+			outbound.AdmissionLabel(result.Outcome, len(admission.Admission.Commitments))).Inc()
 
 		if result.Outcome == outbound.SubmitSourceChanged {
 			// The alert changed between being read and being admitted, so this
@@ -222,7 +222,7 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		// the reasons in the alert's own history.
 		about, _ := admission.Context.Escalation()
 		log.Printf("AlertEngine: %s admission=%s policy=%s commitments=%d unpromised=%d",
-			ag.ID, admissionLabel(result.Outcome, len(admission.Admission.Commitments)),
+			ag.ID, outbound.AdmissionLabel(result.Outcome, len(admission.Admission.Commitments)),
 			about.PolicyID, len(result.IntentIDs), len(about.Unpromised))
 	}
 
@@ -237,19 +237,6 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 // loop works in, which is what lets a reader narrow a hang down to the groups
 // that never reported back. What the cap leaves out is counted, not hidden -
 // a reader who sees "and N more" knows the answer may be outside the list.
-// admissionLabel is what happened to one escalation, as a metric label.
-//
-// It is the store's outcome, with one substitution: an admission that was
-// ACCEPTED and promised nothing is counted as no_targets rather than as
-// created. Both are successes to the store and only one of them means somebody
-// was paged, and the alert on this counter is about exactly that difference.
-func admissionLabel(outcome outbound.SubmitOutcome, commitments int) string {
-	if outcome == outbound.SubmitCreated && commitments == 0 {
-		return "no_targets"
-	}
-	return string(outcome)
-}
-
 func alertGroupIDs(ags []*model.AlertGroup) string {
 	const shown = 10
 

@@ -12,15 +12,32 @@ import "github.com/prometheus/client_golang/prometheus"
 // which no HTTP metric can see.
 var (
 
-	// ScheduleOnCallNotificationsTotal counts notification jobs actually
-	// created, not on-call changes detected. The two differ whenever more than
-	// one instance is running: both observe the same handoff, the dedup key
-	// lets exactly one job through, and counting detections would report two
-	// notifications where one was sent.
+	// ScheduleOnCallNotificationsTotal counts announcements actually admitted,
+	// not on-call changes detected. The two differ whenever more than one
+	// instance is running: both observe the same handoff, the occurrence key
+	// lets exactly one admission create the work, and counting detections would
+	// report two announcements where one was made.
 	ScheduleOnCallNotificationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "schedule_oncall_notifications_total",
-		Help: "On-call notification jobs created, by kind of transition.",
+		Help: "On-call announcements admitted, by kind of transition.",
 	}, []string{"kind"})
+
+	// HandoffRecipientsSkippedTotal counts people who came on duty and were not
+	// told, by why.
+	//
+	// Nothing else shows this. The admission counter says the announcement was
+	// accepted and schedule_oncall_notifications_total says it was made; both
+	// are true of an announcement that reached one of the two people it was
+	// about. This is the only place the other one appears.
+	//
+	// Counted once per person per occurrence, on the admission that CREATED it
+	// and on no other: two instances detecting one shift change both see the
+	// same unreachable person, and both commit - one as created, one as
+	// existing. Counted on both, one person missed would read as two.
+	HandoffRecipientsSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "handoff_recipients_skipped_total",
+		Help: "People on an incoming shift who were not announced to, by reason.",
+	}, []string{"reason"})
 
 	// ScheduleOnCallProjectionFailuresTotal counts schedules the runtime could
 	// not project - a schedule whose duty roster can no longer be read at all.
@@ -68,6 +85,7 @@ const (
 
 func init() {
 	prometheus.MustRegister(ScheduleOnCallNotificationsTotal)
+	prometheus.MustRegister(HandoffRecipientsSkippedTotal)
 	prometheus.MustRegister(ScheduleOnCallProjectionFailuresTotal)
 	prometheus.MustRegister(ScheduleOnCallProjectionDuration)
 }

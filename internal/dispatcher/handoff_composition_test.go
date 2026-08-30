@@ -5,17 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
-
-// occKey is the key the notifier ends up writing: the parts this file decides,
-// spelled by jobdedup. The spelling itself - framing, hashing, the golden
-// vector - is tested where it lives, in the jobdedup package; what is asked
-// here is which events are the same event.
-func occKey(kind, scheduleID string, next observation) string {
-	return jobdedup.HandoffOccurrence(occurrenceOf(kind, scheduleID, next)).Key()
-}
 
 func comp(source, groupID string, users ...string) *composition {
 	c := composition{Source: source, GroupID: groupID, UserIDs: users}
@@ -167,10 +158,10 @@ func TestClassifyIgnoresMovingBoundaries(t *testing.T) {
 	}
 }
 
-// TestOccurrenceKeyDistinguishesArrivals: the dedup key identifies an event, not
+// TestOccurrenceKeyDistinguishesArrivals: the claim identifies an event, not
 // a state. A composition recurs, and if the key were the state alone, the second
-// - entirely legitimate - notification would be swallowed by the unique index
-// while the first job was still pending.
+// - entirely legitimate - notification would be answered as work that already
+// exists while the first announcement was still going out.
 func TestOccurrenceKeyDistinguishesArrivals(t *testing.T) {
 	slot := func(i int) time.Time { return dutyBase.Add(time.Duration(i) * 24 * time.Hour) }
 	arrival := func(groupID string, day int, users ...string) observation {
@@ -185,10 +176,10 @@ func TestOccurrenceKeyDistinguishesArrivals(t *testing.T) {
 
 	t.Run("a rotation returning to the same group", func(t *testing.T) {
 		// A -> B -> C -> A: the last arrival repeats the first composition.
-		first := occKey(kindHandoff, "sched-1", arrival("g-a", 0, "alice"))
-		again := occKey(kindHandoff, "sched-1", arrival("g-a", 3, "alice"))
+		first := occKey(t, kindHandoff, "sched-1", arrival("g-a", 0, "alice"))
+		again := occKey(t, kindHandoff, "sched-1", arrival("g-a", 3, "alice"))
 		if first == again {
-			t.Fatalf("both arrivals of group A produced %q; the second would be deduped away", first)
+			t.Fatalf("both arrivals of group A produced %q; the second would be answered as already made", first)
 		}
 	})
 
@@ -203,26 +194,26 @@ func TestOccurrenceKeyDistinguishesArrivals(t *testing.T) {
 			scheduleID: "sched-1", source: schedulerender.SourceRotation, groupID: "g-b",
 			users: []string{"bob", "dave"}, slotStart: slot(0), start: slot(0).Add(6 * time.Hour),
 		}))
-		if occKey(kindAddedToActiveShift, "sched-1", firstAdd) ==
-			occKey(kindAddedToActiveShift, "sched-1", secondAdd) {
-			t.Fatal("two edits producing the same members share a dedup key")
+		if occKey(t, kindAddedToActiveShift, "sched-1", firstAdd) ==
+			occKey(t, kindAddedToActiveShift, "sched-1", secondAdd) {
+			t.Fatal("two edits producing the same members share a claim")
 		}
 	})
 
 	t.Run("the kind is part of the key", func(t *testing.T) {
-		// Without it, a lingering added_to_active_shift job would suppress the
+		// Without it, a live added_to_active_shift claim would suppress the
 		// handoff that follows with the same composition and boundary.
 		next := arrival("g-b", 1, "bob", "dave")
-		if occKey(kindHandoff, "sched-1", next) == occKey(kindAddedToActiveShift, "sched-1", next) {
-			t.Fatal("the two kinds share a dedup key")
+		if occKey(t, kindHandoff, "sched-1", next) == occKey(t, kindAddedToActiveShift, "sched-1", next) {
+			t.Fatal("the two kinds share a claim")
 		}
 	})
 
 	t.Run("the same event from two instances is one key", func(t *testing.T) {
-		// Two processes observing the same transition must agree, or the dedup
-		// key cannot stop the second job.
-		a := occKey(kindHandoff, "sched-1", arrival("g-b", 1, "bob", "dave"))
-		b := occKey(kindHandoff, "sched-1", arrival("g-b", 1, "dave", "bob"))
+		// Two processes observing the same transition must agree, or the claim
+		// cannot stop the second announcement.
+		a := occKey(t, kindHandoff, "sched-1", arrival("g-b", 1, "bob", "dave"))
+		b := occKey(t, kindHandoff, "sched-1", arrival("g-b", 1, "dave", "bob"))
 		if a != b {
 			t.Fatalf("the same event keyed as %q and %q", a, b)
 		}
@@ -239,7 +230,7 @@ func TestOccurrenceKeyDistinguishesArrivals(t *testing.T) {
 			scheduleID: "sched-1", source: schedulerender.SourceOverride,
 			groupID: "ovr-1", users: []string{"alice"}, slotStart: slot(0),
 		}))
-		if occKey(kindHandoff, "sched-1", group) == occKey(kindHandoff, "sched-1", override) {
+		if occKey(t, kindHandoff, "sched-1", group) == occKey(t, kindHandoff, "sched-1", override) {
 			t.Fatal("a rotation group and an override share a dedup key")
 		}
 	})
@@ -294,13 +285,13 @@ func TestOccurrenceKeyDistinguishesOverrideEdits(t *testing.T) {
 		t.Fatal("the fixture no longer models the same composition arriving twice")
 	}
 
-	if occKey(kindHandoff, "sched-1", firstB) == occKey(kindHandoff, "sched-1", secondB) {
+	if occKey(t, kindHandoff, "sched-1", firstB) == occKey(t, kindHandoff, "sched-1", secondB) {
 		t.Fatal("two edits of one override share a dedup key; the second notification would be suppressed")
 	}
 
 	// The same override, unedited, observed twice is still ONE occurrence -
 	// otherwise every tick would be a new notification.
-	if occKey(kindHandoff, "sched-1", firstB) != occKey(kindHandoff, "sched-1", standIn("bob", "ovr-1-r2")) {
+	if occKey(t, kindHandoff, "sched-1", firstB) != occKey(t, kindHandoff, "sched-1", standIn("bob", "ovr-1-r2")) {
 		t.Fatal("an unchanged override produced two different keys")
 	}
 }
@@ -320,8 +311,8 @@ func TestOccurrenceKeyDistinguishesScheduleRevisions(t *testing.T) {
 			revisionID: revisionID,
 		}))
 	}
-	if occKey(kindAddedToActiveShift, "sched-1", group("rev-7")) ==
-		occKey(kindAddedToActiveShift, "sched-1", group("rev-9")) {
+	if occKey(t, kindAddedToActiveShift, "sched-1", group("rev-7")) ==
+		occKey(t, kindAddedToActiveShift, "sched-1", group("rev-9")) {
 		t.Fatal("two revisions producing the same members share a dedup key")
 	}
 }
@@ -340,7 +331,7 @@ func TestOccurrenceKeyKeepsSubSecondActivations(t *testing.T) {
 			start:      dutyBase.Add(offset),
 		}))
 	}
-	if occKey(kindHandoff, "sched-1", at(0)) == occKey(kindHandoff, "sched-1", at(time.Microsecond)) {
+	if occKey(t, kindHandoff, "sched-1", at(0)) == occKey(t, kindHandoff, "sched-1", at(time.Microsecond)) {
 		t.Fatal("activations a microsecond apart share a dedup key")
 	}
 }

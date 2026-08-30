@@ -2,18 +2,13 @@ package dispatcher
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -48,23 +43,27 @@ type onCallLister interface {
 // the syncer takes identityLookup from the same store. Named without a taker, a
 // role is one more jump for the reader and nothing else.
 type notifierStore interface {
-	// The team name is how the message addresses whoever reads it.
+	// The team name the announcement is about. It travels INTO the payload
+	// rather than into a rendered line, so a channel writes it its own way.
 	GetAllTeams() ([]*model.Team, error)
 
-	// Where the people coming on duty can be reached, per provider.
+	// Where the people coming on duty can be reached, per provider. Read by
+	// the builder through addressBook, which is the narrow half of this.
 	GetIdentitiesForUsers(userIDs []string) (map[string][]*model.ExternalIdentity, error)
 
-	// Admission. False means another instance announced this handover first,
-	// which is why the answer is a value and not an error.
-	CreateJobWithDedup(job *model.Job, stages []*model.JobStage,
-		steps []*model.JobStep) (created bool, err error)
+	// SubmitBatch admits the announcement: the claim over the occurrence and
+	// every commitment under it, in one commit. Two instances that saw the same
+	// shift change offer the same occurrence, and exactly one of them creates
+	// the work - which is the same rule the escalation is admitted by, and the
+	// reason the answer is an outcome rather than an error.
+	SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound.SubmitResult, error)
 }
 
 // HandoffNotifier detects on-call changes and creates notification jobs.
 type HandoffNotifier struct {
 	store         notifierStore
 	oncall        onCallLister
-	providers     dmProviderLookup
+	build         announcementBuilder
 	checkInterval time.Duration
 
 	cacheMu sync.RWMutex
@@ -90,7 +89,7 @@ func NewHandoffNotifier(st notifierStore, oncall onCallLister, providers dmProvi
 	return &HandoffNotifier{
 		store:         st,
 		oncall:        oncall,
-		providers:     providers,
+		build:         announcementBuilder{identities: st, providers: providers},
 		checkInterval: interval,
 		cache:         make(map[string]composition),
 	}
@@ -190,13 +189,15 @@ func (n *HandoffNotifier) checkAll(ctx context.Context) bool {
 	}
 
 	for _, sc := range bulk.Schedules {
-		n.checkSchedule(sc, teamNames)
+		n.checkSchedule(ctx, sc, teamNames)
 	}
 	return true
 }
 
 // checkSchedule compares one schedule against what was last seen of it.
-func (n *HandoffNotifier) checkSchedule(sc schedulerender.ScheduleOnCall, teamNames map[string]string) {
+func (n *HandoffNotifier) checkSchedule(ctx context.Context, sc schedulerender.ScheduleOnCall,
+	teamNames map[string]string) {
+
 	next := observe(sc)
 	kind, notify := classify(n.cached(sc.ScheduleID), next)
 
@@ -217,167 +218,96 @@ func (n *HandoffNotifier) checkSchedule(sc schedulerender.ScheduleOnCall, teamNa
 		return
 	}
 
-	n.handleHandoff(sc, kind, notify, next, teamNames)
+	n.handleHandoff(ctx, sc, kind, notify, next, teamNames)
 }
 
-// handleHandoff creates the notification job for one transition.
-func (n *HandoffNotifier) handleHandoff(sc schedulerender.ScheduleOnCall, kind string,
-	notify []string, next observation, teamNames map[string]string) {
-
-	// The fan-out is per linked identity rather than to the Slack one.
-	// Restrict to providers that (a) are registered and
-	// (b) advertise the "dm" target kind - otherwise stale or unrelated
-	// identities (e.g. an OIDC sub stored as an identity, or a provider we
-	// removed) would create steps that immediately fail.
-	dmProviders := map[string]bool{}
-	if n.providers != nil {
-		for _, p := range n.providers.ProvidersSupporting("dm") {
-			dmProviders[p] = true
-		}
-	}
-
-	identities, err := n.store.GetIdentitiesForUsers(notify)
-	if err != nil {
-		log.Printf("[HandoffNotifier] Failed to load identities for schedule %s: %v", sc.ScheduleID, err)
-		return // Don't cache - next tick retries
-	}
-
-	// Per-user list of usable identities, ordered by provider name for
-	// stable step indices across ticks.
-	usableByUser := make(map[string][]model.ExternalIdentity, len(identities))
-	for uid, list := range identities {
-		var keep []model.ExternalIdentity
-		for _, ei := range list {
-			if ei.ExternalID == "" || !dmProviders[ei.Provider] {
-				continue
-			}
-			keep = append(keep, *ei)
-		}
-		sort.Slice(keep, func(i, j int) bool { return keep[i].Provider < keep[j].Provider })
-		if len(keep) > 0 {
-			usableByUser[uid] = keep
-		}
-	}
-
-	var notifiable []string
-	for _, uid := range notify {
-		if len(usableByUser[uid]) == 0 {
-			log.Printf("[HandoffNotifier] User %s has no dm-capable linked identity for schedule %s, skipping",
-				uid, sc.ScheduleID)
-			continue
-		}
-		notifiable = append(notifiable, uid)
-	}
-
-	if len(notifiable) == 0 {
-		n.setCache(sc.ScheduleID, next.Composition)
-		return
-	}
-
-	if !n.createHandoffJob(sc, kind, notifiable, usableByUser, next, teamNames) {
-		return // Don't update cache - next tick will retry
-	}
-
-	n.setCache(sc.ScheduleID, next.Composition)
-}
-
-// createHandoffJob builds and persists a notification job with one stage and N
-// parallel steps. N is the total number of usable linked identities across all
-// notified users - a user linked to both Slack and Telegram receives
-// one step per provider. The order of steps within a user follows usableByUser
-// (sorted by provider name) so step indices stay stable across retries.
+// handleHandoff admits the announcement for one transition, and decides from
+// the answer whether this schedule has been dealt with.
 //
-// Returns true on success (or non-retryable error), false if the job should
-// be retried.
-func (n *HandoffNotifier) createHandoffJob(sc schedulerender.ScheduleOnCall, kind string,
-	notifiable []string, usableByUser map[string][]model.ExternalIdentity,
-	next observation, teamNames map[string]string) bool {
+// Moving the cache is what makes a transition observed rather than pending, so
+// the rule is a closed one and not "after a success". Two of the six answers
+// are successes that mean the work exists - ours or somebody else's - and one
+// is a failure that no repeat can fix. All three end the schedule's business
+// here. The rest leave the cache alone, and the next tick sees the same
+// transition again.
+func (n *HandoffNotifier) handleHandoff(ctx context.Context, sc schedulerender.ScheduleOnCall,
+	kind string, notify []string, next observation, teamNames map[string]string) {
 
 	teamName := teamNames[sc.TeamID]
 	if teamName == "" {
 		teamName = sc.TeamID
 	}
 
-	message := formatHandoffMessage(kind, teamName, sc.Timezone, next)
-
-	now := time.Now()
-	job := &model.Job{
-		ID:     uuid.New().String(),
-		Status: model.JobStatusPending,
-		Dedup:  jobdedup.HandoffOccurrence(occurrenceOf(kind, sc.ScheduleID, next)),
-		// Stamped like every other job builder does. Left unset - as it was
-		// before - the row lands at year zero, and anything ordering jobs by
-		// creation time sees notifications in an order that has nothing to do
-		// with when they happened.
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-	stageID := uuid.New().String()
-	stage := &model.JobStage{
-		ID:         stageID,
-		JobID:      job.ID,
-		StageIndex: 0,
-		Status:     model.JobStageStatusActive,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-
-	var steps []*model.JobStep
-	idx := 0
-	for _, uid := range notifiable {
-		for _, ei := range usableByUser[uid] {
-			ei := ei // copy for the closure-free loop body
-			stepData := model.HandoffStepData{
-				ProviderName: ei.Provider,
-				TargetID:     identitySendTarget(&ei),
-				Message:      message,
-				ScheduleID:   sc.ScheduleID,
-				TeamID:       sc.TeamID,
-			}
-			stepDataJSON, err := json.Marshal(stepData)
-			if err != nil {
-				log.Printf("[HandoffNotifier] Failed to marshal step data for schedule %s user %s provider %s: %v",
-					sc.ScheduleID, uid, ei.Provider, err)
-				continue
-			}
-			steps = append(steps, &model.JobStep{
-				ID:                uuid.New().String(),
-				JobID:             job.ID,
-				StageID:           stageID,
-				StepIndex:         idx,
-				StepType:          "handoff_notify",
-				Status:            model.JobStepStatusPending,
-				Data:              stepDataJSON,
-				MaxAttempts:       3,
-				ContinueOnFailure: true,
-			})
-			idx++
-		}
-	}
-
-	if len(steps) == 0 {
-		return true
-	}
-
-	created, err := n.store.CreateJobWithDedup(job, []*model.JobStage{stage}, steps)
+	batch, left, err := n.build.build(sc, kind, notify, next, teamName)
 	if err != nil {
-		log.Printf("[HandoffNotifier] Failed to create %s job for schedule %s: %v", kind, sc.ScheduleID, err)
-		return false
-	}
-	if !created {
-		// Another instance detected the same transition first. The notification
-		// is on its way; counting it here as well would double a metric that is
-		// supposed to say how many were sent.
-		log.Printf("[HandoffNotifier] %s job for schedule %s already exists, skipping", kind, sc.ScheduleID)
-		return true
+		// Nothing is known and nothing is claimed. The cache stays where it
+		// was so the next tick asks again: an occurrence admitted with nobody
+		// on it because a read failed would be a durable "there was nobody to
+		// tell", and the real announcement could never be made afterwards.
+		log.Printf("[HandoffNotifier] Could not build the %s announcement for schedule %s (will retry): %v",
+			kind, sc.ScheduleID, err)
+		return
 	}
 
-	// Counted once per transition, not per step: a person linked to two
-	// providers still received one notification.
-	metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kind).Inc()
-	log.Printf("[HandoffNotifier] %s detected for schedule %s (team %s): notifying %s",
-		kind, sc.ScheduleID, teamName, strings.Join(notifiable, ", "))
-	return true
+	result, err := n.store.SubmitBatch(ctx, batch)
+	if err != nil {
+		log.Printf("[HandoffNotifier] Failed to admit the %s announcement for schedule %s (will retry): %v",
+			kind, sc.ScheduleID, err)
+		return
+	}
+	promised := len(batch.Admission.Commitments)
+	label := outbound.AdmissionLabel(result.Outcome, promised)
+	metrics.OutboundAdmissionsTotal.WithLabelValues(label).Inc()
+
+	switch result.Outcome {
+	case outbound.SubmitCreated:
+		// This instance is the one that made the promise, so this is the one
+		// place the people it left out are counted. The loser of the race sees
+		// exactly the same unreachable people, and counting there too would
+		// report one person missed as two.
+		metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kind).Inc()
+		for _, s := range left {
+			metrics.HandoffRecipientsSkippedTotal.WithLabelValues(string(s.Reason)).Inc()
+			log.Printf("[HandoffNotifier] %s on schedule %s: %s was not announced to (%s)",
+				kind, sc.ScheduleID, s.UserID, s.Reason)
+		}
+
+	case outbound.SubmitExisting:
+		// Somebody else admitted this occurrence, or we did and lost the
+		// answer. Either way it is held, and held correctly.
+
+	case outbound.SubmitConflict:
+		// Two instances built the same occurrence with different sets - live
+		// configuration that differed by a field between them, say. The winner
+		// already holds the claim and its announcement is already going out;
+		// there is nothing to ask and nobody to overrule, so a repeat would
+		// only produce this same answer every tick until the shift ended. The
+		// line naming both fingerprints is written by the store, which is the
+		// only place that has them both.
+		log.Printf("[HandoffNotifier] %s on schedule %s is held by a different announcement; moving on",
+			kind, sc.ScheduleID)
+
+	case outbound.SubmitRecipientErased:
+		// The set of people this was about is not the set that exists any
+		// more. The next tick projects it again.
+		log.Printf("[HandoffNotifier] %s on schedule %s names an erased recipient; the next tick rebuilds it",
+			kind, sc.ScheduleID)
+		return
+
+	default:
+		// source_changed and group_not_admitted are answers about an alert
+		// group, and a handover has none. Reaching one means the store took
+		// this announcement down a branch that is not about it at all, so the
+		// schedule is left pending rather than marked done on an answer to
+		// somebody else's question.
+		log.Printf("[HandoffNotifier] %s on schedule %s was answered %q, which is not an answer about a shift change",
+			kind, sc.ScheduleID, result.Outcome)
+		return
+	}
+
+	log.Printf("[HandoffNotifier] %s on schedule %s (team %s) admission=%s promised=%d skipped=%d",
+		kind, sc.ScheduleID, teamName, label, promised, len(left))
+	n.setCache(sc.ScheduleID, next.Composition)
 }
 
 // cached returns the composition last observed for a schedule, or nil if the
@@ -398,39 +328,4 @@ func (n *HandoffNotifier) setCache(scheduleID string, c composition) {
 	n.cacheMu.Lock()
 	n.cache[scheduleID] = c.clone()
 	n.cacheMu.Unlock()
-}
-
-// formatHandoffMessage builds the DM text.
-//
-// Both kinds carry both pairs of boundaries, each labelled for what it is. For
-// an ordinary handoff the first two lines hold the same instant, and that is
-// fine: the coincidence is a fact, not a reason to hide one of them. They differ
-// exactly where it matters - the shift began at 11:00 and the stand-in's
-// assignment starts at 14:00 - and the two kinds differ in their first line:
-// one says you came on call, the other that you joined a shift in progress.
-//
-// There is no "indefinite" case any more. A grid slot always ends, so the
-// current assignment always has an end.
-func formatHandoffMessage(kind, teamName, timezone string, next observation) string {
-	loc, err := time.LoadLocation(timezone)
-	if err != nil {
-		loc = time.UTC
-	}
-	if timezone == "" {
-		timezone = "UTC"
-	}
-	at := func(t time.Time) string {
-		return fmt.Sprintf("%s (%s)", t.In(loc).Format("Mon Jan 2, 15:04"), timezone)
-	}
-
-	headline := fmt.Sprintf(":mega: You are now on-call for team *%s*.\n\n", teamName)
-	if kind == kindAddedToActiveShift {
-		headline = fmt.Sprintf(":heavy_plus_sign: You have been added to the on-call shift in progress for team *%s*.\n\n", teamName)
-	}
-
-	return headline +
-		fmt.Sprintf(":clock1: Rotation shift started:         %s\n", at(next.GridSlotStart)) +
-		fmt.Sprintf(":clock1: Your assignment effective from: %s\n", at(next.AssignmentStart)) +
-		fmt.Sprintf(":clock4: Assignment ends:                %s\n", at(next.AssignmentEnd)) +
-		"\n_Assignment end is current as of now and may change if the schedule is modified._"
 }

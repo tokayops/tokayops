@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"time"
 
@@ -803,11 +804,28 @@ func existingAdmission(ctx context.Context, tx *sql.Tx,
 		return outbound.SubmitResult{}, false, err
 	}
 
-	outcome := outbound.SubmitConflict
 	if bytes.Equal(existingFingerprint, admission.Fingerprint) {
-		outcome = outbound.SubmitExisting
+		return outbound.SubmitResult{
+			Outcome: outbound.SubmitExisting, BatchID: existingID, IntentIDs: ids,
+		}, true, nil
 	}
-	return outbound.SubmitResult{Outcome: outcome, BatchID: existingID, IntentIDs: ids}, true, nil
+
+	// The claim is held by DIFFERENT work, and this is the only place both
+	// fingerprints exist at once: the one the producer offered and the one in
+	// the winner's row. The result carries neither - a producer has no use for
+	// the winner's digest and widening the result for a log line would put it
+	// in everyone's hands - so the line is written here.
+	//
+	// It is worth a line rather than a counter alone because nothing else can
+	// answer the question it raises. Two producers derived different work from
+	// what should be one event; which of them is right cannot be decided here,
+	// and the loser will not ask again. What an operator gets is the claim, the
+	// two digests, and a place to start.
+	log.Printf("outbound: claim %s is held by different work: winner %x, offered %x",
+		admission.BatchKey, existingFingerprint, admission.Fingerprint)
+	return outbound.SubmitResult{
+		Outcome: outbound.SubmitConflict, BatchID: existingID, IntentIDs: ids,
+	}, true, nil
 }
 
 // insertCommitmentsTx writes the commitments in key order.

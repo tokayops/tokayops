@@ -4,7 +4,6 @@ package dispatcher
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -140,74 +139,70 @@ func (e *handoffEnv) tick(d time.Duration) {
 func (e *handoffEnv) warmUp() {
 	e.t.Helper()
 	e.tick(0)
-	if got := e.handoffJobs(); len(got) != 0 {
-		e.t.Fatalf("warm-up created %d jobs, want none", len(got))
+	if got := e.announcements(); len(got) != 0 {
+		e.t.Fatalf("warm-up admitted %d announcements, want none", len(got))
 	}
 	e.notifier.cacheMu.Lock()
 	e.notifier.warmedUp = true
 	e.notifier.cacheMu.Unlock()
 }
 
-type notifyJob struct {
-	id       string
-	alertKey string
-	status   string
+type announcement struct {
+	id      string
+	key     string
+	outcome string
 }
 
-// handoffJobs lists the notification jobs in the database, oldest first.
-func (e *handoffEnv) handoffJobs() []notifyJob {
+// announcements lists the shift-change claims in the database, oldest first.
+func (e *handoffEnv) announcements() []announcement {
 	e.t.Helper()
 	rows, err := e.s.GetDB().Query(`
-		SELECT id, COALESCE(dedup_key, ''), status FROM jobs
-		WHERE type = 'handoff_notify' ORDER BY created_at, id`)
+		SELECT id, batch_key, admission_outcome FROM outbound_batches
+		WHERE key_kind = 'handoff' ORDER BY admitted_at, id`)
 	if err != nil {
-		e.t.Fatalf("query jobs: %v", err)
+		e.t.Fatalf("query the claims: %v", err)
 	}
 	defer rows.Close()
 
-	var out []notifyJob
+	var out []announcement
 	for rows.Next() {
-		var j notifyJob
-		if err := rows.Scan(&j.id, &j.alertKey, &j.status); err != nil {
-			e.t.Fatalf("scan job: %v", err)
+		var a announcement
+		if err := rows.Scan(&a.id, &a.key, &a.outcome); err != nil {
+			e.t.Fatalf("scan a claim: %v", err)
 		}
-		out = append(out, j)
+		out = append(out, a)
 	}
 	return out
 }
 
-// stepTargets lists the dm targets of one job, by provider.
-func (e *handoffEnv) stepTargets(jobID string) map[string]string {
+// recipients lists who one announcement promises to reach, by provider.
+//
+// The value is the internal user id, not the account it will be delivered to:
+// the commitment names the person and the channel resolves the address when it
+// prepares the attempt.
+func (e *handoffEnv) recipients(batchID string) map[string]string {
 	e.t.Helper()
 	rows, err := e.s.GetDB().Query(`
-		SELECT step_type, data, continue_on_failure FROM job_steps
-		WHERE job_id = $1 ORDER BY step_index`, jobID)
+		SELECT provider, target_kind, target_ref FROM outbound_intents
+		WHERE batch_id = $1 ORDER BY idempotency_key`, batchID)
 	if err != nil {
-		e.t.Fatalf("query steps: %v", err)
+		e.t.Fatalf("query the commitments: %v", err)
 	}
 	defer rows.Close()
 
 	out := map[string]string{}
 	for rows.Next() {
-		var stepType, data string
-		var continueOnFailure bool
-		if err := rows.Scan(&stepType, &data, &continueOnFailure); err != nil {
-			e.t.Fatalf("scan step: %v", err)
+		var provider, targetKind, targetRef string
+		if err := rows.Scan(&provider, &targetKind, &targetRef); err != nil {
+			e.t.Fatalf("scan a commitment: %v", err)
 		}
-		if stepType != "handoff_notify" {
-			e.t.Errorf("step type = %q, want handoff_notify", stepType)
+		if targetKind != "user" {
+			e.t.Errorf("a shift is taken by a person, and this one names a %q", targetKind)
 		}
-		if !continueOnFailure {
-			e.t.Error("a fan-out step must not block its siblings")
+		if _, dup := out[provider]; dup {
+			e.t.Errorf("two commitments for provider %q", provider)
 		}
-		var parsed model.HandoffStepData
-		if err := json.Unmarshal([]byte(data), &parsed); err != nil {
-			e.t.Fatalf("unmarshal step data: %v", err)
-		}
-		if _, dup := out[parsed.ProviderName]; dup {
-			e.t.Errorf("duplicate step for provider %q", parsed.ProviderName)
-		}
-		out[parsed.ProviderName] = parsed.TargetID
+		out[provider] = targetRef
 	}
 	return out
 }
@@ -225,35 +220,33 @@ func TestHandoffNotifierOnRevisionModel(t *testing.T) {
 
 	env.tick(24 * time.Hour)
 
-	jobs := env.handoffJobs()
-	if len(jobs) != 1 {
-		t.Fatalf("%d jobs after one handoff, want 1: %+v", len(jobs), jobs)
+	made := env.announcements()
+	if len(made) != 1 {
+		t.Fatalf("%d announcements after one handoff, want 1: %+v", len(made), made)
 	}
 
-	// Both members of the incoming group are notified, and nobody else. The
-	// recipients are read off the step rows rather than through stepTargets,
-	// which keys by provider and is for the multi-provider fan-out.
-	rows, err := env.s.GetDB().Query(`SELECT data FROM job_steps WHERE job_id = $1`, jobs[0].id)
+	// Both members of the incoming group are promised to, and nobody else. Read
+	// off the commitments directly rather than through recipients(), which keys
+	// by provider and is for the multi-provider fan-out.
+	rows, err := env.s.GetDB().Query(`
+		SELECT target_ref, payload->>'schedule_id' FROM outbound_intents WHERE batch_id = $1`,
+		made[0].id)
 	if err != nil {
-		t.Fatalf("query steps: %v", err)
+		t.Fatalf("query the commitments: %v", err)
 	}
 	defer rows.Close()
 	targets := map[string]bool{}
 	for rows.Next() {
-		var data string
-		if err := rows.Scan(&data); err != nil {
+		var userID, scheduleID string
+		if err := rows.Scan(&userID, &scheduleID); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
-		var parsed model.HandoffStepData
-		if err := json.Unmarshal([]byte(data), &parsed); err != nil {
-			t.Fatalf("unmarshal: %v", err)
-		}
-		targets[parsed.TargetID] = true
-		if parsed.ScheduleID != env.schedID {
-			t.Errorf("step schedule = %q, want %q", parsed.ScheduleID, env.schedID)
+		targets[userID] = true
+		if scheduleID != env.schedID {
+			t.Errorf("the announcement is about schedule %q, want %q", scheduleID, env.schedID)
 		}
 	}
-	if !targets["S_B"] || !targets["S_C"] || targets["S_A"] {
+	if !targets["U_B"] || !targets["U_C"] || targets["U_A"] {
 		t.Errorf("notified %v, want the incoming group only", targets)
 	}
 }
@@ -271,30 +264,30 @@ func TestHandoffNotifierRepeatedCompositionIsNotDeduped(t *testing.T) {
 	))
 	env.warmUp()
 
-	// A -> B -> A -> B over three days. Every job stays pending, so the unique
-	// index on dedup_key is live for all of them.
+	// A -> B -> A -> B over three days. The claim over an occurrence is held
+	// forever, so all three are live for all of them.
 	for i := 0; i < 3; i++ {
 		env.tick(24 * time.Hour)
 	}
 
-	jobs := env.handoffJobs()
-	if len(jobs) != 3 {
-		t.Fatalf("%d jobs over three handoffs, want 3: %+v", len(jobs), jobs)
+	made := env.announcements()
+	if len(made) != 3 {
+		t.Fatalf("%d announcements over three handoffs, want 3: %+v", len(made), made)
 	}
 	seen := map[string]bool{}
-	for _, j := range jobs {
-		if j.status != string(model.JobStatusPending) {
-			t.Errorf("job %s is %s; the test needs them pending for dedup to be live", j.id, j.status)
+	for _, a := range made {
+		if a.outcome != "admitted" {
+			t.Errorf("announcement %s was admitted as %q, want admitted", a.id, a.outcome)
 		}
-		if seen[j.alertKey] {
-			t.Errorf("duplicate dedup key %q", j.alertKey)
+		if seen[a.key] {
+			t.Errorf("two announcements claimed %q", a.key)
 		}
-		seen[j.alertKey] = true
+		seen[a.key] = true
 	}
-	// The first and third handoffs put the same group on duty, so their keys
+	// The first and third handoffs put the same group on duty, so their claims
 	// differ only in the moment of activation.
 	if len(seen) != 3 {
-		t.Fatalf("dedup keys = %v, want three distinct ones", seen)
+		t.Fatalf("claims = %v, want three distinct ones", seen)
 	}
 }
 
@@ -318,17 +311,17 @@ func TestHandoffNotifierEditedGroupIsNotDeduped(t *testing.T) {
 		env.tick(time.Minute)
 	}
 
-	jobs := env.handoffJobs()
+	made := env.announcements()
 	// Two additions produce two notifications; the removal produces none.
-	if len(jobs) != 2 {
-		t.Fatalf("%d jobs, want one per addition: %+v", len(jobs), jobs)
+	if len(made) != 2 {
+		t.Fatalf("%d announcements, want one per addition: %+v", len(made), made)
 	}
-	if jobs[0].alertKey == jobs[1].alertKey {
-		t.Fatalf("both additions produced the dedup key %q", jobs[0].alertKey)
+	if made[0].key == made[1].key {
+		t.Fatalf("both additions claimed %q", made[0].key)
 	}
-	for _, j := range jobs {
-		if got := env.stepTargets(j.id)["slack"]; got != "S_B" {
-			t.Errorf("job %s notified %q, want the added member alone", j.id, got)
+	for _, a := range made {
+		if got := env.recipients(a.id)["slack"]; got != "U_B" {
+			t.Errorf("announcement %s notified %q, want the added member alone", a.id, got)
 		}
 	}
 }
@@ -363,8 +356,8 @@ func TestHandoffNotifierTwoInstancesCreateOneJob(t *testing.T) {
 		t.Fatal("second instance tick failed")
 	}
 
-	if jobs := env.handoffJobs(); len(jobs) != 1 {
-		t.Fatalf("%d jobs from two instances, want 1: %+v", len(jobs), jobs)
+	if made := env.announcements(); len(made) != 1 {
+		t.Fatalf("%d announcements from two instances, want 1: %+v", len(made), made)
 	}
 }
 
@@ -398,18 +391,20 @@ func TestHandoffNotifierSecondInstanceAfterTheJobFinished(t *testing.T) {
 	second.warmedUp = true
 	second.cacheMu.Unlock()
 
-	// The first instance detects the handover and its job runs to completion.
+	// The first instance detects the handover and its announcement is delivered
+	// to the end.
 	env.now = env.now.Add(24 * time.Hour)
 	if !env.notifier.checkAll(context.Background()) {
 		t.Fatal("first instance tick failed")
 	}
-	jobs := env.handoffJobs()
-	if len(jobs) != 1 {
-		t.Fatalf("%d jobs from the first instance, want 1: %+v", len(jobs), jobs)
+	made := env.announcements()
+	if len(made) != 1 {
+		t.Fatalf("%d announcements from the first instance, want 1: %+v", len(made), made)
 	}
 	if _, err := env.s.GetDB().Exec(
-		`UPDATE jobs SET status = 'succeeded', finished_at = NOW() WHERE id = $1`, jobs[0].id); err != nil {
-		t.Fatalf("finish the job: %v", err)
+		`UPDATE outbound_intents SET status = 'succeeded' WHERE batch_id = $1`,
+		made[0].id); err != nil {
+		t.Fatalf("deliver the announcement: %v", err)
 	}
 
 	// Only now does the other instance tick. The DM has been delivered; this
@@ -419,13 +414,13 @@ func TestHandoffNotifierSecondInstanceAfterTheJobFinished(t *testing.T) {
 		t.Fatal("second instance tick failed")
 	}
 
-	after := env.handoffJobs()
+	after := env.announcements()
 	if len(after) != 1 {
-		t.Fatalf("%d jobs after the second instance ticked, want 1 - the occurrence was announced already: %+v",
+		t.Fatalf("%d announcements after the second instance ticked, want 1 - the occurrence was announced already: %+v",
 			len(after), after)
 	}
-	if after[0].id != jobs[0].id {
-		t.Errorf("job %s replaced by %s", jobs[0].id, after[0].id)
+	if after[0].id != made[0].id {
+		t.Errorf("claim %s replaced by %s", made[0].id, after[0].id)
 	}
 }
 
@@ -446,20 +441,20 @@ func TestHandoffNotifierDeleteAndRecreate(t *testing.T) {
 	}
 	env.version++
 	env.tick(time.Minute)
-	if jobs := env.handoffJobs(); len(jobs) != 0 {
-		t.Fatalf("the delete created %d jobs, want none: %+v", len(jobs), jobs)
+	if made := env.announcements(); len(made) != 0 {
+		t.Fatalf("the delete admitted %d announcements, want none: %+v", len(made), made)
 	}
 
 	env.now = env.now.Add(time.Hour)
 	env.save(dailyConfig(group(handoffGroupA, "U_A")))
 	env.tick(time.Minute)
 
-	jobs := env.handoffJobs()
-	if len(jobs) != 1 {
-		t.Fatalf("%d jobs after the recreate, want 1: %+v", len(jobs), jobs)
+	made := env.announcements()
+	if len(made) != 1 {
+		t.Fatalf("%d announcements after the recreate, want 1: %+v", len(made), made)
 	}
-	if got := env.stepTargets(jobs[0].id)["slack"]; got != "S_A" {
-		t.Errorf("notified %q, want S_A - her duty was interrupted", got)
+	if got := env.recipients(made[0].id)["slack"]; got != "U_A" {
+		t.Errorf("notified %q, want U_A - her duty was interrupted", got)
 	}
 }
 
@@ -483,22 +478,22 @@ func TestHandoffNotifierOverrideBoundaries(t *testing.T) {
 
 	// Inside the override: the stand-in is on duty.
 	env.tick(90 * time.Minute)
-	jobs := env.handoffJobs()
-	if len(jobs) != 1 {
-		t.Fatalf("%d jobs when the override started, want 1: %+v", len(jobs), jobs)
+	made := env.announcements()
+	if len(made) != 1 {
+		t.Fatalf("%d announcements when the override started, want 1: %+v", len(made), made)
 	}
-	if got := env.stepTargets(jobs[0].id)["slack"]; got != "S_C" {
-		t.Errorf("notified %q, want the stand-in S_C", got)
+	if got := env.recipients(made[0].id)["slack"]; got != "U_C" {
+		t.Errorf("notified %q, want the stand-in U_C", got)
 	}
 
 	// After it: the rotation is back.
 	env.tick(2 * time.Hour)
-	jobs = env.handoffJobs()
-	if len(jobs) != 2 {
-		t.Fatalf("%d jobs after the override ended, want 2: %+v", len(jobs), jobs)
+	made = env.announcements()
+	if len(made) != 2 {
+		t.Fatalf("%d announcements after the override ended, want 2: %+v", len(made), made)
 	}
-	if got := env.stepTargets(jobs[1].id)["slack"]; got != "S_A" {
-		t.Errorf("notified %q, want the returning group S_A", got)
+	if got := env.recipients(made[1].id)["slack"]; got != "U_A" {
+		t.Errorf("notified %q, want the returning group U_A", got)
 	}
 }
 
@@ -514,32 +509,38 @@ func TestHandoffNotifierPartialIdentities(t *testing.T) {
 
 	env.tick(24 * time.Hour)
 
-	jobs := env.handoffJobs()
-	if len(jobs) != 1 {
-		t.Fatalf("%d jobs, want 1: %+v", len(jobs), jobs)
+	made := env.announcements()
+	if len(made) != 1 {
+		t.Fatalf("%d announcements, want 1: %+v", len(made), made)
 	}
-	var stepCount int
-	if err := env.s.GetDB().QueryRow(`SELECT COUNT(*) FROM job_steps WHERE job_id = $1`,
-		jobs[0].id).Scan(&stepCount); err != nil {
-		t.Fatalf("count steps: %v", err)
+	var promised int
+	if err := env.s.GetDB().QueryRow(`SELECT COUNT(*) FROM outbound_intents WHERE batch_id = $1`,
+		made[0].id).Scan(&promised); err != nil {
+		t.Fatalf("count the commitments: %v", err)
 	}
-	if stepCount != 1 {
-		t.Fatalf("%d steps, want 1 - the user with no identity is skipped", stepCount)
+	if promised != 1 {
+		t.Fatalf("%d commitments, want 1 - the user with no identity is skipped", promised)
 	}
-	if got := env.stepTargets(jobs[0].id)["slack"]; got != "S_B" {
-		t.Errorf("notified %q, want S_B", got)
+	if got := env.recipients(made[0].id)["slack"]; got != "U_B" {
+		t.Errorf("notified %q, want U_B", got)
 	}
 }
 
 // TestHandoffNotifierMultiProviderFanOut proves the fan-out is
-// capability-driven, not Slack-specific: one on-call user with identities on two
-// dm-capable providers gets one step per provider, and an identity on a provider
-// that is not dm-capable is excluded.
+// capability-driven, not Slack-specific: one on-call user with identities on
+// two dm-capable providers is promised a message through each, and an identity
+// on a provider that is not dm-capable is excluded.
+//
+// The second provider is a real one. A made-up name would be refused at
+// admission by the rule that a commitment may only name a channel this build
+// can deliver through - which is the rule working, and would leave this test
+// asserting nothing about fan-out.
 func TestHandoffNotifierMultiProviderFanOut(t *testing.T) {
 	env := setupHandoffEnv(t)
-	env.notifier = NewHandoffNotifier(env.s, env.renderer, staticDmProviders{"slack", "fake"}, time.Minute)
+	env.notifier = NewHandoffNotifier(env.s, env.renderer,
+		staticDmProviders{"slack", "telegram"}, time.Minute)
 
-	testutil.BindIdentity(t, env.s, "U_B", "fake", "F_B")
+	testutil.BindIdentity(t, env.s, "U_B", "telegram", "T_B")
 	testutil.BindIdentity(t, env.s, "U_B", "email", "E_B")
 
 	env.save(dailyConfig(
@@ -550,19 +551,23 @@ func TestHandoffNotifierMultiProviderFanOut(t *testing.T) {
 
 	env.tick(24 * time.Hour)
 
-	jobs := env.handoffJobs()
-	if len(jobs) != 1 {
-		t.Fatalf("%d jobs, want 1: %+v", len(jobs), jobs)
+	made := env.announcements()
+	if len(made) != 1 {
+		t.Fatalf("%d announcements, want 1: %+v", len(made), made)
 	}
-	got := env.stepTargets(jobs[0].id)
+	got := env.recipients(made[0].id)
 	if len(got) != 2 {
-		t.Fatalf("fan-out targets = %v, want slack + fake", got)
+		t.Fatalf("fan-out = %v, want one commitment each through slack and telegram", got)
 	}
-	if got["slack"] != "S_B" || got["fake"] != "F_B" {
-		t.Errorf("fan-out targets = %v, want S_B and F_B", got)
+	// One person, two providers, and the SAME person named in both: which
+	// account each provider delivers to is that provider's to resolve, and
+	// resolving it here would freeze an account that may be relinked before the
+	// message goes out.
+	if got["slack"] != "U_B" || got["telegram"] != "U_B" {
+		t.Errorf("fan-out = %v, want U_B through both", got)
 	}
 	if target, ok := got["email"]; ok {
-		t.Errorf("a provider that is not dm-capable produced a step targeting %q", target)
+		t.Errorf("a provider that is not dm-capable was promised a message to %q", target)
 	}
 }
 
@@ -581,8 +586,8 @@ func TestHandoffNotifierThreeGroupsNoRepeatWithinOneShift(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		env.tick(time.Minute)
 	}
-	if jobs := env.handoffJobs(); len(jobs) != 0 {
-		t.Fatalf("%d jobs from ticks inside one shift, want none: %+v", len(jobs), jobs)
+	if made := env.announcements(); len(made) != 0 {
+		t.Fatalf("%d announcements from ticks inside one shift, want none: %+v", len(made), made)
 	}
 }
 
@@ -635,20 +640,15 @@ func TestHandoffNotifierEditedOverrideIsNotDeduped(t *testing.T) {
 		env.tick(time.Minute)
 	}
 
-	jobs := env.handoffJobs()
+	made := env.announcements()
 	// One per activation: U_B, then U_C, U_B, U_C.
-	if len(jobs) != 4 {
-		t.Fatalf("%d jobs over four activations, want 4: %+v", len(jobs), jobs)
+	if len(made) != 4 {
+		t.Fatalf("%d announcements over four activations, want 4: %+v", len(made), made)
 	}
-	if jobs[1].alertKey == jobs[3].alertKey {
-		t.Fatalf("both activations of U_C share the dedup key %q; the second was suppressed", jobs[1].alertKey)
+	if made[1].key == made[3].key {
+		t.Fatalf("both activations of U_C claimed %q; the second was suppressed", made[1].key)
 	}
-	for _, j := range jobs {
-		if j.status != string(model.JobStatusPending) {
-			t.Errorf("job %s is %s; the test needs them pending for dedup to be live", j.id, j.status)
-		}
-	}
-	if got := env.stepTargets(jobs[3].id)["slack"]; got != "S_C" {
-		t.Errorf("the last job notified %q, want S_C back on the override", got)
+	if got := env.recipients(made[3].id)["slack"]; got != "U_C" {
+		t.Errorf("the last announcement notified %q, want U_C back on the override", got)
 	}
 }

@@ -2,18 +2,19 @@ package dispatcher
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
-	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -29,8 +30,8 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 }
 
 // mockNotifierStore implements the store methods HandoffNotifier still needs:
-// team names, linked identities and job creation. On-call state does not come
-// from here any more - it comes from the projection.
+// team names, linked identities and admission. On-call state does not come from
+// here any more - it comes from the projection.
 //
 // It does NOT embed store.StoreInterface. While it did, the double compiled
 // whether or not it implemented the methods under test, and every unimplemented
@@ -39,19 +40,17 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 type mockNotifierStore struct {
 	teams    []*model.Team
 	slackIDs map[string]string // userID -> slack external id ("" means not linked)
-	jobs     []*createdJob
+	admitted []outbound.Batch
 
-	getTeamsErr  error
-	createJobErr error
+	getTeamsErr   error
+	identitiesErr error
+	submitErr     error
+	identityCalls int
 
-	// dedupHits are dedup keys an active job already holds, as a second
-	// instance's write would find them.
-	dedupHits map[string]bool
-}
-
-type createdJob struct {
-	job   *model.Job
-	steps []*model.JobStep
+	// held are occurrences another instance already claimed, and the answer the
+	// store gives about each: the same work comes back as existing, different
+	// work under the same key as a conflict.
+	held map[string]outbound.SubmitOutcome
 }
 
 func (m *mockNotifierStore) GetAllTeams() ([]*model.Team, error) {
@@ -61,13 +60,18 @@ func (m *mockNotifierStore) GetAllTeams() ([]*model.Team, error) {
 	return m.teams, nil
 }
 
-// GetIdentitiesForUsers reads the per-test slackIDs map. A user with an empty or
-// missing entry has no dm-capable identity → the notifier skips them.
+// GetIdentitiesForUsers reads the per-test slackIDs map. A user with a missing
+// entry has no identity at all; one with an empty entry has a Slack link with
+// no address, which is what an unfinished link looks like.
 func (m *mockNotifierStore) GetIdentitiesForUsers(userIDs []string) (map[string][]*model.ExternalIdentity, error) {
+	m.identityCalls++
+	if m.identitiesErr != nil {
+		return nil, m.identitiesErr
+	}
 	out := make(map[string][]*model.ExternalIdentity)
 	for _, id := range userIDs {
 		slackID, ok := m.slackIDs[id]
-		if !ok || slackID == "" {
+		if !ok {
 			continue
 		}
 		out[id] = []*model.ExternalIdentity{{UserID: id, Provider: "slack", ExternalID: slackID}}
@@ -75,23 +79,27 @@ func (m *mockNotifierStore) GetIdentitiesForUsers(userIDs []string) (map[string]
 	return out, nil
 }
 
-func (m *mockNotifierStore) CreateJobWithDedup(job *model.Job, _ []*model.JobStage, steps []*model.JobStep) (bool, error) {
-	if m.createJobErr != nil {
-		return false, m.createJobErr
+func (m *mockNotifierStore) SubmitBatch(_ context.Context, batch outbound.Batch) (outbound.SubmitResult, error) {
+	if m.submitErr != nil {
+		return outbound.SubmitResult{}, m.submitErr
 	}
-	if job.Dedup != nil && m.dedupHits[job.Dedup.Key()] {
-		return false, nil
+	if outcome, taken := m.held[batch.Admission.BatchKey]; taken {
+		return outbound.SubmitResult{Outcome: outcome, BatchID: "held"}, nil
 	}
-	m.jobs = append(m.jobs, &createdJob{job: job, steps: steps})
-	return true, nil
+	m.admitted = append(m.admitted, batch)
+	ids := make([]string, len(batch.Admission.Commitments))
+	for i := range ids {
+		ids[i] = fmt.Sprintf("intent-%d", i)
+	}
+	return outbound.SubmitResult{
+		Outcome: outbound.SubmitCreated, BatchID: batch.Admission.BatchKey, IntentIDs: ids,
+	}, nil
 }
 
-func (m *mockNotifierStore) alertKeys() []string {
+func (m *mockNotifierStore) batchKeys() []string {
 	var out []string
-	for _, j := range m.jobs {
-		if j.job.Dedup != nil {
-			out = append(out, j.job.Dedup.Key())
-		}
+	for _, b := range m.admitted {
+		out = append(out, b.Admission.BatchKey)
 	}
 	return out
 }
@@ -107,9 +115,9 @@ type notifierEnv struct {
 func newNotifierEnv(t *testing.T, slackIDs map[string]string) *notifierEnv {
 	t.Helper()
 	st := &mockNotifierStore{
-		teams:     []*model.Team{{ID: "team-1", Name: "Backend"}},
-		slackIDs:  slackIDs,
-		dedupHits: map[string]bool{},
+		teams:    []*model.Team{{ID: "team-1", Name: "Backend"}},
+		slackIDs: slackIDs,
+		held:     map[string]outbound.SubmitOutcome{},
 	}
 	oncall := &fakeOnCall{}
 	return &notifierEnv{
@@ -128,53 +136,73 @@ func (e *notifierEnv) tick(schedules ...schedulerender.ScheduleOnCall) bool {
 	return e.notifier.checkAll(context.Background())
 }
 
-// warmUp runs the silent first pass and asserts it created nothing.
+// warmUp runs the silent first pass and asserts it admitted nothing.
 func (e *notifierEnv) warmUp(schedules ...schedulerender.ScheduleOnCall) {
 	e.t.Helper()
 	if !e.tick(schedules...) {
 		e.t.Fatal("warm-up tick reported a call failure")
 	}
-	if len(e.store.jobs) != 0 {
-		e.t.Fatalf("warm-up created %d jobs, want none", len(e.store.jobs))
+	if len(e.store.admitted) != 0 {
+		e.t.Fatalf("warm-up admitted %d announcements, want none", len(e.store.admitted))
 	}
 	e.notifier.cacheMu.Lock()
 	e.notifier.warmedUp = true
 	e.notifier.cacheMu.Unlock()
 }
 
-func (e *notifierEnv) jobs() []*createdJob { return e.store.jobs }
+func (e *notifierEnv) announcements() []outbound.Batch { return e.store.admitted }
 
-// targets lists the DM recipients of the one job the test expects.
+// targets lists who the one announcement the test expects is addressed to.
+//
+// Internal user ids, not provider addresses: a commitment names the PERSON, and
+// the channel resolves how to reach them when it prepares the attempt. An
+// identity relinked between the promise and the delivery then reaches the
+// person rather than the account they used to have.
 func (e *notifierEnv) targets() []string {
 	e.t.Helper()
-	if len(e.store.jobs) != 1 {
-		e.t.Fatalf("expected exactly 1 job, got %d", len(e.store.jobs))
+	if len(e.store.admitted) != 1 {
+		e.t.Fatalf("expected exactly 1 announcement, got %d", len(e.store.admitted))
 	}
 	var out []string
-	for _, step := range e.store.jobs[0].steps {
-		var data model.HandoffStepData
-		if err := json.Unmarshal(step.Data, &data); err != nil {
-			e.t.Fatalf("unmarshal step data: %v", err)
-		}
-		out = append(out, data.TargetID)
+	for _, c := range e.store.admitted[0].Admission.Commitments {
+		out = append(out, c.Target.Ref)
 	}
+	sort.Strings(out)
 	return out
 }
 
-func (e *notifierEnv) message() string {
+// payload is what the one announcement tells its first recipient. It is the
+// whole message as far as this side is concerned: what a channel writes is
+// drawn from these fields, in the channel.
+func (e *notifierEnv) payload() keys.HandoffPayloadV1 {
 	e.t.Helper()
-	if len(e.store.jobs) != 1 || len(e.store.jobs[0].steps) == 0 {
-		e.t.Fatalf("expected one job with steps, got %d jobs", len(e.store.jobs))
+	if len(e.store.admitted) != 1 || len(e.store.admitted[0].Admission.Commitments) == 0 {
+		e.t.Fatalf("expected one announcement with recipients, got %d", len(e.store.admitted))
 	}
-	var data model.HandoffStepData
-	if err := json.Unmarshal(e.store.jobs[0].steps[0].Data, &data); err != nil {
-		e.t.Fatalf("unmarshal step data: %v", err)
+	payload, ok := e.store.admitted[0].Admission.Commitments[0].Payload.(keys.HandoffPayloadV1)
+	if !ok {
+		e.t.Fatalf("the commitment carries a %T, not an announcement",
+			e.store.admitted[0].Admission.Commitments[0].Payload)
 	}
-	return data.Message
+	return payload
 }
 
 func (e *notifierEnv) cached(scheduleID string) *composition {
 	return e.notifier.cached(scheduleID)
+}
+
+// occKey is the claim over one occurrence, as the grammar spells it.
+func occKey(t *testing.T, kind, scheduleID string, next observation) string {
+	t.Helper()
+	announced, err := announcementKind(kind)
+	if err != nil {
+		t.Fatalf("kind: %v", err)
+	}
+	key, err := announcementOccurrence(announced, scheduleID, next).Key()
+	if err != nil {
+		t.Fatalf("occurrence key: %v", err)
+	}
+	return key
 }
 
 func slackIDsFor(users ...string) map[string]string {
@@ -193,17 +221,15 @@ func TestNotifierNaturalHandoff(t *testing.T) {
 
 	env.tick(rotationDuty("sched-1", "g-b", "bob", "carol"))
 
-	if got := env.targets(); strings.Join(got, ",") != "U-CAROL" {
+	if got := env.targets(); strings.Join(got, ",") != "carol" {
 		t.Fatalf("notified %v, want carol alone - bob was already on call", got)
 	}
-	// The identity is the occurrence, so it is compared against the occurrence
-	// rather than read: the key is a digest, and asking what it starts with
-	// would only pin the schedule it names.
-	want := jobdedup.HandoffOccurrence(occurrenceOf(kindHandoff, "sched-1",
-		observe(rotationDuty("sched-1", "g-b", "bob", "carol"))))
-	if spec := env.jobs()[0].job.Dedup; spec == nil ||
-		spec.Namespace() != want.Namespace() || spec.Key() != want.Key() {
-		t.Fatalf("dedup spec = %+v, want the handoff occurrence of sched-1 (%s)", spec, want.Key())
+	// The claim is over the occurrence, so it is compared against the
+	// occurrence rather than read: the key is a digest, and asking what it
+	// starts with would only pin the schedule it names.
+	want := occKey(t, kindHandoff, "sched-1", observe(rotationDuty("sched-1", "g-b", "bob", "carol")))
+	if got := env.announcements()[0].Admission.BatchKey; got != want {
+		t.Fatalf("claimed %q, want the handoff occurrence of sched-1 (%s)", got, want)
 	}
 }
 
@@ -215,16 +241,19 @@ func TestNotifierAddedToActiveShift(t *testing.T) {
 
 	env.tick(rotationDuty("sched-1", "g-b", "bob", "dave"))
 
-	if got := env.targets(); strings.Join(got, ",") != "U-DAVE" {
+	if got := env.targets(); strings.Join(got, ",") != "dave" {
 		t.Fatalf("notified %v, want dave alone", got)
 	}
-	want := jobdedup.HandoffOccurrence(occurrenceOf(kindAddedToActiveShift, "sched-1",
-		observe(rotationDuty("sched-1", "g-b", "bob", "dave"))))
-	if spec := env.jobs()[0].job.Dedup; spec == nil || spec.Key() != want.Key() {
-		t.Fatalf("dedup spec = %+v, want the added_to_active_shift occurrence (%s)", spec, want.Key())
+	want := occKey(t, kindAddedToActiveShift, "sched-1",
+		observe(rotationDuty("sched-1", "g-b", "bob", "dave")))
+	if got := env.announcements()[0].Admission.BatchKey; got != want {
+		t.Fatalf("claimed %q, want the added_to_active_shift occurrence (%s)", got, want)
 	}
-	if msg := env.message(); !strings.Contains(msg, "added to the on-call shift in progress") {
-		t.Fatalf("message does not announce joining a shift in progress:\n%s", msg)
+	// Which event this is travels in the payload, as a kind. Nothing here
+	// writes a sentence about it: what a person reads is composed by the
+	// channel that sends it.
+	if kind := env.payload().Kind; kind != keys.HandoffAddedToActiveShift {
+		t.Fatalf("the announcement is a %q, want one about joining a shift in progress", kind)
 	}
 }
 
@@ -256,8 +285,8 @@ func TestNotifierSilentTransitions(t *testing.T) {
 			env := newNotifierEnv(t, slackIDsFor("alice", "bob", "dave"))
 			env.warmUp(tc.first)
 			env.tick(tc.then)
-			if len(env.jobs()) != 0 {
-				t.Fatalf("created %d jobs, want none", len(env.jobs()))
+			if len(env.announcements()) != 0 {
+				t.Fatalf("admitted %d announcements, want none", len(env.announcements()))
 			}
 		})
 	}
@@ -270,13 +299,13 @@ func TestNotifierOverrideBoundaries(t *testing.T) {
 	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
 
 	env.tick(overrideDuty("sched-1", "ovr-1", "carol"))
-	if got := env.targets(); strings.Join(got, ",") != "U-CAROL" {
+	if got := env.targets(); strings.Join(got, ",") != "carol" {
 		t.Fatalf("override start notified %v, want the stand-in", got)
 	}
 
-	env.store.jobs = nil
+	env.store.admitted = nil
 	env.tick(rotationDuty("sched-1", "g-a", "alice"))
-	if got := env.targets(); strings.Join(got, ",") != "U-ALICE" {
+	if got := env.targets(); strings.Join(got, ",") != "alice" {
 		t.Fatalf("override end notified %v, want the returning group", got)
 	}
 }
@@ -298,8 +327,8 @@ func TestNotifierSingleGroupScheduleAcrossBoundaries(t *testing.T) {
 			slotStart:  slot,
 		}))
 	}
-	if len(env.jobs()) != 0 {
-		t.Fatalf("created %d jobs over three boundaries, want none", len(env.jobs()))
+	if len(env.announcements()) != 0 {
+		t.Fatalf("admitted %d announcements over three boundaries, want none", len(env.announcements()))
 	}
 }
 
@@ -313,8 +342,8 @@ func TestNotifierFirstObservationIsSilent(t *testing.T) {
 
 	env.tick(rotationDuty("sched-1", "g-a", "alice"))
 
-	if len(env.jobs()) != 0 {
-		t.Fatalf("created %d jobs for a schedule seen for the first time, want none", len(env.jobs()))
+	if len(env.announcements()) != 0 {
+		t.Fatalf("admitted %d announcements for a schedule seen for the first time, want none", len(env.announcements()))
 	}
 	if got := env.cached("sched-1"); got == nil || strings.Join(got.UserIDs, ",") != "alice" {
 		t.Fatalf("cache = %+v, want the observation recorded silently", got)
@@ -331,8 +360,8 @@ func TestNotifierDeleteAndRecreateNotifies(t *testing.T) {
 
 	deletedAt := dutyBase.Add(time.Hour)
 	env.tick(duty(dutySpec{scheduleID: "sched-1", deletedAt: &deletedAt}))
-	if len(env.jobs()) != 0 {
-		t.Fatalf("the delete itself created %d jobs, want none", len(env.jobs()))
+	if len(env.announcements()) != 0 {
+		t.Fatalf("the delete itself admitted %d announcements, want none", len(env.announcements()))
 	}
 	cached := env.cached("sched-1")
 	if cached == nil || !cached.empty() {
@@ -340,7 +369,7 @@ func TestNotifierDeleteAndRecreateNotifies(t *testing.T) {
 	}
 
 	env.tick(rotationDuty("sched-1", "g-a", "alice"))
-	if got := env.targets(); strings.Join(got, ",") != "U-ALICE" {
+	if got := env.targets(); strings.Join(got, ",") != "alice" {
 		t.Fatalf("recreate notified %v, want alice - her duty was interrupted", got)
 	}
 }
@@ -372,7 +401,7 @@ func TestNotifierDamagedScheduleIsIsolated(t *testing.T) {
 		t.Fatal("a damaged schedule failed the whole tick")
 	}
 
-	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+	if got := env.targets(); strings.Join(got, ",") != "bob" {
 		t.Fatalf("notified %v, want the healthy schedule's handoff to bob", got)
 	}
 	if cached := env.cached("sched-broken"); cached == nil || strings.Join(cached.UserIDs, ",") != "alice" {
@@ -401,7 +430,7 @@ func TestNotifierCallFailureTouchesNothing(t *testing.T) {
 
 	env.oncall.fail(nil)
 	env.tick(rotationDuty("sched-1", "g-b", "bob"))
-	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+	if got := env.targets(); strings.Join(got, ",") != "bob" {
 		t.Fatalf("the retry notified %v, want the handoff it deferred", got)
 	}
 }
@@ -428,7 +457,7 @@ func TestNotifierWarmUpCompletesDespiteDamage(t *testing.T) {
 
 	// The healthy schedule was seeded, so its next transition is a real one.
 	env.tick(rotationDuty("sched-healthy", "g-b", "bob"))
-	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+	if got := env.targets(); strings.Join(got, ",") != "bob" {
 		t.Fatalf("notified %v, want the healthy schedule's handoff", got)
 	}
 }
@@ -458,12 +487,12 @@ func TestNotifierRepairedScheduleIsSilentOnce(t *testing.T) {
 
 	// Repaired: first observation, silent, cache filled.
 	env.tick(rotationDuty("sched-1", "g-a", "alice"))
-	if len(env.jobs()) != 0 {
-		t.Fatalf("the repair created %d jobs, want none", len(env.jobs()))
+	if len(env.announcements()) != 0 {
+		t.Fatalf("the repair admitted %d announcements, want none", len(env.announcements()))
 	}
 	// And the next real transition is announced.
 	env.tick(rotationDuty("sched-1", "g-b", "bob"))
-	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+	if got := env.targets(); strings.Join(got, ",") != "bob" {
 		t.Fatalf("notified %v, want the first transition after the repair", got)
 	}
 }
@@ -499,25 +528,26 @@ func TestNotifierWarmUpBlockedByTeamReadFailure(t *testing.T) {
 }
 
 // TestNotifierSecondInstanceCountsOneNotification: two processes detect the same
-// transition, the dedup key lets one job through, and the metric counts what was
-// sent rather than what was noticed.
+// transition, the claim over the occurrence lets one admission create the work,
+// and the metric counts what was promised rather than what was noticed.
 func TestNotifierSecondInstanceCountsOneNotification(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
 	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
 
-	// The other instance got there first and its job is still pending.
+	// The other instance got there first and holds the occurrence.
 	next := observe(rotationDuty("sched-1", "g-b", "bob"))
-	env.store.dedupHits[occKey(kindHandoff, "sched-1", next)] = true
+	env.store.held[occKey(t, kindHandoff, "sched-1", next)] = outbound.SubmitExisting
 
 	before := counterValue(t, metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kindHandoff))
 	env.tick(rotationDuty("sched-1", "g-b", "bob"))
 	after := counterValue(t, metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kindHandoff))
 
-	if len(env.jobs()) != 0 {
-		t.Fatalf("created %d jobs although one was already pending", len(env.jobs()))
+	if len(env.announcements()) != 0 {
+		t.Fatalf("admitted %d announcements although the occurrence was held",
+			len(env.announcements()))
 	}
 	if after != before {
-		t.Errorf("notification counter moved by %v for a job that was not created", after-before)
+		t.Errorf("notification counter moved by %v for work somebody else promised", after-before)
 	}
 	// The cache still advances: this instance has seen the transition, and
 	// re-detecting it every minute would be noise, not safety.
@@ -526,9 +556,9 @@ func TestNotifierSecondInstanceCountsOneNotification(t *testing.T) {
 	}
 }
 
-// TestNotifierCountsCreatedJobs: one transition, one unit of the metric, however
-// many identities the fan-out reaches.
-func TestNotifierCountsCreatedJobs(t *testing.T) {
+// TestNotifierCountsAdmittedAnnouncements: one transition, one unit of the
+// metric, however many identities the fan-out reaches.
+func TestNotifierCountsAdmittedAnnouncements(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice", "bob", "carol"))
 	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
 
@@ -544,24 +574,25 @@ func TestNotifierCountsCreatedJobs(t *testing.T) {
 	}
 }
 
-// TestNotifierJobFailureRetriesNextTick: the cache is what makes the retry
-// happen, so it must not advance past a job that was never created.
-func TestNotifierJobFailureRetriesNextTick(t *testing.T) {
+// TestNotifierAdmissionFailureRetriesNextTick: the cache is what makes the
+// retry happen, so it must not advance past an announcement that was never
+// admitted.
+func TestNotifierAdmissionFailureRetriesNextTick(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
 	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
 
-	env.store.createJobErr = errors.New("transient DB error")
+	env.store.submitErr = errors.New("transient DB error")
 	env.tick(rotationDuty("sched-1", "g-b", "bob"))
-	if len(env.jobs()) != 0 {
-		t.Fatalf("created %d jobs despite the failure", len(env.jobs()))
+	if len(env.announcements()) != 0 {
+		t.Fatalf("admitted %d announcements despite the failure", len(env.announcements()))
 	}
 	if cached := env.cached("sched-1"); cached == nil || strings.Join(cached.UserIDs, ",") != "alice" {
 		t.Fatalf("cache = %+v, want the old composition so the retry still sees a change", cached)
 	}
 
-	env.store.createJobErr = nil
+	env.store.submitErr = nil
 	env.tick(rotationDuty("sched-1", "g-b", "bob"))
-	if got := env.targets(); strings.Join(got, ",") != "U-BOB" {
+	if got := env.targets(); strings.Join(got, ",") != "bob" {
 		t.Fatalf("the retry notified %v, want bob", got)
 	}
 }
@@ -574,18 +605,31 @@ func TestNotifierSkipsUsersWithoutDmIdentity(t *testing.T) {
 
 	// bob has no identity at all; carol does.
 	env.tick(rotationDuty("sched-1", "g-b", "bob", "carol"))
-	if got := env.targets(); strings.Join(got, ",") != "U-CAROL" {
+	if got := env.targets(); strings.Join(got, ",") != "carol" {
 		t.Fatalf("notified %v, want carol alone", got)
 	}
 
-	// Nobody reachable at all: no job, and the composition is still recorded so
-	// the next transition is measured from it.
-	env.store.jobs = nil
-	env.tick(rotationDuty("sched-1", "g-c", "bob"))
-	if len(env.jobs()) != 0 {
-		t.Fatalf("created %d jobs for an unreachable group, want none", len(env.jobs()))
+	// A group nobody can reach at all. dave is new to this shift - so there IS
+	// something to announce - and there is nowhere to announce it.
+	//
+	// That is still an answer about the occurrence, and it is admitted as one:
+	// a claim with nothing promised under it. Staying silent instead would
+	// leave the occurrence unclaimed, and an instance with a different view of
+	// who is linked could promise something under it a minute later.
+	env.store.admitted = nil
+	env.tick(rotationDuty("sched-1", "g-c", "dave"))
+	if len(env.announcements()) != 1 {
+		t.Fatalf("admitted %d announcements for an unreachable group, want one",
+			len(env.announcements()))
 	}
-	if cached := env.cached("sched-1"); cached == nil || strings.Join(cached.UserIDs, ",") != "bob" {
+	made := env.announcements()[0].Admission
+	if len(made.Commitments) != 0 {
+		t.Fatalf("promised %d messages to somebody nothing can reach", len(made.Commitments))
+	}
+	if made.Outcome != keys.OutcomeNoTargets {
+		t.Fatalf("the announcement was admitted as %q, want no_targets", made.Outcome)
+	}
+	if cached := env.cached("sched-1"); cached == nil || strings.Join(cached.UserIDs, ",") != "dave" {
 		t.Fatalf("cache = %+v, want the observed composition", cached)
 	}
 }
@@ -612,28 +656,36 @@ func TestNotifierKindsDoNotSuppressEachOther(t *testing.T) {
 	env.notifier.cacheMu.Unlock()
 	env.tick(added)
 
-	keys := env.store.alertKeys()
-	if len(keys) != 2 {
-		t.Fatalf("created %d jobs, want one per kind: %v", len(keys), keys)
+	claimed := env.store.batchKeys()
+	if len(claimed) != 2 {
+		t.Fatalf("admitted %d announcements, want one per kind: %v", len(claimed), claimed)
 	}
-	if keys[0] == keys[1] {
-		t.Fatalf("both kinds produced the dedup key %q", keys[0])
+	if claimed[0] == claimed[1] {
+		t.Fatalf("both kinds claimed %q", claimed[0])
 	}
 	// Which key belongs to which kind, stated rather than inferred from the
 	// spelling: the kind is inside the digest, not in front of it.
-	if want := occKey(kindAddedToActiveShift, "sched-1", observe(added)); keys[0] != want {
-		t.Errorf("first job keyed %q, want the added_to_active_shift occurrence %q", keys[0], want)
+	if want := occKey(t, kindAddedToActiveShift, "sched-1", observe(added)); claimed[0] != want {
+		t.Errorf("the first announcement claimed %q, want the added_to_active_shift occurrence %q",
+			claimed[0], want)
 	}
-	if want := occKey(kindHandoff, "sched-1", observe(added)); keys[1] != want {
-		t.Errorf("second job keyed %q, want the handoff occurrence %q", keys[1], want)
+	if want := occKey(t, kindHandoff, "sched-1", observe(added)); claimed[1] != want {
+		t.Errorf("the second announcement claimed %q, want the handoff occurrence %q",
+			claimed[1], want)
 	}
 }
 
-// TestNotifierMessagesCarryBothBoundaries: both texts print the three instants
-// the reader needs, in the schedule's own timezone, and differ in their first
-// line. The two pairs of boundaries diverge exactly where it matters - the shift
-// began at 11:00, the stand-in's assignment at 14:00.
-func TestNotifierMessagesCarryBothBoundaries(t *testing.T) {
+// TestTheAnnouncementCarriesBothBoundaries: the payload carries the three
+// instants a reader needs and the zone to print them in, and the two events are
+// told apart by a kind rather than by a sentence.
+//
+// The producer writes no prose at all now. What used to be asserted here - the
+// first line, the labels, the formatting - is the channel's, and is asserted
+// where the channel builds it. What has to be true HERE is that nothing a
+// channel needs was dropped on the way: the two pairs of boundaries diverge
+// exactly where it matters, the shift began at 11:00 and the stand-in's
+// assignment at 14:00, and a payload carrying one of them could not say so.
+func TestTheAnnouncementCarriesBothBoundaries(t *testing.T) {
 	slotStart := time.Date(2026, 5, 4, 4, 0, 0, 0, time.UTC)   // 11:00 in Bangkok
 	assignStart := time.Date(2026, 5, 4, 7, 0, 0, 0, time.UTC) // 14:00 in Bangkok
 	assignEnd := time.Date(2026, 5, 5, 4, 0, 0, 0, time.UTC)   // 11:00 next day
@@ -645,16 +697,16 @@ func TestNotifierMessagesCarryBothBoundaries(t *testing.T) {
 	}
 
 	tests := []struct {
-		name      string
-		first     schedulerender.ScheduleOnCall
-		then      schedulerender.ScheduleOnCall
-		firstLine string
+		name  string
+		first schedulerender.ScheduleOnCall
+		then  schedulerender.ScheduleOnCall
+		kind  keys.HandoffKind
 	}{
 		{
-			name:      kindHandoff,
-			first:     rotationDuty("sched-1", "g-a", "alice"),
-			then:      duty(shift),
-			firstLine: ":mega: You are now on-call for team *Backend*.",
+			name:  kindHandoff,
+			first: rotationDuty("sched-1", "g-a", "alice"),
+			then:  duty(shift),
+			kind:  keys.HandoffShiftChange,
 		},
 		{
 			name: kindAddedToActiveShift,
@@ -668,7 +720,7 @@ func TestNotifierMessagesCarryBothBoundaries(t *testing.T) {
 				source: schedulerender.SourceRotation, groupID: "g-b", users: []string{"alice", "bob"},
 				slotStart: slotStart, start: assignStart, end: assignEnd,
 			}),
-			firstLine: ":heavy_plus_sign: You have been added to the on-call shift in progress for team *Backend*.",
+			kind: keys.HandoffAddedToActiveShift,
 		},
 	}
 
@@ -678,31 +730,42 @@ func TestNotifierMessagesCarryBothBoundaries(t *testing.T) {
 			env.warmUp(tc.first)
 			env.tick(tc.then)
 
-			msg := env.message()
-			lines := strings.Split(msg, "\n")
-			if lines[0] != tc.firstLine {
-				t.Errorf("first line = %q, want %q", lines[0], tc.firstLine)
+			got := env.payload()
+			if got.Kind != tc.kind {
+				t.Errorf("announced as %q, want %q", got.Kind, tc.kind)
 			}
-			for _, want := range []string{
-				"Rotation shift started:         Mon May 4, 11:00 (Asia/Bangkok)",
-				"Your assignment effective from: Mon May 4, 14:00 (Asia/Bangkok)",
-				"Assignment ends:                Tue May 5, 11:00 (Asia/Bangkok)",
+			if got.TeamName != "Backend" {
+				t.Errorf("team name = %q, want the name and not the id", got.TeamName)
+			}
+			if got.Timezone != "Asia/Bangkok" {
+				t.Errorf("timezone = %q, want the schedule's own", got.Timezone)
+			}
+			for _, moment := range []struct {
+				what string
+				got  time.Time
+				want time.Time
+			}{
+				{"rotation shift start", got.GridSlotStart, slotStart},
+				{"assignment start", got.AssignmentStart, assignStart},
+				{"assignment end", got.AssignmentEnd, assignEnd},
 			} {
-				if !strings.Contains(msg, want) {
-					t.Errorf("message is missing %q:\n%s", want, msg)
+				if !moment.got.Equal(moment.want) {
+					t.Errorf("%s = %s, want %s", moment.what, moment.got, moment.want)
 				}
-			}
-			if strings.Contains(msg, "indefinite") {
-				t.Errorf("message still offers an indefinite end:\n%s", msg)
 			}
 		})
 	}
 }
 
-// TestNotifierMessageUsesTheSnapshotTimezone: the zone comes from the
+// TestTheAnnouncementCarriesTheSnapshotTimezone: the zone comes from the
 // configuration in force, not from the schedule row - which is the whole reason
-// it travels with the projection.
-func TestNotifierMessageUsesTheSnapshotTimezone(t *testing.T) {
+// it travels with the projection - and it travels on as a NAME.
+//
+// Not as an offset and not as formatted text: a channel prints these instants
+// itself, and an announcement that arrives an hour late in a country that
+// changed its clocks in between has to print the time that was true when it was
+// read, which only a name can express.
+func TestTheAnnouncementCarriesTheSnapshotTimezone(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
 	env.warmUp(duty(dutySpec{
 		scheduleID: "sched-1", timezone: "America/New_York",
@@ -714,24 +777,168 @@ func TestNotifierMessageUsesTheSnapshotTimezone(t *testing.T) {
 		slotStart: time.Date(2026, 5, 4, 15, 0, 0, 0, time.UTC),
 	}))
 
-	msg := env.message()
-	if !strings.Contains(msg, "(America/New_York)") {
-		t.Fatalf("message does not use the snapshot timezone:\n%s", msg)
+	got := env.payload()
+	if got.Timezone != "America/New_York" {
+		t.Fatalf("timezone = %q, want the snapshot's own", got.Timezone)
 	}
-	if !strings.Contains(msg, "Mon May 4, 11:00") {
-		t.Fatalf("message does not render 15:00 UTC as 11:00 local:\n%s", msg)
+	if !got.GridSlotStart.Equal(time.Date(2026, 5, 4, 15, 0, 0, 0, time.UTC)) {
+		t.Fatalf("the instant was converted on the way out: %s", got.GridSlotStart)
 	}
 }
 
-// TestNotifierUnknownTimezoneFallsBackToUTC: a zone the runtime cannot load must
-// not stop the notification; the message says which zone it is printing.
-func TestNotifierUnknownTimezoneFallsBackToUTC(t *testing.T) {
-	got := formatHandoffMessage(kindHandoff, "Backend", "Mars/Olympus", observation{
-		GridSlotStart:   dutyBase,
-		AssignmentStart: dutyBase,
-		AssignmentEnd:   dutyBase.Add(24 * time.Hour),
-	})
-	if !strings.Contains(got, fmt.Sprintf("Mon May 4, 11:00 (%s)", "Mars/Olympus")) {
-		t.Fatalf("message did not fall back to UTC times:\n%s", got)
+// TestAZoneNothingCanPrintIsNotAnnounced.
+//
+// The old producer formatted the message itself and fell back to UTC for a zone
+// it could not load, which put the wrong times in front of a person with
+// nothing to say they were wrong. The payload is durable now and every channel
+// reads the same field, so the same fallback would be that mistake repeated
+// forever, in every channel, with nobody told.
+//
+// The announcement is refused instead, the schedule stays pending, and the tick
+// says so every minute. That costs an announcement nobody receives - but the
+// schedule that produced it cannot be saved through the API and cannot be
+// projected either, so a zone arriving here is damage that an operator fixes
+// and not a configuration somebody chose.
+func TestAZoneNothingCanPrintIsNotAnnounced(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.warmUp(duty(dutySpec{
+		scheduleID: "sched-1", timezone: "Mars/Olympus",
+		source: schedulerender.SourceRotation, groupID: "g-a", users: []string{"alice"},
+	}))
+	env.tick(duty(dutySpec{
+		scheduleID: "sched-1", timezone: "Mars/Olympus",
+		source: schedulerender.SourceRotation, groupID: "g-b", users: []string{"bob"},
+	}))
+
+	if len(env.announcements()) != 0 {
+		t.Fatalf("admitted %d announcements in a zone nothing can print",
+			len(env.announcements()))
+	}
+	if cached := env.cached("sched-1"); cached == nil ||
+		strings.Join(cached.UserIDs, ",") != "alice" {
+		t.Fatalf("cache = %+v, want the old composition so the repair is still a change", cached)
+	}
+}
+
+// TestTheCacheMovesOnlyOnAnswersNothingCanImprove.
+//
+// The cache is the whole memory of what has been dealt with, so what moves it
+// is a closed rule rather than "it worked". Three of the answers mean the
+// occurrence is spoken for - by us, or by somebody else, or by somebody else
+// with a different set - and repeating any of them would produce the same
+// answer every minute until the shift ended. The rest leave it where it was, so
+// the next tick sees the same transition and tries again.
+func TestTheCacheMovesOnlyOnAnswersNothingCanImprove(t *testing.T) {
+	cases := []struct {
+		name    string
+		outcome outbound.SubmitOutcome
+		submit  error
+		moves   bool
+	}{
+		{name: "we promised it", outcome: outbound.SubmitCreated, moves: true},
+		{name: "somebody else promised it", outcome: outbound.SubmitExisting, moves: true},
+		{
+			// The loser of a race between two instances that built different
+			// sets. Nothing here can overrule the winner and nothing can ask it
+			// to try again, so re-detecting this forever would be noise.
+			name: "somebody else promised something else", outcome: outbound.SubmitConflict, moves: true,
+		},
+		{
+			// The people it was about are not the people who exist now.
+			name: "a recipient was erased", outcome: outbound.SubmitRecipientErased, moves: false,
+		},
+		{
+			// An answer about an alert group, which a shift change has none of.
+			name: "an answer to somebody else's question", outcome: outbound.SubmitSourceChanged, moves: false,
+		},
+		{name: "nothing is known", submit: errors.New("connection reset"), moves: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+			env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+			next := observe(rotationDuty("sched-1", "g-b", "bob"))
+			if tc.outcome != "" && tc.outcome != outbound.SubmitCreated {
+				env.store.held[occKey(t, kindHandoff, "sched-1", next)] = tc.outcome
+			}
+			env.store.submitErr = tc.submit
+
+			env.tick(rotationDuty("sched-1", "g-b", "bob"))
+
+			cached := env.cached("sched-1")
+			if cached == nil {
+				t.Fatal("the schedule left the cache entirely")
+			}
+			moved := strings.Join(cached.UserIDs, ",") == "bob"
+			if moved != tc.moves {
+				t.Fatalf("cache holds %v; moved=%v, want %v", cached.UserIDs, moved, tc.moves)
+			}
+		})
+	}
+}
+
+// TestAFailedIdentityReadLeavesTheScheduleAlone is the same boundary as the
+// builder's, asserted where the consequence is: a tick that could not read who
+// is linked admits nothing and remembers nothing, so the next one is still
+// looking at a transition.
+func TestAFailedIdentityReadLeavesTheScheduleAlone(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	env.store.identitiesErr = errors.New("connection reset")
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+
+	if len(env.announcements()) != 0 {
+		t.Fatalf("admitted %d announcements without knowing who is linked",
+			len(env.announcements()))
+	}
+	if cached := env.cached("sched-1"); cached == nil ||
+		strings.Join(cached.UserIDs, ",") != "alice" {
+		t.Fatalf("cache = %+v, want the old composition so the retry still sees a change", cached)
+	}
+
+	// And the retry makes it.
+	env.store.identitiesErr = nil
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	if got := env.targets(); strings.Join(got, ",") != "bob" {
+		t.Fatalf("the retry notified %v, want bob", got)
+	}
+}
+
+// TestSkippedRecipientsAreCountedOnceForTheOccurrence.
+//
+// Two instances see one shift change and both see the same unreachable person.
+// Both commit - one creating the work, the other told it exists - so counting
+// after every successful admission would report one person missed as two, and
+// the same is true of a repeat after an answer this instance lost.
+func TestSkippedRecipientsAreCountedOnceForTheOccurrence(t *testing.T) {
+	skipped := func() float64 {
+		return counterValue(t,
+			metrics.HandoffRecipientsSkippedTotal.WithLabelValues(string(skipUnlinked)))
+	}
+
+	// carol is linked, bob is not.
+	env := newNotifierEnv(t, map[string]string{"alice": "U-ALICE", "carol": "U-CAROL"})
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	before := skipped()
+	env.tick(rotationDuty("sched-1", "g-b", "bob", "carol"))
+	if got := skipped() - before; got != 1 {
+		t.Fatalf("counted %v people left out of the announcement it made, want 1", got)
+	}
+
+	// The other instance, arriving at the same occurrence second.
+	loser := newNotifierEnv(t, map[string]string{"alice": "U-ALICE", "carol": "U-CAROL"})
+	loser.store.held = env.store.held
+	loser.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+	next := observe(rotationDuty("sched-1", "g-b", "bob", "carol"))
+	loser.store.held[occKey(t, kindHandoff, "sched-1", next)] = outbound.SubmitExisting
+
+	before = skipped()
+	loser.tick(rotationDuty("sched-1", "g-b", "bob", "carol"))
+	if got := skipped() - before; got != 0 {
+		t.Fatalf("the instance that promised nothing counted %v people left out, want 0", got)
 	}
 }

@@ -285,6 +285,20 @@ const (
 	SubmitRecipientErased SubmitOutcome = "recipient_erased"
 )
 
+// AdmissionLabel is what happened to one admission, as a metric label.
+//
+// Every producer labels with this rather than with the outcome alone, because
+// the outcome alone hides the one answer an operator most wants separated:
+// "created" is also what comes back when the domain accepted an admission that
+// promised nothing at all. A page nobody receives and a page on its way are the
+// same string until this is applied.
+func AdmissionLabel(outcome SubmitOutcome, commitments int) string {
+	if outcome == SubmitCreated && commitments == 0 {
+		return "no_targets"
+	}
+	return string(outcome)
+}
+
 // SubmitResult is the answer to an admission, with what was accepted.
 type SubmitResult struct {
 	Outcome SubmitOutcome
