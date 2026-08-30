@@ -1,4 +1,6 @@
-package dispatcher
+package handoff
+
+import "github.com/tokayops/tokayops/internal/outbound/providers"
 
 // staticCapabilities is the capability registry as these tests need it: a
 // provider name maps to the target kinds it carries here.
@@ -8,12 +10,12 @@ package dispatcher
 // apart is the whole reason the builder asks per name.
 type staticCapabilities map[string][]string
 
-func (s staticCapabilities) Capabilities(name string) (ProviderCapabilities, bool) {
+func (s staticCapabilities) Capabilities(name string) (providers.Capability, bool) {
 	kinds, known := s[name]
 	if !known {
-		return ProviderCapabilities{}, false
+		return providers.Capability{}, false
 	}
-	return ProviderCapabilities{Name: name, SupportedTargetKinds: kinds}, true
+	return providers.Capability{Name: name, SupportedTargetKinds: kinds}, true
 }
 
 // staticDmProviders is the common case: every named provider is registered and

@@ -1,4 +1,4 @@
-package dispatcher
+package handoff
 
 import (
 	"errors"

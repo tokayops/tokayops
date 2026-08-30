@@ -11,17 +11,16 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// ProviderCapabilitiesLookup is the read-only view of the dispatcher's
-// capability registry that the API layer needs. Capability lookup is
-// compile-time data (which provider class supports which target kinds) -
-// it never touches the DB and never fails because an integration is
-// disabled. The dispatcher's *ProviderRegistry implements this.
+// ProviderCapabilitiesLookup is the read-only view of the channel catalogue
+// that the API layer needs. What it answers is declared at start-up - which
+// provider class carries which target kinds - so it never touches the database
+// and never fails because an integration is disabled.
 type ProviderCapabilitiesLookup interface {
 	Capabilities(name string) (capabilities ProviderCapability, ok bool)
 	AllCapabilities() []ProviderCapability
 }
 
-// ProviderCapability mirrors dispatcher.ProviderCapabilities at the API
+// ProviderCapability mirrors providers.Capability at the API
 // boundary so the api package doesn't import dispatcher just for the type.
 // (api already imports dispatcher elsewhere, but the read-only contract is
 // nicer to keep narrow.)

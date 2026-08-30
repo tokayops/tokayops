@@ -1,4 +1,4 @@
-package dispatcher
+package handoff
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -26,7 +27,7 @@ import (
 // Read-only, and defined here so unit tests do not have to spin up a full
 // ProviderRegistry.
 type providerLookup interface {
-	Capabilities(name string) (ProviderCapabilities, bool)
+	Capabilities(name string) (providers.Capability, bool)
 }
 
 // onCallLister is the slice of the schedule projection the notifier needs: who
@@ -68,8 +69,8 @@ type notifierStore interface {
 	SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound.SubmitResult, error)
 }
 
-// HandoffNotifier detects on-call changes and offers an announcement for each.
-type HandoffNotifier struct {
+// Notifier detects on-call changes and offers an announcement for each.
+type Notifier struct {
 	store         notifierStore
 	oncall        onCallLister
 	build         announcementBuilder
@@ -91,24 +92,24 @@ type HandoffNotifier struct {
 	warmedUp bool
 }
 
-// NewHandoffNotifier creates a new HandoffNotifier. oncall is the schedule
+// NewNotifier builds the detector. oncall is the schedule
 // projection; providers is the capability registry view used to filter linked
 // identities down to those served by a registered dm-capable provider.
-func NewHandoffNotifier(st notifierStore, oncall onCallLister, providers providerLookup,
-	interval time.Duration) *HandoffNotifier {
+func NewNotifier(st notifierStore, oncall onCallLister, catalog providerLookup,
+	interval time.Duration) *Notifier {
 
-	return &HandoffNotifier{
+	return &Notifier{
 		store:         st,
 		oncall:        oncall,
-		build:         announcementBuilder{identities: st, providers: providers},
+		build:         announcementBuilder{identities: st, providers: catalog},
 		checkInterval: interval,
 		cache:         make(map[string]composition),
 	}
 }
 
 // Run starts the background detection loop.
-func (n *HandoffNotifier) Run(ctx context.Context) {
-	log.Printf("[HandoffNotifier] Starting with %v interval", n.checkInterval)
+func (n *Notifier) Run(ctx context.Context) {
+	log.Printf("[Notifier] Starting with %v interval", n.checkInterval)
 
 	// Warm-up: populate the cache without announcing anything. It is retried
 	// until a tick completes as a call - see checkAll for why one damaged
@@ -121,14 +122,14 @@ func (n *HandoffNotifier) Run(ctx context.Context) {
 			n.cacheMu.Lock()
 			n.warmedUp = true
 			n.cacheMu.Unlock()
-			log.Println("[HandoffNotifier] Warm-up complete")
+			log.Println("[Notifier] Warm-up complete")
 			break
 		}
 		metrics.HandoffWarmupNotComplete.Inc()
-		log.Println("[HandoffNotifier] Warm-up incomplete, retrying next tick")
+		log.Println("[Notifier] Warm-up incomplete, retrying next tick")
 		select {
 		case <-ctx.Done():
-			log.Println("[HandoffNotifier] Shutting down during warm-up")
+			log.Println("[Notifier] Shutting down during warm-up")
 			return
 		case <-ticker.C:
 		}
@@ -137,7 +138,7 @@ func (n *HandoffNotifier) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[HandoffNotifier] Shutting down")
+			log.Println("[Notifier] Shutting down")
 			return
 		case <-ticker.C:
 			n.checkAll(ctx)
@@ -160,7 +161,7 @@ func (n *HandoffNotifier) Run(ctx context.Context) {
 // passes in silence like any first observation. Marking it "observed with nobody
 // on duty" instead would be worse - the repair would then look like a shift
 // starting after a gap and DM a group whose duty never changed.
-func (n *HandoffNotifier) checkAll(ctx context.Context) bool {
+func (n *Notifier) checkAll(ctx context.Context) bool {
 	// Observed around the call whether or not it succeeds: a tick that gets
 	// slower and then starts failing is the shape this is meant to show.
 	started := time.Now()
@@ -168,7 +169,7 @@ func (n *HandoffNotifier) checkAll(ctx context.Context) bool {
 	metrics.ScheduleOnCallProjectionDuration.
 		WithLabelValues(metrics.ConsumerHandoffNotifier).Observe(time.Since(started).Seconds())
 	if err != nil {
-		log.Printf("[HandoffNotifier] Failed to project on-call state: %v", err)
+		log.Printf("[Notifier] Failed to project on-call state: %v", err)
 		return false
 	}
 
@@ -176,7 +177,7 @@ func (n *HandoffNotifier) checkAll(ctx context.Context) bool {
 		// The cache of a damaged schedule is deliberately left alone. Writing
 		// an empty composition would turn corruption into "the duty ended" and,
 		// on repair, into a notification nobody earned.
-		log.Printf("[HandoffNotifier] Schedule %s (team %s) could not be projected (%s): %v",
+		log.Printf("[Notifier] Schedule %s (team %s) could not be projected (%s): %v",
 			failure.ScheduleID, failure.TeamID, failure.Reason, failure.Err)
 		metrics.ScheduleOnCallProjectionFailuresTotal.
 			WithLabelValues(metrics.ConsumerHandoffNotifier, string(failure.Reason)).Inc()
@@ -192,7 +193,7 @@ func (n *HandoffNotifier) checkAll(ctx context.Context) bool {
 		// cannot read teams is a tick that cannot read anything; treat it as
 		// the read failure it is instead of telling people they are on call
 		// for team "t-1234".
-		log.Printf("[HandoffNotifier] Failed to get teams: %v", err)
+		log.Printf("[Notifier] Failed to get teams: %v", err)
 		return false
 	}
 	teamNames := make(map[string]string, len(teams))
@@ -207,7 +208,7 @@ func (n *HandoffNotifier) checkAll(ctx context.Context) bool {
 }
 
 // checkSchedule compares one schedule against what was last seen of it.
-func (n *HandoffNotifier) checkSchedule(ctx context.Context, sc schedulerender.ScheduleOnCall,
+func (n *Notifier) checkSchedule(ctx context.Context, sc schedulerender.ScheduleOnCall,
 	teamNames map[string]string) {
 
 	next := observe(sc)
@@ -224,7 +225,7 @@ func (n *HandoffNotifier) checkSchedule(ctx context.Context, sc schedulerender.S
 	if len(notify) == 0 {
 		// A real transition with nobody new on it: the group shrank, or the
 		// override handed duty back to people who were already in it.
-		log.Printf("[HandoffNotifier] %s on schedule %s with no newly assigned users, nothing to send",
+		log.Printf("[Notifier] %s on schedule %s with no newly assigned users, nothing to send",
 			kind, sc.ScheduleID)
 		n.setCache(sc.ScheduleID, next.Composition)
 		return
@@ -242,7 +243,7 @@ func (n *HandoffNotifier) checkSchedule(ctx context.Context, sc schedulerender.S
 // is a failure that no repeat can fix. All three end the schedule's business
 // here. The rest leave the cache alone, and the next tick sees the same
 // transition again.
-func (n *HandoffNotifier) handleHandoff(ctx context.Context, sc schedulerender.ScheduleOnCall,
+func (n *Notifier) handleHandoff(ctx context.Context, sc schedulerender.ScheduleOnCall,
 	kind string, notify []string, next observation, teamNames map[string]string) {
 
 	teamName := teamNames[sc.TeamID]
@@ -256,14 +257,14 @@ func (n *HandoffNotifier) handleHandoff(ctx context.Context, sc schedulerender.S
 		// was so the next tick asks again: an occurrence admitted with nobody
 		// on it because a read failed would be a durable "there was nobody to
 		// tell", and the real announcement could never be made afterwards.
-		log.Printf("[HandoffNotifier] Could not build the %s announcement for schedule %s (will retry): %v",
+		log.Printf("[Notifier] Could not build the %s announcement for schedule %s (will retry): %v",
 			kind, sc.ScheduleID, err)
 		return
 	}
 
 	result, err := n.store.SubmitBatch(ctx, batch)
 	if err != nil {
-		log.Printf("[HandoffNotifier] Failed to admit the %s announcement for schedule %s (will retry): %v",
+		log.Printf("[Notifier] Failed to admit the %s announcement for schedule %s (will retry): %v",
 			kind, sc.ScheduleID, err)
 		return
 	}
@@ -279,7 +280,7 @@ func (n *HandoffNotifier) handleHandoff(ctx context.Context, sc schedulerender.S
 		metrics.ScheduleOnCallNotificationsTotal.WithLabelValues(kind).Inc()
 		for _, s := range left {
 			metrics.HandoffRecipientsSkippedTotal.WithLabelValues(string(s.Reason)).Inc()
-			log.Printf("[HandoffNotifier] %s on schedule %s: %s was not announced to (%s)",
+			log.Printf("[Notifier] %s on schedule %s: %s was not announced to (%s)",
 				kind, sc.ScheduleID, s.UserID, s.Reason)
 		}
 
@@ -295,13 +296,13 @@ func (n *HandoffNotifier) handleHandoff(ctx context.Context, sc schedulerender.S
 		// only produce this same answer every tick until the shift ended. The
 		// line naming both fingerprints is written by the store, which is the
 		// only place that has them both.
-		log.Printf("[HandoffNotifier] %s on schedule %s is held by a different announcement; moving on",
+		log.Printf("[Notifier] %s on schedule %s is held by a different announcement; moving on",
 			kind, sc.ScheduleID)
 
 	case outbound.SubmitRecipientErased:
 		// The set of people this was about is not the set that exists any
 		// more. The next tick projects it again.
-		log.Printf("[HandoffNotifier] %s on schedule %s names an erased recipient; the next tick rebuilds it",
+		log.Printf("[Notifier] %s on schedule %s names an erased recipient; the next tick rebuilds it",
 			kind, sc.ScheduleID)
 		return
 
@@ -311,12 +312,12 @@ func (n *HandoffNotifier) handleHandoff(ctx context.Context, sc schedulerender.S
 		// this announcement down a branch that is not about it at all, so the
 		// schedule is left pending rather than marked done on an answer to
 		// somebody else's question.
-		log.Printf("[HandoffNotifier] %s on schedule %s was answered %q, which is not an answer about a shift change",
+		log.Printf("[Notifier] %s on schedule %s was answered %q, which is not an answer about a shift change",
 			kind, sc.ScheduleID, result.Outcome)
 		return
 	}
 
-	log.Printf("[HandoffNotifier] %s on schedule %s (team %s) admission=%s promised=%d skipped=%d",
+	log.Printf("[Notifier] %s on schedule %s (team %s) admission=%s promised=%d skipped=%d",
 		kind, sc.ScheduleID, teamName, label, promised, len(left))
 	n.setCache(sc.ScheduleID, next.Composition)
 }
@@ -325,7 +326,7 @@ func (n *HandoffNotifier) handleHandoff(ctx context.Context, sc schedulerender.S
 // schedule has not been observed in this process. The pointer never leaves this
 // package and is never stored: it is how "never seen" is told from "seen with
 // nobody on duty".
-func (n *HandoffNotifier) cached(scheduleID string) *composition {
+func (n *Notifier) cached(scheduleID string) *composition {
 	n.cacheMu.RLock()
 	defer n.cacheMu.RUnlock()
 	c, ok := n.cache[scheduleID]
@@ -335,7 +336,7 @@ func (n *HandoffNotifier) cached(scheduleID string) *composition {
 	return &c
 }
 
-func (n *HandoffNotifier) setCache(scheduleID string, c composition) {
+func (n *Notifier) setCache(scheduleID string, c composition) {
 	n.cacheMu.Lock()
 	n.cache[scheduleID] = c.clone()
 	n.cacheMu.Unlock()

@@ -1,18 +1,18 @@
 package api
 
-import "github.com/tokayops/tokayops/internal/dispatcher"
+import "github.com/tokayops/tokayops/internal/outbound/providers"
 
-// NewProviderCapsAdapter wraps the dispatcher's capability registry so it
+// NewProviderCapsAdapter wraps the channel catalogue so it
 // satisfies ProviderCapabilitiesLookup at the API boundary. The two types
-// (dispatcher.ProviderCapabilities vs api.ProviderCapability) are field-
+// (providers.Capability vs api.ProviderCapability) are field-
 // identical but kept separate so the API contract isn't pinned to the
-// dispatcher's internal type.
-func NewProviderCapsAdapter(r *dispatcher.ProviderRegistry) ProviderCapabilitiesLookup {
+// catalogue's own type.
+func NewProviderCapsAdapter(r *providers.Catalog) ProviderCapabilitiesLookup {
 	return providerCapsAdapter{r: r}
 }
 
 type providerCapsAdapter struct {
-	r *dispatcher.ProviderRegistry
+	r *providers.Catalog
 }
 
 func (a providerCapsAdapter) Capabilities(name string) (ProviderCapability, bool) {

@@ -14,12 +14,12 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/auth"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rbac"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
+	"github.com/tokayops/tokayops/internal/slacksync"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -49,7 +49,7 @@ type API struct {
 	rbac             *rbac.Checker
 	slack            SlackMessenger
 	integrationCache *store.IntegrationCache
-	syncerManager    *dispatcher.UsergroupSyncerManager
+	syncerManager    *slacksync.UsergroupSyncerManager
 	syncerCtx        context.Context
 	respondEphemeral func(responseURL, text string)
 	selfURL          string                     // TokayOps base URL for manifest generation
@@ -67,7 +67,7 @@ type API struct {
 }
 
 // NewAPI creates a new API instance. Pass nil for oidc if not using OIDC.
-// providerCaps is the dispatcher's capability registry view, used by policy
+// providerCaps is the channel catalogue as this layer reads it, used by policy
 // validation and the GET /providers endpoint. nil is tolerated by individual
 // handlers (policy validation falls back to taxonomy-only checks) but the
 // production wiring in main.go always supplies it.
@@ -118,7 +118,7 @@ func (a *API) SetTelegram(t TelegramAPI) {
 }
 
 // SetUsergroupSyncerManager sets the usergroup syncer manager for dynamic start/stop.
-func (a *API) SetUsergroupSyncerManager(ctx context.Context, manager *dispatcher.UsergroupSyncerManager) {
+func (a *API) SetUsergroupSyncerManager(ctx context.Context, manager *slacksync.UsergroupSyncerManager) {
 	a.syncerCtx = ctx
 	a.syncerManager = manager
 }

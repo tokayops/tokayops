@@ -21,7 +21,6 @@ import (
 	"github.com/tokayops/tokayops/internal/api"
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/engine"
 	"github.com/tokayops/tokayops/internal/ingester"
 	"github.com/tokayops/tokayops/internal/model"
@@ -94,7 +93,6 @@ func (f *fakeBot) sendBody() map[string]interface{} {
 type tgPipelineEnv struct {
 	S      *store.Store
 	Eng    *engine.Engine
-	Disp   *dispatcher.Dispatcher
 	Echo   *echo.Echo
 	Bot    *fakeBot
 	Worker *outbound.Worker
@@ -159,18 +157,18 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
 	eng := engine.NewEngine(s, schedulerender.New(s.ScheduleReadRepository()), &testSettings{}, cfg)
-	disp := dispatcher.NewDispatcher()
+	channels := providers.NewCatalog()
 
 	// The provider instance is the API's, for answerCallback. Nothing sends
 	// through it any more: the engine admits commitments and the outbound
 	// worker below delivers them through the channel handler, against the same
 	// fake Bot API.
 	tg := telegramprovider.NewProvider(cache, "https://tokay.e2e", telegramprovider.WithBaseURL(server.URL))
-	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
+	channels.Register(providers.Capability{
 		Name: "telegram", IntegrationType: model.IntegrationTypeTelegram, SupportedTargetKinds: []string{"dm", "channel"},
 	})
 
-	apiService := api.NewAPI(s, nil, nil, cache, "https://tokay.e2e", api.NewProviderCapsAdapter(disp.Providers()))
+	apiService := api.NewAPI(s, nil, nil, cache, "https://tokay.e2e", api.NewProviderCapsAdapter(channels))
 	apiService.SetTelegram(tg)
 
 	e := echo.New()
@@ -186,7 +184,7 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 				telegramprovider.WithHandlerBaseURL(server.URL)),
 		})
 
-	return &tgPipelineEnv{S: s, Eng: eng, Disp: disp, Worker: worker, Echo: e, Bot: bot}
+	return &tgPipelineEnv{S: s, Eng: eng, Worker: worker, Echo: e, Bot: bot}
 }
 
 func postTelegramWebhook(t *testing.T, e *echo.Echo, secret, body string) *httptest.ResponseRecorder {

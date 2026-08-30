@@ -1,4 +1,4 @@
-package dispatcher
+package handoff
 
 import (
 	"context"
@@ -7,6 +7,9 @@ import (
 
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
+
+// The projection as these tests drive it: one schedule per tick, described by
+// hand, with no database and no revisions behind it.
 
 // fakeOnCall is an onCallLister a test drives tick by tick.
 //
@@ -64,29 +67,6 @@ func (f *fakeOnCall) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
-}
-
-// fakeTeamOnCall answers the single-schedule side of the projection, which is
-// what the escalation builder reads. Anything not seeded answers "no schedule",
-// the same as a team that never configured one.
-type fakeTeamOnCall struct {
-	teams     map[string]schedulerender.TeamOnCall
-	schedules map[string]schedulerender.OnCall
-	err       error
-}
-
-func (f *fakeTeamOnCall) CurrentTeamOnCallNow(ctx context.Context, teamID string) (schedulerender.TeamOnCall, error) {
-	if f.err != nil {
-		return schedulerender.TeamOnCall{}, f.err
-	}
-	return f.teams[teamID], nil
-}
-
-func (f *fakeTeamOnCall) CurrentOnCallNow(ctx context.Context, scheduleID string) (schedulerender.OnCall, error) {
-	if f.err != nil {
-		return schedulerender.OnCall{}, f.err
-	}
-	return f.schedules[scheduleID], nil
 }
 
 // dutySpec describes one schedule as the projection would report it. The zero

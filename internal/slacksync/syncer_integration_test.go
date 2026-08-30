@@ -1,6 +1,6 @@
 //go:build integration
 
-package dispatcher
+package slacksync
 
 import (
 	"context"
@@ -147,6 +147,36 @@ func setupSyncerEnv(t *testing.T) *syncerEnv {
 		cache:        make(map[string]cacheEntry),
 	}
 	return env
+}
+
+// Rotation group identities. L1 group IDs must be canonical UUIDs.
+const (
+	handoffGroupA = "aaaaaaaa-2222-4222-8222-000000000001"
+	handoffGroupB = "bbbbbbbb-2222-4222-8222-000000000002"
+	handoffGroupC = "cccccccc-2222-4222-8222-000000000003"
+)
+
+// dailyConfig is a daily rotation handing over at 12:00 UTC, so a tick a day
+// later is a different group.
+func dailyConfig(groups ...rotation.RotationGroup) rotation.ScheduleConfiguration {
+	policy := rotation.RotationPolicy{
+		Cadence:     model.RotationDaily,
+		HandoffTime: "12:00",
+	}
+	return rotation.ScheduleConfiguration{
+		Timezone: "UTC",
+		L1: rotation.LayerConfiguration{
+			Enabled: true,
+			Policy:  policy,
+			Groups:  groups,
+		},
+		L2:                      rotation.LayerConfiguration{Enabled: false, Policy: policy},
+		L2EscalationTimeoutMins: 5,
+	}
+}
+
+func group(id string, members ...string) rotation.RotationGroup {
+	return rotation.RotationGroup{ID: id, Members: members}
 }
 
 // usergroupConfig is the daily rotation the syncer fixture uses, carrying the

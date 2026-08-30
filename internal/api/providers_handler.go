@@ -7,7 +7,7 @@ import (
 )
 
 // ProvidersResponse lists the capability descriptors of every notification
-// provider registered with the dispatcher.
+// provider this build declares.
 type ProvidersResponse struct {
 	Providers []ProviderCapability `json:"providers"`
 }

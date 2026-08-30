@@ -1,4 +1,4 @@
-package dispatcher
+package handoff
 
 import (
 	"context"
@@ -29,7 +29,7 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 	return m.GetCounter().GetValue()
 }
 
-// mockNotifierStore implements the store methods HandoffNotifier still needs:
+// mockNotifierStore implements the store methods Notifier still needs:
 // team names, linked identities and admission. On-call state does not come from
 // here any more - it comes from the projection.
 //
@@ -109,7 +109,7 @@ type notifierEnv struct {
 	t        *testing.T
 	store    *mockNotifierStore
 	oncall   *fakeOnCall
-	notifier *HandoffNotifier
+	notifier *Notifier
 }
 
 func newNotifierEnv(t *testing.T, slackIDs map[string]string) *notifierEnv {
@@ -124,7 +124,7 @@ func newNotifierEnv(t *testing.T, slackIDs map[string]string) *notifierEnv {
 		t:        t,
 		store:    st,
 		oncall:   oncall,
-		notifier: NewHandoffNotifier(st, oncall, staticDmProviders("slack"), time.Minute),
+		notifier: NewNotifier(st, oncall, staticDmProviders("slack"), time.Minute),
 	}
 }
 

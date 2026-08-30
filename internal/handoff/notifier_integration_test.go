@@ -1,6 +1,6 @@
 //go:build integration
 
-package dispatcher
+package handoff
 
 import (
 	"context"
@@ -32,7 +32,7 @@ type handoffEnv struct {
 	t        *testing.T
 	s        *store.Store
 	config   *scheduleconfig.Service
-	notifier *HandoffNotifier
+	notifier *Notifier
 	renderer *schedulerender.Service
 	teamID   string
 	schedID  string
@@ -84,7 +84,7 @@ func setupHandoffEnv(t *testing.T) *handoffEnv {
 	env.config = scheduleconfig.NewService(s.ScheduleConfigRepository(),
 		scheduleconfig.WithClock(clock))
 	env.renderer = schedulerender.New(s.ScheduleReadRepository(), schedulerender.WithClock(clock))
-	env.notifier = NewHandoffNotifier(s, env.renderer, staticDmProviders("slack"), time.Minute)
+	env.notifier = NewNotifier(s, env.renderer, staticDmProviders("slack"), time.Minute)
 	return env
 }
 
@@ -207,10 +207,10 @@ func (e *handoffEnv) recipients(batchID string) map[string]string {
 	return out
 }
 
-// TestHandoffNotifierOnRevisionModel is the end-to-end shape of the tick: the
+// TestNotifierOverPostgresOnRevisionModel is the end-to-end shape of the tick: the
 // notifier reads a schedule created through the revision model, and the group
 // coming on duty gets one step per dm-capable identity.
-func TestHandoffNotifierOnRevisionModel(t *testing.T) {
+func TestNotifierOverPostgresOnRevisionModel(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(
 		group(handoffGroupA, "U_A"),
@@ -251,12 +251,12 @@ func TestHandoffNotifierOnRevisionModel(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierRepeatedCompositionIsNotDeduped is the reason the dedup key
+// TestNotifierOverPostgresRepeatedCompositionIsNotDeduped is the reason the dedup key
 // carries the moment of activation. A rotation returns to a group it has served
 // before; if the key were the composition alone, the second - legitimate -
 // notification would be swallowed by the unique index while the first job was
 // still pending.
-func TestHandoffNotifierRepeatedCompositionIsNotDeduped(t *testing.T) {
+func TestNotifierOverPostgresRepeatedCompositionIsNotDeduped(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(
 		group(handoffGroupA, "U_A"),
@@ -291,10 +291,10 @@ func TestHandoffNotifierRepeatedCompositionIsNotDeduped(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierEditedGroupIsNotDeduped is the same argument for an edit:
+// TestNotifierOverPostgresEditedGroupIsNotDeduped is the same argument for an edit:
 // [B] -> [B,D] -> [B] -> [B,D] returns to a composition it has already had, and
 // the second addition must still be announced.
-func TestHandoffNotifierEditedGroupIsNotDeduped(t *testing.T) {
+func TestNotifierOverPostgresEditedGroupIsNotDeduped(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(group(handoffGroupA, "U_A")))
 	env.warmUp()
@@ -326,17 +326,17 @@ func TestHandoffNotifierEditedGroupIsNotDeduped(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierTwoInstancesCreateOneJob: two processes observe the same
+// TestNotifierOverPostgresTwoInstancesCreateOneJob: two processes observe the same
 // transition, and the dedup key is what makes them agree. This is why the cache
 // may live in memory per instance.
-func TestHandoffNotifierTwoInstancesCreateOneJob(t *testing.T) {
+func TestNotifierOverPostgresTwoInstancesCreateOneJob(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(
 		group(handoffGroupA, "U_A"),
 		group(handoffGroupB, "U_B"),
 	))
 
-	second := NewHandoffNotifier(env.s, env.renderer, staticDmProviders("slack"), time.Minute)
+	second := NewNotifier(env.s, env.renderer, staticDmProviders("slack"), time.Minute)
 
 	// Both instances warm up on the same state.
 	env.warmUp()
@@ -361,7 +361,7 @@ func TestHandoffNotifierTwoInstancesCreateOneJob(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierSecondInstanceAfterTheJobFinished is bug 13.
+// TestNotifierOverPostgresSecondInstanceAfterTheJobFinished is bug 13.
 //
 // The test above ticks the two instances back to back, while the first job is
 // still pending - which is the window the old rule covered, and the reason the
@@ -374,14 +374,14 @@ func TestHandoffNotifierTwoInstancesCreateOneJob(t *testing.T) {
 // What makes the second DM wrong is not that it is a duplicate message but that
 // the occurrence it announces already happened. That is the statement the
 // forever policy makes, and this is where it is tested.
-func TestHandoffNotifierSecondInstanceAfterTheJobFinished(t *testing.T) {
+func TestNotifierOverPostgresSecondInstanceAfterTheJobFinished(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(
 		group(handoffGroupA, "U_A"),
 		group(handoffGroupB, "U_B"),
 	))
 
-	second := NewHandoffNotifier(env.s, env.renderer, staticDmProviders("slack"), time.Minute)
+	second := NewNotifier(env.s, env.renderer, staticDmProviders("slack"), time.Minute)
 
 	env.warmUp()
 	if !second.checkAll(context.Background()) {
@@ -424,10 +424,10 @@ func TestHandoffNotifierSecondInstanceAfterTheJobFinished(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierDeleteAndRecreate: the delete records an empty composition,
+// TestNotifierOverPostgresDeleteAndRecreate: the delete records an empty composition,
 // so recreating with the same group is a transition again. Without the deleted
 // schedule reaching the notifier this cycle would pass in silence.
-func TestHandoffNotifierDeleteAndRecreate(t *testing.T) {
+func TestNotifierOverPostgresDeleteAndRecreate(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(group(handoffGroupA, "U_A")))
 	env.warmUp()
@@ -458,9 +458,9 @@ func TestHandoffNotifierDeleteAndRecreate(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierOverrideBoundaries: a stand-in is told the same way anyone
+// TestNotifierOverPostgresOverrideBoundaries: a stand-in is told the same way anyone
 // coming on call is, and the group gets the same message when duty comes back.
-func TestHandoffNotifierOverrideBoundaries(t *testing.T) {
+func TestNotifierOverPostgresOverrideBoundaries(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(group(handoffGroupA, "U_A")))
 	env.warmUp()
@@ -497,9 +497,9 @@ func TestHandoffNotifierOverrideBoundaries(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierPartialIdentities: a user with no dm-capable identity is
+// TestNotifierOverPostgresPartialIdentities: a user with no dm-capable identity is
 // skipped individually, without blocking the rest of the group.
-func TestHandoffNotifierPartialIdentities(t *testing.T) {
+func TestNotifierOverPostgresPartialIdentities(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(
 		group(handoffGroupA, "U_A"),
@@ -526,7 +526,7 @@ func TestHandoffNotifierPartialIdentities(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierMultiProviderFanOut proves the fan-out is
+// TestNotifierOverPostgresMultiProviderFanOut proves the fan-out is
 // capability-driven, not Slack-specific: one on-call user with identities on
 // two dm-capable providers is promised a message through each, and an identity
 // on a provider that is not dm-capable is excluded.
@@ -535,9 +535,9 @@ func TestHandoffNotifierPartialIdentities(t *testing.T) {
 // admission by the rule that a commitment may only name a channel this build
 // can deliver through - which is the rule working, and would leave this test
 // asserting nothing about fan-out.
-func TestHandoffNotifierMultiProviderFanOut(t *testing.T) {
+func TestNotifierOverPostgresMultiProviderFanOut(t *testing.T) {
 	env := setupHandoffEnv(t)
-	env.notifier = NewHandoffNotifier(env.s, env.renderer,
+	env.notifier = NewNotifier(env.s, env.renderer,
 		staticDmProviders("slack", "telegram"), time.Minute)
 
 	testutil.BindIdentity(t, env.s, "U_B", "telegram", "T_B")
@@ -571,10 +571,10 @@ func TestHandoffNotifierMultiProviderFanOut(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierThreeGroupsNoRepeatWithinOneShift: consecutive ticks inside
+// TestNotifierOverPostgresThreeGroupsNoRepeatWithinOneShift: consecutive ticks inside
 // one shift observe the same composition and must stay silent - the notifier is
 // polling, and a tick is not an event.
-func TestHandoffNotifierThreeGroupsNoRepeatWithinOneShift(t *testing.T) {
+func TestNotifierOverPostgresThreeGroupsNoRepeatWithinOneShift(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(
 		group(handoffGroupA, "U_A"),
@@ -591,7 +591,7 @@ func TestHandoffNotifierThreeGroupsNoRepeatWithinOneShift(t *testing.T) {
 	}
 }
 
-// TestHandoffNotifierEditedOverrideIsNotDeduped: the same person coming back
+// TestNotifierOverPostgresEditedOverrideIsNotDeduped: the same person coming back
 // onto duty must page again, even while the first job is still pending.
 //
 // Editing an override that is IN FORCE splits it - the served part is closed
@@ -600,7 +600,7 @@ func TestHandoffNotifierThreeGroupsNoRepeatWithinOneShift(t *testing.T) {
 // They used to differ by revision alone, which is what made this case worth an
 // end-to-end test; it is worth keeping because the dedup key still has to tell
 // them apart, and the assertion is unchanged either way.
-func TestHandoffNotifierEditedOverrideIsNotDeduped(t *testing.T) {
+func TestNotifierOverPostgresEditedOverrideIsNotDeduped(t *testing.T) {
 	env := setupHandoffEnv(t)
 	env.save(dailyConfig(group(handoffGroupA, "U_A")))
 	env.warmUp()

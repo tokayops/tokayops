@@ -81,7 +81,7 @@ func (s *Service) RenderRange(ctx context.Context, scheduleID string, from, unti
 // calculation.
 //
 // A schedule that does not exist, was deleted before `at`, or did not yet
-// exist at `at` yields an empty projection rather than an error. A dispatcher
+// exist at `at` yields an empty projection rather than an error. A consumer
 // asking who to page must be told "nobody", not handed a failure it has to
 // interpret. Damage is the exception and does surface: a schedule whose chain
 // is broken, or which carries no history horizon at all, has no honest answer

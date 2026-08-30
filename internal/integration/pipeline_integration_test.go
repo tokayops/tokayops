@@ -20,7 +20,6 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/engine"
 	"github.com/tokayops/tokayops/internal/ingester"
 	"github.com/tokayops/tokayops/internal/model"
@@ -35,7 +34,6 @@ type IntegrationTestEnv struct {
 	S      *store.Store
 	Ing    *ingester.Ingester
 	Eng    *engine.Engine
-	Disp   *dispatcher.Dispatcher
 	Worker *outbound.Worker
 
 	// Handoff is the second family's worker. Announcements are claimed by their
@@ -201,13 +199,10 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
 	renderer := schedulerender.New(s.ScheduleReadRepository())
 	eng := engine.NewEngine(s, renderer, &testSettings{}, cfg)
-	disp := dispatcher.NewDispatcher()
-
-	// The escalation itself no longer goes through the dispatcher: the engine
-	// admits commitments and the outbound worker sends them. The channel below
-	// stands in for Slack, and resolves an address by taking the recipient at
-	// its word - what these tests are about is who was promised and who was
-	// sent to, not how a user id becomes a Slack account.
+	// The engine admits commitments and the outbound workers send them. The
+	// channel below stands in for Slack, and resolves an address by taking the
+	// recipient at its word - what these tests are about is who was promised
+	// and who was sent to, not how a user id becomes a Slack account.
 	channel := &recordingChannel{identity: storeIdentity(s)}
 	channels := map[string]outbound.Channel{"slack": channel, "telegram": channel}
 	worker := outbound.NewWorker(s, "integration-worker", channels)
@@ -229,7 +224,6 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 		S:         s,
 		Ing:       ing,
 		Eng:       eng,
-		Disp:      disp,
 		Worker:    worker,
 		Handoff:   handoff,
 		Channel:   channel,

@@ -1,4 +1,4 @@
-package dispatcher
+package slacksync
 
 import (
 	"context"
@@ -22,6 +22,18 @@ const cacheTTL = 1 * time.Hour
 type cacheEntry struct {
 	slackIDs  string // sorted comma-joined Slack user IDs
 	updatedAt time.Time
+}
+
+// onCallLister is the slice of the schedule projection a sync needs: who is on
+// duty everywhere, right now, read from one database snapshot.
+//
+// Declared here rather than taken as *schedulerender.Service because the
+// revision model is deliberately absent from MockStore, and a narrow interface
+// is what keeps these unit tests off PostgreSQL. The handover detector takes
+// the same shape from the same projection and declares its own: two consumers
+// that happen to need one method are not one role.
+type onCallLister interface {
+	CurrentOnCallForAllNow(ctx context.Context) (schedulerender.BulkOnCall, error)
 }
 
 // identityLookup is the store as a sync needs it: where the people on duty can

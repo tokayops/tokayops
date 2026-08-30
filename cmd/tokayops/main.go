@@ -24,9 +24,9 @@ import (
 	"github.com/tokayops/tokayops/internal/api"
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/engine"
 	"github.com/tokayops/tokayops/internal/erasure"
+	"github.com/tokayops/tokayops/internal/handoff"
 	"github.com/tokayops/tokayops/internal/ingester"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
@@ -37,6 +37,7 @@ import (
 	"github.com/tokayops/tokayops/internal/outbox"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
+	"github.com/tokayops/tokayops/internal/slacksync"
 	"github.com/tokayops/tokayops/internal/store"
 
 	_ "github.com/tokayops/tokayops/docs" // swagger docs
@@ -343,7 +344,7 @@ func main() {
 	eng := engine.NewEngine(st, scheduleRenderer, integrationCache, cfg)
 
 	// Dispatcher
-	disp := dispatcher.NewDispatcher()
+	channels := providers.NewCatalog()
 
 	// An alert group's team is a label carried by the alert, not a foreign key,
 	// so it can name a team that was never set up here. Both providers ask this
@@ -362,7 +363,7 @@ func main() {
 	// through the catalogue any more: what the catalogue answers is what a
 	// channel CAN do, and who holds the instance is the wiring's business.
 	slackProvider := slackprovider.NewProvider(integrationCache, cfg.Global.SelfURL, teamLookup)
-	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
+	channels.Register(providers.Capability{
 		Name:                 "slack",
 		IntegrationType:      model.IntegrationTypeSlack,
 		SupportedTargetKinds: []string{"dm", "channel"},
@@ -373,7 +374,7 @@ func main() {
 	// incoming webhook and interactivity need the provider in the API layer as
 	// well, the way slackProvider is wired above.
 	telegramProvider := telegramprovider.NewProvider(integrationCache, cfg.Global.SelfURL, telegramprovider.WithTeamLookup(teamLookup))
-	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
+	channels.Register(providers.Capability{
 		Name:                 "telegram",
 		IntegrationType:      model.IntegrationTypeTelegram,
 		SupportedTargetKinds: []string{"dm", "channel"},
@@ -402,7 +403,7 @@ func main() {
 	}
 
 	// 8. API
-	apiService := api.NewAPI(st, oidcProvider, slackProvider, integrationCache, cfg.Global.SelfURL, api.NewProviderCapsAdapter(disp.Providers()))
+	apiService := api.NewAPI(st, oidcProvider, slackProvider, integrationCache, cfg.Global.SelfURL, api.NewProviderCapsAdapter(channels))
 
 	// Schedule configuration (revision model). The command service, the read
 	// side and the renderer are built from the store's narrow repositories
@@ -428,7 +429,7 @@ func main() {
 	// serve; it is left alone rather than failed, because what this process was
 	// configured with is not a property of the commitment.
 	//
-	// The token source is the same integration cache the dispatcher uses, read
+	// The token source is the same integration cache the channels use, read
 	// at each attempt on purpose: a rotated token has to apply to work that has
 	// not gone out yet. What a MESSAGE depends on was frozen at admission
 	// instead - see the engine above.
@@ -468,7 +469,6 @@ func main() {
 
 	// 9. Start Background Workers
 	go eng.Run(ctx)
-	go disp.Run(ctx)
 
 	// The outbound worker is the one that gets waited for on the way out.
 	//
@@ -504,7 +504,7 @@ func main() {
 	go outboxWorker.Run(ctx)
 
 	// Usergroup Syncer Manager - allows dynamic start/stop when Slack integration changes
-	syncerManager := dispatcher.NewUsergroupSyncerManager(st, scheduleRenderer, 5*time.Minute)
+	syncerManager := slacksync.NewUsergroupSyncerManager(st, scheduleRenderer, 5*time.Minute)
 	apiService.SetUsergroupSyncerManager(ctx, syncerManager)
 
 	// Start syncer if token is already available
@@ -524,7 +524,7 @@ func main() {
 	// Handoff Notifier - DMs on-call user when shift starts. Provider lookup
 	// supplies the dm-capable set so the notifier doesn't fan out to
 	// identities from unregistered providers.
-	handoffNotifier := dispatcher.NewHandoffNotifier(st, scheduleRenderer, disp.Providers(), 60*time.Second)
+	handoffNotifier := handoff.NewNotifier(st, scheduleRenderer, channels, 60*time.Second)
 	go handoffNotifier.Run(ctx)
 	log.Println("Handoff notifier enabled (60 second interval)")
 

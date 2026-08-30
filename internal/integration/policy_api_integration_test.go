@@ -10,8 +10,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/api"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/tokayops/tokayops/internal/testutil"
 )
@@ -23,13 +23,13 @@ import (
 func setupPolicyAPITest(t *testing.T) *APIIntegrationEnv {
 	s := testutil.SetupDB(t)
 
-	reg := dispatcher.NewProviderRegistry()
-	reg.RegisterCapabilities(dispatcher.ProviderCapabilities{
+	reg := providers.NewCatalog()
+	reg.Register(providers.Capability{
 		Name:                 "slack",
 		IntegrationType:      model.IntegrationTypeSlack,
 		SupportedTargetKinds: []string{"dm", "channel"},
 	})
-	reg.RegisterCapabilities(dispatcher.ProviderCapabilities{
+	reg.Register(providers.Capability{
 		Name:                 "telegram",
 		IntegrationType:      model.IntegrationTypeTelegram,
 		SupportedTargetKinds: []string{"dm", "channel"},
