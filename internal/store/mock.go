@@ -40,7 +40,6 @@ type MockStore struct {
 	apiTokens              map[string]*model.APIToken                 // tokenID -> token
 	externalIdentities     map[string]*model.ExternalIdentity         // "userID|provider" -> identity
 	linkTokens             map[string]mockLinkToken                   // "userID|provider" -> link token
-	jobStages              map[string]*model.JobStage                 // stageID -> stage
 	escalationPolicies     map[string]*model.EscalationPolicy         // policyID -> policy
 	integrations           map[string]*model.Integration              // integrationID -> integration
 	notificationDeliveries map[string]*model.NotificationDelivery     // deliveryID -> delivery
@@ -72,7 +71,6 @@ func NewMockStore() *MockStore {
 
 		externalIdentities:     make(map[string]*model.ExternalIdentity),
 		linkTokens:             make(map[string]mockLinkToken),
-		jobStages:              make(map[string]*model.JobStage),
 		escalationPolicies:     make(map[string]*model.EscalationPolicy),
 		integrations:           make(map[string]*model.Integration),
 		notificationDeliveries: make(map[string]*model.NotificationDelivery),

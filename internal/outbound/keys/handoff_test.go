@@ -56,9 +56,9 @@ func sampleRecipient(provider, user string) HandoffRecipient {
 // TestTheOccurrenceKeyIsTheOneTheJobEngineWrote is the vector that was carried
 // across, not recomputed.
 //
-// The value below is the one `jobdedup.TestHandoffOccurrenceGoldenVector` has
-// pinned when the job engine wrote these claims, reproduced here by hand
-// from the written grammar.
+// The value below is the one the job engine's own vector pinned when it wrote
+// these claims, reproduced here by hand from the written grammar. That vector
+// went with the package it lived in; this is the copy that outlives it.
 //
 // It is NOT what keeps a shift change from being announced twice across the
 // upgrade: the old claims are rows in `jobs` and the new ones are rows in

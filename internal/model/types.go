@@ -44,9 +44,9 @@ type AlertGroup struct {
 	// names the ALERT, not this incident - the same key comes back every time
 	// the same thing breaks, and each time it opens a new group with a new ID.
 	//
-	// It is not the identity of any background work. Jobs declare that through
-	// jobdedup, and an escalation that once keyed itself by this string paged
-	// nobody for the second incident.
+	// It is not the identity of any work done about the alert. An escalation
+	// that once keyed itself by this string paged nobody for the second
+	// incident.
 	//
 	// The JSON name is the one this field has always had, and stays: it is
 	// what the API, the webhooks and the UI already read.
