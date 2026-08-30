@@ -8,8 +8,8 @@ import (
 )
 
 // Family is the execution partition a delivery is claimed under. Claims are
-// taken per family so one kind of backlog cannot delay another; the only family
-// with a grammar today is the notification one.
+// taken per family so one kind of backlog cannot delay another - a burst of
+// shift-change announcements must not hold up a page.
 type Family string
 
 const FamilyNotification Family = "notification"
@@ -50,7 +50,7 @@ const (
 	KindHandoff Kind = "handoff"
 )
 
-// GrammarV1 is the only version either escalation grammar has.
+// GrammarV1 is the only version any of these grammars has.
 //
 // It is stored on every row it identifies and read back before those rows are
 // compared: a digest does not say which encoder produced it, so the version has

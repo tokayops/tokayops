@@ -104,10 +104,8 @@ type DesiredStateResult struct {
 	Touched int
 }
 
-// EscalationAdmission is what a producer hands the store: the identities the
-// grammar derived, plus the two things about the alert group that are settled
-// at the same moment.
-// Batch is one admission offered to the store, whatever it is about.
+// Batch is what a producer hands the store: one admission, whatever it is
+// about.
 //
 // The parts every admission has - the identities the grammar derived, and who
 // is asking - sit here; everything that belongs to ONE sort of claim sits in

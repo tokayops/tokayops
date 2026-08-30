@@ -109,15 +109,6 @@ func undeliverablef(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrUndeliverable, fmt.Sprintf(format, args...))
 }
 
-// SubmitEscalationBatch admits an escalation: the claim, its commitments, the
-// state they are about, and the policy the group was escalated by, in one
-// commit.
-//
-// The order inside is the whole design. The group is locked first and written
-// LAST, and only by the producer whose claim was accepted: an admission that
-// wrote the policy snapshot before knowing whether it won would let the loser
-// overwrite the winner's, leaving a group describing one escalation and
-// executing another.
 // SubmitBatch admits one batch of commitments, whatever the batch is about.
 //
 // One command with two closed forms of context rather than two commands: the
@@ -288,7 +279,15 @@ func admissionCarriesWhatItsKindHas(admission keys.Admission) error {
 	return nil
 }
 
-// submitEscalation admits an alert group's escalation.
+// submitEscalation admits an alert group's escalation: the claim, its
+// commitments, the state they are about, and the policy the group was escalated
+// by, in one commit.
+//
+// The order inside is the whole design. The group is locked first and written
+// LAST, and only by the producer whose claim was accepted: an admission that
+// wrote the policy snapshot before knowing whether it won would let the loser
+// overwrite the winner's, leaving a group describing one escalation and
+// executing another.
 func (s *Store) submitEscalation(ctx context.Context, batch outbound.Batch,
 	about outbound.EscalationContext, family string) (outbound.SubmitResult, error) {
 
@@ -875,11 +874,6 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 	return ids, nil
 }
 
-// timingOffset turns a timing spec into the delay from admission.
-//
-// Only the relative form has a meaning here: an escalation step is "so long
-// after the alert was admitted", and the absolute form belongs to families
-// whose time comes from the domain rather than from the claim.
 // notBeforeOf is the instant a commitment becomes due.
 //
 // Both of the grammar's timing forms are honoured, because both are things a

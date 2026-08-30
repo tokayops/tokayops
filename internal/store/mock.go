@@ -25,7 +25,7 @@ import (
 
 // MockStore is an in-memory implementation of StoreInterface for testing.
 type MockStore struct {
-	// admissions is what SubmitEscalationBatch accepted, by batch key.
+	// admissions is what SubmitBatch accepted, by batch key.
 	admissions map[string]*admittedBatch
 
 	mu sync.RWMutex

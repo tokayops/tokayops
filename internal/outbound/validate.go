@@ -42,14 +42,8 @@ var notificationProviders = map[string]bool{
 // history says why, and the rest of the escalation goes out.
 func DeliversThrough(provider string) bool { return notificationProviders[provider] }
 
-// ValidateEscalationAdmission is the gate a commitment has to pass to become
-// durable.
-//
-// Each rule here corresponds to a capability this build does not have. They are
-// checked at admission rather than at delivery because that is the last moment
-// a refusal costs nothing: afterwards the promise exists, and the only ways out
-// of it are a failed delivery and an operator.
-// ValidateHandoffAdmission is the same gate for a shift-change announcement.
+// ValidateHandoffAdmission is the gate a shift-change announcement has to pass
+// to become durable.
 //
 // The shared half is shared, and the differences are named rather than
 // inherited: a handover is one-shot by definition, so nothing here asks about
@@ -102,6 +96,13 @@ func ValidateHandoffAdmission(adm keys.Admission, now time.Time) error {
 	return nil
 }
 
+// ValidateEscalationAdmission is the gate an escalation's commitments have to
+// pass to become durable.
+//
+// Each rule here corresponds to a capability this build does not have. They are
+// checked at admission rather than at delivery because that is the last moment
+// a refusal costs nothing: afterwards the promise exists, and the only ways out
+// of it are a failed delivery and an operator.
 func ValidateEscalationAdmission(adm keys.Admission, now time.Time) error {
 	if adm.BatchKey == "" {
 		return notAdmissiblef("an admission with no claim")
