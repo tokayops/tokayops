@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // What a shift change looks like in Slack.
@@ -31,12 +32,12 @@ func announcement(payload keys.HandoffPayloadV1) string {
 	// escape for the asterisk, so a name containing one cannot be made safe
 	// inside bold. Inside a span it is literal, and the sanitizer takes the
 	// backtick that would end the span away.
-	headline := fmt.Sprintf(":mega: You are now on-call for team `%s`.\n\n",
-		sanitizeTeamLabel(payload.TeamName))
+	team := teamName(payload.TeamName)
+	headline := fmt.Sprintf(":mega: You are now on-call for team `%s`.\n\n", team)
 	if payload.Kind == keys.HandoffAddedToActiveShift {
 		headline = fmt.Sprintf(
 			":heavy_plus_sign: You have been added to the on-call shift in progress for team `%s`.\n\n",
-			sanitizeTeamLabel(payload.TeamName))
+			team)
 	}
 
 	return headline +
@@ -64,4 +65,18 @@ func displayed(t time.Time, zone string) string {
 		loc = time.UTC
 	}
 	return fmt.Sprintf("%s (%s)", t.In(loc).Format("Mon Jan 2, 15:04"), zone)
+}
+
+// teamName makes a team name safe to put in an announcement, and short enough
+// that every channel writes the same one.
+//
+// Cut BEFORE escaping, so a cut severs neither a character nor an entity, and
+// cut to the length the channels share rather than to this one's own: a person
+// on both gets the announcement twice, and a name whole in one and cut in the
+// other reads as two teams.
+func teamName(name string) string {
+	if r := []rune(name); len(r) > providers.MaxTeamNameLen {
+		name = string(r[:providers.MaxTeamNameLen]) + "…"
+	}
+	return labelSanitizer.Replace(name)
 }

@@ -145,10 +145,16 @@ func TestATeamNameCannotBreakOutOfTheAnnouncement(t *testing.T) {
 	}
 }
 
-// TestALongTeamNameIsCutBeforeItIsEscaped. The name is the only part of an
-// announcement with no length of its own, and it is bounded by the same rule a
-// card's team label is - by runes, before escaping, so a cut can sever neither
-// a character nor an entity.
+// TestALongTeamNameIsCutBeforeItIsEscaped.
+//
+// The name is the only part of an announcement with no length of its own: by
+// runes, before escaping, so a cut severs neither a character nor an entity.
+//
+// The point it is cut at is the one every channel shares, and it is asserted
+// against that rather than against a number written here. A person linked to
+// two channels gets this announcement twice, and a name whole in one and cut in
+// the other reads as two different teams - so a channel that kept a length of
+// its own has to fail here.
 func TestALongTeamNameIsCutBeforeItIsEscaped(t *testing.T) {
 	api := newSlackAPI(t)
 	handler := handlerFor(api)
@@ -163,6 +169,10 @@ func TestALongTeamNameIsCutBeforeItIsEscaped(t *testing.T) {
 	first := strings.SplitN(text, "\n", 2)[0]
 	if !strings.Contains(first, "…") {
 		t.Errorf("a name over the limit arrived whole: %q", first)
+	}
+	if got := strings.Count(first, "&amp;"); got != providers.MaxTeamNameLen {
+		t.Errorf("the name was cut to %d runes, want the %d every channel cuts at",
+			got, providers.MaxTeamNameLen)
 	}
 	if strings.Contains(first, "&am`") || strings.HasSuffix(first, "&am") {
 		t.Errorf("the cut went through an entity: %q", first)

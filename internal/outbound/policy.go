@@ -55,9 +55,9 @@ const (
 	NotificationPrepareDeadline = 5 * time.Second
 
 	// NotificationRecordDeadline bounds the two database calls that open and
-	// close an attempt. Longer than the lock timeout above, so a contended row
-	// is refused by the rule that knows why rather than by a cancelled
-	// context, and far shorter than the lease.
+	// close an attempt. Longer than OutboundLockTimeout, so a contended row is
+	// refused by the rule that knows why rather than by a cancelled context,
+	// and far shorter than the lease.
 	NotificationRecordDeadline = 10 * time.Second
 
 	// NotificationShutdownDeadline is how long a stopping worker waits for the
@@ -106,8 +106,8 @@ type Policy struct {
 	PrepareDeadline time.Duration
 
 	// RecordDeadline bounds the two database calls that open and close an
-	// attempt. Longer than LockTimeout, so a contended row is refused by the
-	// rule that knows why rather than by a cancelled context.
+	// attempt. Longer than OutboundLockTimeout, so a contended row is refused
+	// by the rule that knows why rather than by a cancelled context.
 	RecordDeadline time.Duration
 
 	// ShutdownDeadline is how long a stopping worker waits for the attempts it

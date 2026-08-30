@@ -217,9 +217,11 @@ func TestATeamNameIsCutOnACharacterBoundary(t *testing.T) {
 	if !utf8.ValidString(text) {
 		t.Fatal("the message is not valid UTF-8")
 	}
-	if strings.Count(text, "я") != maxTeamNameLen {
-		t.Errorf("the name was cut to %d runes, want %d",
-			strings.Count(text, "я"), maxTeamNameLen)
+	// Against the length every channel shares, not against one written here:
+	// a channel that kept a length of its own has to fail this.
+	if got := strings.Count(text, "я"); got != providers.MaxTeamNameLen {
+		t.Errorf("the name was cut to %d runes, want the %d every channel cuts at",
+			got, providers.MaxTeamNameLen)
 	}
 }
 
