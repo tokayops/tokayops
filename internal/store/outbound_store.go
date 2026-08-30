@@ -1590,14 +1590,56 @@ func admittedSnapshotTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent)
 // having applied revision 0 of nothing, and would hand a channel a card about
 // no alert.
 //
-// Both sets are closed and neither has a default. A kind this build does not
-// know is work it should leave alone; a form it does not know would otherwise
-// fall into the one-shot branch and reach a provider before anything looked at
-// it again. Both are refused before an attempt exists, which is the only point
-// at which refusing is free.
+// Both sets are closed and both refuse rather than defaulting. A form this
+// build does not know would otherwise fall into a branch chosen by whichever
+// arm happened to be written last, and reach a provider before anything looked
+// at it again. Refused here, it is refused before an attempt exists, which is
+// the only point at which refusing is free.
 func attemptContentTx(ctx context.Context, tx *sql.Tx,
-	intent outbound.Intent) (outbound.AttemptContent, error) {
+	intent outbound.Intent, form outbound.ContentForm,
+	digest []byte) (outbound.AttemptContent, error) {
 
+	switch form {
+	case outbound.ContentPayload:
+		return outbound.NewPayloadContent(digest)
+
+	case outbound.ContentSnapshot:
+		var stored storedSnapshot
+		var err error
+		switch intent.Form {
+		case outbound.FormEditable:
+			stored, err = lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+		case outbound.FormOneShot:
+			stored, err = admittedSnapshotTx(ctx, tx, intent)
+		default:
+			return outbound.AttemptContent{}, outboundContractf(
+				"commitment %s is a %q, which is not a form this build delivers",
+				intent.ID, intent.Form)
+		}
+		if err != nil {
+			return outbound.AttemptContent{}, err
+		}
+		return outbound.NewSnapshotContent(stored.Snapshot, stored.Final)
+	}
+
+	return outbound.AttemptContent{}, outboundContractf(
+		"commitment %s is drawn from a %q, which is not a content form this build has",
+		intent.ID, form)
+}
+
+// executableHere answers what an attempt on this commitment would be drawn
+// from, having established that this build can read the commitment at all.
+//
+// Asked BEFORE anything is recorded about the commitment, including a refusal.
+// A refusal is a durable answer too, and the two failures below make it the
+// wrong one: a kind or a payload schema from a newer build is work to leave
+// alone rather than a permanent failure, and a channel that decoded a swapped
+// payload refused something the domain never promised. The question does not
+// depend on what any channel thinks, so it comes first.
+//
+// The commitment's own row and nothing else - the alert's state is read later,
+// and only for an attempt that is actually going to be made.
+func executableHere(intent outbound.Intent) (outbound.ContentForm, []byte, error) {
 	form := contentFormOf(intent.KeyKind)
 	if form == "" {
 		// A kind this build has never heard of, and the answer is to change
@@ -1610,51 +1652,16 @@ func attemptContentTx(ctx context.Context, tx *sql.Tx,
 		// what the newer build was going to deliver. This transaction rolls
 		// back and the commitment stays pending. Its lease is NOT released by
 		// that rollback - the claim committed it earlier - so the instance that
-		// knows the kind takes it once locked_until passes. Same rule as a
-		// render snapshot written under a schema version this build cannot
-		// read.
-		return outbound.AttemptContent{}, outboundContractf(
+		// knows the kind takes it once locked_until passes.
+		return "", nil, outboundContractf(
 			"commitment %s is a %q, which is not a kind of claim this build executes",
 			intent.ID, intent.KeyKind)
 	}
-
-	// The payload, before anything decides what this attempt is drawn FROM.
-	//
-	// EVERY commitment carries one - it is what the business key was built over
-	// - and every one of them therefore has something that can be compared
-	// against what was admitted. Doing this only for the commitments that are
-	// DELIVERED from their payload would leave the card path unguarded, and a
-	// card's payload decides where it goes and how it behaves: an interactive
-	// flag turned off in the row would produce a page with no buttons on it and
-	// nothing would notice.
 	digest, err := admittedPayloadDigest(intent)
 	if err != nil {
-		return outbound.AttemptContent{}, err
+		return "", nil, err
 	}
-
-	if form == outbound.ContentPayload {
-		return outbound.NewPayloadContent(digest)
-	}
-
-	// The other of the two forms contentFormOf hands out. A card follows the
-	// alert and is drawn from the state the group is in now; a one-shot
-	// escalation is drawn from the state its admission froze. Answering either
-	// with the payload instead would hand a channel a card about no alert.
-	var stored storedSnapshot
-	switch intent.Form {
-	case outbound.FormEditable:
-		stored, err = lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
-	case outbound.FormOneShot:
-		stored, err = admittedSnapshotTx(ctx, tx, intent)
-	default:
-		return outbound.AttemptContent{}, outboundContractf(
-			"commitment %s is a %q, which is not a form this build delivers",
-			intent.ID, intent.Form)
-	}
-	if err != nil {
-		return outbound.AttemptContent{}, err
-	}
-	return outbound.NewSnapshotContent(stored.Snapshot, stored.Final)
+	return form, digest, nil
 }
 
 // admittedPayloadDigest reads a commitment's payload and answers with what it

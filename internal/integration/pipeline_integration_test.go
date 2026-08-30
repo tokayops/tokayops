@@ -381,6 +381,16 @@ func (c *recordingChannel) StopFailing(address string) {
 }
 
 func (c *recordingChannel) Prepare(ctx context.Context, intent outbound.Intent) outbound.Preparation {
+	// The payload is read first, exactly as every real channel reads it: a
+	// channel cannot write a message without decoding what it is supposed to
+	// say, and it has no way to tell "a shape I have no decoder for" from "a
+	// shape nobody can read". A double that skipped this would be a double that
+	// never produces the one answer the domain has to overrule.
+	if _, err := keys.DecodeEscalationPayloadV1(
+		intent.PayloadSchemaVersion, intent.Payload); err != nil {
+		return outbound.Impossible("payload_unreadable", err.Error())
+	}
+
 	if intent.TargetKind != keys.TargetUser {
 		return outbound.Ready(intent.TargetRef)
 	}

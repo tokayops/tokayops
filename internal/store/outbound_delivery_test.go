@@ -640,6 +640,61 @@ func TestBeginRefusesWhatItCannotAuthorise(t *testing.T) {
 	})
 }
 
+// TestARefusalIsNotRecordedAgainstWorkThisBuildCannotRead.
+//
+// A channel prepares before the attempt is opened, and preparing means decoding
+// the payload. A shape this build has no decoder for therefore comes back as
+// "permanently unreadable" from every channel there is - which is true of the
+// CHANNEL and false of the commitment: the build that wrote the row renders it
+// perfectly well.
+//
+// Recorded as given, the refusal ends the commitment, and a rollback would kill
+// exactly the work the newer build had admitted. So the question this build can
+// answer on its own is asked first, and it decides whether an answer may be
+// recorded at all.
+func TestARefusalIsNotRecordedAgainstWorkThisBuildCannotRead(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	for _, preparation := range []outbound.PreparationOutcome{
+		outbound.PreparationPermanent, outbound.PreparationTransient,
+	} {
+		t.Run(string(preparation), func(t *testing.T) {
+			agID := outboundGroup(t, s)
+			intentID := admitOne(t, s, agID)[0]
+			// The row as a build that renders a later payload shape wrote it.
+			exec(t, s, `UPDATE outbound_intents SET payload_schema_version = 2 WHERE id = $1`,
+				intentID)
+			token := claimOne(t, s, intentID)
+
+			_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+				IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+				Preparation: preparation, ErrorClass: "payload_unreadable",
+			})
+			if !errors.Is(err, ErrOutboundContract) {
+				t.Fatalf("a refusal about an unreadable shape answered %v", err)
+			}
+
+			if status := statusOf(t, s, intentID); status != outbound.StatusPending {
+				t.Fatalf("the commitment is %s; the build that wrote it never gets it back",
+					status)
+			}
+			var attempts, events int
+			if err := s.db.QueryRow(`
+				SELECT (SELECT count(*) FROM outbound_attempts WHERE intent_id = $1),
+				       (SELECT count(*) FROM outbound_intent_events
+				        WHERE intent_id = $1 AND kind <> 'created')`,
+				intentID).Scan(&attempts, &events); err != nil {
+				t.Fatalf("count the journal: %v", err)
+			}
+			if attempts != 0 || events != 0 {
+				t.Errorf("the refusal left %d attempt(s) and %d journal line(s) behind",
+					attempts, events)
+			}
+		})
+	}
+}
+
 // TestPreparationRefusalsLeaveProofRatherThanDoubt is the distinction the
 // journal is built around: a call that provably never happened is recorded as
 // such, and never as an attempt whose fate is unknown.

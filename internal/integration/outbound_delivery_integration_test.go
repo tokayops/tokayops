@@ -307,11 +307,72 @@ func TestWorkOutlivesTheProcessThatTookIt(t *testing.T) {
 	}
 }
 
+// TestWorkFromANewerBuildIsLeftWhereItIs.
+//
+// A rollback is not stop-the-world the way an upgrade is, so an older instance
+// meets rows a newer one admitted. Every one of them is work that will be done
+// - by the instance that knows the shape - and the only wrong answer is a
+// durable one.
+//
+// It has to be shown from the worker, because the worker is where the trap is.
+// A channel prepares before the attempt exists, preparing means decoding the
+// payload, and a shape with no decoder here comes back "permanently
+// unreadable" from every channel there is. Handed straight to the store, that
+// verdict ends the commitment. Calling the store directly with a preparation
+// this test chose would prove nothing about the path that actually runs.
+func TestWorkFromANewerBuildIsLeftWhereItIs(t *testing.T) {
+	env := setupIntegrationTest(t)
+
+	sendWebhook(t, env.Echo, criticalAlert("from_a_newer_build", "DiskFilling"))
+	env.Eng.ProcessNewAlertGroups(context.Background())
+	if _, err := env.S.GetDB().Exec(`
+		UPDATE outbound_intents SET payload_schema_version = 2
+		WHERE alert_group_id = (SELECT id FROM alert_groups WHERE alert_key = $1)`,
+		"from_a_newer_build"); err != nil {
+		t.Fatalf("write the commitments as a newer build would: %v", err)
+	}
+
+	// A second alert this build understands completely. It is the proof that
+	// the worker ran at all: without it, "nothing happened" is also what a
+	// worker that never started would leave behind.
+	sendWebhook(t, env.Echo, criticalAlert("from_this_build", "MemoryFilling"))
+	env.Eng.ProcessNewAlertGroups(context.Background())
+
+	stop := startOutboundWorker(t, env.Worker)
+	waitForDeliveries(t, env.S, "from_this_build", 2)
+	// Joined, not merely cancelled: the commitments from the newer build were
+	// claimed alongside the others, and what this asserts is what the worker
+	// did with them - which is only settled once it has finished.
+	stop()
+
+	for _, intent := range intentsOf(t, env, "from_a_newer_build") {
+		if intent.Status != outbound.StatusPending {
+			t.Errorf("commitment %s is %s; the build that admitted it never gets it back",
+				intent.ID, intent.Status)
+		}
+	}
+
+	var attempts, events int
+	if err := env.S.GetDB().QueryRow(`
+		SELECT count(a.id), count(e.id)
+		FROM outbound_intents i
+		JOIN alert_groups ag ON ag.id = i.alert_group_id
+		LEFT JOIN outbound_attempts a ON a.intent_id = i.id
+		LEFT JOIN outbound_intent_events e ON e.intent_id = i.id AND e.kind <> 'created'
+		WHERE ag.alert_key = $1`, "from_a_newer_build").Scan(&attempts, &events); err != nil {
+		t.Fatalf("count what was written: %v", err)
+	}
+	if attempts != 0 || events != 0 {
+		t.Fatalf("this build wrote %d attempt(s) and %d journal line(s) about work "+
+			"it cannot read", attempts, events)
+	}
+}
+
 // TestAPageStartsGoingOutPromptly is the D7 smoke, and it is declared a smoke
 // rather than a percentile on purpose: one measurement on an idle instance
-// proves the path is not asleep, and nothing more. The percentile under a load
-// profile belongs to Sprint 4, where there is a second partition to measure
-// isolation against.
+// proves the path is not asleep, and nothing more. A percentile under a load
+// profile needs a second partition to measure isolation against, and waits for
+// one.
 func TestAPageStartsGoingOutPromptly(t *testing.T) {
 	env := setupIntegrationTest(t)
 

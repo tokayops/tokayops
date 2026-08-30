@@ -475,19 +475,33 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{Outcome: outbound.BeginLeaseLost}, nil
 	}
 
-	// A refusal comes before the state is read, because it is true whatever the
-	// state says: nothing was going to be sent either way, and reporting "the
-	// state is unreadable" for a commitment whose identity is not even linked
-	// would send whoever reads it to the wrong place.
-	if req.Preparation != outbound.PreparationReady {
-		shape, err := refusalShape(*intent)
-		if err != nil {
-			return outbound.BeginAttemptResult{}, err
+	// Whether this build can read the commitment at all, before its answer and
+	// before the caller's.
+	//
+	// A channel prepares BEFORE this call and decodes the payload to do it, so
+	// a shape this build has no decoder for comes back as "permanently
+	// unreadable" from every channel there is. Recorded as given, that ends a
+	// commitment a newer build renders perfectly well - and a rollback would
+	// then kill exactly the work the newer build had admitted. The one question
+	// that does not depend on any channel is asked here instead, and it decides
+	// whether a refusal may be recorded at all.
+	form, digest, err := executableHere(*intent)
+	if err == nil && req.Preparation != outbound.PreparationReady {
+		// A refusal comes before the STATE is read, because it is true whatever
+		// the state says: nothing was going to be sent either way, and
+		// reporting "the state is unreadable" for a commitment whose identity
+		// is not even linked would send whoever reads it to the wrong place.
+		shape, shapeErr := refusalShape(*intent)
+		if shapeErr != nil {
+			return outbound.BeginAttemptResult{}, shapeErr
 		}
 		return s.recordPreparation(ctx, tx, req, *intent, shape)
 	}
 
-	content, err := attemptContentTx(ctx, tx, *intent)
+	var content outbound.AttemptContent
+	if err == nil {
+		content, err = attemptContentTx(ctx, tx, *intent, form, digest)
+	}
 	if err != nil {
 		shape, shapeErr := refusalShape(*intent)
 		if shapeErr != nil {
