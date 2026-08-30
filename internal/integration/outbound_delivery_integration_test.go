@@ -346,6 +346,14 @@ func TestAPageStartsGoingOutPromptly(t *testing.T) {
 func TestNoMoreLeasesThanSlots(t *testing.T) {
 	env := setupIntegrationTest(t)
 
+	// A worker of this test's own, under a name nobody else answers to. The
+	// fixture's worker is called "integration-worker" in every test, so a late
+	// goroutine of a neighbouring one holding leases under that name would be
+	// counted here as this worker exceeding its pool.
+	const poolWorkerID = "pool-slots-worker"
+	worker := outbound.NewWorker(env.S, poolWorkerID,
+		map[string]outbound.Channel{"slack": env.Channel, "telegram": env.Channel})
+
 	// More work than the pool, all of it held inside the provider so the slots
 	// stay occupied while the worker keeps ticking.
 	release := env.Channel.Hold()
@@ -361,7 +369,7 @@ func TestNoMoreLeasesThanSlots(t *testing.T) {
 	}
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	stop := startOutboundWorker(t, env.Worker)
+	stop := startOutboundWorker(t, worker)
 
 	// The worker has to have started before the count means anything.
 	until(t, "the pool to fill", func() bool {
@@ -370,18 +378,20 @@ func TestNoMoreLeasesThanSlots(t *testing.T) {
 
 	// Whatever the worker does, it never holds more leases than it has slots.
 	//
-	// Counted by WORKER, not across the table. The claim is that one worker
-	// stays inside its own pool, and a whole-table count says something else: a
-	// lease left live by a neighbouring test - they share this database, and a
-	// notification lease outlives the test that took it by ninety seconds -
-	// would be read as this worker holding too many.
+	// Counted by WORKER, and by a worker id nobody else uses. The claim is that
+	// one worker stays inside its own pool, and a whole-table count says
+	// something else: a lease left live by a neighbouring test - they share
+	// this database, and a notification lease outlives the test that took it by
+	// ninety seconds - would be read as this worker holding too many. The
+	// shared fixture name would not fix that either, since every test's worker
+	// answers to it.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		var leased int
 		if err := env.S.GetDB().QueryRow(`
 			SELECT count(*) FROM outbound_intents
 			WHERE lease_token IS NOT NULL AND locked_until > now()
-			  AND worker_id = $1`, "integration-worker").Scan(&leased); err != nil {
+			  AND worker_id = $1`, poolWorkerID).Scan(&leased); err != nil {
 			t.Fatalf("count the leases: %v", err)
 		}
 		if leased > outbound.NotificationPoolSize {

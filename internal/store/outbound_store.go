@@ -827,7 +827,7 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 			return nil, fmt.Errorf("encode the payload of %s: %w", c.IdempotencyKey, err)
 		}
 
-		offset, err := timingOffset(c.Timing)
+		notBefore, err := notBeforeOf(c.Timing, admittedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -849,20 +849,19 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 				ambiguity_policy, payload_schema_version, payload, provider_key_codec_version,
 				status, desired_revision, not_before, next_attempt_at, expires_at)
 			VALUES (
-				$1, $2, $3, $20, $4, $5,
+				$1, $2, $3, $19, $4, $5,
 				$6, $7, $8, $9, $10, $11,
 				$12, $13, $14, $15,
 				'pending', $16,
-				$17::timestamptz + make_interval(secs => $18),
-				GREATEST(now(), $17::timestamptz + make_interval(secs => $18)),
-				$19)`,
+				$17, GREATEST(now(), $17::timestamptz),
+				$18)`,
 			id, batchID, c.IdempotencyKey,
 			string(admission.Kind), admission.GrammarVersion,
 			c.Provider, string(c.Target.Kind), c.Target.Ref, nilIfEmpty(admission.AlertGroupID),
 			string(form), string(c.CompletionMode),
 			string(c.AmbiguityPolicy), c.PayloadSchemaVersion, payload, keys.ProviderKeyCodecV1,
 			admission.Revision,
-			admittedAt, offset.Seconds(),
+			notBefore,
 			expiresAt, family,
 		); err != nil {
 			return nil, fmt.Errorf("write the commitment %s: %w", c.IdempotencyKey, err)
@@ -881,14 +880,31 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 // Only the relative form has a meaning here: an escalation step is "so long
 // after the alert was admitted", and the absolute form belongs to families
 // whose time comes from the domain rather than from the claim.
-func timingOffset(spec keys.TimingSpec) (time.Duration, error) {
+// notBeforeOf is the instant a commitment becomes due.
+//
+// Both of the grammar's timing forms are honoured, because both are things a
+// producer can legitimately mean. A relative one is a delay measured from the
+// admission - a policy step that pages five minutes after the alert - and it is
+// resolved against the database's clock, never a process's. An absolute one is
+// a moment the domain supplies and cannot move: the start of an on-call
+// assignment is one, and a handover announcement is timed by it.
+//
+// The bounded form is refused. It is a DEADLINE - the earlier of an instant and
+// an age - and reading it as a start time would take the wrong half of it and
+// make the work due at the moment it should stop being worth doing.
+func notBeforeOf(spec keys.TimingSpec, admittedAt time.Time) (time.Time, error) {
 	if err := spec.Validate(); err != nil {
-		return 0, outboundContractf("timing: %v", err)
+		return time.Time{}, outboundContractf("timing: %v", err)
 	}
-	if spec.Kind != keys.TimingRelativeToAdmission {
-		return 0, outboundContractf("an escalation step timed as %q", spec.Kind)
+	switch spec.Kind {
+	case keys.TimingRelativeToAdmission:
+		return admittedAt.Add(spec.Offset), nil
+	case keys.TimingAbsolute:
+		return spec.At.UTC(), nil
+	default:
+		return time.Time{}, outboundContractf(
+			"a commitment timed as %q, which says when work ENDS", spec.Kind)
 	}
-	return spec.Offset, nil
 }
 
 func expiryOf(spec *keys.TimingSpec, admittedAt time.Time) (*time.Time, error) {

@@ -593,3 +593,58 @@ func TestAHandoverDeadlineIsBounded(t *testing.T) {
 	}
 	assertNothingAdmitted(t, s, before)
 }
+
+// TestACommitmentTimedByADomainInstantIsDueThen.
+//
+// Both of the grammar's timing forms are things a producer can mean, and both
+// have to survive the trip through admission. A relative one is a delay from
+// the admission - a policy step that pages five minutes after the alert. An
+// absolute one is a moment the domain supplies and cannot move: the start of an
+// on-call assignment is one, and that is how a handover announcement is timed.
+//
+// Admission used to take only the first, so a batch the grammar accepts came
+// back refused with a message about escalation steps.
+func TestACommitmentTimedByADomainInstantIsDueThen(t *testing.T) {
+	s := setupTestDB(t)
+	seedUsers(t, s, "u-alice")
+
+	at := handoffOccurrence("sched-1").AssignmentStart
+	recipient := announceTo("slack", "u-alice")
+	recipient.Timing = keys.TimingSpec{Kind: keys.TimingAbsolute, At: at}
+
+	result, err := s.SubmitBatch(context.Background(), handoffBatch(t, "sched-1", recipient))
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+
+	var notBefore time.Time
+	if err := s.db.QueryRow(
+		`SELECT not_before FROM outbound_intents WHERE batch_id = $1`, result.BatchID).
+		Scan(&notBefore); err != nil {
+		t.Fatalf("read when it is due: %v", err)
+	}
+	if !notBefore.Equal(at) {
+		t.Fatalf("the announcement is due at %s, and the domain said %s", notBefore, at)
+	}
+}
+
+// TestADeadlineIsNotAStartTime. The bounded form says when work stops being
+// worth doing; read as a start time it would take the wrong half of it and make
+// the commitment due at the moment it should end.
+func TestADeadlineIsNotAStartTime(t *testing.T) {
+	s := setupTestDB(t)
+	seedUsers(t, s, "u-alice")
+
+	recipient := announceTo("slack", "u-alice")
+	recipient.Timing = keys.TimingSpec{
+		Kind:   keys.TimingBounded,
+		At:     time.Date(2026, 5, 4, 19, 0, 0, 0, time.UTC),
+		MaxAge: time.Hour,
+	}
+
+	before := alertDomainState(t, s)
+	if _, err := s.SubmitBatch(context.Background(), handoffBatch(t, "sched-1", recipient)); err == nil {
+		t.Fatal("a commitment timed by a deadline was admitted")
+	}
+	assertNothingAdmitted(t, s, before)
+}
