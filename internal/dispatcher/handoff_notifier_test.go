@@ -786,20 +786,18 @@ func TestTheAnnouncementCarriesTheSnapshotTimezone(t *testing.T) {
 	}
 }
 
-// TestAZoneNothingCanPrintIsNotAnnounced.
+// TestAnAnnouncementTheGrammarRefusesLeavesTheScheduleAlone.
 //
-// The old producer formatted the message itself and fell back to UTC for a zone
-// it could not load, which put the wrong times in front of a person with
-// nothing to say they were wrong. The payload is durable now and every channel
-// reads the same field, so the same fallback would be that mistake repeated
-// forever, in every channel, with nobody told.
+// What is on trial is the producer's answer to a refusal, not the refusal: an
+// announcement that could not be built is not an announcement that was decided
+// against, so the cache stays where it was and the next tick tries again.
 //
-// The announcement is refused instead, the schedule stays pending, and the tick
-// says so every minute. That costs an announcement nobody receives - but the
-// schedule that produced it cannot be saved through the API and cannot be
-// projected either, so a zone arriving here is damage that an operator fixes
-// and not a configuration somebody chose.
-func TestAZoneNothingCanPrintIsNotAnnounced(t *testing.T) {
+// The trigger is a time zone nothing can load, which is the cheapest one to
+// write down - and it is not reachable through the real projection: a schedule
+// carrying one is refused when it is saved, and computing its rotation fails
+// before any of this, so it arrives as a projection failure instead. Every
+// other way the grammar refuses an announcement takes this same path.
+func TestAnAnnouncementTheGrammarRefusesLeavesTheScheduleAlone(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
 	env.warmUp(duty(dutySpec{
 		scheduleID: "sched-1", timezone: "Mars/Olympus",
