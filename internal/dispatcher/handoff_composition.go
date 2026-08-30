@@ -4,7 +4,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/tokayops/tokayops/internal/jobdedup"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -181,44 +180,4 @@ func addedUsers(prev, next []string) []string {
 		}
 	}
 	return out
-}
-
-// occurrenceOf names the notification, which is not the same question the
-// composition answers.
-//
-// A composition recurs: a rotation A -> B -> C comes back to A, and an edit
-// [B] -> [B,D] -> [B] -> [B,D] comes back to [B,D]. Both returns are real news
-// for whoever came on duty, so the occurrence carries three things beyond the
-// composition:
-//
-//   - the kind, without which an added_to_active_shift would suppress the
-//     handoff that follows it;
-//   - the moment the assignment took effect, which is what separates two turns
-//     of the same rotation;
-//   - the revision that put the composition on duty, which is what separates two
-//     edits that land inside one assignment. Editing an override does not move
-//     its valid_from, so the moment alone repeats when a stand-in is swapped out
-//     and back.
-//
-// Neither of the last two is redundant: a rotation serves many slots from one
-// revision, and an override serves many revisions from one valid_from.
-//
-// The moment lives here and not in the composition on purpose: put it there and
-// a schedule with one group would DM its members at every shift boundary.
-//
-// Two instances derive these parts from the same rows, so they derive the same
-// identity - which is what lets one of the two jobs be refused. How the parts
-// become a key is jobdedup's business, and deliberately not spelled here: the
-// claim it takes is held forever, so its encoding belongs with the policy that
-// says so.
-func occurrenceOf(kind, scheduleID string, next observation) jobdedup.Occurrence {
-	return jobdedup.Occurrence{
-		Kind:            kind,
-		ScheduleID:      scheduleID,
-		Source:          next.Composition.Source,
-		GroupID:         next.Composition.GroupID,
-		UserIDs:         next.Composition.UserIDs,
-		AssignmentStart: next.AssignmentStart,
-		RevisionID:      next.RevisionID,
-	}
 }

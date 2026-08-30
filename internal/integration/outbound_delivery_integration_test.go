@@ -369,6 +369,73 @@ func TestWorkFromANewerBuildIsLeftWhereItIs(t *testing.T) {
 	}
 }
 
+// TestNothingWritesAJobAnyMore is the checkpoint the teardown is ordered
+// around.
+//
+// The step loop still exists and nobody starts it; the executors still exist
+// and nobody calls them. That is deliberate, because it is the only state in
+// which this can be asserted about the PRODUCT rather than about a package that
+// no longer compiles: everything a running instance does is done here, and the
+// tables the job engine used stay empty.
+//
+// Both producers, because they left at different times and for different
+// reasons - an escalation became a set of commitments, and a shift change
+// became an announcement admitted the same way.
+func TestNothingWritesAJobAnyMore(t *testing.T) {
+	env := setupIntegrationTest(t)
+	ctx := context.Background()
+
+	sendWebhook(t, env.Echo, criticalAlert("no_jobs", "DiskFilling"))
+	env.Eng.ProcessNewAlertGroups(ctx)
+	stopPaging := startOutboundWorker(t, env.Worker)
+	waitForDeliveries(t, env.S, "no_jobs", 2)
+	stopPaging()
+
+	admission, err := keys.HandoffBatch{
+		Occurrence: keys.Occurrence{
+			Kind: keys.HandoffShiftChange, ScheduleID: "sched-no-jobs", Source: "rotation",
+			GroupID: "g-a", UserIDs: []string{"U_TEST"},
+			AssignmentStart: time.Now().Add(time.Hour).UTC(), RevisionID: "rev-1",
+		},
+		TeamName: "Backend", Timezone: "UTC",
+		GridSlotStart:      time.Now().Add(time.Hour).UTC(),
+		AssignmentEnd:      time.Now().Add(9 * time.Hour).UTC(),
+		MaxAge:             time.Hour,
+		GrammarVersion:     keys.GrammarV1,
+		FingerprintVersion: keys.CurrentBatchFingerprintVersion(),
+		Recipients:         []keys.HandoffRecipient{announceThrough("slack", "U_TEST")},
+	}.Admit()
+	if err != nil {
+		t.Fatalf("build the announcement: %v", err)
+	}
+	if _, err := env.S.SubmitBatch(ctx, outbound.Batch{
+		Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: "notifier",
+	}); err != nil {
+		t.Fatalf("admit the announcement: %v", err)
+	}
+	stopHandoff := startOutboundWorker(t, env.Handoff)
+	until(t, "the announcement to be delivered", func() bool {
+		var settled int
+		if err := env.S.GetDB().QueryRow(`
+			SELECT count(*) FROM outbound_intents
+			WHERE key_kind = 'handoff' AND status = 'succeeded'`).Scan(&settled); err != nil {
+			t.Fatalf("read the commitments: %v", err)
+		}
+		return settled == 1
+	})
+	stopHandoff()
+
+	for _, table := range []string{"jobs", "job_stages", "job_steps"} {
+		var rows int
+		if err := env.S.GetDB().QueryRow(`SELECT count(*) FROM ` + table).Scan(&rows); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if rows != 0 {
+			t.Errorf("%s holds %d row(s); something still writes to the job engine", table, rows)
+		}
+	}
+}
+
 // TestAPageStartsGoingOutPromptly is the D7 smoke, and it is declared a smoke
 // rather than a percentile on purpose: one measurement on an idle instance
 // proves the path is not asleep, and nothing more. A percentile under a load
