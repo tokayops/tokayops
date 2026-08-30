@@ -446,6 +446,9 @@ func intentFor(t *testing.T, target keys.Target) outbound.Intent {
 	}
 	return outbound.Intent{
 		ID: "intent-1", Provider: "telegram",
+		// The kind is what decides which shape the payload is read in, so a
+		// commitment without one is not a commitment.
+		KeyKind:    keys.KindEscalation,
 		TargetKind: target.Kind, TargetRef: target.Ref,
 		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
 		Payload:              payload,
@@ -556,7 +559,6 @@ func TestACallWithNoStateToRenderIsRefused(t *testing.T) {
 		t.Fatalf("build the content: %v", err)
 	}
 	call.Content = payloadOnly
-	call.KeyKind = keys.Kind("handoff")
 
 	result, err := handler.ExecuteAttempt(context.Background(), call)
 	if err == nil {
@@ -565,7 +567,7 @@ func TestACallWithNoStateToRenderIsRefused(t *testing.T) {
 	if result.Evidence != outbound.DefinitelyNotSent {
 		t.Fatalf("a call that never went out is recorded as %q", result.Evidence)
 	}
-	if !strings.Contains(result.Summary, "handoff") {
+	if !strings.Contains(result.Summary, string(keys.KindEscalation)) {
 		t.Fatalf("the refusal does not say what it was: %q", result.Summary)
 	}
 	if len(api.calls) != 0 {

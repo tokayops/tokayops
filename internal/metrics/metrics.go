@@ -302,17 +302,28 @@ var (
 	}, []string{"reason", "outcome"})
 
 	// OutboundAdmissionLatencySeconds measures the promise: from the commit
-	// that admitted an escalation to the start of the FIRST attempt of a
-	// commitment that was due immediately.
+	// that admitted work to the start of the FIRST attempt of a commitment that
+	// was due immediately.
 	//
 	// Only immediately-due commitments are observed. A step with a ten-minute
 	// delay would otherwise report ten minutes of latency for working exactly
 	// as configured. Both ends of the interval are the database's own clock,
 	// so nothing here depends on two processes agreeing about the time.
+	//
+	// The boundaries past 60 are what makes the second family measurable at
+	// all. Paging lives in the seconds and its nine original boundaries are
+	// kept exactly, so its thresholds are measured as they always were; a
+	// hundred announcements draining through a small pool live at 240 to 300,
+	// and with 60 as the last finite bucket every healthy one of those would
+	// land in +Inf. histogram_quantile would then answer 60 for all of them -
+	// the SLO would read green precisely when it was broken.
 	OutboundAdmissionLatencySeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "outbound_admission_latency_seconds",
-		Help:    "Seconds from admitting an escalation to starting the first attempt of an immediately due commitment.",
-		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+		Name: "outbound_admission_latency_seconds",
+		Help: "Seconds from admitting work to starting the first attempt of an immediately due commitment.",
+		Buckets: []float64{
+			0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
+			120, 180, 240, 300, 360, 600, 900,
+		},
 	}, []string{"family"})
 )
 

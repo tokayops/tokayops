@@ -39,8 +39,13 @@ type IntegrationTestEnv struct {
 	Disp     *dispatcher.Dispatcher
 	MockProv *MockProvider
 	Worker   *outbound.Worker
-	Channel  *recordingChannel
-	Echo     *echo.Echo
+
+	// Handoff is the second family's worker. Announcements are claimed by their
+	// own partition, so nothing delivers one unless this is running.
+	Handoff *outbound.Worker
+
+	Channel *recordingChannel
+	Echo    *echo.Echo
 
 	// Schedules is the schedule configuration command service, and Renderer the
 	// projection the engine and the escalation builder read through. Schedules
@@ -214,8 +219,17 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	// its word - what these tests are about is who was promised and who was
 	// sent to, not how a user id becomes a Slack account.
 	channel := &recordingChannel{identity: storeIdentity(s)}
-	worker := outbound.NewWorker(s, "integration-worker",
-		map[string]outbound.Channel{"slack": channel, "telegram": channel})
+	channels := map[string]outbound.Channel{"slack": channel, "telegram": channel}
+	worker := outbound.NewWorker(s, "integration-worker", channels)
+	// The second family's worker, over the same channels. A shift change is
+	// delivered by its own pool, which is the whole point of the partition, so
+	// a test that only ran the paging worker would watch announcements sit in
+	// the queue for ever.
+	handoff, err := outbound.NewWorkerFor(outbound.FamilyHandoff, s,
+		"integration-handoff-worker", channels)
+	if err != nil {
+		t.Fatalf("build the handover worker: %v", err)
+	}
 
 	// Echo
 	e := echo.New()
@@ -228,6 +242,7 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 		Disp:      disp,
 		MockProv:  mockProvider,
 		Worker:    worker,
+		Handoff:   handoff,
 		Channel:   channel,
 		Echo:      e,
 		Schedules: scheduleconfig.NewService(s.ScheduleConfigRepository()),
@@ -381,14 +396,23 @@ func (c *recordingChannel) StopFailing(address string) {
 }
 
 func (c *recordingChannel) Prepare(ctx context.Context, intent outbound.Intent) outbound.Preparation {
-	// The payload is read first, exactly as every real channel reads it: a
-	// channel cannot write a message without decoding what it is supposed to
-	// say, and it has no way to tell "a shape I have no decoder for" from "a
-	// shape nobody can read". A double that skipped this would be a double that
-	// never produces the one answer the domain has to overrule.
-	if _, err := keys.DecodeEscalationPayloadV1(
-		intent.PayloadSchemaVersion, intent.Payload); err != nil {
-		return outbound.Impossible("payload_unreadable", err.Error())
+	// The payload is read first, exactly as every real channel reads it, and in
+	// the shape its KIND says it is in: a channel cannot write a message
+	// without decoding what it is supposed to say, and it has no way to tell "a
+	// shape I have no decoder for" from "a shape nobody can read". A double
+	// that skipped this would be a double that never produces the one answer
+	// the domain has to overrule.
+	switch intent.KeyKind {
+	case keys.KindHandoff:
+		if _, err := keys.DecodeHandoffPayloadV1(
+			intent.PayloadSchemaVersion, intent.Payload); err != nil {
+			return outbound.Impossible("payload_unreadable", err.Error())
+		}
+	default:
+		if _, err := keys.DecodeEscalationPayloadV1(
+			intent.PayloadSchemaVersion, intent.Payload); err != nil {
+			return outbound.Impossible("payload_unreadable", err.Error())
+		}
 	}
 
 	if intent.TargetKind != keys.TargetUser {

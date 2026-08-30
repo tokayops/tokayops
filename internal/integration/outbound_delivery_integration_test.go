@@ -10,6 +10,7 @@ import (
 
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
 // The promises the delivery domain makes that can only be shown end to end.
@@ -481,3 +482,99 @@ func TestNoMoreLeasesThanSlots(t *testing.T) {
 }
 
 var _ = model.AlertGroupStatusNew
+
+// TestAShiftChangeReachesBothChannels is the whole path for the second family,
+// end to end: an announcement is admitted, claimed by its own partition,
+// prepared, sent, and settled - once per channel the person is linked to.
+//
+// It is the delivery half of the split the payload exists for. The producer
+// writes no words at all now, so if it ever went back to composing a sentence
+// the two messages here would be the same string; what this asserts is that
+// each channel was handed the payload and wrote its own.
+func TestAShiftChangeReachesBothChannels(t *testing.T) {
+	env := setupIntegrationTest(t)
+	ctx := context.Background()
+
+	if err := env.S.BindExternalIdentity(&model.ExternalIdentity{
+		UserID: "U_TEST", Provider: "telegram", ExternalID: "T_TEST",
+	}); err != nil {
+		t.Fatalf("link a Telegram account: %v", err)
+	}
+
+	admission, err := keys.HandoffBatch{
+		Occurrence: keys.Occurrence{
+			Kind: keys.HandoffShiftChange, ScheduleID: "sched-1", Source: "rotation",
+			GroupID: "g-a", UserIDs: []string{"U_TEST"},
+			AssignmentStart: time.Now().Add(time.Hour).UTC(), RevisionID: "rev-1",
+		},
+		TeamName: "Backend", Timezone: "UTC",
+		GridSlotStart:      time.Now().Add(time.Hour).UTC(),
+		AssignmentEnd:      time.Now().Add(9 * time.Hour).UTC(),
+		MaxAge:             time.Hour,
+		GrammarVersion:     keys.GrammarV1,
+		FingerprintVersion: keys.CurrentBatchFingerprintVersion(),
+		Recipients: []keys.HandoffRecipient{
+			announceThrough("slack", "U_TEST"),
+			announceThrough("telegram", "U_TEST"),
+		},
+	}.Admit()
+	if err != nil {
+		t.Fatalf("build the announcement: %v", err)
+	}
+	result, err := env.S.SubmitBatch(ctx, outbound.Batch{
+		Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: "notifier",
+	})
+	if err != nil {
+		t.Fatalf("admit the announcement: %v", err)
+	}
+	if result.Outcome != outbound.SubmitCreated || len(result.IntentIDs) != 2 {
+		t.Fatalf("the announcement answered %q with %d commitments",
+			result.Outcome, len(result.IntentIDs))
+	}
+
+	stop := startOutboundWorker(t, env.Handoff)
+	until(t, "both announcements to be delivered", func() bool {
+		var settled int
+		if err := env.S.GetDB().QueryRow(`
+			SELECT count(*) FROM outbound_intents
+			WHERE key_kind = 'handoff' AND status = 'succeeded'`).Scan(&settled); err != nil {
+			t.Fatalf("read the commitments: %v", err)
+		}
+		return settled == 2
+	})
+	stop()
+
+	// Each channel was called at the address the identity resolves to, which is
+	// the account and not the person: the commitment names U_TEST and what
+	// reached the provider is what U_TEST is known by there.
+	sent := env.Channel.SentTargets()
+	found := map[string]bool{}
+	for _, target := range sent {
+		found[target] = true
+	}
+	if !found["S_TEST"] || !found["T_TEST"] {
+		t.Fatalf("the announcement reached %v, want the Slack and Telegram accounts", sent)
+	}
+
+	// And nothing about the alert domain moved: an announcement is not about an
+	// alert group, and the family it ran in is its own.
+	var family string
+	if err := env.S.GetDB().QueryRow(
+		`SELECT DISTINCT delivery_family FROM outbound_intents WHERE key_kind = 'handoff'`).
+		Scan(&family); err != nil {
+		t.Fatalf("read the family: %v", err)
+	}
+	if family != outbound.FamilyHandoff {
+		t.Fatalf("the announcement ran in %q", family)
+	}
+}
+
+// announceThrough is one recipient of an announcement, as the builder makes it.
+func announceThrough(provider, userID string) keys.HandoffRecipient {
+	return keys.HandoffRecipient{
+		Provider: provider, UserID: userID,
+		Timing:          keys.TimingSpec{Kind: keys.TimingRelativeToAdmission},
+		CompletionMode:  keys.CompletionOnAcceptance,
+		AmbiguityPolicy: keys.PolicyRetry,
+	}
+}

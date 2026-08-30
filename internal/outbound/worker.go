@@ -47,6 +47,7 @@ type Channel interface {
 // Worker runs one family's deliveries on one instance.
 type Worker struct {
 	family   string
+	policy   Policy
 	workerID string
 	pool     int
 
@@ -58,7 +59,7 @@ type Worker struct {
 	running  sync.WaitGroup
 }
 
-// NewWorker builds the worker for the notification family.
+// NewWorker builds the worker for the paging family.
 //
 // The channels are keyed by provider. A provider missing from this map is one
 // this instance cannot serve, and it is left alone rather than failed: what
@@ -66,13 +67,37 @@ type Worker struct {
 // instance that ended work its neighbours can do would be the worst kind of
 // deployment accident.
 func NewWorker(st outboundStore, workerID string, channels map[string]Channel) *Worker {
+	worker, err := NewWorkerFor(FamilyNotification, st, workerID, channels)
+	if err != nil {
+		// PolicyOf knows this family; a build where it does not is a build
+		// that cannot page anybody, and it should not start.
+		panic(err)
+	}
+	return worker
+}
+
+// NewWorkerFor builds the worker for one family.
+//
+// The family is a name and the numbers come from PolicyOf, never from the
+// caller. Given both, a caller could start a worker whose attempt deadline
+// outlives its own lease, or one draining a partition nothing else knows about
+// - and the claims of that partition would be invisible to every metric and
+// every alert written against the families that exist.
+func NewWorkerFor(family string, st outboundStore, workerID string,
+	channels map[string]Channel) (*Worker, error) {
+
+	policy, err := PolicyOf(family)
+	if err != nil {
+		return nil, err
+	}
 	return &Worker{
-		family:   FamilyNotification,
+		family:   policy.Family,
+		policy:   policy,
 		workerID: workerID,
-		pool:     NotificationPoolSize,
+		pool:     policy.PoolSize,
 		store:    st,
 		channels: channels,
-	}
+	}, nil
 }
 
 // Run works until the context is cancelled, then waits for what it holds.
@@ -80,7 +105,7 @@ func (w *Worker) Run(ctx context.Context) {
 	log.Printf("outbound worker %s started: family=%s pool=%d providers=%d",
 		w.workerID, w.family, w.pool, len(w.channels))
 
-	ticker := time.NewTicker(NotificationClaimInterval)
+	ticker := time.NewTicker(w.policy.ClaimInterval)
 	defer ticker.Stop()
 
 	for {
@@ -127,7 +152,7 @@ func (w *Worker) drain() {
 	select {
 	case <-finished:
 		log.Printf("outbound worker %s stopped", w.workerID)
-	case <-time.After(NotificationShutdownDeadline):
+	case <-time.After(w.policy.ShutdownDeadline):
 		log.Printf("outbound worker %s stopped with %d attempts unfinished; "+
 			"recovery will close them as ambiguous", w.workerID, w.inflight.Load())
 	}
@@ -225,7 +250,7 @@ func (w *Worker) claim(ctx context.Context, free int, tick uint64) []Leased {
 				}
 				leased, err := w.store.ClaimDueIntents(ctx, ClaimRequest{
 					Family: w.family, Provider: provider, Phase: phase.kind,
-					Limit: phase.limit, Lease: NotificationLease, WorkerID: w.workerID,
+					Limit: phase.limit, Lease: w.policy.Lease, WorkerID: w.workerID,
 				})
 				if err != nil {
 					log.Printf("outbound worker %s: claim %s: %v", w.workerID, provider, err)
@@ -296,11 +321,11 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 	}
 	detached := context.WithoutCancel(parent)
 
-	prepareCtx, cancelPrepare := context.WithTimeout(detached, NotificationPrepareDeadline)
+	prepareCtx, cancelPrepare := context.WithTimeout(detached, w.policy.PrepareDeadline)
 	prepared := channel.Prepare(prepareCtx, leased.Intent)
 	cancelPrepare()
 
-	beginCtx, cancelBegin := recording(detached)
+	beginCtx, cancelBegin := w.recording(detached)
 	begun, err := w.store.BeginAttempt(beginCtx,
 		prepared.Request(leased.Intent.ID, leased.LeaseToken, w.workerID))
 	cancelBegin()
@@ -323,7 +348,7 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 			Observe(*begun.FirstAttemptLatency)
 	}
 
-	attemptCtx, cancelAttempt := context.WithTimeout(detached, NotificationAttemptDeadline)
+	attemptCtx, cancelAttempt := context.WithTimeout(detached, w.policy.AttemptDeadline)
 	call := Call{
 		IntentID:             leased.Intent.ID,
 		AttemptID:            begun.AttemptID,
@@ -361,7 +386,7 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 	metrics.OutboundAttemptsTotal.WithLabelValues(w.family, leased.Intent.Provider,
 		string(begun.Operation), string(concluded.Outcome()), errorClass(concluded)).Inc()
 
-	finalizeCtx, cancelFinalize := recording(detached)
+	finalizeCtx, cancelFinalize := w.recording(detached)
 	recorded, err := w.store.FinalizeDeliveryAttempt(finalizeCtx, FinalizeRequest{
 		AttemptID:  begun.AttemptID,
 		LeaseToken: leased.LeaseToken,
@@ -446,8 +471,8 @@ func detail(c Conclusion) string {
 // somebody else holds is refused by the store's own rule rather than by a
 // context nobody can explain, and short enough that a database gone quiet does
 // not hold a slot for the length of a lease.
-func recording(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, NotificationRecordDeadline)
+func (w *Worker) recording(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, w.policy.RecordDeadline)
 }
 
 // brokenContract says whether a finalisation that was not accepted indicates a

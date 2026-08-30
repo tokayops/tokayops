@@ -3123,12 +3123,16 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 	if err := rows6.Err(); err != nil {
 		return nil, err
 	}
-	// And the paging family reports even when it has no rows at all, so the
-	// series exists from the first scrape rather than appearing the first time
-	// somebody is paged.
-	if !hasFamily(snap.OutboundLatenessSeconds, outbound.FamilyNotification) {
-		snap.OutboundLatenessSeconds = append(snap.OutboundLatenessSeconds,
-			model.OutboundLateness{Family: outbound.FamilyNotification})
+	// And every family this build executes reports even when it has no rows at
+	// all, so the series exists from the first scrape rather than appearing the
+	// first time somebody is paged or comes on duty. A graph that only starts
+	// when the thing it watches first happens is a graph nobody can alert on
+	// until then.
+	for _, family := range []string{outbound.FamilyNotification, outbound.FamilyHandoff} {
+		if !hasFamily(snap.OutboundLatenessSeconds, family) {
+			snap.OutboundLatenessSeconds = append(snap.OutboundLatenessSeconds,
+				model.OutboundLateness{Family: family})
+		}
 	}
 
 	if err := s.readCardsBehind(snap); err != nil {

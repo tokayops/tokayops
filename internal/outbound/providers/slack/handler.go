@@ -67,9 +67,34 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// the shape. So the domain asks that question itself before it records
 	// anything, and this refusal reaches the journal only when the shape is one
 	// this build does know.
-	payload, err := keys.DecodeEscalationPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
-	if err != nil {
-		return outbound.Impossible("payload_unreadable", err.Error())
+	// Which shape to read it in comes from the KIND of claim. A closed set with
+	// no default: two kinds carry two payloads that have nothing to do with
+	// each other, and reading one as the other is not a decode failure but a
+	// message about the wrong thing.
+	//
+	// A handover carries no coordinates to check afterwards, and that is not an
+	// omission. It is one message that is never changed, so there is nothing a
+	// later attempt could aim at and nothing to compare a name against.
+	var written keys.Target
+	mayBeChanged := false
+	switch intent.KeyKind {
+	case keys.KindEscalation, keys.KindEscalationReplay:
+		payload, err := keys.DecodeEscalationPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
+		if err != nil {
+			return outbound.Impossible("payload_unreadable", err.Error())
+		}
+		written, mayBeChanged = payload.Target, true
+
+	case keys.KindHandoff:
+		payload, err := keys.DecodeHandoffPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
+		if err != nil {
+			return outbound.Impossible("payload_unreadable", err.Error())
+		}
+		written = payload.Target
+
+	default:
+		return outbound.Impossible("unsupported_kind", fmt.Sprintf(
+			"Slack has nothing to write for a %q commitment", intent.KeyKind))
 	}
 
 	// The commitment names a recipient twice: in its own columns, which decide
@@ -77,10 +102,10 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// where those two disagree would send a person's private message to the
 	// channel named in the columns - a leak, not a mangled journal entry - so
 	// the two are compared before anything is resolved.
-	if payload.Target.Kind != intent.TargetKind || payload.Target.Ref != intent.TargetRef {
+	if written.Kind != intent.TargetKind || written.Ref != intent.TargetRef {
 		return outbound.Impossible("target_mismatch", fmt.Sprintf(
 			"the commitment is addressed to %s %q and its message is written for %s %q",
-			intent.TargetKind, intent.TargetRef, payload.Target.Kind, payload.Target.Ref))
+			intent.TargetKind, intent.TargetRef, written.Kind, written.Ref))
 	}
 	if h.tokens == nil || h.tokens.GetSlackToken() == "" {
 		return outbound.Impossible("integration_missing",
@@ -93,7 +118,7 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// that never touched the network, retried on the family's backoff - and a
 	// card has no deadline, so that is forever. Refused here it is what it is:
 	// a deterministic refusal, recorded, in front of somebody who can act.
-	if intent.HasReceipt {
+	if mayBeChanged && intent.HasReceipt {
 		data, ok := parseData(string(intent.Receipt))
 		if !ok {
 			return outbound.Impossible("receipt_unreadable",
@@ -166,18 +191,6 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 // history left the render snapshot with it; bringing either back is a decision
 // somebody makes on purpose, not a line added to this function.
 func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbound.Result, error) {
-	payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
-	if err != nil {
-		// Nothing was sent, and nothing will be until the payload is readable.
-		// It is reported as an ordinary refusal rather than a permanent one
-		// because the domain classifies transport, not content: the retry will
-		// fail the same way, visibly, until somebody looks.
-		return outbound.Result{
-			Evidence: outbound.DefinitelyNotSent,
-			Summary:  "the commitment's payload cannot be read: " + err.Error(),
-		}, err
-	}
-
 	token := ""
 	if h.tokens != nil {
 		token = h.tokens.GetSlackToken()
@@ -190,20 +203,10 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 	}
 	client := h.newClient(token)
 
-	snapshot, drawn := call.Content.Snapshot()
-	if !drawn {
-		// This channel draws an alert card from a frozen state, and this
-		// commitment has none. Not an empty card: a message about nothing is
-		// worse than a message that did not go.
-		return outbound.Result{
-			Evidence: outbound.DefinitelyNotSent,
-			Summary: fmt.Sprintf(
-				"a %s commitment renders from a state, and this one carries none",
-				call.KeyKind),
-		}, ErrNoContent
+	options, refusal, err := h.write(call)
+	if err != nil {
+		return refusal, err
 	}
-	state := snapshot.Content()
-	options := messageFor(state, payload)
 
 	if call.AttemptKind == outbound.AttemptMutation {
 		return updateMessage(ctx, client, call, options)
@@ -357,6 +360,61 @@ func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification
 		}, true
 	}
 	return outbound.Classification{}, false
+}
+
+// write turns the commitment into what Slack is asked to post.
+//
+// The kind decides where the words come from, and the two are not alike: an
+// alert card is drawn from a state frozen at admission and follows that alert
+// afterwards, while a shift change IS its payload and is written once. Sharing
+// one path would mean one of them rendering from something it does not have.
+//
+// A refusal here is DefinitelyNotSent: nothing has been called yet, and saying
+// so is what keeps a payload nobody can read from being recorded as a call
+// whose fate is unknown and retried on the family's backoff forever.
+func (h *Handler) write(call outbound.Call) ([]slackapi.MsgOption, outbound.Result, error) {
+	switch call.KeyKind {
+	case keys.KindHandoff:
+		payload, err := keys.DecodeHandoffPayloadV1(call.PayloadSchemaVersion, call.Payload)
+		if err != nil {
+			return nil, outbound.Result{
+				Evidence: outbound.DefinitelyNotSent,
+				Summary:  "the commitment's payload cannot be read: " + err.Error(),
+			}, err
+		}
+		return []slackapi.MsgOption{
+			slackapi.MsgOptionText(announcement(payload), false),
+		}, outbound.Result{}, nil
+
+	case keys.KindEscalation, keys.KindEscalationReplay:
+		payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
+		if err != nil {
+			return nil, outbound.Result{
+				Evidence: outbound.DefinitelyNotSent,
+				Summary:  "the commitment's payload cannot be read: " + err.Error(),
+			}, err
+		}
+		snapshot, drawn := call.Content.Snapshot()
+		if !drawn {
+			// This kind draws an alert card from a frozen state, and this
+			// commitment has none. Not an empty card: a message about nothing
+			// is worse than a message that did not go.
+			return nil, outbound.Result{
+				Evidence: outbound.DefinitelyNotSent,
+				Summary: fmt.Sprintf(
+					"a %s commitment renders from a state, and this one carries none",
+					call.KeyKind),
+			}, ErrNoContent
+		}
+		return messageFor(snapshot.Content(), payload), outbound.Result{}, nil
+
+	default:
+		return nil, outbound.Result{
+			Evidence: outbound.DefinitelyNotSent,
+			Summary: fmt.Sprintf(
+				"Slack has nothing to write for a %q commitment", call.KeyKind),
+		}, ErrNoContent
+	}
 }
 
 // messageFor turns the snapshot into the call's content: a card for a channel,

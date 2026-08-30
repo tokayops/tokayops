@@ -69,9 +69,34 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// the shape. So the domain asks that question itself before it records
 	// anything, and this refusal reaches the journal only when the shape is one
 	// this build does know.
-	payload, err := keys.DecodeEscalationPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
-	if err != nil {
-		return outbound.Impossible("payload_unreadable", err.Error())
+	// Which shape to read it in comes from the KIND of claim. A closed set with
+	// no default: two kinds carry two payloads that have nothing to do with
+	// each other, and reading one as the other is not a decode failure but a
+	// message about the wrong thing.
+	//
+	// A handover carries no coordinates to check afterwards, and that is not an
+	// omission. It is one message that is never changed, so there is nothing a
+	// later attempt could aim at and nothing to compare a name against.
+	var written keys.Target
+	mayBeChanged := false
+	switch intent.KeyKind {
+	case keys.KindEscalation, keys.KindEscalationReplay:
+		payload, err := keys.DecodeEscalationPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
+		if err != nil {
+			return outbound.Impossible("payload_unreadable", err.Error())
+		}
+		written, mayBeChanged = payload.Target, true
+
+	case keys.KindHandoff:
+		payload, err := keys.DecodeHandoffPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
+		if err != nil {
+			return outbound.Impossible("payload_unreadable", err.Error())
+		}
+		written = payload.Target
+
+	default:
+		return outbound.Impossible("unsupported_kind", fmt.Sprintf(
+			"Telegram has nothing to write for a %q commitment", intent.KeyKind))
 	}
 
 	// The commitment names a recipient twice: in its own columns, which decide
@@ -79,10 +104,10 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// where those two disagree would send a person's private message to the
 	// channel named in the columns - a leak, not a mangled journal entry - so
 	// the two are compared before anything is resolved.
-	if payload.Target.Kind != intent.TargetKind || payload.Target.Ref != intent.TargetRef {
+	if written.Kind != intent.TargetKind || written.Ref != intent.TargetRef {
 		return outbound.Impossible("target_mismatch", fmt.Sprintf(
 			"the commitment is addressed to %s %q and its message is written for %s %q",
-			intent.TargetKind, intent.TargetRef, payload.Target.Kind, payload.Target.Ref))
+			intent.TargetKind, intent.TargetRef, written.Kind, written.Ref))
 	}
 	if h.tokens == nil || h.tokens.GetTelegramToken() == "" {
 		return outbound.Impossible("integration_missing",
@@ -92,7 +117,7 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	// The same rule as the payload above, for the same reason: a change aimed
 	// at coordinates nobody can read is a refusal, not a call to retry. A card
 	// has no deadline, so a retry loop over a broken row never ends.
-	if intent.HasReceipt {
+	if mayBeChanged && intent.HasReceipt {
 		data, ok := messageAt(intent.Receipt)
 		if !ok {
 			return outbound.Impossible("receipt_unreadable",
@@ -140,14 +165,6 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 // Telegram has no thread and no permalink, so there is no enrichment either -
 // what comes back is already the whole receipt.
 func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbound.Result, error) {
-	payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
-	if err != nil {
-		return outbound.Result{
-			Evidence: outbound.DefinitelyNotSent,
-			Summary:  "the commitment's payload cannot be read: " + err.Error(),
-		}, err
-	}
-
 	token := ""
 	if h.tokens != nil {
 		token = h.tokens.GetTelegramToken()
@@ -159,41 +176,12 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 		}, ErrNoToken
 	}
 
-	snapshot, drawn := call.Content.Snapshot()
-	if !drawn {
-		// This channel draws an alert card from a frozen state, and this
-		// commitment has none. Not an empty card: a message about nothing is
-		// worse than a message that did not go.
-		return outbound.Result{
-			Evidence: outbound.DefinitelyNotSent,
-			Summary: fmt.Sprintf(
-				"a %s commitment renders from a state, and this one carries none",
-				call.KeyKind),
-		}, ErrNoContent
-	}
-	state := snapshot.Content()
 	body := map[string]interface{}{
 		"chat_id":                  call.Endpoint,
 		"disable_web_page_preview": true,
 	}
-
-	// A card is HTML this package built and escaped; a direct message is
-	// somebody's own words, sent as they are. Marking free text as HTML makes a
-	// perfectly ordinary "a < b" or an unclosed tag unsendable - the message
-	// fails to go out for the shape of its text, which is not a delivery
-	// failure anybody can act on.
-	//
-	// A direct message carries no keyboard either: buttons belong on the card
-	// in a channel, which is where an acknowledgement is visible to everybody
-	// the alert was raised for.
-	if payload.Target.Kind == keys.TargetUser {
-		body["text"] = directMessage(state, payload)
-	} else {
-		body["text"] = RenderCard(state)
-		body["parse_mode"] = "HTML"
-		if keyboard := KeyboardFor(state, payload.Interactive); keyboard != nil {
-			body["reply_markup"] = keyboard
-		}
+	if refusal, err := h.write(call, body); err != nil {
+		return refusal, err
 	}
 
 	method := "sendMessage"
@@ -355,6 +343,84 @@ func messageAt(raw json.RawMessage) (Data, bool) {
 		return Data{}, false
 	}
 	return data, true
+}
+
+// write fills in what Telegram is asked to send, and how to parse it.
+//
+// The kind decides where the words come from, and the two are not alike: an
+// alert card is drawn from a state frozen at admission and follows that alert
+// afterwards, while a shift change IS its payload and is written once. Sharing
+// one path would mean one of them rendering from something it does not have.
+//
+// A refusal here is DefinitelyNotSent: nothing has been called yet, and saying
+// so is what keeps a payload nobody can read from being recorded as a call
+// whose fate is unknown and retried on the family's backoff forever.
+func (h *Handler) write(call outbound.Call, body map[string]interface{}) (outbound.Result, error) {
+	switch call.KeyKind {
+	case keys.KindHandoff:
+		payload, err := keys.DecodeHandoffPayloadV1(call.PayloadSchemaVersion, call.Payload)
+		if err != nil {
+			return outbound.Result{
+				Evidence: outbound.DefinitelyNotSent,
+				Summary:  "the commitment's payload cannot be read: " + err.Error(),
+			}, err
+		}
+		// HTML, unlike the direct message below, and the difference is who
+		// wrote the words: an announcement is composed here out of fields this
+		// package escaped, so the emphasis in it is meant to be emphasis.
+		body["text"] = announcement(payload)
+		body["parse_mode"] = "HTML"
+		return outbound.Result{}, nil
+
+	case keys.KindEscalation, keys.KindEscalationReplay:
+		payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
+		if err != nil {
+			return outbound.Result{
+				Evidence: outbound.DefinitelyNotSent,
+				Summary:  "the commitment's payload cannot be read: " + err.Error(),
+			}, err
+		}
+		snapshot, drawn := call.Content.Snapshot()
+		if !drawn {
+			// This kind draws an alert card from a frozen state, and this
+			// commitment has none. Not an empty card: a message about nothing
+			// is worse than a message that did not go.
+			return outbound.Result{
+				Evidence: outbound.DefinitelyNotSent,
+				Summary: fmt.Sprintf(
+					"a %s commitment renders from a state, and this one carries none",
+					call.KeyKind),
+			}, ErrNoContent
+		}
+		state := snapshot.Content()
+
+		// A card is HTML this package built and escaped; a direct message about
+		// an alert is somebody's own words, sent as they are. Marking free text
+		// as HTML makes a perfectly ordinary "a < b" or an unclosed tag
+		// unsendable - the message fails to go out for the shape of its text,
+		// which is not a delivery failure anybody can act on.
+		//
+		// A direct message carries no keyboard either: buttons belong on the
+		// card in a channel, which is where an acknowledgement is visible to
+		// everybody the alert was raised for.
+		if payload.Target.Kind == keys.TargetUser {
+			body["text"] = directMessage(state, payload)
+			return outbound.Result{}, nil
+		}
+		body["text"] = RenderCard(state)
+		body["parse_mode"] = "HTML"
+		if keyboard := KeyboardFor(state, payload.Interactive); keyboard != nil {
+			body["reply_markup"] = keyboard
+		}
+		return outbound.Result{}, nil
+
+	default:
+		return outbound.Result{
+			Evidence: outbound.DefinitelyNotSent,
+			Summary: fmt.Sprintf(
+				"Telegram has nothing to write for a %q commitment", call.KeyKind),
+		}, ErrNoContent
+	}
 }
 
 // directMessage is what a person is told, in plain text.

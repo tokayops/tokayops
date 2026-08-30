@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -454,10 +455,26 @@ func main() {
 		}
 		return identity.ExternalID, nil
 	}
-	outboundWorker := outbound.NewWorker(st, uuid.New().String(), map[string]outbound.Channel{
-		"slack":    slackprovider.NewHandler(integrationCache, identityLookup),
-		"telegram": telegramprovider.NewHandler(integrationCache, identityLookup),
-	})
+	// One worker per execution family, over the same channels.
+	//
+	// The channels are shared because a Slack message is a Slack message
+	// whichever family asked for it; the WORKERS are not, because a hundred
+	// schedules turning over on one hour boundary must not stand between an
+	// alert and the person on call. Each family's numbers come from its policy,
+	// and the second pool is small on purpose: it is a second set of concurrent
+	// calls to the same providers.
+	outboundChannels := func() map[string]outbound.Channel {
+		return map[string]outbound.Channel{
+			"slack":    slackprovider.NewHandler(integrationCache, identityLookup),
+			"telegram": telegramprovider.NewHandler(integrationCache, identityLookup),
+		}
+	}
+	outboundWorker := outbound.NewWorker(st, uuid.New().String(), outboundChannels())
+	handoffWorker, err := outbound.NewWorkerFor(outbound.FamilyHandoff, st,
+		uuid.New().String(), outboundChannels())
+	if err != nil {
+		log.Fatalf("Failed to build the handover worker: %v", err)
+	}
 
 	// 9. Start Background Workers
 	go eng.Run(ctx)
@@ -473,15 +490,21 @@ func main() {
 	// returns; nothing else waited for it, so every restart risked a handful of
 	// those.
 	//
-	// It is given no deadline here on purpose. The worker has its own
-	// (outbound.NotificationShutdownDeadline, 60s: the longest one commitment
-	// can take), and a shorter one wrapped round it would defeat the reason
-	// that number is a sum rather than a guess. The container's stop grace
+	// They are given no deadline here on purpose. Each worker has its own -
+	// its family's shutdown deadline, the longest one commitment of that family
+	// can take - and a shorter one wrapped round them would defeat the reason
+	// those numbers are sums rather than guesses. The container's stop grace
 	// period has to be longer than it - see docker-compose.prod.yml.
+	// Both of them, for the same reason: each is holding calls that have been
+	// made, and neither may be walked away from.
 	outboundStopped := make(chan struct{})
 	go func() {
 		defer close(outboundStopped)
-		outboundWorker.Run(ctx)
+		var running sync.WaitGroup
+		running.Add(2)
+		go func() { defer running.Done(); outboundWorker.Run(ctx) }()
+		go func() { defer running.Done(); handoffWorker.Run(ctx) }()
+		running.Wait()
 	}()
 
 	// Outbox Delivery Worker
