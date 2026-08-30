@@ -128,8 +128,8 @@ func (s *Store) BindExternalIdentityIfAbsent(userID, provider, externalID, displ
 }
 
 // GetExternalIdentity loads the identity for (user_id, provider). Absence is
-// signalled by sql.ErrNoRows; the dispatcher's resolveRecipient maps it to
-// ErrIdentityNotLinked (a permanent dispatcher error).
+// signalled by sql.ErrNoRows; a channel preparing an attempt maps it to a
+// refusal that no retry can improve.
 func (s *Store) GetExternalIdentity(userID, provider string) (*model.ExternalIdentity, error) {
 	return s.GetExternalIdentityContext(context.Background(), userID, provider)
 }

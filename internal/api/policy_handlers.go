@@ -20,10 +20,10 @@ type ProviderCapabilitiesLookup interface {
 	AllCapabilities() []ProviderCapability
 }
 
-// ProviderCapability mirrors providers.Capability at the API
-// boundary so the api package doesn't import dispatcher just for the type.
-// (api already imports dispatcher elsewhere, but the read-only contract is
-// nicer to keep narrow.)
+// ProviderCapability mirrors providers.Capability at the API boundary. The
+// duplication is deliberate: this is what the HTTP response is shaped like, and
+// a response shaped by another package's struct changes whenever that struct
+// does.
 type ProviderCapability struct {
 	Name                 string                `json:"name"`
 	IntegrationType      model.IntegrationType `json:"integration_type"`
@@ -290,7 +290,7 @@ func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup)
 	}
 
 	// Capability check: provider registered, and target_kind supported.
-	// caps == nil means this binary has no dispatcher wired in (test setup);
+	// caps == nil means this binary has no channel catalogue wired in (test setup);
 	// fall back to validating the legacy {dm,channel} pair without provider
 	// existence checks so unit tests that don't supply a registry still pass.
 	if caps != nil {

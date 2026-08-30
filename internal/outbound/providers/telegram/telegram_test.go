@@ -107,7 +107,7 @@ func TestTelegram_MissingToken_Permanent(t *testing.T) {
 	if !errors.Is(err, ErrNoToken) {
 		t.Errorf("direct message: got %v, want ErrNoToken", err)
 	}
-	// Whether the dispatcher treats that as permanent is the dispatcher's rule
+	// Whether the caller treats that as permanent is the caller's rule
 	// and is asserted there: a channel that classified its own errors for its
 	// caller would be two answers to one question.
 }

@@ -98,7 +98,7 @@ type tgPipelineEnv struct {
 	Worker *outbound.Worker
 }
 
-// setupTelegramPipeline wires the real pipeline (ingester → engine → dispatcher)
+// setupTelegramPipeline wires the real pipeline (ingester -> engine -> outbound worker)
 // with a REAL TelegramProvider pointed at a fake Bot API, plus the API layer so
 // the inbound /telegram/webhook is reachable on the same echo. Mirrors
 // pipeline_integration_test.go's harness, swapping MockProvider for telegram.
@@ -211,10 +211,11 @@ func waitForFake(t *testing.T, count func() int, want int, what string) {
 	t.Fatalf("timeout waiting for %s (count %d >= %d)", what, count(), want)
 }
 
-// TestTelegramPipeline_SendCallbackAck drives the full feature end-to-end against
-// a fake Bot API: alert → policy → dispatcher → telegram card send (with Ack/Resolve
-// keyboard), then an inbound callback_query → ack → answerCallbackQuery, and the
-// ack-update loop → editMessageText.
+// TestTelegramPipeline_SendCallbackAck drives the full feature end-to-end
+// against a fake Bot API: an alert is escalated, admitted, and the outbound
+// worker sends the card with its Ack/Resolve keyboard; an inbound callback_query
+// acknowledges it and is answered; and the acknowledgement moves what the card
+// has to show, so the worker changes the message it already made.
 func TestTelegramPipeline_SendCallbackAck(t *testing.T) {
 	env := setupTelegramPipeline(t)
 
@@ -228,7 +229,7 @@ func TestTelegramPipeline_SendCallbackAck(t *testing.T) {
 		t.Fatalf("BindExternalIdentity: %v", err)
 	}
 
-	// 1. Ingest critical alert → engine → dispatcher → telegram channel send.
+	// 1. Ingest critical alert -> engine -> outbound worker -> telegram card.
 	payload := `{
 		"groupKey": "tg_e2e_1", "status": "firing",
 		"commonLabels": {"team": "tgteam", "severity": "critical", "alertname": "TGAlert"},
@@ -344,7 +345,7 @@ func TestTelegramPipeline_StartLinkingAndSecretGuard(t *testing.T) {
 // deliverCardForLinkedUser ingests a critical alert, runs the pipeline to
 // deliver the telegram channel card and links an admin user's telegram id.
 // Bringing the card to a later revision is the delivery worker's, not the
-// dispatcher's. Returns the AG.
+// worker's. Returns the AG.
 func deliverCardForLinkedUser(t *testing.T, env *tgPipelineEnv, ctx context.Context, dedup, email, externalID string) *model.AlertGroup {
 	t.Helper()
 	user := testutil.SeedUser(t, env.S, email)

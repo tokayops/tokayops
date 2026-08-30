@@ -111,43 +111,30 @@ func NewNotifier(st notifierStore, oncall onCallLister, catalog providerLookup,
 func (n *Notifier) Run(ctx context.Context) {
 	log.Printf("[Notifier] Starting with %v interval", n.checkInterval)
 
-	// Warm-up: populate the cache without announcing anything. It is retried
-	// until a tick completes as a call - see checkAll for why one damaged
-	// schedule is not allowed to hold it up.
 	ticker := time.NewTicker(n.checkInterval)
 	defer ticker.Stop()
 
 	for {
-		if n.checkAll(ctx) {
-			n.cacheMu.Lock()
-			n.warmedUp = true
-			n.cacheMu.Unlock()
-			log.Println("[Notifier] Warm-up complete")
-			break
-		}
-		metrics.HandoffWarmupNotComplete.Inc()
-		log.Println("[Notifier] Warm-up incomplete, retrying next tick")
-		select {
-		case <-ctx.Done():
-			log.Println("[Notifier] Shutting down during warm-up")
-			return
-		case <-ticker.C:
-		}
-	}
-
-	for {
+		n.Tick(ctx)
 		select {
 		case <-ctx.Done():
 			log.Println("[Notifier] Shutting down")
 			return
 		case <-ticker.C:
-			n.checkAll(ctx)
 		}
 	}
 }
 
-// checkAll projects every schedule once and reacts to what changed. It reports
-// whether warm-up may be considered complete.
+// Tick projects every schedule once and reacts to what changed. It reports
+// whether the tick was a complete observation.
+//
+// Exported because one tick is the unit: Run is a loop around it, and anything
+// that wants to watch the detector do its job - a test over a real database,
+// most of all - drives it here rather than racing a ticker. Warm-up is part of
+// the tick for the same reason. The FIRST complete tick announces nothing and
+// only records what it saw, because the detector announces CHANGES and a
+// schedule it has never seen has not changed; without that rule every restart
+// would DM every on-call person, one fan-out per schedule.
 //
 // That answer is decided by the CALL, not by its contents. A tick that read the
 // database and found one schedule corrupt has still observed every other
@@ -161,7 +148,7 @@ func (n *Notifier) Run(ctx context.Context) {
 // passes in silence like any first observation. Marking it "observed with nobody
 // on duty" instead would be worse - the repair would then look like a shift
 // starting after a gap and DM a group whose duty never changed.
-func (n *Notifier) checkAll(ctx context.Context) bool {
+func (n *Notifier) Tick(ctx context.Context) bool {
 	// Observed around the call whether or not it succeeds: a tick that gets
 	// slower and then starts failing is the shape this is meant to show.
 	started := time.Now()
@@ -170,6 +157,7 @@ func (n *Notifier) checkAll(ctx context.Context) bool {
 		WithLabelValues(metrics.ConsumerHandoffNotifier).Observe(time.Since(started).Seconds())
 	if err != nil {
 		log.Printf("[Notifier] Failed to project on-call state: %v", err)
+		metrics.HandoffWarmupNotComplete.Inc()
 		return false
 	}
 
@@ -184,6 +172,7 @@ func (n *Notifier) checkAll(ctx context.Context) bool {
 	}
 
 	if len(bulk.Schedules) == 0 {
+		n.observed()
 		return true
 	}
 
@@ -194,6 +183,7 @@ func (n *Notifier) checkAll(ctx context.Context) bool {
 		// the read failure it is instead of telling people they are on call
 		// for team "t-1234".
 		log.Printf("[Notifier] Failed to get teams: %v", err)
+		metrics.HandoffWarmupNotComplete.Inc()
 		return false
 	}
 	teamNames := make(map[string]string, len(teams))
@@ -204,7 +194,19 @@ func (n *Notifier) checkAll(ctx context.Context) bool {
 	for _, sc := range bulk.Schedules {
 		n.checkSchedule(ctx, sc, teamNames)
 	}
+	n.observed()
 	return true
+}
+
+// observed marks the detector as having seen the world at least once. Every
+// tick after the first is allowed to announce what changed since.
+func (n *Notifier) observed() {
+	n.cacheMu.Lock()
+	defer n.cacheMu.Unlock()
+	if !n.warmedUp {
+		log.Println("[Notifier] Warm-up complete")
+	}
+	n.warmedUp = true
 }
 
 // checkSchedule compares one schedule against what was last seen of it.

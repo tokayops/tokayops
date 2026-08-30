@@ -97,7 +97,7 @@ func assertPolicyStep(t *testing.T, s *model.EscalationStep, provider, kind, tty
 }
 
 // TestPolicyAPI_ListProviders verifies GET /api/v1/providers reflects the real
-// dispatcher registry: slack and telegram, each supporting dm + channel.
+// channel catalogue: slack and telegram, each supporting dm + channel.
 func TestPolicyAPI_ListProviders(t *testing.T) {
 	env := setupPolicyAPITest(t)
 	admin := seedGlobalAdmin(t, env.S, "admin@providers.test")

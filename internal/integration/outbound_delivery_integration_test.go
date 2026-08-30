@@ -8,9 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/handoff"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
+	"github.com/tokayops/tokayops/internal/rotation"
+	"github.com/tokayops/tokayops/internal/scheduleconfig"
 )
 
 // The promises the delivery domain makes that can only be shown end to end.
@@ -372,15 +376,16 @@ func TestWorkFromANewerBuildIsLeftWhereItIs(t *testing.T) {
 // TestNothingWritesAJobAnyMore is the checkpoint the teardown is ordered
 // around.
 //
-// The step loop still exists and nobody starts it; the executors still exist
-// and nobody calls them. That is deliberate, because it is the only state in
-// which this can be asserted about the PRODUCT rather than about a package that
-// no longer compiles: everything a running instance does is done here, and the
-// tables the job engine used stay empty.
+// The step loop still exists and nobody starts it; the executors are gone. This
+// is the state in which the claim can be made about the PRODUCT rather than
+// about a package that no longer compiles: everything a running instance does
+// is done here, and the tables the job engine used stay empty.
 //
-// Both producers, because they left at different times and for different
-// reasons - an escalation became a set of commitments, and a shift change
-// became an announcement admitted the same way.
+// Through the real producers, both of them. An alert arrives by webhook and is
+// escalated; a shift changes and the detector announces it. Building an
+// announcement by hand and admitting it would prove that SubmitBatch writes no
+// job - which nobody doubted - while a detector still writing one alongside it
+// went unnoticed.
 func TestNothingWritesAJobAnyMore(t *testing.T) {
 	env := setupIntegrationTest(t)
 	ctx := context.Background()
@@ -391,28 +396,45 @@ func TestNothingWritesAJobAnyMore(t *testing.T) {
 	waitForDeliveries(t, env.S, "no_jobs", 2)
 	stopPaging()
 
-	admission, err := keys.HandoffBatch{
-		Occurrence: keys.Occurrence{
-			Kind: keys.HandoffShiftChange, ScheduleID: "sched-no-jobs", Source: "rotation",
-			GroupID: "g-a", UserIDs: []string{"U_TEST"},
-			AssignmentStart: time.Now().Add(time.Hour).UTC(), RevisionID: "rev-1",
-		},
-		TeamName: "Backend", Timezone: "UTC",
-		GridSlotStart:      time.Now().Add(time.Hour).UTC(),
-		AssignmentEnd:      time.Now().Add(9 * time.Hour).UTC(),
-		MaxAge:             time.Hour,
-		GrammarVersion:     keys.GrammarV1,
-		FingerprintVersion: keys.CurrentBatchFingerprintVersion(),
-		Recipients:         []keys.HandoffRecipient{announceThrough("slack", "U_TEST")},
-	}.Admit()
-	if err != nil {
-		t.Fatalf("build the announcement: %v", err)
+	// A shift change, detected the way the runtime detects one. Somebody joins
+	// the group already on duty, which is a transition an edit makes and the
+	// clock has no part in.
+	catalog := providers.NewCatalog()
+	catalog.Register(providers.Capability{
+		Name:                 "slack",
+		IntegrationType:      model.IntegrationTypeSlack,
+		SupportedTargetKinds: []string{"dm", "channel"},
+	})
+	notifier := handoff.NewNotifier(env.S, env.Renderer, catalog, time.Minute)
+
+	onDuty := func(version int64, members ...string) int64 {
+		t.Helper()
+		res, err := env.Schedules.Save(ctx, "devops", scheduleconfig.SaveCommand{
+			ExpectedVersion: version,
+			Desired: pipelineConfig(
+				[]rotation.RotationGroup{{ID: pipelineGroupA, Members: members}}, ""),
+			ActorID: "U_TEST",
+		})
+		if err != nil {
+			t.Fatalf("save the schedule: %v", err)
+		}
+		return res.Version
 	}
-	if _, err := env.S.SubmitBatch(ctx, outbound.Batch{
-		Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: "notifier",
-	}); err != nil {
-		t.Fatalf("admit the announcement: %v", err)
+	for _, id := range []string{"U_TEST", "U_DEFAULT"} {
+		if err := env.S.AddTeamMember("devops", id, model.TeamMemberRoleMember); err != nil {
+			t.Fatalf("AddTeamMember %s: %v", id, err)
+		}
 	}
+
+	version := onDuty(0, "U_TEST")
+	if !notifier.Tick(ctx) {
+		t.Fatal("the detector's first tick did not complete")
+	}
+	onDuty(version, "U_TEST", "U_DEFAULT")
+	if !notifier.Tick(ctx) {
+		t.Fatal("the detector's tick did not complete")
+	}
+
 	stopHandoff := startOutboundWorker(t, env.Handoff)
 	until(t, "the announcement to be delivered", func() bool {
 		var settled int
@@ -424,6 +446,18 @@ func TestNothingWritesAJobAnyMore(t *testing.T) {
 		return settled == 1
 	})
 	stopHandoff()
+
+	// The detector really did produce it, rather than the tick passing in
+	// silence and this test asserting about empty tables alone.
+	var announced string
+	if err := env.S.GetDB().QueryRow(`
+		SELECT target_ref FROM outbound_intents WHERE key_kind = 'handoff'`).
+		Scan(&announced); err != nil {
+		t.Fatalf("read the announcement: %v", err)
+	}
+	if announced != "U_DEFAULT" {
+		t.Fatalf("the announcement went to %q, want the person who joined the shift", announced)
+	}
 
 	for _, table := range []string{"jobs", "job_stages", "job_steps"} {
 		var rows int

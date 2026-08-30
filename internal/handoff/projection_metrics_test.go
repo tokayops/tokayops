@@ -77,7 +77,7 @@ func TestADamagedScheduleIsCountedUnderTheConsumerThatMetIt(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice"))
 	env.warmUp()
 	env.oncall.setBulk(failure)
-	if !env.notifier.checkAll(context.Background()) {
+	if !env.notifier.Tick(context.Background()) {
 		t.Fatal("a damaged schedule failed the whole tick")
 	}
 

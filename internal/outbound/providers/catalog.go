@@ -30,6 +30,12 @@ type Capability struct {
 }
 
 // Carries reports whether this provider delivers to the given kind of target.
+//
+// Asked of ONE provider by name, and there is no "which providers carry a
+// direct message" beside it on purpose: from a list of the qualifying ones,
+// every absent provider looks the same, and a channel that is registered and
+// does not carry direct messages is a setting somebody can change while one
+// this build has never heard of is a channel that was taken away.
 func (c Capability) Carries(targetKind string) bool {
 	for _, kind := range c.SupportedTargetKinds {
 		if kind == targetKind {
@@ -83,18 +89,5 @@ func (c *Catalog) AllCapabilities() []Capability {
 		out = append(out, entry)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
-}
-
-// ProvidersSupporting is the names of the providers that carry targetKind,
-// sorted for stability.
-func (c *Catalog) ProvidersSupporting(targetKind string) []string {
-	out := make([]string, 0, len(c.entries))
-	for name, entry := range c.entries {
-		if entry.Carries(targetKind) {
-			out = append(out, name)
-		}
-	}
-	sort.Strings(out)
 	return out
 }

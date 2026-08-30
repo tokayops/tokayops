@@ -48,24 +48,6 @@ var (
 	}, []string{"team"})
 )
 
-// Tier 3 - Dispatcher / notification delivery
-var (
-	JobStepsProcessedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "job_steps_processed_total",
-		Help: "Total number of job steps processed.",
-	}, []string{"type", "status"})
-
-	NotificationSentTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "notification_sent_total",
-		Help: "Total number of notifications sent successfully.",
-	}, []string{"channel"})
-
-	NotificationErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "notification_errors_total",
-		Help: "Total number of notification delivery errors.",
-	}, []string{"channel", "reason"})
-)
-
 // Tier 4 - Engine
 var (
 	EngineRunsTotal = prometheus.NewCounter(prometheus.CounterOpts{
@@ -357,9 +339,6 @@ func init() {
 	prometheus.MustRegister(AlertGroupsResolvedTotal)
 
 	// Tier 3
-	prometheus.MustRegister(JobStepsProcessedTotal)
-	prometheus.MustRegister(NotificationSentTotal)
-	prometheus.MustRegister(NotificationErrorsTotal)
 
 	// Tier 4
 	prometheus.MustRegister(EngineRunsTotal)

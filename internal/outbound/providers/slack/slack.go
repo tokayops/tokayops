@@ -150,8 +150,9 @@ var ErrNoReceipt = fmt.Errorf("slack: the message to change has no readable coor
 // commitment was routed to a channel that cannot render it.
 var ErrNoContent = fmt.Errorf("slack: this commitment carries no state to render")
 
-// (ErrNoSlackUserID is gone: the dispatcher-level ErrIdentityNotLinked in
-// identity.go covers it generically.)
+// (ErrNoSlackUserID is gone: a channel preparing an attempt answers
+// "identity_not_linked" for a person with no account here, whichever provider
+// it is.)
 
 // getClient returns a Slack client, recreating it if the token changed.
 // Returns error if no token is configured or tokenSource is nil.
@@ -179,7 +180,7 @@ func (s *Provider) getClient() (*slackapi.Client, error) {
 
 // SendDM is a thin convenience wrapper over Send for callers that hold a
 // concrete *Provider and only need a fire-and-forget DM (internal/api OTP
-// and integration handlers). It is NOT part of dispatcher.Provider.
+// and integration handlers). It is not part of the delivery path.
 func (s *Provider) SendDM(ctx context.Context, userID, message string) error {
 	_, err := s.Send(ctx, providers.NotificationRequest{
 		Kind:     "slack_dm",

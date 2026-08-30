@@ -57,9 +57,16 @@ type TokenSource interface {
 	GetTelegramInteractive() bool
 }
 
-// Provider implements dispatcher.Provider against the Telegram Bot API
-// using a raw net/http client (no third-party SDK) so the timeout and the test
-// base URL are fully under our control.
+// Provider is Telegram as the API layer uses it: answering a callback, setting
+// a webhook, sending a one-off message.
+//
+// It is not the delivery channel - Handler in this package is, and the outbound
+// worker calls that. This one exists because those calls have nothing to do
+// with a commitment: they answer somebody pressing a button, or a webhook being
+// configured.
+//
+// A raw net/http client rather than a third-party SDK, so the timeout and the
+// test base URL are fully under our control.
 type Provider struct {
 	tokenSource TokenSource
 	selfURL     string               // TokayOps base URL for deep links

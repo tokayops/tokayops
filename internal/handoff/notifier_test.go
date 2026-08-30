@@ -133,7 +133,7 @@ func newNotifierEnv(t *testing.T, slackIDs map[string]string) *notifierEnv {
 func (e *notifierEnv) tick(schedules ...schedulerender.ScheduleOnCall) bool {
 	e.t.Helper()
 	e.oncall.set(schedules...)
-	return e.notifier.checkAll(context.Background())
+	return e.notifier.Tick(context.Background())
 }
 
 // warmUp runs the silent first pass and asserts it admitted nothing.
@@ -145,9 +145,6 @@ func (e *notifierEnv) warmUp(schedules ...schedulerender.ScheduleOnCall) {
 	if len(e.store.admitted) != 0 {
 		e.t.Fatalf("warm-up admitted %d announcements, want none", len(e.store.admitted))
 	}
-	e.notifier.cacheMu.Lock()
-	e.notifier.warmedUp = true
-	e.notifier.cacheMu.Unlock()
 }
 
 func (e *notifierEnv) announcements() []outbound.Batch { return e.store.admitted }
@@ -397,7 +394,7 @@ func TestNotifierDamagedScheduleIsIsolated(t *testing.T) {
 			Err:        errors.New("snapshot could not be decoded"),
 		}},
 	})
-	if !env.notifier.checkAll(context.Background()) {
+	if !env.notifier.Tick(context.Background()) {
 		t.Fatal("a damaged schedule failed the whole tick")
 	}
 
@@ -421,7 +418,7 @@ func TestNotifierCallFailureTouchesNothing(t *testing.T) {
 	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
 
 	env.oncall.fail(errors.New("could not begin transaction"))
-	if env.notifier.checkAll(context.Background()) {
+	if env.notifier.Tick(context.Background()) {
 		t.Fatal("a read failure reported success")
 	}
 	if cached := env.cached("sched-1"); cached == nil || strings.Join(cached.UserIDs, ",") != "alice" {
@@ -448,7 +445,7 @@ func TestNotifierWarmUpCompletesDespiteDamage(t *testing.T) {
 			Reason: schedulerender.FailureRevisionGap, Err: errors.New("no revision in force"),
 		}},
 	})
-	if !env.notifier.checkAll(context.Background()) {
+	if !env.notifier.Tick(context.Background()) {
 		t.Fatal("warm-up was blocked by a damaged schedule")
 	}
 	env.notifier.cacheMu.Lock()
@@ -474,7 +471,7 @@ func TestNotifierRepairedScheduleIsSilentOnce(t *testing.T) {
 			Reason: schedulerender.FailureSnapshotDecode, Err: errors.New("boom"),
 		}},
 	})
-	if !env.notifier.checkAll(context.Background()) {
+	if !env.notifier.Tick(context.Background()) {
 		t.Fatal("warm-up was blocked by a damaged schedule")
 	}
 	env.notifier.cacheMu.Lock()
@@ -504,7 +501,7 @@ func TestNotifierWarmUpBlockedByCallFailure(t *testing.T) {
 	env := newNotifierEnv(t, slackIDsFor("alice"))
 	env.oncall.fail(errors.New("no connection"))
 
-	if env.notifier.checkAll(context.Background()) {
+	if env.notifier.Tick(context.Background()) {
 		t.Fatal("warm-up completed on a tick that read nothing")
 	}
 	if env.cached("sched-1") != nil {

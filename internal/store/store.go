@@ -98,7 +98,7 @@ func (s *Store) Close() error {
 
 // GetDB returns the underlying sql.DB connection.
 // STRICTLY FOR TESTING PURPOSES ONLY.
-// Do not use this method in application code (api, engine, dispatcher).
+// Do not use this method in application code (api, engine, the producers).
 // Always add new methods to Store interface instead of bypassing it.
 func (s *Store) GetDB() *sql.DB {
 	return s.db
@@ -847,7 +847,7 @@ func (s *Store) buildSchema() error {
 	--
 	-- The step shape is (provider, target_kind) rather than the old flat
 	-- step_type. Provider validity is enforced at the API layer
-	-- against the dispatcher's capability registry - keeping it as TEXT here
+	-- against the channel catalogue - keeping it as TEXT here
 	-- avoids re-encoding the provider catalog in the DB.
 	CREATE TABLE IF NOT EXISTS escalation_steps (
 		id TEXT PRIMARY KEY,

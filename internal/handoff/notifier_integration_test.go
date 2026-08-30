@@ -130,7 +130,7 @@ func (e *handoffEnv) save(cfg rotation.ScheduleConfiguration) {
 func (e *handoffEnv) tick(d time.Duration) {
 	e.t.Helper()
 	e.now = e.now.Add(d)
-	if !e.notifier.checkAll(context.Background()) {
+	if !e.notifier.Tick(context.Background()) {
 		e.t.Fatal("tick reported a call failure")
 	}
 }
@@ -142,9 +142,6 @@ func (e *handoffEnv) warmUp() {
 	if got := e.announcements(); len(got) != 0 {
 		e.t.Fatalf("warm-up admitted %d announcements, want none", len(got))
 	}
-	e.notifier.cacheMu.Lock()
-	e.notifier.warmedUp = true
-	e.notifier.cacheMu.Unlock()
 }
 
 type announcement struct {
@@ -340,19 +337,16 @@ func TestNotifierOverPostgresTwoInstancesCreateOneJob(t *testing.T) {
 
 	// Both instances warm up on the same state.
 	env.warmUp()
-	if !second.checkAll(context.Background()) {
+	if !second.Tick(context.Background()) {
 		t.Fatal("second instance failed to warm up")
 	}
-	second.cacheMu.Lock()
-	second.warmedUp = true
-	second.cacheMu.Unlock()
 
 	// Both see the same handoff.
 	env.now = env.now.Add(24 * time.Hour)
-	if !env.notifier.checkAll(context.Background()) {
+	if !env.notifier.Tick(context.Background()) {
 		t.Fatal("first instance tick failed")
 	}
-	if !second.checkAll(context.Background()) {
+	if !second.Tick(context.Background()) {
 		t.Fatal("second instance tick failed")
 	}
 
@@ -384,17 +378,14 @@ func TestNotifierOverPostgresSecondInstanceAfterTheJobFinished(t *testing.T) {
 	second := NewNotifier(env.s, env.renderer, staticDmProviders("slack"), time.Minute)
 
 	env.warmUp()
-	if !second.checkAll(context.Background()) {
+	if !second.Tick(context.Background()) {
 		t.Fatal("second instance failed to warm up")
 	}
-	second.cacheMu.Lock()
-	second.warmedUp = true
-	second.cacheMu.Unlock()
 
 	// The first instance detects the handover and its announcement is delivered
 	// to the end.
 	env.now = env.now.Add(24 * time.Hour)
-	if !env.notifier.checkAll(context.Background()) {
+	if !env.notifier.Tick(context.Background()) {
 		t.Fatal("first instance tick failed")
 	}
 	made := env.announcements()
@@ -410,7 +401,7 @@ func TestNotifierOverPostgresSecondInstanceAfterTheJobFinished(t *testing.T) {
 	// Only now does the other instance tick. The DM has been delivered; this
 	// instance has no way of knowing that except through the claim in the
 	// table.
-	if !second.checkAll(context.Background()) {
+	if !second.Tick(context.Background()) {
 		t.Fatal("second instance tick failed")
 	}
 
