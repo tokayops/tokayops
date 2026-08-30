@@ -157,7 +157,7 @@ func (n *Notifier) Tick(ctx context.Context) bool {
 		WithLabelValues(metrics.ConsumerHandoffNotifier).Observe(time.Since(started).Seconds())
 	if err != nil {
 		log.Printf("[Notifier] Failed to project on-call state: %v", err)
-		metrics.HandoffWarmupNotComplete.Inc()
+		n.incompleteWarmUp()
 		return false
 	}
 
@@ -183,7 +183,7 @@ func (n *Notifier) Tick(ctx context.Context) bool {
 		// the read failure it is instead of telling people they are on call
 		// for team "t-1234".
 		log.Printf("[Notifier] Failed to get teams: %v", err)
-		metrics.HandoffWarmupNotComplete.Inc()
+		n.incompleteWarmUp()
 		return false
 	}
 	teamNames := make(map[string]string, len(teams))
@@ -196,6 +196,26 @@ func (n *Notifier) Tick(ctx context.Context) bool {
 	}
 	n.observed()
 	return true
+}
+
+// incompleteWarmUp counts a tick that failed BEFORE the detector had ever seen
+// the world, and only that.
+//
+// The counter answers one question: is this instance still unable to announce
+// anything at all. A failure afterwards is an ordinary bad tick - the cache
+// stands, the next tick tries again, and every transition is still detected -
+// and counting it here would turn a metric that means "this instance is deaf"
+// into one that means "something failed once", which nobody can alert on.
+
+func (n *Notifier) incompleteWarmUp() {
+	n.cacheMu.RLock()
+	warmedUp := n.warmedUp
+	n.cacheMu.RUnlock()
+	if warmedUp {
+		return
+	}
+	metrics.HandoffWarmupNotComplete.Inc()
+	log.Println("[Notifier] Warm-up incomplete, retrying next tick")
 }
 
 // observed marks the detector as having seen the world at least once. Every

@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	slackapi "github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // alertsBlockText extracts the markdown text from the severity+alerts section
@@ -52,7 +55,9 @@ func TestRegression_RenderMessageV2_Truncation(t *testing.T) {
 	alerts := make([]model.Alert, 15)
 	for i := 0; i < 15; i++ {
 		alerts[i] = model.Alert{
-			Status: model.AlertStatusFiring,
+			Fingerprint: fmt.Sprintf("fp-%d", i),
+			StartsAt:    alertStart,
+			Status:      model.AlertStatusFiring,
 			Labels: map[string]string{
 				"alertname": fmt.Sprintf("Alert%d", i+1),
 				"severity":  "critical",
@@ -61,14 +66,15 @@ func TestRegression_RenderMessageV2_Truncation(t *testing.T) {
 	}
 
 	ag := &model.AlertGroup{
+		Status:   model.AlertGroupStatusTriggered,
 		ID:       "ag-truncate",
 		Title:    "ManyAlerts",
 		Severity: "critical",
 		Alerts:   alerts,
 	}
 
-	titleBlocks := renderTitleBlocks(provider.freeze(ag, false))
-	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
+	titleBlocks := renderTitleBlocks(frozen(t, ag))
+	att := renderBodyAttachment(frozen(t, ag), provider.interactive())
 	body := alertsBlockText(t, att)
 
 	// Count bullet points (alert lines)
@@ -104,7 +110,9 @@ func TestRegression_RenderMessageV2_SmallGroup(t *testing.T) {
 	alerts := make([]model.Alert, 5)
 	for i := 0; i < 5; i++ {
 		alerts[i] = model.Alert{
-			Status: model.AlertStatusFiring,
+			Fingerprint: fmt.Sprintf("fp-%d", i),
+			StartsAt:    alertStart,
+			Status:      model.AlertStatusFiring,
 			Labels: map[string]string{
 				"alertname": fmt.Sprintf("Alert%d", i+1),
 				"severity":  "critical",
@@ -113,13 +121,14 @@ func TestRegression_RenderMessageV2_SmallGroup(t *testing.T) {
 	}
 
 	ag := &model.AlertGroup{
+		Status:   model.AlertGroupStatusTriggered,
 		ID:       "ag-small",
 		Title:    "SmallGroup",
 		Severity: "critical",
 		Alerts:   alerts,
 	}
 
-	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
+	att := renderBodyAttachment(frozen(t, ag), provider.interactive())
 	body := alertsBlockText(t, att)
 
 	// All 5 alerts should be rendered
@@ -148,7 +157,9 @@ func TestRegression_RenderMessageV2_SlackUsersMentionsPreserved(t *testing.T) {
 	alerts := make([]model.Alert, 12)
 	for i := 0; i < 12; i++ {
 		alerts[i] = model.Alert{
-			Status: model.AlertStatusFiring,
+			Fingerprint: fmt.Sprintf("fp-%d", i),
+			StartsAt:    alertStart,
+			Status:      model.AlertStatusFiring,
 			Labels: map[string]string{
 				"alertname": fmt.Sprintf("Alert%d", i+1),
 				"severity":  "critical",
@@ -159,13 +170,14 @@ func TestRegression_RenderMessageV2_SlackUsersMentionsPreserved(t *testing.T) {
 	alerts[11].Labels["slack_user"] = "U99999"
 
 	ag := &model.AlertGroup{
+		Status:   model.AlertGroupStatusTriggered,
 		ID:       "ag-mentions",
 		Title:    "MentionsTest",
 		Severity: "critical",
 		Alerts:   alerts,
 	}
 
-	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
+	att := renderBodyAttachment(frozen(t, ag), provider.interactive())
 	body := alertsBlockText(t, att)
 
 	// slack_user mention from alert #12 should still be included
@@ -181,12 +193,12 @@ func TestRegression_RenderMessageV2_SlackUsersMentionsPreserved(t *testing.T) {
 // message they used to have to themselves, so the cap that used to belong to
 // the summaries section is this one now.
 func TestRegression_AlertList_Truncation(t *testing.T) {
-	provider := &Provider{}
-
 	alerts := make([]model.Alert, 15)
 	for i := 0; i < 15; i++ {
 		alerts[i] = model.Alert{
-			Status: model.AlertStatusFiring,
+			Fingerprint: fmt.Sprintf("fp-%d", i),
+			StartsAt:    alertStart,
+			Status:      model.AlertStatusFiring,
 			Labels: map[string]string{
 				"alertname": fmt.Sprintf("Alert%d", i+1),
 			},
@@ -197,11 +209,12 @@ func TestRegression_AlertList_Truncation(t *testing.T) {
 	}
 
 	ag := &model.AlertGroup{
+		Status: model.AlertGroupStatusTriggered,
 		ID:     "ag-sum-trunc",
 		Alerts: alerts,
 	}
 
-	state := provider.freeze(ag, false)
+	state := frozen(t, ag)
 	result := buildAlertList(state.Alerts, state.DisplayTimezone)
 
 	// Count alert lines (each bullet starts with an icon)
@@ -230,14 +243,16 @@ func TestRegression_AlertList_Truncation(t *testing.T) {
 // description is shortened rather than pushing the alerts below it out of the
 // card: the body is capped, and what is cut is cut here on purpose.
 func TestRegression_AlertList_LongDescription(t *testing.T) {
-	provider := &Provider{}
 
 	longDesc := strings.Repeat("x", 500) // 500 chars
 
 	ag := &model.AlertGroup{
-		ID: "ag-long-desc",
+		Status: model.AlertGroupStatusTriggered,
+		ID:     "ag-long-desc",
 		Alerts: []model.Alert{
 			{
+				Fingerprint: "fp-long",
+				StartsAt:    alertStart,
 				Status:      model.AlertStatusFiring,
 				Labels:      map[string]string{"alertname": "LongAlert"},
 				Annotations: map[string]string{"description": longDesc},
@@ -245,7 +260,7 @@ func TestRegression_AlertList_LongDescription(t *testing.T) {
 		},
 	}
 
-	state := provider.freeze(ag, false)
+	state := frozen(t, ag)
 	result := buildAlertList(state.Alerts, state.DisplayTimezone)
 
 	if strings.Contains(result, longDesc) {
@@ -257,7 +272,7 @@ func TestRegression_AlertList_LongDescription(t *testing.T) {
 	// them apart would mean a revision raised for a difference nobody sees.
 	other := ag.Alerts[0].Annotations["description"] + "-and-a-different-tail"
 	ag.Alerts[0].Annotations["description"] = other
-	twin := provider.freeze(ag, false)
+	twin := frozen(t, ag)
 	if got := buildAlertList(twin.Alerts, twin.DisplayTimezone); got != result {
 		t.Errorf("two descriptions cut to the same value rendered differently:\n%s\n%s",
 			result, got)
@@ -269,3 +284,30 @@ func TestRegression_AlertList_LongDescription(t *testing.T) {
 		t.Errorf("Result too long (%d chars), expected the description to be cut", len(result))
 	}
 }
+
+// frozen is the state a card is drawn from, built the way admission builds it.
+//
+// Through SnapshotOf rather than by hand: what a channel renders is what the
+// domain froze, and a test that assembled the input itself could draw a card
+// from a state no producer could ever admit. There is only one door now - the
+// tolerant freeze that drew from a live row went with the executors that
+// needed it.
+func frozen(t *testing.T, ag *model.AlertGroup) keys.SnapshotInput {
+	return frozenFor(t, ag, false, true)
+}
+
+func frozenFor(t *testing.T, ag *model.AlertGroup, resolved, onboarded bool) keys.SnapshotInput {
+	t.Helper()
+	snapshot, err := providers.SnapshotOf(providers.GroupView{
+		Group: ag, IsResolved: resolved, SelfURL: "https://tokay.example",
+		TeamOnboarded: onboarded, Zone: "UTC",
+	})
+	if err != nil {
+		t.Fatalf("freeze the state: %v", err)
+	}
+	return snapshot.Content()
+}
+
+// alertStart is when the fixtures' alerts began. Fixed, because a card prints
+// it and a test that rendered "now" would assert against the clock.
+var alertStart = time.Unix(1700000000, 0).UTC()

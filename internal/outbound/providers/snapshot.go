@@ -132,54 +132,6 @@ func alertSnapshot(alert model.Alert, firstSeen time.Time) keys.AlertSnapshot {
 	return out
 }
 
-// RenderableOf is the freeze for the path that renders a row that already
-// exists, and it cannot fail.
-//
-// That path has to draw a card from whatever the row holds - an alert nobody
-// fingerprinted, an event recorded without an id - because the message is owed
-// to somebody and sending nothing is not an answer to a data problem. So the
-// gaps are filled with something unique and obviously synthetic, and the whole
-// question is kept away from admission: a producer offering state like this is
-// refused by SnapshotOf, because a digest over unidentifiable alerts cannot say
-// what was sent.
-//
-// It exists for the executors, and it dies with them.
-func RenderableOf(view GroupView) keys.SnapshotInput {
-	in := ViewOf(view)
-
-	fallback := time.Unix(0, 0).UTC()
-	if view.Group != nil && !view.Group.CreatedAt.IsZero() {
-		fallback = view.Group.CreatedAt
-	}
-	for i := range in.Alerts {
-		if in.Alerts[i].Fingerprint == "" {
-			in.Alerts[i].Fingerprint = fmt.Sprintf("unfingerprinted-%d", i)
-		}
-		if in.Alerts[i].StartsAt.IsZero() {
-			in.Alerts[i].StartsAt = fallback
-		}
-		// The same bound the protocol applies when it canonicalises. A live row
-		// rendered here has to produce the bytes an admitted snapshot would.
-		if d := in.Alerts[i].Description; d != nil {
-			cut := keys.TruncateAlertDescription(*d)
-			in.Alerts[i].Description = &cut
-		}
-	}
-
-	// A vocabulary this build does not share is a card that still has to be
-	// drawn. Admission refuses the same values, because there the substitution
-	// would be recorded as what was accepted.
-	if !keys.KnownGroupStatus(in.Status) {
-		in.Status = keys.GroupProcessing
-	}
-	for i := range in.Alerts {
-		if !keys.KnownAlertStatus(in.Alerts[i].Status) {
-			in.Alerts[i].Status = keys.AlertFiring
-		}
-	}
-	return in
-}
-
 // groupStatus maps the live status, with "being resolved right now" beating
 // whatever the row still says: the resolve path renders the closing card before
 // the status change is visible.

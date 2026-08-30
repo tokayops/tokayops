@@ -1,5 +1,6 @@
-// Package providers holds what every delivery channel needs in common: how a
-// send is asked for, and the one lookup both of them make about a team.
+// Package providers holds what every delivery channel needs in common: how long
+// a name may be, what the channels of this build can do, and how a network
+// answer is read.
 //
 // It is deliberately thin. The channels are independent of each other - a Slack
 // change must not be able to alter what Telegram sends - so what lives here is
@@ -15,28 +16,8 @@ import (
 	"net"
 	"syscall"
 
-	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 )
-
-// NotificationTarget is who a message goes to, as this system names them.
-type NotificationTarget struct {
-	Kind string // "channel" | "user"
-	ID   string
-}
-
-// NotificationRequest is a typed send request covering both alert cards (have
-// an AlertGroup, no free-form Message) and free-form DMs/OTP/handoff (have a
-// Message, no AlertGroup). Providers MUST decide behaviour from Target.Kind,
-// Editable, AlertGroup and Message - NOT from Kind, which is for
-// metrics/context only.
-type NotificationRequest struct {
-	Kind       string // step kind for metrics/context: slack_channel|slack_dm|firehose|otp|handoff
-	Target     NotificationTarget
-	Message    string            // free-form text (DM/OTP/handoff); empty for alert cards
-	AlertGroup *model.AlertGroup // optional; present for alert cards
-	Editable   bool              // true => updatable card (returns payload); false => fire-and-forget
-}
 
 // TeamLookup reports whether an alert group's team is onboarded in TokayOps,
 // meaning a row for it exists in the teams table. An alert group's team is a

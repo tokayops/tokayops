@@ -69,9 +69,7 @@ type TokenSource interface {
 // test base URL are fully under our control.
 type Provider struct {
 	tokenSource TokenSource
-	selfURL     string               // TokayOps base URL for deep links
-	teamLookup  providers.TeamLookup // nil means "assume onboarded", see teamIsOnboarded
-	baseURL     string               // Bot API base; default telegramDefaultBaseURL, overridable in tests
+	baseURL     string // Bot API base; default telegramDefaultBaseURL, overridable in tests
 	mu          sync.Mutex
 	cachedToken string
 	client      *http.Client
@@ -93,18 +91,15 @@ func WithBaseURL(u string) Option {
 	}
 }
 
-// WithTeamLookup wires the check for whether an alert group's team is onboarded.
-// Telegram never posts a card for an unonboarded team today (that path is
-// firehose, which is Slack-only), so this exists to keep the two channels from
-// drifting apart if that ever changes.
-func WithTeamLookup(lookup providers.TeamLookup) Option {
-	return func(p *Provider) { p.teamLookup = lookup }
-}
-
-func NewProvider(tokenSource TokenSource, selfURL string, opts ...Option) *Provider {
+// NewProvider builds Telegram as the API layer uses it: answering a callback,
+// setting a webhook, sending a one-off message.
+//
+// It carries no base URL of TokayOps' own and no team lookup any more. Both
+// existed for the freeze that drew a card from a live alert group, and a card
+// is drawn from the state frozen at admission now.
+func NewProvider(tokenSource TokenSource, opts ...Option) *Provider {
 	p := &Provider{
 		tokenSource: tokenSource,
-		selfURL:     selfURL,
 		baseURL:     telegramDefaultBaseURL,
 	}
 	for _, opt := range opts {
@@ -284,18 +279,17 @@ func (t *Provider) sendMessage(ctx context.Context, client *http.Client, token, 
 	return r.MessageID, nil
 }
 
-// Send is the job engine's one remaining call into this channel: a
-// fire-and-forget direct message. The same rule as Slack's, for the same
-// reason - a card posted from here would be one nothing can update, because
-// nothing here records where it landed.
-func (t *Provider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
-	if req.Target.Kind != "user" {
-		return "", fmt.Errorf("telegram: %q is not sent from here any more", req.Target.Kind)
+// SendDM is one message to one person, sent and forgotten.
+//
+// The whole of what this type sends, for the calls that are not a commitment.
+// Anything a commitment promises goes through Handler, which records where the
+// message landed so a later revision can reach it - a card posted from here
+// would be one nothing could update.
+func (t *Provider) SendDM(ctx context.Context, chatID, message string) error {
+	if message == "" {
+		return fmt.Errorf("telegram: a direct message with nothing in it")
 	}
-	if req.Message == "" {
-		return "", fmt.Errorf("telegram: user send requires a message")
-	}
-	return "", t.sendDM(ctx, req.Target.ID, req.Message)
+	return t.sendDM(ctx, chatID, message)
 }
 
 // sendDM sends a fire-and-forget plain-text DM. It needs a linked identity:
@@ -470,23 +464,6 @@ func (t *Provider) DeleteWebhook(ctx context.Context, token string) error {
 // no threads, so it is a single self-contained message.
 func RenderCard(state keys.SnapshotInput) string {
 	return assembleCard(cardBodyLines(state), cardFooter(state), telegramMaxMessageLen)
-}
-
-// freeze takes the snapshot for the path that still starts from a live row,
-// reading the configuration, the team lookup and the process zone once - here -
-// rather than halfway through drawing a card.
-func (t *Provider) freeze(ag *model.AlertGroup, isResolved bool) keys.SnapshotInput {
-	onboarded := true
-	if t.interactive() && !isResolved && ag != nil {
-		onboarded = providers.TeamIsOnboarded(t.teamLookup, ag.TeamID)
-	}
-	return providers.RenderableOf(providers.GroupView{
-		Group:         ag,
-		IsResolved:    isResolved,
-		SelfURL:       t.selfURL,
-		TeamOnboarded: onboarded,
-		Zone:          providers.ProcessZone(),
-	})
 }
 
 func (t *Provider) interactive() bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +14,6 @@ import (
 	slackapi "github.com/slack-go/slack"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
-	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // mockTokenSource implements TokenSource for testing
@@ -32,10 +32,9 @@ func (m *mockTokenSource) GetSlackInteractive() bool {
 
 // newSlackProviderForTest creates a Provider with a pre-configured client for testing
 // This allows tests to use a mock server without the provider recreating the client
-func newSlackProviderForTest(token, apiURL, selfURL string) *Provider {
+func newSlackProviderForTest(token, apiURL string) *Provider {
 	return &Provider{
 		tokenSource: &mockTokenSource{token: token},
-		selfURL:     selfURL,
 		client:      slackapi.New(token, slackapi.OptionAPIURL(apiURL)),
 		cachedToken: token,
 	}
@@ -64,14 +63,9 @@ func TestSlackProvider_SendDM_OpensConversationAndPosts(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
-	if _, err := provider.Send(context.Background(), providers.NotificationRequest{
-		Kind:     "slack_dm",
-		Target:   providers.NotificationTarget{Kind: "user", ID: "U_TARGET"},
-		Message:  "hello there",
-		Editable: false,
-	}); err != nil {
-		t.Fatalf("Send DM: %v", err)
+	provider := newSlackProviderForTest("test-token", server.URL+"/")
+	if err := provider.SendDM(context.Background(), "U_TARGET", "hello there"); err != nil {
+		t.Fatalf("send a direct message: %v", err)
 	}
 	if !opened {
 		t.Error("expected conversations.open to be called")
@@ -104,7 +98,7 @@ func TestSlackProvider_LookupByEmail(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
+	provider := newSlackProviderForTest("test-token", server.URL+"/")
 
 	id, err := provider.GetSlackUserIDByEmail(context.Background(), "found@x.test")
 	if err != nil || id != "U_FOUND" {
@@ -136,7 +130,7 @@ func TestSlackProvider_EmailBySlackID(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	provider := newSlackProviderForTest("test-token", server.URL+"/", "")
+	provider := newSlackProviderForTest("test-token", server.URL+"/")
 
 	email, err := provider.GetEmailBySlackID(context.Background(), "U_OK")
 	if err != nil || email != "ok@x.test" {
@@ -150,22 +144,13 @@ func TestSlackProvider_EmailBySlackID(t *testing.T) {
 	}
 }
 
-// TestSlackProvider_MissingToken verifies that an unconfigured token surfaces as
-// ErrNoToken on both channel and DM sends (a permanent, no-retry error).
+// TestSlackProvider_MissingToken verifies that an unconfigured token surfaces
+// as ErrNoToken - a permanent refusal, not something to retry.
 func TestSlackProvider_MissingToken(t *testing.T) {
 	provider := &Provider{tokenSource: &mockTokenSource{token: ""}}
 
-	if _, err := provider.Send(context.Background(), providers.NotificationRequest{
-		Kind: "slack_dm", Target: providers.NotificationTarget{Kind: "user", ID: "U1"}, Message: "x",
-	}); !errors.Is(err, ErrNoToken) {
+	if err := provider.SendDM(context.Background(), "U1", "x"); !errors.Is(err, ErrNoToken) {
 		t.Errorf("dm send: expected ErrNoToken, got %v", err)
-	}
-	// And a channel target is refused before the token is even looked at: a
-	// card posted from here would be one nothing can update.
-	if _, err := provider.Send(context.Background(), providers.NotificationRequest{
-		Kind: "channel", Target: providers.NotificationTarget{Kind: "channel", ID: "C1"}, AlertGroup: &model.AlertGroup{}, Editable: true,
-	}); err == nil || errors.Is(err, ErrNoToken) {
-		t.Errorf("channel send: expected a refusal of the target kind, got %v", err)
 	}
 }
 
@@ -174,7 +159,7 @@ func TestSlackProvider_MissingToken(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRenderTitleAndBody_Triggered(t *testing.T) {
-	provider := &Provider{selfURL: "https://tokayops.example.com", tokenSource: &mockTokenSource{interactive: true}}
+	provider := &Provider{tokenSource: &mockTokenSource{interactive: true}}
 	ag := &model.AlertGroup{
 		ID:       "ag-v2-1",
 		Title:    "HighCPU",
@@ -182,8 +167,10 @@ func TestRenderTitleAndBody_Triggered(t *testing.T) {
 		Severity: "critical",
 		Alerts: []model.Alert{
 			{
-				Status: model.AlertStatusFiring,
-				Labels: map[string]string{"alertname": "HighCPU", "severity": "critical"},
+				Fingerprint: "fp-5",
+				StartsAt:    alertStart,
+				Status:      model.AlertStatusFiring,
+				Labels:      map[string]string{"alertname": "HighCPU", "severity": "critical"},
 				Annotations: map[string]string{
 					"dashboard": "https://grafana/d/cpu",
 					"runbook":   "https://wiki/cpu",
@@ -192,8 +179,8 @@ func TestRenderTitleAndBody_Triggered(t *testing.T) {
 		},
 	}
 
-	title := renderTitleBlocks(provider.freeze(ag, false))
-	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
+	title := renderTitleBlocks(frozen(t, ag))
+	att := renderBodyAttachment(frozen(t, ag), provider.interactive())
 
 	// Color bar = red
 	if att.Color != "#FF0000" {
@@ -278,12 +265,12 @@ func TestRenderTitleAndBody_Acknowledged(t *testing.T) {
 		Status:   model.AlertGroupStatusAcknowledged,
 		Severity: "warning",
 		Alerts: []model.Alert{
-			{Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "HighMem", "severity": "warning"}},
+			{Fingerprint: "fp-1", StartsAt: alertStart, Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "HighMem", "severity": "warning"}},
 		},
 	}
 
-	title := renderTitleBlocks(provider.freeze(ag, false))
-	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
+	title := renderTitleBlocks(frozen(t, ag))
+	att := renderBodyAttachment(frozen(t, ag), provider.interactive())
 
 	if att.Color != "#FFA500" {
 		t.Errorf("expected orange color, got %s", att.Color)
@@ -319,12 +306,12 @@ func TestRenderTitleAndBody_Resolved(t *testing.T) {
 		Status:   model.AlertGroupStatusResolved,
 		Severity: "critical",
 		Alerts: []model.Alert{
-			{Status: model.AlertStatusResolved, Labels: map[string]string{"alertname": "DiskFull"}},
+			{Fingerprint: "fp-2", StartsAt: alertStart, Status: model.AlertStatusResolved, Labels: map[string]string{"alertname": "DiskFull"}},
 		},
 	}
 
-	title := renderTitleBlocks(provider.freeze(ag, true))
-	att := renderBodyAttachment(provider.freeze(ag, true), provider.interactive())
+	title := renderTitleBlocks(frozenFor(t, ag, true, true))
+	att := renderBodyAttachment(frozenFor(t, ag, true, true), provider.interactive())
 
 	if att.Color != "#36a64f" {
 		t.Errorf("expected green color, got %s", att.Color)
@@ -350,22 +337,27 @@ func TestRenderTitleAndBody_Resolved(t *testing.T) {
 func TestRenderTitleAndBody_WithMentions(t *testing.T) {
 	provider := &Provider{}
 	ag := &model.AlertGroup{
+		Status:   model.AlertGroupStatusTriggered,
 		ID:       "ag-v2-mentions",
 		Title:    "MentionTest",
 		Severity: "critical",
 		Alerts: []model.Alert{
 			{
-				Status: model.AlertStatusFiring,
-				Labels: map[string]string{"alertname": "A1", "slack_user": "U12345"},
+				Fingerprint: "fp-6",
+				StartsAt:    alertStart,
+				Status:      model.AlertStatusFiring,
+				Labels:      map[string]string{"alertname": "A1", "slack_user": "U12345"},
 			},
 			{
-				Status: model.AlertStatusFiring,
-				Labels: map[string]string{"alertname": "A2", "slack_user": "S67890"},
+				Fingerprint: "fp-7",
+				StartsAt:    alertStart,
+				Status:      model.AlertStatusFiring,
+				Labels:      map[string]string{"alertname": "A2", "slack_user": "S67890"},
 			},
 		},
 	}
 
-	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
+	att := renderBodyAttachment(frozen(t, ag), provider.interactive())
 
 	// Severity section (block 0 in body attachment) should contain mentions
 	severityBlock := att.Blocks.BlockSet[0].(*slackapi.SectionBlock)
@@ -378,18 +370,18 @@ func TestRenderTitleAndBody_WithMentions(t *testing.T) {
 }
 
 func TestRenderTitleAndBody_WithExternalURL(t *testing.T) {
-	provider := &Provider{}
 	ag := &model.AlertGroup{
+		Status:      model.AlertGroupStatusTriggered,
 		ID:          "ag-v2-url",
 		Title:       "URLTest",
 		Severity:    "critical",
 		ExternalURL: "https://alertmanager.example.com/alerts/1",
 		Alerts: []model.Alert{
-			{Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "A1"}},
+			{Fingerprint: "fp-3", StartsAt: alertStart, Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "A1"}},
 		},
 	}
 
-	title := renderTitleBlocks(provider.freeze(ag, false))
+	title := renderTitleBlocks(frozen(t, ag))
 
 	titleBlock := title[0].(*slackapi.SectionBlock)
 	if !strings.Contains(titleBlock.Text.Text, "https://alertmanager.example.com/alerts/1") {
@@ -403,7 +395,9 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 	longURL := "https://grafana.example.com/d/" + strings.Repeat("x", 200)
 	for i := 0; i < 10; i++ {
 		alerts = append(alerts, model.Alert{
-			Status: model.AlertStatusFiring,
+			Fingerprint: fmt.Sprintf("fp-long-%d", i),
+			StartsAt:    alertStart,
+			Status:      model.AlertStatusFiring,
 			Labels: map[string]string{
 				"alertname": "VeryLongAlertName" + strings.Repeat("A", 50),
 				"severity":  "critical",
@@ -417,10 +411,11 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 
 	provider := &Provider{}
 	ag := &model.AlertGroup{
-		ID: "ag-trunc", Title: "TruncTest", Severity: "critical", Alerts: alerts,
+		Status: model.AlertGroupStatusTriggered,
+		ID:     "ag-trunc", Title: "TruncTest", Severity: "critical", Alerts: alerts,
 	}
 
-	att := renderBodyAttachment(provider.freeze(ag, false), provider.interactive())
+	att := renderBodyAttachment(frozen(t, ag), provider.interactive())
 
 	// Alerts section block (index 0 in body attachment) must be ≤ 3000 chars
 	alertsBlock := att.Blocks.BlockSet[0].(*slackapi.SectionBlock)
@@ -443,7 +438,7 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 	}
 
 	// buildAlertList itself should NOT truncate (v1 backward compat)
-	state := provider.freeze(ag, false)
+	state := frozen(t, ag)
 	rawList := buildAlertList(state.Alerts, state.DisplayTimezone)
 	if strings.Contains(rawList, "truncated") {
 		t.Error("buildAlertList should not truncate - that's renderBodyAttachment's job")
@@ -496,68 +491,46 @@ func teamGateAlertGroup(teamID string) *model.AlertGroup {
 		Severity: "critical",
 		Status:   model.AlertGroupStatusTriggered,
 		Alerts: []model.Alert{
-			{Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "A1", "severity": "critical"}},
+			{Fingerprint: "fp-4", StartsAt: alertStart, Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "A1", "severity": "critical"}},
 		},
 	}
 }
 
-// Buttons are offered only where somebody can actually press them. An alert
-// group's team is a label off the alert, so it can name a team that was never
-// set up here, and for that team RBAC denies everyone but a global admin.
+// TestSlack_TeamGate: whether a card carries buttons, or the notice that says
+// why it cannot.
+//
+// Both halves come from the state now. Whether the team is onboarded was
+// decided when the state was frozen and travels in the snapshot; whether this
+// installation offers interactivity at all is the administrator's setting, read
+// per attempt. Nothing asks a database mid-render - the lookup that used to
+// happen here belonged to the freeze that drew a card from a live row, and a
+// blip in it could strip the buttons off every team that IS set up.
 func TestSlack_TeamGate(t *testing.T) {
 	tests := []struct {
 		name        string
 		interactive bool
 		isResolved  bool
-		lookup      *countingTeamLookup
-		useNilHook  bool
+		onboarded   bool
 		wantButtons bool
 		wantNotice  bool
-		wantCalls   int
 	}{
 		{
 			name:        "onboarded team keeps its buttons",
-			interactive: true,
-			lookup:      &countingTeamLookup{onboarded: true},
-			wantButtons: true,
-			wantCalls:   1,
+			interactive: true, onboarded: true, wantButtons: true,
 		},
 		{
-			name:        "unknown team gets the notice instead of buttons",
-			interactive: true,
-			lookup:      &countingTeamLookup{onboarded: false},
-			wantNotice:  true,
-			wantCalls:   1,
+			name:        "a team TokayOps does not have gets the notice instead of buttons",
+			interactive: true, onboarded: false, wantNotice: true,
 		},
 		{
-			// A database blip must not strip buttons from teams that are set up
-			// and announce it in the channel everyone reads.
-			name:        "a failing lookup degrades to onboarded",
-			interactive: true,
-			lookup:      &countingTeamLookup{onboarded: false, err: errors.New("db down")},
-			wantButtons: true,
-			wantCalls:   1,
-		},
-		{
-			name:        "no lookup wired up behaves as before",
-			interactive: true,
-			useNilHook:  true,
-			wantButtons: true,
-		},
-		{
-			// Interactivity off is the administrator's decision, not a fault, so
-			// it earns no notice - and no query either.
+			// Interactivity off is the administrator's decision, not a fault,
+			// so it earns no notice either.
 			name:        "interactivity off gives neither buttons nor notice",
-			interactive: false,
-			lookup:      &countingTeamLookup{onboarded: false},
-			wantCalls:   0,
+			interactive: false, onboarded: true,
 		},
 		{
-			name:        "resolved card gives neither buttons nor notice",
-			interactive: true,
-			isResolved:  true,
-			lookup:      &countingTeamLookup{onboarded: false},
-			wantCalls:   0,
+			name:        "a resolved card gives neither buttons nor notice",
+			interactive: true, isResolved: true, onboarded: true,
 		},
 	}
 
@@ -565,15 +538,10 @@ func TestSlack_TeamGate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			provider := &Provider{
 				tokenSource: &mockTokenSource{token: "tok", interactive: tt.interactive},
-				selfURL:     "https://tokay.example",
 			}
-			if !tt.useNilHook {
-				provider.teamLookup = tt.lookup.fn
-			}
+			state := frozenFor(t, teamGateAlertGroup("payments"), tt.isResolved, tt.onboarded)
 
-			att := renderBodyAttachment(
-				provider.freeze(teamGateAlertGroup("payments"), tt.isResolved),
-				provider.interactive())
+			att := renderBodyAttachment(state, provider.interactive())
 
 			if got := findActionBlock(att) != nil; got != tt.wantButtons {
 				t.Errorf("buttons present = %v, want %v", got, tt.wantButtons)
@@ -585,10 +553,6 @@ func TestSlack_TeamGate(t *testing.T) {
 			}
 			if tt.wantNotice && !strings.Contains(notice, "payments") {
 				t.Errorf("notice does not name the team label: %q", notice)
-			}
-
-			if !tt.useNilHook && tt.lookup.calls != tt.wantCalls {
-				t.Errorf("team lookup ran %d times, want %d", tt.lookup.calls, tt.wantCalls)
 			}
 		})
 	}

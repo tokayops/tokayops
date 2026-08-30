@@ -3,31 +3,16 @@ package slack
 import (
 	"context"
 	"testing"
-
-	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
-// TestTheLegacySendTakesDirectMessagesOnly. What is left of Send is the handoff
-// announcement: one direct message, nothing edits it afterwards.
-//
-// A channel target is refused rather than posted. A card sent from here would
-// record nothing about where it landed, so no revision of the alert could ever
-// reach it - and the fact that no caller asks for one today is not a reason to
-// leave the branch open. Where cards do come from is ExecuteAttempt.
-func TestTheLegacySendTakesDirectMessagesOnly(t *testing.T) {
-	provider := newSlackProviderForTest("test-token", "http://invalid.local/", "")
-	ctx := context.Background()
+// TestSendDMRefusesAnEmptyMessage. What this type sends is a direct message
+// and nothing else: no target kind to get wrong, and no way to ask it for a
+// card. A card sent from here would record nothing about where it landed, so no
+// revision of the alert could ever reach it - cards come from ExecuteAttempt.
+func TestSendDMRefusesAnEmptyMessage(t *testing.T) {
+	provider := newSlackProviderForTest("test-token", "http://invalid.local/")
 
-	if _, err := provider.Send(ctx, providers.NotificationRequest{
-		Target: providers.NotificationTarget{Kind: "carrier-pigeon", ID: "x"}}); err == nil {
-		t.Error("unknown target kind should error")
-	}
-	if _, err := provider.Send(ctx, providers.NotificationRequest{
-		Target: providers.NotificationTarget{Kind: "channel", ID: "C1"}, Editable: true}); err == nil {
-		t.Error("a card is not sent from here any more, and was accepted")
-	}
-	if _, err := provider.Send(ctx, providers.NotificationRequest{
-		Target: providers.NotificationTarget{Kind: "user", ID: "U1"}}); err == nil {
-		t.Error("user send without a message should error")
+	if err := provider.SendDM(context.Background(), "U1", ""); err == nil {
+		t.Error("a message with nothing in it was sent")
 	}
 }

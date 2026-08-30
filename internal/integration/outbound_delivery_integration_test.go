@@ -376,10 +376,11 @@ func TestWorkFromANewerBuildIsLeftWhereItIs(t *testing.T) {
 // TestNothingWritesAJobAnyMore is the checkpoint the teardown is ordered
 // around.
 //
-// The step loop still exists and nobody starts it; the executors are gone. This
-// is the state in which the claim can be made about the PRODUCT rather than
-// about a package that no longer compiles: everything a running instance does
-// is done here, and the tables the job engine used stay empty.
+// Nothing that runs writes a job any more, and the tables the job engine used
+// stay empty while a real instance does its work. The tables themselves are
+// still there - dropping them is a separate decision, taken with the upgrade in
+// hand - so this is a claim about the product rather than about a schema that
+// makes the rows impossible.
 //
 // Through the real producers, both of them. An alert arrives by webhook and is
 // escalated; a shift changes and the detector announces it. Building an

@@ -11,9 +11,6 @@ import (
 	"time"
 
 	slackapi "github.com/slack-go/slack"
-	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/outbound/keys"
-	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // ErrUserNotFound means the email has no matching Slack account.
@@ -67,8 +64,6 @@ type TokenSource interface {
 
 type Provider struct {
 	tokenSource TokenSource
-	selfURL     string               // TokayOps base URL for deep links
-	teamLookup  providers.TeamLookup // nil means "assume onboarded", see teamIsOnboarded
 	mu          sync.Mutex
 	cachedToken string
 	client      *slackapi.Client
@@ -102,35 +97,15 @@ func parseData(raw string) (*Data, bool) {
 	return &data, true
 }
 
-func NewProvider(tokenSource TokenSource, selfURL string, teamLookup providers.TeamLookup) *Provider {
-	return &Provider{
-		tokenSource: tokenSource,
-		selfURL:     selfURL,
-		teamLookup:  teamLookup,
-	}
-}
-
-// freeze takes the snapshot the renderers work from, reading the configuration,
-// the team lookup and the process zone once - at this instant - instead of
-// halfway through drawing a card.
-func (s *Provider) freeze(ag *model.AlertGroup, isResolved bool) keys.SnapshotInput {
-	onboarded := true
-	// Skipped unless it can change the card: a resolved card never carries
-	// buttons, and with interactivity off their absence is the administrator's
-	// decision rather than something to report - so neither state gets buttons
-	// OR the notice, and neither should pay a query for it, least of all while
-	// the database is the thing that is struggling.
-	if s.interactive() && !isResolved && ag != nil {
-		onboarded = providers.TeamIsOnboarded(s.teamLookup, ag.TeamID)
-	}
-
-	return providers.RenderableOf(providers.GroupView{
-		Group:         ag,
-		IsResolved:    isResolved,
-		SelfURL:       s.selfURL,
-		TeamOnboarded: onboarded,
-		Zone:          providers.ProcessZone(),
-	})
+// NewProvider builds Slack as the API layer uses it: a direct message on
+// somebody's behalf, and the interactivity setting.
+//
+// It carries no base URL and no team lookup any more. Both existed for the
+// freeze that drew a card from a live alert group, and a card is drawn from the
+// state frozen at admission now - so the links in it, and whether the team is
+// onboarded, are decided there and travel in the snapshot.
+func NewProvider(tokenSource TokenSource) *Provider {
+	return &Provider{tokenSource: tokenSource}
 }
 
 func (s *Provider) interactive() bool {
@@ -178,17 +153,23 @@ func (s *Provider) getClient() (*slackapi.Client, error) {
 	return s.client, nil
 }
 
-// SendDM is a thin convenience wrapper over Send for callers that hold a
-// concrete *Provider and only need a fire-and-forget DM (internal/api OTP
-// and integration handlers). It is not part of the delivery path.
+// SendDM is one message to one person, sent and forgotten.
+//
+// The whole of what this type sends. It exists for the calls that are not a
+// commitment - an OTP somebody just asked for, a note from an integration
+// handler - and those have no receipt, no revision and nothing to update
+// afterwards. Anything a commitment promises goes through Handler, which
+// records where the message landed so a later revision can reach it.
+//
+// It used to be a case inside a generic request shaped like a job step, with a
+// target kind, an alert group and an editable flag. Every one of those had one
+// answer here and the shape invited a caller to ask for a card nothing could
+// ever update.
 func (s *Provider) SendDM(ctx context.Context, userID, message string) error {
-	_, err := s.Send(ctx, providers.NotificationRequest{
-		Kind:     "slack_dm",
-		Target:   providers.NotificationTarget{Kind: "user", ID: userID},
-		Message:  message,
-		Editable: false,
-	})
-	return err
+	if message == "" {
+		return fmt.Errorf("slack: a direct message with nothing in it")
+	}
+	return s.sendDM(ctx, userID, message)
 }
 
 // sendDM opens a direct message channel with the user and sends a message.
@@ -254,26 +235,6 @@ func (s *Provider) GetEmailBySlackID(ctx context.Context, slackUserID string) (s
 		return "", fmt.Errorf("slack user %s has no email in profile", slackUserID)
 	}
 	return user.Profile.Email, nil
-}
-
-// Send is the job engine's one remaining call into this channel: a
-// fire-and-forget direct message, which is what a handover announcement is. It
-// returns no payload because nothing edits it afterwards.
-//
-// A channel target is refused rather than posted. It used to post an alert
-// card, and that is the delivery domain's work now - it goes through
-// ExecuteAttempt, which records where the card landed so a later revision can
-// reach it. Posting one from here would make a card nothing can update, and
-// the fact that no caller does it today is not a reason to leave the branch
-// open. Behaviour keys on Target.Kind, never on req.Kind.
-func (s *Provider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
-	if req.Target.Kind != "user" {
-		return "", fmt.Errorf("slack: %q is not sent from here any more", req.Target.Kind)
-	}
-	if req.Message == "" {
-		return "", fmt.Errorf("slack: user send requires a message")
-	}
-	return "", s.sendDM(ctx, req.Target.ID, req.Message)
 }
 
 // providers.MessageStatus holds the resolved title and color for a Slack message.

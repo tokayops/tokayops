@@ -448,10 +448,6 @@ func TestNotifierWarmUpCompletesDespiteDamage(t *testing.T) {
 	if !env.notifier.Tick(context.Background()) {
 		t.Fatal("warm-up was blocked by a damaged schedule")
 	}
-	env.notifier.cacheMu.Lock()
-	env.notifier.warmedUp = true
-	env.notifier.cacheMu.Unlock()
-
 	// The healthy schedule was seeded, so its next transition is a real one.
 	env.tick(rotationDuty("sched-healthy", "g-b", "bob"))
 	if got := env.targets(); strings.Join(got, ",") != "bob" {
@@ -474,10 +470,6 @@ func TestNotifierRepairedScheduleIsSilentOnce(t *testing.T) {
 	if !env.notifier.Tick(context.Background()) {
 		t.Fatal("warm-up was blocked by a damaged schedule")
 	}
-	env.notifier.cacheMu.Lock()
-	env.notifier.warmedUp = true
-	env.notifier.cacheMu.Unlock()
-
 	if env.cached("sched-1") != nil {
 		t.Fatal("the damaged schedule was cached; it must stay unknown")
 	}
@@ -491,6 +483,52 @@ func TestNotifierRepairedScheduleIsSilentOnce(t *testing.T) {
 	env.tick(rotationDuty("sched-1", "g-b", "bob"))
 	if got := env.targets(); strings.Join(got, ",") != "bob" {
 		t.Fatalf("notified %v, want the first transition after the repair", got)
+	}
+}
+
+// TestOnlyAWarmUpFailureIsCountedAsOne.
+//
+// The counter answers "is this instance still unable to announce anything at
+// all", and an alert is written against exactly that. A tick that fails after
+// the detector has seen the world is an ordinary bad tick: the cache stands,
+// the next tick tries again, and nothing was missed - counted here, it would
+// turn a metric that means "this instance is deaf" into one that means
+// "something failed once".
+func TestOnlyAWarmUpFailureIsCountedAsOne(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+
+	// Before the first complete tick, a failure is exactly what this counts.
+	before := counterValue(t, metrics.HandoffWarmupNotComplete)
+	env.oncall.fail(errors.New("connection reset"))
+	if env.notifier.Tick(context.Background()) {
+		t.Fatal("a tick that read nothing reported itself complete")
+	}
+	if got := counterValue(t, metrics.HandoffWarmupNotComplete) - before; got != 1 {
+		t.Fatalf("a failed warm-up moved the counter by %v, want 1", got)
+	}
+
+	// Warmed up.
+	env.oncall.fail(nil)
+	if !env.tick(rotationDuty("sched-1", "g-a", "alice")) {
+		t.Fatal("the warm-up tick did not complete")
+	}
+
+	// And afterwards, the same failure is not a warm-up failure.
+	before = counterValue(t, metrics.HandoffWarmupNotComplete)
+	env.oncall.fail(errors.New("connection reset"))
+	if env.notifier.Tick(context.Background()) {
+		t.Fatal("a tick that read nothing reported itself complete")
+	}
+	if got := counterValue(t, metrics.HandoffWarmupNotComplete) - before; got != 0 {
+		t.Fatalf("a failure after warm-up moved the counter by %v", got)
+	}
+
+	// The cache stood through it, so the transition that follows is still
+	// detected: nothing was missed, which is why it was not counted.
+	env.oncall.fail(nil)
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	if got := env.targets(); strings.Join(got, ",") != "bob" {
+		t.Fatalf("notified %v after a failed tick, want the transition", got)
 	}
 }
 

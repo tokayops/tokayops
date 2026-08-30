@@ -343,26 +343,14 @@ func main() {
 	// rather than read again by whoever sends it.
 	eng := engine.NewEngine(st, scheduleRenderer, integrationCache, cfg)
 
-	// Dispatcher
+	// What the channels of this build can do. Read by the policy editor, and by
+	// the detector before it promises an announcement.
 	channels := providers.NewCatalog()
-
-	// An alert group's team is a label carried by the alert, not a foreign key,
-	// so it can name a team that was never set up here. Both providers ask this
-	// before offering Ack/Resolve.
-	teamLookup := func(teamID string) (bool, error) {
-		if _, err := st.GetTeamByID(teamID); err != nil {
-			if err == sql.ErrNoRows {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}
 
 	// The Slack provider is the API layer's SlackMessenger. Nothing resolves it
 	// through the catalogue any more: what the catalogue answers is what a
 	// channel CAN do, and who holds the instance is the wiring's business.
-	slackProvider := slackprovider.NewProvider(integrationCache, cfg.Global.SelfURL, teamLookup)
+	slackProvider := slackprovider.NewProvider(integrationCache)
 	channels.Register(providers.Capability{
 		Name:                 "slack",
 		IntegrationType:      model.IntegrationTypeSlack,
@@ -373,7 +361,7 @@ func main() {
 	// telegram appear in the policy editor and in the handoff fan-out; the
 	// incoming webhook and interactivity need the provider in the API layer as
 	// well, the way slackProvider is wired above.
-	telegramProvider := telegramprovider.NewProvider(integrationCache, cfg.Global.SelfURL, telegramprovider.WithTeamLookup(teamLookup))
+	telegramProvider := telegramprovider.NewProvider(integrationCache)
 	channels.Register(providers.Capability{
 		Name:                 "telegram",
 		IntegrationType:      model.IntegrationTypeTelegram,

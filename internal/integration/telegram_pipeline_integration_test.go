@@ -163,7 +163,7 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 	// through it any more: the engine admits commitments and the outbound
 	// worker below delivers them through the channel handler, against the same
 	// fake Bot API.
-	tg := telegramprovider.NewProvider(cache, "https://tokay.e2e", telegramprovider.WithBaseURL(server.URL))
+	tg := telegramprovider.NewProvider(cache, telegramprovider.WithBaseURL(server.URL))
 	channels.Register(providers.Capability{
 		Name: "telegram", IntegrationType: model.IntegrationTypeTelegram, SupportedTargetKinds: []string{"dm", "channel"},
 	})

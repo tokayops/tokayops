@@ -69,20 +69,22 @@ func TestTheFallbacksAreResolvedOnce(t *testing.T) {
 	}
 }
 
-// TestAdmissionRefusesWhatRenderingTolerates is the line between the two doors.
-func TestAdmissionRefusesWhatRenderingTolerates(t *testing.T) {
+// TestAdmissionRefusesStateNobodyCanTellApart.
+//
+// There used to be a second, tolerant freeze beside this one, for a path that
+// drew a card from a live row and had to draw SOMETHING - it invented a
+// fingerprint rather than refuse. That path is gone with the job engine, and
+// with it the question of what a card made from unidentifiable alerts would
+// mean under a digest saying it was what got sent.
+//
+// One door now, and it refuses.
+func TestAdmissionRefusesStateNobodyCanTellApart(t *testing.T) {
 	group := liveGroup()
 	group.Alerts[0].Fingerprint = ""
 	group.TimelineEvents[0].ID = ""
-	view := GroupView{Group: group, Zone: "UTC"}
 
-	if _, err := SnapshotOf(view); err == nil {
+	if _, err := SnapshotOf(GroupView{Group: group, Zone: "UTC"}); err == nil {
 		t.Fatal("a producer was allowed to admit state whose alerts cannot be told apart")
-	}
-
-	state := RenderableOf(view)
-	if len(state.Alerts) != 1 || state.Alerts[0].Fingerprint == "" {
-		t.Fatalf("rendering a live row dropped an alert nobody fingerprinted: %+v", state.Alerts)
 	}
 }
 
@@ -106,10 +108,11 @@ func TestTheProcessZoneNeverReachesASnapshot(t *testing.T) {
 	}
 }
 
-// TestAVocabularyThisBuildDoesNotShare. The two doors differ here as well: a
-// status nobody declared is refused at admission, because a substitution would
-// be recorded as what was accepted - a message about a state the alert was
-// never in, under a digest saying otherwise. The card still gets drawn.
+// TestAVocabularyThisBuildDoesNotShare. A status nobody declared is refused at
+// admission, because a substitution would be recorded as what was accepted - a
+// message about a state the alert was never in, under a digest saying
+// otherwise. What the freeze does NOT do is repair it on the way past, which is
+// what makes admission able to see it at all.
 func TestAVocabularyThisBuildDoesNotShare(t *testing.T) {
 	group := liveGroup()
 	group.Status = model.AlertGroupStatus("quarantined")
@@ -128,14 +131,4 @@ func TestAVocabularyThisBuildDoesNotShare(t *testing.T) {
 		t.Fatalf("the unknown status became %q before anybody could refuse it", faithful.Status)
 	}
 
-	renderable := RenderableOf(view)
-	if renderable.Status != keys.GroupProcessing {
-		t.Fatalf("the card cannot be drawn: status is %q", renderable.Status)
-	}
-	if renderable.Alerts[0].Status != keys.AlertFiring {
-		t.Fatalf("the alert is %q", renderable.Alerts[0].Status)
-	}
-	if _, err := keys.NewRenderSnapshot(renderable); err != nil {
-		t.Fatalf("the renderable state is still not renderable: %v", err)
-	}
 }
