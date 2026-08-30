@@ -48,12 +48,6 @@ const (
 	// NotificationClaimInterval is how often the queue is looked at.
 	NotificationClaimInterval = time.Second
 
-	// NotificationLockTimeout bounds how long a point mutation waits for a row
-	// somebody else is holding. Well inside the lease, because a mutation that
-	// waited longer than the lease it is protecting would be applying a
-	// decision that has already been reassigned.
-	NotificationLockTimeout = 3 * time.Second
-
 	// NotificationPrepareDeadline bounds resolving an address, credentials and
 	// configuration. That is local work measured in milliseconds; the deadline
 	// is here so a dependency that hangs costs one slot for five seconds
@@ -107,10 +101,6 @@ type Policy struct {
 	// ClaimInterval is how often the queue is looked at.
 	ClaimInterval time.Duration
 
-	// LockTimeout bounds how long a point mutation waits for a row somebody
-	// else is holding. Well inside the lease.
-	LockTimeout time.Duration
-
 	// PrepareDeadline bounds resolving an address, credentials and
 	// configuration.
 	PrepareDeadline time.Duration
@@ -142,7 +132,6 @@ func PolicyOf(family string) (Policy, error) {
 			AttemptDeadline:  NotificationAttemptDeadline,
 			PoolSize:         NotificationPoolSize,
 			ClaimInterval:    NotificationClaimInterval,
-			LockTimeout:      NotificationLockTimeout,
 			PrepareDeadline:  NotificationPrepareDeadline,
 			RecordDeadline:   NotificationRecordDeadline,
 			ShutdownDeadline: NotificationShutdownDeadline,
@@ -154,7 +143,6 @@ func PolicyOf(family string) (Policy, error) {
 			AttemptDeadline:  HandoffAttemptDeadline,
 			PoolSize:         HandoffPoolSize,
 			ClaimInterval:    HandoffClaimInterval,
-			LockTimeout:      HandoffLockTimeout,
 			PrepareDeadline:  HandoffPrepareDeadline,
 			RecordDeadline:   HandoffRecordDeadline,
 			ShutdownDeadline: HandoffShutdownDeadline,
@@ -195,7 +183,6 @@ const (
 	// HandoffClaimInterval is how often the queue is looked at.
 	HandoffClaimInterval = 5 * time.Second
 
-	HandoffLockTimeout     = NotificationLockTimeout
 	HandoffPrepareDeadline = NotificationPrepareDeadline
 	HandoffRecordDeadline  = NotificationRecordDeadline
 
@@ -205,6 +192,17 @@ const (
 		HandoffRecordDeadline + HandoffAttemptDeadline +
 		HandoffRecordDeadline + 10*time.Second
 )
+
+// OutboundLockTimeout bounds how long a point mutation waits for a row somebody
+// else is holding.
+//
+// Not part of a family's policy, and deliberately: it is set once per store,
+// on every statement that store runs, so a per-family value would be a number
+// the tests could change and the database would never see. What has to be true
+// of it is the same for every family, and it is asserted as such - a mutation
+// that waited longer than the lease it protects would be applying a decision
+// that has already been reassigned to somebody else.
+const OutboundLockTimeout = 3 * time.Second
 
 const (
 	backoffBase = 2 * time.Second

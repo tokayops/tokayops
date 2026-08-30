@@ -18,7 +18,27 @@ func TestTheDeadlinesFitInsideEachOther(t *testing.T) {
 				t.Fatalf("no policy for %s: %v", family, err)
 			}
 
+			// The whole chain, against the lease. Not the attempt alone: the
+			// lease starts when the commitment is CLAIMED, and everything from
+			// resolving an address to writing the result down happens under
+			// it. A chain that outgrew the lease would let somebody else
+			// reclaim the commitment and start again while this worker is
+			// still recording the answer it already has.
+			//
+			// This is the invariant, and the shutdown one below cannot stand in
+			// for it: the shutdown deadline is defined as this same sum, so
+			// growing any step grows both sides of that comparison and it stays
+			// true while this one breaks.
 			chain := p.PrepareDeadline + p.RecordDeadline + p.AttemptDeadline + p.RecordDeadline
+			if chain >= p.Lease {
+				t.Errorf("one commitment may take %s under a lease of %s, so it can "+
+					"still be in flight when somebody else is told to redo it",
+					chain, p.Lease)
+			}
+			// And the shutdown deadline against the same sum. Written as a
+			// number rather than as this sum it was once already shorter than
+			// the chain it was meant to cover, and a worker that walked away
+			// early abandons a call whose answer has just arrived.
 			if p.ShutdownDeadline < chain {
 				t.Errorf("a stopping worker waits %s for work that may take %s; the "+
 					"difference is calls whose answers are thrown away",
@@ -29,15 +49,18 @@ func TestTheDeadlinesFitInsideEachOther(t *testing.T) {
 					"running when somebody else is told to redo it",
 					p.AttemptDeadline, p.Lease)
 			}
-			if p.LockTimeout >= p.Lease {
+			// The lock timeout is one store-wide number rather than a policy
+			// field, so it is compared against every family here: what must be
+			// true of it is true of all of them at once.
+			if OutboundLockTimeout >= p.Lease {
 				t.Errorf("a mutation may wait %s for a row under a lease of %s, and would "+
 					"then apply a decision that has been reassigned",
-					p.LockTimeout, p.Lease)
+					OutboundLockTimeout, p.Lease)
 			}
-			if p.RecordDeadline <= p.LockTimeout {
+			if p.RecordDeadline <= OutboundLockTimeout {
 				t.Errorf("recording gives up after %s while the store waits %s for a "+
 					"contended row, so the refusal would come from the context rather "+
-					"than the rule", p.RecordDeadline, p.LockTimeout)
+					"than the rule", p.RecordDeadline, OutboundLockTimeout)
 			}
 			if p.PoolSize < 1 {
 				t.Errorf("a pool of %d holds no leases, so this family is a queue "+

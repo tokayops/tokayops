@@ -1491,7 +1491,7 @@ func lockAlertGroupTx(ctx context.Context, tx *sql.Tx, alertGroupID string) erro
 // timeout, by contrast, is a retry of a mutation that classifies itself.
 func setLockTimeoutTx(ctx context.Context, tx *sql.Tx, wait time.Duration) error {
 	if wait <= 0 {
-		wait = outbound.NotificationLockTimeout
+		wait = outbound.OutboundLockTimeout
 	}
 	_, err := tx.ExecContext(ctx,
 		fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", wait.Milliseconds()))

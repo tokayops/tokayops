@@ -145,6 +145,33 @@ func TestATeamNameCannotBreakOutOfTheAnnouncement(t *testing.T) {
 	}
 }
 
+// TestALongTeamNameIsCutBeforeItIsEscaped. The name is the only part of an
+// announcement with no length of its own, and it is bounded by the same rule a
+// card's team label is - by runes, before escaping, so a cut can sever neither
+// a character nor an entity.
+func TestALongTeamNameIsCutBeforeItIsEscaped(t *testing.T) {
+	api := newSlackAPI(t)
+	handler := handlerFor(api)
+
+	long := strings.Repeat("&", 400)
+	if _, err := handler.ExecuteAttempt(context.Background(),
+		announcementCall(t, announcementPayload(t, keys.HandoffShiftChange, long))); err != nil {
+		t.Fatalf("send the announcement: %v", err)
+	}
+
+	text, _ := api.posts[0]["text"].(string)
+	first := strings.SplitN(text, "\n", 2)[0]
+	if !strings.Contains(first, "…") {
+		t.Errorf("a name over the limit arrived whole: %q", first)
+	}
+	if strings.Contains(first, "&am`") || strings.HasSuffix(first, "&am") {
+		t.Errorf("the cut went through an entity: %q", first)
+	}
+	if !strings.HasSuffix(first, "`.") {
+		t.Errorf("the name broke out of its span: %q", first)
+	}
+}
+
 // TestAnAnnouncementNobodyCanReadStopsBeforeTheNetwork: the same rule the
 // escalation payload has. A shift change nothing can read is a refusal with
 // proof, not a call whose fate is unknown.

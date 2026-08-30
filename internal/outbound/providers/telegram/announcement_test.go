@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -148,6 +149,80 @@ func TestATeamNameCannotBreakOutOfTheAnnouncement(t *testing.T) {
 	}
 }
 
+// TestALongTeamNameStillSendsAndStillReads.
+//
+// The name is the only part of an announcement with no length of its own, and
+// nothing between the form that accepts it and the Bot API bounds it. Whole, a
+// long enough one puts the message over the API's hard limit; the API answers
+// "message is too long", and an announcement that was perfectly valid ends as a
+// permanent failure for every person on that team, every shift, until somebody
+// renames it.
+//
+// The cut happens before the escaping, so what arrives is still valid HTML - a
+// cut through "&amp;" would leave "&am", which Telegram refuses for a different
+// reason and just as permanently.
+func TestALongTeamNameStillSendsAndStillReads(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	// Every rune of it escapes to five characters, which is the worst case for
+	// the length, and a cut landing inside one is the worst case for the shape.
+	// Long enough to be cut, and shaped so the cut lands where the escaping
+	// changed the length: eighty runes of the NAME end inside the run of
+	// ampersands, so a cut applied afterwards would fall in the middle of an
+	// entity instead.
+	long := strings.Repeat("a", 79) + strings.Repeat("&", 400)
+	if _, err := handler.ExecuteAttempt(context.Background(),
+		announcementCall(t, announcementPayload(t, keys.HandoffShiftChange, long))); err != nil {
+		t.Fatalf("send the announcement: %v", err)
+	}
+
+	text, _ := api.calls[0]["text"].(string)
+	if bare := looseAmpersand(text); bare != "" {
+		t.Errorf("the cut left %q, which is not an entity Telegram will accept:\n%s",
+			bare, first(text))
+	}
+	if len(text) > telegramMaxMessageLen {
+		t.Fatalf("the message is %d bytes, over the %d the Bot API takes",
+			len(text), telegramMaxMessageLen)
+	}
+	// Cut, and said so.
+	first := strings.SplitN(text, "\n", 2)[0]
+	if !strings.Contains(first, "…") {
+		t.Errorf("a name over the limit arrived whole: %q", first)
+	}
+	if !strings.HasSuffix(first, "</b>.") {
+		t.Errorf("the announcement's own markup was disturbed: %q", first)
+	}
+	// And the message still says what it is for.
+	if !strings.Contains(text, "Assignment ends: Tue May 5, 11:00 (Asia/Bangkok)") {
+		t.Errorf("the shift's own facts were cut instead of the name:\n%s", text)
+	}
+}
+
+// TestATeamNameIsCutOnACharacterBoundary: by runes, not by bytes. A cut through
+// a multi-byte character leaves a byte sequence that is not text at all, and
+// what Telegram does with it is not worth finding out.
+func TestATeamNameIsCutOnACharacterBoundary(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	long := strings.Repeat("я", 200)
+	if _, err := handler.ExecuteAttempt(context.Background(),
+		announcementCall(t, announcementPayload(t, keys.HandoffShiftChange, long))); err != nil {
+		t.Fatalf("send the announcement: %v", err)
+	}
+
+	text, _ := api.calls[0]["text"].(string)
+	if !utf8.ValidString(text) {
+		t.Fatal("the message is not valid UTF-8")
+	}
+	if strings.Count(text, "я") != maxTeamNameLen {
+		t.Errorf("the name was cut to %d runes, want %d",
+			strings.Count(text, "я"), maxTeamNameLen)
+	}
+}
+
 // TestAnAnnouncementNobodyCanReadStopsBeforeTheNetwork: the same rule the
 // escalation payload has. A shift change nothing can read is a refusal with
 // proof, not a call whose fate is unknown.
@@ -225,3 +300,36 @@ func TestAnAnnouncementWrittenForSomebodyElseIsRefused(t *testing.T) {
 		t.Fatalf("an announcement written for somebody else was %s", prepared.Outcome())
 	}
 }
+
+// looseAmpersand answers with the first ampersand that does not begin one of
+// the entities html.EscapeString produces.
+//
+// Telegram parses the whole message as HTML and refuses all of it over one of
+// these, so a message carrying one is a message that never arrives - which is
+// what a cut applied AFTER escaping leaves behind.
+func looseAmpersand(text string) string {
+	entities := []string{"&amp;", "&lt;", "&gt;", "&#34;", "&#39;"}
+	for i := 0; i < len(text); i++ {
+		if text[i] != '&' {
+			continue
+		}
+		whole := false
+		for _, entity := range entities {
+			if strings.HasPrefix(text[i:], entity) {
+				whole = true
+				i += len(entity) - 1
+				break
+			}
+		}
+		if !whole {
+			end := i + 6
+			if end > len(text) {
+				end = len(text)
+			}
+			return text[i:end]
+		}
+	}
+	return ""
+}
+
+func first(text string) string { return strings.SplitN(text, "\n", 2)[0] }

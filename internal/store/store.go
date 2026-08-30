@@ -114,7 +114,7 @@ func NewStore(dsn string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: db, lockTimeout: outbound.NotificationLockTimeout}, nil
+	return &Store{db: db, lockTimeout: outbound.OutboundLockTimeout}, nil
 }
 
 // legacyColumnMigrationsLock is what makes the block below safe for instances

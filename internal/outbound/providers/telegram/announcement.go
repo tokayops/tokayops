@@ -24,7 +24,7 @@ import (
 // and the emphasis would be literal angle brackets.
 func announcement(payload keys.HandoffPayloadV1) string {
 	at := func(t time.Time) string { return displayed(t, payload.Timezone) }
-	team := html.EscapeString(payload.TeamName)
+	team := escapedTeamName(payload.TeamName)
 
 	headline := fmt.Sprintf("📣 You are now on-call for team <b>%s</b>.\n\n", team)
 	if payload.Kind == keys.HandoffAddedToActiveShift {
@@ -60,4 +60,32 @@ func displayed(t time.Time, zone string) string {
 		loc = time.UTC
 	}
 	return html.EscapeString(fmt.Sprintf("%s (%s)", t.In(loc).Format("Mon Jan 2, 15:04"), zone))
+}
+
+// maxTeamNameLen bounds the one field of an announcement that has no length of
+// its own.
+//
+// Everything else here is this package's own words and three formatted
+// instants; the team name is free text, and nothing between the form that
+// accepts it and this line says how long it may be. Left whole, a team called
+// something long enough makes the message exceed telegramMaxMessageLen, the Bot
+// API answers "message is too long", and an announcement that was perfectly
+// valid ends as a permanent failure - for every person on that team, every
+// shift, until somebody renames it.
+//
+// Eighty runes is what the Slack card allows a team label, and the same number
+// is used here so one team name does not arrive whole in one channel and cut in
+// the other.
+const maxTeamNameLen = 80
+
+// escapedTeamName makes a team name safe to put inside a tag, and short enough
+// that the message it goes into can be sent.
+//
+// Cut BEFORE escaping, so a cut can never sever an entity and leave "&am"
+// behind - and by runes, so it cannot sever a character either.
+func escapedTeamName(name string) string {
+	if r := []rune(name); len(r) > maxTeamNameLen {
+		name = string(r[:maxTeamNameLen]) + "…"
+	}
+	return html.EscapeString(name)
 }
