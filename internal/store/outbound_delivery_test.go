@@ -1487,69 +1487,117 @@ func TestAnAnnouncementIsDeliveredWithNoRevisionAnywhere(t *testing.T) {
 
 // TestAPayloadThatIsNotTheOneAdmitted.
 //
-// The third way, and the one nothing else catches: an announcement swapped for
-// another announcement. It has the right kind, a schema this build knows, bytes
-// that canonicalise and the recipient the columns name - every check a payload
-// meets on its way to a provider - and it is not what the domain promised. Sent,
-// it tells a person about a shift nobody committed to telling them about.
+// The third way a payload can be wrong, and the one nothing else catches: an
+// announcement swapped for another announcement, a card swapped for another
+// card. It has the right kind, a schema this build knows, bytes that
+// canonicalise and the recipient the columns name - every check a payload meets
+// on its way to a provider - and it is not what the domain promised.
 //
-// The second half is the control. The same bytes, with the digest that belongs
-// to them, go out: what refuses the first half is the comparison and not some
-// property of the payload itself.
+// Both kinds, because the two are drawn from different things and the payload
+// is the one piece they share. A handover IS its payload; a card is drawn from
+// the alert's state, and its payload still decides where the card goes and
+// whether anybody can press anything on it. Checking only the first would leave
+// a page that arrives with its buttons quietly turned off.
+//
+// The second half of each is the control. The same bytes, with the digest that
+// belongs to them, go out: what refuses the first half is the comparison and
+// not some property of the payload itself.
 func TestAPayloadThatIsNotTheOneAdmitted(t *testing.T) {
-	const other = `{"kind":"handoff","team_name":"Platform","schedule_id":"sched-2",` +
-		`"timezone":"UTC","grid_slot_start":"2026-05-04T11:00:00Z",` +
-		`"assignment_start":"2026-05-04T11:00:00Z","assignment_end":"2026-05-04T19:00:00Z"}`
+	for _, tc := range []struct {
+		name string
+		// swapped admits a commitment and then moves its payload to another
+		// valid one, answering with the commitment and the endpoint it is
+		// bound to.
+		swapped func(t *testing.T, s *Store) (string, string)
+		claim   func(t *testing.T, s *Store, intentID string) string
+	}{
+		{
+			name: "an announcement",
+			swapped: func(t *testing.T, s *Store) (string, string) {
+				t.Helper()
+				const other = `{"kind":"handoff","team_name":"Platform",` +
+					`"schedule_id":"sched-2","timezone":"UTC",` +
+					`"grid_slot_start":"2026-05-04T11:00:00Z",` +
+					`"assignment_start":"2026-05-04T11:00:00Z",` +
+					`"assignment_end":"2026-05-04T19:00:00Z"}`
+				return announcementCarrying(t, s, 1, other), "U0001"
+			},
+			claim: claimHandoff,
+		},
+		{
+			name: "a card",
+			swapped: func(t *testing.T, s *Store) (string, string) {
+				t.Helper()
+				agID := outboundGroup(t, s)
+				intentID := admitOne(t, s, agID)[0]
+				// One flag, and the recipient untouched: what changes is
+				// whether the page that arrives can be acted on.
+				exec(t, s, `
+					UPDATE outbound_intents
+					SET payload = jsonb_set(payload, '{interactive}', 'false')
+					WHERE id = $1`, intentID)
+				return intentID, "C0001"
+			},
+			claim: claimOne,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			begin := func(t *testing.T, s *Store, intentID, endpoint string) outbound.BeginAttemptResult {
+				t.Helper()
+				token := tc.claim(t, s, intentID)
+				result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+					IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+					Preparation: outbound.PreparationReady, BoundEndpoint: endpoint,
+				})
+				if err != nil {
+					t.Fatalf("begin: %v", err)
+				}
+				return result
+			}
 
-	begin := func(t *testing.T, s *Store, intentID string) outbound.BeginAttemptResult {
-		t.Helper()
-		token := claimHandoff(t, s, intentID)
-		result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
-			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
-			Preparation: outbound.PreparationReady, BoundEndpoint: "U0001",
+			t.Run("in its place", func(t *testing.T) {
+				s := setupTestDB(t)
+				s.SetRenderEnvironment("https://tokay.example", "UTC")
+				intentID, endpoint := tc.swapped(t, s)
+
+				result := begin(t, s, intentID, endpoint)
+				if result.Outcome != outbound.BeginPreparedPermanent {
+					t.Fatalf("a payload nobody promised answered %q", result.Outcome)
+				}
+				if status := statusOf(t, s, intentID); status != outbound.StatusPermanentFailed {
+					t.Fatalf("the commitment is %s, and the wrong payload is still owed", status)
+				}
+			})
+
+			t.Run("the same bytes, admitted", func(t *testing.T) {
+				s := setupTestDB(t)
+				s.SetRenderEnvironment("https://tokay.example", "UTC")
+				intentID, endpoint := tc.swapped(t, s)
+
+				// What admission would have written for these bytes. Taken from
+				// the row rather than composed here, so the digest is over
+				// exactly what the attempt will read.
+				var kind string
+				var schemaVersion int
+				var stored []byte
+				if err := s.db.QueryRow(`
+					SELECT key_kind, payload_schema_version, payload
+					FROM outbound_intents WHERE id = $1`, intentID).
+					Scan(&kind, &schemaVersion, &stored); err != nil {
+					t.Fatalf("read the payload back: %v", err)
+				}
+				digest, err := keys.PayloadDigest(keys.Kind(kind), schemaVersion, stored)
+				if err != nil {
+					t.Fatalf("digest the payload: %v", err)
+				}
+				exec(t, s, `UPDATE outbound_intents SET payload_digest = $2 WHERE id = $1`,
+					intentID, digest)
+
+				result := begin(t, s, intentID, endpoint)
+				if result.Outcome != outbound.BeginStarted {
+					t.Fatalf("a payload that IS the one admitted answered %q", result.Outcome)
+				}
+			})
 		})
-		if err != nil {
-			t.Fatalf("begin: %v", err)
-		}
-		return result
 	}
-
-	t.Run("another announcement in its place", func(t *testing.T) {
-		s := setupTestDB(t)
-		s.SetRenderEnvironment("https://tokay.example", "UTC")
-		intentID := announcementCarrying(t, s, 1, other)
-
-		if result := begin(t, s, intentID); result.Outcome != outbound.BeginPreparedPermanent {
-			t.Fatalf("an announcement nobody promised answered %q", result.Outcome)
-		}
-		if status := statusOf(t, s, intentID); status != outbound.StatusPermanentFailed {
-			t.Fatalf("the commitment is %s, and the wrong announcement is still owed", status)
-		}
-	})
-
-	t.Run("the same bytes, admitted", func(t *testing.T) {
-		s := setupTestDB(t)
-		s.SetRenderEnvironment("https://tokay.example", "UTC")
-		intentID := announcementCarrying(t, s, 1, other)
-
-		// What admission would have written for these bytes. Taken from the row
-		// rather than composed here, so the digest is over exactly what the
-		// attempt will read.
-		var stored []byte
-		if err := s.db.QueryRow(
-			`SELECT payload FROM outbound_intents WHERE id = $1`, intentID).
-			Scan(&stored); err != nil {
-			t.Fatalf("read the payload back: %v", err)
-		}
-		digest, err := keys.PayloadDigest(keys.KindHandoff, 1, stored)
-		if err != nil {
-			t.Fatalf("digest the payload: %v", err)
-		}
-		exec(t, s, `UPDATE outbound_intents SET payload_digest = $2 WHERE id = $1`,
-			intentID, digest)
-
-		if result := begin(t, s, intentID); result.Outcome != outbound.BeginStarted {
-			t.Fatalf("an announcement that IS the one admitted answered %q", result.Outcome)
-		}
-	})
 }

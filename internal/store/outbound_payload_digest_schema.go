@@ -83,7 +83,8 @@ func applyPayloadDigest(ctx context.Context, tx *sql.Tx) error {
 			"%d commitment(s) still have no payload digest after the backfill", missing)
 	}
 
-	// 4-8. NOT NULL, then the rules.
+	// 4-11. Required, then the seven rules. The rules go last so that none of
+	//       them is checked against a column that is still being filled.
 	for _, step := range []struct {
 		what string
 		sql  string

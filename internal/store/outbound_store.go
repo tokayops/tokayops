@@ -1580,15 +1580,6 @@ func admittedSnapshotTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent)
 		false, intent.AlertGroupID)
 }
 
-// attemptStateTx is the state one attempt renders, chosen by what the
-// commitment is: a card follows the alert, a message does not.
-//
-// The set is closed, and an unrecognised form stops here rather than taking a
-// default. A default would be the one-shot branch, so a form this build does
-// not know - a damaged row, or one written by a version that has more of them -
-// would open an effect and reach the provider before anything looked at it
-// again. It is refused before an attempt exists, which is the only point at
-// which refusing is free.
 // attemptContentTx reads what an attempt will be made from, in whichever of the
 // two forms this commitment has.
 //
@@ -1598,81 +1589,106 @@ func admittedSnapshotTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent)
 // all. Answering the second with an empty snapshot would record a commitment as
 // having applied revision 0 of nothing, and would hand a channel a card about
 // no alert.
+//
+// Both sets are closed and neither has a default. A kind this build does not
+// know is work it should leave alone; a form it does not know would otherwise
+// fall into the one-shot branch and reach a provider before anything looked at
+// it again. Both are refused before an attempt exists, which is the only point
+// at which refusing is free.
 func attemptContentTx(ctx context.Context, tx *sql.Tx,
 	intent outbound.Intent) (outbound.AttemptContent, error) {
 
-	switch contentFormOf(intent.KeyKind) {
-	case outbound.ContentPayload:
-		// The version first, and on its own. A schema this build has no shape
-		// for is a deployment that is behind, not a broken commitment: the
-		// instance that wrote it renders it perfectly well, and ending the work
-		// here would destroy exactly what that instance was about to deliver.
-		// Nothing is written, the commitment stays pending, and a build that
-		// knows the schema takes it. Same split as a render snapshot, where an
-		// unknown schema version stops and unreadable bytes end the commitment.
-		if !keys.KnowsPayloadSchema(intent.KeyKind, intent.PayloadSchemaVersion) {
-			return outbound.AttemptContent{}, outboundContractf(
-				"the payload of %s is at %s schema %d, which this build cannot render",
-				intent.ID, intent.KeyKind, intent.PayloadSchemaVersion)
-		}
-		digest, err := keys.PayloadDigest(intent.KeyKind, intent.PayloadSchemaVersion, intent.Payload)
-		if err != nil {
-			// A shape this build HAS, carrying bytes it cannot read. Durable
-			// data a person fixes, and the commitment ends visibly rather than
-			// retrying against a row that will never parse.
-			return outbound.AttemptContent{}, undeliverablef(
-				"the payload of %s cannot be canonicalised: %v", intent.ID, err)
-		}
-		// What was promised, against what is there now. A payload swapped for
-		// another VALID one passes every check above - it has the right shape,
-		// it canonicalises, it addresses the same person - and would be sent as
-		// though the domain had promised it. The digest is the only thing that
-		// still remembers what was actually admitted.
+	form := contentFormOf(intent.KeyKind)
+	if form == "" {
+		// A kind this build has never heard of, and the answer is to change
+		// nothing. It is almost certainly a row written by a NEWER build - the
+		// upgrade is stop-the-world, but a rollback is not - and the work is
+		// perfectly good work that this instance cannot do.
 		//
-		// Undeliverable, not a contract error: no other build renders this row
-		// any better, and no retry changes it. It ends visibly, with the row
-		// named, and the external effect never happens.
-		if !bytes.Equal(digest, intent.PayloadDigest) {
-			return outbound.AttemptContent{}, undeliverablef(
-				"the payload of %s is not the one it was admitted with: "+
-					"admitted %x, stored %x", intent.ID, intent.PayloadDigest, digest)
-		}
-		return outbound.NewPayloadContent(digest)
-
-	case outbound.ContentSnapshot:
-		var stored storedSnapshot
-		var err error
-		switch intent.Form {
-		case outbound.FormEditable:
-			stored, err = lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
-		case outbound.FormOneShot:
-			stored, err = admittedSnapshotTx(ctx, tx, intent)
-		default:
-			return outbound.AttemptContent{}, outboundContractf(
-				"commitment %s is a %q, which is not a form this build delivers",
-				intent.ID, intent.Form)
-		}
-		if err != nil {
-			return outbound.AttemptContent{}, err
-		}
-		return outbound.NewSnapshotContent(stored.Snapshot, stored.Final)
+		// Not undeliverable: that ends the commitment for good, and a build
+		// that killed work it merely did not understand would destroy exactly
+		// what the newer build was going to deliver. This transaction rolls
+		// back and the commitment stays pending. Its lease is NOT released by
+		// that rollback - the claim committed it earlier - so the instance that
+		// knows the kind takes it once locked_until passes. Same rule as a
+		// render snapshot written under a schema version this build cannot
+		// read.
+		return outbound.AttemptContent{}, outboundContractf(
+			"commitment %s is a %q, which is not a kind of claim this build executes",
+			intent.ID, intent.KeyKind)
 	}
 
-	// A kind this build has never heard of, and the answer is to change
-	// nothing. It is almost certainly a row written by a NEWER build - the
-	// upgrade is stop-the-world, but a rollback is not - and the work is
-	// perfectly good work that this instance cannot do.
+	// The payload, before anything decides what this attempt is drawn FROM.
 	//
-	// Not undeliverable: that ends the commitment for good, and a build that
-	// killed work it merely did not understand would destroy exactly what the
-	// newer build was going to deliver. This transaction rolls back and the
-	// commitment stays pending. Its lease is NOT released by that rollback -
-	// the claim committed it earlier - so the instance that knows the kind
-	// takes it once locked_until passes. Same rule as a render snapshot
-	// written under a schema version this build cannot read.
-	return outbound.AttemptContent{}, outboundContractf(
-		"commitment %s is a %q, which is not a kind of claim this build executes",
-		intent.ID, intent.KeyKind)
+	// EVERY commitment carries one - it is what the business key was built over
+	// - and every one of them therefore has something that can be compared
+	// against what was admitted. Doing this only for the commitments that are
+	// DELIVERED from their payload would leave the card path unguarded, and a
+	// card's payload decides where it goes and how it behaves: an interactive
+	// flag turned off in the row would produce a page with no buttons on it and
+	// nothing would notice.
+	digest, err := admittedPayloadDigest(intent)
+	if err != nil {
+		return outbound.AttemptContent{}, err
+	}
+
+	if form == outbound.ContentPayload {
+		return outbound.NewPayloadContent(digest)
+	}
+
+	// The other of the two forms contentFormOf hands out. A card follows the
+	// alert and is drawn from the state the group is in now; a one-shot
+	// escalation is drawn from the state its admission froze. Answering either
+	// with the payload instead would hand a channel a card about no alert.
+	var stored storedSnapshot
+	switch intent.Form {
+	case outbound.FormEditable:
+		stored, err = lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+	case outbound.FormOneShot:
+		stored, err = admittedSnapshotTx(ctx, tx, intent)
+	default:
+		return outbound.AttemptContent{}, outboundContractf(
+			"commitment %s is a %q, which is not a form this build delivers",
+			intent.ID, intent.Form)
+	}
+	if err != nil {
+		return outbound.AttemptContent{}, err
+	}
+	return outbound.NewSnapshotContent(stored.Snapshot, stored.Final)
+}
+
+// admittedPayloadDigest reads a commitment's payload and answers with what it
+// digests to, having established that it is still the payload the commitment
+// was admitted with.
+//
+// Three failures, and they are three different things. A schema this build has
+// no shape for is a deployment that is behind, not a broken commitment: the
+// instance that wrote it renders it perfectly well, so nothing is written and a
+// build that knows the schema takes the work later. Bytes that will not
+// canonicalise under a shape this build DOES have are damage a person fixes.
+// And bytes that canonicalise to something other than what was admitted are a
+// payload swapped for another - it has the right shape, it addresses the same
+// recipient, and it is not what the domain promised.
+func admittedPayloadDigest(intent outbound.Intent) ([]byte, error) {
+	if !keys.KnowsPayloadSchema(intent.KeyKind, intent.PayloadSchemaVersion) {
+		return nil, outboundContractf(
+			"the payload of %s is at %s schema %d, which this build cannot render",
+			intent.ID, intent.KeyKind, intent.PayloadSchemaVersion)
+	}
+	digest, err := keys.PayloadDigest(intent.KeyKind, intent.PayloadSchemaVersion, intent.Payload)
+	if err != nil {
+		return nil, undeliverablef(
+			"the payload of %s cannot be canonicalised: %v", intent.ID, err)
+	}
+	// Undeliverable, not a contract error: no other build renders this row any
+	// better and no retry changes it. It ends visibly, with the row named, and
+	// the external effect never happens.
+	if !bytes.Equal(digest, intent.PayloadDigest) {
+		return nil, undeliverablef(
+			"the payload of %s is not the one it was admitted with: admitted %x, stored %x",
+			intent.ID, intent.PayloadDigest, digest)
+	}
+	return digest, nil
 }
 
 // contentFormOf says which of the two forms a kind of claim is drawn from.

@@ -38,8 +38,12 @@ import (
 //     decision. None of those has a network call or a transport outcome, so
 //     none of them belongs in the attempts table.
 //
-// Nothing here migrates data: the tables are new and empty, and the schema is
-// created in full on every start.
+// The schema is created in full on every start, and a database that already has
+// the tables is brought up to it in the same transaction. That part DOES touch
+// data: a column added to a populated table has to be filled before it can be
+// required, and a rule added to one has to be checked against the rows that are
+// already there. Those steps live beside the columns they are about, and a row
+// none of them can read stops the start rather than being worked around.
 
 // outboundSchemaAdvisoryLock serializes the block below across instances.
 //

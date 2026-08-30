@@ -429,6 +429,21 @@ func TestDecideRefusesWhatItDoesNotHave(t *testing.T) {
 			}(),
 		},
 		{
+			// The same contradiction wearing the one flag that used to get past
+			// it: "final" is a statement about a revision, so an attempt that
+			// applied none cannot have applied the last one.
+			name: "an editable card that applied no revision, and called it the last",
+			in: func() Input {
+				i := sendingIntent()
+				i.Form = FormEditable
+				i.DesiredRevision = 3
+				return Input{
+					Intent: i, Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted,
+					AttemptIsFinal: true,
+				}
+			}(),
+		},
+		{
 			name: "a trigger nobody defined",
 			in:   Input{Intent: sendingIntent(), Trigger: Trigger("apply_provider_event")},
 		},

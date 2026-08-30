@@ -516,17 +516,23 @@ func settleApplied(in Input, proof Proof, row string) (Transition, error) {
 		return Transition{To: StatusSucceeded, Effects: effects, Row: row + "/S1"}, nil
 	}
 
-	if in.AttemptIsFinal {
-		return Transition{To: StatusSucceeded, Effects: effects, Row: row + "/S2"}, nil
-	}
-
 	// Only an editable commitment reaches here, and every one of those is drawn
 	// from a state that has revisions - so a missing one is a contradiction
 	// rather than a case to handle.
+	//
+	// Before the final branch, not after it. "This attempt applied the last
+	// revision there will be" is a statement ABOUT a revision, and taking it
+	// from a caller that could not name one would retire a card on the strength
+	// of a claim nothing in the input supports.
 	if in.AttemptRevision == nil {
 		return Transition{}, invalidf(
 			"an editable commitment settled an attempt that applied no revision")
 	}
+
+	if in.AttemptIsFinal {
+		return Transition{To: StatusSucceeded, Effects: effects, Row: row + "/S2"}, nil
+	}
+
 	if *in.AttemptRevision >= in.Intent.DesiredRevision {
 		return Transition{To: StatusIdle, Effects: effects, Row: row + "/S3"}, nil
 	}
