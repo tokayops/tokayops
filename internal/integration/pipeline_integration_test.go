@@ -15,7 +15,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,12 +32,11 @@ import (
 )
 
 type IntegrationTestEnv struct {
-	S        *store.Store
-	Ing      *ingester.Ingester
-	Eng      *engine.Engine
-	Disp     *dispatcher.Dispatcher
-	MockProv *MockProvider
-	Worker   *outbound.Worker
+	S      *store.Store
+	Ing    *ingester.Ingester
+	Eng    *engine.Engine
+	Disp   *dispatcher.Dispatcher
+	Worker *outbound.Worker
 
 	// Handoff is the second family's worker. Announcements are claimed by their
 	// own partition, so nothing delivers one unless this is running.
@@ -203,15 +201,7 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
 	renderer := schedulerender.New(s.ScheduleReadRepository())
 	eng := engine.NewEngine(s, renderer, &testSettings{}, cfg)
-	disp, err := dispatcher.NewDispatcher(s)
-	if err != nil {
-		t.Fatalf("NewDispatcher failed: %v", err)
-	}
-
-	// Mock Provider. The dispatcher still runs the alert-update and resolution
-	// loops, which is what it is here for.
-	mockProvider := &MockProvider{}
-	disp.RegisterProvider("slack", mockProvider)
+	disp := dispatcher.NewDispatcher()
 
 	// The escalation itself no longer goes through the dispatcher: the engine
 	// admits commitments and the outbound worker sends them. The channel below
@@ -240,7 +230,6 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 		Ing:       ing,
 		Eng:       eng,
 		Disp:      disp,
-		MockProv:  mockProvider,
 		Worker:    worker,
 		Handoff:   handoff,
 		Channel:   channel,
@@ -539,20 +528,6 @@ type testSettings struct{}
 func (testSettings) GetSlackInteractive() bool    { return true }
 func (testSettings) GetTelegramInteractive() bool { return true }
 
-// runDispatcherLoop runs ProcessPendingSteps in a loop until context is canceled
-func runDispatcherLoop(ctx context.Context, disp *dispatcher.Dispatcher) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			disp.ProcessPendingSteps(ctx)
-		}
-	}
-}
-
 func waitForAlertGroupStatus(t *testing.T, s *store.Store, alertKey string, expectedStatus model.AlertGroupStatus) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -610,15 +585,7 @@ func TestPipeline_HappyPath(t *testing.T) {
 		t.Errorf("Expected status Processing, got %s", active.Status)
 	}
 
-	// Check if Job was created (optional but good sanity check)
-	// We can't easily fetch it without ID, but we know CreateJobWithDedup was called.
-
-	// 3. Dispatcher (Process Jobs)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Run dispatcher loop in background to process all steps
-	go runDispatcherLoop(ctx, env.Disp)
+	// 3. Delivery
 	startOutboundWorker(t, env.Worker)
 
 	// Unified escalation job: firehose is step 0, policy step is step 1
@@ -655,9 +622,6 @@ func TestPipeline_PartialUpdate(t *testing.T) {
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	// Execute steps (unified job: firehose=step0, policy=step1)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_partial_1", 2)
@@ -728,9 +692,6 @@ func TestPipeline_FullResolve(t *testing.T) {
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	// Dispatch - unified job: firehose=step0, policy=step1
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_resolve_1", 2)
@@ -806,61 +767,6 @@ func TestPipeline_Dedup(t *testing.T) {
 	if count != 1 {
 		t.Errorf("Expected 1 alert group after duplicate webhook, got %d", count)
 	}
-}
-
-// MockProvider is safe for concurrent use (worker runs steps in parallel goroutines).
-type MockProvider struct {
-	sentCount    atomic.Int64
-	updateCount  atomic.Int64
-	resolveCount atomic.Int64
-
-	mu          sync.Mutex
-	sentTargets []string
-}
-
-// Send satisfies the Provider interface as it stands: it takes a typed
-// NotificationRequest and records the recipient under sentTargets so existing
-// assertions on SendDM (now unified into Send with Editable=false) keep
-// working. Editable=true returns a JSON payload that survives the delivery
-// round-trip; fire-and-forget DMs return an empty payload.
-func (m *MockProvider) Send(ctx context.Context, req providers.NotificationRequest) (string, error) {
-	m.sentCount.Add(1)
-	m.mu.Lock()
-	m.sentTargets = append(m.sentTargets, req.Target.ID)
-	m.mu.Unlock()
-	if !req.Editable {
-		return "", nil
-	}
-	return `{"channel_id":"C_MOCK","timestamp":"1234567890.123456","permalink":"https://slack.com/mock"}`, nil
-}
-
-func (m *MockProvider) Update(ctx context.Context, _ *model.NotificationDelivery, _ *model.AlertGroup) (string, error) {
-	m.updateCount.Add(1)
-	return `{"channel_id":"C_MOCK","timestamp":"1234567890.123456","permalink":"https://slack.com/mock"}`, nil
-}
-
-func (m *MockProvider) Resolve(ctx context.Context, _ *model.NotificationDelivery, _ *model.AlertGroup) error {
-	m.resolveCount.Add(1)
-	return nil
-}
-
-// Permalink is part of the Provider interface. A static stub is enough; the
-// integration tests assert on counters, not on link shape.
-func (m *MockProvider) Permalink(_ *model.NotificationDelivery) string {
-	return "https://slack.com/mock"
-}
-
-func (m *MockProvider) SentCount() int    { return int(m.sentCount.Load()) }
-func (m *MockProvider) UpdateCount() int  { return int(m.updateCount.Load()) }
-func (m *MockProvider) ResolveCount() int { return int(m.resolveCount.Load()) }
-
-// SentTargets returns a copy of all targetIDs that received a Send/SendDM call.
-func (m *MockProvider) SentTargets() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]string, len(m.sentTargets))
-	copy(out, m.sentTargets)
-	return out
 }
 
 // TestPipeline_FirehoseOnly verifies that firehose-only alerts (no policy) work correctly.
@@ -955,9 +861,6 @@ func TestPipeline_ResolutionAllDeliveries(t *testing.T) {
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
 	// 2. Execute both steps (firehose + policy)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_resolve_all_1", 2)
@@ -1035,9 +938,6 @@ func TestPipeline_ScheduleFanOut(t *testing.T) {
 
 	initialSentCount := env.Channel.SentCount()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	// Stage 0: firehose, Stage 1: fan-out DMs (L1 + L2 if resolved)
@@ -1143,9 +1043,6 @@ func TestPipeline_ScheduleFanOut_MultiUserGroup(t *testing.T) {
 
 	initialSentCount := env.Channel.SentCount()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_multi_fanout_1", 2)
@@ -1242,9 +1139,6 @@ func TestPipeline_ScheduleFanOut_OverrideOverGroup(t *testing.T) {
 
 	initialSentCount := env.Channel.SentCount()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_override_group_1", 2)
@@ -1328,9 +1222,6 @@ func TestPipeline_ScheduleFanOut_NoL2Additive(t *testing.T) {
 
 	initialSentCount := env.Channel.SentCount()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_no_l2_additive_1", 2)
@@ -1344,23 +1235,20 @@ func TestPipeline_ScheduleFanOut_NoL2Additive(t *testing.T) {
 	}
 }
 
-// TestPipeline_DisabledProvider_PermanentFail verifies that a DM step targeting a
-// provider with no enabled integration fails PERMANENTLY at runtime - the worker
-// classifies ErrProviderNotConfigured as permanent (no retry loop) and the
-// non-continue-on-failure step hard-fails the job. This is the end-to-end
-// counterpart to the unit-level TestRegistry_DisabledIntegration_NotConfigured.
-func TestPipeline_DisabledProvider_PermanentFail(t *testing.T) {
+// TestPipeline_UndeliverableProviderIsNotPromised: a policy step naming a
+// provider this build has no channel for.
+//
+// It used to be resolved at execution time and fail there. Nothing resolves a
+// provider any more: the admission gate asks whether this build delivers
+// through it at all, and a step it cannot deliver is dropped before the promise
+// exists - because a promise nothing can keep is a commitment whose every
+// attempt fails, and refusing the whole escalation instead would take this
+// alert's firehose down with it on every tick, forever.
+func TestPipeline_UndeliverableProviderIsNotPromised(t *testing.T) {
 	env := setupIntegrationTest(t)
 
-	// Register a provider whose backing integration type has no enabled integration
-	// in this fresh DB, so resolving it yields ErrProviderNotConfigured - the same
-	// error a disabled Slack integration produces. The build fn is never invoked.
-	env.Disp.RegisterProviderFactory("blocked", model.IntegrationTypeAlertmanagerWebhook,
-		func(*model.Integration) (dispatcher.Provider, error) { return env.MockProv, nil })
-
-	// Policy with a single non-COF DM step on the unconfigured provider. MaxAttempts=3
-	// so that a (wrong) transient classification would visibly retry; a permanent
-	// failure must leave attempt_count at 0.
+	// A policy with one non-COF DM step on a provider that is not a channel
+	// here.
 	blockedPolicy := &model.EscalationPolicy{
 		ID:   "blocked_policy",
 		Name: "Blocked Provider Policy",
@@ -1395,9 +1283,6 @@ func TestPipeline_DisabledProvider_PermanentFail(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	// The firehose still goes out. A step naming a provider nothing here
@@ -1486,9 +1371,6 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_channel_update_1", 2)
@@ -1588,9 +1470,6 @@ func TestPipeline_EscalationUnlinked(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	waitForDeliveries(t, env.S, "test_unlinked_1", 2)
@@ -1679,9 +1558,6 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	startOutboundWorker(t, env.Worker)
 
 	// Wait for firehose (stage 0) to complete - DM step (stage 1) is delayed, still pending
@@ -1700,28 +1576,27 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 		t.Fatal("Expected ack to succeed")
 	}
 
-	// Stop the dispatcher loop so nothing is running while this is read.
-	cancel()
-	time.Sleep(200 * time.Millisecond) // let goroutine drain
-
-	// Verify the delayed page was withdrawn. It had not gone out - it was five
-	// minutes away - so acknowledging the alert takes it back rather than
-	// letting it wake somebody about an alert that is already handled.
+	// The delayed page is withdrawn. It had not gone out - it was five minutes
+	// away - so acknowledging the alert takes it back rather than letting it
+	// wake somebody about an alert that is already handled.
+	//
+	// The firehose card is owed one more thing at this moment and that is not a
+	// failure: acknowledging an alert moves what its card has to show, so the
+	// card goes back into the queue to say so and settles again once the worker
+	// has applied it. Waited for rather than slept through, because how long
+	// that takes is the worker's business and not this test's.
 	var withdrawn, owing int
-	if err := env.S.GetDB().QueryRow(`
-		SELECT count(*) FILTER (WHERE i.status = 'canceled'),
-		       count(*) FILTER (WHERE i.status IN ('pending', 'sending'))
-		FROM outbound_intents i
-		JOIN alert_groups ag ON ag.id = i.alert_group_id
-		WHERE ag.alert_key = 'test_cancel_exec_1'`).Scan(&withdrawn, &owing); err != nil {
-		t.Fatalf("read the commitments: %v", err)
-	}
-	if withdrawn != 1 {
-		t.Errorf("%d commitments were withdrawn, want the delayed page", withdrawn)
-	}
-	if owing != 0 {
-		t.Errorf("%d commitments are still owed after the acknowledgement", owing)
-	}
+	until(t, "the withdrawal and the acknowledged card to settle", func() bool {
+		if err := env.S.GetDB().QueryRow(`
+			SELECT count(*) FILTER (WHERE i.status = 'canceled'),
+			       count(*) FILTER (WHERE i.status IN ('pending', 'sending'))
+			FROM outbound_intents i
+			JOIN alert_groups ag ON ag.id = i.alert_group_id
+			WHERE ag.alert_key = 'test_cancel_exec_1'`).Scan(&withdrawn, &owing); err != nil {
+			t.Fatalf("read the commitments: %v", err)
+		}
+		return withdrawn == 1 && owing == 0
+	})
 
 	// Verify AG status is acknowledged
 	updatedAG, _ := env.S.GetAlertGroupByID(ag.ID)

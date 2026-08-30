@@ -159,17 +159,13 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
 	eng := engine.NewEngine(s, schedulerender.New(s.ScheduleReadRepository()), &testSettings{}, cfg)
-	disp, err := dispatcher.NewDispatcher(s)
-	if err != nil {
-		t.Fatalf("NewDispatcher: %v", err)
-	}
+	disp := dispatcher.NewDispatcher()
 
-	// One shared provider instance for the ack-update loop (dispatcher) and
-	// answerCallback (API). The escalation SEND no longer goes through it: the
-	// engine admits commitments and the outbound worker below delivers them
-	// through the channel handler, against the same fake Bot API.
+	// The provider instance is the API's, for answerCallback. Nothing sends
+	// through it any more: the engine admits commitments and the outbound
+	// worker below delivers them through the channel handler, against the same
+	// fake Bot API.
 	tg := telegramprovider.NewProvider(cache, "https://tokay.e2e", telegramprovider.WithBaseURL(server.URL))
-	disp.RegisterProvider("telegram", tg)
 	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
 		Name: "telegram", IntegrationType: model.IntegrationTypeTelegram, SupportedTargetKinds: []string{"dm", "channel"},
 	})
@@ -245,7 +241,6 @@ func TestTelegramPipeline_SendCallbackAck(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	go runDispatcherLoop(ctx, env.Disp)
 	go runOutboundWorker(ctx, env.Worker)
 
 	waitForDeliveries(t, env.S, "tg_e2e_1", 1)
@@ -365,7 +360,6 @@ func deliverCardForLinkedUser(t *testing.T, env *tgPipelineEnv, ctx context.Cont
 	payload := fmt.Sprintf(`{"groupKey":%q,"status":"firing","commonLabels":{"team":"tgteam","severity":"critical","alertname":"TGAlert"},"alerts":[{"fingerprint":"fp-%s","status":"firing","labels":{"alertname":"TGAlert"}}]}`, dedup, dedup)
 	sendWebhook(t, env.Echo, payload)
 	env.Eng.ProcessNewAlertGroups(context.Background())
-	go runDispatcherLoop(ctx, env.Disp)
 	go runOutboundWorker(ctx, env.Worker)
 	waitForDeliveries(t, env.S, dedup, 1)
 	ag, err := env.S.GetActiveAlertGroupByAlertKey(dedup)

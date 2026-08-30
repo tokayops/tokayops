@@ -343,12 +343,8 @@ func main() {
 	eng := engine.NewEngine(st, scheduleRenderer, integrationCache, cfg)
 
 	// Dispatcher
-	disp, err := dispatcher.NewDispatcher(st)
-	if err != nil {
-		log.Fatalf("Failed to initialize dispatcher: %v", err)
-	}
+	disp := dispatcher.NewDispatcher()
 
-	// Register Providers - from DB with dynamic token lookup.
 	// An alert group's team is a label carried by the alert, not a foreign key,
 	// so it can name a team that was never set up here. Both providers ask this
 	// before offering Ack/Resolve.
@@ -362,13 +358,10 @@ func main() {
 		return true, nil
 	}
 
-	// The concrete slackProvider instance is also used by the API layer as its
-	// SlackMessenger, so the dispatcher factory returns that same instance; the
-	// registry keys it by integration ID.
+	// The Slack provider is the API layer's SlackMessenger. Nothing resolves it
+	// through the catalogue any more: what the catalogue answers is what a
+	// channel CAN do, and who holds the instance is the wiring's business.
 	slackProvider := slackprovider.NewProvider(integrationCache, cfg.Global.SelfURL, teamLookup)
-	disp.RegisterProviderFactory("slack", model.IntegrationTypeSlack, func(integ *model.Integration) (dispatcher.Provider, error) {
-		return slackProvider, nil
-	})
 	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
 		Name:                 "slack",
 		IntegrationType:      model.IntegrationTypeSlack,
@@ -380,9 +373,6 @@ func main() {
 	// incoming webhook and interactivity need the provider in the API layer as
 	// well, the way slackProvider is wired above.
 	telegramProvider := telegramprovider.NewProvider(integrationCache, cfg.Global.SelfURL, telegramprovider.WithTeamLookup(teamLookup))
-	disp.RegisterProviderFactory("telegram", model.IntegrationTypeTelegram, func(integ *model.Integration) (dispatcher.Provider, error) {
-		return telegramProvider, nil
-	})
 	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
 		Name:                 "telegram",
 		IntegrationType:      model.IntegrationTypeTelegram,

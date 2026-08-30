@@ -23,7 +23,7 @@ import (
 func setupPolicyAPITest(t *testing.T) *APIIntegrationEnv {
 	s := testutil.SetupDB(t)
 
-	reg := dispatcher.NewProviderRegistry(s)
+	reg := dispatcher.NewProviderRegistry()
 	reg.RegisterCapabilities(dispatcher.ProviderCapabilities{
 		Name:                 "slack",
 		IntegrationType:      model.IntegrationTypeSlack,

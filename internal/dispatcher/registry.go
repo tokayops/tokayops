@@ -1,101 +1,36 @@
 package dispatcher
 
 import (
-	"errors"
 	"fmt"
 	"sort"
-	"sync"
 
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
-// ErrUnknownProvider means no provider is registered under the requested name.
-var ErrUnknownProvider = errors.New("unknown provider")
-
-// ErrProviderNotConfigured means the provider's backing integration is absent or disabled.
-var ErrProviderNotConfigured = errors.New("provider not configured")
-
-// ErrMissingProvider means a job step reached an executor with no provider name.
-// Every builder sets one, so an empty value is a build-invariant violation -
-// permanent (see worker.go isPermanentError); retrying cannot help.
-var ErrMissingProvider = errors.New("step has no provider")
-
-// ProviderResolver resolves a provider name to a Provider instance. Executors depend
-// on this interface so tests can supply a fixed map (staticProviders) while production
-// uses the integration-aware ProviderRegistry.
-type ProviderResolver interface {
-	Provider(name string) (Provider, error)
-}
-
-// staticProviders is a ProviderResolver backed by a fixed map - used by tests and
-// simple wiring where no per-integration resolution is needed.
-type staticProviders map[string]Provider
-
-func (s staticProviders) Provider(name string) (Provider, error) {
-	p, ok := s[name]
-	if !ok {
-		return nil, fmt.Errorf("provider %q: %w", name, ErrUnknownProvider)
-	}
-	return p, nil
-}
-
-// providerFactory builds a Provider bound to a specific integration. The integ
-// arg is the seam for several integrations of one type: today the Slack factory
-// ignores it (the shared IntegrationCache is the token source), but the registry
-// still keys instances by integ.ID, so that day arrives without touching call
-// sites.
-type providerFactory func(integ *model.Integration) (Provider, error)
-
-type factoryReg struct {
-	integType model.IntegrationType
-	build     providerFactory
-}
-
-// ProviderCapabilities describes what a provider class can do, independent
-// of whether an enabled integration exists right now. The policy editor and
-// frontend dropdown read capabilities; the dispatcher uses Provider() for
-// runtime resolution. Splitting the two means policy validation never returns
-// a 400 just because the Slack integration was temporarily disabled.
+// ProviderCapabilities describes what a provider class can do, independent of
+// whether an enabled integration exists right now.
+//
+// It is a catalogue and nothing else. Resolving a name to a working provider
+// used to live here too, for the executors that made calls from a job step;
+// those are gone, and with them the store this registry held and the whole
+// question of whether an integration happens to be enabled. What is left
+// answers "what could this channel do", which is what a policy editor needs to
+// offer a step and what an announcement needs to know before it promises one -
+// and neither of them should get a different answer because Slack was switched
+// off for ten minutes.
 type ProviderCapabilities struct {
 	Name                 string                // provider key - e.g. "slack"
 	IntegrationType      model.IntegrationType // backing integration type
 	SupportedTargetKinds []string              // sorted; e.g. ["channel","dm"]
 }
 
-// ProviderRegistry resolves providers either from explicitly registered instances
-// (static, by name) or from a factory that is bound to the integration of a given type.
-// Factory-built instances are cached per integration ID.
+// ProviderRegistry is the catalogue of what the channels of this build can do.
 type ProviderRegistry struct {
-	store        store.StoreInterface
-	static       map[string]Provider
-	factories    map[string]factoryReg
 	capabilities map[string]ProviderCapabilities
-
-	mu        sync.Mutex
-	instances map[string]Provider // keyed by integration ID
 }
 
-func NewProviderRegistry(s store.StoreInterface) *ProviderRegistry {
-	return &ProviderRegistry{
-		store:        s,
-		static:       make(map[string]Provider),
-		factories:    make(map[string]factoryReg),
-		capabilities: make(map[string]ProviderCapabilities),
-		instances:    make(map[string]Provider),
-	}
-}
-
-// RegisterStatic registers a fixed Provider instance under a name. Takes precedence
-// over any factory registered under the same name.
-func (r *ProviderRegistry) RegisterStatic(name string, p Provider) {
-	r.static[name] = p
-}
-
-// RegisterFactory registers a factory that builds a Provider bound to the (single,
-// for now) enabled integration of integType.
-func (r *ProviderRegistry) RegisterFactory(name string, integType model.IntegrationType, build providerFactory) {
-	r.factories[name] = factoryReg{integType: integType, build: build}
+func NewProviderRegistry() *ProviderRegistry {
+	return &ProviderRegistry{capabilities: make(map[string]ProviderCapabilities)}
 }
 
 // RegisterCapabilities records what a provider class can do. Capability
@@ -152,43 +87,4 @@ func (r *ProviderRegistry) ProvidersSupporting(targetKind string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// Provider resolves a provider name to an instance. Static registrations win; otherwise
-// the factory's integration is resolved by type (must exist and be enabled) and the
-// instance is cached by integration ID.
-func (r *ProviderRegistry) Provider(name string) (Provider, error) {
-	if p, ok := r.static[name]; ok {
-		return p, nil
-	}
-
-	reg, ok := r.factories[name]
-	if !ok {
-		return nil, fmt.Errorf("provider %q: %w", name, ErrUnknownProvider)
-	}
-
-	integ, err := r.store.GetIntegrationByType(reg.integType)
-	if errors.Is(err, store.ErrIntegrationNotFound) {
-		return nil, fmt.Errorf("provider %q has no integration: %w", name, ErrProviderNotConfigured)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("resolve integration for provider %q: %w", name, err)
-	}
-	// Check Enabled here rather than trusting the query filter - not every store
-	// implementation filters disabled rows.
-	if integ == nil || !integ.Enabled {
-		return nil, fmt.Errorf("provider %q has no enabled integration: %w", name, ErrProviderNotConfigured)
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if p, ok := r.instances[integ.ID]; ok {
-		return p, nil
-	}
-	p, err := reg.build(integ)
-	if err != nil {
-		return nil, fmt.Errorf("build provider %q for integration %s: %w", name, integ.ID, err)
-	}
-	r.instances[integ.ID] = p
-	return p, nil
 }
