@@ -826,6 +826,18 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 			return nil, fmt.Errorf("encode the payload of %s: %w", c.IdempotencyKey, err)
 		}
 
+		// What this payload IS, recorded beside it. Every attempt recomputes it
+		// from the row and compares: the payload is not in the business key, so
+		// without this there is nothing a swap could be caught against.
+		//
+		// Taken from the bytes that are about to be stored, not from the value
+		// in hand: if the two ever disagreed, the row would be checked against
+		// a digest of something else.
+		digest, err := keys.PayloadDigest(admission.Kind, c.PayloadSchemaVersion, payload)
+		if err != nil {
+			return nil, fmt.Errorf("digest the payload of %s: %w", c.IdempotencyKey, err)
+		}
+
 		notBefore, err := notBeforeOf(c.Timing, admittedAt)
 		if err != nil {
 			return nil, err
@@ -845,12 +857,13 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 			INSERT INTO outbound_intents (
 				id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
 				provider, target_kind, target_ref, alert_group_id, form, completion_mode,
-				ambiguity_policy, payload_schema_version, payload, provider_key_codec_version,
+				ambiguity_policy, payload_schema_version, payload, payload_digest,
+				provider_key_codec_version,
 				status, desired_revision, not_before, next_attempt_at, expires_at)
 			VALUES (
 				$1, $2, $3, $19, $4, $5,
 				$6, $7, $8, $9, $10, $11,
-				$12, $13, $14, $15,
+				$12, $13, $14, $20, $15,
 				'pending', $16,
 				$17, GREATEST(now(), $17::timestamptz),
 				$18)`,
@@ -861,7 +874,7 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 			string(c.AmbiguityPolicy), c.PayloadSchemaVersion, payload, keys.ProviderKeyCodecV1,
 			admission.Revision,
 			notBefore,
-			expiresAt, family,
+			expiresAt, family, digest,
 		); err != nil {
 			return nil, fmt.Errorf("write the commitment %s: %w", c.IdempotencyKey, err)
 		}
@@ -1096,7 +1109,7 @@ const outboundIntentColumns = `
 	       cancellation_requested,
 	       accepted_duplicate_risk, not_before, next_attempt_at, expires_at,
 	       create_key IS NOT NULL, payload_schema_version,
-	       provider_key_codec_version, payload, receipt, receipt_ref,
+	       provider_key_codec_version, payload, payload_digest, receipt, receipt_ref,
 	       COALESCE(expires_at <= now(), FALSE)`
 
 // scanIntent turns one row of outboundIntentColumns into a commitment, and is
@@ -1123,7 +1136,8 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		&intent.CancellationRequested,
 		&intent.AcceptedDuplicateRisk, &intent.NotBefore, &intent.NextAttemptAt, &expiresAt,
 		&intent.GenerationBound, &intent.PayloadSchemaVersion,
-		&intent.ProviderKeyCodecVersion, &payload, &coordinates, &name,
+		&intent.ProviderKeyCodecVersion, &payload, &intent.PayloadDigest,
+		&coordinates, &name,
 		&deadlinePassed); err != nil {
 		return nil, false, err
 	}
@@ -1209,7 +1223,11 @@ type transitionWrite struct {
 	// is not the same as the one desired now: the desired state may have moved
 	// while the attempt was in flight, and recording that as applied would
 	// claim the card shows something it does not.
-	AppliedRevision int64
+	//
+	// Nil when the commitment has no revisions - one drawn from its own payload
+	// rather than from a state that is revised. Written as NULL, not as zero: a
+	// zero would say the commitment had caught up with a state nobody froze.
+	AppliedRevision *int64
 	// ReceiptRef is the name the channel gives the object the attempt produced.
 	// Stored beside the coordinates so that a later change can say what it is
 	// aimed at without anything in the domain reading a provider's JSON.
@@ -1284,6 +1302,10 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 				WHEN $11 THEN now() + make_interval(secs => $12)
 				WHEN $13 THEN now()
 				ELSE next_attempt_at END,
+			-- $15 is NULL when the attempt applied no revision at all, and the
+			-- column takes that NULL: a commitment drawn from its own payload
+			-- has no series to be at a position in, and a zero here would say
+			-- it had caught up with a state nobody ever froze.
 			applied_revision = CASE WHEN $14 THEN $15 ELSE applied_revision END,
 			final_revision_applied = CASE
 				WHEN $14 AND $16 THEN TRUE ELSE final_revision_applied END,
@@ -1600,6 +1622,20 @@ func attemptContentTx(ctx context.Context, tx *sql.Tx,
 			// retrying against a row that will never parse.
 			return outbound.AttemptContent{}, undeliverablef(
 				"the payload of %s cannot be canonicalised: %v", intent.ID, err)
+		}
+		// What was promised, against what is there now. A payload swapped for
+		// another VALID one passes every check above - it has the right shape,
+		// it canonicalises, it addresses the same person - and would be sent as
+		// though the domain had promised it. The digest is the only thing that
+		// still remembers what was actually admitted.
+		//
+		// Undeliverable, not a contract error: no other build renders this row
+		// any better, and no retry changes it. It ends visibly, with the row
+		// named, and the external effect never happens.
+		if !bytes.Equal(digest, intent.PayloadDigest) {
+			return outbound.AttemptContent{}, undeliverablef(
+				"the payload of %s is not the one it was admitted with: "+
+					"admitted %x, stored %x", intent.ID, intent.PayloadDigest, digest)
 		}
 		return outbound.NewPayloadContent(digest)
 

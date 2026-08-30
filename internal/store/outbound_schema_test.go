@@ -141,7 +141,7 @@ func (i intentFixture) insert(s *Store) error {
 			(id, batch_id, idempotency_key, delivery_family, key_kind,
 			 grammar_version, provider, target_kind, target_ref, alert_group_id,
 			 form, completion_mode, ambiguity_policy, payload_schema_version,
-			 payload, provider_key_codec_version, status, generation_no,
+			 payload, payload_digest, provider_key_codec_version, status, generation_no,
 			 attempts_in_generation, failure_streak, cancellation_requested,
 			 current_attempt_id, lease_token, locked_until,
 			 not_before, next_attempt_at)
@@ -150,7 +150,7 @@ func (i intentFixture) insert(s *Store) error {
 			 'editable', 'on_acceptance', 'retry', 1,
 			 '{"slot":{"kind":"firehose","index":0},
 			   "target":{"kind":"channel","ref":"C123"},
-			   "interactive":true}'::jsonb, 1, $5, $6,
+			   "interactive":true}'::jsonb, decode(repeat('ab', 32), 'hex'), 1, $5, $6,
 			 $7, $8, $9,
 			 $10, $11, $12,
 			 now(), now())`,
@@ -268,6 +268,22 @@ func TestOutboundSchemaIsIdempotent(t *testing.T) {
 	}
 	if constraints != 1 {
 		t.Fatalf("expected exactly one %s, found %d", outboundCurrentAttemptFK, constraints)
+	}
+
+	// The rules added by their own guarded blocks. Each looks itself up before
+	// adding, and a guard that looked up the wrong name would add a second copy
+	// on every start until one of them was violated by a row.
+	for _, rule := range outboundRulesAddedWithTheDigest {
+		var copies int
+		if err := s.db.QueryRow(`
+			SELECT count(*) FROM pg_constraint
+			WHERE conname = $1 AND conrelid = $2::regclass`,
+			rule.name, rule.table).Scan(&copies); err != nil {
+			t.Fatalf("count %s on %s: %v", rule.name, rule.table, err)
+		}
+		if copies != 1 {
+			t.Errorf("found %d copies of %s on %s", copies, rule.name, rule.table)
+		}
 	}
 
 	var indexes int
@@ -977,20 +993,30 @@ func TestOutboundIndexesAreDeclaredOnce(t *testing.T) {
 func TestACommitmentCannotBeAddressedTwoWays(t *testing.T) {
 	s := setupTestDB(t)
 	agID := outboundGroup(t, s)
-	batch := newBatch(agID).mustInsert(t, s)
+
+	// A claim per kind. A commitment points at all of its claim's identity, so
+	// a replay under an escalation's claim is refused before its payload is
+	// looked at, and the rule under test would never be reached.
+	claims := map[string]string{}
+	for _, kind := range []string{"escalation", "escalation_replay"} {
+		b := newBatch(agID)
+		b.Kind = kind
+		claims[kind] = b.mustInsert(t, s).ID
+	}
 
 	insert := func(kind, targetKind, targetRef, payload string) error {
 		_, err := s.db.Exec(`
 			INSERT INTO outbound_intents (
 				id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
 				provider, target_kind, target_ref, alert_group_id, form, completion_mode,
-				ambiguity_policy, payload_schema_version, payload,
+				ambiguity_policy, payload_schema_version, payload, payload_digest,
 				provider_key_codec_version, status, desired_revision, not_before,
 				next_attempt_at)
 			VALUES ($1, $2, $1, 'notification', $7, 1,
 			        'slack', $3, $4, $5, 'editable', 'on_acceptance',
-			        'retry', 1, $6::jsonb, 1, 'pending', 0, now(), now())`,
-			uuid.New().String(), batch.ID, targetKind, targetRef, agID, payload, kind)
+			        'retry', 1, $6::jsonb, decode(repeat('ab', 32), 'hex'),
+			        1, 'pending', 0, now(), now())`,
+			uuid.New().String(), claims[kind], targetKind, targetRef, agID, payload, kind)
 		return err
 	}
 
@@ -1015,6 +1041,64 @@ func TestACommitmentCannotBeAddressedTwoWays(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestAHandoverNamesOnePersonInBothPlaces. The two rules a handover carries of
+// its own, and neither is the escalation rule extended.
+//
+// The first is the same idea as the escalation one - the columns say where the
+// message goes, the payload says who it greets - and it is stated separately so
+// that a payload with no target at all is refused rather than compared against
+// nothing. The second is about the business key: a handover's key carries the
+// occurrence, the provider and the user id and NOT the kind of target, so one
+// aimed at a channel would share a key with one aimed at the person of that id.
+func TestAHandoverNamesOnePersonInBothPlaces(t *testing.T) {
+	s := setupTestDB(t)
+
+	batch := newBatch("")
+	batch.Kind, batch.Family, batch.AlertGroupID = "handoff", "handoff", nil
+	batch.mustInsert(t, s)
+
+	insert := func(targetKind, targetRef, payload string) error {
+		_, err := s.db.Exec(`
+			INSERT INTO outbound_intents (
+				id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
+				provider, target_kind, target_ref, form, completion_mode,
+				ambiguity_policy, payload_schema_version, payload, payload_digest,
+				provider_key_codec_version, status, desired_revision, not_before,
+				next_attempt_at)
+			VALUES ($1, $2, $1, 'handoff', 'handoff', 1,
+			        'slack', $3, $4, 'one_shot', 'on_acceptance',
+			        'retry', 1, $5::jsonb, decode(repeat('ab', 32), 'hex'),
+			        1, 'pending', 0, now(), now())`,
+			uuid.New().String(), batch.ID, targetKind, targetRef, payload)
+		return err
+	}
+
+	const shift = `"kind":"handoff","team_name":"Backend","schedule_id":"sched-1",` +
+		`"timezone":"UTC","grid_slot_start":"2026-05-04T11:00:00Z",` +
+		`"assignment_start":"2026-05-04T11:00:00Z","assignment_end":"2026-05-04T19:00:00Z"`
+
+	if err := insert("user", "u-alice",
+		`{`+shift+`,"target":{"kind":"user","ref":"u-alice"}}`); err != nil {
+		t.Fatalf("an announcement that agrees with itself was refused: %v", err)
+	}
+
+	for name, row := range map[string]struct {
+		targetKind, targetRef, payload string
+	}{
+		"greeting somebody else": {"user", "u-alice",
+			`{` + shift + `,"target":{"kind":"user","ref":"u-bob"}}`},
+		"greeting nobody at all": {"user", "u-alice", `{` + shift + `}`},
+		"a shift taken by a channel": {"channel", "C0001",
+			`{` + shift + `,"target":{"kind":"channel","ref":"C0001"}}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := insert(row.targetKind, row.targetRef, row.payload); err == nil {
+				t.Fatal("the database accepted an announcement it exists to forbid")
+			}
+		})
 	}
 }
 
@@ -1058,13 +1142,14 @@ func TestTheTargetRuleReachesAnExistingDatabase(t *testing.T) {
 		INSERT INTO outbound_intents (
 			id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
 			provider, target_kind, target_ref, alert_group_id, form, completion_mode,
-			ambiguity_policy, payload_schema_version, payload,
+			ambiguity_policy, payload_schema_version, payload, payload_digest,
 			provider_key_codec_version, status, desired_revision, not_before,
 			next_attempt_at)
 		VALUES ($1, $2, $1, 'notification', 'escalation', 1,
 		        'slack', 'channel', 'C0001', $3, 'editable', 'on_acceptance',
 		        'retry', 1,
 		        '{"slot":{"kind":"firehose"},"target":{"kind":"user","ref":"user-1"}}'::jsonb,
+		        decode(repeat('ab', 32), 'hex'),
 		        1, 'pending', 0, now(), now())`,
 		uuid.New().String(), batch.ID, agID)
 	if err == nil {

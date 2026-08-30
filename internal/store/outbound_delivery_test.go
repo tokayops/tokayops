@@ -1118,7 +1118,8 @@ func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
 		INSERT INTO outbound_intents (
 			id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
 			provider, target_kind, target_ref, alert_group_id, form, completion_mode,
-			ambiguity_policy, payload_schema_version, payload, provider_key_codec_version,
+			ambiguity_policy, payload_schema_version, payload, payload_digest,
+			provider_key_codec_version,
 			status, desired_revision, attempts_in_generation, not_before, next_attempt_at)
 		SELECT gen_random_uuid()::text, $1, 'backlog-' || g, $2, 'escalation', 1,
 		       'slack', 'channel', 'C' || g, $3, 'editable', 'on_acceptance',
@@ -1126,7 +1127,7 @@ func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
 		       jsonb_build_object(
 			       'slot', jsonb_build_object('kind', 'firehose', 'index', 0),
 			       'target', jsonb_build_object('kind', 'channel', 'ref', 'C' || g),
-			       'interactive', true), 1,
+			       'interactive', true), decode(repeat('ab', 32), 'hex'), 1,
 		       'pending', 0, CASE WHEN g % 10 = 0 THEN 1 ELSE 0 END,
 		       now() - interval '3 hours', now() - make_interval(secs => g)
 		FROM generate_series(1, 5000) g`, batchID, testFamily, agID); err != nil {
@@ -1201,16 +1202,15 @@ func TestAKindThisBuildDoesNotKnowIsLeftAlone(t *testing.T) {
 	attemptsBefore, eventsBefore = count()
 
 	// A kind from a build that is ahead of this one. Not `handoff`: that one
-	// this build now knows, and knowing it is what test 10g proves.
-	for _, statement := range []string{
-		`UPDATE outbound_batches SET key_kind = 'something_newer'
-		 WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)`,
-		`UPDATE outbound_intents SET key_kind = 'something_newer' WHERE id = $1`,
-	} {
-		if _, err := s.db.Exec(statement, intentID); err != nil {
-			t.Fatalf("re-label the claim: %v", err)
-		}
-	}
+	// this build now knows.
+	//
+	// Which family a kind belongs to is stated in the database, so a row of a
+	// kind this build has never heard of cannot be written under this build's
+	// rules at all - and it does not have to be. The build that introduces the
+	// kind widens the rule in its own migration, and that is what is borrowed
+	// here to reach the state this one has to survive reading.
+	asABuildThatKnows(t, s, "something_newer", testFamily)
+	relabel(t, s, intentID, "something_newer", testFamily)
 
 	token := claimOne(t, s, intentID)
 	_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
@@ -1271,38 +1271,16 @@ func TestAHandoverDrawsFromItsPayload(t *testing.T) {
 // first look like the second, and a rollback then kills every announcement the
 // newer build admitted.
 func TestTheTwoWaysAPayloadCanBeUnusable(t *testing.T) {
-	handover := func(t *testing.T, s *Store, schemaVersion int, payload string) string {
-		t.Helper()
-		agID := outboundGroup(t, s)
-		intentID := admitOne(t, s, agID)[0]
-		for _, statement := range []string{
-			`UPDATE outbound_batches SET key_kind = 'handoff'
-			 WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)`,
-			`UPDATE outbound_intents SET key_kind = 'handoff',
-			     payload_schema_version = $2, payload = $3::jsonb WHERE id = $1`,
-		} {
-			args := []any{intentID}
-			if strings.Contains(statement, "payload_schema_version") {
-				args = append(args, schemaVersion, payload)
-			}
-			if _, err := s.db.Exec(statement, args...); err != nil {
-				t.Fatalf("write the commitment: %v", err)
-			}
-		}
-		return intentID
-	}
-
 	const announcement = `{"kind":"handoff","team_name":"Backend","schedule_id":"sched-1",` +
 		`"timezone":"UTC","grid_slot_start":"2026-05-04T11:00:00Z",` +
-		`"assignment_start":"2026-05-04T11:00:00Z","assignment_end":"2026-05-04T19:00:00Z",` +
-		`"target":{"kind":"user","ref":"u-alice"}}`
+		`"assignment_start":"2026-05-04T11:00:00Z","assignment_end":"2026-05-04T19:00:00Z"}`
 
 	t.Run("a schema from a newer build", func(t *testing.T) {
 		s := setupTestDB(t)
 		s.SetRenderEnvironment("https://tokay.example", "UTC")
-		intentID := handover(t, s, 2, announcement)
+		intentID := announcementCarrying(t, s, 2, announcement)
 
-		token := claimOne(t, s, intentID)
+		token := claimHandoff(t, s, intentID)
 		_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 			Preparation: outbound.PreparationReady, BoundEndpoint: "U0001",
@@ -1322,11 +1300,12 @@ func TestTheTwoWaysAPayloadCanBeUnusable(t *testing.T) {
 	t.Run("bytes this build cannot read", func(t *testing.T) {
 		s := setupTestDB(t)
 		s.SetRenderEnvironment("https://tokay.example", "UTC")
-		// The schema this build knows, carrying an announcement with no
-		// recipient - damage, not a newer protocol.
-		intentID := handover(t, s, 1, `{"kind":"handoff","team_name":"Backend"}`)
+		// The schema this build knows, carrying an announcement with no shift
+		// in it - no schedule, no timezone, none of the three instants. Damage,
+		// not a newer protocol.
+		intentID := announcementCarrying(t, s, 1, `{"kind":"handoff","team_name":"Backend"}`)
 
-		token := claimOne(t, s, intentID)
+		token := claimHandoff(t, s, intentID)
 		result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 			Preparation: outbound.PreparationReady, BoundEndpoint: "U0001",
@@ -1339,6 +1318,238 @@ func TestTheTwoWaysAPayloadCanBeUnusable(t *testing.T) {
 		}
 		if status := statusOf(t, s, intentID); status != outbound.StatusPermanentFailed {
 			t.Fatalf("the commitment is %s, and nobody will be sent to look at it", status)
+		}
+	})
+}
+
+// relabel moves a claim and its commitments to another kind at once.
+//
+// A commitment points at its claim's whole identity and a family is derived
+// from a kind, so neither row can move on its own. Both updates are one
+// statement: the key between them is checked when the statement ends, by which
+// point the two agree again.
+func relabel(t *testing.T, s *Store, intentID, kind, family string) {
+	t.Helper()
+	exec(t, s, `
+		WITH claim AS (
+			UPDATE outbound_batches SET key_kind = $2, delivery_family = $3
+			WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)
+			RETURNING id
+		)
+		UPDATE outbound_intents SET key_kind = $2, delivery_family = $3
+		WHERE batch_id IN (SELECT id FROM claim)`, intentID, kind, family)
+}
+
+// asABuildThatKnows teaches the database one more kind, the way the build that
+// introduces it would, and takes the lesson back when the test ends.
+//
+// The suite shares one database, so a rule left widened would quietly let every
+// later test write rows this build forbids.
+func asABuildThatKnows(t *testing.T, s *Store, kind, family string) {
+	t.Helper()
+	wider := fmt.Sprintf(`(%s OR (key_kind = '%s' AND delivery_family = '%s'))`,
+		familyOfKindSQL, kind, family)
+
+	for _, rule := range []struct{ table, name string }{
+		{"outbound_batches", outboundBatchFamilyConstraint},
+		{"outbound_intents", outboundIntentFamilyConstraint},
+	} {
+		exec(t, s, `ALTER TABLE `+rule.table+` DROP CONSTRAINT `+rule.name)
+		exec(t, s, `ALTER TABLE `+rule.table+` ADD CONSTRAINT `+rule.name+` CHECK `+wider)
+
+		table, name := rule.table, rule.name
+		t.Cleanup(func() {
+			// The rows written under the wider rule go first. Truncation
+			// happens when the NEXT test starts, and the narrow rule is
+			// validated against the table the moment it is added.
+			exec(t, s, `TRUNCATE outbound_intent_events, outbound_attempt_observations,
+			            outbound_attempts, outbound_intents, outbound_group_snapshots,
+			            outbound_batches CASCADE`)
+			exec(t, s, `ALTER TABLE `+table+` DROP CONSTRAINT `+name)
+			exec(t, s, `ALTER TABLE `+table+` ADD CONSTRAINT `+name+
+				` CHECK `+familyOfKindSQL)
+		})
+	}
+}
+
+// announcementCarrying admits a real shift-change announcement and then moves
+// its payload, and only its payload.
+//
+// The kind, the family and the recipient columns stay as admission wrote them,
+// so a test built on this differs from a healthy commitment in the payload and
+// nothing else - and the recipient is written back into it from the columns
+// beside it, because a commitment addressed two ways is a row the database will
+// not hold and is nobody's subject here.
+func announcementCarrying(t *testing.T, s *Store, schemaVersion int, payload string) string {
+	t.Helper()
+	seedUsers(t, s, "u-alice")
+	// A shift still ahead of us: the fixed one these helpers announce by
+	// default has already ended, and a commitment born expired is never
+	// claimed, so there would be nothing to begin an attempt on.
+	result := mustSubmit(t, s, handoffAnnouncedFor(t, "sched-1",
+		time.Now().Add(time.Hour), announceTo("slack", "u-alice")))
+	if result.Outcome != outbound.SubmitCreated {
+		t.Fatalf("the announcement answered %q", result.Outcome)
+	}
+	intentID := result.IntentIDs[0]
+	exec(t, s, `
+		UPDATE outbound_intents
+		SET payload_schema_version = $2,
+		    payload = $3::jsonb || jsonb_build_object(
+		        'target', jsonb_build_object('kind', target_kind, 'ref', target_ref))
+		WHERE id = $1`, intentID, schemaVersion, payload)
+	return intentID
+}
+
+func claimHandoff(t *testing.T, s *Store, intentID string) string {
+	t.Helper()
+	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
+		Family: string(keys.FamilyHandoff), Provider: "slack",
+		Phase: outbound.ClaimRetriesFirst, Limit: 10,
+		Lease: outbound.NotificationLease, WorkerID: "worker-1",
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	for _, l := range leased {
+		if l.Intent.ID == intentID {
+			return l.LeaseToken
+		}
+	}
+	t.Fatalf("the claim did not include %s (%d came back)", intentID, len(leased))
+	return ""
+}
+
+// TestAnAnnouncementIsDeliveredWithNoRevisionAnywhere.
+//
+// A handover is drawn from its own payload, and a payload has no revisions. The
+// commitment therefore goes all the way through - claimed, opened, settled -
+// without one, and the columns that hold a revision stay empty.
+//
+// Empty rather than zero, which is the whole reason the revision is optional:
+// zero IS a revision, and a row saying "applied revision 0" is indistinguishable
+// from a card that really did apply the first one. Nothing downstream could then
+// tell "this commitment has no revisions" from "this commitment is at the
+// beginning", and the difference decides whether a thing is ever revised again.
+func TestAnAnnouncementIsDeliveredWithNoRevisionAnywhere(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	seedUsers(t, s, "u-alice")
+	result := mustSubmit(t, s, handoffAnnouncedFor(t, "sched-1",
+		time.Now().Add(time.Hour), announceTo("slack", "u-alice")))
+	if result.Outcome != outbound.SubmitCreated {
+		t.Fatalf("the announcement answered %q", result.Outcome)
+	}
+	intentID := result.IntentIDs[0]
+
+	token := claimHandoff(t, s, intentID)
+	begun, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+		Preparation: outbound.PreparationReady, BoundEndpoint: "U0001",
+	})
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if begun.Outcome != outbound.BeginStarted {
+		t.Fatalf("opening an attempt on an announcement answered %q", begun.Outcome)
+	}
+	// The attempt carries no revision either: the content it was opened from
+	// has none to carry.
+	if revision, ok := begun.Content.Revision(); ok {
+		t.Errorf("the announcement was opened at revision %d", revision)
+	}
+
+	settled, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token, Conclusion: accepted(),
+	})
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if settled.To != outbound.StatusSucceeded {
+		t.Fatalf("a delivered announcement is %s", settled.To)
+	}
+
+	var onIntent, onAttempt sql.NullInt64
+	if err := s.db.QueryRow(`
+		SELECT i.applied_revision, a.applied_revision
+		FROM outbound_intents i JOIN outbound_attempts a ON a.id = $2
+		WHERE i.id = $1`, intentID, begun.AttemptID).Scan(&onIntent, &onAttempt); err != nil {
+		t.Fatalf("read the revisions back: %v", err)
+	}
+	if onIntent.Valid {
+		t.Errorf("the commitment applied revision %d, and it has no revisions", onIntent.Int64)
+	}
+	if onAttempt.Valid {
+		t.Errorf("the attempt applied revision %d, and it had none to apply", onAttempt.Int64)
+	}
+}
+
+// TestAPayloadThatIsNotTheOneAdmitted.
+//
+// The third way, and the one nothing else catches: an announcement swapped for
+// another announcement. It has the right kind, a schema this build knows, bytes
+// that canonicalise and the recipient the columns name - every check a payload
+// meets on its way to a provider - and it is not what the domain promised. Sent,
+// it tells a person about a shift nobody committed to telling them about.
+//
+// The second half is the control. The same bytes, with the digest that belongs
+// to them, go out: what refuses the first half is the comparison and not some
+// property of the payload itself.
+func TestAPayloadThatIsNotTheOneAdmitted(t *testing.T) {
+	const other = `{"kind":"handoff","team_name":"Platform","schedule_id":"sched-2",` +
+		`"timezone":"UTC","grid_slot_start":"2026-05-04T11:00:00Z",` +
+		`"assignment_start":"2026-05-04T11:00:00Z","assignment_end":"2026-05-04T19:00:00Z"}`
+
+	begin := func(t *testing.T, s *Store, intentID string) outbound.BeginAttemptResult {
+		t.Helper()
+		token := claimHandoff(t, s, intentID)
+		result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+			Preparation: outbound.PreparationReady, BoundEndpoint: "U0001",
+		})
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		return result
+	}
+
+	t.Run("another announcement in its place", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.SetRenderEnvironment("https://tokay.example", "UTC")
+		intentID := announcementCarrying(t, s, 1, other)
+
+		if result := begin(t, s, intentID); result.Outcome != outbound.BeginPreparedPermanent {
+			t.Fatalf("an announcement nobody promised answered %q", result.Outcome)
+		}
+		if status := statusOf(t, s, intentID); status != outbound.StatusPermanentFailed {
+			t.Fatalf("the commitment is %s, and the wrong announcement is still owed", status)
+		}
+	})
+
+	t.Run("the same bytes, admitted", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.SetRenderEnvironment("https://tokay.example", "UTC")
+		intentID := announcementCarrying(t, s, 1, other)
+
+		// What admission would have written for these bytes. Taken from the row
+		// rather than composed here, so the digest is over exactly what the
+		// attempt will read.
+		var stored []byte
+		if err := s.db.QueryRow(
+			`SELECT payload FROM outbound_intents WHERE id = $1`, intentID).
+			Scan(&stored); err != nil {
+			t.Fatalf("read the payload back: %v", err)
+		}
+		digest, err := keys.PayloadDigest(keys.KindHandoff, 1, stored)
+		if err != nil {
+			t.Fatalf("digest the payload: %v", err)
+		}
+		exec(t, s, `UPDATE outbound_intents SET payload_digest = $2 WHERE id = $1`,
+			intentID, digest)
+
+		if result := begin(t, s, intentID); result.Outcome != outbound.BeginStarted {
+			t.Fatalf("an announcement that IS the one admitted answered %q", result.Outcome)
 		}
 	})
 }

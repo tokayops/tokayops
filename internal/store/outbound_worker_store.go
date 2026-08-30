@@ -376,7 +376,7 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 	transition, err := outbound.Decide(outbound.Input{
 		Intent:          *intent,
 		Trigger:         outbound.TriggerRecoverStale,
-		AttemptRevision: attemptRevision.Int64,
+		AttemptRevision: nullableRevision(attemptRevision),
 		Expired:         expired,
 	})
 	if err != nil {
@@ -387,7 +387,7 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 		Intent:          *intent,
 		Transition:      transition,
 		Backoff:         outbound.Backoff(intent.FailureStreak + 1),
-		AppliedRevision: attemptRevision.Int64,
+		AppliedRevision: nullableRevision(attemptRevision),
 		Actor:           "recovery",
 		Reason:          "the lease expired with an attempt in flight",
 	}); err != nil {
@@ -1063,8 +1063,8 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	// commitment's own state describe the same thing.
 	completion := concluded
 	if attemptRevision.Valid {
-		applied := attemptRevision.Int64
-		completion.AppliedRevision = &applied
+		value := attemptRevision.Int64
+		completion.AppliedRevision = &value
 	}
 
 	// Only now the fingerprint, and under the protocol the ATTEMPT was opened
@@ -1124,7 +1124,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 			"attempt %s is open but its commitment points elsewhere", req.AttemptID)
 	}
 
-	applied := attemptRevision.Int64
+	applied := nullableRevision(attemptRevision)
 
 	// Whether that revision was the LAST one is a property of the stored state
 	// too. Only a success needs the answer: the one doubtful outcome that
@@ -1141,7 +1141,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		if err != nil {
 			return outbound.FinalizeResult{}, err
 		}
-		final = stored.Final && stored.Revision == applied
+		final = stored.Final && applied != nil && stored.Revision == *applied
 	}
 
 	transition, err := outbound.Decide(outbound.Input{
@@ -1322,4 +1322,15 @@ func appliedRevision(content outbound.AttemptContent) any {
 		return revision
 	}
 	return nil
+}
+
+// nullableRevision keeps "this attempt applied no revision" distinct from "it
+// applied revision zero". The first is a commitment drawn from its own payload,
+// which has no revisions at all; the second is the first state of one that has.
+func nullableRevision(value sql.NullInt64) *int64 {
+	if !value.Valid {
+		return nil
+	}
+	revision := value.Int64
+	return &revision
 }

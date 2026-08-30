@@ -26,14 +26,31 @@ func handoffOccurrence(schedule string) keys.Occurrence {
 	}
 }
 
+// handoffBatch announces the shift these tests are written around: a fixed one,
+// so that what is stored can be compared against written-down values.
+//
+// Its slot is in the past, which admission allows on purpose - a shift that came
+// and went while the system was stopped is still a fact - and which means the
+// commitments are born expired. A test that has to CLAIM one needs a shift that
+// has not ended yet, and takes handoffAnnouncedFor.
 func handoffBatch(t *testing.T, schedule string, recipients ...keys.HandoffRecipient) outbound.Batch {
 	t.Helper()
+	return handoffAnnouncedFor(t, schedule,
+		time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC), recipients...)
+}
+
+func handoffAnnouncedFor(t *testing.T, schedule string, slotStart time.Time,
+	recipients ...keys.HandoffRecipient) outbound.Batch {
+
+	t.Helper()
+	occurrence := handoffOccurrence(schedule)
+	occurrence.AssignmentStart = slotStart.UTC()
 	admission, err := keys.HandoffBatch{
-		Occurrence:         handoffOccurrence(schedule),
+		Occurrence:         occurrence,
 		TeamName:           "Backend",
 		Timezone:           "UTC",
-		GridSlotStart:      time.Date(2026, 5, 4, 11, 0, 0, 0, time.UTC),
-		AssignmentEnd:      time.Date(2026, 5, 4, 19, 0, 0, 0, time.UTC),
+		GridSlotStart:      slotStart.UTC(),
+		AssignmentEnd:      slotStart.UTC().Add(8 * time.Hour),
 		MaxAge:             time.Hour,
 		GrammarVersion:     keys.GrammarV1,
 		FingerprintVersion: keys.CurrentBatchFingerprintVersion(),

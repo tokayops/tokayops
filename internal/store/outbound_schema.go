@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -179,6 +180,12 @@ CREATE TABLE IF NOT EXISTS outbound_intents (
 	-- parsing that here would put Slack's field names, and Telegram's, inside
 	-- rules that are supposed to hold for every channel there will ever be.
 	receipt_ref                TEXT,
+	-- What this commitment's payload was when it was admitted, canonicalised.
+	-- Every attempt recomputes it from the payload on the row and compares:
+	-- without it there is nothing to compare against, because the payload is
+	-- not in the business key and its wire form reaches only the intent
+	-- fingerprint, which an attempt does not recompute.
+	payload_digest             BYTEA NOT NULL,
 	receipt_recorded           BOOLEAN NOT NULL DEFAULT FALSE,
 	receipt_redacted_at        TIMESTAMPTZ,
 	-- When the recipient of this commitment was erased. A durable prohibition
@@ -868,6 +875,10 @@ func (s *Store) applyOutboundSchema() error {
 			return fmt.Errorf("failed to add %s on %s: %w",
 				outboundReceiptStateConstraint, table, err)
 		}
+	}
+
+	if err := applyPayloadDigest(context.Background(), tx); err != nil {
+		return err
 	}
 
 	return tx.Commit()

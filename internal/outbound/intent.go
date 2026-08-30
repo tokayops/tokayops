@@ -224,6 +224,13 @@ type Intent struct {
 	// never happened, recorded as one, retried forever.
 	Payload json.RawMessage
 
+	// PayloadDigest is what the payload digested to when the commitment was
+	// admitted. Stored beside the bytes rather than derived from them on every
+	// read, because the two are only useful when they disagree: a payload
+	// changed after the promise was made still canonicalises perfectly, and
+	// without something to compare it against it would simply be delivered.
+	PayloadDigest []byte
+
 	DesiredRevision      int64
 	AppliedRevision      *int64
 	FinalRevisionApplied bool

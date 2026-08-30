@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -776,32 +777,65 @@ func TestSubmitRefusesAClaimThatIsNotAboutThisAdmission(t *testing.T) {
 	s := setupTestDB(t)
 	ctx := context.Background()
 
-	spoil := map[string]func(t *testing.T, agID string){
-		"held for another alert group": func(t *testing.T, agID string) {
-			exec(t, s, `UPDATE outbound_batches SET alert_group_id = $2 WHERE alert_group_id = $1`,
-				agID, outboundGroup(t, s))
+	// Two ways the disagreement arises, and both are the same disagreement. The
+	// alert a claim is held for is not in the key's opening triple, so a stored
+	// row can name another one; the kind and the grammar ARE in it, so a stored
+	// row naming them differently is unreachable - what is reachable is a build
+	// that keys claims differently arriving at the same string. That one comes
+	// in through the door rather than through the table.
+	cases := []struct {
+		name     string
+		stored   func(t *testing.T, agID string)
+		incoming func(outbound.Batch) outbound.Batch
+		// The guard by its own words: several contract errors live on this
+		// path, and a test that accepts any of them proves whichever one fires.
+		says string
+	}{
+		{
+			name: "held for another alert group",
+			stored: func(t *testing.T, agID string) {
+				exec(t, s, `UPDATE outbound_batches SET alert_group_id = $2
+				            WHERE alert_group_id = $1`, agID, outboundGroup(t, s))
+			},
+			says: "is held for",
 		},
-		"held as another kind of claim": func(t *testing.T, agID string) {
-			exec(t, s, `UPDATE outbound_batches SET key_kind = 'escalation_replay' WHERE alert_group_id = $1`,
-				agID)
+		{
+			name: "held as another kind of claim",
+			incoming: func(b outbound.Batch) outbound.Batch {
+				b.Admission.Kind = keys.KindEscalationReplay
+				return b
+			},
+			says: "is held as",
 		},
-		"keyed under another grammar": func(t *testing.T, agID string) {
-			exec(t, s, `UPDATE outbound_batches SET grammar_version = 99 WHERE alert_group_id = $1`,
-				agID)
+		{
+			name: "keyed under another grammar",
+			incoming: func(b outbound.Batch) outbound.Batch {
+				b.Admission.GrammarVersion = 99
+				return b
+			},
+			says: "was keyed under grammar",
 		},
 	}
 
-	for name, damage := range spoil {
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			agID := outboundGroup(t, s)
 			adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
 			mustSubmit(t, s, adm)
 
-			damage(t, agID)
+			if tc.stored != nil {
+				tc.stored(t, agID)
+			}
+			if tc.incoming != nil {
+				adm = tc.incoming(adm)
+			}
 
 			_, err := s.SubmitBatch(ctx, adm)
 			if !errors.Is(err, ErrOutboundContract) {
 				t.Fatalf("a claim that is not about this admission answered %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.says) {
+				t.Errorf("refused with %q, which is not %q", err, tc.says)
 			}
 		})
 	}

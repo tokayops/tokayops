@@ -254,7 +254,7 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 		if err != nil {
 			return outbound.ResolveAmbiguityResult{}, err
 		}
-		final = stored.Final && stored.Revision == facts.Revision
+		final = stored.Final && facts.Revision != nil && stored.Revision == *facts.Revision
 
 		// An editable card being brought back to life has to aim at the state
 		// the group is in NOW, or it would reapply a revision from before the
@@ -384,8 +384,9 @@ func decisionIsStale(intent outbound.Intent, decision outbound.Decision, groupSt
 // know about the journal: what the last attempt was doing, which revision it
 // was applying, and whether anything in this generation ended in doubt.
 type attemptFacts struct {
-	Kind      outbound.AttemptKind
-	Revision  int64
+	Kind outbound.AttemptKind
+	// Revision is what the last attempt applied, and nil when it applied none.
+	Revision  *int64
 	Ambiguous bool
 
 	// ResourceLost is proof, from the journal, that the message this commitment
@@ -477,7 +478,7 @@ func lastAttemptFactsTx(ctx context.Context, tx *sql.Tx, intentID string,
 
 	return attemptFacts{
 		Kind:         outbound.AttemptKind(kind.String),
-		Revision:     revision.Int64,
+		Revision:     nullableRevision(revision),
 		Ambiguous:    ambiguous,
 		ResourceLost: lost,
 	}, nil

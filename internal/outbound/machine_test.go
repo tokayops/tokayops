@@ -178,7 +178,7 @@ func TestDecideNamedRows(t *testing.T) {
 				i.DesiredRevision = 3
 				return Input{
 					Intent: i, Trigger: TriggerFinishAttempt,
-					Outcome: OutcomeAccepted, AttemptRevision: 3,
+					Outcome: OutcomeAccepted, AttemptRevision: revisionOf(3),
 				}
 			}(),
 			to: StatusIdle, row: "T8/S3",
@@ -191,7 +191,7 @@ func TestDecideNamedRows(t *testing.T) {
 				i.DesiredRevision = 4
 				return Input{
 					Intent: i, Trigger: TriggerFinishAttempt,
-					Outcome: OutcomeAccepted, AttemptRevision: 3,
+					Outcome: OutcomeAccepted, AttemptRevision: revisionOf(3),
 				}
 			}(),
 			to: StatusPending, row: "T8/S4",
@@ -204,10 +204,23 @@ func TestDecideNamedRows(t *testing.T) {
 				i.DesiredRevision = 3
 				return Input{
 					Intent: i, Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted,
-					AttemptRevision: 3, AttemptIsFinal: true,
+					AttemptRevision: revisionOf(3), AttemptIsFinal: true,
 				}
 			}(),
 			to: StatusSucceeded, row: "T8/S2",
+		},
+		{
+			// A handover announcement: one message, drawn from its own payload,
+			// with no revision to report and none to compare against.
+			name: "an announcement settled with no revision at all",
+			in: func() Input {
+				i := sendingIntent()
+				i.Form = FormOneShot
+				return Input{
+					Intent: i, Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted,
+				}
+			}(),
+			to: StatusSucceeded, row: "T8/S1",
 		},
 		{
 			name: "a lease died mid-flight",
@@ -403,6 +416,19 @@ func TestDecideRefusesWhatItDoesNotHave(t *testing.T) {
 			},
 		},
 		{
+			// An editable card is drawn from a state that HAS revisions, so an
+			// attempt on one that applied none is a contradiction. Answered as
+			// "revision 0" it would be behind every desired revision and go
+			// back in the queue forever.
+			name: "an editable card that applied no revision",
+			in: func() Input {
+				i := sendingIntent()
+				i.Form = FormEditable
+				i.DesiredRevision = 3
+				return Input{Intent: i, Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted}
+			}(),
+		},
+		{
 			name: "a trigger nobody defined",
 			in:   Input{Intent: sendingIntent(), Trigger: Trigger("apply_provider_event")},
 		},
@@ -551,7 +577,12 @@ func TestDecideOverTheWholeInputSpace(t *testing.T) {
 					for _, completion := range allCompletion {
 						for _, final := range bothWays {
 							for _, canceled := range bothWays {
-								for _, behind := range bothWays {
+								// Three answers, not two: an attempt can have
+								// applied the revision that was wanted, one
+								// that has since been overtaken, or none at all
+								// - which is every commitment drawn from its
+								// own payload.
+								for _, revision := range []*int64{nil, revisionOf(2), revisionOf(3)} {
 									intent := sendingIntent()
 									intent.Status = status
 									intent.AmbiguityPolicy = policy
@@ -559,10 +590,6 @@ func TestDecideOverTheWholeInputSpace(t *testing.T) {
 									intent.CompletionMode = completion
 									intent.CancellationRequested = canceled
 									intent.DesiredRevision = 3
-									revision := int64(3)
-									if behind {
-										revision = 2
-									}
 									check(Input{
 										Intent:          intent,
 										Trigger:         TriggerFinishAttempt,
@@ -647,3 +674,7 @@ func knownStatus(s Status) bool {
 	}
 	return false
 }
+
+// revisionOf is the revision an attempt applied, as the machine takes it: a
+// pointer, so "applied none" and "applied revision zero" stay apart.
+func revisionOf(value int64) *int64 { return &value }

@@ -1,11 +1,13 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
 
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
 // What a database from the previous version gets when this one starts.
@@ -34,6 +36,24 @@ func previousOutboundShape(t *testing.T, s *Store) {
 		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
 			outboundReceiptNameConstraint,
 		`ALTER TABLE outbound_intents DROP COLUMN IF EXISTS receipt_ref`,
+
+		// The commitments and their claims had no families to keep in step and
+		// nothing remembered what a payload was admitted as. The key between a
+		// claim and its commitments goes before the unique index it points at,
+		// and the length rule goes with the column it is about.
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+			outboundIntentBatchIdentity,
+		`ALTER TABLE outbound_batches DROP CONSTRAINT IF EXISTS ` +
+			outboundBatchIdentityUnique,
+		`ALTER TABLE outbound_batches DROP CONSTRAINT IF EXISTS ` +
+			outboundBatchFamilyConstraint,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+			outboundIntentFamilyConstraint,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+			outboundHandoffTargetAgreement,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+			outboundHandoffPersonTarget,
+		`ALTER TABLE outbound_intents DROP COLUMN IF EXISTS payload_digest`,
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
 			t.Fatalf("build the previous shape: %v", err)
@@ -368,5 +388,180 @@ func TestAFormThisBuildDoesNotDeliverStopsBeforeTheNetwork(t *testing.T) {
 	}
 	if attempts != 0 {
 		t.Fatalf("the refusal left %d journal records behind", attempts)
+	}
+}
+
+// outboundRulesAddedWithTheDigest is every rule that arrives with the payload
+// digest, named once so the upgrade tests and the idempotence test cannot drift
+// apart about what "all of them" means.
+var outboundRulesAddedWithTheDigest = []struct{ table, name string }{
+	{"outbound_intents", outboundPayloadDigestLenConstraint},
+	{"outbound_batches", outboundBatchFamilyConstraint},
+	{"outbound_intents", outboundIntentFamilyConstraint},
+	{"outbound_batches", outboundBatchIdentityUnique},
+	{"outbound_intents", outboundIntentBatchIdentity},
+	{"outbound_intents", outboundHandoffTargetAgreement},
+	{"outbound_intents", outboundHandoffPersonTarget},
+}
+
+// TestAStartFillsInThePayloadDigests.
+//
+// The column is NOT NULL and the table has rows, so the upgrade cannot be one
+// statement: it adds the column empty, fills it with this build's own codec and
+// only then makes it required. What this asserts is the end of that - every
+// commitment carrying the digest of its own payload, and every rule that came
+// with it in force and checked against the rows that were already there.
+func TestAStartFillsInThePayloadDigests(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	admitOne(t, s, agID, channelCommitment("C-ops", 0), dmCommitment("U-nina"))
+
+	previousOutboundShape(t, s)
+	if hasColumn(t, s, "outbound_intents", "payload_digest") {
+		t.Fatal("the previous shape still has the column this test is about")
+	}
+
+	if err := s.applyOutboundSchema(); err != nil {
+		t.Fatalf("start against the previous shape: %v", err)
+	}
+
+	// Every commitment, digested from the bytes on its own row. Compared
+	// against a value computed here rather than against "not null", because a
+	// backfill that wrote the same constant everywhere would pass that.
+	rows, err := s.db.Query(`
+		SELECT id, key_kind, payload_schema_version, payload, payload_digest
+		FROM outbound_intents WHERE alert_group_id = $1`, agID)
+	if err != nil {
+		t.Fatalf("read the commitments back: %v", err)
+	}
+	defer rows.Close()
+
+	filled := 0
+	for rows.Next() {
+		var id, kind string
+		var schemaVersion int
+		var payload, stored []byte
+		if err := rows.Scan(&id, &kind, &schemaVersion, &payload, &stored); err != nil {
+			t.Fatalf("scan a commitment: %v", err)
+		}
+		want, err := keys.PayloadDigest(keys.Kind(kind), schemaVersion, payload)
+		if err != nil {
+			t.Fatalf("digest the payload of %s: %v", id, err)
+		}
+		if !bytes.Equal(stored, want) {
+			t.Errorf("%s carries %x, its payload digests to %x", id, stored, want)
+		}
+		filled++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the commitments: %v", err)
+	}
+	if filled != 2 {
+		t.Fatalf("the upgrade looked at %d commitment(s), there were 2", filled)
+	}
+
+	// The rules, and the fact that each was checked against the rows already in
+	// the table. A constraint added NOT VALID would be present and would have
+	// let every row that was there through unexamined.
+	for _, rule := range outboundRulesAddedWithTheDigest {
+		var validated bool
+		if err := s.db.QueryRow(`
+			SELECT convalidated FROM pg_constraint
+			WHERE conname = $1 AND conrelid = $2::regclass`,
+			rule.name, rule.table).Scan(&validated); err != nil {
+			t.Errorf("%s did not arrive on %s: %v", rule.name, rule.table, err)
+			continue
+		}
+		if !validated {
+			t.Errorf("%s is on %s but was never checked against its rows",
+				rule.name, rule.table)
+		}
+	}
+
+	// And the rules bite on the upgraded database, which is the only place they
+	// were added by a later statement rather than by CREATE TABLE.
+	var intentID string
+	if err := s.db.QueryRow(
+		`SELECT id FROM outbound_intents WHERE alert_group_id = $1 LIMIT 1`,
+		agID).Scan(&intentID); err != nil {
+		t.Fatalf("pick a commitment: %v", err)
+	}
+	for name, statement := range map[string]string{
+		outboundPayloadDigestLenConstraint: `UPDATE outbound_intents
+			SET payload_digest = decode(repeat('ab', 31), 'hex') WHERE id = $1`,
+		outboundIntentFamilyConstraint: `UPDATE outbound_intents
+			SET delivery_family = 'handoff' WHERE id = $1`,
+		// The claim moves with the commitment, because a commitment alone
+		// cannot: the key between them would refuse it before the handover
+		// rules were reached. The payload names the same channel the columns
+		// do, so the rule about addressing is satisfied and the one about who
+		// takes a shift is the one left to refuse it.
+		outboundHandoffPersonTarget: `
+			WITH claim AS (
+				UPDATE outbound_batches SET key_kind = 'handoff', delivery_family = 'handoff'
+				WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)
+				RETURNING id
+			)
+			UPDATE outbound_intents SET key_kind = 'handoff', delivery_family = 'handoff'
+			WHERE batch_id IN (SELECT id FROM claim)`,
+	} {
+		if _, err := s.db.Exec(statement, intentID); err == nil {
+			t.Errorf("the upgraded database accepted a row %s exists to forbid", name)
+		} else if !strings.Contains(err.Error(), name) {
+			t.Errorf("expected %s to refuse the row, got: %v", name, err)
+		}
+	}
+}
+
+// TestAStartRefusesAPayloadItCannotDigest.
+//
+// A payload the codec will not read has no digest anybody can compute, and
+// there is no value to put in the column that would mean anything: a zero, or
+// the digest of some other reading of the bytes, would be compared against on
+// every attempt for the rest of that commitment's life. So the start stops and
+// names the row.
+//
+// And it stops WHOLE. Half of this applied - the column present, the rules not
+// - is a database where the next start finds a column it has no reason to
+// distrust.
+func TestAStartRefusesAPayloadItCannotDigest(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	intentID := admitOne(t, s, agID, channelCommitment("C-ops", 0))[0]
+
+	previousOutboundShape(t, s)
+	// A slot with no kind: the schema version this build renders, carrying
+	// bytes it cannot read. The recipient is left exactly as it was, so the
+	// rule about addressing is not what refuses this.
+	exec(t, s, `
+		UPDATE outbound_intents
+		SET payload = jsonb_set(payload, '{slot}', '{"kind":""}') WHERE id = $1`,
+		intentID)
+
+	// The remedy the refusal names, applied here so that every later start in
+	// this process is not refused for the same reason.
+	t.Cleanup(func() {
+		exec(t, s, `
+			UPDATE outbound_intents
+			SET payload = jsonb_set(payload, '{slot}', '{"kind":"firehose"}')
+			WHERE id = $1`, intentID)
+		if err := s.applyOutboundSchema(); err != nil {
+			t.Fatalf("put the schema back: %v", err)
+		}
+	})
+
+	err := s.applyOutboundSchema()
+	if err == nil {
+		t.Fatal("a start accepted a payload nothing can digest")
+	}
+	if !strings.Contains(err.Error(), intentID) {
+		t.Fatalf("the refusal does not name the row to fix: %v", err)
+	}
+	if hasColumn(t, s, "outbound_intents", "payload_digest") {
+		t.Error("the refusal added the column anyway")
 	}
 }

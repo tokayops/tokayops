@@ -115,9 +115,14 @@ type Input struct {
 	// Outcome is the transport result for TriggerFinishAttempt.
 	Outcome Outcome
 
-	// AttemptRevision is the revision the finished attempt was applying. It
+	// AttemptRevision is the revision the finished attempt was applying, and it
 	// becomes the applied revision on success.
-	AttemptRevision int64
+	//
+	// Nil when the commitment has no revisions at all - one drawn from its own
+	// payload rather than from a state that is revised. Not zero: a zero is a
+	// revision, and it would compare as "behind revision 1" and put such a
+	// commitment back in the queue forever.
+	AttemptRevision *int64
 
 	// AttemptIsFinal says the attempt applied the last revision this commitment
 	// will ever have - the resolve of an alert, after which the card is done.
@@ -515,7 +520,14 @@ func settleApplied(in Input, proof Proof, row string) (Transition, error) {
 		return Transition{To: StatusSucceeded, Effects: effects, Row: row + "/S2"}, nil
 	}
 
-	if in.AttemptRevision >= in.Intent.DesiredRevision {
+	// Only an editable commitment reaches here, and every one of those is drawn
+	// from a state that has revisions - so a missing one is a contradiction
+	// rather than a case to handle.
+	if in.AttemptRevision == nil {
+		return Transition{}, invalidf(
+			"an editable commitment settled an attempt that applied no revision")
+	}
+	if *in.AttemptRevision >= in.Intent.DesiredRevision {
 		return Transition{To: StatusIdle, Effects: effects, Row: row + "/S3"}, nil
 	}
 
