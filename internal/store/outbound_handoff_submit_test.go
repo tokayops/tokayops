@@ -511,6 +511,47 @@ func TestOnlyAHandoverMayCarryABoundedDeadline(t *testing.T) {
 		if !expired {
 			t.Fatal("an announcement about a shift that is over has a deadline in the future")
 		}
+
+		// Admitted PENDING, though: what makes it terminal is the sweep, and
+		// the difference matters because the two write different histories.
+		// Submit refusing it would leave no record that the announcement was
+		// ever owed; the sweep ends it under its own name, with a reason.
+		intentID := result.IntentIDs[0]
+		if got := statusOf(t, s, intentID); got != outbound.StatusPending {
+			t.Fatalf("Submit made the announcement %s by itself", got)
+		}
+
+		swept, err := s.ExpireDueIntents(context.Background(),
+			string(keys.FamilyHandoff), 10)
+		if err != nil {
+			t.Fatalf("expire what is due: %v", err)
+		}
+		if len(swept) != 1 || swept[0].IntentID != intentID {
+			t.Fatalf("the sweep of the handover family took %d commitments", len(swept))
+		}
+		if got := statusOf(t, s, intentID); got != outbound.StatusExpired {
+			t.Fatalf("after the sweep the announcement is %s", got)
+		}
+
+		// And nothing was ever sent: a commitment born past its deadline is
+		// never worth a call, so there is no attempt row and no message to
+		// somebody about a shift that ended an hour ago.
+		var attempts int
+		if err := s.db.QueryRow(
+			`SELECT count(*) FROM outbound_attempts WHERE intent_id = $1`, intentID).
+			Scan(&attempts); err != nil {
+			t.Fatalf("count the attempts: %v", err)
+		}
+		if attempts != 0 {
+			t.Fatalf("%d attempts were made on an announcement that was already too late",
+				attempts)
+		}
+
+		// The history says why, rather than leaving a status nobody can
+		// account for.
+		if countEvents(t, s, intentID, "expired") != 1 {
+			t.Error("the journal does not say the deadline passed")
+		}
 	})
 }
 
