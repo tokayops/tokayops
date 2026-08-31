@@ -338,8 +338,6 @@ func init() {
 	prometheus.MustRegister(UnknownTeamAlertGroupsTotal)
 	prometheus.MustRegister(AlertGroupsResolvedTotal)
 
-	// Tier 3
-
 	// Tier 4
 	prometheus.MustRegister(EngineRunsTotal)
 	prometheus.MustRegister(EngineAlertGroupsPickedTotal)

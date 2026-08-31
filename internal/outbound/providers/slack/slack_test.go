@@ -445,19 +445,6 @@ func TestRenderBodyAttachment_AlertListTruncation(t *testing.T) {
 	}
 }
 
-// countingTeamLookup is a providers.TeamLookup that records how often it ran, so a test
-// can assert the lookup was skipped, not just that its answer was ignored.
-type countingTeamLookup struct {
-	calls     int
-	onboarded bool
-	err       error
-}
-
-func (c *countingTeamLookup) fn(string) (bool, error) {
-	c.calls++
-	return c.onboarded, c.err
-}
-
 // findActionBlock reports whether the attachment offers Ack/Resolve.
 func findActionBlock(att slackapi.Attachment) *slackapi.ActionBlock {
 	for _, b := range att.Blocks.BlockSet {

@@ -311,20 +311,6 @@ func TestTelegram_TeamGate(t *testing.T) {
 	}
 }
 
-// countingTeamLookup is a providers.TeamLookup that records how often it ran,
-// so a test can assert the lookup was skipped, not just that its answer was
-// ignored.
-type countingTeamLookup struct {
-	calls     int
-	onboarded bool
-	err       error
-}
-
-func (c *countingTeamLookup) fn(string) (bool, error) {
-	c.calls++
-	return c.onboarded, c.err
-}
-
 // frozen is the state a card is drawn from, built the way admission builds it.
 //
 // Through SnapshotOf rather than by hand: what a channel renders is what the
