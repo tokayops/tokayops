@@ -197,7 +197,9 @@ func (s *Store) resolveByAlertmanagerTx(ctx context.Context, tx *sql.Tx,
 	if err := tx.Commit(); err != nil {
 		return alertgroup.MergeResult{}, err
 	}
-	countWithdrawn(withdrawn)
+	// By alert group, so every one of them is paging: a handover names no
+	// alert group and cannot be among these.
+	countWithdrawn(map[string]int{outbound.FamilyNotification: withdrawn})
 	countDesired(outbound.DesiredResolve, desired.Outcome)
 	return alertgroup.MergeResult{
 		Outcome: alertgroup.MergeResolved, AlertGroupID: group.ID,

@@ -46,6 +46,7 @@ type mockNotifierStore struct {
 	identitiesErr error
 	submitErr     error
 	identityCalls int
+	submitCalls   int
 
 	// held are occurrences another instance already claimed, and the answer the
 	// store gives about each: the same work comes back as existing, different
@@ -80,6 +81,7 @@ func (m *mockNotifierStore) GetIdentitiesForUsers(userIDs []string) (map[string]
 }
 
 func (m *mockNotifierStore) SubmitBatch(_ context.Context, batch outbound.Batch) (outbound.SubmitResult, error) {
+	m.submitCalls++
 	if m.submitErr != nil {
 		return outbound.SubmitResult{}, m.submitErr
 	}
@@ -853,6 +855,76 @@ func TestAnAnnouncementTheGrammarRefusesLeavesTheScheduleAlone(t *testing.T) {
 	}
 }
 
+// TestARestartBetweenDetectionAndAdmissionAnnouncesNothing.
+//
+// This fixes the behaviour as it is, not as anyone would like it. The
+// composition lives in the process, so an instance that dies after seeing a
+// shift change and before admitting it takes the observation with it: the
+// process that replaces it warms up on the world as it now stands, and a
+// change that already happened is part of that baseline.
+//
+// The occurrence key does not help here and is not meant to. It stops two
+// instances announcing one change twice; it says nothing about a change nobody
+// is left to announce. Making detection durable is separate work, and this test
+// exists so that it is not mistaken for done.
+func TestARestartBetweenDetectionAndAdmissionAnnouncesNothing(t *testing.T) {
+	before := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	before.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	// The shift changes. This instance never gets to the admission.
+	after := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	after.warmUp(rotationDuty("sched-1", "g-b", "bob"))
+	if len(after.announcements()) != 0 {
+		t.Fatalf("the replacement announced %d changes on its first tick",
+			len(after.announcements()))
+	}
+
+	// And it stays silent about it afterwards, because as far as it knows
+	// nothing has changed.
+	after.tick(rotationDuty("sched-1", "g-b", "bob"))
+	if len(after.announcements()) != 0 {
+		t.Fatalf("the replacement announced %d changes it never saw happen",
+			len(after.announcements()))
+	}
+
+	// The next real transition is announced, so what was lost is one event and
+	// not the schedule.
+	after.tick(rotationDuty("sched-1", "g-c", "alice"))
+	if got := after.targets(); strings.Join(got, ",") != "alice" {
+		t.Fatalf("notified %v, want the next transition", got)
+	}
+}
+
+// TestAnAnswerThatWasLostIsNotAskedAgain.
+//
+// The commit happened and the answer did not arrive: the producer has no idea
+// its work exists. The next tick offers the same occurrence and is told it
+// already exists, and that is an answer nothing improves - so the cache moves
+// and there is no third offer.
+//
+// Left pending, this is a Submit per tick for the rest of the shift, all of
+// them answered the same way.
+func TestAnAnswerThatWasLostIsNotAskedAgain(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	// The work exists; this instance never heard so.
+	next := observe(rotationDuty("sched-1", "g-b", "bob"))
+	env.store.held[occKey(t, kindHandoff, "sched-1", next)] = outbound.SubmitExisting
+
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	offered := env.store.submitCalls
+	if offered != 1 {
+		t.Fatalf("the transition was offered %d times, want once", offered)
+	}
+
+	// The same state again: nothing has changed, so nothing is offered.
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	if env.store.submitCalls != offered {
+		t.Errorf("the occurrence was offered again after being told it exists")
+	}
+}
+
 // TestTheCacheMovesOnlyOnAnswersNothingCanImprove.
 //
 // The cache is the whole memory of what has been dealt with, so what moves it
@@ -909,6 +981,38 @@ func TestTheCacheMovesOnlyOnAnswersNothingCanImprove(t *testing.T) {
 				t.Fatalf("cache holds %v; moved=%v, want %v", cached.UserIDs, moved, tc.moves)
 			}
 		})
+	}
+}
+
+// TestAConflictIsNotOfferedAgain.
+//
+// Two instances built the same occurrence from different sets - live
+// configuration that differed by a field between them - and this one lost. The
+// winner already holds the claim and its announcement is already going out;
+// there is nothing to ask and nobody to overrule.
+//
+// So it is counted, logged with both fingerprints by the store, and let go. Not
+// letting go means this same answer every tick until the shift ends, which is a
+// loop that fixes nothing and hides the one line that said what happened.
+func TestAConflictIsNotOfferedAgain(t *testing.T) {
+	env := newNotifierEnv(t, slackIDsFor("alice", "bob"))
+	env.warmUp(rotationDuty("sched-1", "g-a", "alice"))
+
+	next := observe(rotationDuty("sched-1", "g-b", "bob"))
+	env.store.held[occKey(t, kindHandoff, "sched-1", next)] = outbound.SubmitConflict
+
+	env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	lost := env.store.submitCalls
+	if lost != 1 {
+		t.Fatalf("the transition was offered %d times, want once", lost)
+	}
+
+	for i := 0; i < 3; i++ {
+		env.tick(rotationDuty("sched-1", "g-b", "bob"))
+	}
+	if env.store.submitCalls != lost {
+		t.Errorf("the lost occurrence was offered %d more times",
+			env.store.submitCalls-lost)
 	}
 }
 

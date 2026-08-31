@@ -71,9 +71,14 @@ func (r *erasureRepo) WithinTx(ctx context.Context, fn func(erasure.Tx) error) e
 type erasureTx struct {
 	tx *sql.Tx
 
-	// withdrawn is how many commitments this erasure ended, held until the
-	// transaction commits. See WithinTx.
-	withdrawn int
+	// withdrawn is the commitments this erasure ended, by the family each ran
+	// in, held until the transaction commits. See WithinTx.
+	//
+	// By family and not as one number: the counter is watched per partition,
+	// and an announcement withdrawn from the handover queue counted against
+	// paging reads as an escalation that did not go out - which is what
+	// somebody is woken up for.
+	withdrawn map[string]int
 }
 
 // adminLifecycleLockKey is an arbitrary but fixed advisory-lock key. Every
@@ -285,7 +290,7 @@ func (t *erasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID
 		    worker_id = NULL, updated_at = now()
 		WHERE target_kind = 'user' AND target_ref = $1
 		  AND NOT receipt_recorded AND status IN ('pending', 'manual_review')
-		RETURNING id`, userID, "canceled",
+		RETURNING id, delivery_family`, userID, "canceled",
 		"the recipient was erased")
 	if err != nil {
 		return err
@@ -296,46 +301,54 @@ func (t *erasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID
 		SET cancellation_requested = TRUE, updated_at = now()
 		WHERE target_kind = 'user' AND target_ref = $1
 		  AND NOT receipt_recorded AND status = 'sending'
-		RETURNING id`, userID, "cancellation_requested",
+		RETURNING id, delivery_family`, userID, "cancellation_requested",
 		"the recipient was erased; this send was already in flight"); err != nil {
 		return err
 	}
 
 	// Counted, not returned: the caller is the erasure service, which has no
 	// business knowing how many messages somebody was owed.
-	t.withdrawn += withdrawn
+	if t.withdrawn == nil {
+		t.withdrawn = map[string]int{}
+	}
+	for family, n := range withdrawn {
+		t.withdrawn[family] += n
+	}
 	return nil
 }
 
 // withdrawOutbound runs one withdrawal and writes a line in each commitment's
 // own journal, saying what actually happened to it. The reason names nobody: it
 // is written into a row that survives the person it is about.
-func (t *erasureTx) withdrawOutbound(ctx context.Context, query, userID, kind, reason string) (int, error) {
+func (t *erasureTx) withdrawOutbound(ctx context.Context, query, userID, kind, reason string) (map[string]int, error) {
 	rows, err := t.tx.QueryContext(ctx, query, userID)
 	if err != nil {
-		return 0, fmt.Errorf("withdraw the notifications of an erased user: %w", err)
+		return nil, fmt.Errorf("withdraw the notifications of an erased user: %w", err)
 	}
-	var ids []string
+	type withdrawal struct{ id, family string }
+	var withdrawn []withdrawal
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var w withdrawal
+		if err := rows.Scan(&w.id, &w.family); err != nil {
 			rows.Close()
-			return 0, err
+			return nil, err
 		}
-		ids = append(ids, id)
+		withdrawn = append(withdrawn, w)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	for _, id := range ids {
-		if err := appendIntentEventTx(ctx, t.tx, id, nextEventSeq, kind,
+	byFamily := map[string]int{}
+	for _, w := range withdrawn {
+		if err := appendIntentEventTx(ctx, t.tx, w.id, nextEventSeq, kind,
 			reason, "erasure"); err != nil {
-			return 0, err
+			return nil, err
 		}
+		byFamily[w.family]++
 	}
-	return len(ids), nil
+	return byFamily, nil
 }
 
 // ScrubOutboundEndpointsForUser removes every personal coordinate the delivery

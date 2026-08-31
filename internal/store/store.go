@@ -1188,7 +1188,9 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
-	countWithdrawn(withdrawn)
+	// By alert group, so every one of them is paging: a handover names no
+	// alert group and cannot be among these.
+	countWithdrawn(map[string]int{outbound.FamilyNotification: withdrawn})
 	countDesired(outbound.DesiredAck, desired.Outcome)
 	return true, nil
 }
@@ -1277,7 +1279,9 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
-	countWithdrawn(withdrawn)
+	// By alert group, so every one of them is paging: a handover names no
+	// alert group and cannot be among these.
+	countWithdrawn(map[string]int{outbound.FamilyNotification: withdrawn})
 	countDesired(outbound.DesiredResolve, desired.Outcome)
 	return true, nil
 }
@@ -1292,10 +1296,13 @@ func countDesired(reason outbound.DesiredReason, outcome outbound.DesiredOutcome
 		WithLabelValues(string(reason), string(outcome)).Inc()
 }
 
-// countWithdrawn records commitments that ended because the alert did.
-func countWithdrawn(n int) {
-	for i := 0; i < n; i++ {
-		countTerminal(outbound.FamilyNotification, outbound.StatusCanceled)
+// countWithdrawn records commitments that ended because the alert did, in the
+// family each of them ran in.
+func countWithdrawn(byFamily map[string]int) {
+	for family, n := range byFamily {
+		for i := 0; i < n; i++ {
+			countTerminal(family, outbound.StatusCanceled)
+		}
 	}
 }
 

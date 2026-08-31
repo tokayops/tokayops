@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -812,4 +813,118 @@ func TestTheJournalTellsAnErasedDeliveryFromOneThatNeverHappened(t *testing.T) {
 				attempt.ReceiptRecorded, attempt.ReceiptRedactedAt)
 		}
 	})
+}
+
+// TestErasureReachesAnAnnouncementAndLeavesTheKeyAlone.
+//
+// A shift-change announcement is a commitment like any other, so erasure has to
+// find it: what is owed is withdrawn, and the address it was bound to is gone
+// with the identity row.
+//
+// What stays is stated here as a policy rather than tolerated as an oversight.
+// The internal user id is in the business key, in the fingerprint and in the
+// payload, and it stays in all three. It is this system's own name for a person
+// - not an address, not a display name, and nothing an erased person can be
+// contacted through - and it is what keeps the history of a promise joinable to
+// the anonymised person it was made about. Removing it would not make anybody
+// less reachable; it would make the record of what was owed to them
+// unreadable, and it would change the key, which is what stops a shift change
+// being announced twice.
+func TestErasureReachesAnAnnouncementAndLeavesTheKeyAlone(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+	seedUsers(t, s, "u-alice")
+
+	result := mustSubmit(t, s, handoffAnnouncedFor(t, "sched-1",
+		time.Now().Add(time.Hour), announceTo("slack", "u-alice")))
+	if result.Outcome != outbound.SubmitCreated || len(result.IntentIDs) != 1 {
+		t.Fatalf("the announcement answered %q with %d commitments",
+			result.Outcome, len(result.IntentIDs))
+	}
+	intentID := result.IntentIDs[0]
+
+	// What the row says about the person before anybody is erased.
+	var keyBefore, refBefore, payloadBefore string
+	var fingerprintBefore []byte
+	if err := s.db.QueryRow(`
+		SELECT idempotency_key, target_ref, payload::text, fingerprint
+		FROM outbound_intents i JOIN outbound_batches b ON b.id = i.batch_id
+		WHERE i.id = $1`, intentID).
+		Scan(&keyBefore, &refBefore, &payloadBefore, &fingerprintBefore); err != nil {
+		t.Fatalf("read the commitment: %v", err)
+	}
+
+	before := terminalCount(t, outbound.FamilyHandoff, string(outbound.StatusCanceled))
+	if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "u-alice"); err != nil {
+		t.Fatalf("erase: %v", err)
+	}
+
+	// Owed, and withdrawn - and counted in the handover family, because a
+	// withdrawal counted against paging is an alert about the wrong queue.
+	if got := statusOf(t, s, intentID); got != outbound.StatusCanceled {
+		t.Errorf("an unsent announcement to an erased person is %s", got)
+	}
+	if got := terminalCount(t, outbound.FamilyHandoff, string(outbound.StatusCanceled)) - before; got != 1 {
+		t.Errorf("the handover family counted %v withdrawals, want 1", got)
+	}
+
+	// The address is gone; the identity is not.
+	if endpoint := endpointOf(t, s, intentID); endpoint.Valid {
+		t.Errorf("the announcement still carries the address %q", endpoint.String)
+	}
+	var keyAfter, refAfter, payloadAfter string
+	var fingerprintAfter []byte
+	if err := s.db.QueryRow(`
+		SELECT idempotency_key, target_ref, payload::text, fingerprint
+		FROM outbound_intents i JOIN outbound_batches b ON b.id = i.batch_id
+		WHERE i.id = $1`, intentID).
+		Scan(&keyAfter, &refAfter, &payloadAfter, &fingerprintAfter); err != nil {
+		t.Fatalf("read the commitment back: %v", err)
+	}
+	if keyAfter != keyBefore {
+		t.Errorf("the business key changed: %q -> %q", keyBefore, keyAfter)
+	}
+	if refAfter != "u-alice" {
+		t.Errorf("the commitment names %q; it is supposed to name the person", refAfter)
+	}
+	if payloadAfter != payloadBefore {
+		t.Errorf("the payload changed:\n%s\n%s", payloadBefore, payloadAfter)
+	}
+	if !bytes.Equal(fingerprintAfter, fingerprintBefore) {
+		t.Errorf("the fingerprint changed: %x -> %x", fingerprintBefore, fingerprintAfter)
+	}
+}
+
+// TestErasureCountsEachFamilyWhereItHappened.
+//
+// One person, two commitments, two partitions. The counter this alerts on is
+// per family, and a withdrawal from the handover queue counted against paging
+// reads as an escalation that did not go out - which is the alert somebody gets
+// out of bed for.
+func TestErasureCountsEachFamilyWhereItHappened(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+	seedUsers(t, s, "u-alice")
+
+	agID := outboundGroup(t, s)
+	admitOne(t, s, agID, dmForUser("u-alice", 1))
+
+	if result := mustSubmit(t, s, handoffAnnouncedFor(t, "sched-1",
+		time.Now().Add(time.Hour), announceTo("slack", "u-alice"))); result.Outcome != outbound.SubmitCreated {
+		t.Fatalf("the announcement answered %q", result.Outcome)
+	}
+
+	paging := terminalCount(t, outbound.FamilyNotification, string(outbound.StatusCanceled))
+	handover := terminalCount(t, outbound.FamilyHandoff, string(outbound.StatusCanceled))
+
+	if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "u-alice"); err != nil {
+		t.Fatalf("erase: %v", err)
+	}
+
+	if got := terminalCount(t, outbound.FamilyNotification, string(outbound.StatusCanceled)) - paging; got != 1 {
+		t.Errorf("paging counted %v withdrawals, want 1", got)
+	}
+	if got := terminalCount(t, outbound.FamilyHandoff, string(outbound.StatusCanceled)) - handover; got != 1 {
+		t.Errorf("the handover family counted %v withdrawals, want 1", got)
+	}
 }

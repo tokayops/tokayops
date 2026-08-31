@@ -4,9 +4,13 @@ package handoff
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rotation"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
@@ -288,6 +292,61 @@ func TestNotifierOverPostgresRepeatedCompositionIsNotDeduped(t *testing.T) {
 	}
 }
 
+// TestAScheduleChangedAfterAnAnnouncementOwesBoth.
+//
+// There is no such thing as withdrawing an announcement. The schedule moving
+// again does not make the first one wrong - somebody DID come on duty, and the
+// message about it is still owed - and the second change is a different event
+// about different people, so it gets a claim of its own.
+//
+// The alternative would be a producer deciding that a promise it made a minute
+// ago is no longer interesting, which is the one thing a commitment exists to
+// prevent.
+func TestAScheduleChangedAfterAnAnnouncementOwesBoth(t *testing.T) {
+	env := setupHandoffEnv(t)
+	env.save(dailyConfig(group(handoffGroupA, "U_A")))
+	env.warmUp()
+
+	env.now = env.now.Add(time.Hour)
+	env.save(dailyConfig(group(handoffGroupA, "U_A", "U_B")))
+	env.tick(time.Minute)
+
+	first := env.announcements()
+	if len(first) != 1 {
+		t.Fatalf("%d announcements after the first edit, want 1: %+v", len(first), first)
+	}
+
+	// The schedule moves again before anything was delivered.
+	env.now = env.now.Add(time.Hour)
+	env.save(dailyConfig(group(handoffGroupA, "U_A", "U_B", "U_C")))
+	env.tick(time.Minute)
+
+	made := env.announcements()
+	if len(made) != 2 {
+		t.Fatalf("%d announcements after the second edit, want 2: %+v", len(made), made)
+	}
+	if made[0].key == made[1].key {
+		t.Fatalf("both edits claimed %q; the second is a different event", made[0].key)
+	}
+
+	// The first is still owed, and still owed to the person it was about.
+	var owed int
+	if err := env.s.GetDB().QueryRow(`
+		SELECT count(*) FROM outbound_intents
+		WHERE batch_id = $1 AND status = 'pending'`, made[0].id).Scan(&owed); err != nil {
+		t.Fatalf("read the first announcement: %v", err)
+	}
+	if owed != 1 {
+		t.Fatalf("the first announcement owes %d messages; nothing withdrew it", owed)
+	}
+	if got := env.recipients(made[0].id)["slack"]; got != "U_B" {
+		t.Errorf("the first announcement is about %q, want U_B", got)
+	}
+	if got := env.recipients(made[1].id)["slack"]; got != "U_C" {
+		t.Errorf("the second announcement is about %q, want U_C", got)
+	}
+}
+
 // TestNotifierOverPostgresEditedGroupIsNotDeduped is the same argument for an edit:
 // [B] -> [B,D] -> [B] -> [B,D] returns to a composition it has already had, and
 // the second addition must still be announced.
@@ -352,6 +411,84 @@ func TestNotifierOverPostgresTwoInstancesCreateOneJob(t *testing.T) {
 
 	if made := env.announcements(); len(made) != 1 {
 		t.Fatalf("%d announcements from two instances, want 1: %+v", len(made), made)
+	}
+}
+
+// TestTwoInstancesRaceOnOneOccurrence.
+//
+// The test above ticks them one after the other, which is the easy half: the
+// loser reads a row that is already committed. This is the other half - both
+// inside the door at once, on a real database, which is the only place the
+// answer is decided.
+//
+// What has to hold is one claim and one set of commitments. The loser is told
+// the work exists, and told it against the SAME claim, because a second claim
+// over one occurrence is a second announcement to the same person about the
+// same shift.
+//
+// It also carries a person nobody can reach, for the counter: both instances
+// see the same skipped recipient and both commit, so a count taken after every
+// successful admission would report one person missed as two.
+func TestTwoInstancesRaceOnOneOccurrence(t *testing.T) {
+	env := setupHandoffEnv(t)
+	env.save(dailyConfig(
+		group(handoffGroupA, "U_A"),
+		// U_NOSLACK is on the incoming shift and has no linked account: one
+		// commitment is promised and one person is skipped.
+		group(handoffGroupB, "U_B", "U_NOSLACK"),
+	))
+
+	second := NewNotifier(env.s, env.renderer, staticDmProviders("slack"), time.Minute)
+	env.warmUp()
+	if !second.Tick(context.Background()) {
+		t.Fatal("second instance failed to warm up")
+	}
+
+	skipped := func() float64 {
+		t.Helper()
+		counter, err := metrics.HandoffRecipientsSkippedTotal.GetMetricWithLabelValues("no_identity")
+		if err != nil {
+			t.Fatalf("read the counter: %v", err)
+		}
+		var m dto.Metric
+		if err := counter.Write(&m); err != nil {
+			t.Fatalf("read the counter: %v", err)
+		}
+		return m.GetCounter().GetValue()
+	}
+	before := skipped()
+
+	// Both instances meet the same handover at the same moment.
+	env.now = env.now.Add(24 * time.Hour)
+	var wg sync.WaitGroup
+	complete := make([]bool, 2)
+	for i, notifier := range []*Notifier{env.notifier, second} {
+		wg.Add(1)
+		go func(i int, n *Notifier) {
+			defer wg.Done()
+			complete[i] = n.Tick(context.Background())
+		}(i, notifier)
+	}
+	wg.Wait()
+
+	for i, ok := range complete {
+		if !ok {
+			t.Fatalf("instance %d did not complete its tick", i)
+		}
+	}
+
+	made := env.announcements()
+	if len(made) != 1 {
+		t.Fatalf("%d claims over one occurrence, want 1: %+v", len(made), made)
+	}
+	if got := env.recipients(made[0].id); len(got) != 1 || got["slack"] != "U_B" {
+		t.Fatalf("the claim promises %v, want one message to U_B", got)
+	}
+
+	// One person missed, counted once. Counted after every commit instead, the
+	// loser would have added a second.
+	if got := skipped() - before; got != 1 {
+		t.Errorf("the skipped person was counted %v times", got)
 	}
 }
 
