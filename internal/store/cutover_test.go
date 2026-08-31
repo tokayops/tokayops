@@ -28,8 +28,11 @@ func TestTheCutoverLeavesTheJobEngineGone(t *testing.T) {
 		t.Fatalf("run the cutover: %v", err)
 	}
 
-	// A start on the build that ships this file.
-	if err := s.applyOutboundSchema(); err != nil {
+	// A start on the build that ships this file - the whole of it, not the
+	// outbound half: every one of these tables was created by the main schema
+	// block, and a check that skipped it would pass while a start put them
+	// straight back.
+	if err := s.InitDB(); err != nil {
 		t.Fatalf("start after the cutover: %v", err)
 	}
 
