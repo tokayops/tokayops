@@ -71,7 +71,17 @@ func legacyJobEngine(t *testing.T, s *Store) {
 			attempt INTEGER DEFAULT 0,
 			created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`,
 		`CREATE TABLE job_dedup_policies (
-			namespace TEXT PRIMARY KEY, scope TEXT NOT NULL)`,
+			namespace TEXT PRIMARY KEY,
+			scope     TEXT NOT NULL CHECK (scope IN ('while_active', 'forever')),
+			job_type  TEXT NOT NULL,
+			UNIQUE (namespace, scope, job_type))`,
+		// The key that makes job_dedup_policies a parent of jobs rather than a
+		// table beside it. Without it the drops could be written in any order
+		// and this would still pass, while a real database refused them.
+		`ALTER TABLE jobs ADD CONSTRAINT jobs_dedup_policy_fk
+			FOREIGN KEY (dedup_namespace, dedup_scope, type)
+			REFERENCES job_dedup_policies (namespace, scope, job_type)
+			ON UPDATE RESTRICT ON DELETE RESTRICT`,
 		`ALTER TABLE alert_groups
 			ADD COLUMN slack_update_pending BOOLEAN NOT NULL DEFAULT FALSE,
 			ADD COLUMN ack_processed_at TIMESTAMPTZ`,
@@ -98,9 +108,6 @@ func TestTheCutoverLeavesTheJobEngineGone(t *testing.T) {
 	            VALUES ('step-1', 'job-1', 'stage-1', 0, 'dm', 'succeeded')`)
 	exec(t, s, `INSERT INTO notification_deliveries (id, alert_group_id, job_step_id, provider, kind)
 	            VALUES ('delivery-1', $1, 'step-1', 'slack', 'slack_dm')`, agID)
-	exec(t, s, `INSERT INTO job_dedup_policies (namespace, scope)
-	            VALUES ('escalation', 'while_active')`)
-
 	path := filepath.Join("..", "..", "migrations", "drop-job-engine.sql")
 	statements, err := os.ReadFile(path)
 	if err != nil {
