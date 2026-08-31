@@ -96,18 +96,30 @@ func TestTheCutoverLeavesTheJobEngineGone(t *testing.T) {
 	s := setupTestDB(t)
 	legacyJobEngine(t, s)
 
-	// Rows, because a drop over empty tables proves less than half of this: a
-	// foreign key with nothing under it refuses nothing, and the order these
-	// statements are written in would stop mattering.
+	// The order the drops are written in is decided by the keys above, and a
+	// key refuses a DROP whether or not anything is stored under it: it is the
+	// constraint that depends on the table, not the rows. What the rows are is
+	// what is lost - a file that dropped the tables in a workable order and
+	// left the data behind would still be doing the wrong thing.
+	//
+	// The job carries its dedup triple all the same, because the key to the
+	// policy table is MATCH SIMPLE: a row with NULLs in two of the three
+	// columns is not covered by it at all, and this fixture is the shape a
+	// released database has rather than the least one that compiles.
 	agID := outboundGroup(t, s)
-	exec(t, s, `INSERT INTO jobs (id, type, status, alert_group_id)
-	            VALUES ('job-1', 'escalation', 'succeeded', $1)`, agID)
+	exec(t, s, `INSERT INTO job_dedup_policies (namespace, scope, job_type)
+	            VALUES ('escalation', 'while_active', 'escalation')`)
+	exec(t, s, `INSERT INTO jobs
+	              (id, type, status, dedup_namespace, dedup_key, dedup_scope, alert_group_id)
+	            VALUES ('job-1', 'escalation', 'succeeded',
+	                    'escalation', 'k-1', 'while_active', $1)`, agID)
 	exec(t, s, `INSERT INTO job_stages (id, job_id, stage_index, status)
 	            VALUES ('stage-1', 'job-1', 0, 'succeeded')`)
 	exec(t, s, `INSERT INTO job_steps (id, job_id, stage_id, step_index, step_type, status)
 	            VALUES ('step-1', 'job-1', 'stage-1', 0, 'dm', 'succeeded')`)
 	exec(t, s, `INSERT INTO notification_deliveries (id, alert_group_id, job_step_id, provider, kind)
 	            VALUES ('delivery-1', $1, 'step-1', 'slack', 'slack_dm')`, agID)
+
 	path := filepath.Join("..", "..", "migrations", "drop-job-engine.sql")
 	statements, err := os.ReadFile(path)
 	if err != nil {
