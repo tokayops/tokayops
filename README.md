@@ -17,9 +17,12 @@ Alertmanager grouped, deduplicated by `groupKey`, with a status lifecycle,
 timeline and escalation state.
 
 Delivery is built to be reliable and horizontally safe: a transactional outbox
-commits events in the same transaction as the status change, and job steps run
-under DB leases with compare-and-swap ownership, so a crashed worker's work is
-re-claimed instead of lost.
+commits events in the same transaction as the status change, and everything the
+system owes somebody is a durable commitment written before the network is
+touched. Workers claim commitments under DB leases with compare-and-swap
+ownership and journal every attempt before making the call, so a crashed
+worker's work is re-claimed rather than lost, and a call whose answer never
+arrived is recorded as exactly that rather than guessed at.
 
 ## Features
 
@@ -31,9 +34,13 @@ re-claimed instead of lost.
 - On-call schedules with multi-user groups (1+ users per rotation slot), L2
   backup, overrides and calendar.
 - Parallel notification fan-out: every member of the on-call group is DM'd in
-  parallel within one escalation step; failures are isolated per member.
-- Stage-based job execution with per-step leases and stage-aware claim; failed
-  workers are reclaimed automatically.
+  parallel within one escalation step; failures are isolated per member, and a
+  delivery that keeps failing keeps being retried until it succeeds, is
+  withdrawn, or reaches its deadline.
+- Two delivery queues that cannot delay each other: paging and shift-change
+  announcements are claimed separately, by separate workers with pools of their
+  own, so a hundred schedules turning over at once never stands between an
+  alert and the person on call.
 - Group handoff notifications: every incoming on-call member with a linked
   account gets a shift-start DM.
 - Dual-send: team channel + firehose logging.
