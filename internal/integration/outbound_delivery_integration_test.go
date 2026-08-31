@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -887,5 +888,94 @@ func announceThrough(provider, userID string) keys.HandoffRecipient {
 		Timing:          keys.TimingSpec{Kind: keys.TimingRelativeToAdmission},
 		CompletionMode:  keys.CompletionOnAcceptance,
 		AmbiguityPolicy: keys.PolicyRetry,
+	}
+}
+
+// TestAnAnnouncementIsOneThingAllTheWayDown.
+//
+// Four places describe what was sent, and each of them is written by a
+// different piece of code at a different moment: the payload column, filled at
+// admission; payload_digest beside it, computed by the codec before the row was
+// accepted; request_fingerprint on the attempt, written when the call opened;
+// and the bytes the channel was actually handed. The claim is that they are all
+// the same thing, and it is worth asserting because nothing in the schema makes
+// it so - each of the four would look perfectly healthy on its own while
+// describing a different message.
+//
+// It is checked for the handover family in particular because this is the only
+// family whose content is a payload. An escalation's fingerprint comes from a
+// snapshot whose digest the alert domain already guards on both sides; an
+// announcement's comes from bytes that only this chain ever compares.
+func TestAnAnnouncementIsOneThingAllTheWayDown(t *testing.T) {
+	env := setupIntegrationTest(t)
+	ctx := context.Background()
+
+	result, err := env.S.SubmitBatch(ctx, announcement(t, "sched-identity"))
+	if err != nil {
+		t.Fatalf("admit the announcement: %v", err)
+	}
+	if result.Outcome != outbound.SubmitCreated || len(result.IntentIDs) != 1 {
+		t.Fatalf("the announcement answered %q with %d commitments",
+			result.Outcome, len(result.IntentIDs))
+	}
+	intentID := result.IntentIDs[0]
+
+	stop := startOutboundWorker(t, env.Handoff)
+	until(t, "the announcement to be delivered", func() bool {
+		var status string
+		if err := env.S.GetDB().QueryRow(
+			`SELECT status FROM outbound_intents WHERE id = $1`, intentID).Scan(&status); err != nil {
+			t.Fatalf("read the commitment: %v", err)
+		}
+		return status == "succeeded"
+	})
+	stop()
+
+	// What the channel was handed, split at the digest the worker put in front
+	// of it. A hex digest contains no bar, so the first one is the separator.
+	sent := env.Channel.SentTo("S_TEST")
+	if len(sent) != 1 {
+		t.Fatalf("the channel was called %d times, want once", len(sent))
+	}
+	bar := strings.Index(sent[0], "|")
+	if bar < 0 {
+		t.Fatalf("the recorded call has no separator: %q", sent[0])
+	}
+	contentDigest, delivered := sent[0][:bar], []byte(sent[0][bar+1:])
+
+	// The bytes that reached the channel, digested by the protocol, are what
+	// the commitment was admitted under. This is the end the others are checked
+	// against: a payload swapped anywhere along the way lands here.
+	var schemaVersion int
+	var admittedDigest, fingerprint []byte
+	if err := env.S.GetDB().QueryRow(`
+		SELECT i.payload_schema_version, i.payload_digest, a.request_fingerprint
+		FROM outbound_intents i
+		JOIN outbound_attempts a
+		  ON a.intent_id = i.id AND a.record_kind = 'attempt'
+		WHERE i.id = $1`, intentID).
+		Scan(&schemaVersion, &admittedDigest, &fingerprint); err != nil {
+		t.Fatalf("read what was written down: %v", err)
+	}
+
+	ofDelivered, err := keys.PayloadDigest(keys.KindHandoff, schemaVersion, delivered)
+	if err != nil {
+		t.Fatalf("the channel was handed a payload the codec cannot read: %v", err)
+	}
+	if got, want := fmt.Sprintf("%x", ofDelivered), fmt.Sprintf("%x", admittedDigest); got != want {
+		t.Errorf("the channel was handed %s; the commitment was admitted with %s", got, want)
+	}
+	if got, want := fmt.Sprintf("%x", fingerprint), fmt.Sprintf("%x", admittedDigest); got != want {
+		t.Errorf("the attempt records sending %s; the commitment was admitted with %s", got, want)
+	}
+	if got, want := contentDigest, fmt.Sprintf("%x", admittedDigest); got != want {
+		t.Errorf("the call named %s as its content; the commitment was admitted with %s", got, want)
+	}
+
+	// And the payload really is the announcement rather than an empty shape
+	// that happens to digest consistently: an all-round agreement about nothing
+	// would satisfy every comparison above.
+	if !strings.Contains(string(delivered), "Backend") {
+		t.Errorf("the payload names no team: %s", delivered)
 	}
 }
