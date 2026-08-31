@@ -444,8 +444,8 @@ func TestABoundedDeadlineNeedsBothHalves(t *testing.T) {
 }
 
 // The wire vectors. Every value below was written out by hand from the
-// protocol in epic12-gates.md, over inputs the test supplies - not captured
-// from this implementation. A vector taken from the code it checks moves with
+// written protocol, over inputs the test supplies - not captured from this
+// implementation. A vector taken from the code it checks moves with
 // the code and proves nothing.
 
 // TestTheHandoffBatchFingerprintIsGolden pins both outcomes.

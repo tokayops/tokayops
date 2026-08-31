@@ -23,7 +23,7 @@ import (
 // delivery has an identity and a frozen state to render from, and the only
 // answer it can give on a retry is the same answer - which is the whole reason
 // the snapshot, the links, the team's state and the buttons are settled HERE
-// rather than read again by whoever sends (S1-D28).
+// rather than read again by whoever sends.
 //
 // It is also the only place that spends an alert's one chance to page: nothing
 // picks up a group that already has an admission. So the difference between
@@ -404,7 +404,7 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 	resolver := &scheduleResolver{people: people, oncall: p.oncall, team: teamOnCall}
 
 	// The offset is cumulative from ADMISSION, not from the previous step
-	// finishing (S1-D4). A step that is still retrying no longer holds the rest
+	// finishing. A step that is still retrying no longer holds the rest
 	// of the escalation back: the promise of step one outlives its own delay,
 	// and step two goes out when the policy said it would.
 	offset := time.Duration(0)

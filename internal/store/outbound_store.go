@@ -446,7 +446,7 @@ func (s *Store) submitEscalation(ctx context.Context, batch outbound.Batch,
 	// Only now the group itself: what it escalates by, and who was on duty when
 	// it arrived. Both are the winner's answers and nobody else's - a loser that
 	// wrote either would leave a group describing one escalation and executing
-	// another (S1-D20).
+	// another.
 	//
 	// COALESCE, because "the producer could not read the people" and "nobody was
 	// on call" are different claims. The first arrives here as nothing at all

@@ -31,8 +31,8 @@ func rotationObs(groupID string, users ...string) observation {
 	return obs(schedulerender.SourceRotation, groupID, users...)
 }
 
-// TestClassify is the decision table of S6-D2 and S6-D15 as a test: what
-// happened, and who is told.
+// TestClassify is the decision table as a test: what happened, and who is
+// told.
 func TestClassify(t *testing.T) {
 	tests := []struct {
 		name       string

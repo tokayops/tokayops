@@ -68,8 +68,7 @@ func until(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// TestARetryCarriesWhatWasAdmitted is S1-D3, and it is the reason a snapshot
-// exists at all.
+// TestARetryCarriesWhatWasAdmitted is the reason a snapshot exists at all.
 //
 // The alert changes between two attempts of one commitment - a second alert
 // joins the group, which rewrites the row every renderer used to read. The
@@ -777,7 +776,7 @@ func announcement(t *testing.T, scheduleID string) outbound.Batch {
 	}
 }
 
-// TestNoMoreLeasesThanSlots is S1-D23. A lease taken without a slot to run it in
+// TestNoMoreLeasesThanSlots. A lease taken without a slot to run it in
 // is a lease sitting in a local queue while it expires - and an expired lease
 // means somebody else redoes a call that may already have gone out.
 func TestNoMoreLeasesThanSlots(t *testing.T) {

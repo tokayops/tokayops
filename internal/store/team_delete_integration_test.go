@@ -176,7 +176,7 @@ func TestLockTeamBlocksConcurrentScheduleInsert(t *testing.T) {
 	}
 }
 
-// The half of S6-D10 that the lock alone does not give: after waiting for the
+// The half that the lock alone does not give: after waiting for the
 // lock, the delete has to SEE the schedule that committed while it waited.
 //
 // That is READ COMMITTED, and it is the reason the root is read AFTER the

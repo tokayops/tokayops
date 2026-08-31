@@ -73,10 +73,10 @@ test-integration:
 # see the --shuffle comment in the script.
 #
 # Scoped to ./internal/store/... deliberately. The tree as a whole has never
-# been order-independent - `-shuffle=on` over ./internal/... fails on `epic10`
-# too, in api, dispatcher and integration - and fixing that is a separate piece
-# of work, recorded in tokay-docs. Widening this target before then would give
-# it a red baseline and make it useless for the thing it was added to check.
+# been order-independent - `-shuffle=on` over ./internal/... fails in api and
+# integration too - and fixing that is a separate piece of work. Widening this
+# target before then would give it a red baseline and make it useless for the
+# thing it was added to check.
 test-integration-shuffle:
 	@./scripts/run_integration_tests.sh --shuffle --pkg ./internal/store/... --failures
 

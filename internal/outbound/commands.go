@@ -204,7 +204,7 @@ type EscalationContext struct {
 	// a claim about the SAME moment the commitments were built from. Written
 	// outside this unit of work it would be the loser's answer overwriting the
 	// winner's - a group displaying one set of people while another set is
-	// being paged (S1-D20).
+	// being paged.
 	//
 	// Empty means nothing is recorded. That is not the same as an empty
 	// snapshot: "nobody was on call" is a fact about the schedule, and a
