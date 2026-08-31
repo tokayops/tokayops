@@ -41,17 +41,11 @@ type StoreInterface interface {
 	// Atomic resolve with alerts update (ingester auto-resolve: alerts + status + timeline + outbox in one transaction)
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string, incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
 
-	// notification_deliveries is not reachable through this interface any more.
-	// It had one reader and one writer, both in the job path that kept an alert
-	// group's messages current, and both are gone: what was delivered and where
-	// it landed is an outbound commitment now.
-	//
-	// The table and the concrete *Store methods survive until the destructive
-	// migration, so this enforces nothing: a consumer port that named them
-	// would be satisfied by *Store as it stands. What it does is take them off
-	// the inventory everybody reads, so reaching for them is a deliberate act
-	// rather than an autocomplete. Nothing depends on them today, and what
-	// keeps it that way is that no version shipping in between is planned.
+	// notification_deliveries has no methods anywhere any more. It had one
+	// reader and one writer, both in the job path that kept an alert group's
+	// messages current, and what was delivered and where it landed is an
+	// outbound commitment now. The table itself stands until the cutover under
+	// migrations/, holding rows nothing reads.
 
 	// Incidents (stub for future, business-level events)
 	CreateIncident(i *model.Incident) error

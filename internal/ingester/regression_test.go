@@ -190,9 +190,10 @@ func TestRegression_DuplicateKey_RetryMerge(t *testing.T) {
 	}
 }
 
-// TestRegression_MergeDoesNotRegressTriggeredStatus verifies that when a repeat webhook
-// arrives for an AG in "triggered" status, the status stays "triggered" (no regression
-// to "processing"), alerts are updated, and slack_update_pending is set.
+// TestRegression_MergeDoesNotRegressTriggeredStatus verifies that when a repeat
+// webhook arrives for an AG in "triggered" status, the status stays "triggered"
+// (no regression to "processing"), the alerts are updated, and the version a
+// producer reads moves.
 func TestRegression_MergeDoesNotRegressTriggeredStatus(t *testing.T) {
 	mock := store.NewMockStore()
 
@@ -238,7 +239,8 @@ func TestRegression_MergeDoesNotRegressTriggeredStatus(t *testing.T) {
 		t.Errorf("Expected 2 alerts after merge, got %d", len(storedAG.Alerts))
 	}
 
-	// Verify: slack_update_pending should be true
+	// Verify: what a message about this alert would say has changed, so the
+	// version an escalation is admitted against has to move with it.
 	if storedAG.RenderSourceVersion == 0 {
 		t.Error("the version a producer reads did not move for a new alert")
 	}

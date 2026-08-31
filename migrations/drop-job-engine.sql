@@ -7,8 +7,13 @@
 --
 -- Run it by hand, against a database that has already started at least once on
 -- a build that no longer writes to any of it, and after you are sure you will
--- not roll back to a build that does. It is not reversible: the rows are gone,
--- and the older builds that read them will not start against the result.
+-- not roll back to a build that does.
+--
+-- There is no way back, and the way it fails is quiet. An older build creates
+-- these tables itself on start-up, so it comes up perfectly well - on an empty
+-- job engine, with none of the work or the history it expects to find. It will
+-- not tell you anything is missing. Restoring a backup taken before this ran is
+-- the only way back.
 --
 -- Escalations and shift-change announcements are commitments in the outbound
 -- tables now, and what they did is in outbound_attempts and

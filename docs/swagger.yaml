@@ -715,9 +715,6 @@ definitions:
     type: object
   model.AlertGroup:
     properties:
-      ack_processed_at:
-        description: When ack update job was processed
-        type: string
       acknowledged_by:
         description: Acknowledgement
         type: string
@@ -731,7 +728,18 @@ definitions:
       current_step:
         type: integer
       dedup_key:
-        description: groupKey from Alertmanager (fingerprint)
+        description: |-
+          AlertKey is what the alerting system calls the alert this group is
+          about: Alertmanager's group key, or a single alert's fingerprint. It
+          names the ALERT, not this incident - the same key comes back every time
+          the same thing breaks, and each time it opens a new group with a new ID.
+
+          It is not the identity of any work done about the alert. An escalation
+          that once keyed itself by this string paged nobody for the second
+          incident.
+
+          The JSON name is the one this field has always had, and stays: it is
+          what the API, the webhooks and the UI already read.
         type: string
       external_url:
         description: External Link to Alertmanager Source (for clickable titles)
@@ -760,9 +768,6 @@ definitions:
         type: string
       severity:
         type: string
-      slack_update_pending:
-        description: Slack Update Tracking
-        type: boolean
       status:
         $ref: '#/definitions/model.AlertGroupStatus'
       team_id:

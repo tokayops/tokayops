@@ -3751,10 +3751,6 @@ const docTemplate = `{
         "model.AlertGroup": {
             "type": "object",
             "properties": {
-                "ack_processed_at": {
-                    "description": "When ack update job was processed",
-                    "type": "string"
-                },
                 "acknowledged_by": {
                     "description": "Acknowledgement",
                     "type": "string"
@@ -3773,7 +3769,7 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "dedup_key": {
-                    "description": "groupKey from Alertmanager (fingerprint)",
+                    "description": "AlertKey is what the alerting system calls the alert this group is\nabout: Alertmanager's group key, or a single alert's fingerprint. It\nnames the ALERT, not this incident - the same key comes back every time\nthe same thing breaks, and each time it opens a new group with a new ID.\n\nIt is not the identity of any work done about the alert. An escalation\nthat once keyed itself by this string paged nobody for the second\nincident.\n\nThe JSON name is the one this field has always had, and stays: it is\nwhat the API, the webhooks and the UI already read.",
                     "type": "string"
                 },
                 "external_url": {
@@ -3816,10 +3812,6 @@ const docTemplate = `{
                 },
                 "severity": {
                     "type": "string"
-                },
-                "slack_update_pending": {
-                    "description": "Slack Update Tracking",
-                    "type": "boolean"
                 },
                 "status": {
                     "$ref": "#/definitions/model.AlertGroupStatus"

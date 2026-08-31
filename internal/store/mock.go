@@ -784,10 +784,6 @@ func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]st
 }
 
 // ========================================
-// Notification Deliveries
-// ========================================
-
-// ========================================
 // Incidents (stub for future)
 // ========================================
 
