@@ -10,7 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/tokayops/tokayops/internal/handoff"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -563,7 +566,9 @@ func TestABurstOfShiftChangesDoesNotDelayAPage(t *testing.T) {
 	// the handover pool is jammed from the first tick to the end of the test.
 	release := env.Channel.HoldKind(keys.KindHandoff)
 	defer release()
-	startOutboundWorker(t, env.Handoff)
+	// Both workers at their own pace: what this measures is a delay, so the
+	// intervals that produce it have to be the deployed ones.
+	startOutboundWorkerAtItsOwnPace(t, env.Handoff)
 	until(t, "the handover pool to fill", func() bool {
 		var sending int
 		if err := env.S.GetDB().QueryRow(`
@@ -577,7 +582,7 @@ func TestABurstOfShiftChangesDoesNotDelayAPage(t *testing.T) {
 	// And now somebody is paged.
 	sendWebhook(t, env.Echo, criticalAlert("page_under_burst", "DiskFilling"))
 	env.Eng.ProcessNewAlertGroups(ctx)
-	startOutboundWorker(t, env.Worker)
+	startOutboundWorkerAtItsOwnPace(t, env.Worker)
 	waitForDeliveries(t, env.S, "page_under_burst", 2)
 
 	// Measured at both ends by the database, the way the histogram is. The
@@ -640,11 +645,32 @@ func TestAHundredShiftChangesMeetTheirOwnProfile(t *testing.T) {
 		}
 	}
 
-	// No head start: the worker begins after everything is already due, which
-	// is what an hour boundary looks like.
-	stop := startOutboundWorker(t, env.Handoff)
+	// No head start, and the worker's OWN interval: how often the queue is
+	// looked at is half of what a profile measures, and a five-second claim
+	// driven at fifty milliseconds is a different system. Run() also waits a
+	// full interval before its first tick, which is what an hour boundary
+	// looks like from the worker's side.
+	stop := startOutboundWorkerAtItsOwnPace(t, env.Handoff)
+
+	// The gauge an alert is actually written against, watched while the queue
+	// drains. It is a CURRENT value, so its peak only exists while the backlog
+	// does: computed from the rows afterwards it would be a different number,
+	// and a collector that stopped emitting the series would leave the whole
+	// claim green.
+	registry := prometheus.NewRegistry()
+	metrics.RegisterCollectorWith(registry, env.S)
+	var peakLateness float64
+	scraped := 0
+
 	deadline := time.Now().Add(15 * time.Minute)
 	for {
+		if late, reported := latenessOfFamily(t, registry, outbound.FamilyHandoff); reported {
+			scraped++
+			if late > peakLateness {
+				peakLateness = late
+			}
+		}
+
 		var settled int
 		if err := env.S.GetDB().QueryRow(`
 			SELECT count(*) FROM outbound_intents
@@ -660,6 +686,9 @@ func TestAHundredShiftChangesMeetTheirOwnProfile(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 	stop()
+	if scraped == 0 {
+		t.Fatal("the handover lateness series was never on a scrape")
+	}
 
 	// Both ends from the database's own clock, like the histogram.
 	var p95, p99, worst float64
@@ -676,8 +705,9 @@ func TestAHundredShiftChangesMeetTheirOwnProfile(t *testing.T) {
 		) waits`).Scan(&p95, &p99, &worst); err != nil {
 		t.Fatalf("measure the profile: %v", err)
 	}
-	t.Logf("handover profile over %d announcements: p95=%.1fs p99=%.1fs worst=%.1fs",
-		burst, p95, p99, worst)
+	t.Logf("handover profile over %d announcements: p95=%.1fs p99=%.1fs worst=%.1fs; "+
+		"peak lateness %.1fs over %d scrapes",
+		burst, p95, p99, worst, peakLateness, scraped)
 
 	if p95 > 300 {
 		t.Errorf("p95 = %.1fs, over the 300s this family promises", p95)
@@ -685,10 +715,40 @@ func TestAHundredShiftChangesMeetTheirOwnProfile(t *testing.T) {
 	if p99 > 360 {
 		t.Errorf("p99 = %.1fs, over the 360s this family promises", p99)
 	}
-	// The lateness series is what an alert watches, and 900s is where it fires.
-	if worst >= 900 {
-		t.Errorf("an announcement waited %.1fs, which is what the alert is set at", worst)
+	// And the gauge itself, because that is what fires: an alert reads the
+	// series, not the attempt rows, and 900s is where it is set.
+	if peakLateness >= 900 {
+		t.Errorf("outbound_queue_lateness_seconds{family=handoff} peaked at %.1fs, "+
+			"which is what the alert is set at", peakLateness)
 	}
+	// The backlog really was one, so the peak above is a measurement rather
+	// than a gauge nobody moved. Both ends of the profile are the same event.
+	if peakLateness == 0 && worst > 0 {
+		t.Errorf("the queue was %.1fs behind and the gauge never left zero", worst)
+	}
+}
+
+// latenessOfFamily is one scrape of outbound_queue_lateness_seconds for one
+// family, and says whether the series was there at all.
+func latenessOfFamily(t *testing.T, registry *prometheus.Registry, family string) (float64, bool) {
+	t.Helper()
+	gathered, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	for _, mf := range gathered {
+		if mf.GetName() != "outbound_queue_lateness_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, label := range m.GetLabel() {
+				if label.GetName() == "family" && label.GetValue() == family {
+					return m.GetGauge().GetValue(), true
+				}
+			}
+		}
+	}
+	return 0, false
 }
 
 // announcement is one shift change, admitted the way the detector admits one.
@@ -980,5 +1040,57 @@ func TestAnAnnouncementIsOneThingAllTheWayDown(t *testing.T) {
 	// would satisfy every comparison above.
 	if !strings.Contains(string(delivered), "Backend") {
 		t.Errorf("the payload names no team: %s", delivered)
+	}
+}
+
+// TestEveryFamilyIsOnTheGraphBeforeItHasAnything.
+//
+// A gauge that appears the first time the thing it watches happens cannot be
+// alerted on until then. The rule an operator writes is "handover work is not
+// waiting longer than fifteen minutes", and until the first shift change there
+// is no series for that expression to match: no data, which in Prometheus is
+// neither a breach nor a zero.
+//
+// So this is a scrape, not a snapshot. The collector is registered against the
+// real store and the registry is gathered, because the two halves fail
+// independently: the store can stop adding the row for a family with nothing in
+// it, and the collector can stop emitting the series it was given. Either one
+// leaves the alert unwritable, and only the gathered families show both.
+func TestEveryFamilyIsOnTheGraphBeforeItHasAnything(t *testing.T) {
+	env := setupIntegrationTest(t)
+
+	registry := prometheus.NewRegistry()
+	metrics.RegisterCollectorWith(registry, env.S)
+	gathered, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+
+	found := map[string]float64{}
+	for _, family := range gathered {
+		if family.GetName() != "outbound_queue_lateness_seconds" {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			for _, label := range m.GetLabel() {
+				if label.GetName() == "family" {
+					found[label.GetValue()] = m.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+
+	for _, family := range []string{outbound.FamilyNotification, outbound.FamilyHandoff} {
+		late, reported := found[family]
+		if !reported {
+			t.Errorf("a scrape carries no lateness series for %s, so no rule can be "+
+				"written about it: got %v", family, found)
+			continue
+		}
+		// Zero means "nothing is owed", which is the truth here and a different
+		// statement from silence.
+		if late != 0 {
+			t.Errorf("%s reports %v seconds late with nothing owed at all", family, late)
+		}
 	}
 }

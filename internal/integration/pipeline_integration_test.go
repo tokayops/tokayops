@@ -303,6 +303,35 @@ func startOutboundWorker(t *testing.T, worker *outbound.Worker) func() {
 	return stop
 }
 
+// startOutboundWorkerAtItsOwnPace runs the worker the way production runs it -
+// Run(), on policy.ClaimInterval - and returns the function that stops it.
+//
+// The helper above ticks fifty times a second so that a test about WHAT is
+// delivered does not spend its life asleep. A test about HOW LONG delivery
+// takes cannot use it: the interval is part of the answer, and driven at fifty
+// milliseconds the queue drains at a rate no deployment has. For the handover
+// family the difference is two orders of magnitude, and a profile measured that
+// way stays green through any change to the real number.
+func startOutboundWorkerAtItsOwnPace(t *testing.T, worker *outbound.Worker) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		worker.Run(ctx)
+	}()
+
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			<-stopped
+		})
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
 // runOutboundWorker drives the delivery worker until the context is cancelled.
 //
 // Its own tick rather than Run(): the worker's interval is a second, and a test

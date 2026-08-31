@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 
 // abandonedAnnouncement leaves behind exactly what a crash leaves behind: an
 // open attempt, no completion, and a lease that has run out.
-func abandonedAnnouncement(t *testing.T, s *Store, schedule string) (intentID, attemptID string) {
+func abandonedAnnouncement(t *testing.T, s *Store, schedule string) (intentID, attemptID, token string) {
 	t.Helper()
 	seedUsers(t, s, "u-alice")
 	result := mustSubmit(t, s, handoffAnnouncedFor(t, schedule,
@@ -30,7 +31,7 @@ func abandonedAnnouncement(t *testing.T, s *Store, schedule string) (intentID, a
 	}
 	intentID = result.IntentIDs[0]
 
-	token := claimHandoff(t, s, intentID)
+	token = claimHandoff(t, s, intentID)
 	begun, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
 		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
 		Preparation: outbound.PreparationReady, BoundEndpoint: "U0001",
@@ -42,7 +43,7 @@ func abandonedAnnouncement(t *testing.T, s *Store, schedule string) (intentID, a
 		t.Fatalf("opening an attempt on the announcement answered %q", begun.Outcome)
 	}
 	expireLease(t, s, intentID)
-	return intentID, begun.AttemptID
+	return intentID, begun.AttemptID, token
 }
 
 func attemptOutcome(t *testing.T, s *Store, attemptID string) (outcome, reason string) {
@@ -65,7 +66,7 @@ func attemptOutcome(t *testing.T, s *Store, attemptID string) (outcome, reason s
 // and was never told is the failure this domain exists to prevent.
 func TestAnAnnouncementSurvivesTheInstanceThatWasSendingIt(t *testing.T) {
 	s := setupTestDB(t)
-	intentID, attemptID := abandonedAnnouncement(t, s, "sched-crash")
+	intentID, attemptID, token := abandonedAnnouncement(t, s, "sched-crash")
 
 	recovered, err := s.RecoverStaleAttempts(context.Background(),
 		string(keys.FamilyHandoff), 10)
@@ -86,12 +87,49 @@ func TestAnAnnouncementSurvivesTheInstanceThatWasSendingIt(t *testing.T) {
 		t.Fatalf("after the crash the announcement is %s, and nobody will make it", got)
 	}
 
+	// And then the instance that was believed dead answers. It is not allowed
+	// to decide anything - recovery already took the row - but what it says is
+	// kept, because a late acceptance is sometimes the only proof that a
+	// message exists at all. Thrown away, a person would be announced to twice
+	// and nothing would ever say the first one landed.
+	late, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+		AttemptID: attemptID, LeaseToken: token, Conclusion: accepted(),
+	})
+	if err != nil {
+		t.Fatalf("the late answer: %v", err)
+	}
+	if late.Outcome != outbound.FinalizeLeaseLost {
+		t.Fatalf("the returning worker answered %q; it does not hold the row any more",
+			late.Outcome)
+	}
+	if !late.ObservationRecorded {
+		t.Fatal("a late acceptance was thrown away")
+	}
+
+	var observations int
+	var observedRevision sql.NullInt64
+	if err := s.db.QueryRow(`
+		SELECT count(*), max(applied_revision)
+		FROM outbound_attempt_observations WHERE attempt_id = $1`, attemptID).
+		Scan(&observations, &observedRevision); err != nil {
+		t.Fatalf("read the observations: %v", err)
+	}
+	if observations != 1 {
+		t.Fatalf("%d late results were kept for one attempt", observations)
+	}
+	// NULL, not zero. A handover is drawn from a payload and has no revisions,
+	// and an observation claiming revision 0 says the announcement caught up
+	// with a state that does not exist.
+	if observedRevision.Valid {
+		t.Errorf("the late answer records applying revision %d", observedRevision.Int64)
+	}
+
 	// And what comes back is the same announcement, not a fresh one: the second
 	// attempt is opened from the payload the first was admitted with.
 	exec(t, s, `UPDATE outbound_intents SET next_attempt_at = now() WHERE id = $1`, intentID)
-	token := claimHandoff(t, s, intentID)
+	retryToken := claimHandoff(t, s, intentID)
 	second, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
-		IntentID: intentID, LeaseToken: token, WorkerID: "worker-2",
+		IntentID: intentID, LeaseToken: retryToken, WorkerID: "worker-2",
 		Preparation: outbound.PreparationReady, BoundEndpoint: "U0001",
 	})
 	if err != nil {
@@ -116,7 +154,7 @@ func TestAnAnnouncementSurvivesTheInstanceThatWasSendingIt(t *testing.T) {
 // of an external effect nobody has.
 func TestAnAnnouncementNobodyCanStillUseIsNotRetried(t *testing.T) {
 	s := setupTestDB(t)
-	intentID, attemptID := abandonedAnnouncement(t, s, "sched-crash-late")
+	intentID, attemptID, _ := abandonedAnnouncement(t, s, "sched-crash-late")
 
 	// The process was away for longer than the announcement was good for.
 	exec(t, s, `UPDATE outbound_intents SET expires_at = now() - interval '1 minute'
@@ -142,7 +180,7 @@ func TestAnAnnouncementNobodyCanStillUseIsNotRetried(t *testing.T) {
 // families were split to remove.
 func TestOneFamilysRecoveryLeavesTheOtherAlone(t *testing.T) {
 	s := setupTestDB(t)
-	intentID, attemptID := abandonedAnnouncement(t, s, "sched-crash-other")
+	intentID, attemptID, _ := abandonedAnnouncement(t, s, "sched-crash-other")
 
 	recovered, err := s.RecoverStaleAttempts(context.Background(), testFamily, 10)
 	if err != nil {

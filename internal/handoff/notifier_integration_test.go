@@ -4,6 +4,7 @@ package handoff
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/rotation"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -438,7 +440,13 @@ func TestTwoInstancesRaceOnOneOccurrence(t *testing.T) {
 		group(handoffGroupB, "U_B", "U_NOSLACK"),
 	))
 
-	second := NewNotifier(env.s, env.renderer, staticDmProviders("slack"), time.Minute)
+	// Both instances admit through one door that holds each of them until the
+	// other arrives with the same occurrence, so the two really are inside
+	// SubmitBatch together rather than merely started together.
+	both := meetInside(t, env.s)
+	env.notifier = NewNotifier(both, env.renderer, staticDmProviders("slack"), time.Minute)
+	second := NewNotifier(both, env.renderer, staticDmProviders("slack"), time.Minute)
+	// Warm-up admits nothing, so nothing meets at the door during it.
 	env.warmUp()
 	if !second.Tick(context.Background()) {
 		t.Fatal("second instance failed to warm up")
@@ -483,6 +491,37 @@ func TestTwoInstancesRaceOnOneOccurrence(t *testing.T) {
 	}
 	if got := env.recipients(made[0].id); len(got) != 1 || got["slack"] != "U_B" {
 		t.Fatalf("the claim promises %v, want one message to U_B", got)
+	}
+
+	// One claim in the table is only half of it. What each instance was TOLD
+	// decides what it does next: the winner created the work, and the loser has
+	// to be told the work exists - under the SAME claim, because a second claim
+	// over one occurrence is a second message to the same person about the same
+	// shift. A loser told anything else either announces again or leaves the
+	// occurrence to be offered forever.
+	offered := both.occurrences()
+	if len(offered) != 1 {
+		t.Fatalf("the instances offered %d occurrences, want 1: %v", len(offered), offered)
+	}
+	answers := both.answers(offered[0])
+	if len(answers) != 2 {
+		t.Fatalf("%d instances were answered about %s, want 2", len(answers), offered[0])
+	}
+	outcomes := map[outbound.SubmitOutcome]int{}
+	for _, answer := range answers {
+		outcomes[answer.Outcome]++
+	}
+	if outcomes[outbound.SubmitCreated] != 1 || outcomes[outbound.SubmitExisting] != 1 {
+		t.Fatalf("the two instances were told %v, want one created and one existing",
+			outcomes)
+	}
+	if answers[0].BatchID != answers[1].BatchID {
+		t.Errorf("the instances were pointed at claims %q and %q",
+			answers[0].BatchID, answers[1].BatchID)
+	}
+	if answers[0].BatchID != made[0].id {
+		t.Errorf("they were pointed at %q and the claim in the table is %q",
+			answers[0].BatchID, made[0].id)
 	}
 
 	// One person missed, counted once. Counted after every commit instead, the
@@ -779,4 +818,92 @@ func TestNotifierOverPostgresEditedOverrideIsNotDeduped(t *testing.T) {
 	if got := env.recipients(made[3].id)["slack"]; got != "U_C" {
 		t.Errorf("the last announcement notified %q, want U_C back on the override", got)
 	}
+}
+
+// meeting is the two instances actually meeting inside SubmitBatch, and what
+// each of them was told.
+//
+// Two goroutines started together are not a race: one tick can finish entirely
+// before the other begins, and the test then shows only that a later call found
+// an earlier call's row - which is the ordinary repeat, and has its own test.
+// So a call waits at the door until another call carrying the SAME occurrence
+// arrives, and both go through from one instant. What they contend over after
+// that is the database's business, which is the thing under test.
+type meeting struct {
+	inner notifierStore
+	t     *testing.T
+
+	mu      sync.Mutex
+	gates   map[string]chan struct{}
+	arrived map[string]int
+	told    map[string][]outbound.SubmitResult
+}
+
+func meetInside(t *testing.T, inner notifierStore) *meeting {
+	return &meeting{
+		inner: inner, t: t,
+		gates:   map[string]chan struct{}{},
+		arrived: map[string]int{},
+		told:    map[string][]outbound.SubmitResult{},
+	}
+}
+
+func (m *meeting) GetAllTeams() ([]*model.Team, error) { return m.inner.GetAllTeams() }
+
+func (m *meeting) GetIdentitiesForUsers(ids []string) (map[string][]*model.ExternalIdentity, error) {
+	return m.inner.GetIdentitiesForUsers(ids)
+}
+
+func (m *meeting) SubmitBatch(ctx context.Context,
+	batch outbound.Batch) (outbound.SubmitResult, error) {
+
+	key := batch.Admission.BatchKey
+	m.mu.Lock()
+	gate, known := m.gates[key]
+	if !known {
+		gate = make(chan struct{})
+		m.gates[key] = gate
+	}
+	m.arrived[key]++
+	nth := m.arrived[key]
+	m.mu.Unlock()
+
+	if nth >= 2 {
+		close(gate)
+	} else {
+		// Not forever: a second instance that never comes is a test that
+		// fails, not one that hangs.
+		select {
+		case <-gate:
+		case <-time.After(10 * time.Second):
+			m.t.Errorf("only one instance ever offered %s; there was no race", key)
+		}
+	}
+
+	result, err := m.inner.SubmitBatch(ctx, batch)
+	if err == nil {
+		m.mu.Lock()
+		m.told[key] = append(m.told[key], result)
+		m.mu.Unlock()
+	}
+	return result, err
+}
+
+// answers is what the instances were told about one occurrence.
+func (m *meeting) answers(key string) []outbound.SubmitResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]outbound.SubmitResult(nil), m.told[key]...)
+}
+
+// occurrences is every occurrence that was offered at all, sorted.
+func (m *meeting) occurrences() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keys := make([]string, 0, len(m.told))
+	for key := range m.told {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }

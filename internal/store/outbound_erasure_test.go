@@ -835,13 +835,30 @@ func TestErasureReachesAnAnnouncementAndLeavesTheKeyAlone(t *testing.T) {
 	ctx := context.Background()
 	seedUsers(t, s, "u-alice")
 
-	result := mustSubmit(t, s, handoffAnnouncedFor(t, "sched-1",
+	// Two announcements to one person. The second is still owed, which is what
+	// erasure withdraws; the first was DELIVERED, which is the only way the
+	// coordinates below exist to be scrubbed at all. An announcement that never
+	// reached a provider has no address on it, and a test built on one would
+	// assert the absence of something that was never there.
+	sent := announcedTo(t, s, "sched-sent", "u-alice")
+	deliver(t, s, sent)
+	result := mustSubmit(t, s, handoffAnnouncedFor(t, "sched-owed",
 		time.Now().Add(time.Hour), announceTo("slack", "u-alice")))
 	if result.Outcome != outbound.SubmitCreated || len(result.IntentIDs) != 1 {
 		t.Fatalf("the announcement answered %q with %d commitments",
 			result.Outcome, len(result.IntentIDs))
 	}
 	intentID := result.IntentIDs[0]
+
+	// The coordinates the delivery left behind, asserted PRESENT: everything
+	// after the erasure is about their absence, and an absence that was there
+	// beforehand proves nothing.
+	sentAttempt := onlyAttempt(t, s, sent)
+	for what, value := range coordinatesOf(t, s, sent, sentAttempt) {
+		if value == "" {
+			t.Fatalf("the delivered announcement has no %s to erase", what)
+		}
+	}
 
 	// What the row says about the person before anybody is erased.
 	var keyBefore, refBefore, payloadBefore string
@@ -868,7 +885,36 @@ func TestErasureReachesAnAnnouncementAndLeavesTheKeyAlone(t *testing.T) {
 		t.Errorf("the handover family counted %v withdrawals, want 1", got)
 	}
 
-	// The address is gone; the identity is not.
+	// Every coordinate the delivery left, in all three places one can be: the
+	// commitment, the attempt under it, and the name the channel gave the
+	// message.
+	for what, value := range coordinatesOf(t, s, sent, sentAttempt) {
+		if value != "" {
+			t.Errorf("the delivered announcement still carries its %s: %s", what, value)
+		}
+	}
+	// And the FACT of the message stays, so the state machine still knows
+	// something exists out there rather than deciding it never happened.
+	var recorded bool
+	var redactedAt sql.NullTime
+	if err := s.db.QueryRow(
+		`SELECT receipt_recorded, receipt_redacted_at FROM outbound_intents WHERE id = $1`,
+		sent).Scan(&recorded, &redactedAt); err != nil {
+		t.Fatalf("read what is left of the receipt: %v", err)
+	}
+	if !recorded {
+		t.Error("erasure decided the message had never been sent")
+	}
+	if !redactedAt.Valid {
+		t.Error("the coordinates went without a note saying when")
+	}
+	// The delivered one is not withdrawn: it is done, and there is nothing to
+	// withdraw.
+	if got := statusOf(t, s, sent); got != outbound.StatusSucceeded {
+		t.Errorf("a delivered announcement became %s", got)
+	}
+
+	// The address on the one still owed is gone too.
 	if endpoint := endpointOf(t, s, intentID); endpoint.Valid {
 		t.Errorf("the announcement still carries the address %q", endpoint.String)
 	}
@@ -927,4 +973,90 @@ func TestErasureCountsEachFamilyWhereItHappened(t *testing.T) {
 	if got := terminalCount(t, outbound.FamilyHandoff, string(outbound.StatusCanceled)) - handover; got != 1 {
 		t.Errorf("the handover family counted %v withdrawals, want 1", got)
 	}
+}
+
+// announcedTo admits one shift-change announcement to one person, for a shift
+// that has not ended yet - a commitment born expired is never claimed.
+func announcedTo(t *testing.T, s *Store, schedule, user string) string {
+	t.Helper()
+	result := mustSubmit(t, s, handoffAnnouncedFor(t, schedule,
+		time.Now().Add(time.Hour), announceTo("slack", user)))
+	if result.Outcome != outbound.SubmitCreated || len(result.IntentIDs) != 1 {
+		t.Fatalf("the announcement answered %q with %d commitments",
+			result.Outcome, len(result.IntentIDs))
+	}
+	return result.IntentIDs[0]
+}
+
+// deliver takes an announcement all the way through a provider, which is what
+// puts an address, a receipt and a name for the message on the rows.
+func deliver(t *testing.T, s *Store, intentID string) {
+	t.Helper()
+	ctx := context.Background()
+	token := claimHandoff(t, s, intentID)
+	begun, err := s.BeginAttempt(ctx, outbound.BeginAttemptRequest{
+		IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+		Preparation: outbound.PreparationReady, BoundEndpoint: "D0123",
+	})
+	if err != nil {
+		t.Fatalf("begin an attempt: %v", err)
+	}
+	if begun.Outcome != outbound.BeginStarted {
+		t.Fatalf("opening an attempt on the announcement answered %q", begun.Outcome)
+	}
+	settled, err := s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token,
+		Conclusion: conclusion(outbound.ConclusionInput{
+			Outcome: outbound.OutcomeAccepted,
+			Status:  "ok",
+			// An address in prose, which is why the scrub takes it too.
+			Summary: "accepted with channel=D0123",
+			Receipt: receiptOf("D0123/1700000000.000100",
+				`{"channel":"D0123","ts":"1700000000.000100"}`),
+		}),
+	})
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if settled.Outcome != outbound.FinalizeFinalized {
+		t.Fatalf("the delivery answered %q", settled.Outcome)
+	}
+}
+
+func onlyAttempt(t *testing.T, s *Store, intentID string) string {
+	t.Helper()
+	var id string
+	if err := s.db.QueryRow(`
+		SELECT id FROM outbound_attempts
+		WHERE intent_id = $1 AND record_kind = 'attempt'`, intentID).Scan(&id); err != nil {
+		t.Fatalf("read the attempt of %s: %v", intentID, err)
+	}
+	return id
+}
+
+// coordinatesOf is every place a delivered announcement says where its message
+// went, named so a failure says which one survived. Empty means gone.
+func coordinatesOf(t *testing.T, s *Store, intentID, attemptID string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	var endpoint, receipt, ref sql.NullString
+	if err := s.db.QueryRow(
+		`SELECT bound_endpoint, receipt::text, receipt_ref
+		 FROM outbound_intents WHERE id = $1`, intentID).
+		Scan(&endpoint, &receipt, &ref); err != nil {
+		t.Fatalf("read the commitment's coordinates: %v", err)
+	}
+	out["address"], out["receipt"], out["message name"] = endpoint.String, receipt.String, ref.String
+
+	var attemptEndpoint, attemptReceipt, summary sql.NullString
+	if err := s.db.QueryRow(
+		`SELECT bound_endpoint, receipt::text, response_summary
+		 FROM outbound_attempts WHERE id = $1`, attemptID).
+		Scan(&attemptEndpoint, &attemptReceipt, &summary); err != nil {
+		t.Fatalf("read the attempt's coordinates: %v", err)
+	}
+	out["attempt address"] = attemptEndpoint.String
+	out["attempt receipt"] = attemptReceipt.String
+	out["attempt summary"] = summary.String
+	return out
 }
