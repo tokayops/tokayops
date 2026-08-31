@@ -4,6 +4,8 @@ package handoff
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"sort"
 	"sync"
 	"testing"
@@ -440,13 +442,9 @@ func TestTwoInstancesRaceOnOneOccurrence(t *testing.T) {
 		group(handoffGroupB, "U_B", "U_NOSLACK"),
 	))
 
-	// Both instances admit through one door that holds each of them until the
-	// other arrives with the same occurrence, so the two really are inside
-	// SubmitBatch together rather than merely started together.
-	both := meetInside(t, env.s)
+	both := recording(env.s)
 	env.notifier = NewNotifier(both, env.renderer, staticDmProviders("slack"), time.Minute)
 	second := NewNotifier(both, env.renderer, staticDmProviders("slack"), time.Minute)
-	// Warm-up admits nothing, so nothing meets at the door during it.
 	env.warmUp()
 	if !second.Tick(context.Background()) {
 		t.Fatal("second instance failed to warm up")
@@ -466,7 +464,15 @@ func TestTwoInstancesRaceOnOneOccurrence(t *testing.T) {
 	}
 	before := skipped()
 
-	// Both instances meet the same handover at the same moment.
+	// Both instances meet the same handover at the same moment, and the moment
+	// is held open by the database rather than by the Go scheduler: the door
+	// closes in front of the insert, so neither transaction can commit a claim
+	// while the other is still deciding there is none.
+	//
+	// Installed after the warm-up, which admits nothing and would otherwise
+	// stand at the door forever.
+	door := holdEveryClaimAtTheInsert(t, env.s.GetDB())
+
 	env.now = env.now.Add(24 * time.Hour)
 	var wg sync.WaitGroup
 	complete := make([]bool, 2)
@@ -477,6 +483,13 @@ func TestTwoInstancesRaceOnOneOccurrence(t *testing.T) {
 			complete[i] = n.Tick(context.Background())
 		}(i, notifier)
 	}
+
+	// Both of them there, each having read the batch key and found nothing.
+	// This is the state the unique index exists for, and reaching it is the
+	// whole difference between this test and a repeat.
+	door.waitFor(2)
+	door.open()
+
 	wg.Wait()
 
 	for i, ok := range complete {
@@ -820,90 +833,146 @@ func TestNotifierOverPostgresEditedOverrideIsNotDeduped(t *testing.T) {
 	}
 }
 
-// meeting is the two instances actually meeting inside SubmitBatch, and what
-// each of them was told.
+// recorder keeps what each instance was told, and is otherwise the store.
 //
-// Two goroutines started together are not a race: one tick can finish entirely
-// before the other begins, and the test then shows only that a later call found
-// an earlier call's row - which is the ordinary repeat, and has its own test.
-// So a call waits at the door until another call carrying the SAME occurrence
-// arrives, and both go through from one instant. What they contend over after
-// that is the database's business, which is the thing under test.
-type meeting struct {
+// It does no synchronising: two goroutines started together are not a race -
+// one tick can finish entirely before the other begins - and a barrier in Go
+// only lines up the CALLS. What has to be lined up is what the two transactions
+// are doing inside PostgreSQL, and only PostgreSQL can hold them there.
+type recorder struct {
 	inner notifierStore
-	t     *testing.T
 
-	mu      sync.Mutex
-	gates   map[string]chan struct{}
-	arrived map[string]int
-	told    map[string][]outbound.SubmitResult
+	mu   sync.Mutex
+	told map[string][]outbound.SubmitResult
 }
 
-func meetInside(t *testing.T, inner notifierStore) *meeting {
-	return &meeting{
-		inner: inner, t: t,
-		gates:   map[string]chan struct{}{},
-		arrived: map[string]int{},
-		told:    map[string][]outbound.SubmitResult{},
-	}
+func recording(inner notifierStore) *recorder {
+	return &recorder{inner: inner, told: map[string][]outbound.SubmitResult{}}
 }
 
-func (m *meeting) GetAllTeams() ([]*model.Team, error) { return m.inner.GetAllTeams() }
+func (r *recorder) GetAllTeams() ([]*model.Team, error) { return r.inner.GetAllTeams() }
 
-func (m *meeting) GetIdentitiesForUsers(ids []string) (map[string][]*model.ExternalIdentity, error) {
-	return m.inner.GetIdentitiesForUsers(ids)
+func (r *recorder) GetIdentitiesForUsers(ids []string) (map[string][]*model.ExternalIdentity, error) {
+	return r.inner.GetIdentitiesForUsers(ids)
 }
 
-func (m *meeting) SubmitBatch(ctx context.Context,
+func (r *recorder) SubmitBatch(ctx context.Context,
 	batch outbound.Batch) (outbound.SubmitResult, error) {
 
-	key := batch.Admission.BatchKey
-	m.mu.Lock()
-	gate, known := m.gates[key]
-	if !known {
-		gate = make(chan struct{})
-		m.gates[key] = gate
-	}
-	m.arrived[key]++
-	nth := m.arrived[key]
-	m.mu.Unlock()
-
-	if nth >= 2 {
-		close(gate)
-	} else {
-		// Not forever: a second instance that never comes is a test that
-		// fails, not one that hangs.
-		select {
-		case <-gate:
-		case <-time.After(10 * time.Second):
-			m.t.Errorf("only one instance ever offered %s; there was no race", key)
-		}
-	}
-
-	result, err := m.inner.SubmitBatch(ctx, batch)
+	result, err := r.inner.SubmitBatch(ctx, batch)
 	if err == nil {
-		m.mu.Lock()
-		m.told[key] = append(m.told[key], result)
-		m.mu.Unlock()
+		r.mu.Lock()
+		r.told[batch.Admission.BatchKey] = append(r.told[batch.Admission.BatchKey], result)
+		r.mu.Unlock()
 	}
 	return result, err
 }
 
 // answers is what the instances were told about one occurrence.
-func (m *meeting) answers(key string) []outbound.SubmitResult {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]outbound.SubmitResult(nil), m.told[key]...)
+func (r *recorder) answers(key string) []outbound.SubmitResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]outbound.SubmitResult(nil), r.told[key]...)
 }
 
 // occurrences is every occurrence that was offered at all, sorted.
-func (m *meeting) occurrences() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	keys := make([]string, 0, len(m.told))
-	for key := range m.told {
+func (r *recorder) occurrences() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	keys := make([]string, 0, len(r.told))
+	for key := range r.told {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// claimBarrier is the door, and it is inside the database.
+//
+// A trigger makes every transaction inserting a claim wait for one advisory
+// lock, and the test holds that lock. What arrives at the door is therefore a
+// transaction that has already read the batch key and found nothing - that read
+// is the statement before the insert - so counting the sessions waiting there
+// counts the instances that are about to compete for the same key. Released
+// together, they are arbitrated by the unique index and by nothing else.
+//
+// The alternative, letting the two goroutines run and hoping, tests a
+// sequential repeat most of the time: the second transaction commits before the
+// first one has begun, and the first then reads a claim that is already there.
+const claimBarrierKey = 7710041
+
+type claimBarrier struct {
+	t      *testing.T
+	db     *sql.DB
+	holder *sql.Conn
+}
+
+func holdEveryClaimAtTheInsert(t *testing.T, db *sql.DB) *claimBarrier {
+	t.Helper()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `
+		CREATE OR REPLACE FUNCTION tokay_test_hold_claim() RETURNS trigger AS $$
+		BEGIN
+			PERFORM pg_advisory_xact_lock(`+fmt.Sprint(claimBarrierKey)+`);
+			RETURN NEW;
+		END $$ LANGUAGE plpgsql;
+		CREATE TRIGGER tokay_test_hold_claim BEFORE INSERT ON outbound_batches
+			FOR EACH ROW EXECUTE FUNCTION tokay_test_hold_claim()`); err != nil {
+		t.Fatalf("install the door: %v", err)
+	}
+
+	// The lock is taken on a connection of its own and held for the session:
+	// released with the statement, it would be gone before anybody arrived.
+	holder, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("take a connection for the door: %v", err)
+	}
+	if _, err := holder.ExecContext(ctx,
+		`SELECT pg_advisory_lock($1)`, claimBarrierKey); err != nil {
+		t.Fatalf("close the door: %v", err)
+	}
+
+	b := &claimBarrier{t: t, db: db, holder: holder}
+	t.Cleanup(func() {
+		b.open()
+		holder.Close()
+		if _, err := db.ExecContext(ctx, `
+			DROP TRIGGER IF EXISTS tokay_test_hold_claim ON outbound_batches;
+			DROP FUNCTION IF EXISTS tokay_test_hold_claim()`); err != nil {
+			t.Errorf("take the door away: %v", err)
+		}
+	})
+	return b
+}
+
+// waitFor blocks until n transactions are held at the insert, and fails if they
+// never are: fewer than n means the instances never met, and a test that went
+// on regardless would be the sequential repeat wearing a race's name.
+func (b *claimBarrier) waitFor(n int) {
+	b.t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var waiting int
+		if err := b.db.QueryRow(`
+			SELECT count(*) FROM pg_locks
+			WHERE locktype = 'advisory' AND NOT granted
+			  AND classid = 0 AND objid = $1 AND objsubid = 1`,
+			claimBarrierKey).Scan(&waiting); err != nil {
+			b.t.Fatalf("look at the door: %v", err)
+		}
+		if waiting >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			b.t.Fatalf("%d transactions reached the claim, want %d: the instances "+
+				"never competed for it", waiting, n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (b *claimBarrier) open() {
+	b.holder.ExecContext(context.Background(),
+		`SELECT pg_advisory_unlock($1)`, claimBarrierKey)
 }
