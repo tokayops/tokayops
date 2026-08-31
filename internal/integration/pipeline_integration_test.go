@@ -338,6 +338,15 @@ type recordingChannel struct {
 	// an answer at all.
 	answerErr map[string]error
 
+	// holdKind, when set, narrows hold to one kind of claim, so a test can jam
+	// one family's pool and watch the other keep working.
+	holdKind keys.Kind
+
+	// delay is how long every call takes to answer. A provider that answers
+	// instantly makes a pool look infinite: what a slot costs is the whole
+	// exchange, and a test about how long a queue takes has to pay it.
+	delay time.Duration
+
 	// hold keeps every call inside the provider until it is closed, which is
 	// how a test looks at a worker with its slots genuinely occupied.
 	hold chan struct{}
@@ -346,6 +355,28 @@ type recordingChannel struct {
 // Hold makes every call block inside the provider until the returned function
 // is called. Without it a "slow provider" is not slow at all: an error returns
 // immediately and the slot is free again before anybody can look at it.
+// AnswerIn makes every call take that long, which is what a slot actually
+// costs.
+func (c *recordingChannel) AnswerIn(d time.Duration) {
+	c.mu.Lock()
+	c.delay = d
+	c.mu.Unlock()
+}
+
+// HoldKind is Hold, narrowed to one kind of claim.
+func (c *recordingChannel) HoldKind(kind keys.Kind) func() {
+	c.mu.Lock()
+	c.holdKind = kind
+	c.mu.Unlock()
+	release := c.Hold()
+	return func() {
+		release()
+		c.mu.Lock()
+		c.holdKind = ""
+		c.mu.Unlock()
+	}
+}
+
 func (c *recordingChannel) Hold() func() {
 	c.mu.Lock()
 	c.hold = make(chan struct{})
@@ -428,10 +459,17 @@ func (c *recordingChannel) ExecuteAttempt(_ context.Context,
 	told, failing := c.answer[call.Endpoint]
 	toldErr := c.answerErr[call.Endpoint]
 	hold := c.hold
+	if c.holdKind != "" && call.KeyKind != c.holdKind {
+		hold = nil
+	}
+	delay := c.delay
 	c.mu.Unlock()
 
 	if hold != nil {
 		<-hold
+	}
+	if delay > 0 {
+		time.Sleep(delay)
 	}
 
 	if failing {

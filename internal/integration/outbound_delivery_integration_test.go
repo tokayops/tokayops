@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -529,6 +530,186 @@ func TestAPageStartsGoingOutPromptly(t *testing.T) {
 	if worst > 10 {
 		t.Fatalf("the first attempt of an immediately due commitment started %.1fs "+
 			"after it was admitted", worst)
+	}
+}
+
+// TestABurstOfShiftChangesDoesNotDelayAPage.
+//
+// This is the whole reason the handover has a family of its own. Schedules are
+// aligned to the hour, so a hundred of them can turn over in the same second,
+// and there is no upper bound on how many there are. Sharing one pool with
+// paging, that burst is what stands between an alert and the person on call.
+//
+// The announcements here are held inside the channel, so the handover pool is
+// full and stays full - the worst case, not a busy one. Then an alert arrives,
+// and its first attempt has to start anyway.
+func TestABurstOfShiftChangesDoesNotDelayAPage(t *testing.T) {
+	env := setupIntegrationTest(t)
+	ctx := context.Background()
+
+	// A burst, admitted straight through the door the detector uses.
+	const burst = 40
+	for i := 0; i < burst; i++ {
+		if _, err := env.S.SubmitBatch(ctx, announcement(t, fmt.Sprintf("sched-%d", i))); err != nil {
+			t.Fatalf("admit announcement %d: %v", i, err)
+		}
+	}
+
+	// Every announcement that reaches the channel stays there. Two slots, so
+	// the handover pool is jammed from the first tick to the end of the test.
+	release := env.Channel.HoldKind(keys.KindHandoff)
+	defer release()
+	startOutboundWorker(t, env.Handoff)
+	until(t, "the handover pool to fill", func() bool {
+		var sending int
+		if err := env.S.GetDB().QueryRow(`
+			SELECT count(*) FROM outbound_intents
+			WHERE key_kind = 'handoff' AND status = 'sending'`).Scan(&sending); err != nil {
+			t.Fatalf("read the queue: %v", err)
+		}
+		return sending >= outbound.HandoffPoolSize
+	})
+
+	// And now somebody is paged.
+	sendWebhook(t, env.Echo, criticalAlert("page_under_burst", "DiskFilling"))
+	env.Eng.ProcessNewAlertGroups(ctx)
+	startOutboundWorker(t, env.Worker)
+	waitForDeliveries(t, env.S, "page_under_burst", 2)
+
+	// Measured at both ends by the database, the way the histogram is. The
+	// paging profile allows seconds; what this catches is the shape where the
+	// page waits behind the burst, which is minutes.
+	var worst float64
+	if err := env.S.GetDB().QueryRow(`
+		SELECT max(EXTRACT(EPOCH FROM (a.started_at - b.admitted_at)))::double precision
+		FROM outbound_attempts a
+		JOIN outbound_intents i ON i.id = a.intent_id
+		JOIN outbound_batches b ON b.id = i.batch_id
+		JOIN alert_groups ag ON ag.id = i.alert_group_id
+		WHERE ag.alert_key = $1 AND a.attempt_no = 1 AND i.not_before <= b.admitted_at`,
+		"page_under_burst").Scan(&worst); err != nil {
+		t.Fatalf("measure the delay: %v", err)
+	}
+	if worst > 10 {
+		t.Fatalf("a page waited %.1fs behind %d announcements", worst, burst)
+	}
+
+	// The announcements really were in the way: none of them finished.
+	var settled int
+	if err := env.S.GetDB().QueryRow(`
+		SELECT count(*) FROM outbound_intents
+		WHERE key_kind = 'handoff' AND status = 'succeeded'`).Scan(&settled); err != nil {
+		t.Fatalf("read the announcements: %v", err)
+	}
+	if settled != 0 {
+		t.Fatalf("%d announcements got through a channel that never answered", settled)
+	}
+}
+
+// TestAHundredShiftChangesMeetTheirOwnProfile is the handover family's SLO,
+// measured rather than reasoned about.
+//
+// It is not in the ordinary run, and the reason is the same thing that makes it
+// worth having: it takes minutes. Set TOKAY_PROFILE_SLO=1 to run it. What it
+// costs in wall clock is exactly what the profile is about - a pool of two,
+// answering in three seconds, working through a hundred announcements that all
+// came due on one hour boundary.
+//
+// It models OCCUPANCY, which is the part an arithmetic check gets wrong. A slot
+// is taken for the whole exchange and freed only when the attempt is finalised,
+// so the queue drains at the rate the pool actually allows. N divided by a
+// throughput figure, or a couple of deliveries per tick, both answer faster
+// than the system does and would pass a profile that is being missed.
+func TestAHundredShiftChangesMeetTheirOwnProfile(t *testing.T) {
+	if os.Getenv("TOKAY_PROFILE_SLO") == "" {
+		t.Skip("set TOKAY_PROFILE_SLO=1: this one runs for minutes on purpose")
+	}
+	env := setupIntegrationTest(t)
+	ctx := context.Background()
+
+	const burst = 100
+	env.Channel.AnswerIn(3 * time.Second)
+
+	for i := 0; i < burst; i++ {
+		if _, err := env.S.SubmitBatch(ctx, announcement(t, fmt.Sprintf("profile-%d", i))); err != nil {
+			t.Fatalf("admit announcement %d: %v", i, err)
+		}
+	}
+
+	// No head start: the worker begins after everything is already due, which
+	// is what an hour boundary looks like.
+	stop := startOutboundWorker(t, env.Handoff)
+	deadline := time.Now().Add(15 * time.Minute)
+	for {
+		var settled int
+		if err := env.S.GetDB().QueryRow(`
+			SELECT count(*) FROM outbound_intents
+			WHERE key_kind = 'handoff' AND status = 'succeeded'`).Scan(&settled); err != nil {
+			t.Fatalf("read the queue: %v", err)
+		}
+		if settled == burst {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d announcements delivered before the test gave up", settled, burst)
+		}
+		time.Sleep(time.Second)
+	}
+	stop()
+
+	// Both ends from the database's own clock, like the histogram.
+	var p95, p99, worst float64
+	if err := env.S.GetDB().QueryRow(`
+		SELECT percentile_disc(0.95) WITHIN GROUP (ORDER BY waited),
+		       percentile_disc(0.99) WITHIN GROUP (ORDER BY waited),
+		       max(waited)
+		FROM (
+			SELECT EXTRACT(EPOCH FROM (a.started_at - b.admitted_at))::double precision AS waited
+			FROM outbound_attempts a
+			JOIN outbound_intents i ON i.id = a.intent_id
+			JOIN outbound_batches b ON b.id = i.batch_id
+			WHERE i.key_kind = 'handoff' AND a.attempt_no = 1
+		) waits`).Scan(&p95, &p99, &worst); err != nil {
+		t.Fatalf("measure the profile: %v", err)
+	}
+	t.Logf("handover profile over %d announcements: p95=%.1fs p99=%.1fs worst=%.1fs",
+		burst, p95, p99, worst)
+
+	if p95 > 300 {
+		t.Errorf("p95 = %.1fs, over the 300s this family promises", p95)
+	}
+	if p99 > 360 {
+		t.Errorf("p99 = %.1fs, over the 360s this family promises", p99)
+	}
+	// The lateness series is what an alert watches, and 900s is where it fires.
+	if worst >= 900 {
+		t.Errorf("an announcement waited %.1fs, which is what the alert is set at", worst)
+	}
+}
+
+// announcement is one shift change, admitted the way the detector admits one.
+func announcement(t *testing.T, scheduleID string) outbound.Batch {
+	t.Helper()
+	start := time.Now().Add(time.Hour).UTC()
+	admission, err := keys.HandoffBatch{
+		Occurrence: keys.Occurrence{
+			Kind: keys.HandoffShiftChange, ScheduleID: scheduleID, Source: "rotation",
+			GroupID: "g-a", UserIDs: []string{"U_TEST"},
+			AssignmentStart: start, RevisionID: "rev-1",
+		},
+		TeamName: "Backend", Timezone: "UTC",
+		GridSlotStart:      start,
+		AssignmentEnd:      start.Add(8 * time.Hour),
+		MaxAge:             time.Hour,
+		GrammarVersion:     keys.GrammarV1,
+		FingerprintVersion: keys.CurrentBatchFingerprintVersion(),
+		Recipients:         []keys.HandoffRecipient{announceThrough("slack", "U_TEST")},
+	}.Admit()
+	if err != nil {
+		t.Fatalf("build the announcement for %s: %v", scheduleID, err)
+	}
+	return outbound.Batch{
+		Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: "notifier",
 	}
 }
 
