@@ -11,8 +11,8 @@ container, your Postgres.
 ## Architecture
 
 TokayOps is an asynchronous pipeline: ingest (Alertmanager webhook) -> store
-(PostgreSQL) -> policy engine -> dispatcher (pluggable providers) -> Slack /
-Telegram. The primary runtime entity is the **AlertGroup**: the alerts
+(PostgreSQL) -> policy engine -> outbound delivery (pluggable channels) ->
+Slack / Telegram. The primary runtime entity is the **AlertGroup**: the alerts
 Alertmanager grouped, deduplicated by `groupKey`, with a status lifecycle,
 timeline and escalation state.
 
@@ -304,10 +304,11 @@ then, read the release notes before every minor upgrade.
 - `internal/api`: REST API implementation (Echo).
 - `internal/auth`: Authentication logic (JWT, BCrypt).
 - `internal/config`: Configuration loading (YAML).
-- `internal/dispatcher`: Notification dispatch (Slack, Telegram) behind a provider abstraction.
 - `internal/engine`: Policy assignment engine.
+- `internal/handoff`: Detects shift changes and admits the announcement.
 - `internal/ingester`: Alertmanager webhook ingestion.
 - `internal/model`: Data models (AlertGroup, User, etc.).
+- `internal/outbound`: Outbound delivery: durable commitments, the delivery worker, and the Slack and Telegram channels under `providers/`.
 - `internal/store`: Database access layer (PostgreSQL).
 - `web`: Frontend assets (Vanilla JS + CSS).
 

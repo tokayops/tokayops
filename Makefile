@@ -2,7 +2,7 @@
        test-db-start test-db-stop test-db-status \
        test-integration test-integration-quick test-integration-run \
        test-integration-shuffle \
-       test-pipeline test-dispatcher \
+       test-pipeline test-delivery \
        e2e-install e2e-test e2e-test-ui e2e-test-headed e2e-up e2e-down \
        e2e-wait e2e-seed \
        webhook-receiver webhook-receiver-build
@@ -93,9 +93,13 @@ test-integration-run:
 test-pipeline:
 	@./scripts/run_integration_tests.sh --run TestPipeline
 
-# Run dispatcher tests only
-test-dispatcher:
-	@./scripts/run_integration_tests.sh --pkg ./internal/dispatcher/... --failures
+# Run delivery tests only. One invocation with both patterns in a single --pkg:
+# the script keeps one package string and expands it unquoted, so a second
+# --pkg would silently replace the first, and a second invocation would collide
+# on the ephemeral database container.
+test-delivery:
+	@./scripts/run_integration_tests.sh --failures \
+		--pkg "./internal/outbound/... ./internal/handoff/..."
 
 # =============================================================================
 # E2E Testing
