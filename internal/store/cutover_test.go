@@ -82,6 +82,22 @@ func legacyJobEngine(t *testing.T, s *Store) {
 			FOREIGN KEY (dedup_namespace, dedup_scope, type)
 			REFERENCES job_dedup_policies (namespace, scope, job_type)
 			ON UPDATE RESTRICT ON DELETE RESTRICT`,
+		// The two rules the released schema puts on a job's identity beside
+		// that key. They are here so the rows below have to be rows a real
+		// database would have accepted: without them the fixture would take a
+		// half-filled spec, or an escalation answering for no alert group.
+		`ALTER TABLE jobs ADD CONSTRAINT jobs_escalation_identity CHECK (
+			dedup_namespace IS NULL
+			OR type <> 'escalation'
+			OR (alert_group_id IS NOT NULL AND alert_group_id = dedup_key))`,
+		`ALTER TABLE jobs ADD CONSTRAINT jobs_dedup_spec_complete CHECK (
+			(dedup_namespace IS NULL AND dedup_key IS NULL AND dedup_scope IS NULL)
+			OR (dedup_namespace IS NOT NULL AND dedup_key IS NOT NULL
+			    AND dedup_scope IS NOT NULL))`,
+		`CREATE UNIQUE INDEX idx_jobs_dedup_active ON jobs (dedup_namespace, dedup_key)
+			WHERE dedup_scope = 'while_active' AND status IN ('pending', 'running')`,
+		`CREATE UNIQUE INDEX idx_jobs_dedup_forever ON jobs (dedup_namespace, dedup_key)
+			WHERE dedup_scope = 'forever'`,
 		`ALTER TABLE alert_groups
 			ADD COLUMN slack_update_pending BOOLEAN NOT NULL DEFAULT FALSE,
 			ADD COLUMN ack_processed_at TIMESTAMPTZ`,
@@ -106,13 +122,17 @@ func TestTheCutoverLeavesTheJobEngineGone(t *testing.T) {
 	// policy table is MATCH SIMPLE: a row with NULLs in two of the three
 	// columns is not covered by it at all, and this fixture is the shape a
 	// released database has rather than the least one that compiles.
+	//
+	// Its key IS the alert group, which is what the escalation identity rule
+	// requires: an escalation answers for one incident, and the row that names
+	// a group without answering for it is the one that rule exists to refuse.
 	agID := outboundGroup(t, s)
 	exec(t, s, `INSERT INTO job_dedup_policies (namespace, scope, job_type)
 	            VALUES ('escalation', 'while_active', 'escalation')`)
 	exec(t, s, `INSERT INTO jobs
 	              (id, type, status, dedup_namespace, dedup_key, dedup_scope, alert_group_id)
 	            VALUES ('job-1', 'escalation', 'succeeded',
-	                    'escalation', 'k-1', 'while_active', $1)`, agID)
+	                    'escalation', $1, 'while_active', $1)`, agID)
 	exec(t, s, `INSERT INTO job_stages (id, job_id, stage_index, status)
 	            VALUES ('stage-1', 'job-1', 0, 'succeeded')`)
 	exec(t, s, `INSERT INTO job_steps (id, job_id, stage_id, step_index, step_type, status)
