@@ -721,3 +721,92 @@ func TestADeadlineIsNotAStartTime(t *testing.T) {
 	}
 	assertNothingAdmitted(t, s, before)
 }
+
+// TestAnAnnouncementIsGoodUntilTheEarlierOfTwoThings.
+//
+// The bounded form is two atoms and one answer: the shift's own end, and how
+// long an announcement is worth making at all. Which of them wins is not a
+// property of the announcement - it is whichever comes first - and both sides
+// are reachable in ordinary use. A shift that ends in ten minutes is bounded by
+// itself; an eight-hour one is bounded by the hour nobody wants a stale shift
+// notice after.
+//
+// Asserted against the admitted_at the DATABASE wrote, because half of the
+// arithmetic is measured from it: a test using its own clock would be checking
+// two different admissions against each other and would drift by however long
+// the round trip took.
+func TestAnAnnouncementIsGoodUntilTheEarlierOfTwoThings(t *testing.T) {
+	s := setupTestDB(t)
+	seedUsers(t, s, "u-alice")
+
+	for _, c := range []struct {
+		name      string
+		endsIn    time.Duration
+		maxAge    time.Duration
+		shiftWins bool
+	}{
+		{"a shift that ends before the notice goes stale", 10 * time.Minute, time.Hour, true},
+		{"a shift that outlasts it", 8 * time.Hour, time.Hour, false},
+		// Either side of the crossing point by a minute. The shift starts a
+		// minute from now, so the two are equal at endsIn = maxAge - 1m; at
+		// the point itself both branches give the same instant, so which one
+		// ran cannot be observed and is not asserted.
+		{"a minute before the crossing", 58 * time.Minute, time.Hour, true},
+		{"a minute after it", 60 * time.Minute, time.Hour, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			start := time.Now().Add(time.Minute).UTC().Truncate(time.Microsecond)
+			end := start.Add(c.endsIn)
+
+			occurrence := handoffOccurrence("sched-" + c.name)
+			occurrence.AssignmentStart = start
+			admission, err := keys.HandoffBatch{
+				Occurrence: occurrence, TeamName: "Backend", Timezone: "UTC",
+				GridSlotStart:      start,
+				AssignmentEnd:      end,
+				MaxAge:             c.maxAge,
+				GrammarVersion:     keys.GrammarV1,
+				FingerprintVersion: keys.CurrentBatchFingerprintVersion(),
+				Recipients:         []keys.HandoffRecipient{announceTo("slack", "u-alice")},
+			}.Admit()
+			if err != nil {
+				t.Fatalf("build the admission: %v", err)
+			}
+			result, err := s.SubmitBatch(context.Background(), outbound.Batch{
+				Admission: admission, Context: outbound.AnnouncingShiftChange(),
+				Actor: "notifier",
+			})
+			if err != nil {
+				t.Fatalf("admit: %v", err)
+			}
+
+			var admittedAt, expiresAt time.Time
+			if err := s.db.QueryRow(`
+				SELECT b.admitted_at, i.expires_at
+				FROM outbound_batches b
+				JOIN outbound_intents i ON i.batch_id = b.id
+				WHERE b.id = $1`, result.BatchID).Scan(&admittedAt, &expiresAt); err != nil {
+				t.Fatalf("read the deadline: %v", err)
+			}
+
+			want := admittedAt.Add(c.maxAge)
+			which := "the announcement went stale"
+			if c.shiftWins {
+				want, which = end, "the shift ended"
+			}
+			if !expiresAt.UTC().Equal(want.UTC()) {
+				t.Fatalf("the announcement is good until %s; %s at %s",
+					expiresAt.UTC(), which, want.UTC())
+			}
+			// And the other half really was the later one, so the case is the
+			// branch it says it is rather than both answers coinciding.
+			other := end
+			if c.shiftWins {
+				other = admittedAt.Add(c.maxAge)
+			}
+			if !other.After(want) {
+				t.Fatalf("this case does not choose: %s is not after %s", other.UTC(), want.UTC())
+			}
+		})
+	}
+}
