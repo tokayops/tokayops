@@ -376,11 +376,13 @@ func TestWorkFromANewerBuildIsLeftWhereItIs(t *testing.T) {
 // TestNothingWritesAJobAnyMore is the checkpoint the teardown is ordered
 // around.
 //
-// Nothing that runs writes a job any more, and the tables the job engine used
-// stay empty while a real instance does its work. The tables themselves are
-// still there - dropping them is a separate decision, taken with the upgrade in
-// hand - so this is a claim about the product rather than about a schema that
-// makes the rows impossible.
+// Nothing that runs writes a job any more.
+//
+// The tables are made here rather than found, and that is the point: this build
+// creates none of them, so on a fresh database the claim would be about a
+// schema that makes the rows impossible rather than about the product. What an
+// UPGRADED database looks like until the cutover is run is exactly this - the
+// tables still standing, and nothing putting anything in them.
 //
 // Through the real producers, both of them. An alert arrives by webhook and is
 // escalated; a shift changes and the detector announces it. Building an
@@ -390,6 +392,32 @@ func TestWorkFromANewerBuildIsLeftWhereItIs(t *testing.T) {
 func TestNothingWritesAJobAnyMore(t *testing.T) {
 	env := setupIntegrationTest(t)
 	ctx := context.Background()
+
+	// The shape an upgraded database still has: enough of it that a writer
+	// would succeed if one were left.
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS jobs (
+			id TEXT PRIMARY KEY, type TEXT, status TEXT, dedup_namespace TEXT,
+			dedup_key TEXT, dedup_scope TEXT, alert_group_id TEXT,
+			created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`,
+		`CREATE TABLE IF NOT EXISTS job_stages (
+			id TEXT PRIMARY KEY, job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+			stage_index INTEGER, status TEXT)`,
+		`CREATE TABLE IF NOT EXISTS job_steps (
+			id TEXT PRIMARY KEY, job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+			stage_id TEXT REFERENCES job_stages(id), step_index INTEGER,
+			step_type TEXT, status TEXT, data TEXT)`,
+	} {
+		if _, err := env.S.GetDB().Exec(ddl); err != nil {
+			t.Fatalf("build the old shape: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		if _, err := env.S.GetDB().Exec(
+			`DROP TABLE IF EXISTS job_steps, job_stages, jobs`); err != nil {
+			t.Fatalf("take the old shape away again: %v", err)
+		}
+	})
 
 	sendWebhook(t, env.Echo, criticalAlert("no_jobs", "DiskFilling"))
 	env.Eng.ProcessNewAlertGroups(ctx)

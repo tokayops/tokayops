@@ -73,12 +73,10 @@ type AlertGroup struct {
 	Alerts []Alert `json:"alerts"`
 
 	// Acknowledgement
-	AcknowledgedBy string     `json:"acknowledged_by,omitempty"`
-	ResolvedBy     string     `json:"resolved_by,omitempty"`
-	AckProcessedAt *time.Time `json:"ack_processed_at,omitempty"` // Declared, no longer written: the loop that set it is gone
+	AcknowledgedBy string `json:"acknowledged_by,omitempty"`
+	ResolvedBy     string `json:"resolved_by,omitempty"`
 
 	// Slack Update Tracking
-	SlackUpdatePending bool `json:"slack_update_pending,omitempty"` // Declared, no longer written: what a card shows is a revision now
 
 	// RenderSourceVersion is the version of the state a message about this
 	// alert is drawn from. Every write that changes what such a message would
@@ -147,25 +145,6 @@ type AlertGroupSummary struct {
 	ResolvedAt     *time.Time       `json:"resolved_at,omitempty"`
 	AlertsCount    int              `json:"alerts_count"`
 	FiringCount    int              `json:"firing_count"`
-}
-
-// NotificationDelivery represents a single notification delivery attempt.
-// It is tied to an AlertGroup and typically to a JobStep.
-type NotificationDelivery struct {
-	ID              string    `json:"id"`
-	AlertGroupID    string    `json:"alert_group_id"`
-	JobStepID       *string   `json:"job_step_id,omitempty"`
-	Provider        string    `json:"provider"`
-	Kind            string    `json:"kind"` // slack_channel, slack_dm, firehose
-	TargetType      string    `json:"target_type,omitempty"`
-	TargetID        string    `json:"target_id,omitempty"`
-	ProviderPayload string    `json:"provider_payload,omitempty"`
-	SupportsUpdate  bool      `json:"supports_update"`
-	IsPrimary       bool      `json:"is_primary"`
-	IsFirehose      bool      `json:"is_firehose"`
-	Attempt         int       `json:"attempt"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // IncidentStatus represents the lifecycle state of a business incident.

@@ -29,23 +29,22 @@ type MockStore struct {
 
 	mu sync.RWMutex
 
-	alertGroups            map[string]*model.AlertGroup
-	incidents              map[int]*model.Incident
-	incidentSeq            int
-	teams                  map[string]*model.Team
-	users                  map[string]*model.User
-	erasedUsers            map[string]bool
-	teamMembers            map[string]map[string]model.TeamMemberRole // teamID -> userID -> role
-	timelineEvents         map[string][]*model.TimelineEvent          // alertGroupID -> events
-	apiTokens              map[string]*model.APIToken                 // tokenID -> token
-	externalIdentities     map[string]*model.ExternalIdentity         // "userID|provider" -> identity
-	linkTokens             map[string]mockLinkToken                   // "userID|provider" -> link token
-	escalationPolicies     map[string]*model.EscalationPolicy         // policyID -> policy
-	integrations           map[string]*model.Integration              // integrationID -> integration
-	notificationDeliveries map[string]*model.NotificationDelivery     // deliveryID -> delivery
-	outboxEvents           map[string]*model.OutboxEvent              // eventID -> event
-	outboxDeliveries       map[string]*model.OutboxDelivery           // deliveryID -> delivery
-	deliveryAttempts       map[string][]*model.DeliveryAttempt        // deliveryID -> attempts
+	alertGroups        map[string]*model.AlertGroup
+	incidents          map[int]*model.Incident
+	incidentSeq        int
+	teams              map[string]*model.Team
+	users              map[string]*model.User
+	erasedUsers        map[string]bool
+	teamMembers        map[string]map[string]model.TeamMemberRole // teamID -> userID -> role
+	timelineEvents     map[string][]*model.TimelineEvent          // alertGroupID -> events
+	apiTokens          map[string]*model.APIToken                 // tokenID -> token
+	externalIdentities map[string]*model.ExternalIdentity         // "userID|provider" -> identity
+	linkTokens         map[string]mockLinkToken                   // "userID|provider" -> link token
+	escalationPolicies map[string]*model.EscalationPolicy         // policyID -> policy
+	integrations       map[string]*model.Integration              // integrationID -> integration
+	outboxEvents       map[string]*model.OutboxEvent              // eventID -> event
+	outboxDeliveries   map[string]*model.OutboxDelivery           // deliveryID -> delivery
+	deliveryAttempts   map[string][]*model.DeliveryAttempt        // deliveryID -> attempts
 
 	// Error injection for testing. When set, the corresponding method returns this error.
 	GetIntegrationByIDError       error
@@ -69,14 +68,13 @@ func NewMockStore() *MockStore {
 		timelineEvents: make(map[string][]*model.TimelineEvent),
 		apiTokens:      make(map[string]*model.APIToken),
 
-		externalIdentities:     make(map[string]*model.ExternalIdentity),
-		linkTokens:             make(map[string]mockLinkToken),
-		escalationPolicies:     make(map[string]*model.EscalationPolicy),
-		integrations:           make(map[string]*model.Integration),
-		notificationDeliveries: make(map[string]*model.NotificationDelivery),
-		outboxEvents:           make(map[string]*model.OutboxEvent),
-		outboxDeliveries:       make(map[string]*model.OutboxDelivery),
-		deliveryAttempts:       make(map[string][]*model.DeliveryAttempt),
+		externalIdentities: make(map[string]*model.ExternalIdentity),
+		linkTokens:         make(map[string]mockLinkToken),
+		escalationPolicies: make(map[string]*model.EscalationPolicy),
+		integrations:       make(map[string]*model.Integration),
+		outboxEvents:       make(map[string]*model.OutboxEvent),
+		outboxDeliveries:   make(map[string]*model.OutboxDelivery),
+		deliveryAttempts:   make(map[string][]*model.DeliveryAttempt),
 	}
 
 	// Seed data matching what InitDB would create
@@ -788,184 +786,6 @@ func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]st
 // ========================================
 // Notification Deliveries
 // ========================================
-
-func (m *MockStore) UpsertNotificationDelivery(d *model.NotificationDelivery) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if d == nil {
-		return fmt.Errorf("delivery is nil")
-	}
-
-	now := time.Now()
-	if d.ID == "" {
-		d.ID = uuid.New().String()
-	}
-	if d.CreatedAt.IsZero() {
-		d.CreatedAt = now
-	}
-	d.UpdatedAt = now
-
-	if d.JobStepID != nil && *d.JobStepID != "" {
-		for _, existing := range m.notificationDeliveries {
-			if existing.JobStepID != nil && *existing.JobStepID == *d.JobStepID {
-				existing.AlertGroupID = d.AlertGroupID
-				existing.Provider = d.Provider
-				existing.Kind = d.Kind
-				existing.TargetType = d.TargetType
-				existing.TargetID = d.TargetID
-				existing.ProviderPayload = d.ProviderPayload
-				existing.SupportsUpdate = d.SupportsUpdate
-				existing.IsFirehose = d.IsFirehose
-				// Intentionally keep existing.IsPrimary to avoid clobbering primary on retries.
-				existing.Attempt = d.Attempt
-				existing.UpdatedAt = d.UpdatedAt
-				return nil
-			}
-		}
-	}
-
-	copy := *d
-	if d.JobStepID != nil {
-		jobStepID := *d.JobStepID
-		copy.JobStepID = &jobStepID
-	}
-	m.notificationDeliveries[copy.ID] = &copy
-	return nil
-}
-
-func (m *MockStore) SetPrimaryDeliveryIfNone(alertGroupID, deliveryID string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID == alertGroupID && d.IsPrimary {
-			return false, nil
-		}
-	}
-
-	if d, ok := m.notificationDeliveries[deliveryID]; ok {
-		d.IsPrimary = true
-		d.UpdatedAt = time.Now()
-		return true, nil
-	}
-
-	return false, sql.ErrNoRows
-}
-
-func (m *MockStore) GetPrimaryDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var selected *model.NotificationDelivery
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID != alertGroupID || d.Provider != provider || !d.IsPrimary {
-			continue
-		}
-		if selected == nil || d.CreatedAt.After(selected.CreatedAt) {
-			selected = d
-		}
-	}
-	if selected == nil {
-		return nil, nil
-	}
-	copy := *selected
-	if selected.JobStepID != nil {
-		jobStepID := *selected.JobStepID
-		copy.JobStepID = &jobStepID
-	}
-	return &copy, nil
-}
-
-func (m *MockStore) GetFirehoseDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var selected *model.NotificationDelivery
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID != alertGroupID || d.Provider != provider || !d.IsFirehose || !d.SupportsUpdate {
-			continue
-		}
-		if selected == nil || d.CreatedAt.After(selected.CreatedAt) {
-			selected = d
-		}
-	}
-	if selected == nil {
-		return nil, nil
-	}
-	copy := *selected
-	if selected.JobStepID != nil {
-		jobStepID := *selected.JobStepID
-		copy.JobStepID = &jobStepID
-	}
-	return &copy, nil
-}
-
-func (m *MockStore) GetDeliveryByID(id string) (*model.NotificationDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, d := range m.notificationDeliveries {
-		if d.ID == id {
-			copy := *d
-			if d.JobStepID != nil {
-				jobStepID := *d.JobStepID
-				copy.JobStepID = &jobStepID
-			}
-			return &copy, nil
-		}
-	}
-	return nil, nil
-}
-
-func (m *MockStore) ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var deliveries []*model.NotificationDelivery
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID != alertGroupID {
-			continue
-		}
-		copy := *d
-		if d.JobStepID != nil {
-			jobStepID := *d.JobStepID
-			copy.JobStepID = &jobStepID
-		}
-		deliveries = append(deliveries, &copy)
-	}
-
-	sort.Slice(deliveries, func(i, j int) bool {
-		return deliveries[i].CreatedAt.Before(deliveries[j].CreatedAt)
-	})
-
-	return deliveries, nil
-}
-
-func (m *MockStore) HasPrimaryDelivery(alertGroupID, provider string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID == alertGroupID && d.Provider == provider && d.IsPrimary {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (m *MockStore) UpdateDeliveryPayload(deliveryID, payload string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, d := range m.notificationDeliveries {
-		if d.ID == deliveryID {
-			d.ProviderPayload = payload
-			return nil
-		}
-	}
-	return nil
-}
 
 // ========================================
 // Incidents (stub for future)

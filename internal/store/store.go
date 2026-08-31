@@ -158,30 +158,9 @@ const legacyColumnMigrationsDDL = `
             ALTER TABLE users ADD COLUMN auth_provider TEXT;
         END IF;
 
-		-- 6. Add FK for notification_deliveries.job_step_id if missing
-		IF NOT EXISTS(
-			SELECT 1 FROM information_schema.table_constraints
-			WHERE table_name = 'notification_deliveries'
-			  AND constraint_name = 'notification_deliveries_job_step_id_fkey'
-		) THEN
-			ALTER TABLE notification_deliveries
-			ADD CONSTRAINT notification_deliveries_job_step_id_fkey
-			FOREIGN KEY (job_step_id) REFERENCES job_steps(id) ON DELETE SET NULL;
-		END IF;
-
 		-- 7. Add resolved_by column
 		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='resolved_by') THEN
 			ALTER TABLE alert_groups ADD COLUMN resolved_by TEXT;
-		END IF;
-
-		-- 8. Add ack_processed_at column for tracking when ack update was processed
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='ack_processed_at') THEN
-			ALTER TABLE alert_groups ADD COLUMN ack_processed_at TIMESTAMPTZ;
-		END IF;
-
-		-- 8. Add slack_update_pending flag for tracking when Slack messages need updating
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_pending') THEN
-			ALTER TABLE alert_groups ADD COLUMN slack_update_pending BOOLEAN NOT NULL DEFAULT FALSE;
 		END IF;
 
 		-- 8. The version of the state a card is drawn from. Every write that
@@ -192,8 +171,9 @@ const legacyColumnMigrationsDDL = `
 		-- state that has moved since.
 		--
 		-- It was called slack_update_generation, after a loop that no longer
-		-- exists. The flag that loop read, slack_update_pending above, is
-		-- declared and no longer written or read by anything.
+		-- exists. The flag that loop read, slack_update_pending, is not added
+		-- to a database that never had one and is dropped from those that do -
+		-- see the cutover file under migrations/.
 		IF EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_generation')
 		   AND NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='render_source_version') THEN
 			ALTER TABLE alert_groups RENAME COLUMN slack_update_generation TO render_source_version;
@@ -202,17 +182,6 @@ const legacyColumnMigrationsDDL = `
 			ALTER TABLE alert_groups ADD COLUMN render_source_version BIGINT NOT NULL DEFAULT 0;
 		END IF;
 
-		-- 9. Add alert_group_id column to jobs table
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns
-		              WHERE table_name='jobs' AND column_name='alert_group_id') THEN
-			ALTER TABLE jobs ADD COLUMN alert_group_id TEXT;
-		END IF;
-
-		-- 9b. Filling alert_group_id and keeping one escalation row per group
-		-- used to happen here, around a unique index this block dropped and
-		-- recreated on every start. Both moved into the one-shot job dedup
-		-- migration: recreating that index after the model exists would put
-		-- back the rule the model replaced.
 	END $$;
 	`
 
@@ -295,9 +264,9 @@ func (s *Store) buildSchema() error {
 		-- not this row - the same key comes back every time the same thing
 		-- breaks, and each time it is a new incident with a new id.
 		--
-		-- Not to be confused with jobs.dedup_key, which names a piece of
-		-- background work. Confusing the two is how an escalation once came to
-		-- be identified by the alert instead of by the incident.
+		-- It is not the identity of the work done about it either. An
+		-- escalation identified by the alert instead of by the incident is how
+		-- the second occurrence of a problem once went unpaged.
 		alert_key TEXT NOT NULL,
 		status TEXT NOT NULL,
 		title TEXT,
@@ -435,88 +404,6 @@ func (s *Store) buildSchema() error {
 		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 
-	-- Jobs (Phase 2)
-	CREATE TABLE IF NOT EXISTS jobs (
-		id TEXT PRIMARY KEY,
-		type TEXT NOT NULL,
-		status TEXT NOT NULL,
-		payload TEXT NOT NULL DEFAULT '{}',
-		-- Identity and policy: (dedup_namespace, dedup_key) names the work,
-		-- dedup_scope says how long that name is exclusive. All three or none;
-		-- the uniqueness rules themselves live with the migration that
-		-- introduces them (job_dedup_migration.go).
-		dedup_namespace TEXT,
-		dedup_key TEXT,
-		dedup_scope TEXT,
-		alert_group_id TEXT,
-		current_stage INTEGER DEFAULT 0,
-		error TEXT,
-		created_at TIMESTAMPTZ DEFAULT NOW(),
-		updated_at TIMESTAMPTZ DEFAULT NOW(),
-		finished_at TIMESTAMPTZ,
-		canceled_at TIMESTAMPTZ
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-
-	-- Job Stages (Phase 2: sequential execution groups within a job)
-	CREATE TABLE IF NOT EXISTS job_stages (
-		id TEXT PRIMARY KEY,
-		job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-		stage_index INTEGER NOT NULL,
-		status TEXT NOT NULL DEFAULT 'blocked',
-		created_at TIMESTAMPTZ DEFAULT NOW(),
-		updated_at TIMESTAMPTZ DEFAULT NOW(),
-		UNIQUE(job_id, stage_index)
-	);
-	CREATE INDEX IF NOT EXISTS idx_job_stages_job_status ON job_stages(job_id, status);
-
-	-- Job Steps (Phase 2)
-	CREATE TABLE IF NOT EXISTS job_steps (
-		id TEXT PRIMARY KEY,
-		job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-		stage_id TEXT NOT NULL REFERENCES job_stages(id),
-		step_index INTEGER NOT NULL,
-		step_type TEXT NOT NULL,
-		status TEXT NOT NULL,
-		data TEXT NOT NULL DEFAULT '{}',
-		result TEXT,
-		error TEXT,
-		next_run_at TIMESTAMPTZ,
-		locked_until TIMESTAMPTZ,
-		locked_by TEXT,
-		attempt_count INTEGER DEFAULT 0,
-		timeout_seconds INTEGER,
-		max_attempts INTEGER DEFAULT 5,
-		continue_on_failure BOOLEAN DEFAULT FALSE,
-		created_at TIMESTAMPTZ DEFAULT NOW(),
-		updated_at TIMESTAMPTZ DEFAULT NOW()
-	);
-	
-	CREATE INDEX IF NOT EXISTS idx_job_steps_status_next_run ON job_steps(status, next_run_at) 
-	WHERE status IN ('pending', 'retry');
-	CREATE INDEX IF NOT EXISTS idx_job_steps_job_id_index ON job_steps(job_id, step_index);
-
-	-- Notification Deliveries (Phase 3+)
-	CREATE TABLE IF NOT EXISTS notification_deliveries (
-		id TEXT PRIMARY KEY,
-		alert_group_id TEXT NOT NULL REFERENCES alert_groups(id),
-		job_step_id TEXT UNIQUE REFERENCES job_steps(id) ON DELETE SET NULL,
-		provider TEXT NOT NULL,
-		kind TEXT NOT NULL,
-		target_type TEXT,
-		target_id TEXT,
-		provider_payload TEXT,
-		supports_update BOOLEAN DEFAULT FALSE,
-		is_primary BOOLEAN DEFAULT FALSE,
-		is_firehose BOOLEAN DEFAULT FALSE,
-		attempt INTEGER DEFAULT 0,
-		created_at TIMESTAMPTZ DEFAULT NOW(),
-		updated_at TIMESTAMPTZ DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_notification_deliveries_alert_group ON notification_deliveries(alert_group_id);
-	CREATE INDEX IF NOT EXISTS idx_notification_deliveries_primary ON notification_deliveries(alert_group_id, is_primary);
-	CREATE INDEX IF NOT EXISTS idx_notification_deliveries_firehose ON notification_deliveries(alert_group_id, is_firehose);
 	`
 	if _, err := s.db.Exec(query); err != nil {
 		return err
@@ -544,72 +431,6 @@ func (s *Store) buildSchema() error {
 	ALTER TABLE alert_groups ALTER COLUMN team_name_snapshot SET NOT NULL;
 	`
 	if _, err := s.db.Exec(snapshotMigration); err != nil {
-		return err
-	}
-
-	// Job stages migration: create table, backfill stage_id, rename current_step
-	jobStagesMigration := `
-	DO $$
-	BEGIN
-		-- 1. Create job_stages table if not exists (for upgrades; fresh installs already have it)
-		CREATE TABLE IF NOT EXISTS job_stages (
-			id TEXT PRIMARY KEY,
-			job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-			stage_index INTEGER NOT NULL,
-			status TEXT NOT NULL DEFAULT 'blocked',
-			created_at TIMESTAMPTZ DEFAULT NOW(),
-			updated_at TIMESTAMPTZ DEFAULT NOW(),
-			UNIQUE(job_id, stage_index)
-		);
-		CREATE INDEX IF NOT EXISTS idx_job_stages_job_status ON job_stages(job_id, status);
-
-		-- 2. Add stage_id column to job_steps (nullable initially for migration)
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns
-		              WHERE table_name='job_steps' AND column_name='stage_id') THEN
-			ALTER TABLE job_steps ADD COLUMN stage_id TEXT REFERENCES job_stages(id);
-		END IF;
-
-		-- 3. Migrate existing steps: each step gets its own stage
-		INSERT INTO job_stages (id, job_id, stage_index, status, created_at, updated_at)
-		SELECT
-			'stage-' || js.id,
-			js.job_id,
-			js.step_index,
-			CASE
-				WHEN js.status IN ('succeeded', 'failed', 'canceled') THEN js.status
-				WHEN js.status = 'blocked' THEN 'blocked'
-				ELSE 'active'
-			END,
-			js.created_at,
-			js.updated_at
-		FROM job_steps js
-		ON CONFLICT (job_id, stage_index) DO NOTHING;
-
-		-- 4. Backfill stage_id on job_steps
-		UPDATE job_steps js SET stage_id = (
-			SELECT jst.id FROM job_stages jst
-			WHERE jst.job_id = js.job_id AND jst.stage_index = js.step_index
-		)
-		WHERE js.stage_id IS NULL;
-
-		-- 5. Enforce NOT NULL if all rows migrated
-		IF NOT EXISTS (SELECT 1 FROM job_steps WHERE stage_id IS NULL) THEN
-			IF EXISTS (
-				SELECT 1 FROM information_schema.columns
-				WHERE table_name='job_steps' AND column_name='stage_id' AND is_nullable='YES'
-			) THEN
-				ALTER TABLE job_steps ALTER COLUMN stage_id SET NOT NULL;
-			END IF;
-		END IF;
-
-		-- 6. Rename jobs.current_step -> current_stage (upgrade path)
-		IF EXISTS(SELECT 1 FROM information_schema.columns
-		          WHERE table_name='jobs' AND column_name='current_step') THEN
-			ALTER TABLE jobs RENAME COLUMN current_step TO current_stage;
-		END IF;
-	END $$;
-	`
-	if _, err := s.db.Exec(jobStagesMigration); err != nil {
 		return err
 	}
 
@@ -1054,8 +875,7 @@ func (s *Store) buildSchema() error {
 // All query functions should use this to ensure consistent column ordering.
 const alertGroupColumns = `id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step,
 	external_url, alerts_data, policy_snapshot, oncall_snapshot,
-	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, ack_processed_at,
-	slack_update_pending, render_source_version`
+	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, render_source_version`
 
 // alertGroupScanner is an interface for scanning rows (works with *sql.Row and *sql.Rows).
 type alertGroupScanner interface {
@@ -1066,7 +886,7 @@ type alertGroupScanner interface {
 // The row must contain columns in the order defined by alertGroupColumns.
 func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	var ag model.AlertGroup
-	var resolvedAt, ackProcessedAt sql.NullTime
+	var resolvedAt sql.NullTime
 	var teamID, teamNameSnapshot, severity, policyID, externalURL sql.NullString
 	var alertsData, policySnapshot, oncallSnapshot, acknowledgedBy, resolvedBy sql.NullString
 
@@ -1075,8 +895,8 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 		&teamID, &teamNameSnapshot, &severity, &policyID, &ag.CurrentStep,
 		&externalURL, &alertsData,
 		&policySnapshot, &oncallSnapshot,
-		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt, &acknowledgedBy, &resolvedBy, &ackProcessedAt,
-		&ag.SlackUpdatePending, &ag.RenderSourceVersion,
+		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt, &acknowledgedBy, &resolvedBy,
+		&ag.RenderSourceVersion,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -1096,9 +916,6 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 
 	if resolvedAt.Valid {
 		ag.ResolvedAt = &resolvedAt.Time
-	}
-	if ackProcessedAt.Valid {
-		ag.AckProcessedAt = &ackProcessedAt.Time
 	}
 
 	// The alerts ARE the alert group: they are what a message about it says,
@@ -1480,231 +1297,6 @@ func countWithdrawn(n int) {
 	for i := 0; i < n; i++ {
 		countTerminal(outbound.FamilyNotification, outbound.StatusCanceled)
 	}
-}
-
-// ========================================
-// Notification Deliveries
-// ========================================
-
-func (s *Store) UpsertNotificationDelivery(d *model.NotificationDelivery) error {
-	if d == nil {
-		return errors.New("delivery is nil")
-	}
-
-	now := time.Now()
-	if d.ID == "" {
-		d.ID = uuid.New().String()
-	}
-	if d.CreatedAt.IsZero() {
-		d.CreatedAt = now
-	}
-	d.UpdatedAt = now
-
-	var jobStepID sql.NullString
-	if d.JobStepID != nil && *d.JobStepID != "" {
-		jobStepID = sql.NullString{String: *d.JobStepID, Valid: true}
-	}
-
-	// NOTE: is_primary is intentionally NOT updated on conflict to avoid clobbering
-	// the chosen primary delivery when a step is retried or re-upserted.
-	query := `
-		INSERT INTO notification_deliveries (
-			id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-			provider_payload, supports_update,
-			is_primary, is_firehose, attempt, created_at, updated_at
-		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-		ON CONFLICT (job_step_id) DO UPDATE SET
-			alert_group_id = EXCLUDED.alert_group_id,
-			provider = EXCLUDED.provider,
-			kind = EXCLUDED.kind,
-			target_type = EXCLUDED.target_type,
-			target_id = EXCLUDED.target_id,
-			provider_payload = EXCLUDED.provider_payload,
-			supports_update = EXCLUDED.supports_update,
-			is_firehose = EXCLUDED.is_firehose,
-			attempt = EXCLUDED.attempt,
-			updated_at = EXCLUDED.updated_at
-	`
-
-	_, err := s.db.Exec(
-		query,
-		d.ID,
-		d.AlertGroupID,
-		jobStepID,
-		d.Provider,
-		d.Kind,
-		d.TargetType,
-		d.TargetID,
-		d.ProviderPayload,
-		d.SupportsUpdate,
-		d.IsPrimary,
-		d.IsFirehose,
-		d.Attempt,
-		d.CreatedAt,
-		d.UpdatedAt,
-	)
-	return err
-}
-
-func (s *Store) SetPrimaryDeliveryIfNone(alertGroupID, deliveryID string) (bool, error) {
-	query := `
-		UPDATE notification_deliveries
-		SET is_primary = TRUE, updated_at = $1
-		WHERE id = $2
-		AND NOT EXISTS (
-			SELECT 1 FROM notification_deliveries WHERE alert_group_id = $3 AND is_primary = TRUE
-		)
-	`
-
-	res, err := s.db.Exec(query, time.Now(), deliveryID, alertGroupID)
-	if err != nil {
-		return false, err
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows > 0, nil
-}
-
-func (s *Store) GetPrimaryDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error) {
-	query := `
-		SELECT id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-		       provider_payload, supports_update,
-		       is_primary, is_firehose, attempt, created_at, updated_at
-		FROM notification_deliveries
-		WHERE alert_group_id = $1 AND provider = $2 AND is_primary = TRUE
-		ORDER BY created_at DESC
-		LIMIT 1
-	`
-
-	row := s.db.QueryRow(query, alertGroupID, provider)
-	return scanNotificationDelivery(row)
-}
-
-func (s *Store) GetFirehoseDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error) {
-	query := `
-		SELECT id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-		       provider_payload, supports_update,
-		       is_primary, is_firehose, attempt, created_at, updated_at
-		FROM notification_deliveries
-		WHERE alert_group_id = $1 AND provider = $2 AND is_firehose = TRUE AND supports_update = TRUE
-		ORDER BY created_at DESC
-		LIMIT 1
-	`
-
-	row := s.db.QueryRow(query, alertGroupID, provider)
-	return scanNotificationDelivery(row)
-}
-
-func (s *Store) GetDeliveryByID(id string) (*model.NotificationDelivery, error) {
-	query := `
-		SELECT id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-		       provider_payload, supports_update,
-		       is_primary, is_firehose, attempt, created_at, updated_at
-		FROM notification_deliveries
-		WHERE id = $1
-	`
-
-	row := s.db.QueryRow(query, id)
-	return scanNotificationDelivery(row)
-}
-
-func (s *Store) UpdateDeliveryPayload(deliveryID, payload string) error {
-	query := `UPDATE notification_deliveries SET provider_payload = $1, updated_at = $2 WHERE id = $3`
-	_, err := s.db.Exec(query, payload, time.Now(), deliveryID)
-	return err
-}
-
-func (s *Store) ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error) {
-	query := `
-		SELECT id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-		       provider_payload, supports_update,
-		       is_primary, is_firehose, attempt, created_at, updated_at
-		FROM notification_deliveries
-		WHERE alert_group_id = $1
-		ORDER BY created_at ASC
-	`
-
-	rows, err := s.db.Query(query, alertGroupID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var deliveries []*model.NotificationDelivery
-	for rows.Next() {
-		delivery, err := scanNotificationDelivery(rows)
-		if err != nil {
-			return nil, err
-		}
-		if delivery != nil {
-			deliveries = append(deliveries, delivery)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return deliveries, nil
-}
-
-func (s *Store) HasPrimaryDelivery(alertGroupID, provider string) (bool, error) {
-	query := `
-		SELECT 1 FROM notification_deliveries
-		WHERE alert_group_id = $1 AND provider = $2 AND is_primary = TRUE
-		LIMIT 1
-	`
-
-	var dummy int
-	err := s.db.QueryRow(query, alertGroupID, provider).Scan(&dummy)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-type notificationDeliveryScanner interface {
-	Scan(dest ...any) error
-}
-
-func scanNotificationDelivery(scanner notificationDeliveryScanner) (*model.NotificationDelivery, error) {
-	var d model.NotificationDelivery
-	var jobStepID, targetType, targetID, providerPayload sql.NullString
-
-	err := scanner.Scan(
-		&d.ID,
-		&d.AlertGroupID,
-		&jobStepID,
-		&d.Provider,
-		&d.Kind,
-		&targetType,
-		&targetID,
-		&providerPayload,
-		&d.SupportsUpdate,
-		&d.IsPrimary,
-		&d.IsFirehose,
-		&d.Attempt,
-		&d.CreatedAt,
-		&d.UpdatedAt,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if jobStepID.Valid {
-		d.JobStepID = &jobStepID.String
-	}
-	d.TargetType = targetType.String
-	d.TargetID = targetID.String
-	d.ProviderPayload = providerPayload.String
-
-	return &d, nil
 }
 
 func (s *Store) GetProcessingAlertGroups() ([]*model.AlertGroup, error) {
