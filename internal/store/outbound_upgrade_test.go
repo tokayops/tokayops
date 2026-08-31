@@ -418,6 +418,11 @@ func TestAStartFillsInThePayloadDigests(t *testing.T) {
 	agID := desiredGroup(t, s, "Disk filling up")
 	admitOne(t, s, agID, channelCommitment("C-ops", 0), dmCommitment("U-nina"))
 
+	// A second alert with one direct message and nothing else, for the rules
+	// below that need a claim holding a single commitment.
+	aloneID := desiredGroup(t, s, "Certificate expiring")
+	admitOne(t, s, aloneID, dmCommitment("U-nina"))
+
 	previousOutboundShape(t, s)
 	if hasColumn(t, s, "outbound_intents", "payload_digest") {
 		t.Fatal("the previous shape still has the column this test is about")
@@ -482,37 +487,74 @@ func TestAStartFillsInThePayloadDigests(t *testing.T) {
 
 	// And the rules bite on the upgraded database, which is the only place they
 	// were added by a later statement rather than by CREATE TABLE.
-	var intentID string
-	if err := s.db.QueryRow(
-		`SELECT id FROM outbound_intents WHERE alert_group_id = $1 LIMIT 1`,
-		agID).Scan(&intentID); err != nil {
-		t.Fatalf("pick a commitment: %v", err)
-	}
-	for name, statement := range map[string]string{
-		outboundPayloadDigestLenConstraint: `UPDATE outbound_intents
-			SET payload_digest = decode(repeat('ab', 31), 'hex') WHERE id = $1`,
-		outboundIntentFamilyConstraint: `UPDATE outbound_intents
-			SET delivery_family = 'handoff' WHERE id = $1`,
-		// The claim moves with the commitment, because a commitment alone
-		// cannot: the key between them would refuse it before the handover
-		// rules were reached. The payload names the same channel the columns
-		// do, so the rule about addressing is satisfied and the one about who
-		// takes a shift is the one left to refuse it.
-		outboundHandoffPersonTarget: `
+	//
+	// The two handover rules are reached by WHICH commitment is moved, not by
+	// the statement: both are aimed at key_kind = 'handoff' and the one about
+	// who takes a shift refuses first, so a channel-addressed row can never
+	// show whether the other one is there at all.
+	channelIntent := intentAddressed(t, s, agID, "channel")
+	// From a claim of its OWN. A claim moves with its whole set of
+	// commitments, so a person-addressed one sharing a claim with a
+	// channel-addressed one can never get past the rule about who takes a
+	// shift, whichever of the two is named.
+	userIntent := intentAddressed(t, s, aloneID, "user")
+
+	// The claim moves with the commitment, because a commitment alone cannot:
+	// the key between them would refuse it before either handover rule was
+	// reached.
+	const becomeAHandover = `
+		WITH claim AS (
+			UPDATE outbound_batches SET key_kind = 'handoff', delivery_family = 'handoff'
+			WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)
+			RETURNING id
+		)
+		UPDATE outbound_intents SET key_kind = 'handoff', delivery_family = 'handoff'
+		WHERE batch_id IN (SELECT id FROM claim)`
+
+	for _, refusal := range []struct {
+		name, statement, intentID string
+	}{
+		{outboundPayloadDigestLenConstraint, `UPDATE outbound_intents
+			SET payload_digest = decode(repeat('ab', 31), 'hex') WHERE id = $1`, userIntent},
+		{outboundIntentFamilyConstraint, `UPDATE outbound_intents
+			SET delivery_family = 'handoff' WHERE id = $1`, userIntent},
+		// Addressed to a channel: a shift is taken by a person.
+		{outboundHandoffPersonTarget, becomeAHandover, channelIntent},
+		// Addressed to a person, so the rule above is satisfied, and the
+		// payload made to name somebody else. Two answers to "who is this
+		// message for", which is the whole of this rule: the columns decide
+		// where it is sent and the payload decides what it says, so a row like
+		// this greets one person by another's name.
+		{outboundHandoffTargetAgreement, `
 			WITH claim AS (
 				UPDATE outbound_batches SET key_kind = 'handoff', delivery_family = 'handoff'
 				WHERE id = (SELECT batch_id FROM outbound_intents WHERE id = $1)
 				RETURNING id
 			)
-			UPDATE outbound_intents SET key_kind = 'handoff', delivery_family = 'handoff'
-			WHERE batch_id IN (SELECT id FROM claim)`,
+			UPDATE outbound_intents
+			SET key_kind = 'handoff', delivery_family = 'handoff',
+			    payload = jsonb_set(payload, '{target,ref}', '"U-somebody-else"')
+			WHERE batch_id IN (SELECT id FROM claim)`, userIntent},
 	} {
-		if _, err := s.db.Exec(statement, intentID); err == nil {
-			t.Errorf("the upgraded database accepted a row %s exists to forbid", name)
-		} else if !strings.Contains(err.Error(), name) {
-			t.Errorf("expected %s to refuse the row, got: %v", name, err)
+		if _, err := s.db.Exec(refusal.statement, refusal.intentID); err == nil {
+			t.Errorf("the upgraded database accepted a row %s exists to forbid", refusal.name)
+		} else if !strings.Contains(err.Error(), refusal.name) {
+			t.Errorf("expected %s to refuse the row, got: %v", refusal.name, err)
 		}
 	}
+}
+
+// intentAddressed picks the commitment aimed at one kind of target, and fails
+// when there is none: which rule a statement reaches depends on it.
+func intentAddressed(t *testing.T, s *Store, agID, targetKind string) string {
+	t.Helper()
+	var id string
+	if err := s.db.QueryRow(`
+		SELECT id FROM outbound_intents
+		WHERE alert_group_id = $1 AND target_kind = $2`, agID, targetKind).Scan(&id); err != nil {
+		t.Fatalf("no commitment addressed to a %s: %v", targetKind, err)
+	}
+	return id
 }
 
 // TestAStartRefusesAPayloadItCannotDigest.

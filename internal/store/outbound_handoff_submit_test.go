@@ -247,6 +247,62 @@ func TestARepeatedAnnouncementIsTheSameAnnouncement(t *testing.T) {
 	}
 }
 
+// TestARepeatedAnnouncementToNobodyIsAlsoTheSameAnnouncement.
+//
+// The claim with nothing under it, which is the one a repeat could most easily
+// miss: a no_targets admission writes a batch row and zero commitments, so
+// there is nothing to find it by except the batch itself. It also carries a
+// different fingerprint from an admitted one - the outcome is in the material -
+// so being recognised at all means being recognised under its own.
+//
+// A repeat that answered anything else would be a shift change nobody can be
+// told about being re-submitted on every tick of the detector, forever: the
+// producer moves its cache on `existing` exactly as it does on `created`, and
+// on nothing else.
+func TestARepeatedAnnouncementToNobodyIsAlsoTheSameAnnouncement(t *testing.T) {
+	s := setupTestDB(t)
+
+	first, err := s.SubmitBatch(context.Background(), handoffBatch(t, "sched-empty"))
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	if first.Outcome != outbound.SubmitCreated || len(first.IntentIDs) != 0 {
+		t.Fatalf("an announcement to nobody answered %q with %d commitments",
+			first.Outcome, len(first.IntentIDs))
+	}
+	var outcome string
+	if err := s.db.QueryRow(
+		`SELECT admission_outcome FROM outbound_batches WHERE id = $1`,
+		first.BatchID).Scan(&outcome); err != nil {
+		t.Fatalf("read the claim: %v", err)
+	}
+	if outcome != string(keys.OutcomeNoTargets) {
+		t.Fatalf("the claim was recorded as %q", outcome)
+	}
+
+	repeat, err := s.SubmitBatch(context.Background(), handoffBatch(t, "sched-empty"))
+	if err != nil {
+		t.Fatalf("repeat: %v", err)
+	}
+	if repeat.Outcome != outbound.SubmitExisting {
+		t.Fatalf("the repeat answered %q; the occurrence would be submitted again "+
+			"on every tick", repeat.Outcome)
+	}
+	if repeat.BatchID != first.BatchID {
+		t.Fatalf("the repeat found claim %q, the first was %q", repeat.BatchID, first.BatchID)
+	}
+
+	var claims int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM outbound_batches WHERE key_kind = 'handoff'`).
+		Scan(&claims); err != nil {
+		t.Fatalf("count the claims: %v", err)
+	}
+	if claims != 1 {
+		t.Fatalf("%d claims were written for one shift change", claims)
+	}
+}
+
 // TestAClaimOfOneKindIsNotAnAnswerAboutAnother.
 //
 // The subject is nullable, and both directions are stated: a claim that names

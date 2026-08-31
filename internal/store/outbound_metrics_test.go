@@ -294,3 +294,29 @@ func telegramCommitment(ref string) keys.EscalationCommitment {
 	c.Slot = keys.Slot{Kind: keys.SlotPolicy, Index: 1}
 	return c
 }
+
+// TestEveryFamilyIsOnTheGraphBeforeItHasAnything.
+//
+// A gauge that appears the first time the thing it watches happens cannot be
+// alerted on until then. The rule an operator writes is "handover work is not
+// waiting longer than fifteen minutes", and until the first shift change there
+// is no series for it to be about: the expression matches nothing, which in
+// Prometheus is not a breach and not a zero but no data at all.
+//
+// So both families report from the first scrape, on a database where neither
+// has a single row. Zero here means "nothing is owed", which is the truth, and
+// it is a different statement from silence.
+func TestEveryFamilyIsOnTheGraphBeforeItHasAnything(t *testing.T) {
+	s := setupTestDB(t)
+
+	for _, family := range []string{outbound.FamilyNotification, outbound.FamilyHandoff} {
+		late, reported := latenessOf(t, s, family)
+		if !reported {
+			t.Errorf("%s has no lateness series, so no rule can be written about it", family)
+			continue
+		}
+		if late != 0 {
+			t.Errorf("%s reports %v seconds late with nothing owed at all", family, late)
+		}
+	}
+}

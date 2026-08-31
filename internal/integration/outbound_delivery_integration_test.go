@@ -146,15 +146,18 @@ func TestARetryableFailureHasNoDeathCounter(t *testing.T) {
 	// with only three failures behind it - and an implementation that gave up
 	// on the fourth would pass.
 	//
-	// Far past anything MaxAttempts would have allowed. The backoff is what
-	// slows this down, so the attempts are forced forward rather than waited
-	// for: the point is the absence of a limit, not the curve.
+	// Ten, which is past every limit the engine had: a step defaulted to five
+	// attempts and the escalation policy never set a higher one. Four would
+	// have proved nothing - a build that still stopped at five would pass it -
+	// and the number is the whole claim here. The backoff is what slows this
+	// down, so the attempts are forced forward rather than waited for: the
+	// point is the absence of a limit, not the curve.
 	// Waited for in the DATABASE, not at the provider. The channel counts a call
 	// when it is ENTERED, so a fourth call is in flight long before the fourth
 	// failure is recorded - and a test reading the row at that moment would find
 	// a streak of three, or a commitment still sending, and fail a working
 	// implementation.
-	const failures = 4
+	const failures = 10
 	until(t, fmt.Sprintf("%d recorded failures", failures), func() bool {
 		var streak int
 		var status string
