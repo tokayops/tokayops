@@ -236,9 +236,12 @@ and `408` are retried; any other `4xx`, and any `3xx` (redirects are not
 followed), ends it as failed; a `5xx`, a timeout or a connection error is retried
 with exponential backoff (2s doubling, capped at 30 minutes, with jitter) for up
 to 24 hours from the event, after which the delivery expires. A subscriber's
-`timeout_seconds` is honoured up to 30 seconds. Private and link-local
-addresses are refused before any request is made unless the operator allows the
-range with `TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS`. Disabling or deleting the
+`timeout_seconds` is honoured up to 30 seconds. Only a public address may be
+posted to: every address the subscriber's name resolves to is checked before
+any request is made and again when the connection is opened, and private,
+loopback, link-local, unique-local, shared-address-space, multicast,
+unspecified and other reserved addresses are refused unless the operator allows
+the range with `TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS`. Disabling or deleting the
 integration withdraws its undelivered deliveries; the delivery history of a
 deleted integration stays readable.
 
@@ -250,9 +253,10 @@ deleted integration stays readable.
 
 A replay requires an `Idempotency-Key` header (1 to 128 bytes): repeating the
 request with the same key returns the same new delivery, so a retried request
-never delivers twice. Only a finished delivery (`sent` or `failed`) can be
-replayed; the new delivery uses the integration's current URL, secret and
-headers, and the response names it in `delivery_id`.
+never delivers twice. Only a finished delivery (`sent` or `failed`) of an
+enabled integration can be replayed (a delivery in progress, or a disabled
+integration, answers `409`); the new delivery uses the integration's current
+URL, secret and headers, and the response names it in `delivery_id`.
 
 ### Legacy Endpoints
 `/api/v1/incidents/*` endpoints are aliased to `/api/v1/alert-groups/*` for backward compatibility.
