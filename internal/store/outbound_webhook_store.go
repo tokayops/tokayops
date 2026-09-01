@@ -3,7 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 
+	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
@@ -66,4 +69,123 @@ func admitWebhookTx(ctx context.Context, tx *sql.Tx, batch keys.WebhookBatch,
 		BatchID:   batchID,
 		IntentIDs: intentIDs,
 	}, nil
+}
+
+// FanOutNextEvent turns one pending event of the alert outbox into commitments
+// to its subscribers, in one transaction, and reports Found=false when nothing
+// is pending.
+//
+// The event is claimed with a row lock and nothing else - no lease, no
+// attempt counter. Fan-out makes no network calls, so a process that dies at any
+// point rolls the whole thing back and the event is pending for the next tick;
+// and under the lock exactly one fan-out ever reaches the door for one event,
+// which is why "existing" and "conflict" from the door are refused here as
+// contract violations rather than handled: they mean a second path to the door
+// exists, and that is fixed, not tolerated.
+//
+// The audience is read under FOR SHARE. Deleting or disabling a subscriber takes
+// FOR UPDATE on the same row, so whichever gets there first, the other waits,
+// and no live commitment to a subscriber that is gone can be left behind (D2,
+// package 3).
+//
+// An event this build cannot read - an event type it does not know, an empty
+// body - is refused with the event named and Refused set, and is left exactly
+// as it was. It holds the head of the queue until a person fixes the row: the
+// execution model builds no way around a damaged execution row, only a way to
+// see one.
+func (s *Store) FanOutNextEvent(ctx context.Context) (outbound.FanOutResult, error) {
+	policy, err := outbound.PolicyOf(outbound.FamilyWebhook)
+	if err != nil {
+		return outbound.FanOutResult{}, err
+	}
+	grammar, err := keys.CurrentGrammarVersion(keys.KindWebhookEvent)
+	if err != nil {
+		return outbound.FanOutResult{}, outboundContractf("%v", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return outbound.FanOutResult{}, err
+	}
+	defer tx.Rollback()
+	if err := setLockTimeoutTx(ctx, tx, s.lockTimeout); err != nil {
+		return outbound.FanOutResult{}, err
+	}
+
+	var eventID, teamID, eventType string
+	var body []byte
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, team_id, event_type, payload FROM event_outbox
+		WHERE status IN ('pending', 'processing')
+		ORDER BY created_at, id
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1`).Scan(&eventID, &teamID, &eventType, &body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return outbound.FanOutResult{}, tx.Commit()
+	}
+	if err != nil {
+		return outbound.FanOutResult{}, fmt.Errorf("claim an event to fan out: %w", err)
+	}
+	found := outbound.FanOutResult{Found: true, EventID: eventID}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM integrations
+		WHERE type = $1 AND enabled
+		  AND (scope = $2 OR (scope = $3 AND team_id = $4))
+		ORDER BY id
+		FOR SHARE`, model.IntegrationTypeGenericWebhook,
+		model.WebhookScopeGlobal, model.WebhookScopeTeam, teamID)
+	if err != nil {
+		return found, fmt.Errorf("resolve the audience of event %s: %w", eventID, err)
+	}
+	var audience []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return found, err
+		}
+		audience = append(audience, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return found, err
+	}
+
+	admitted, err := admitWebhookTx(ctx, tx, keys.WebhookBatch{
+		Kind:               keys.KindWebhookEvent,
+		EventID:            eventID,
+		EventType:          keys.WebhookEventType(eventType),
+		Body:               string(body),
+		IntegrationIDs:     audience,
+		Expiry:             policy.Expiry,
+		GrammarVersion:     grammar,
+		FingerprintVersion: keys.CurrentBatchFingerprintVersion(),
+	}, "fan-out")
+	if err != nil {
+		if errors.Is(err, ErrOutboundContract) {
+			found.Refused = true
+		}
+		return found, fmt.Errorf("event %s: %w", eventID, err)
+	}
+	if admitted.Outcome != outbound.SubmitCreated {
+		// Under the row lock nobody else reaches the door for this event, so
+		// its claim cannot already be held. That it is means a second path.
+		found.Refused = true
+		return found, outboundContractf(
+			"event %s is already admitted as %q under a lock that allows one fan-out",
+			eventID, admitted.Outcome)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE event_outbox SET status = $2 WHERE id = $1`,
+		eventID, model.OutboxEventStatusFannedOut); err != nil {
+		return found, fmt.Errorf("mark event %s fanned out: %w", eventID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return found, err
+	}
+	found.Outcome = admitted.Outcome
+	found.Commitments = len(admitted.IntentIDs)
+	return found, nil
 }

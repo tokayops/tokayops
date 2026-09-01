@@ -1141,7 +1141,10 @@ func TestBackoffGrowsWithTheStreak(t *testing.T) {
 		1: 2 * time.Second, 2: 4 * time.Second, 3: 8 * time.Second,
 		9: 5 * time.Minute, 100: 5 * time.Minute,
 	} {
-		got := outbound.Backoff(streak)
+		got, err := outbound.BackoffFor(outbound.FamilyNotification, streak)
+		if err != nil {
+			t.Fatalf("backoff for the paging family: %v", err)
+		}
 		if !within(got, base) {
 			t.Errorf("failure %d waits %s, want about %s", streak, got, base)
 		}

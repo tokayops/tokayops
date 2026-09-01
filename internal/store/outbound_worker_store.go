@@ -383,10 +383,14 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 		return nil, err
 	}
 
+	backoff, err := outbound.BackoffFor(intent.Family, intent.FailureStreak+1)
+	if err != nil {
+		return nil, outboundContractf("%v", err)
+	}
 	if err := applyTransitionTx(ctx, tx, transitionWrite{
 		Intent:          *intent,
 		Transition:      transition,
-		Backoff:         outbound.Backoff(intent.FailureStreak + 1),
+		Backoff:         backoff,
 		AppliedRevision: nullableRevision(attemptRevision),
 		Actor:           "recovery",
 		Reason:          "the lease expired with an attempt in flight",
@@ -895,10 +899,14 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 		return outbound.BeginAttemptResult{}, err
 	}
 
+	backoff, err := outbound.BackoffFor(intent.Family, intent.FailureStreak+1)
+	if err != nil {
+		return outbound.BeginAttemptResult{}, outboundContractf("%v", err)
+	}
 	if err := applyTransitionTx(ctx, tx, transitionWrite{
 		Intent:     intent,
 		Transition: transition,
-		Backoff:    outbound.Backoff(intent.FailureStreak + 1),
+		Backoff:    backoff,
 		Actor:      req.WorkerID,
 		Reason:     req.ErrorClass,
 	}); err != nil {
@@ -1223,10 +1231,14 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		settledReceipt, settledRef = nil, ""
 	}
 
+	backoff, err := outbound.BackoffFor(intent.Family, intent.FailureStreak+1)
+	if err != nil {
+		return outbound.FinalizeResult{}, outboundContractf("%v", err)
+	}
 	if err := applyTransitionTx(ctx, tx, transitionWrite{
 		Intent:          *intent,
 		Transition:      transition,
-		Backoff:         outbound.Backoff(intent.FailureStreak + 1),
+		Backoff:         backoff,
 		AppliedRevision: applied,
 		AttemptIsFinal:  final,
 		Receipt:         settledReceipt,

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
 // The notification family's execution policy: how long a lease lives, how long
@@ -25,6 +27,11 @@ import (
 const (
 	FamilyNotification = "notification"
 	FamilyHandoff      = "handoff"
+	// FamilyWebhook is the partition outgoing webhooks run in. Its own because
+	// the slot scheduler is fair by count and paging pays in time: a call to a
+	// subscriber that neither answers nor refuses holds a slot for the whole of
+	// its timeout, two orders of magnitude longer than a direct message.
+	FamilyWebhook = string(keys.FamilyWebhook)
 )
 
 const (
@@ -114,6 +121,31 @@ type Policy struct {
 	// holds. Spelled as the sum of what one commitment can take rather than as
 	// a number, because a number drifts.
 	ShutdownDeadline time.Duration
+
+	// ConfigReadBudget bounds the channel's own read of its configuration
+	// INSIDE an attempt, where one is needed: the webhook channel reads the
+	// subscriber's secret and timeout from the database before it posts. Zero
+	// for the families whose channels read nothing there. It is a separate
+	// context inside the attempt, not a share of it, so a slow read costs the
+	// read and never the subscriber's promised timeout.
+	ConfigReadBudget time.Duration
+
+	// MaxSubscriberTimeout is the longest HTTP timeout a subscriber may be
+	// given, and the third term the attempt deadline has to exceed. Zero for
+	// the families that have no subscribers.
+	MaxSubscriberTimeout time.Duration
+
+	// Expiry is how long a commitment of this family stays owed, measured from
+	// admission, where the family fixes that rather than the producer. Zero
+	// means the family does not: an escalation is withdrawn by an
+	// acknowledgement, a handover carries a deadline of its own shape.
+	Expiry time.Duration
+
+	// BackoffCap is where this family's retry curve stops growing. The curve
+	// is one; the ceiling is the family's, because what it costs to knock on a
+	// dead subscriber's door every five minutes for a day is not what it costs
+	// to knock on Slack's.
+	BackoffCap time.Duration
 }
 
 // PolicyOf is the closed set of families this build executes.
@@ -135,6 +167,7 @@ func PolicyOf(family string) (Policy, error) {
 			PrepareDeadline:  NotificationPrepareDeadline,
 			RecordDeadline:   NotificationRecordDeadline,
 			ShutdownDeadline: NotificationShutdownDeadline,
+			BackoffCap:       backoffCap,
 		}, nil
 	case FamilyHandoff:
 		return Policy{
@@ -146,6 +179,22 @@ func PolicyOf(family string) (Policy, error) {
 			PrepareDeadline:  HandoffPrepareDeadline,
 			RecordDeadline:   HandoffRecordDeadline,
 			ShutdownDeadline: HandoffShutdownDeadline,
+			BackoffCap:       backoffCap,
+		}, nil
+	case FamilyWebhook:
+		return Policy{
+			Family:               FamilyWebhook,
+			Lease:                WebhookLease,
+			AttemptDeadline:      WebhookAttemptDeadline,
+			PoolSize:             WebhookPoolSize,
+			ClaimInterval:        WebhookClaimInterval,
+			PrepareDeadline:      WebhookPrepareDeadline,
+			RecordDeadline:       WebhookRecordDeadline,
+			ShutdownDeadline:     WebhookShutdownDeadline,
+			ConfigReadBudget:     WebhookConfigReadBudget,
+			MaxSubscriberTimeout: WebhookMaxSubscriberTimeout,
+			Expiry:               WebhookExpiry,
+			BackoffCap:           WebhookBackoffCap,
 		}, nil
 	default:
 		return Policy{}, fmt.Errorf("outbound: %q is not a family this build executes", family)
@@ -193,6 +242,69 @@ const (
 		HandoffRecordDeadline + 10*time.Second
 )
 
+// The webhook family's numbers.
+//
+// Sized for the expensive case and not for the healthy one. Healthy webhook
+// traffic is trivial; what costs is a subscriber that neither answers nor
+// refuses - a black hole - holding a slot for the whole of its timeout. The
+// profile these numbers are computed against is in the gates (D4): up to 140
+// live commitments to dead addresses per instance, a burst of 80 due at once,
+// a slot held no longer than 31 seconds.
+const (
+	// WebhookLease is the old outbox worker's lease, kept: the chain of one
+	// commitment is 5 + 10 + 35 + 10 = 60 seconds and fits with room.
+	WebhookLease = 120 * time.Second
+
+	// WebhookMaxSubscriberTimeout is the longest a subscriber may be given to
+	// answer. The API refuses more; a value saved before the limit is clamped
+	// by the channel at every read before the call.
+	WebhookMaxSubscriberTimeout = 30 * time.Second
+
+	// WebhookConfigReadBudget bounds the channel's read of the subscriber's
+	// configuration inside the attempt, as its own context.
+	WebhookConfigReadBudget = 2 * time.Second
+
+	// WebhookAttemptDeadline is a SUM, and has to be: the read, the longest
+	// timeout a subscriber may have, and slack for the scheduling between them.
+	// Written as a number it would quietly promise the subscriber thirty
+	// seconds and deliver fewer whenever the read was slow, and a receiver
+	// answering on its 29th second would be cut off and recorded as doubt.
+	WebhookAttemptDeadline = WebhookConfigReadBudget + WebhookMaxSubscriberTimeout + 3*time.Second
+
+	// WebhookPoolSize is eight. Slots are shared by provider and this family
+	// has one, so all eight can go to one dead subscriber; that is accepted,
+	// and it is why the number is sized against the black-hole profile rather
+	// than against healthy traffic.
+	WebhookPoolSize = 8
+
+	// WebhookClaimInterval is the old outbox worker's. An event to a subscriber
+	// is not urgent the way a page is.
+	WebhookClaimInterval = 2 * time.Second
+
+	WebhookPrepareDeadline = NotificationPrepareDeadline
+	WebhookRecordDeadline  = NotificationRecordDeadline
+
+	// WebhookShutdownDeadline is the same sum as the others, over this family's
+	// numbers.
+	WebhookShutdownDeadline = WebhookPrepareDeadline +
+		WebhookRecordDeadline + WebhookAttemptDeadline +
+		WebhookRecordDeadline + 10*time.Second
+
+	// WebhookExpiry is how long an event stays owed to a subscriber. A day is a
+	// product decision: an alert event a day late tells the receiving system
+	// about an incident that is over, the subscriber has the REST API to
+	// recover from, and a day covers an ordinary maintenance window. It enters
+	// the fingerprint of every webhook commitment, so it is fixed here and not
+	// tuned later.
+	WebhookExpiry = 24 * time.Hour
+
+	// WebhookBackoffCap is where the retry curve stops for this family. Thirty
+	// minutes rather than the five of the others: a subscriber that is dead for
+	// a day would otherwise be knocked on some 270 times, holding a slot for
+	// its whole timeout each time. Not in the fingerprint; tunable.
+	WebhookBackoffCap = 30 * time.Minute
+)
+
 // OutboundLockTimeout bounds how long a point mutation waits for a row somebody
 // else is holding.
 //
@@ -219,16 +331,37 @@ const (
 	backoffStreakCap = 24
 )
 
-// Backoff is how long a commitment waits after its failure number `streak`.
+// BackoffFor is how long a commitment of a family waits after its failure
+// number `streak`.
 //
 //	1 -> 2s    4 -> 16s   7 -> 128s
 //	2 -> 4s    5 -> 32s   8 -> 256s
-//	3 -> 8s    6 -> 64s   9 and beyond -> 5m
+//	3 -> 8s    6 -> 64s   9 and beyond -> the family's ceiling
+//
+// The curve is one for every family; the ceiling is the family's (D4). At five
+// minutes it is reached from the ninth failure; at thirty, the curve keeps
+// doubling through 512 and 1024 seconds and the ceiling is reached from the
+// eleventh. A ceiling therefore moves the point of saturation too, which is
+// why the number of attempts a dead subscriber costs is taken by running this
+// function and not by a formula.
 //
 // The streak counts consecutive failures of the CURRENT effect and is cleared
 // by any success. The failures of an effect that has already happened have no
 // business slowing down the next one.
-func Backoff(streak int) time.Duration {
+//
+// A family this build does not know is refused rather than given the default
+// curve: the row that named it is a row nothing here understands.
+func BackoffFor(family string, streak int) (time.Duration, error) {
+	policy, err := PolicyOf(family)
+	if err != nil {
+		return 0, err
+	}
+	return backoffWith(policy.BackoffCap, streak, randomFraction()), nil
+}
+
+// backoffWith is the curve with the random half taken as an argument, so the
+// two edges of the jitter can be pinned in a test rather than sampled.
+func backoffWith(cap time.Duration, streak int, fraction float64) time.Duration {
 	if streak < 1 {
 		streak = 1
 	}
@@ -237,11 +370,11 @@ func Backoff(streak int) time.Duration {
 	}
 
 	raw := float64(backoffBase) * math.Pow(2, float64(streak-1))
-	if raw > float64(backoffCap) {
-		raw = float64(backoffCap)
+	if raw > float64(cap) {
+		raw = float64(cap)
 	}
 
-	spread := raw * backoffJitter * (2*randomFraction() - 1)
+	spread := raw * backoffJitter * (2*fraction - 1)
 	delay := time.Duration(raw + spread)
 	if delay < 0 {
 		delay = time.Duration(raw)
