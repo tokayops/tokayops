@@ -76,3 +76,22 @@ func newEffectDoor(kind keys.Kind) (effectDoor, error) {
 		return "", fmt.Errorf("outbound: %q is not a kind whose effects this build can restart", kind)
 	}
 }
+
+// CreateOperationOf is the verb a commitment's FIRST external effect is asked
+// for, by kind.
+//
+// A message is sent; an event is delivered. The verb travels into the journal
+// and into the operation label of the attempt metric, and "delivery to a
+// subscriber" against "a message to a person" is the difference that label
+// exists to show. A change to an existing message is never a first effect and
+// is decided elsewhere, from the state the change applies.
+func CreateOperationOf(kind keys.Kind) (Operation, error) {
+	switch kind {
+	case keys.KindEscalation, keys.KindEscalationReplay, keys.KindHandoff:
+		return OperationSend, nil
+	case keys.KindWebhookEvent, keys.KindWebhookReplay:
+		return OperationDeliver, nil
+	default:
+		return "", fmt.Errorf("outbound: %q is not a kind whose deliveries this build can name", kind)
+	}
+}

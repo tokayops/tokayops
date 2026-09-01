@@ -209,6 +209,14 @@ func contextMatchesKind(kind keys.Kind, form outbound.ContextForm) error {
 		want = outbound.ContextEscalation
 	case keys.KindHandoff:
 		want = outbound.ContextHandoff
+	case keys.KindWebhookEvent, keys.KindWebhookReplay:
+		// Not an omission and not a third context: the webhook family is
+		// admitted through doors of its own - the fan-out of an event and the
+		// replay of one - which derive the admission from its provenance
+		// inside the transaction. A ready-made admission arriving here is a
+		// caller on the wrong path, and it is told so by name.
+		return outboundContractf(
+			"a %q admission comes through the webhook family's own doors, not SubmitBatch", kind)
 	default:
 		return outboundContractf(
 			"an admission of kind %q, which this build does not admit", kind)
@@ -280,12 +288,12 @@ func admissionCarriesWhatItsKindHas(admission keys.Admission) error {
 				"an escalation admission at revision %d carrying the state of revision %d",
 				admission.Revision, content.Revision)
 		}
-	case keys.KindHandoff:
+	case keys.KindHandoff, keys.KindWebhookEvent, keys.KindWebhookReplay:
 		if hasGroup || hasState || hasSchema || admission.Revision != 0 {
 			return outboundContractf(
-				"a handover admission carrying an alert group's state: "+
+				"a %s admission carrying an alert group's state: "+
 					"group=%v snapshot=%v schema=%v revision=%d",
-				hasGroup, hasState, hasSchema, admission.Revision)
+				admission.Kind, hasGroup, hasState, hasSchema, admission.Revision)
 		}
 	default:
 		return outboundContractf(
@@ -1754,7 +1762,7 @@ func contentFormOf(kind keys.Kind) outbound.ContentForm {
 	switch kind {
 	case keys.KindEscalation, keys.KindEscalationReplay:
 		return outbound.ContentSnapshot
-	case keys.KindHandoff:
+	case keys.KindHandoff, keys.KindWebhookEvent, keys.KindWebhookReplay:
 		return outbound.ContentPayload
 	default:
 		return ""

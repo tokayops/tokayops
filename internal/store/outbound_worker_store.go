@@ -721,10 +721,14 @@ type plannedAttempt struct {
 // an attempt final would be able to retire a card the alert is still using.
 func planAttempt(intent outbound.Intent, content outbound.AttemptContent) (plannedAttempt, error) {
 	if !intent.HasReceipt {
-		return plannedAttempt{
-			Kind:      outbound.AttemptCreate,
-			Operation: outbound.OperationSend,
-		}, nil
+		// The verb of a first effect is the kind's: a message is sent, an
+		// event is delivered. Read from the row, not assumed - a webhook
+		// journalled as "send" would be counted with the pages.
+		operation, err := outbound.CreateOperationOf(intent.KeyKind)
+		if err != nil {
+			return plannedAttempt{}, outboundContractf("%v", err)
+		}
+		return plannedAttempt{Kind: outbound.AttemptCreate, Operation: operation}, nil
 	}
 	if intent.Form != outbound.FormEditable {
 		// Nothing brings a one-shot back with coordinates: it is done when it
@@ -751,9 +755,11 @@ func planAttempt(intent outbound.Intent, content outbound.AttemptContent) (plann
 // recorded as an update, and the kind carries what is actually true.
 func refusalShape(intent outbound.Intent) (plannedAttempt, error) {
 	if !intent.HasReceipt {
-		return plannedAttempt{
-			Kind: outbound.AttemptCreate, Operation: outbound.OperationSend,
-		}, nil
+		operation, err := outbound.CreateOperationOf(intent.KeyKind)
+		if err != nil {
+			return plannedAttempt{}, outboundContractf("%v", err)
+		}
+		return plannedAttempt{Kind: outbound.AttemptCreate, Operation: operation}, nil
 	}
 	if intent.Form != outbound.FormEditable {
 		return plannedAttempt{}, outboundContractf(
