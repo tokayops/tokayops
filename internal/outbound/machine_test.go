@@ -2,7 +2,10 @@ package outbound
 
 import (
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
 // The machine is checked twice over: a table of named rows that says what each
@@ -44,6 +47,7 @@ func sendingIntent() Intent {
 	return Intent{
 		ID:              "intent-1",
 		AlertGroupID:    "ag-1",
+		KeyKind:         keys.KindEscalation,
 		Provider:        "slack",
 		Form:            FormOneShot,
 		CompletionMode:  CompletionOnAcceptance,
@@ -693,3 +697,56 @@ func knownStatus(s Status) bool {
 // revisionOf is the revision an attempt applied, as the machine takes it: a
 // pointer, so "applied none" and "applied revision zero" stay apart.
 func revisionOf(value int64) *int64 { return &value }
+
+// TestAWebhookCommitmentHasOneDoorToANewEffect. An operator's retry, of either
+// generation, is refused for the webhook kinds from every state it is allowed
+// for an escalation - and refused for THAT reason, before anything about
+// deadlines or duplicate risk, so the operator is told the real one. Cancel is
+// untouched: it starts nothing.
+func TestAWebhookCommitmentHasOneDoorToANewEffect(t *testing.T) {
+	for _, kind := range []keys.Kind{keys.KindWebhookEvent, keys.KindWebhookReplay} {
+		for _, status := range []Status{StatusManualReview, StatusPermanentFailed, StatusExpired} {
+			for _, decision := range []Decision{DecisionRetryNewGeneration, DecisionRetryCurrentGeneration} {
+				i := sendingIntent()
+				i.KeyKind = kind
+				i.Status = status
+				// Every other guard satisfied, so the refusal can only be the door.
+				in := Input{Intent: i, Trigger: TriggerOperator, Decision: decision,
+					LastAttemptKind: AttemptCreate, NewExpiryProvided: true}
+				_, err := Decide(in)
+				if !errors.Is(err, ErrInvalidTransition) {
+					t.Fatalf("%s %s %s: %v", kind, status, decision, err)
+				}
+				if !strings.Contains(err.Error(), "replay") {
+					t.Fatalf("%s %s %s refused for the wrong reason: %v", kind, status, decision, err)
+				}
+			}
+		}
+
+		// The same input for an escalation goes through: the door is the kind's.
+		i := sendingIntent()
+		i.Status = StatusPermanentFailed
+		if _, err := Decide(Input{Intent: i, Trigger: TriggerOperator,
+			Decision: DecisionRetryNewGeneration, LastAttemptKind: AttemptCreate}); err != nil {
+			t.Fatalf("an escalation's operator retry was refused: %v", err)
+		}
+
+		// Cancel is not a new effect and stays open to the webhook kinds.
+		w := sendingIntent()
+		w.KeyKind = kind
+		w.Status = StatusPermanentFailed
+		got, err := Decide(Input{Intent: w, Trigger: TriggerOperator, Decision: DecisionCancel})
+		if err != nil || got.To != StatusCanceled || got.Row != "T30" {
+			t.Fatalf("cancel on a webhook commitment: %+v %v", got, err)
+		}
+	}
+
+	// A kind nobody knows is refused too, not waved through.
+	u := sendingIntent()
+	u.KeyKind = keys.Kind("something_newer")
+	u.Status = StatusPermanentFailed
+	if _, err := Decide(Input{Intent: u, Trigger: TriggerOperator,
+		Decision: DecisionRetryNewGeneration, LastAttemptKind: AttemptCreate}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("an unknown kind was retried: %v", err)
+	}
+}

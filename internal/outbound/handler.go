@@ -233,6 +233,12 @@ const (
 	// BreachDetailNotAllowed: the channel stated something about the object
 	// that its answer does not prove, or that is not a channel's to state.
 	BreachDetailNotAllowed Breach = "detail_not_allowed"
+
+	// BreachUnknownKind: the call carried a kind of claim this build cannot
+	// judge acceptances for. Not a channel's fault, and not a delivery
+	// problem either - a row from another version of this system - but the
+	// answer is doubt for the same reason every other unknown is.
+	BreachUnknownKind Breach = "unknown_kind"
 )
 
 // Conclusion is what one attempt concluded: the answer the protocol
@@ -280,6 +286,13 @@ type ConclusionInput struct {
 	Class   string
 	Status  string
 
+	// KeyKind is what sort of claim the attempt was for. It decides one thing
+	// here: whether an acceptance that names no object is a contradiction (a
+	// message has coordinates) or the normal shape of success (a POST has
+	// none). Read only on that path, so a conclusion that names its object
+	// needs no kind to be valid.
+	KeyKind keys.Kind
+
 	// Receipt is what THIS call produced, and it is what gets stored about the
 	// attempt. A change to an existing message usually produces nothing.
 	Receipt Receipt
@@ -315,8 +328,14 @@ func NewConclusion(in ConclusionInput) (Conclusion, error) {
 		in.ReceiptRef = in.Receipt.Ref()
 	}
 	if in.Outcome == OutcomeAccepted && in.ReceiptRef == "" {
-		return Conclusion{}, fmt.Errorf(
-			"outbound: an acceptance naming no message is one nothing can find again")
+		names, err := AcceptanceNamesObject(in.KeyKind)
+		if err != nil {
+			return Conclusion{}, err
+		}
+		if names {
+			return Conclusion{}, fmt.Errorf(
+				"outbound: an acceptance naming no message is one nothing can find again")
+		}
 	}
 
 	completion := keys.Completion{Outcome: in.Outcome}
@@ -404,11 +423,20 @@ func Conclude(h Handler, call Call, res Result, err error) (Conclusion, Breach) 
 					string(BreachMutationRetargeted), BreachMutationRetargeted
 			}
 		default:
-			// An acceptance has to say what it made. "Yes, and I will not tell
-			// you where" leaves a message nothing can find, update or resolve -
-			// and leaves the commitment looking unsent, so the next revision
-			// would make a second one beside it.
-			if !receipt.Recorded() {
+			// Whether an acceptance has to say what it made is the KIND's to
+			// answer, and it is asked here first because this is the first of
+			// the three places the rule lives - and the one that does not refuse
+			// but quietly changes the outcome. For a message, "yes, and I will
+			// not tell you where" leaves one nothing can find, update or
+			// resolve, and the commitment looking unsent, so the next revision
+			// would make a second beside it. For a POST there is nothing to
+			// name, and demanding it would turn every delivery into doubt.
+			names, err := AcceptanceNamesObject(call.KeyKind)
+			switch {
+			case err != nil:
+				outcome, class, breach = OutcomeAmbiguous,
+					string(BreachUnknownKind), BreachUnknownKind
+			case names && !receipt.Recorded():
 				outcome, class, breach = OutcomeAmbiguous,
 					string(BreachAcceptanceWithoutReceipt), BreachAcceptanceWithoutReceipt
 			}
@@ -437,7 +465,7 @@ func Conclude(h Handler, call Call, res Result, err error) (Conclusion, Breach) 
 	// coordinates, it was aimed at them. Keeping the two apart is the store's
 	// job, and it has the attempt kind to do it with.
 	concluded, buildErr := NewConclusion(ConclusionInput{
-		Outcome: outcome, Class: class, Status: res.Status,
+		Outcome: outcome, Class: class, Status: res.Status, KeyKind: call.KeyKind,
 		Receipt: receipt, ReceiptRef: ref, Detail: detail,
 		Summary: Summarise(res.Summary, err),
 	})
@@ -447,7 +475,7 @@ func Conclude(h Handler, call Call, res Result, err error) (Conclusion, Breach) 
 		// other, doubt is the answer that costs least.
 		concluded, _ = NewConclusion(ConclusionInput{
 			Outcome: OutcomeAmbiguous, Class: string(BreachUnknownOutcome),
-			Status: res.Status, Summary: Summarise(res.Summary, err),
+			Status: res.Status, KeyKind: call.KeyKind, Summary: Summarise(res.Summary, err),
 		})
 		return concluded, BreachUnknownOutcome
 	}

@@ -374,13 +374,15 @@ func TestASummaryIsTruncatedWhereverItComesFrom(t *testing.T) {
 
 // createCall is what most of these are about: making a message, with nothing
 // out there yet.
-func createCall() Call { return Call{AttemptKind: AttemptCreate, Operation: OperationSend} }
+func createCall() Call {
+	return Call{AttemptKind: AttemptCreate, Operation: OperationSend, KeyKind: keys.KindEscalation}
+}
 
 // mutationCall is a change to a message that exists, named by the channel that
 // made it.
 func mutationCall(ref string) Call {
 	return Call{
-		AttemptKind: AttemptMutation, Operation: OperationUpdate,
+		AttemptKind: AttemptMutation, Operation: OperationUpdate, KeyKind: keys.KindEscalation,
 		Receipt:    []byte(`{"channel_id":"C0001","timestamp":"100.200"}`),
 		ReceiptRef: ref,
 	}
@@ -549,4 +551,73 @@ func sameDetail(got, want *keys.ProviderResultDetail) bool {
 		return got == want
 	}
 	return *got == *want
+}
+
+// TestWhetherAnAcceptanceNamesAnObjectIsTheKindsToSay is the first of the three
+// places the rule lives, and the one that quietly changes the outcome rather
+// than refusing: a webhook acceptance with no receipt is a success, an
+// escalation's or a handover's is a breach recorded as doubt, and a kind this
+// build cannot judge is doubt of its own kind. Through Conclude, because a test
+// that called the constructor would never reach this place.
+func TestWhetherAnAcceptanceNamesAnObjectIsTheKindsToSay(t *testing.T) {
+	accepting := &wilfulHandler{outcome: OutcomeAccepted, known: true}
+	made := mustReceipt("C0001/100.200", `{"channel_id":"C0001","timestamp":"100.200"}`)
+
+	cases := []struct {
+		name    string
+		kind    keys.Kind
+		got     Receipt
+		outcome Outcome
+		breach  Breach
+		ref     string
+	}{
+		{name: "a webhook POST accepted, nothing to name", kind: keys.KindWebhookEvent,
+			outcome: OutcomeAccepted, breach: BreachNone},
+		{name: "a webhook replay accepted, nothing to name", kind: keys.KindWebhookReplay,
+			outcome: OutcomeAccepted, breach: BreachNone},
+		{name: "a webhook that named something anyway keeps it", kind: keys.KindWebhookEvent,
+			got: made, outcome: OutcomeAccepted, breach: BreachNone, ref: "C0001/100.200"},
+		{name: "an escalation accepted without coordinates", kind: keys.KindEscalation,
+			outcome: OutcomeAmbiguous, breach: BreachAcceptanceWithoutReceipt},
+		{name: "a re-admitted escalation accepted without coordinates", kind: keys.KindEscalationReplay,
+			outcome: OutcomeAmbiguous, breach: BreachAcceptanceWithoutReceipt},
+		{name: "a handover accepted without coordinates", kind: keys.KindHandoff,
+			outcome: OutcomeAmbiguous, breach: BreachAcceptanceWithoutReceipt},
+		{name: "a kind this build cannot judge", kind: keys.Kind("something_newer"),
+			outcome: OutcomeAmbiguous, breach: BreachUnknownKind},
+		{name: "no kind at all", kind: "",
+			outcome: OutcomeAmbiguous, breach: BreachUnknownKind},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			call := createCall()
+			call.KeyKind = tc.kind
+			concluded, breach := Conclude(accepting, call,
+				Result{Evidence: ProviderResponse, Status: "200", Receipt: tc.got}, nil)
+			if concluded.Outcome() != tc.outcome {
+				t.Errorf("concluded %q, want %q", concluded.Outcome(), tc.outcome)
+			}
+			if breach != tc.breach {
+				t.Errorf("breach %q, want %q", breach, tc.breach)
+			}
+			if ref := concluded.Completion().ReceiptRefOrEmpty(); ref != tc.ref {
+				t.Errorf("the conclusion names %q, want %q", ref, tc.ref)
+			}
+		})
+	}
+
+	// The second place, the constructor, answers the same way - and only asks
+	// the kind on the one path where it matters.
+	if _, err := NewConclusion(ConclusionInput{Outcome: OutcomeAccepted, KeyKind: keys.KindWebhookEvent}); err != nil {
+		t.Fatalf("a webhook acceptance with nothing to name was refused: %v", err)
+	}
+	if _, err := NewConclusion(ConclusionInput{Outcome: OutcomeAccepted, KeyKind: keys.KindEscalation}); err == nil {
+		t.Fatal("an escalation acceptance with nothing to name was built")
+	}
+	if _, err := NewConclusion(ConclusionInput{Outcome: OutcomeAccepted}); err == nil {
+		t.Fatal("an acceptance with nothing to name and no kind was built")
+	}
+	if _, err := NewConclusion(ConclusionInput{Outcome: OutcomeAccepted, ReceiptRef: "C0001/1"}); err != nil {
+		t.Fatalf("an acceptance that names its object needs no kind, got: %v", err)
+	}
 }

@@ -606,6 +606,9 @@ func operatorCancel(in Input) (Transition, error) {
 }
 
 func operatorRetryCurrent(in Input) (Transition, error) {
+	if err := throughResolveAmbiguity(in); err != nil {
+		return Transition{}, err
+	}
 	if in.Intent.Status == StatusExpired && !in.NewExpiryProvided {
 		// Without a fresh deadline the first claim would expire it again, and
 		// the command would be a no-op an operator repeats forever.
@@ -628,6 +631,9 @@ func operatorRetryCurrent(in Input) (Transition, error) {
 }
 
 func operatorRetryNew(in Input) (Transition, error) {
+	if err := throughResolveAmbiguity(in); err != nil {
+		return Transition{}, err
+	}
 	if in.LastAttemptKind != AttemptCreate && !in.ResourceLossConfirmed {
 		// A new external object may only replace one that was never created or
 		// is known to be gone. Otherwise the old one stays behind, unowned.
@@ -658,6 +664,26 @@ func operatorRetryNew(in Input) (Transition, error) {
 		},
 		Row: row,
 	}, nil
+}
+
+// throughResolveAmbiguity is the first guard of both operator retries: this
+// commitment's kind has to be one whose door to a new effect is this command.
+//
+// First, before the guards about deadlines and duplicate risk, because a kind
+// with another door must be told that and nothing else - an operator refused
+// for "no new deadline" would supply one and be refused again for the real
+// reason. A webhook commitment is retried by replay, which makes a new
+// commitment; reviving this one would be a second live delivery beside it.
+func throughResolveAmbiguity(in Input) error {
+	door, err := newEffectDoor(in.Intent.KeyKind)
+	if err != nil {
+		return invalidf("%v", err)
+	}
+	if door != doorResolveAmbiguity {
+		return invalidf("a %s commitment is not retried by an operator; its door to a new effect is %s",
+			in.Intent.KeyKind, door)
+	}
+	return nil
 }
 
 // rowFor picks between the one-shot and the editable line of the same decision.

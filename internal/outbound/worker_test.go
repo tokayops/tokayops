@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"log"
 	"os"
 	"strings"
@@ -17,6 +16,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/tokayops/tokayops/internal/metrics"
+
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
 // What the worker is responsible for is arithmetic and order: it takes exactly
@@ -132,7 +133,8 @@ func (f *fakeStore) ClaimDueIntents(_ context.Context, req ClaimRequest) ([]Leas
 		f.nextID++
 		leased = append(leased, Leased{
 			Intent: Intent{
-				ID: fmt.Sprintf("intent-%d", f.nextID), Provider: req.Provider,
+				KeyKind: keys.KindEscalation,
+				ID:      fmt.Sprintf("intent-%d", f.nextID), Provider: req.Provider,
 				Status: StatusPending, AlertGroupID: "ag-1",
 			},
 			LeaseToken:  fmt.Sprintf("token-%d", f.nextID),
@@ -460,7 +462,7 @@ func TestAStoppingWorkerStillRecordsWhatHappened(t *testing.T) {
 	go func() {
 		defer close(done)
 		w.serve(ctx, Leased{
-			Intent:     Intent{ID: "intent-1", Provider: "slack", Status: StatusPending},
+			Intent:     Intent{ID: "intent-1", KeyKind: keys.KindEscalation, Provider: "slack", Status: StatusPending},
 			LeaseToken: "token-1",
 		})
 	}()
@@ -694,7 +696,8 @@ func TestTheAttemptLogSaysWhatHappenedWithoutSayingWhatWasSent(t *testing.T) {
 	w := testWorker(store, map[string]Channel{"slack": channel})
 	w.serve(context.Background(), Leased{
 		Intent: Intent{
-			ID: "intent-7", Provider: "slack", Status: StatusPending,
+			KeyKind: keys.KindEscalation,
+			ID:      "intent-7", Provider: "slack", Status: StatusPending,
 			AlertGroupID: "ag-1", GenerationNo: 2,
 		},
 		LeaseToken: "token-7",

@@ -990,15 +990,16 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		intentToken     sql.NullString
 	)
 	var attemptKind string
+	var keyKind keys.Kind
 	if err := tx.QueryRowContext(ctx, `
 		SELECT a.lease_token, a.finished_at, a.finish_reason, a.completion_fingerprint,
 		       a.applied_revision, COALESCE(a.completion_fingerprint_version, 0),
-		       a.attempt_kind, i.current_attempt_id, i.lease_token
+		       a.attempt_kind, i.current_attempt_id, i.lease_token, i.key_kind
 		FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
 		WHERE a.id = $1`, req.AttemptID).
 		Scan(&attemptToken, &finishedAt, &finishReason, &storedPrint,
 			&attemptRevision, &attemptVersion, &attemptKind, &currentAttempt,
-			&intentToken); err != nil {
+			&intentToken, &keyKind); err != nil {
 		return outbound.FinalizeResult{}, err
 	}
 
@@ -1067,8 +1068,17 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	}
 	if concluded.Outcome == keys.OutcomeAccepted &&
 		attemptKind == string(outbound.AttemptCreate) && len(receipt) == 0 {
-		return outbound.FinalizeResult{}, outboundContractf(
-			"attempt %s created something and did not say what", req.AttemptID)
+		// The third of the three places this rule lives, asked of the kind
+		// read off the row: a message that was made has coordinates, a POST
+		// that was accepted has none to give.
+		names, err := outbound.AcceptanceNamesObject(keyKind)
+		if err != nil {
+			return outbound.FinalizeResult{}, outboundContractf("attempt %s: %v", req.AttemptID, err)
+		}
+		if names {
+			return outbound.FinalizeResult{}, outboundContractf(
+				"attempt %s created something and did not say what", req.AttemptID)
+		}
 	}
 
 	// The result is completed from the attempt's own row before anything is

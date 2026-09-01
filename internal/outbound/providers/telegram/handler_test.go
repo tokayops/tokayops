@@ -243,7 +243,7 @@ func TestAnAcceptanceThatNamesNothingIsDoubt(t *testing.T) {
 			}
 
 			concluded, breach := outbound.Conclude(handler,
-				outbound.Call{AttemptKind: outbound.AttemptCreate}, result, err)
+				outbound.Call{AttemptKind: outbound.AttemptCreate, KeyKind: keys.KindEscalation}, result, err)
 			if concluded.Outcome() != outbound.OutcomeAmbiguous {
 				t.Fatalf("an acceptance naming nothing concluded %q", concluded.Outcome())
 			}
@@ -534,7 +534,7 @@ func TestARedirectIsAnAnswerNotADeadEnd(t *testing.T) {
 		t.Fatalf("a message that may exist was recorded as never sent: %+v", result)
 	}
 
-	concluded, _ := outbound.Conclude(handler, outbound.Call{AttemptKind: outbound.AttemptCreate}, result, err)
+	concluded, _ := outbound.Conclude(handler, outbound.Call{AttemptKind: outbound.AttemptCreate, KeyKind: keys.KindEscalation}, result, err)
 	if concluded.Outcome() != outbound.OutcomeAmbiguous {
 		t.Fatalf("a redirect concluded %q", concluded.Outcome())
 	}
