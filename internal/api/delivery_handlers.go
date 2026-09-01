@@ -105,7 +105,9 @@ func (a *API) GetDeliveryDetail(c echo.Context) error {
 // configuration. The Idempotency-Key names the operator's decision: a repeat of
 // the request with the same key finds the same new delivery and gets the same
 // answer. A delivery still in progress is not replayed - a second live one
-// beside it would reach the subscriber twice for certain.
+// beside it would reach the subscriber twice for certain - and neither is
+// anything to a subscriber that is switched off: the switch withdrew its work,
+// and a replay would give it back.
 func (a *API) ReplayDelivery(c echo.Context) error {
 	integrationID := c.Param("id")
 	deliveryID := c.Param("deliveryId")
@@ -125,6 +127,8 @@ func (a *API) ReplayDelivery(c echo.Context) error {
 		return c.JSON(http.StatusNotFound, ErrorResponse{Error: "delivery not found"})
 	case errors.Is(err, store.ErrWebhookDeliveryNotTerminal):
 		return c.JSON(http.StatusConflict, ErrorResponse{Error: "delivery is already in progress"})
+	case errors.Is(err, store.ErrWebhookSubscriberDisabled):
+		return c.JSON(http.StatusConflict, ErrorResponse{Error: "integration is disabled; enable it to replay"})
 	case errors.Is(err, store.ErrIntegrationBusy):
 		return c.JSON(http.StatusConflict, ErrorResponse{Error: "integration is being changed by another request, try again"})
 	case err != nil:

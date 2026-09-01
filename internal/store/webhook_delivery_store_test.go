@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -343,4 +344,120 @@ func TestOperatorRetriesAreRefusedForWebhookCommitments(t *testing.T) {
 		AND target_ref = $1 AND status IN ('pending', 'sending', 'manual_review')`, id).Scan(&live); err != nil || live != 1 {
 		t.Fatalf("%d live commitments after the replay (%v), want exactly the replay", live, err)
 	}
+}
+
+// TestAReplayToASwitchedOffSubscriberIsRefused: switching a subscriber off
+// withdrew what it was owed, and what was withdrawn is terminal - so it can be
+// asked for again, and a replay that obliged would hand the work back through
+// the other door and the channel, which does not look at the switch, would
+// deliver it. Refused while the subscriber is off; allowed again once it is on.
+// And a commitment addressed to something that is not a webhook subscriber has
+// no replay at all.
+func TestAReplayToASwitchedOffSubscriberIsRefused(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+	id := subscriber(t, s, "hooks", model.WebhookScopeGlobal, "", true)
+	fannedOut(t, s)
+	fannedOut(t, s)
+	owed := commitmentsOwedTo(t, s, id)
+	ended(t, s, owed[0].ID, outbound.StatusSucceeded)
+	off, on := false, true
+
+	change, err := s.UpdateIntegration(ctx, id, IntegrationPatch{Enabled: &off}, "nina")
+	if err != nil || change.Withdrawn != 1 {
+		t.Fatalf("the switch answered %+v (%v)", change, err)
+	}
+	// The exact path: the withdrawn commitment is canceled, which is terminal,
+	// and the delivered one is too. Neither may be replayed now.
+	for _, original := range owed {
+		if _, err := replay(s, id, original.ID, "k-off-"+original.ID); !errors.Is(err, ErrWebhookSubscriberDisabled) {
+			t.Fatalf("a replay to a switched-off subscriber answered %v", err)
+		}
+	}
+	if got := commitmentsOwedTo(t, s, id); len(got) != 2 {
+		t.Fatalf("a refused replay made a commitment: %+v", got)
+	}
+
+	if _, err := s.UpdateIntegration(ctx, id, IntegrationPatch{Enabled: &on}, "nina"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := replay(s, id, owed[1].ID, "k-on")
+	if err != nil || result.Outcome != outbound.SubmitCreated {
+		t.Fatalf("a replay to the subscriber switched back on answered %+v (%v)", result, err)
+	}
+
+	// Not a subscriber: an integration of another type, named by a commitment
+	// through the door. The replay route has nothing for it.
+	slackCfg, _ := json.Marshal(model.SlackConfig{Token: "xoxb-1"})
+	slack := &model.Integration{Type: model.IntegrationTypeSlack, Name: "slack", Enabled: true, Config: slackCfg}
+	if err := s.CreateIntegration(slack); err != nil {
+		t.Fatal(err)
+	}
+	misaddressed, err := admitWebhook(t, s, webhookBatch(keys.KindWebhookEvent, "evt-slack", slack.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended(t, s, misaddressed.IntentIDs[0], outbound.StatusSucceeded)
+	if _, err := replay(s, slack.ID, misaddressed.IntentIDs[0], "k-slack"); !errors.Is(err, ErrWebhookDeliveryNotFound) {
+		t.Fatalf("a replay to an integration that is not a subscriber answered %v", err)
+	}
+}
+
+// TestReplayAndDisablingLeaveNoLiveCommitmentInEitherOrder: the replay reads
+// the subscriber FOR SHARE, the switch takes FOR UPDATE. Replay first: the
+// switch waits, is refused past its timeout, and its repeat withdraws the
+// replay's commitment. Switch first: the replay is refused.
+func TestReplayAndDisablingLeaveNoLiveCommitmentInEitherOrder(t *testing.T) {
+	off := false
+	t.Run("the replay wins", func(t *testing.T) {
+		s := setupTestDB(t)
+		s.lockTimeout = 300 * time.Millisecond
+		id := subscriber(t, s, "hooks", model.WebhookScopeGlobal, "", true)
+		eventID := fannedOut(t, s)
+		original := onlyOne(t, commitmentsOwedTo(t, s, id))
+		ended(t, s, original.ID, outbound.StatusSucceeded)
+
+		ctx := context.Background()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, `SELECT enabled FROM integrations WHERE id = $1 FOR SHARE`, id); err != nil {
+			t.Fatal(err)
+		}
+		batch := webhookBatch(keys.KindWebhookReplay, eventID, id)
+		batch.ClientRequestID = "k-race"
+		if _, err := admitWebhookTx(ctx, tx, batch, "nina"); err != nil {
+			t.Fatalf("admit the replay under the lock: %v", err)
+		}
+
+		if _, err := s.UpdateIntegration(ctx, id, IntegrationPatch{Enabled: &off}, "nina"); !errors.Is(err, ErrIntegrationBusy) {
+			tx.Rollback()
+			t.Fatalf("a switch against a replay in progress answered %v, want busy", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		change, err := s.UpdateIntegration(ctx, id, IntegrationPatch{Enabled: &off}, "nina")
+		if err != nil || change.Withdrawn != 1 {
+			t.Fatalf("the repeated switch: %+v (%v), want the replay's commitment withdrawn", change, err)
+		}
+		noLiveCommitment(t, s, id)
+	})
+	t.Run("the switch wins", func(t *testing.T) {
+		s := setupTestDB(t)
+		id := subscriber(t, s, "hooks", model.WebhookScopeGlobal, "", true)
+		fannedOut(t, s)
+		original := onlyOne(t, commitmentsOwedTo(t, s, id))
+		ended(t, s, original.ID, outbound.StatusSucceeded)
+		if _, err := s.UpdateIntegration(context.Background(), id, IntegrationPatch{Enabled: &off}, "nina"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := replay(s, id, original.ID, "k-late"); !errors.Is(err, ErrWebhookSubscriberDisabled) {
+			t.Fatalf("a replay after the switch answered %v", err)
+		}
+		if got := commitmentsOwedTo(t, s, id); len(got) != 1 {
+			t.Fatalf("a switched-off subscriber was promised %+v", got)
+		}
+	})
 }

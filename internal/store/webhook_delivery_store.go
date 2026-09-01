@@ -31,6 +31,12 @@ var (
 	// worked on: a second live commitment beside it would be a guaranteed
 	// duplicate, not a probable one.
 	ErrWebhookDeliveryNotTerminal = errors.New("webhook delivery is still in progress")
+	// ErrWebhookSubscriberDisabled is a replay to a subscriber that is switched
+	// off. Switching it off withdrew what it was owed, and what was withdrawn
+	// is terminal - so it can be asked for again, and a replay that obliged
+	// would hand the work back through the other door. "Off" means "do not
+	// send" at every door.
+	ErrWebhookSubscriberDisabled = errors.New("webhook subscriber is disabled")
 )
 
 // WebhookReplayRequest is one operator asking for one event to be delivered to
@@ -274,11 +280,13 @@ func nullable(s sql.NullString) *string {
 // a payload swapped on the row, which an attempt would refuse, would be
 // legitimised by a fresh digest on a fresh commitment and go out.
 //
-// The subscriber is read FOR SHARE, like the fan-out reads its audience:
-// deletion takes FOR UPDATE on the same row, so a replay that read a living
-// subscriber cannot commit after the deletion did - the deletion waits, and
-// then withdraws the new commitment too. A deleted subscriber is not found;
-// the tombstone lets its history be read and lets nothing be made for it.
+// The subscriber is read FOR SHARE, like the fan-out reads its audience, and
+// it has to be a webhook subscriber that is switched on. Deletion and
+// disabling take FOR UPDATE on the same row, so a replay that read a living,
+// enabled subscriber cannot commit after either did - the command waits, and
+// then withdraws the new commitment too. A deleted subscriber is not found; the
+// tombstone lets its history be read and lets nothing be made for it. A
+// switched-off one is refused: what the switch withdrew stays withdrawn.
 func (s *Store) ReplayWebhookDelivery(ctx context.Context, req WebhookReplayRequest) (WebhookReplayResult, error) {
 	policy, err := outbound.PolicyOf(outbound.FamilyWebhook)
 	if err != nil {
@@ -323,14 +331,17 @@ func (s *Store) ReplayWebhookDelivery(ctx context.Context, req WebhookReplayRequ
 		return WebhookReplayResult{}, outboundContractf("the payload of %s: %v", original.ID, err)
 	}
 
-	var subscriber string
-	err = tx.QueryRowContext(ctx, `SELECT id FROM integrations WHERE id = $1 FOR SHARE`,
-		req.IntegrationID).Scan(&subscriber)
+	var enabled bool
+	err = tx.QueryRowContext(ctx, `SELECT enabled FROM integrations WHERE id = $1 AND type = $2 FOR SHARE`,
+		req.IntegrationID, model.IntegrationTypeGenericWebhook).Scan(&enabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WebhookReplayResult{}, ErrWebhookDeliveryNotFound
 	}
 	if err != nil {
 		return WebhookReplayResult{}, busyOr(err)
+	}
+	if !enabled {
+		return WebhookReplayResult{}, ErrWebhookSubscriberDisabled
 	}
 
 	admitted, err := admitWebhookTx(ctx, tx, keys.WebhookBatch{

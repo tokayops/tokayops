@@ -18,6 +18,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/api"
 	"github.com/tokayops/tokayops/internal/auth"
+	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -75,6 +76,21 @@ func (e *webhookEnv) call(t *testing.T, method, path string, headers map[string]
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	rec := httptest.NewRecorder()
+	e.e.ServeHTTP(rec, req)
+	return rec
+}
+
+// callJSON is one authenticated request with a JSON body.
+func (e *webhookEnv) callJSON(t *testing.T, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	token, err := auth.GenerateToken(e.admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(&http.Cookie{Name: api.AuthCookieName, Value: token})
 	rec := httptest.NewRecorder()
 	e.e.ServeHTTP(rec, req)
 	return rec
@@ -898,5 +914,50 @@ func TestADeadSubscriberStaysOwedAndIsRetriedOnTheCurve(t *testing.T) {
 	ceiling := (outbound.WebhookBackoffCap + outbound.WebhookBackoffCap/5).Seconds()
 	if wait <= 0 || wait > ceiling {
 		t.Fatalf("the next attempt is %.0fs away; want within the 30 minute ceiling and its jitter", wait)
+	}
+}
+
+// TestAReplayToASwitchedOffSubscriberIsRefusedThroughTheAPI: the switch is a
+// PUT, the replay a POST, and between them the subscriber is called exactly
+// once more - after it is switched back on.
+func TestAReplayToASwitchedOffSubscriberIsRefusedThroughTheAPI(t *testing.T) {
+	// The switch goes through the API, which checks the subscriber's URL
+	// against the HTTPS policy; the receiver here is plain HTTP on loopback.
+	t.Setenv(config.WebhookAllowHTTPEnv, "true")
+	env := setupWebhookEnv(t)
+	rec := &receiver{}
+	rec.status.Store(http.StatusOK)
+	subscriber := env.subscribe(t, rec.serve(t).URL)
+	env.event(t)
+	env.deliverOnce(t)
+	original := env.deliveries(t, subscriber).Deliveries[0]
+	if original.Status != model.OutboxDeliverySent {
+		t.Fatalf("the original is %s", original.Status)
+	}
+
+	if r := env.callJSON(t, http.MethodPut, "/api/v1/integrations/"+subscriber, `{"enabled":false}`); r.Code != http.StatusOK {
+		t.Fatalf("switch off: %d %s", r.Code, r.Body.String())
+	}
+	r := env.replay(t, subscriber, original.ID, "press-1")
+	if r.Code != http.StatusConflict || !strings.Contains(r.Body.String(), "disabled") {
+		t.Fatalf("a replay to a switched-off subscriber answered %d %s", r.Code, r.Body.String())
+	}
+	if env.rowsOwedTo(t, subscriber) != 1 {
+		t.Fatal("a refused replay made a delivery")
+	}
+	env.deliverOnce(t)
+	if rec.calls.Load() != 1 {
+		t.Fatalf("a switched-off subscriber was called: %d calls", rec.calls.Load())
+	}
+
+	if r := env.callJSON(t, http.MethodPut, "/api/v1/integrations/"+subscriber, `{"enabled":true}`); r.Code != http.StatusOK {
+		t.Fatalf("switch on: %d %s", r.Code, r.Body.String())
+	}
+	if r := env.replay(t, subscriber, original.ID, "press-2"); r.Code != http.StatusOK {
+		t.Fatalf("a replay after switching back on answered %d %s", r.Code, r.Body.String())
+	}
+	env.deliverOnce(t)
+	if rec.calls.Load() != 2 {
+		t.Fatalf("the replay after switching back on: %d calls, want 2", rec.calls.Load())
 	}
 }

@@ -241,6 +241,7 @@ func TestAReplayNeedsAKeyAndAnswersWithTheNewDelivery(t *testing.T) {
 	}{
 		{"no such delivery", store.ErrWebhookDeliveryNotFound, http.StatusNotFound},
 		{"still in progress", store.ErrWebhookDeliveryNotTerminal, http.StatusConflict},
+		{"the subscriber is switched off", store.ErrWebhookSubscriberDisabled, http.StatusConflict},
 		{"the subscriber is being changed", store.ErrIntegrationBusy, http.StatusConflict},
 		{"anything else", errors.New("the database is unwell"), http.StatusInternalServerError},
 	} {
