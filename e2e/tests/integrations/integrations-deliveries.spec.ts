@@ -138,6 +138,16 @@ async function pollForDeliveries(
   );
 }
 
+/**
+ * Helper: the first delivery row that has finished as failed - the one a replay
+ * button is shown for, whatever a replay made earlier sits above it.
+ */
+function failedRow(page: import('@playwright/test').Page) {
+  return page.locator('.delivery-table tbody tr')
+    .filter({ has: page.locator('.delivery-status-failed') })
+    .first();
+}
+
 test.describe('Integrations - Deliveries', () => {
   let webhookIntegrationId = '';
   let inboundIntegrationId = '';
@@ -244,11 +254,12 @@ test.describe('Integrations - Deliveries', () => {
     await deliveriesBtn.click();
     await expect(integrationsPage.integrationModal).toHaveClass(/active/, { timeout: 10000 });
 
-    // Wait for delivery rows
-    const firstRow = integrationsPage.page.locator('.delivery-table tbody tr').first();
+    // A finished delivery, not the newest row: a replay made by another test
+    // in this worker may sit on top, still pending and with no attempt to show.
+    const firstRow = failedRow(integrationsPage.page);
     await expect(firstRow).toBeVisible({ timeout: 15000 });
 
-    // Click the first row to open detail
+    // Click the row to open detail
     await firstRow.click();
 
     // Verify detail panel renders (delivery-detail-meta is the detail container)
@@ -260,31 +271,78 @@ test.describe('Integrations - Deliveries', () => {
     await expect(attemptTable).toBeVisible();
   });
 
-  test('should replay a delivery', async ({ integrationsPage }) => {
-    const deliveriesBtn = integrationsPage.page.locator(
+  test('a replay keeps its key while the answer is in doubt and opens the new delivery', async ({ integrationsPage, page }) => {
+    const deliveriesBtn = page.locator(
       `.integration-card[data-integration-id="${webhookIntegrationId}"] .deliveries-btn`,
     );
     await deliveriesBtn.click();
     await expect(integrationsPage.integrationModal).toHaveClass(/active/, { timeout: 10000 });
 
-    // Wait for delivery rows
-    const firstRow = integrationsPage.page.locator('.delivery-table tbody tr').first();
-    await expect(firstRow).toBeVisible({ timeout: 15000 });
-
-    // Click the first row to open detail
-    await firstRow.click();
-
-    // Wait for detail to load
-    const detailMeta = integrationsPage.page.locator('.delivery-detail-meta');
-    await expect(detailMeta).toBeVisible({ timeout: 10000 });
-
-    // beforeAll polls until status=failed, so replay button should be visible
-    const replayBtn = integrationsPage.page.locator('#delivery-detail-replay-btn');
+    const row = failedRow(page);
+    await expect(row).toBeVisible({ timeout: 15000 });
+    const originalId = await row.getAttribute('data-delivery-id');
+    expect(originalId).toBeTruthy();
+    await row.click();
+    await expect(page.locator('.delivery-detail-meta')).toBeVisible({ timeout: 10000 });
+    const replayBtn = page.locator('#delivery-detail-replay-btn');
     await expect(replayBtn).toBeVisible({ timeout: 5000 });
 
-    await replayBtn.click();
+    // The server's answers are staged at the network boundary, so each rule of
+    // the key is exercised against the answer that defines it; the last press
+    // reaches the real server. The key is read off the request the browser
+    // actually sent.
+    const keys: string[] = [];
+    let answer: 'doubt' | 'nothing' | 'refusal' | 'real' = 'doubt';
+    await page.route('**/deliveries/*/replay', route => {
+      keys.push(route.request().headers()['idempotency-key'] ?? '');
+      switch (answer) {
+        case 'doubt':
+          return route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"the database is unwell"}' });
+        case 'nothing':
+          return route.abort('connectionfailed');
+        case 'refusal':
+          return route.fulfill({ status: 404, contentType: 'application/json', body: '{"error":"delivery not found"}' });
+        case 'real':
+          return route.continue();
+      }
+    });
+    const press = async (expectedRequests: number) => {
+      await expect(replayBtn).toBeEnabled();
+      await replayBtn.click();
+      await expect.poll(() => keys.length).toBe(expectedRequests);
+    };
 
-    // Verify success toast appears
-    await integrationsPage.expectToastVisible();
+    // A 500 does not prove nothing happened: the key is kept for the next press.
+    answer = 'doubt';
+    await press(1);
+    await expect(page.locator('#toast-container .toast.error').last()).toContainText('Replay failed');
+    // No answer at all: kept as well.
+    answer = 'nothing';
+    await press(2);
+    // A 4xx is the server refusing the request itself. It went out with the
+    // kept key, and the refusal ends the key.
+    answer = 'refusal';
+    await press(3);
+    expect(keys[0]).toMatch(/\S/);
+    expect(keys[1]).toBe(keys[0]);
+    expect(keys[2]).toBe(keys[0]);
+
+    // The next press is a new decision: a new key, the real server, and the
+    // NEW delivery on the screen - the original stays exactly as it was.
+    answer = 'real';
+    // The real answer and not a staged one: the staged responses of the
+    // presses above are still being delivered to the page when this is armed.
+    const replayed = page.waitForResponse(r => r.request().method() === 'POST'
+      && r.url().includes('/replay') && r.status() === 200);
+    const opened = page.waitForRequest(r => r.method() === 'GET'
+      && /\/deliveries\/[^/?]+$/.test(r.url()) && !r.url().endsWith('/' + originalId));
+    await press(4);
+    expect(keys[3]).not.toBe(keys[0]);
+    const body = await (await replayed).json();
+    expect(body.ok).toBe(true);
+    expect(body.delivery_id).toBeTruthy();
+    expect(body.delivery_id).not.toBe(originalId);
+    expect((await opened).url()).toContain('/deliveries/' + body.delivery_id);
+    await expect(page.locator('#toast-container .toast.success').last()).toContainText('Delivery queued for replay');
   });
 });

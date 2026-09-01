@@ -37,9 +37,15 @@ async function request(endpoint, options = {}) {
         }
     }
 
+    // The caller's options first and the headers LAST. The headers were built
+    // from the caller's own plus Content-Type and the CSRF token, and spreading
+    // the options after them put the caller's bare headers back - without the
+    // token. A request that carried a header of its own, the replay with its
+    // Idempotency-Key, reached a production server that way and was refused as
+    // a forgery; nothing in this environment noticed, because CSRF is off here.
     const config = {
-        headers,
         ...options,
+        headers,
     };
 
     // Statuses that are an answer rather than a failure. A 404 from "does this
