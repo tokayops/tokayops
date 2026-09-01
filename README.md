@@ -48,8 +48,9 @@ arrived is recorded as exactly that rather than guessed at.
   signature-verified endpoint. Toggled per integration.
 - Telegram channel: outbound delivery, policy routing and Ack/Resolve buttons
   via a secret-verified webhook. Toggled per integration.
-- Generic outgoing webhooks through a transactional outbox: HMAC-signed,
-  SSRF-guarded, retried with backoff, with a delivery log and replay.
+- Generic outgoing webhooks as durable deliveries: HMAC-signed, SSRF-guarded,
+  retried with backoff for up to a day, with a per-subscriber delivery log and
+  an idempotent replay. The contract is under "Outgoing Webhooks" below.
 - Observability: Prometheus metrics endpoint including MTTA/MTTR histograms and
   on-call health gauges.
 - OIDC/SSO: optional single sign-on with auto-registration.
@@ -210,6 +211,49 @@ curl -X PATCH http://localhost:8080/api/auth/me \
 ```
 Note: SSO users cannot change their name (synced from provider).
 
+### Outgoing Webhooks
+A `generic_webhook` integration subscribes to alert group events
+(`alert_group.firing`, `alert_group.acknowledged`, `alert_group.resolved`),
+globally or for one team. Each event is committed together with the alert
+group's own transition and delivered to every subscriber as its own delivery.
+
+What a subscriber receives is one `POST` per event with a JSON body and these
+headers:
+
+| Header | Value |
+|--------|-------|
+| `Content-Type` | `application/json` |
+| `X-Tokay-Event` | Event type, e.g. `alert_group.firing` |
+| `X-Tokay-Event-ID` | The event's id; every retry and replay of the same event carries the same id, so receivers can deduplicate on it |
+| `X-Tokay-Timestamp` | Unix timestamp of the request |
+| `X-Tokay-Signature` | `sha256=<hex>` of `HMAC-SHA256(timestamp + "." + body, secret)`, present when the integration has a secret |
+
+The subscriber's `custom_headers` are added to every request; the names above
+and `Content-Type` are reserved and cannot be overridden.
+
+How a delivery is treated depends on the answer: a `2xx` finishes it; `429`
+and `408` are retried; any other `4xx`, and any `3xx` (redirects are not
+followed), ends it as failed; a `5xx`, a timeout or a connection error is retried
+with exponential backoff (2s doubling, capped at 30 minutes, with jitter) for up
+to 24 hours from the event, after which the delivery expires. A subscriber's
+`timeout_seconds` is honoured up to 30 seconds. Private and link-local
+addresses are refused before any request is made unless the operator allows the
+range with `TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS`. Disabling or deleting the
+integration withdraws its undelivered deliveries; the delivery history of a
+deleted integration stays readable.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/integrations/:id/deliveries` | Delivery log of a subscriber (paginated) |
+| GET | `/api/v1/integrations/:id/deliveries/:deliveryId` | One delivery with its attempts |
+| POST | `/api/v1/integrations/:id/deliveries/:deliveryId/replay` | Deliver the event again, as a new delivery |
+
+A replay requires an `Idempotency-Key` header (1 to 128 bytes): repeating the
+request with the same key returns the same new delivery, so a retried request
+never delivers twice. Only a finished delivery (`sent` or `failed`) can be
+replayed; the new delivery uses the integration's current URL, secret and
+headers, and the response names it in `delivery_id`.
+
 ### Legacy Endpoints
 `/api/v1/incidents/*` endpoints are aliased to `/api/v1/alert-groups/*` for backward compatibility.
 
@@ -315,7 +359,7 @@ then, read the release notes before every minor upgrade.
 - `internal/handoff`: Detects shift changes and admits the announcement.
 - `internal/ingester`: Alertmanager webhook ingestion.
 - `internal/model`: Data models (AlertGroup, User, etc.).
-- `internal/outbound`: Outbound delivery: durable commitments, the delivery worker, and the Slack and Telegram channels under `providers/`.
+- `internal/outbound`: Outbound delivery: durable commitments, the delivery workers, the fan-out of alert events to webhook subscribers, and the Slack, Telegram and outgoing webhook channels under `providers/`.
 - `internal/store`: Database access layer (PostgreSQL).
 - `web`: Frontend assets (Vanilla JS + CSS).
 
