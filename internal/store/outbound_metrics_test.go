@@ -294,3 +294,22 @@ func telegramCommitment(ref string) keys.EscalationCommitment {
 	c.Slot = keys.Slot{Kind: keys.SlotPolicy, Index: 1}
 	return c
 }
+
+// TestEveryFamilyReportsLatenessFromTheFirstScrape: the series exists at zero
+// before the first commitment of the family, for every family this build
+// executes. A graph that only starts when the thing it watches first happens is
+// a graph nobody can alert on until then.
+func TestEveryFamilyReportsLatenessFromTheFirstScrape(t *testing.T) {
+	s := setupTestDB(t)
+	for _, family := range []string{outbound.FamilyNotification, outbound.FamilyHandoff, outbound.FamilyWebhook} {
+		seconds, found := latenessOf(t, s, family)
+		if !found {
+			t.Errorf("%s reports no lateness before its first commitment", family)
+		} else if seconds != 0 {
+			t.Errorf("%s reports %v seconds of lateness on an empty queue", family, seconds)
+		}
+	}
+	if _, found := latenessOf(t, s, "carrier_pigeon"); found {
+		t.Error("a family nobody executes reports lateness")
+	}
+}

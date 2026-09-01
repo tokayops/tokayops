@@ -2753,7 +2753,7 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 	// first time somebody is paged or comes on duty. A graph that only starts
 	// when the thing it watches first happens is a graph nobody can alert on
 	// until then.
-	for _, family := range []string{outbound.FamilyNotification, outbound.FamilyHandoff} {
+	for _, family := range []string{outbound.FamilyNotification, outbound.FamilyHandoff, outbound.FamilyWebhook} {
 		if !hasFamily(snap.OutboundLatenessSeconds, family) {
 			snap.OutboundLatenessSeconds = append(snap.OutboundLatenessSeconds,
 				model.OutboundLateness{Family: family})

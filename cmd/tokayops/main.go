@@ -31,10 +31,11 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
 	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
-	"github.com/tokayops/tokayops/internal/outbox"
+	webhookprovider "github.com/tokayops/tokayops/internal/outbound/providers/webhook"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 	"github.com/tokayops/tokayops/internal/slacksync"
@@ -455,6 +456,31 @@ func main() {
 		log.Fatalf("Failed to build the handover worker: %v", err)
 	}
 
+	// The third family, and the only channel it has. Outgoing webhooks run in a
+	// pool of their own because a subscriber that neither answers nor refuses
+	// holds a slot for the whole of its timeout, which is two orders of
+	// magnitude longer than a direct message; the channel reads the
+	// subscriber's configuration from the store, not from the cache, because
+	// the cache is refreshed only by the process that handled a change. The
+	// channel is NOT registered in the catalogue above: the catalogue says what
+	// may be a step of an escalation policy, and a webhook is not one.
+	allowedCIDRs, _ := config.ParseAllowedPrivateCIDRs()
+	webhookWorker, err := outbound.NewWorkerFor(outbound.FamilyWebhook, st,
+		uuid.New().String(), map[string]outbound.Channel{
+			keys.ProviderWebhook: webhookprovider.NewHandler(st, allowedCIDRs),
+		})
+	if err != nil {
+		log.Fatalf("Failed to build the webhook worker: %v", err)
+	}
+	// The family's producer: it turns each event of the alert outbox into
+	// commitments to the subscribers that are enabled and in scope. A loop of
+	// its own, beside the engine and the shift-change detector, not a step of
+	// the worker's tick.
+	fanOut, err := outbound.NewFanOut(st)
+	if err != nil {
+		log.Fatalf("Failed to build the webhook fan-out: %v", err)
+	}
+
 	// 9. Start Background Workers
 	go eng.Run(ctx)
 
@@ -473,23 +499,21 @@ func main() {
 	// can take - and a shorter one wrapped round them would defeat the reason
 	// those numbers are sums rather than guesses. The container's stop grace
 	// period has to be longer than it - see docker-compose.prod.yml.
-	// Both of them, for the same reason: each is holding calls that have been
-	// made, and neither may be walked away from.
+	// All three of them, for the same reason: each is holding calls that have
+	// been made, and none may be walked away from. The fan-out is not waited
+	// for: it makes no network calls, and a transaction cut off mid-tick rolls
+	// back whole and leaves the event for the next process.
 	outboundStopped := make(chan struct{})
 	go func() {
 		defer close(outboundStopped)
 		var running sync.WaitGroup
-		running.Add(2)
+		running.Add(3)
 		go func() { defer running.Done(); outboundWorker.Run(ctx) }()
 		go func() { defer running.Done(); handoffWorker.Run(ctx) }()
+		go func() { defer running.Done(); webhookWorker.Run(ctx) }()
 		running.Wait()
 	}()
-
-	// Outbox Delivery Worker
-	allowedCIDRs, _ := config.ParseAllowedPrivateCIDRs()
-	outboxSender := outbox.NewHTTPSender(allowedCIDRs)
-	outboxWorker := outbox.New(st, outboxSender)
-	go outboxWorker.Run(ctx)
+	go fanOut.Run(ctx)
 
 	// Usergroup Syncer Manager - allows dynamic start/stop when Slack integration changes
 	syncerManager := slacksync.NewUsergroupSyncerManager(st, scheduleRenderer, 5*time.Minute)
