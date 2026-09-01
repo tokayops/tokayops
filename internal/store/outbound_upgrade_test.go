@@ -97,14 +97,51 @@ func sprint3OutboundShape(t *testing.T, s *Store) {
 		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundWebhookProviderConstraint,
 		`DROP INDEX IF EXISTS idx_outbound_intents_subscriber`,
 		`DROP TABLE IF EXISTS integration_tombstones`,
-		`ALTER TABLE event_outbox_deliveries DROP CONSTRAINT IF EXISTS event_outbox_deliveries_integration_id_fkey`,
-		`ALTER TABLE event_outbox_deliveries ADD CONSTRAINT event_outbox_deliveries_integration_id_fkey
-			FOREIGN KEY (integration_id) REFERENCES integrations(id)`,
+		// The old worker's two tables, in the exact form the previous release
+		// created them - with the foreign key to integrations that the start
+		// removes. This build does not create them, so the shape has to.
+		`DROP TABLE IF EXISTS event_outbox_delivery_attempts`,
+		`DROP TABLE IF EXISTS event_outbox_deliveries`,
+		`CREATE TABLE event_outbox_deliveries (
+			id TEXT PRIMARY KEY,
+			event_id TEXT NOT NULL REFERENCES event_outbox(id),
+			integration_id TEXT NOT NULL REFERENCES integrations(id),
+			status TEXT NOT NULL DEFAULT 'pending',
+			attempts INT NOT NULL DEFAULT 0,
+			next_attempt_at TIMESTAMPTZ,
+			last_http_status INT,
+			last_error TEXT,
+			request_payload TEXT,
+			response_body_trunc TEXT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			sent_at TIMESTAMPTZ,
+			UNIQUE(event_id, integration_id)
+		)`,
+		`CREATE INDEX idx_delivery_retry ON event_outbox_deliveries (next_attempt_at)
+			WHERE status IN ('pending', 'retry')`,
+		`CREATE INDEX idx_delivery_event ON event_outbox_deliveries (event_id)`,
+		`CREATE TABLE event_outbox_delivery_attempts (
+			id TEXT PRIMARY KEY,
+			delivery_id TEXT NOT NULL REFERENCES event_outbox_deliveries(id),
+			attempt INT NOT NULL,
+			http_status INT,
+			error TEXT,
+			response_body_trunc TEXT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX idx_delivery_attempts_delivery ON event_outbox_delivery_attempts (delivery_id)`,
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
 			t.Fatalf("build the Sprint 3 shape: %v", err)
 		}
 	}
+	t.Cleanup(func() {
+		for _, table := range []string{"event_outbox_delivery_attempts", "event_outbox_deliveries"} {
+			if _, err := s.db.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
+				t.Errorf("remove the legacy %s: %v", table, err)
+			}
+		}
+	})
 }
 
 func relationExists(t *testing.T, s *Store, name string) bool {

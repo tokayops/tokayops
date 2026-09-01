@@ -806,49 +806,15 @@ func (s *Store) buildSchema() error {
 		WHERE status IN ('pending', 'processing');
 	CREATE INDEX IF NOT EXISTS idx_outbox_alert_group
 		ON event_outbox (alert_group_id);
-
-	CREATE TABLE IF NOT EXISTS event_outbox_deliveries (
-		id TEXT PRIMARY KEY,
-		event_id TEXT NOT NULL REFERENCES event_outbox(id),
-		integration_id TEXT NOT NULL REFERENCES integrations(id),
-		status TEXT NOT NULL DEFAULT 'pending',
-		attempts INT NOT NULL DEFAULT 0,
-		next_attempt_at TIMESTAMPTZ,
-		last_http_status INT,
-		last_error TEXT,
-		request_payload TEXT,
-		response_body_trunc TEXT,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		sent_at TIMESTAMPTZ,
-		UNIQUE(event_id, integration_id)
-	);
-	CREATE INDEX IF NOT EXISTS idx_delivery_retry
-		ON event_outbox_deliveries (next_attempt_at)
-		WHERE status IN ('pending', 'retry');
-	CREATE INDEX IF NOT EXISTS idx_delivery_event
-		ON event_outbox_deliveries (event_id);
 	`
 	if _, err := s.db.Exec(outboxQuery); err != nil {
 		return err
 	}
-
-	// Delivery attempts audit log (append-only)
-	deliveryAttemptsQuery := `
-	CREATE TABLE IF NOT EXISTS event_outbox_delivery_attempts (
-		id TEXT PRIMARY KEY,
-		delivery_id TEXT NOT NULL REFERENCES event_outbox_deliveries(id),
-		attempt INT NOT NULL,
-		http_status INT,
-		error TEXT,
-		response_body_trunc TEXT,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_delivery_attempts_delivery
-		ON event_outbox_delivery_attempts (delivery_id);
-	`
-	if _, err := s.db.Exec(deliveryAttemptsQuery); err != nil {
-		return err
-	}
+	// The event is the root of the webhook family and stays. What the old
+	// worker derived from it - event_outbox_deliveries and its attempts - is
+	// not created any more: a delivery is a commitment in the outbound tables.
+	// On an upgraded database the two tables stay until
+	// migrations/drop-webhook-outbox.sql removes them by hand.
 
 	// Drop FK on event_outbox.team_id - unknown teams are a valid runtime case
 	// (firehose-only alerts) and global webhook subscriptions must still fan-out.
@@ -2676,24 +2642,10 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, err
 	}
 
-	// 6. Outbox deliveries by status
-	rows4, err := s.db.Query(`SELECT status, COUNT(*) FROM event_outbox_deliveries GROUP BY status`)
-	if err != nil {
-		return nil, fmt.Errorf("outbox deliveries by status query: %w", err)
-	}
-	defer rows4.Close()
-	for rows4.Next() {
-		var c model.StatusCount
-		if err := rows4.Scan(&c.Status, &c.Count); err != nil {
-			return nil, err
-		}
-		snap.OutboxDeliveriesByStatus = append(snap.OutboxDeliveriesByStatus, c)
-	}
-	if err := rows4.Err(); err != nil {
-		return nil, err
-	}
-
-	// 7. Outbound commitments by family and status.
+	// 6. Outbound commitments by family and status. (Webhook deliveries are
+	// among them: the table the old worker kept them in is not read here, and
+	// on a fresh database it does not exist - a query against it would fail the
+	// whole snapshot, and the collector answers a failed snapshot with nothing.)
 	rows5, err := s.db.Query(`
 		SELECT delivery_family, status, COUNT(*) FROM outbound_intents
 		GROUP BY delivery_family, status`)

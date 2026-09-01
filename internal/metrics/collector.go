@@ -38,11 +38,6 @@ var (
 		"Current count of outbox events by status.",
 		[]string{"status"}, nil,
 	)
-	outboxDeliveriesByStatusDesc = prometheus.NewDesc(
-		"outbox_deliveries_by_status",
-		"Current count of outbox deliveries by status.",
-		[]string{"status"}, nil,
-	)
 	outboundIntentsByStatusDesc = prometheus.NewDesc(
 		"outbound_intents_by_status",
 		"Current count of outbound delivery commitments by status.",
@@ -80,7 +75,6 @@ func (c *BusinessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- teamsWithoutPolicyDesc
 	ch <- alertGroupsByStatusDesc
 	ch <- outboxEventsByStatusDesc
-	ch <- outboxDeliveriesByStatusDesc
 	ch <- outboundIntentsByStatusDesc
 	ch <- outboundQueueLatenessDesc
 	ch <- outboundCardsBehindDesc
@@ -124,13 +118,6 @@ func (c *BusinessCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, sc := range snap.OutboxEventsByStatus {
 		ch <- prometheus.MustNewConstMetric(
 			outboxEventsByStatusDesc, prometheus.GaugeValue,
-			float64(sc.Count), sc.Status,
-		)
-	}
-
-	for _, sc := range snap.OutboxDeliveriesByStatus {
-		ch <- prometheus.MustNewConstMetric(
-			outboxDeliveriesByStatusDesc, prometheus.GaugeValue,
 			float64(sc.Count), sc.Status,
 		)
 	}

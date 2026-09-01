@@ -13,7 +13,6 @@ type MetricsSnapshot struct {
 	TeamsWithPermanentOnCall int
 	TeamsWithoutPolicy       int
 	OutboxEventsByStatus     []StatusCount
-	OutboxDeliveriesByStatus []StatusCount
 
 	// OutboundIntentsByStatus is what each delivery family currently owes and
 	// what it has finished with.

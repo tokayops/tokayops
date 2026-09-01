@@ -136,25 +136,13 @@ type StoreInterface interface {
 	WithIntegrationLocked(ctx context.Context, id string, fn func(current *model.Integration) error) error
 	IntegrationTombstone(ctx context.Context, id string) (model.IntegrationTombstone, bool, error)
 
-	// Outbox (Phase 6)
+	// The alert outbox: the events the alert transactions write, and what the
+	// fan-out turns into commitments. Written by the atomic transactions, read
+	// by the fan-out; the pending read is how a test sees what a transaction
+	// promised.
 	CreateOutboxEvent(event *model.OutboxEvent) error
 	GetOutboxEventByID(id string) (*model.OutboxEvent, error)
 	GetPendingOutboxEvents(limit int) ([]*model.OutboxEvent, error)
-	UpdateOutboxEvent(event *model.OutboxEvent) error
-	UpdateOutboxEventIfOwned(event *model.OutboxEvent, workerID string) (bool, error)
-	ClaimOutboxEvents(workerID string, limit int, leaseDuration time.Duration) ([]*model.OutboxEvent, error)
-	ExtendOutboxEventLease(eventID, workerID string, until time.Time) (bool, error)
-
-	CreateOutboxDelivery(delivery *model.OutboxDelivery) error
-	GetOutboxDeliveryByID(id string) (*model.OutboxDelivery, error)
-	GetOutboxDelivery(eventID, integrationID string) (*model.OutboxDelivery, error)
-	GetDeliveriesByEventID(eventID string) ([]*model.OutboxDelivery, error)
-	GetDeliveriesByIntegrationID(integrationID string, limit, offset int) ([]*model.OutboxDelivery, int, error)
-	UpdateOutboxDelivery(delivery *model.OutboxDelivery) error
-	ReplayOutboxDelivery(deliveryID string) error
-
-	CreateDeliveryAttempt(attempt *model.DeliveryAttempt) error
-	GetDeliveryAttempts(deliveryID string) ([]*model.DeliveryAttempt, error)
 
 	// Webhook deliveries: the delivery routes over the outbound domain's
 	// commitments. See webhook_delivery_store.go.

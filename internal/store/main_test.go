@@ -79,7 +79,6 @@ func setupTestDB(t *testing.T) *Store {
 		"outbound_intents",
 		"outbound_group_snapshots",
 		"outbound_batches",
-		"event_outbox_deliveries",
 		"event_outbox",
 		"integration_tombstones",
 		"integrations",

@@ -71,8 +71,6 @@ func TruncateTables(t testing.TB, s *store.Store) {
 		"outbound_intents",
 		"outbound_group_snapshots",
 		"outbound_batches",
-		"event_outbox_delivery_attempts",
-		"event_outbox_deliveries",
 		"event_outbox",
 		"integrations",
 		"schedule_revisions",

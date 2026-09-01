@@ -151,35 +151,6 @@ var (
 	})
 )
 
-// Tier 7 - Outbox Delivery
-var (
-	OutboxEventsClaimedTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "outbox_events_claimed_total",
-		Help: "Total number of outbox events claimed by the worker.",
-	})
-
-	OutboxEventsCompletedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "outbox_events_completed_total",
-		Help: "Total number of outbox events completed.",
-	}, []string{"result"})
-
-	OutboxDeliveryAttemptsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "outbox_delivery_attempts_total",
-		Help: "Total number of outbox delivery attempts.",
-	}, []string{"status"})
-
-	OutboxDeliveryDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "outbox_delivery_duration_seconds",
-		Help:    "HTTP call duration for outbox webhook deliveries.",
-		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
-	})
-
-	OutboxDeliveryBlockedTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "outbox_delivery_blocked_total",
-		Help: "Total number of outbox deliveries blocked by SSRF IP policy.",
-	})
-)
-
 // Tier 8 - outbound delivery
 //
 // What an operator needs from this domain is two questions answered: is
@@ -361,13 +332,6 @@ func init() {
 	prometheus.MustRegister(TelegramUserLinkedTotal)
 	prometheus.MustRegister(TelegramInteractionTotal)
 	prometheus.MustRegister(TelegramUnlinkedUserTotal)
-
-	// Tier 7
-	prometheus.MustRegister(OutboxEventsClaimedTotal)
-	prometheus.MustRegister(OutboxEventsCompletedTotal)
-	prometheus.MustRegister(OutboxDeliveryAttemptsTotal)
-	prometheus.MustRegister(OutboxDeliveryDuration)
-	prometheus.MustRegister(OutboxDeliveryBlockedTotal)
 
 	// Tier 8
 	prometheus.MustRegister(OutboundAttemptsTotal)

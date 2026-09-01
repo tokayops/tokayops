@@ -172,42 +172,6 @@ func TestBusinessCollector_OutboxEventsByStatus(t *testing.T) {
 	}
 }
 
-func TestBusinessCollector_OutboxDeliveriesByStatus(t *testing.T) {
-	s := store.NewMockStore()
-
-	s.CreateOutboxEvent(&model.OutboxEvent{
-		ID: "evt-1", EventType: model.OutboxEventFiring, AlertGroupID: "ag-1",
-		TeamID: "devops", Payload: []byte(`{}`), Status: model.OutboxEventStatusCompleted,
-	})
-
-	s.CreateOutboxDelivery(&model.OutboxDelivery{
-		ID: "del-1", EventID: "evt-1", IntegrationID: "integ-1", Status: model.OutboxDeliverySent,
-	})
-	s.CreateOutboxDelivery(&model.OutboxDelivery{
-		ID: "del-2", EventID: "evt-1", IntegrationID: "integ-2", Status: model.OutboxDeliveryFailed,
-	})
-	s.CreateOutboxDelivery(&model.OutboxDelivery{
-		ID: "del-3", EventID: "evt-1", IntegrationID: "integ-3", Status: model.OutboxDeliveryRetry,
-	})
-
-	collected := collectMetrics(t, s)
-
-	val := findGaugeValue(t, collected, "outbox_deliveries_by_status", map[string]string{"status": "sent"})
-	if val != 1 {
-		t.Errorf("outbox_deliveries_by_status{sent} = %v, want 1", val)
-	}
-
-	val = findGaugeValue(t, collected, "outbox_deliveries_by_status", map[string]string{"status": "failed"})
-	if val != 1 {
-		t.Errorf("outbox_deliveries_by_status{failed} = %v, want 1", val)
-	}
-
-	val = findGaugeValue(t, collected, "outbox_deliveries_by_status", map[string]string{"status": "retry"})
-	if val != 1 {
-		t.Errorf("outbox_deliveries_by_status{retry} = %v, want 1", val)
-	}
-}
-
 // --------------- helpers ---------------
 
 // collectMetrics registers a fresh collector in a temporary registry, gathers, and returns families.
