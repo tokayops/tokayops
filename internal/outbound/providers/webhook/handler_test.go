@@ -249,7 +249,8 @@ func TestTheSubscribersAnswerIsClassifiedByRange(t *testing.T) {
 		outcome outbound.Outcome
 		class   string
 	}{
-		{200, outbound.OutcomeAccepted, ""}, {202, outbound.OutcomeAccepted, ""}, {204, outbound.OutcomeAccepted, ""},
+		{200, outbound.OutcomeAccepted, ""}, {201, outbound.OutcomeAccepted, ""}, {202, outbound.OutcomeAccepted, ""},
+		{204, outbound.OutcomeAccepted, ""}, {226, outbound.OutcomeAccepted, ""},
 		{429, outbound.OutcomeRetryableRejection, "rate_limited"},
 		{408, outbound.OutcomeRetryableRejection, "request_timeout"},
 		{301, outbound.OutcomePermanentRejection, "redirect_not_followed"},
@@ -286,12 +287,23 @@ func TestTheSubscribersAnswerIsClassifiedByRange(t *testing.T) {
 			}
 		})
 	}
-	// Whole ranges, not the examples above: every 4xx that is not 408 or 429 is a
-	// refusal; every 3xx is a redirect; nothing from 500 up is the channel's to say.
+	// Every status there is, 100 through 599, and not the examples above: an
+	// implementation that accepted 200, 202 and 204 by name would pass them and
+	// refuse a 201, which is as good an acceptance as any. Nothing below 200 is
+	// an answer to the request and nothing from 500 up is the channel's to say;
+	// both are left to the domain, whose answer is doubt.
 	h := NewHandler(&configs{found: true}, loopback(t))
-	for code := 300; code < 600; code++ {
+	for code := 100; code < 600; code++ {
 		got, known := h.ClassifyResponse(outbound.Result{Status: strconv.Itoa(code)})
 		switch {
+		case code < 200:
+			if known {
+				t.Errorf("HTTP %d was classified by the channel: %+v", code, got)
+			}
+		case code < 300:
+			if !known || got.Outcome != outbound.OutcomeAccepted || got.Class != "" {
+				t.Errorf("HTTP %d: %+v %v, want acceptance", code, got, known)
+			}
 		case code < 400:
 			if !known || got.Outcome != outbound.OutcomePermanentRejection || got.Class != "redirect_not_followed" {
 				t.Errorf("HTTP %d: %+v %v", code, got, known)
@@ -519,4 +531,108 @@ func TestTheSignatureIsTheOneSubscribersAlreadyVerify(t *testing.T) {
 	if got := Sign("1700000000", []byte(`{"event":"alert_group.firing"}`), "s3cret"); got != want {
 		t.Fatalf("the signature is %s, subscribers verify %s", got, want)
 	}
+}
+
+// TestOnlyAPublicAddressMayBePostedTo: the policy is what an address IS, not a
+// list of what it is not. Every kind of address that is not globally reachable
+// is refused - at the preparation, where it ends the commitment, and at the
+// socket, where a name that moved is caught - and the allowlist is the one way
+// through.
+func TestOnlyAPublicAddressMayBePostedTo(t *testing.T) {
+	blocked := []string{
+		"10.0.0.7", "172.16.0.1", "192.168.1.1", // private
+		"127.0.0.1", "::1", // loopback
+		"169.254.169.254", "fe80::1", // link-local: where the metadata service lives
+		"fc00::1", "fd12:3456::1", // unique-local
+		"0.0.0.0", "::", "0.1.2.3", // unspecified, and "this" network
+		"100.64.0.1",                                                          // shared address space
+		"192.0.0.1", "192.0.2.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", // IETF, documentation, benchmarking
+		"224.0.0.1", "239.255.255.250", "ff02::1", // multicast
+		"240.0.0.1", "255.255.255.255", // reserved, and broadcast
+		"::ffff:10.0.0.7", "::ffff:127.0.0.1", // IPv4 written as IPv6
+		"64:ff9b::a00:7",        // 10.0.0.7 through NAT64
+		"2002:a00:7::",          // 10.0.0.7 through 6to4
+		"100::1", "2001:db8::1", // discard-only, documentation
+	}
+	public := []string{"93.184.216.34", "8.8.8.8", "2606:4700::1111", "2001:4860:4860::8888",
+		"::ffff:93.184.216.34", "64:ff9b::5db8:d822", "2002:5db8:d822::"}
+	none := ipPolicy{}
+	for _, a := range blocked {
+		if none.allowedIP(net.ParseIP(a)) {
+			t.Errorf("%s was allowed", a)
+		}
+	}
+	for _, a := range public {
+		if !none.allowedIP(net.ParseIP(a)) {
+			t.Errorf("%s was refused", a)
+		}
+	}
+	if none.allowedIP(nil) {
+		t.Error("no address at all was allowed")
+	}
+
+	// The allowlist is the one way through, judged over the address itself:
+	// an allowed IPv4 range covers the address however it is written.
+	allowing := ipPolicy{allowed: cidrs(t, "fc00::/7", "10.0.0.0/8")}
+	for _, a := range []string{"fc00::1", "10.0.0.7", "::ffff:10.0.0.7", "64:ff9b::a00:7"} {
+		if !allowing.allowedIP(net.ParseIP(a)) {
+			t.Errorf("%s was refused with its range allowed", a)
+		}
+	}
+	for _, a := range []string{"100.64.0.1", "172.16.0.1", "::"} {
+		if allowing.allowedIP(net.ParseIP(a)) {
+			t.Errorf("allowing two ranges opened %s", a)
+		}
+	}
+
+	// Both points, for addresses the list this replaced let through.
+	for _, a := range []string{"fc00::1", "::", "100.64.0.1", "64:ff9b::a00:7", "::ffff:10.0.0.7"} {
+		address := a
+		t.Run("at the preparation: "+address, func(t *testing.T) {
+			resolve := func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP(address)}, nil }
+			h := NewHandlerResolving(&configs{found: true, cfg: model.GenericWebhookConfig{URL: "https://hooks.example.com/a"}}, nil, resolve)
+			intent := intentFor(t, subscriberID)
+			req := h.Prepare(context.Background(), intent).Request(intent.ID, "lease", "worker")
+			if req.Preparation != outbound.PreparationPermanent || req.ErrorClass != "ip_policy" {
+				t.Fatalf("prepared as %s / %q, want a permanent ip_policy refusal", req.Preparation, req.ErrorClass)
+			}
+		})
+		t.Run("at the socket: "+address, func(t *testing.T) {
+			rec := &received{}
+			srv := serve(t, http.StatusOK, rec)
+			var answers atomic.Int32
+			flipping := func(context.Context, string) ([]net.IP, error) {
+				if answers.Add(1) == 1 {
+					return []net.IP{net.ParseIP("93.184.216.34")}, nil // preparation: public
+				}
+				return []net.IP{net.ParseIP(address)}, nil // dial: moved
+			}
+			store := &configs{found: true, cfg: model.GenericWebhookConfig{URL: "http://moved.example.com/hook"}}
+			h := NewHandlerResolving(store, nil, flipping)
+			if prepared := h.Prepare(context.Background(), intentFor(t, subscriberID)); prepared.Outcome() != outbound.PreparationReady {
+				t.Fatalf("prepared as %+v", prepared)
+			}
+			result, err := h.ExecuteAttempt(context.Background(),
+				callTo(t, "http://moved.example.com"+srv.URL[strings.LastIndex(srv.URL, ":"):]+"/hook"))
+			if !errors.Is(err, ErrBlockedAddress) || result.Evidence != outbound.DefinitelyNotSent {
+				t.Fatalf("recorded as %q: %v", result.Evidence, err)
+			}
+			if rec.calls.Load() != 0 {
+				t.Fatal("the address was reached")
+			}
+		})
+	}
+}
+
+func cidrs(t *testing.T, list ...string) []*net.IPNet {
+	t.Helper()
+	nets := make([]*net.IPNet, 0, len(list))
+	for _, c := range list {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nets = append(nets, n)
+	}
+	return nets
 }

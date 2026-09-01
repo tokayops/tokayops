@@ -101,16 +101,81 @@ func EffectiveTimeout(cfg model.GenericWebhookConfig) time.Duration {
 	return timeout
 }
 
-// privateRanges are the address ranges a subscriber may not live in unless the
-// installation allows them explicitly: an outgoing webhook is a request this
-// system makes on a stranger's behalf, and a stranger must not be able to point
-// it at the metadata service or the database.
-var privateRanges = func() []*net.IPNet {
-	var nets []*net.IPNet
-	for _, cidr := range []string{
-		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
-		"169.254.0.0/16", "::1/128", "fe80::/10",
-	} {
+// A subscriber may live only at a public address, unless the installation
+// allows the range explicitly: an outgoing webhook is a request this system
+// makes on a stranger's behalf, and a stranger must not be able to point it at
+// the metadata service, the database, or anything else this process can reach
+// and they cannot.
+//
+// "Public" is decided by what the address IS. The list this replaced named what
+// it was not - the three RFC 1918 ranges, loopback, link-local - and let through
+// everything it had not thought of: the IPv6 unique-local range, the unspecified
+// address, the shared address space carriers use, multicast, the reserved
+// quarter of IPv4. Each of those can be a way in.
+func isPublic(ip net.IP) bool {
+	if len(ip) == 0 {
+		return false
+	}
+	// An IPv4 address carried inside an IPv6 one - mapped, or embedded by a
+	// translation prefix - is judged as the IPv4 address it names: through
+	// NAT64 or 6to4, 64:ff9b::a00:7 is 10.0.0.7.
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		ip = v4
+	}
+	if ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	for _, r := range reservedRanges {
+		if r.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+// reservedRanges are the special-purpose ranges of the IANA registries that are
+// not globally reachable and that net.IP has no predicate for.
+var reservedRanges = parseCIDRs(
+	"0.0.0.0/8",       // "this" network
+	"100.64.0.0/10",   // shared address space (RFC 6598)
+	"192.0.0.0/24",    // IETF protocol assignments
+	"192.0.2.0/24",    // documentation (TEST-NET-1)
+	"198.18.0.0/15",   // benchmarking
+	"198.51.100.0/24", // documentation (TEST-NET-2)
+	"203.0.113.0/24",  // documentation (TEST-NET-3)
+	"240.0.0.0/4",     // reserved, and the broadcast address
+	"100::/64",        // discard-only
+	"2001:db8::/32",   // documentation
+)
+
+var (
+	nat64WellKnown = parseCIDRs("64:ff9b::/96")[0]
+	sixToFour      = parseCIDRs("2002::/16")[0]
+)
+
+// embeddedIPv4 is the IPv4 address an address carries, or nil: an IPv4 address
+// itself, an IPv4-mapped IPv6 address, or the address a translation prefix
+// embeds.
+func embeddedIPv4(ip net.IP) net.IP {
+	if v4 := ip.To4(); v4 != nil {
+		return v4
+	}
+	if len(ip) != net.IPv6len {
+		return nil
+	}
+	switch {
+	case nat64WellKnown.Contains(ip):
+		return net.IPv4(ip[12], ip[13], ip[14], ip[15])
+	case sixToFour.Contains(ip):
+		return net.IPv4(ip[2], ip[3], ip[4], ip[5])
+	}
+	return nil
+}
+
+func parseCIDRs(cidrs ...string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
 		_, ipNet, err := net.ParseCIDR(cidr)
 		if err != nil {
 			panic(err)
@@ -118,15 +183,6 @@ var privateRanges = func() []*net.IPNet {
 		nets = append(nets, ipNet)
 	}
 	return nets
-}()
-
-func isPrivate(ip net.IP) bool {
-	for _, cidr := range privateRanges {
-		if cidr.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }
 
 // Resolver turns a host name into addresses. It is a function so a test can
@@ -148,23 +204,30 @@ func SystemResolver(ctx context.Context, host string) ([]net.IP, error) {
 }
 
 // ipPolicy decides whether a host may be posted to: refused if ANY address it
-// resolves to is private and not allowed. All addresses, not the first - a name
-// with one public and one private address would otherwise pass or fail by the
-// order the resolver happened to answer in.
+// resolves to is not public and not allowed. All addresses, not the first - a
+// name with one public and one private address would otherwise pass or fail by
+// the order the resolver happened to answer in.
 type ipPolicy struct {
 	allowed []*net.IPNet
 	resolve Resolver
 }
 
 // ErrBlockedAddress is a subscriber whose address the installation forbids.
-var ErrBlockedAddress = fmt.Errorf("webhook: the address is in a private range this installation does not allow")
+var ErrBlockedAddress = fmt.Errorf("webhook: the address is not public and this installation does not allow it")
 
+// allowedIP: public, or inside a range the installation allowed. The allowlist
+// is judged over the same address the policy judged, so an allowed IPv4 range
+// covers the address whichever way it is written.
 func (p ipPolicy) allowedIP(ip net.IP) bool {
-	if !isPrivate(ip) {
+	if isPublic(ip) {
 		return true
 	}
+	judged := ip
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		judged = v4
+	}
 	for _, cidr := range p.allowed {
-		if cidr.Contains(ip) {
+		if cidr.Contains(ip) || cidr.Contains(judged) {
 			return true
 		}
 	}
