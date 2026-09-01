@@ -1,0 +1,522 @@
+package webhook
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
+)
+
+// The channel, against real HTTP servers on the loopback - which is a private
+// range, so every test that expects a delivery also exercises the allow list.
+
+const (
+	subscriberID = "int-a"
+	eventID      = "evt-1"
+	eventBody    = `{"event":"alert_group.firing","alert_group":{"id":"ag-1"}}`
+)
+
+// configs is the store as the channel sees it, and a test's hand on it.
+type configs struct {
+	cfg   model.GenericWebhookConfig
+	found bool
+	err   error
+	reads atomic.Int32
+	// block, when set, makes the read wait for the context: the budget test.
+	block bool
+}
+
+func (c *configs) SubscriberConfig(ctx context.Context, id string) (model.GenericWebhookConfig, bool, error) {
+	c.reads.Add(1)
+	if c.block {
+		<-ctx.Done()
+		return model.GenericWebhookConfig{}, false, ctx.Err()
+	}
+	if c.err != nil {
+		return model.GenericWebhookConfig{}, false, c.err
+	}
+	if !c.found {
+		return model.GenericWebhookConfig{}, false, nil
+	}
+	return c.cfg, true, nil
+}
+
+func loopback(t *testing.T) []*net.IPNet {
+	t.Helper()
+	_, lo, err := net.ParseCIDR("127.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []*net.IPNet{lo}
+}
+
+func payloadRaw(t *testing.T, subscriber string) []byte {
+	t.Helper()
+	raw, err := json.Marshal(keys.WebhookPayloadV1{
+		Target:    keys.Target{Kind: keys.TargetSubscriber, Ref: subscriber},
+		EventID:   eventID,
+		EventType: keys.WebhookEventFiring,
+		Body:      eventBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func intentFor(t *testing.T, subscriber string) outbound.Intent {
+	t.Helper()
+	return outbound.Intent{
+		ID: "intent-1", KeyKind: keys.KindWebhookEvent, Provider: keys.ProviderWebhook,
+		TargetKind: keys.TargetSubscriber, TargetRef: subscriber, Form: outbound.FormOneShot,
+		Payload: payloadRaw(t, subscriber), PayloadSchemaVersion: 1,
+	}
+}
+
+func callTo(t *testing.T, endpoint string) outbound.Call {
+	t.Helper()
+	return outbound.Call{
+		IntentID: "intent-1", AttemptID: "attempt-1", Provider: keys.ProviderWebhook,
+		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationDeliver,
+		Endpoint: endpoint, ProviderKey: "create-key",
+		KeyKind: keys.KindWebhookEvent, Family: outbound.FamilyWebhook,
+		Payload: payloadRaw(t, subscriberID), PayloadSchemaVersion: 1,
+	}
+}
+
+// received is what a test server saw.
+type received struct {
+	calls   atomic.Int32
+	body    atomic.Value
+	headers atomic.Value
+}
+
+func serve(t *testing.T, status int, rec *received) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rec != nil {
+			rec.calls.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			rec.body.Store(string(body))
+			rec.headers.Store(r.Header.Clone())
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte("thanks"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestAnEventIsPostedAsTheContractSays: the body is the payload's body byte for
+// byte, the headers are ours, the signature verifies with the subscriber's
+// secret over "<timestamp>.<body>", and the acceptance names no object - which
+// the kind allows.
+func TestAnEventIsPostedAsTheContractSays(t *testing.T) {
+	rec := &received{}
+	srv := serve(t, http.StatusOK, rec)
+	store := &configs{found: true, cfg: model.GenericWebhookConfig{
+		URL: srv.URL, Secret: "s3cret", CustomHeaders: map[string]string{"X-Team": "sre"}}}
+	h := NewHandler(store, loopback(t))
+
+	prepared := h.Prepare(context.Background(), intentFor(t, subscriberID))
+	if prepared.Outcome() != outbound.PreparationReady {
+		t.Fatalf("prepared as %+v", prepared)
+	}
+	call := callTo(t, srv.URL)
+	result, err := h.ExecuteAttempt(context.Background(), call)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	concluded, breach := outbound.Conclude(h, call, result, err)
+	if breach != outbound.BreachNone || concluded.Outcome() != outbound.OutcomeAccepted {
+		t.Fatalf("a 200 concluded %q with breach %q", concluded.Outcome(), breach)
+	}
+	if concluded.Completion().ReceiptRefOrEmpty() != "" {
+		t.Fatal("a POST named an object")
+	}
+
+	if rec.calls.Load() != 1 {
+		t.Fatalf("the subscriber was called %d times", rec.calls.Load())
+	}
+	if got := rec.body.Load().(string); got != eventBody {
+		t.Fatalf("the body arrived as\n  %s\nand was\n  %s", got, eventBody)
+	}
+	headers := rec.headers.Load().(http.Header)
+	if headers.Get(HeaderEvent) != "alert_group.firing" || headers.Get(HeaderEventID) != eventID ||
+		headers.Get(HeaderContentType) != "application/json" || headers.Get("X-Team") != "sre" {
+		t.Fatalf("headers %v", headers)
+	}
+	ts := headers.Get(HeaderTimestamp)
+	if _, err := strconv.ParseInt(ts, 10, 64); err != nil {
+		t.Fatalf("timestamp %q", ts)
+	}
+	if want := "sha256=" + Sign(ts, []byte(eventBody), "s3cret"); headers.Get(HeaderSignature) != want {
+		t.Fatalf("signature %q, want %q", headers.Get(HeaderSignature), want)
+	}
+}
+
+// TestOurHeadersWinOverTheSubscribers: a configuration that names our headers -
+// saved before the check on the way in existed, in any case - loses at the
+// request. All five of them, in mixed case.
+func TestOurHeadersWinOverTheSubscribers(t *testing.T) {
+	rec := &received{}
+	srv := serve(t, http.StatusOK, rec)
+	store := &configs{found: true, cfg: model.GenericWebhookConfig{
+		URL: srv.URL, Secret: "s3cret", CustomHeaders: map[string]string{
+			"x-tokay-event-id":  "forged",
+			"X-TOKAY-EVENT":     "forged",
+			"X-Tokay-Timestamp": "0",
+			"x-tokay-signature": "sha256=forged",
+			"content-type":      "text/plain",
+			"X-Real":            "kept",
+		}}}
+	h := NewHandler(store, loopback(t))
+	if _, err := h.ExecuteAttempt(context.Background(), callTo(t, srv.URL)); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	headers := rec.headers.Load().(http.Header)
+	if headers.Get(HeaderEventID) != eventID || headers.Get(HeaderEvent) != "alert_group.firing" ||
+		headers.Get(HeaderContentType) != "application/json" || headers.Get(HeaderTimestamp) == "0" ||
+		headers.Get(HeaderSignature) == "sha256=forged" {
+		t.Fatalf("a subscriber's configuration replaced our headers: %v", headers)
+	}
+	if headers.Get("X-Real") != "kept" {
+		t.Fatal("an ordinary custom header was dropped")
+	}
+	for _, name := range []string{"x-tokay-event-id", "X-Tokay-Event-ID", "Content-Type", "content-type", "X-TOKAY-Anything"} {
+		if !IsReservedHeader(name) {
+			t.Errorf("%s is not reserved", name)
+		}
+	}
+	if IsReservedHeader("X-Team") || IsReservedHeader("Authorization") {
+		t.Error("an ordinary header is reserved")
+	}
+}
+
+// TestTheSecretIsReadAgainAndTheAddressIsNot: between the preparation and the
+// call the subscriber rotated its secret and moved its URL. The signature uses
+// the new secret; the POST goes to the address the generation is bound to.
+func TestTheSecretIsReadAgainAndTheAddressIsNot(t *testing.T) {
+	bound := &received{}
+	boundSrv := serve(t, http.StatusOK, bound)
+	moved := &received{}
+	movedSrv := serve(t, http.StatusOK, moved)
+
+	store := &configs{found: true, cfg: model.GenericWebhookConfig{URL: boundSrv.URL, Secret: "old"}}
+	h := NewHandler(store, loopback(t))
+	prepared := h.Prepare(context.Background(), intentFor(t, subscriberID))
+	if prepared.Outcome() != outbound.PreparationReady {
+		t.Fatalf("prepared as %+v", prepared)
+	}
+
+	store.cfg = model.GenericWebhookConfig{URL: movedSrv.URL, Secret: "new"}
+	if _, err := h.ExecuteAttempt(context.Background(), callTo(t, boundSrv.URL)); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if bound.calls.Load() != 1 || moved.calls.Load() != 0 {
+		t.Fatalf("the bound address was called %d times, the moved one %d",
+			bound.calls.Load(), moved.calls.Load())
+	}
+	headers := bound.headers.Load().(http.Header)
+	ts := headers.Get(HeaderTimestamp)
+	if headers.Get(HeaderSignature) != "sha256="+Sign(ts, []byte(eventBody), "new") {
+		t.Fatal("the request was signed with the secret the preparation saw, not the current one")
+	}
+	if store.reads.Load() != 2 {
+		t.Fatalf("the configuration was read %d times, once per half is 2", store.reads.Load())
+	}
+}
+
+// TestTheSubscribersAnswerIsClassifiedByRange: through Conclude, with the real
+// handler, over the whole rule and not a list of examples - 409, 418 and 499 are
+// refusals like 400 is, every 3xx is a redirect not followed, and 5xx is left
+// to the domain, which answers doubt.
+func TestTheSubscribersAnswerIsClassifiedByRange(t *testing.T) {
+	cases := []struct {
+		code    int
+		outcome outbound.Outcome
+		class   string
+	}{
+		{200, outbound.OutcomeAccepted, ""}, {202, outbound.OutcomeAccepted, ""}, {204, outbound.OutcomeAccepted, ""},
+		{429, outbound.OutcomeRetryableRejection, "rate_limited"},
+		{408, outbound.OutcomeRetryableRejection, "request_timeout"},
+		{301, outbound.OutcomePermanentRejection, "redirect_not_followed"},
+		{302, outbound.OutcomePermanentRejection, "redirect_not_followed"},
+		{307, outbound.OutcomePermanentRejection, "redirect_not_followed"},
+		{308, outbound.OutcomePermanentRejection, "redirect_not_followed"},
+		{400, outbound.OutcomePermanentRejection, "rejected_4xx"},
+		{401, outbound.OutcomePermanentRejection, "rejected_4xx"},
+		{404, outbound.OutcomePermanentRejection, "rejected_4xx"},
+		{409, outbound.OutcomePermanentRejection, "rejected_4xx"},
+		{418, outbound.OutcomePermanentRejection, "rejected_4xx"},
+		{499, outbound.OutcomePermanentRejection, "rejected_4xx"},
+		{500, outbound.OutcomeAmbiguous, "unknown_status"},
+		{502, outbound.OutcomeAmbiguous, "unknown_status"},
+		{599, outbound.OutcomeAmbiguous, "unknown_status"},
+	}
+	for _, tc := range cases {
+		t.Run(strconv.Itoa(tc.code), func(t *testing.T) {
+			h := NewHandler(&configs{found: true}, loopback(t))
+			result := outbound.Result{Evidence: outbound.ProviderResponse, Status: strconv.Itoa(tc.code)}
+			concluded, breach := outbound.Conclude(h, callTo(t, "https://example.com"), result, nil)
+			if breach != outbound.BreachNone {
+				t.Fatalf("breach %q", breach)
+			}
+			if concluded.Outcome() != tc.outcome {
+				t.Errorf("HTTP %d concluded %q, want %q", tc.code, concluded.Outcome(), tc.outcome)
+			}
+			class := ""
+			if concluded.Completion().ErrorClass != nil {
+				class = *concluded.Completion().ErrorClass
+			}
+			if class != tc.class {
+				t.Errorf("HTTP %d classified %q, want %q", tc.code, class, tc.class)
+			}
+		})
+	}
+	// Whole ranges, not the examples above: every 4xx that is not 408 or 429 is a
+	// refusal; every 3xx is a redirect; nothing from 500 up is the channel's to say.
+	h := NewHandler(&configs{found: true}, loopback(t))
+	for code := 300; code < 600; code++ {
+		got, known := h.ClassifyResponse(outbound.Result{Status: strconv.Itoa(code)})
+		switch {
+		case code < 400:
+			if !known || got.Outcome != outbound.OutcomePermanentRejection || got.Class != "redirect_not_followed" {
+				t.Errorf("HTTP %d: %+v %v", code, got, known)
+			}
+		case code == 408 || code == 429:
+			if !known || got.Outcome != outbound.OutcomeRetryableRejection {
+				t.Errorf("HTTP %d: %+v %v", code, got, known)
+			}
+		case code < 500:
+			if !known || got.Outcome != outbound.OutcomePermanentRejection || got.Class != "rejected_4xx" {
+				t.Errorf("HTTP %d: %+v %v", code, got, known)
+			}
+		default:
+			if known {
+				t.Errorf("HTTP %d was classified by the channel: %+v", code, got)
+			}
+		}
+	}
+	if _, known := h.ClassifyResponse(outbound.Result{Status: "ok"}); known {
+		t.Error("a status that is not a number was classified")
+	}
+}
+
+// TestARedirectIsNotFollowed: the subscriber answers 301 to a working address;
+// that address is never called, the 301 is the answer, and it is a refusal.
+func TestARedirectIsNotFollowed(t *testing.T) {
+	final := &received{}
+	finalSrv := serve(t, http.StatusOK, final)
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, finalSrv.URL, http.StatusMovedPermanently)
+	}))
+	t.Cleanup(redirect.Close)
+
+	h := NewHandler(&configs{found: true, cfg: model.GenericWebhookConfig{URL: redirect.URL}}, loopback(t))
+	call := callTo(t, redirect.URL)
+	result, err := h.ExecuteAttempt(context.Background(), call)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if result.Status != "301" {
+		t.Fatalf("the answer recorded is %q, want the redirect itself", result.Status)
+	}
+	if final.calls.Load() != 0 {
+		t.Fatalf("the redirect was followed: the final address was called %d times", final.calls.Load())
+	}
+	concluded, _ := outbound.Conclude(h, call, result, err)
+	if concluded.Outcome() != outbound.OutcomePermanentRejection {
+		t.Fatalf("a redirect concluded %q", concluded.Outcome())
+	}
+}
+
+// TestPreparationRefusesWhatWillNotChangeAndWaitsForWhatMight: the closed set
+// of preparation answers, each for its reason.
+func TestPreparationRefusesWhatWillNotChangeAndWaitsForWhatMight(t *testing.T) {
+	public := func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("93.184.216.34")}, nil }
+	mixed := func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("93.184.216.34"), net.ParseIP("10.0.0.7")}, nil
+	}
+	nxdomain := func(_ context.Context, host string) ([]net.IP, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+
+	cases := []struct {
+		name    string
+		store   *configs
+		resolve Resolver
+		intent  func(outbound.Intent) outbound.Intent
+		outcome outbound.PreparationOutcome
+		class   string
+	}{
+		{"a subscriber that exists", &configs{found: true, cfg: model.GenericWebhookConfig{URL: "https://hooks.example.com/a"}},
+			public, nil, outbound.PreparationReady, ""},
+		{"no such subscriber", &configs{found: false}, public, nil, outbound.PreparationPermanent, "integration_missing"},
+		{"the database failed", &configs{err: errors.New("connection reset")}, public, nil,
+			outbound.PreparationTransient, "config_read_failed"},
+		{"no URL", &configs{found: true}, public, nil, outbound.PreparationPermanent, "url_missing"},
+		{"an unusable URL", &configs{found: true, cfg: model.GenericWebhookConfig{URL: "::not a url"}}, public, nil,
+			outbound.PreparationPermanent, "url_invalid"},
+		{"one private address among public ones", &configs{found: true, cfg: model.GenericWebhookConfig{URL: "https://hooks.example.com/a"}},
+			mixed, nil, outbound.PreparationPermanent, "ip_policy"},
+		{"a name that does not resolve", &configs{found: true, cfg: model.GenericWebhookConfig{URL: "https://hooks.example.com/a"}},
+			nxdomain, nil, outbound.PreparationTransient, "dns"},
+		{"a payload for another subscriber", &configs{found: true}, public,
+			func(i outbound.Intent) outbound.Intent { i.TargetRef = "int-b"; return i },
+			outbound.PreparationPermanent, "target_mismatch"},
+		{"a payload that does not read", &configs{found: true}, public,
+			func(i outbound.Intent) outbound.Intent { i.Payload = []byte(`{"body":`); return i },
+			outbound.PreparationPermanent, "payload_unreadable"},
+		{"a kind this channel does not deliver", &configs{found: true}, public,
+			func(i outbound.Intent) outbound.Intent { i.KeyKind = keys.KindHandoff; return i },
+			outbound.PreparationPermanent, "unsupported_kind"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewHandlerResolving(tc.store, nil, tc.resolve)
+			intent := intentFor(t, subscriberID)
+			if tc.intent != nil {
+				intent = tc.intent(intent)
+			}
+			prepared := h.Prepare(context.Background(), intent)
+			req := prepared.Request(intent.ID, "lease", "worker")
+			if req.Preparation != tc.outcome || req.ErrorClass != tc.class {
+				t.Fatalf("prepared as %s / %q, want %s / %q", req.Preparation, req.ErrorClass, tc.outcome, tc.class)
+			}
+			if tc.outcome == outbound.PreparationReady && req.BoundEndpoint != tc.store.cfg.URL {
+				t.Fatalf("bound to %q", req.BoundEndpoint)
+			}
+		})
+	}
+}
+
+// TestAConfigurationThatCannotBeReadIsARequestThatNeverLeft: inside the attempt,
+// the database failing, the subscriber gone, or the read outliving its budget is
+// evidence of absence - the request was never built - and not the doubt an
+// unrecognised error would otherwise become.
+func TestAConfigurationThatCannotBeReadIsARequestThatNeverLeft(t *testing.T) {
+	rec := &received{}
+	srv := serve(t, http.StatusOK, rec)
+	for name, store := range map[string]*configs{
+		"the database failed":      {err: errors.New("connection reset")},
+		"the subscriber is gone":   {found: false},
+		"the read outlives budget": {block: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := NewHandler(store, loopback(t))
+			h.budget = 50 * time.Millisecond
+			started := time.Now()
+			result, err := h.ExecuteAttempt(context.Background(), callTo(t, srv.URL))
+			if err == nil {
+				t.Fatal("a call with no configuration went out")
+			}
+			if result.Evidence != outbound.DefinitelyNotSent {
+				t.Fatalf("recorded as %q, want definitely not sent", result.Evidence)
+			}
+			if store.block && time.Since(started) > time.Second {
+				t.Fatalf("the read was not bounded by its budget: %s", time.Since(started))
+			}
+		})
+	}
+	if rec.calls.Load() != 0 {
+		t.Fatalf("the subscriber was called %d times without a configuration", rec.calls.Load())
+	}
+}
+
+// TestAnAddressThatMovedIntoAPrivateRangeIsBlockedAtTheSocket: the preparation
+// saw a public address and bound it; by the dial the name answers with a private
+// one. The dial refuses, the request provably never left, and the next
+// preparation will refuse for good.
+func TestAnAddressThatMovedIntoAPrivateRangeIsBlockedAtTheSocket(t *testing.T) {
+	rec := &received{}
+	srv := serve(t, http.StatusOK, rec)
+	var answers atomic.Int32
+	flipping := func(context.Context, string) ([]net.IP, error) {
+		if answers.Add(1) == 1 {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil // preparation: public
+		}
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil // dial: private
+	}
+	store := &configs{found: true, cfg: model.GenericWebhookConfig{URL: "http://moved.example.com/hook"}}
+	h := NewHandlerResolving(store, nil, flipping)
+
+	if prepared := h.Prepare(context.Background(), intentFor(t, subscriberID)); prepared.Outcome() != outbound.PreparationReady {
+		t.Fatalf("prepared as %+v", prepared)
+	}
+	result, err := h.ExecuteAttempt(context.Background(), callTo(t, "http://moved.example.com"+srv.URL[strings.LastIndex(srv.URL, ":"):]+"/hook"))
+	if err == nil {
+		t.Fatal("a request to a blocked address went out")
+	}
+	if !errors.Is(err, ErrBlockedAddress) || result.Evidence != outbound.DefinitelyNotSent {
+		t.Fatalf("recorded as %q: %v", result.Evidence, err)
+	}
+	if rec.calls.Load() != 0 {
+		t.Fatal("the private address was reached")
+	}
+	if prepared := h.Prepare(context.Background(), intentFor(t, subscriberID)); prepared.Outcome() != outbound.PreparationPermanent {
+		t.Fatalf("the next preparation did not refuse for good: %+v", prepared)
+	}
+}
+
+// TestASubscriberIsGivenItsTimeoutAndNoMore: a subscriber that never answers is
+// doubt after ITS timeout, not after the attempt's; and a saved timeout above
+// the ceiling is clamped, at the read before the call.
+func TestASubscriberIsGivenItsTimeoutAndNoMore(t *testing.T) {
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The body is read first: until it is, the server does not watch the
+		// connection and would never see the client give up. Bounded either
+		// way, so a test that is wrong cannot hang the run.
+		_, _ = io.ReadAll(r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	t.Cleanup(hang.Close)
+	store := &configs{found: true, cfg: model.GenericWebhookConfig{URL: hang.URL, TimeoutSeconds: 1}}
+	h := NewHandler(store, loopback(t))
+	started := time.Now()
+	result, err := h.ExecuteAttempt(context.Background(), callTo(t, hang.URL))
+	if err == nil {
+		t.Fatal("a subscriber that never answered was accepted")
+	}
+	if result.Evidence != outbound.PossiblySent {
+		t.Fatalf("a timeout after the request went out was recorded as %q", result.Evidence)
+	}
+	if elapsed := time.Since(started); elapsed < time.Second || elapsed > 3*time.Second {
+		t.Fatalf("the call took %s for a one-second timeout", elapsed)
+	}
+
+	for seconds, want := range map[int]time.Duration{
+		0: 30 * time.Second, 10: 10 * time.Second, 30: 30 * time.Second,
+		45: 30 * time.Second, 60: 30 * time.Second,
+	} {
+		if got := EffectiveTimeout(model.GenericWebhookConfig{TimeoutSeconds: seconds}); got != want {
+			t.Errorf("timeout_seconds=%d gives %s, want %s", seconds, got, want)
+		}
+	}
+}
+
+// TestTheSignatureIsTheOneSubscribersAlreadyVerify pins the algorithm the
+// documentation describes - HMAC-SHA256 over "<timestamp>.<body>", hex - so the
+// move from the old worker changed nothing a subscriber checks. The vector was
+// computed independently of this code.
+func TestTheSignatureIsTheOneSubscribersAlreadyVerify(t *testing.T) {
+	const want = "3defdef6e81edf86cf66b409ee5c4e4a970a624585ef5ab39c4f08187a091bcc"
+	if got := Sign("1700000000", []byte(`{"event":"alert_group.firing"}`), "s3cret"); got != want {
+		t.Fatalf("the signature is %s, subscribers verify %s", got, want)
+	}
+}

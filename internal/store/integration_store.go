@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -393,4 +394,42 @@ func stringPtrToNullString(s *string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: *s, Valid: true}
+}
+
+// SubscriberConfig reads one generic webhook integration's configuration for the
+// delivery channel, under the caller's context.
+//
+// From the database, not the cache: the cache holds no generic webhooks and is
+// refreshed only by the process that handled a change, so a secret rotated on
+// one instance would leave every other signing with the old one. Under the
+// caller's context, because the channel reads this inside an attempt whose
+// every step has a deadline, and a read that could outlive them would hold a
+// slot the deadlines exist to free.
+//
+// The bool is whether the subscriber exists; an id that names an integration of
+// another type is not a subscriber either. An error is the database failing,
+// and the two are different answers to a delivery.
+func (s *Store) SubscriberConfig(ctx context.Context, integrationID string) (model.GenericWebhookConfig, bool, error) {
+	var kind model.IntegrationType
+	var encrypted string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT type, config FROM integrations WHERE id = $1`, integrationID).Scan(&kind, &encrypted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.GenericWebhookConfig{}, false, nil
+	}
+	if err != nil {
+		return model.GenericWebhookConfig{}, false, err
+	}
+	if kind != model.IntegrationTypeGenericWebhook {
+		return model.GenericWebhookConfig{}, false, nil
+	}
+	raw, err := decryptConfig(encrypted)
+	if err != nil {
+		return model.GenericWebhookConfig{}, false, err
+	}
+	var cfg model.GenericWebhookConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return model.GenericWebhookConfig{}, false, fmt.Errorf("subscriber %s: configuration does not read: %w", integrationID, err)
+	}
+	return cfg, true, nil
 }
