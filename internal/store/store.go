@@ -857,6 +857,38 @@ func (s *Store) buildSchema() error {
 		return err
 	}
 
+	// The delivery history of a subscriber outlives the subscriber. The old
+	// deliveries table referenced integrations without ON DELETE, so deleting an
+	// integration with any history answered 500; the table stays until the
+	// cutover removes it by hand, but its foreign key goes now, on every start
+	// that finds the table. The table and its rows are not touched.
+	if _, err := s.db.Exec(`
+	DO $$
+	BEGIN
+		IF to_regclass('event_outbox_deliveries') IS NOT NULL THEN
+			ALTER TABLE event_outbox_deliveries
+				DROP CONSTRAINT IF EXISTS event_outbox_deliveries_integration_id_fkey;
+		END IF;
+	END $$;`); err != nil {
+		return err
+	}
+
+	// What remains of a deleted integration: enough to decide who may read its
+	// delivery history. Written in the transaction that deletes it, read by the
+	// scope resolver of the delivery routes and by nothing that creates work.
+	// The scope is frozen at deletion on purpose - it describes a historical
+	// object, and who could see that history must not change afterwards.
+	if _, err := s.db.Exec(`
+	CREATE TABLE IF NOT EXISTS integration_tombstones (
+		id         TEXT PRIMARY KEY,
+		type       TEXT NOT NULL,
+		scope      TEXT,
+		team_id    TEXT,
+		deleted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`); err != nil {
+		return err
+	}
+
 	// Outbound delivery: the tables an outgoing commitment lives in. Last,
 	// because two of them reference alert_groups, and under their own lock -
 	// see outbound_schema.go.

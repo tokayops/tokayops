@@ -20,8 +20,29 @@ const (
 	outboundPayloadDigestLenConstraint = "outbound_intents_payload_digest_len"
 
 	// The pair of columns that must agree inside one row, on both tables.
-	outboundBatchFamilyConstraint  = "outbound_batches_family_matches_kind"
-	outboundIntentFamilyConstraint = "outbound_intents_family_matches_kind"
+	//
+	// The name carries the version of the vocabulary, and that is the whole
+	// upgrade mechanism: a guarded constraint is added only when its NAME is
+	// absent, so extending the CHECK under the old name would reach a fresh
+	// database and never an existing one - which would keep the old rule and
+	// refuse the first row of any family added since. A new vocabulary is a new
+	// name plus the removal of the old.
+	outboundBatchFamilyConstraint  = "outbound_batches_family_matches_kind_v2"
+	outboundIntentFamilyConstraint = "outbound_intents_family_matches_kind_v2"
+
+	// The names the previous vocabulary was held under. Dropped on every start;
+	// a no-op once they are gone.
+	outboundBatchFamilyConstraintV1  = "outbound_batches_family_matches_kind"
+	outboundIntentFamilyConstraintV1 = "outbound_intents_family_matches_kind"
+
+	// A webhook delivery's own three rules. The first two are the handover's
+	// rules again, for the same reason: the business key names the event and the
+	// subscriber and NOT the target kind or the provider, so a row could be
+	// consistent with itself and still be aimed at a person or executed by a
+	// worker with no channel for it.
+	outboundWebhookSubscriberTarget   = "outbound_intents_webhook_targets_a_subscriber"
+	outboundWebhookTargetAgreement    = "outbound_intents_webhook_payload_addresses_the_target"
+	outboundWebhookProviderConstraint = "outbound_intents_webhook_provider"
 
 	// The claim's identity, and the commitment that has to point at all of it.
 	outboundBatchIdentityUnique = "outbound_batches_identity"
@@ -40,6 +61,7 @@ const (
 const familyOfKindSQL = `(
 	(key_kind IN ('escalation', 'escalation_replay') AND delivery_family = 'notification')
 	OR (key_kind = 'handoff' AND delivery_family = 'handoff')
+	OR (key_kind IN ('webhook_event', 'webhook_replay') AND delivery_family = 'webhook')
 )`
 
 // applyPayloadDigest brings a database to the shape this build needs, in the
@@ -100,6 +122,22 @@ func applyPayloadDigest(ctx context.Context, tx *sql.Tx) error {
 				`CHECK (octet_length(payload_digest) = 32)`),
 		},
 		{
+			// The old vocabulary goes first, then the new one arrives under its
+			// own name. Both statements are no-ops on a database that has been
+			// through this once, and on one that has not the old rule is gone
+			// before a webhook row could meet it.
+			what: "drop " + outboundBatchFamilyConstraintV1,
+			sql: `ALTER TABLE outbound_batches DROP CONSTRAINT IF EXISTS ` +
+				outboundBatchFamilyConstraintV1,
+		},
+		{
+			what: "drop " + outboundIntentFamilyConstraintV1,
+			sql: `ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+				outboundIntentFamilyConstraintV1,
+		},
+		{
+			// Validating, not NOT VALID: the new vocabulary is a superset of the
+			// old, so no existing row can contradict it and the check is cheap.
 			what: outboundBatchFamilyConstraint,
 			sql: guardedConstraint("outbound_batches", outboundBatchFamilyConstraint,
 				`CHECK `+familyOfKindSQL),
@@ -156,6 +194,37 @@ func applyPayloadDigest(ctx context.Context, tx *sql.Tx) error {
 			what: outboundHandoffPersonTarget,
 			sql: guardedConstraint("outbound_intents", outboundHandoffPersonTarget,
 				`CHECK (key_kind <> 'handoff' OR target_kind = 'user')`),
+		},
+		{
+			// A webhook is delivered to a subscriber. Its business key carries
+			// the event and the integration id and not the target kind, so a
+			// row aimed at a person of the same id would share the key with the
+			// one aimed at the subscriber.
+			what: outboundWebhookSubscriberTarget,
+			sql: guardedConstraint("outbound_intents", outboundWebhookSubscriberTarget,
+				`CHECK (key_kind NOT IN ('webhook_event', 'webhook_replay')
+					OR target_kind = 'subscriber')`),
+		},
+		{
+			// The handover rule again, for the webhook kinds: the payload names
+			// the subscriber it was composed for, the columns name the one it is
+			// delivered to, and the two must be one.
+			what: outboundWebhookTargetAgreement,
+			sql: guardedConstraint("outbound_intents", outboundWebhookTargetAgreement,
+				`CHECK (
+					key_kind NOT IN ('webhook_event', 'webhook_replay')
+					OR (payload->'target'->>'kind' IS NOT DISTINCT FROM target_kind
+						AND payload->'target'->>'ref' IS NOT DISTINCT FROM target_ref)
+				)`),
+		},
+		{
+			// The family has one provider, and it is not in the key. A row in
+			// the webhook partition naming any other would sit in a queue
+			// whose worker has no channel for it and no other worker sees.
+			what: outboundWebhookProviderConstraint,
+			sql: guardedConstraint("outbound_intents", outboundWebhookProviderConstraint,
+				`CHECK (key_kind NOT IN ('webhook_event', 'webhook_replay')
+					OR provider = 'webhook')`),
 		},
 	} {
 		if _, err := tx.ExecContext(ctx, step.sql); err != nil {

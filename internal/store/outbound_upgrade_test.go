@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
@@ -53,10 +54,218 @@ func previousOutboundShape(t *testing.T, s *Store) {
 			outboundHandoffTargetAgreement,
 		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
 			outboundHandoffPersonTarget,
+		// Nor anything the webhook family brought.
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+			outboundWebhookSubscriberTarget,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+			outboundWebhookTargetAgreement,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` +
+			outboundWebhookProviderConstraint,
 		`ALTER TABLE outbound_intents DROP COLUMN IF EXISTS payload_digest`,
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
 			t.Fatalf("build the previous shape: %v", err)
+		}
+	}
+}
+
+// sprint3OutboundShape is the schema as the version before the webhook family
+// left it: the family vocabulary held under its FIRST name, with escalation and
+// handover in it and nothing else; no webhook rules; no subscriber index; no
+// tombstones; and the old deliveries table still holding its foreign key to
+// integrations.
+//
+// The distinction from previousOutboundShape matters: this is the shape on which
+// the rename of the vocabulary constraint is the whole upgrade, and a test from
+// a fresh schema cannot see it - there the constraint is created once under the
+// new name and the guard never meets the old.
+func sprint3OutboundShape(t *testing.T, s *Store) {
+	t.Helper()
+	const previousVocabulary = `(
+		(key_kind IN ('escalation', 'escalation_replay') AND delivery_family = 'notification')
+		OR (key_kind = 'handoff' AND delivery_family = 'handoff')
+	)`
+	for _, statement := range []string{
+		`ALTER TABLE outbound_batches DROP CONSTRAINT IF EXISTS ` + outboundBatchFamilyConstraint,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundIntentFamilyConstraint,
+		`ALTER TABLE outbound_batches ADD CONSTRAINT ` + outboundBatchFamilyConstraintV1 +
+			` CHECK ` + previousVocabulary,
+		`ALTER TABLE outbound_intents ADD CONSTRAINT ` + outboundIntentFamilyConstraintV1 +
+			` CHECK ` + previousVocabulary,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundWebhookSubscriberTarget,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundWebhookTargetAgreement,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundWebhookProviderConstraint,
+		`DROP INDEX IF EXISTS idx_outbound_intents_subscriber`,
+		`DROP TABLE IF EXISTS integration_tombstones`,
+		`ALTER TABLE event_outbox_deliveries DROP CONSTRAINT IF EXISTS event_outbox_deliveries_integration_id_fkey`,
+		`ALTER TABLE event_outbox_deliveries ADD CONSTRAINT event_outbox_deliveries_integration_id_fkey
+			FOREIGN KEY (integration_id) REFERENCES integrations(id)`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatalf("build the Sprint 3 shape: %v", err)
+		}
+	}
+}
+
+func relationExists(t *testing.T, s *Store, name string) bool {
+	t.Helper()
+	var present bool
+	if err := s.db.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, name).Scan(&present); err != nil {
+		t.Fatalf("look for %s: %v", name, err)
+	}
+	return present
+}
+
+// insertWebhookRows writes one webhook claim and one webhook commitment the way
+// the store will, in raw SQL, so that a database can be asked whether it ACCEPTS
+// the family rather than whether a constraint with the right name is present.
+// The optional overrides are how the tests below make a row wrong in exactly
+// one way.
+func insertWebhookRows(s *Store, override func(batch, intent map[string]any)) error {
+	batchID, intentID := uuid.New().String(), uuid.New().String()
+	batch := map[string]any{
+		"key_kind": "webhook_event", "delivery_family": "webhook",
+	}
+	intent := map[string]any{
+		"key_kind": "webhook_event", "delivery_family": "webhook",
+		"provider": "webhook", "target_kind": "subscriber", "target_ref": "int-a",
+		"payload_kind": "subscriber", "payload_ref": "int-a",
+	}
+	if override != nil {
+		override(batch, intent)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		INSERT INTO outbound_batches
+			(id, batch_key, key_kind, delivery_family, grammar_version,
+			 fingerprint, fingerprint_version, admission_outcome, intent_count)
+		VALUES ($1, $2, $3, $4, 1, $5, 1, 'admitted', 1)`,
+		batchID, "evt-"+batchID, batch["key_kind"], batch["delivery_family"], digest32(0x20)); err != nil {
+		return err
+	}
+	payload := `{"target":{"kind":"` + intent["payload_kind"].(string) + `","ref":"` +
+		intent["payload_ref"].(string) +
+		`"},"event_id":"evt-1","event_type":"alert_group.firing","body":"{}"}`
+	if _, err := tx.Exec(`
+		INSERT INTO outbound_intents
+			(id, batch_id, idempotency_key, delivery_family, key_kind,
+			 grammar_version, provider, target_kind, target_ref,
+			 form, completion_mode, ambiguity_policy, payload_schema_version,
+			 payload, payload_digest, provider_key_codec_version, status,
+			 not_before, next_attempt_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5,
+			 1, $6, $7, $8,
+			 'one_shot', 'on_acceptance', 'retry', 1,
+			 $9::jsonb, decode(repeat('ab', 32), 'hex'), 1, 'pending',
+			 now(), now(), now() + interval '24 hours')`,
+		intentID, batchID, "int-"+intentID, intent["delivery_family"], intent["key_kind"],
+		intent["provider"], intent["target_kind"], intent["target_ref"], payload); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// TestAStartLearnsTheWebhookFamilyOnAnUpgradedDatabase is the upgrade the
+// fresh-schema tests cannot see. The family vocabulary is a CHECK, the CHECK is
+// guarded by name, and a database that already has the old name would keep the
+// old rule - refusing the first webhook row - unless the start removes it and
+// adds the new one under a new name. Proven by INSERTING webhook rows, because
+// the presence of a constraint with the right name proves nothing about what it
+// accepts.
+func TestAStartLearnsTheWebhookFamilyOnAnUpgradedDatabase(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	// Live escalations, so the vocabulary is validated against real rows.
+	agID := desiredGroup(t, s, "Disk filling up")
+	admitOne(t, s, agID, channelCommitment("C-ops", 0), dmCommitment("U-nina"))
+
+	sprint3OutboundShape(t, s)
+	if !hasNamedConstraint(t, s, "outbound_intents", outboundIntentFamilyConstraintV1) {
+		t.Fatal("the Sprint 3 shape does not hold the vocabulary under its first name")
+	}
+	if err := insertWebhookRows(s, nil); err == nil {
+		t.Fatal("the Sprint 3 shape accepted a webhook row: the test proves nothing")
+	}
+	if !hasNamedConstraint(t, s, "event_outbox_deliveries", "event_outbox_deliveries_integration_id_fkey") {
+		t.Fatal("the Sprint 3 shape does not hold the foreign key this start removes")
+	}
+
+	// The whole start, twice: the second one has to change nothing.
+	for round := 1; round <= 2; round++ {
+		if err := s.InitDB(); err != nil {
+			t.Fatalf("start %d against the Sprint 3 shape: %v", round, err)
+		}
+	}
+
+	for _, gone := range []struct{ table, name string }{
+		{"outbound_batches", outboundBatchFamilyConstraintV1},
+		{"outbound_intents", outboundIntentFamilyConstraintV1},
+		{"event_outbox_deliveries", "event_outbox_deliveries_integration_id_fkey"},
+	} {
+		if hasNamedConstraint(t, s, gone.table, gone.name) {
+			t.Errorf("%s is still on %s after the start", gone.name, gone.table)
+		}
+	}
+	for _, rule := range []struct{ table, name string }{
+		{"outbound_batches", outboundBatchFamilyConstraint},
+		{"outbound_intents", outboundIntentFamilyConstraint},
+		{"outbound_intents", outboundWebhookSubscriberTarget},
+		{"outbound_intents", outboundWebhookTargetAgreement},
+		{"outbound_intents", outboundWebhookProviderConstraint},
+	} {
+		var validated bool
+		if err := s.db.QueryRow(`SELECT convalidated FROM pg_constraint
+			WHERE conname = $1 AND conrelid = $2::regclass`, rule.name, rule.table).Scan(&validated); err != nil {
+			t.Errorf("%s did not arrive on %s: %v", rule.name, rule.table, err)
+		} else if !validated {
+			t.Errorf("%s is on %s but was never checked against its rows", rule.name, rule.table)
+		}
+	}
+	if !relationExists(t, s, "integration_tombstones") {
+		t.Error("the tombstones table did not arrive")
+	}
+	if !relationExists(t, s, "idx_outbound_intents_subscriber") {
+		t.Error("the subscriber index did not arrive")
+	}
+
+	// The point of the whole test: a webhook claim and commitment go in.
+	if err := insertWebhookRows(s, nil); err != nil {
+		t.Fatalf("the upgraded database refuses the webhook family: %v", err)
+	}
+	// The vocabulary still refuses the pairings it exists to refuse.
+	if err := insertWebhookRows(s, func(b, i map[string]any) {
+		b["delivery_family"], i["delivery_family"] = "notification", "notification"
+	}); err == nil {
+		t.Error("a webhook kind in the notification partition was accepted")
+	} else if !strings.Contains(err.Error(), "family_matches_kind_v2") {
+		t.Errorf("refused, but not by the vocabulary: %v", err)
+	}
+	// And each of the three webhook rules bites, by behaviour, on the upgraded
+	// database - not on a fresh one where CREATE TABLE could have carried them.
+	for _, refusal := range []struct {
+		name  string
+		spoil func(b, i map[string]any)
+	}{
+		// Aimed at a person in BOTH places, so the agreement rule is satisfied
+		// and the one about who a webhook is for is the one that answers.
+		// Postgres checks constraints in name order, and the agreement rule's
+		// name sorts first.
+		{outboundWebhookSubscriberTarget, func(b, i map[string]any) {
+			i["target_kind"], i["payload_kind"] = "user", "user"
+		}},
+		{outboundWebhookTargetAgreement, func(b, i map[string]any) { i["payload_ref"] = "int-b" }},
+		{outboundWebhookProviderConstraint, func(b, i map[string]any) { i["provider"] = "slack" }},
+	} {
+		err := insertWebhookRows(s, refusal.spoil)
+		if err == nil {
+			t.Errorf("the upgraded database accepted a row %s exists to forbid", refusal.name)
+		} else if !strings.Contains(err.Error(), refusal.name) {
+			t.Errorf("expected %s to refuse the row, got: %v", refusal.name, err)
 		}
 	}
 }
@@ -402,6 +611,9 @@ var outboundRulesAddedWithTheDigest = []struct{ table, name string }{
 	{"outbound_intents", outboundIntentBatchIdentity},
 	{"outbound_intents", outboundHandoffTargetAgreement},
 	{"outbound_intents", outboundHandoffPersonTarget},
+	{"outbound_intents", outboundWebhookSubscriberTarget},
+	{"outbound_intents", outboundWebhookTargetAgreement},
+	{"outbound_intents", outboundWebhookProviderConstraint},
 }
 
 // TestAStartFillsInThePayloadDigests.

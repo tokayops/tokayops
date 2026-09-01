@@ -81,6 +81,7 @@ func setupTestDB(t *testing.T) *Store {
 		"outbound_batches",
 		"event_outbox_deliveries",
 		"event_outbox",
+		"integration_tombstones",
 		"integrations",
 		"schedule_revisions",
 		"schedule_override_revisions",

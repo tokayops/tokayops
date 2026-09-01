@@ -410,6 +410,12 @@ CREATE INDEX IF NOT EXISTS idx_outbound_intents_group
 	WHERE alert_group_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_outbound_intents_status
 	ON outbound_intents (delivery_family, status);
+-- The delivery history of one subscriber, newest first: what the webhook API
+-- lists per integration. The family is in the predicate because target_ref is
+-- a user id for every other family, and this index has nothing to say there.
+CREATE INDEX IF NOT EXISTS idx_outbound_intents_subscriber
+	ON outbound_intents (target_ref, created_at DESC)
+	WHERE delivery_family = 'webhook';
 
 -- The journal is read by (intent, number) and by (intent, sequence), and both
 -- of those already have an index: the unique constraints that make those pairs
