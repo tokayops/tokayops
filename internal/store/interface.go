@@ -156,6 +156,12 @@ type StoreInterface interface {
 	CreateDeliveryAttempt(attempt *model.DeliveryAttempt) error
 	GetDeliveryAttempts(deliveryID string) ([]*model.DeliveryAttempt, error)
 
+	// Webhook deliveries: the delivery routes over the outbound domain's
+	// commitments. See webhook_delivery_store.go.
+	ListWebhookDeliveries(ctx context.Context, integrationID string, limit, offset int) ([]*model.OutboxDelivery, int, error)
+	WebhookDelivery(ctx context.Context, integrationID, deliveryID string) (*model.OutboxDelivery, []*model.DeliveryAttempt, error)
+	ReplayWebhookDelivery(ctx context.Context, req WebhookReplayRequest) (WebhookReplayResult, error)
+
 	// Metrics
 	GetMetricsSnapshot() (*model.MetricsSnapshot, error)
 

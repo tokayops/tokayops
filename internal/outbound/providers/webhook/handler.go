@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -168,17 +169,64 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 		return outbound.Result{Evidence: outbound.DefinitelyNotSent, Summary: err.Error()}, err
 	}
 
-	body := []byte(payload.Body)
+	status, answer, err := h.post(ctx, call.Endpoint, payload.EventID,
+		model.OutboxEventType(payload.EventType), []byte(payload.Body), cfg)
+	var neverLeft *requestNotBuilt
+	if errors.As(err, &neverLeft) {
+		return outbound.Result{Evidence: outbound.DefinitelyNotSent, Summary: "build the request: " + err.Error()}, err
+	}
+	if err != nil {
+		return outbound.Result{Evidence: providers.EvidenceOf(err), Summary: err.Error()}, err
+	}
+	return outbound.Result{
+		Evidence: outbound.ProviderResponse,
+		Status:   strconv.Itoa(status),
+		Summary:  fmt.Sprintf("HTTP %d: %s", status, answer),
+	}, nil
+}
+
+// Send is one delivery outside the domain - the integration's test endpoint -
+// through the same address policy, the same headers and signature and the same
+// timeout as an attempt. It answers with the subscriber's status code, or with
+// why nothing was sent. A test that took another path would prove nothing
+// about deliveries.
+func (h *Handler) Send(ctx context.Context, cfg model.GenericWebhookConfig, eventID string,
+	eventType model.OutboxEventType, body []byte) (int, error) {
+
+	target, err := url.Parse(cfg.URL)
+	if err != nil || target.Hostname() == "" {
+		return 0, fmt.Errorf("webhook: %q is not a usable URL", cfg.URL)
+	}
+	if err := h.policy.check(ctx, target.Hostname()); err != nil {
+		return 0, err
+	}
+	status, _, err := h.post(ctx, cfg.URL, eventID, eventType, body, cfg)
+	return status, err
+}
+
+// requestNotBuilt is a request that never existed: the one failure before the
+// network that an attempt must report as definitely not sent.
+type requestNotBuilt struct{ err error }
+
+func (e *requestNotBuilt) Error() string { return e.err.Error() }
+func (e *requestNotBuilt) Unwrap() error { return e.err }
+
+// post is the one POST both the attempt and the test endpoint make: the
+// contract headers over the body, the subscriber's timeout under the family's
+// ceiling, the address policy at the socket. It answers with the status code
+// and a bounded, trimmed excerpt of the response.
+func (h *Handler) post(ctx context.Context, endpoint, eventID string, eventType model.OutboxEventType,
+	body []byte, cfg model.GenericWebhookConfig) (int, string, error) {
+
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	headers := Headers(payload.EventID, model.OutboxEventType(payload.EventType), body,
-		cfg.Secret, cfg.CustomHeaders, timestamp)
+	headers := Headers(eventID, eventType, body, cfg.Secret, cfg.CustomHeaders, timestamp)
 
 	timeout := EffectiveTimeout(cfg)
 	callCtx, cancelCall := context.WithTimeout(ctx, timeout)
 	defer cancelCall()
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, call.Endpoint, strings.NewReader(payload.Body))
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return outbound.Result{Evidence: outbound.DefinitelyNotSent, Summary: "build the request: " + err.Error()}, err
+		return 0, "", &requestNotBuilt{err}
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -186,15 +234,11 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 
 	resp, err := h.newClient(timeout).Do(req)
 	if err != nil {
-		return outbound.Result{Evidence: providers.EvidenceOf(err), Summary: err.Error()}, err
+		return 0, "", err
 	}
 	defer resp.Body.Close()
 	answer, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	return outbound.Result{
-		Evidence: outbound.ProviderResponse,
-		Status:   strconv.Itoa(resp.StatusCode),
-		Summary:  fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(answer))),
-	}, nil
+	return resp.StatusCode, strings.TrimSpace(string(answer)), nil
 }
 
 // readPayload is the one decoder both halves use, and the closed switch over

@@ -827,11 +827,17 @@ const API = {
         deliveryDetail: (id, deliveryId) => request(`/integrations/${encodeURIComponent(id)}/deliveries/${encodeURIComponent(deliveryId)}`),
 
         /**
-         * Replay a delivery
+         * Replay a delivery. The replay is a NEW delivery of the same event;
+         * the response carries its delivery_id. The Idempotency-Key names one
+         * decision: a repeat with the same key finds the same new delivery.
          * @param {string} id - Integration ID
          * @param {string} deliveryId - Delivery ID
+         * @param {string} idempotencyKey - one per press of the button
          */
-        replayDelivery: (id, deliveryId) => request(`/integrations/${encodeURIComponent(id)}/deliveries/${encodeURIComponent(deliveryId)}/replay`, { method: 'POST' }),
+        replayDelivery: (id, deliveryId, idempotencyKey) => request(`/integrations/${encodeURIComponent(id)}/deliveries/${encodeURIComponent(deliveryId)}/replay`, {
+            method: 'POST',
+            headers: { 'Idempotency-Key': idempotencyKey },
+        }),
     },
 };
 

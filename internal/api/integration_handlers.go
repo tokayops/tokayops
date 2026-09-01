@@ -16,7 +16,7 @@ import (
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/integrations"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/outbox"
+	webhookprovider "github.com/tokayops/tokayops/internal/outbound/providers/webhook"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -617,30 +617,24 @@ func (a *API) testWebhookIntegration(c echo.Context, integration *model.Integrat
 	}
 
 	eventID := "test-" + uuid.New().String()
-	headers := outbox.BuildHeaders(eventID, model.OutboxEventFiring, body, cfg.Secret, cfg.CustomHeaders)
-
-	timeout := 30 * time.Second
-	if cfg.TimeoutSeconds > 0 {
-		timeout = time.Duration(cfg.TimeoutSeconds) * time.Second
-	}
-
 	allowedCIDRs, _ := config.ParseAllowedPrivateCIDRs()
-	sender := outbox.NewHTTPSender(allowedCIDRs)
-	ctx, cancel := context.WithTimeout(c.Request().Context(), timeout)
-	defer cancel()
-
-	result := sender.Send(ctx, cfg.URL, body, headers)
-	if result.Error != nil {
+	// Through the channel the worker delivers with: the same address policy,
+	// the same headers and signature, the same timeout ceiling. A test that took
+	// another path would prove nothing about deliveries. The configuration is in
+	// hand, so the channel is built without a store to read one from.
+	status, err := webhookprovider.NewHandler(nil, allowedCIDRs).
+		Send(c.Request().Context(), cfg, eventID, model.OutboxEventFiring, body)
+	if err != nil {
 		return c.JSON(http.StatusOK, TestIntegrationResponse{
 			OK:      false,
-			Message: fmt.Sprintf("Delivery failed: %v", result.Error),
+			Message: fmt.Sprintf("Delivery failed: %v", err),
 		})
 	}
 
-	ok := result.HTTPStatus >= 200 && result.HTTPStatus < 300
+	ok := status >= 200 && status < 300
 	return c.JSON(http.StatusOK, TestIntegrationResponse{
 		OK:      ok,
-		Message: fmt.Sprintf("Webhook responded with HTTP %d", result.HTTPStatus),
+		Message: fmt.Sprintf("Webhook responded with HTTP %d", status),
 	})
 }
 

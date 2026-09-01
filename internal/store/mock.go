@@ -2268,6 +2268,21 @@ func (m *MockStore) GetDeliveryAttempts(deliveryID string) ([]*model.DeliveryAtt
 	return result, nil
 }
 
+// The double has no commitments and so no webhook deliveries: the list is
+// empty and nothing is found. A test that needs deliveries wraps the double
+// with what it wants answered.
+func (m *MockStore) ListWebhookDeliveries(_ context.Context, _ string, _, _ int) ([]*model.OutboxDelivery, int, error) {
+	return []*model.OutboxDelivery{}, 0, nil
+}
+
+func (m *MockStore) WebhookDelivery(_ context.Context, _, _ string) (*model.OutboxDelivery, []*model.DeliveryAttempt, error) {
+	return nil, nil, ErrWebhookDeliveryNotFound
+}
+
+func (m *MockStore) ReplayWebhookDelivery(_ context.Context, _ WebhookReplayRequest) (WebhookReplayResult, error) {
+	return WebhookReplayResult{}, ErrWebhookDeliveryNotFound
+}
+
 // Ensure Store implements StoreInterface
 var _ StoreInterface = (*Store)(nil)
 var _ StoreInterface = (*MockStore)(nil)
