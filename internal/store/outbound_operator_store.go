@@ -131,10 +131,10 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, ac
 	return withdrawn, nil
 }
 
-func cancelRowsTx(ctx context.Context, tx *sql.Tx, query, alertGroupID string) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, query, alertGroupID)
+func cancelRowsTx(ctx context.Context, tx *sql.Tx, query, owner string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, query, owner)
 	if err != nil {
-		return nil, fmt.Errorf("withdraw the notifications of %s: %w", alertGroupID, err)
+		return nil, fmt.Errorf("withdraw the commitments of %s: %w", owner, err)
 	}
 	defer rows.Close()
 

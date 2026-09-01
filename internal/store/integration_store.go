@@ -73,43 +73,6 @@ func (s *Store) CreateIntegration(i *model.Integration) error {
 	return nil
 }
 
-// UpdateIntegration updates an integration, keeping existing secrets if new ones are empty
-func (s *Store) UpdateIntegration(i *model.Integration) error {
-	i.UpdatedAt = time.Now()
-
-	// Get existing integration to merge secrets
-	existing, err := s.GetIntegrationByID(i.ID)
-	if err != nil {
-		return err
-	}
-
-	// Merge secrets: if new secret is empty or "****", keep existing
-	mergedConfig := mergeSecrets(existing.Type, existing.Config, i.Config)
-
-	// Encrypt merged config
-	encryptedConfig, err := encryptConfig(mergedConfig)
-	if err != nil {
-		return err
-	}
-
-	query := `UPDATE integrations SET name = $1, enabled = $2, scope = $3, team_id = $4, config = $5, updated_at = $6 WHERE id = $7`
-	result, err := s.db.Exec(query, i.Name, i.Enabled, scopeToNullString(i.Scope), stringPtrToNullString(i.TeamID), encryptedConfig, i.UpdatedAt, i.ID)
-	if err != nil {
-		// Same race as on create, reachable the same way: moving an existing
-		// integration onto a team scope writes team_id too.
-		if isIntegrationTeamFKViolation(err) {
-			return ErrIntegrationTeamNotFound
-		}
-		return err
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return ErrIntegrationNotFound
-	}
-	return nil
-}
-
 // GetIntegrationByID retrieves an integration by ID with decrypted config
 func (s *Store) GetIntegrationByID(id string) (*model.Integration, error) {
 	query := `SELECT id, type, direction, name, enabled, scope, team_id, config, created_at, updated_at FROM integrations WHERE id = $1`
@@ -146,19 +109,6 @@ func (s *Store) GetAllIntegrations() ([]*model.Integration, error) {
 	}
 	defer rows.Close()
 	return scanIntegrations(rows)
-}
-
-// DeleteIntegration deletes an integration by ID
-func (s *Store) DeleteIntegration(id string) error {
-	result, err := s.db.Exec(`DELETE FROM integrations WHERE id = $1`, id)
-	if err != nil {
-		return err
-	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return ErrIntegrationNotFound
-	}
-	return nil
 }
 
 // scanIntegration scans a single integration row

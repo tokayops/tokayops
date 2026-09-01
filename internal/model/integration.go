@@ -45,6 +45,18 @@ type Integration struct {
 	UpdatedAt time.Time            `json:"updated_at"`
 }
 
+// IntegrationTombstone is what remains of a deleted integration: enough to
+// decide who may still read its delivery history, and nothing else. The scope
+// is the one it had when it was deleted, on purpose - it describes a
+// historical object, and who could see that history does not change afterwards.
+type IntegrationTombstone struct {
+	ID        string
+	Type      IntegrationType
+	Scope     *WebhookScope
+	TeamID    *string
+	DeletedAt time.Time
+}
+
 // SlackConfig is the config schema for Slack integrations
 type SlackConfig struct {
 	Token          string `json:"token"`                     // Bot token for notifications

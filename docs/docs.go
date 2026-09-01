@@ -928,6 +928,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/api.ErrorResponse"
                         }
                     },
+                    "409": {
+                        "description": "the integration is being changed by another request; retry",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -957,6 +963,12 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "the integration is being changed by another request; retry",
                         "schema": {
                             "$ref": "#/definitions/api.ErrorResponse"
                         }
@@ -3852,6 +3864,14 @@ const docTemplate = `{
             "x-enum-comments": {
                 "AlertGroupStatusAcknowledged": "User acknowledged, waiting for resolution"
             },
+            "x-enum-descriptions": [
+                "",
+                "",
+                "",
+                "User acknowledged, waiting for resolution",
+                "",
+                ""
+            ],
             "x-enum-varnames": [
                 "AlertGroupStatusNew",
                 "AlertGroupStatusProcessing",
@@ -4210,6 +4230,10 @@ const docTemplate = `{
                 "TeamMemberRoleAdmin": "Team administrator",
                 "TeamMemberRoleMember": "Regular team member"
             },
+            "x-enum-descriptions": [
+                "Team administrator",
+                "Regular team member"
+            ],
             "x-enum-varnames": [
                 "TeamMemberRoleAdmin",
                 "TeamMemberRoleMember"
@@ -4322,6 +4346,10 @@ const docTemplate = `{
                 "UserRoleAdmin": "Full system access",
                 "UserRoleUser": "Standard authenticated user (default)"
             },
+            "x-enum-descriptions": [
+                "Full system access",
+                "Standard authenticated user (default)"
+            ],
             "x-enum-varnames": [
                 "UserRoleAdmin",
                 "UserRoleUser"

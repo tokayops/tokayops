@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"testing"
@@ -70,9 +71,9 @@ func TestIntegrationStore(t *testing.T) {
 		}
 
 		// Update
-		fetched.Name = "Updated Slack"
-		fetched.Enabled = false
-		err = s.UpdateIntegration(fetched)
+		renamed, off := "Updated Slack", false
+		_, err = s.UpdateIntegration(context.Background(), integration.ID,
+			IntegrationPatch{Name: &renamed, Enabled: &off}, "test")
 		if err != nil {
 			t.Fatalf("UpdateIntegration failed: %v", err)
 		}
@@ -86,7 +87,7 @@ func TestIntegrationStore(t *testing.T) {
 		}
 
 		// Delete
-		err = s.DeleteIntegration(integration.ID)
+		_, err = s.DeleteIntegration(context.Background(), integration.ID, "test")
 		if err != nil {
 			t.Fatalf("DeleteIntegration failed: %v", err)
 		}
@@ -198,9 +199,9 @@ func TestIntegrationStore(t *testing.T) {
 
 		// Update with masked config (simulating API update where user didn't change secret)
 		maskedCfg, _ := json.Marshal(model.SlackConfig{Token: model.MaskedSecret, DefaultChannel: "C456"})
-		integration.Config = maskedCfg
-		integration.Name = "Slack Updated"
-		s.UpdateIntegration(integration)
+		renamed := "Slack Updated"
+		s.UpdateIntegration(context.Background(), integration.ID,
+			IntegrationPatch{Name: &renamed, Config: maskedCfg}, "test")
 
 		// Fetch and verify token was preserved
 		updated, _ := s.GetIntegrationByID(integration.ID)
@@ -224,8 +225,7 @@ func TestIntegrationStore(t *testing.T) {
 
 		// Update with masked signing_secret
 		maskedCfg, _ := json.Marshal(model.SlackConfig{Token: model.MaskedSecret, SigningSecret: model.MaskedSecret})
-		integration.Config = maskedCfg
-		s.UpdateIntegration(integration)
+		s.UpdateIntegration(context.Background(), integration.ID, IntegrationPatch{Config: maskedCfg}, "test")
 
 		updated, _ := s.GetIntegrationByID(integration.ID)
 		var updatedCfg model.SlackConfig
@@ -245,8 +245,7 @@ func TestIntegrationStore(t *testing.T) {
 
 		// Update with empty signing_secret
 		emptyCfg, _ := json.Marshal(model.SlackConfig{Token: model.MaskedSecret})
-		integration.Config = emptyCfg
-		s.UpdateIntegration(integration)
+		s.UpdateIntegration(context.Background(), integration.ID, IntegrationPatch{Config: emptyCfg}, "test")
 
 		updated, _ := s.GetIntegrationByID(integration.ID)
 		var updatedCfg model.SlackConfig
@@ -318,8 +317,9 @@ func TestIntegrationStore(t *testing.T) {
 		}
 
 		// Update name
-		fetched.Name = "Updated Global"
-		if err := s.UpdateIntegration(fetched); err != nil {
+		renamed := "Updated Global"
+		if _, err := s.UpdateIntegration(context.Background(), integration.ID,
+			IntegrationPatch{Name: &renamed}, "test"); err != nil {
 			t.Fatalf("UpdateIntegration failed: %v", err)
 		}
 		updated, _ := s.GetIntegrationByID(integration.ID)
@@ -328,7 +328,7 @@ func TestIntegrationStore(t *testing.T) {
 		}
 
 		// Delete
-		if err := s.DeleteIntegration(integration.ID); err != nil {
+		if _, err := s.DeleteIntegration(context.Background(), integration.ID, "test"); err != nil {
 			t.Fatalf("DeleteIntegration failed: %v", err)
 		}
 	})
@@ -449,9 +449,9 @@ func TestIntegrationStore(t *testing.T) {
 
 		// Update with masked secret only - other config fields should be preserved
 		maskedCfg, _ := json.Marshal(model.GenericWebhookConfig{Secret: model.MaskedSecret})
-		integration.Config = maskedCfg
-		integration.Name = "WH Updated"
-		s.UpdateIntegration(integration)
+		renamed := "WH Updated"
+		s.UpdateIntegration(context.Background(), integration.ID,
+			IntegrationPatch{Name: &renamed, Config: maskedCfg}, "test")
 
 		updated, _ := s.GetIntegrationByID(integration.ID)
 		var updatedCfg model.GenericWebhookConfig

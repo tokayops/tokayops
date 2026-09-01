@@ -28,12 +28,7 @@ func TestASubscriberConfigurationIsReadFromTheDatabase(t *testing.T) {
 	// Rotated through the store, read back fresh: no cache in between.
 	raw, _ := json.Marshal(model.GenericWebhookConfig{URL: "https://example.com/hooks", Secret: "rotated",
 		TimeoutSeconds: 45, CustomHeaders: map[string]string{"X-Team": "sre"}})
-	integration, err := s.GetIntegrationByID(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	integration.Config = raw
-	if err := s.UpdateIntegration(integration); err != nil {
+	if _, err := s.UpdateIntegration(context.Background(), id, IntegrationPatch{Config: raw}, "test"); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 	cfg, found, err = s.SubscriberConfig(context.Background(), id)

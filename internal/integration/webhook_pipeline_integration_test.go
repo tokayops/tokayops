@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/model"
@@ -273,5 +274,140 @@ func TestAnEventNobodySubscribedToIsDoneWithoutACall(t *testing.T) {
 	if err := env.s.GetDB().QueryRow(`SELECT count(*) FROM outbound_intents WHERE delivery_family = 'webhook'`).
 		Scan(&commitments); err != nil || commitments != 0 {
 		t.Fatalf("%d commitments for nobody (%v)", commitments, err)
+	}
+}
+
+// gatedReceiver holds every request until it is released, so a commitment can
+// be caught on the wire.
+type gatedReceiver struct {
+	receiver
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newGatedReceiver(status int) *gatedReceiver {
+	g := &gatedReceiver{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	g.status.Store(int32(status))
+	return g
+}
+
+func (g *gatedReceiver) serve(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		g.calls.Add(1)
+		g.body.Store(string(body))
+		g.headers.Store(req.Header.Clone())
+		g.entered <- struct{}{}
+		select {
+		case <-g.release:
+		case <-time.After(10 * time.Second):
+		}
+		w.WriteHeader(int(g.status.Load()))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func (e *webhookEnv) flagOf(t *testing.T, subscriber string) bool {
+	t.Helper()
+	var flagged bool
+	if err := e.s.GetDB().QueryRow(`SELECT cancellation_requested FROM outbound_intents
+		WHERE delivery_family = 'webhook' AND target_ref = $1`, subscriber).Scan(&flagged); err != nil {
+		t.Fatalf("read the flag: %v", err)
+	}
+	return flagged
+}
+
+// TestDeletingASubscriberMidFlightEndsTheCommitmentWithTheAttempt: a request
+// already on the wire is not withdrawn by anything; the deletion flags the
+// commitment and the attempt's outcome decides. A failure becomes a withdrawal
+// where a retry would otherwise follow; a success is a success. Neither leaves
+// anything live, and nothing is called again.
+func TestDeletingASubscriberMidFlightEndsTheCommitmentWithTheAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{"the request fails: withdrawn instead of retried", http.StatusInternalServerError, "canceled"},
+		{"the request lands: done", http.StatusOK, "succeeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := setupWebhookEnv(t)
+			rec := newGatedReceiver(tc.status)
+			srv := rec.serve(t)
+			subscriber := env.subscribe(t, srv.URL)
+			env.event(t)
+			ctx := context.Background()
+
+			if n := env.fanOut.Tick(ctx); n != 1 {
+				t.Fatalf("fan-out handled %d events", n)
+			}
+			env.worker.Tick(ctx)
+			select {
+			case <-rec.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the request never went out")
+			}
+			if got := env.commitmentOf(t, subscriber); got.Status != "sending" {
+				t.Fatalf("on the wire the commitment is %q", got.Status)
+			}
+
+			change, err := env.s.DeleteIntegration(ctx, subscriber, "nina")
+			if err != nil || change.Withdrawn != 0 {
+				t.Fatalf("deleting mid-flight: %+v (%v), want nothing withdrawn outright", change, err)
+			}
+			if got := env.commitmentOf(t, subscriber); got.Status != "sending" || !env.flagOf(t, subscriber) {
+				t.Fatalf("after the deletion the commitment is %q, flagged=%v", got.Status, env.flagOf(t, subscriber))
+			}
+
+			close(rec.release)
+			env.worker.Drain()
+			got := env.commitmentOf(t, subscriber)
+			if got.Status != tc.want {
+				t.Fatalf("after HTTP %d under a deletion the commitment is %q, want %q", tc.status, got.Status, tc.want)
+			}
+			if env.flagOf(t, subscriber) {
+				t.Fatal("the flag was not consumed by the ending")
+			}
+			if got.ReceiptRecorded {
+				t.Fatal("a webhook recorded a receipt")
+			}
+			env.deliverOnce(t)
+			if rec.calls.Load() != 1 {
+				t.Fatalf("a deleted subscriber was called again: %d calls", rec.calls.Load())
+			}
+		})
+	}
+}
+
+// TestTheChannelDoesNotLookAtTheSwitch: withdrawal has one door, the explicit
+// transition. A commitment that outlived the switch - the state a race can
+// leave, constructed here directly because the command would have withdrawn it
+// - is delivered; a channel that quietly refused would be a second rule with
+// its own races and no record of why a commitment stopped.
+func TestTheChannelDoesNotLookAtTheSwitch(t *testing.T) {
+	env := setupWebhookEnv(t)
+	rec := &receiver{}
+	rec.status.Store(http.StatusOK)
+	srv := rec.serve(t)
+	subscriber := env.subscribe(t, srv.URL)
+	env.event(t)
+	ctx := context.Background()
+	if n := env.fanOut.Tick(ctx); n != 1 {
+		t.Fatalf("fan-out handled %d events", n)
+	}
+	if _, err := env.s.GetDB().Exec(`UPDATE integrations SET enabled = FALSE WHERE id = $1`, subscriber); err != nil {
+		t.Fatal(err)
+	}
+
+	env.worker.Tick(ctx)
+	env.worker.Drain()
+	if rec.calls.Load() != 1 {
+		t.Fatalf("the subscriber was called %d times", rec.calls.Load())
+	}
+	if got := env.commitmentOf(t, subscriber); got.Status != "succeeded" {
+		t.Fatalf("the commitment is %q", got.Status)
 	}
 }

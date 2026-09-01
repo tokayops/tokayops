@@ -42,6 +42,8 @@ type MockStore struct {
 	linkTokens         map[string]mockLinkToken                   // "userID|provider" -> link token
 	escalationPolicies map[string]*model.EscalationPolicy         // policyID -> policy
 	integrations       map[string]*model.Integration              // integrationID -> integration
+	tombstones         map[string]model.IntegrationTombstone      // integrationID -> what its deletion left
+	effectsMu          sync.Mutex                                 // the double's stand-in for the advisory lock
 	outboxEvents       map[string]*model.OutboxEvent              // eventID -> event
 	outboxDeliveries   map[string]*model.OutboxDelivery           // deliveryID -> delivery
 	deliveryAttempts   map[string][]*model.DeliveryAttempt        // deliveryID -> attempts
@@ -72,6 +74,7 @@ func NewMockStore() *MockStore {
 		linkTokens:         make(map[string]mockLinkToken),
 		escalationPolicies: make(map[string]*model.EscalationPolicy),
 		integrations:       make(map[string]*model.Integration),
+		tombstones:         make(map[string]model.IntegrationTombstone),
 		outboxEvents:       make(map[string]*model.OutboxEvent),
 		outboxDeliveries:   make(map[string]*model.OutboxDelivery),
 		deliveryAttempts:   make(map[string][]*model.DeliveryAttempt),
@@ -1683,7 +1686,9 @@ func (m *MockStore) CreateIntegration(i *model.Integration) error {
 		return fmt.Errorf("unknown integration type %s", i.Type)
 	}
 	i.Direction = dir
-	i.ID = fmt.Sprintf("int-%d", len(m.integrations)+1)
+	if i.ID == "" {
+		i.ID = fmt.Sprintf("int-%d", len(m.integrations)+1)
+	}
 	i.CreatedAt = time.Now()
 	i.UpdatedAt = time.Now()
 
@@ -1755,29 +1760,73 @@ func (m *MockStore) GetAllIntegrations() ([]*model.Integration, error) {
 	return result, nil
 }
 
-func (m *MockStore) UpdateIntegration(i *model.Integration) error {
+// UpdateIntegration applies the patch to the stored row, the way the store
+// applies it to the row re-read under its lock. The double has no
+// commitments, so nothing is ever withdrawn here.
+func (m *MockStore) UpdateIntegration(_ context.Context, id string, patch IntegrationPatch,
+	_ string) (IntegrationChange, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.integrations[i.ID]; !ok {
-		return ErrIntegrationNotFound
+	current, ok := m.integrations[id]
+	if !ok {
+		return IntegrationChange{}, ErrIntegrationNotFound
 	}
-
-	i.UpdatedAt = time.Now()
-	copy := *i
-	m.integrations[i.ID] = &copy
-	return nil
+	before := *current
+	after := before
+	if patch.Name != nil {
+		after.Name = *patch.Name
+	}
+	if patch.Enabled != nil {
+		after.Enabled = *patch.Enabled
+	}
+	if patch.Config != nil {
+		after.Config = mergeSecrets(before.Type, before.Config, patch.Config)
+	}
+	after.UpdatedAt = time.Now()
+	stored := after
+	m.integrations[id] = &stored
+	return IntegrationChange{Before: &before, After: &after}, nil
 }
 
-func (m *MockStore) DeleteIntegration(id string) error {
+func (m *MockStore) DeleteIntegration(_ context.Context, id, _ string) (IntegrationChange, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.integrations[id]; !ok {
-		return ErrIntegrationNotFound
+	current, ok := m.integrations[id]
+	if !ok {
+		return IntegrationChange{}, ErrIntegrationNotFound
 	}
+	before := *current
 	delete(m.integrations, id)
-	return nil
+	m.tombstones[id] = model.IntegrationTombstone{
+		ID: id, Type: before.Type, Scope: before.Scope, TeamID: before.TeamID, DeletedAt: time.Now(),
+	}
+	return IntegrationChange{Before: &before}, nil
+}
+
+// WithIntegrationLocked serialises fn across callers the way the advisory lock
+// does, and hands it the row as it stands now.
+func (m *MockStore) WithIntegrationLocked(_ context.Context, id string,
+	fn func(current *model.Integration) error) error {
+	m.effectsMu.Lock()
+	defer m.effectsMu.Unlock()
+
+	current, err := m.GetIntegrationByID(id)
+	if errors.Is(err, ErrIntegrationNotFound) {
+		current = nil
+	} else if err != nil {
+		return err
+	}
+	return fn(current)
+}
+
+func (m *MockStore) IntegrationTombstone(_ context.Context, id string) (model.IntegrationTombstone, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	tombstone, ok := m.tombstones[id]
+	return tombstone, ok, nil
 }
 
 // GetAPITokenByID retrieves an API token by ID from MockStore

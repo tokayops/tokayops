@@ -129,8 +129,12 @@ type StoreInterface interface {
 	GetIntegrationByType(integrationType model.IntegrationType) (*model.Integration, error)
 	GetIntegrationsByType(integrationType model.IntegrationType) ([]*model.Integration, error)
 	GetAllIntegrations() ([]*model.Integration, error)
-	UpdateIntegration(i *model.Integration) error
-	DeleteIntegration(id string) error
+	// The lifecycle commands: one transaction each over the row and the
+	// webhook commitments owed to it. See integration_lifecycle_store.go.
+	UpdateIntegration(ctx context.Context, id string, patch IntegrationPatch, actor string) (IntegrationChange, error)
+	DeleteIntegration(ctx context.Context, id, actor string) (IntegrationChange, error)
+	WithIntegrationLocked(ctx context.Context, id string, fn func(current *model.Integration) error) error
+	IntegrationTombstone(ctx context.Context, id string) (model.IntegrationTombstone, bool, error)
 
 	// Outbox (Phase 6)
 	CreateOutboxEvent(event *model.OutboxEvent) error

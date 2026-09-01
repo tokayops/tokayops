@@ -259,8 +259,11 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.POST("/integrations/:id/test", a.TestIntegration, a.Require(rbac.ActionIntegrationUpdate, ScopeFromIntegration("id")))
 
 	// Delivery logs and replay
-	v1.GET("/integrations/:id/deliveries", a.ListIntegrationDeliveries, a.Require(rbac.ActionIntegrationView, ScopeFromIntegration("id")))
-	v1.GET("/integrations/:id/deliveries/:deliveryId", a.GetDeliveryDetail, a.Require(rbac.ActionIntegrationView, ScopeFromIntegration("id")))
+	// The two reading routes resolve through the tombstone once the integration
+	// is gone; the replay does not - it makes a new delivery, and a deleted
+	// subscriber gets none.
+	v1.GET("/integrations/:id/deliveries", a.ListIntegrationDeliveries, a.Require(rbac.ActionIntegrationView, ScopeFromIntegrationHistory("id")))
+	v1.GET("/integrations/:id/deliveries/:deliveryId", a.GetDeliveryDetail, a.Require(rbac.ActionIntegrationView, ScopeFromIntegrationHistory("id")))
 	v1.POST("/integrations/:id/deliveries/:deliveryId/replay", a.ReplayDelivery, a.Require(rbac.ActionIntegrationUpdate, ScopeFromIntegration("id")))
 
 	// Slack Interactive (Public - no AuthMiddleware, uses Slack signature verification)

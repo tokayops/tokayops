@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,18 @@ type fakeTelegramAPI struct {
 	setSecrets []string
 	delTokens  []string
 	username   string
+	// registered is the Bot API's side: which tokens have a webhook right now.
+	registered map[string]string
+}
+
+// registeredTokens is every token with a webhook registered, sorted.
+func (f *fakeTelegramAPI) registeredTokens() []string {
+	tokens := make([]string, 0, len(f.registered))
+	for token := range f.registered {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	return tokens
 }
 
 func (f *fakeTelegramAPI) AnswerCallback(_ context.Context, _, text string) error {
@@ -49,11 +62,16 @@ func (f *fakeTelegramAPI) SetWebhook(_ context.Context, token, url, secret strin
 	f.setTokens = append(f.setTokens, token)
 	f.setURLs = append(f.setURLs, url)
 	f.setSecrets = append(f.setSecrets, secret)
+	if f.registered == nil {
+		f.registered = map[string]string{}
+	}
+	f.registered[token] = url
 	return nil
 }
 func (f *fakeTelegramAPI) DeleteWebhook(_ context.Context, token string) error {
 	f.delCalls++
 	f.delTokens = append(f.delTokens, token)
+	delete(f.registered, token)
 	return nil
 }
 

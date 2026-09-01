@@ -219,32 +219,73 @@ func ScopeFromIntegration(paramName string) ScopeResolver {
 			return rbac.Scope{}, err
 		}
 		c.Set("integration", integration)
-
-		// Admin: full access via GlobalScope (Rule 1 bypass)
-		userID, _ := c.Get("user_id").(string)
-		isAdmin, err := api.rbac.IsAdmin(userID)
-		if err != nil {
-			return rbac.Scope{}, err
-		}
-		if isAdmin {
-			return rbac.GlobalScope(), nil
-		}
-
-		// Non-admin: only team-scoped generic_webhook they admin
-		if integration.Scope == nil || *integration.Scope != model.WebhookScopeTeam || integration.TeamID == nil {
-			return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "integration not found")
-		}
-
-		isTeamAdmin, err := api.rbac.IsTeamAdmin(userID, *integration.TeamID)
-		if err != nil {
-			return rbac.Scope{}, err
-		}
-		if !isTeamAdmin {
-			return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "integration not found")
-		}
-
-		return rbac.TeamScope(*integration.TeamID), nil
+		return integrationScope(c, api, integration.Scope, integration.TeamID)
 	}
+}
+
+// ScopeFromIntegrationHistory is ScopeFromIntegration for the routes that READ
+// an integration's delivery history: a deleted integration answers through its
+// tombstone, with the scope it had when it was deleted. Only a deleted generic
+// webhook does - a Slack or Telegram integration had no history route while it
+// lived, and an empty successful list after its death would be a route that
+// never existed. Nothing that creates work resolves through here: the history
+// of a deleted subscriber may be read, and a new delivery to it may not be
+// made.
+func ScopeFromIntegrationHistory(paramName string) ScopeResolver {
+	return func(c echo.Context, api *API) (rbac.Scope, error) {
+		id := c.Param(paramName)
+		if id == "" {
+			return rbac.Scope{}, echo.NewHTTPError(http.StatusBadRequest, "missing integration id")
+		}
+
+		integration, err := api.store.GetIntegrationByID(id)
+		switch {
+		case err == nil:
+			c.Set("integration", integration)
+			return integrationScope(c, api, integration.Scope, integration.TeamID)
+		case errors.Is(err, store.ErrIntegrationNotFound):
+			tombstone, found, err := api.store.IntegrationTombstone(c.Request().Context(), id)
+			if err != nil {
+				return rbac.Scope{}, err
+			}
+			if !found || tombstone.Type != model.IntegrationTypeGenericWebhook {
+				return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "integration not found")
+			}
+			return integrationScope(c, api, tombstone.Scope, tombstone.TeamID)
+		default:
+			return rbac.Scope{}, err
+		}
+	}
+}
+
+// integrationScope is the rule the integration resolvers share: an admin sees
+// everything; anybody else sees a team-scoped webhook of a team they admin, and
+// otherwise learns nothing - 404, not 403.
+func integrationScope(c echo.Context, api *API, scope *model.WebhookScope, teamID *string) (rbac.Scope, error) {
+	// Admin: full access via GlobalScope (Rule 1 bypass)
+	userID, _ := c.Get("user_id").(string)
+	isAdmin, err := api.rbac.IsAdmin(userID)
+	if err != nil {
+		return rbac.Scope{}, err
+	}
+	if isAdmin {
+		return rbac.GlobalScope(), nil
+	}
+
+	// Non-admin: only team-scoped generic_webhook they admin
+	if scope == nil || *scope != model.WebhookScopeTeam || teamID == nil {
+		return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "integration not found")
+	}
+
+	isTeamAdmin, err := api.rbac.IsTeamAdmin(userID, *teamID)
+	if err != nil {
+		return rbac.Scope{}, err
+	}
+	if !isTeamAdmin {
+		return rbac.Scope{}, echo.NewHTTPError(http.StatusNotFound, "integration not found")
+	}
+
+	return rbac.TeamScope(*teamID), nil
 }
 
 // ScopeIntegrationCreate resolves scope for POST /integrations.

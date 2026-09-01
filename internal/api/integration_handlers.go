@@ -224,9 +224,8 @@ func (a *API) CreateIntegration(c echo.Context) error {
 		a.restartUsergroupSyncer()
 	}
 
-	// Register the Telegram webhook for an enabled bot (best-effort).
-	if integration.Type == model.IntegrationTypeTelegram && integration.Enabled {
-		a.setTelegramWebhook(c.Request().Context(), integration)
+	if integration.Type == model.IntegrationTypeTelegram {
+		a.reconcileTelegramWebhook(c.Request().Context(), integration.ID)
 	}
 
 	return c.JSON(http.StatusCreated, integrations.MaskSecrets(integration))
@@ -243,12 +242,17 @@ func (a *API) CreateIntegration(c echo.Context) error {
 // @Success 200 {object} model.Integration
 // @Failure 400 {object} ErrorResponse
 // @Failure 404 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse "the integration is being changed by another request; retry"
 // @Failure 500 {object} ErrorResponse
 // @Router /api/v1/integrations/{id} [put]
 func (a *API) UpdateIntegration(c echo.Context) error {
 	id := c.Param("id")
 
-	// Use integration from middleware context if available
+	// The middleware's copy serves the validation below and nothing else: the
+	// type is immutable, and the URL check is about the request. The row itself
+	// is re-read under a lock by the command, and the patch is applied there -
+	// applying it to this copy and writing the result back whole would overwrite
+	// whatever somebody else changed in between.
 	var existing *model.Integration
 	if cached, ok := c.Get("integration").(*model.Integration); ok {
 		existing = cached
@@ -263,32 +267,21 @@ func (a *API) UpdateIntegration(c echo.Context) error {
 		}
 	}
 
-	// Snapshot the OLD telegram bot token before the config is overwritten below.
-	// reloadIntegrationCache() clears tokens, so deleting the old webhook after the
-	// reload would have no token - we must capture it now and pass it explicitly.
-	var oldTelegramCfgRaw json.RawMessage
-	if existing.Type == model.IntegrationTypeTelegram {
-		oldTelegramCfgRaw = existing.Config
-	}
-
 	var req UpdateIntegrationRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
 	}
 
-	// Update fields
+	patch := store.IntegrationPatch{Enabled: req.Enabled}
 	if req.Name != "" {
-		existing.Name = req.Name
-	}
-	if req.Enabled != nil {
-		existing.Enabled = *req.Enabled
+		patch.Name = &req.Name
 	}
 	if req.Config != nil {
 		// Validate config (allow empty/masked secrets on update)
 		if err := validateIntegrationConfig(existing.Type, req.Config, true); err != nil {
 			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 		}
-		existing.Config = req.Config
+		patch.Config = req.Config
 	}
 
 	// For generic_webhook, always validate the effective URL against HTTPS policy.
@@ -312,50 +305,28 @@ func (a *API) UpdateIntegration(c echo.Context) error {
 		}
 	}
 
-	if err := a.store.UpdateIntegration(existing); err != nil {
-		// Same race as on create: moving an integration onto a team scope
-		// writes team_id, and the team can go away in between.
-		if errors.Is(err, store.ErrIntegrationTeamNotFound) {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "team not found"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+	actor, _ := c.Get("user_id").(string)
+	change, err := a.store.UpdateIntegration(c.Request().Context(), id, patch, actor)
+	if err != nil {
+		return a.integrationCommandFailed(c, err)
 	}
+	updated := change.After
 
 	// Reload cache
 	a.reloadIntegrationCache()
 
 	// Restart usergroup syncer if Slack integration was updated
-	if existing.Type == model.IntegrationTypeSlack {
+	if updated.Type == model.IntegrationTypeSlack {
 		a.restartUsergroupSyncer()
 	}
 
-	// Reload to get updated data
-	updated, _ := a.store.GetIntegrationByID(id)
-	if updated != nil {
-		existing = updated
+	// The rows this command saw are candidates for deregistration and nothing
+	// more; what is registered is decided by the row as it stands now.
+	if updated.Type == model.IntegrationTypeTelegram {
+		a.reconcileTelegramWebhook(c.Request().Context(), id, change.Before, change.After)
 	}
 
-	// Telegram webhook lifecycle (best-effort, merged/decrypted `existing` config).
-	// Delete the OLD webhook ONLY when it would otherwise be orphaned - the
-	// integration is now disabled, or the bot token rotated to a different bot.
-	// For a same-token edit we just re-affirm via the idempotent setWebhook, so a
-	// harmless edit can't open a delete-then-failed-set gap that kills interactivity.
-	if existing.Type == model.IntegrationTypeTelegram {
-		ctx := c.Request().Context()
-		var oldCfg, newCfg model.TelegramConfig
-		_ = json.Unmarshal(oldTelegramCfgRaw, &oldCfg)
-		_ = json.Unmarshal(existing.Config, &newCfg)
-
-		tokenRotated := oldCfg.BotToken != "" && oldCfg.BotToken != newCfg.BotToken
-		if !existing.Enabled || tokenRotated {
-			a.deleteTelegramWebhookForConfig(ctx, oldTelegramCfgRaw)
-		}
-		if existing.Enabled {
-			a.setTelegramWebhook(ctx, existing)
-		}
-	}
-
-	return c.JSON(http.StatusOK, integrations.MaskSecrets(existing))
+	return c.JSON(http.StatusOK, integrations.MaskSecrets(updated))
 }
 
 // DeleteIntegration deletes an integration
@@ -365,49 +336,47 @@ func (a *API) UpdateIntegration(c echo.Context) error {
 // @Param id path string true "Integration ID"
 // @Success 204
 // @Failure 404 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse "the integration is being changed by another request; retry"
 // @Failure 500 {object} ErrorResponse
 // @Router /api/v1/integrations/{id} [delete]
 func (a *API) DeleteIntegration(c echo.Context) error {
 	id := c.Param("id")
 
-	// Use integration from middleware context if available
-	var integration *model.Integration
-	if cached, ok := c.Get("integration").(*model.Integration); ok {
-		integration = cached
-	} else {
-		var err error
-		integration, err = a.store.GetIntegrationByID(id)
-		if err != nil {
-			if errors.Is(err, store.ErrIntegrationNotFound) {
-				return c.JSON(http.StatusNotFound, ErrorResponse{Error: "integration not found"})
-			}
-			return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-		}
+	actor, _ := c.Get("user_id").(string)
+	change, err := a.store.DeleteIntegration(c.Request().Context(), id, actor)
+	if err != nil {
+		return a.integrationCommandFailed(c, err)
 	}
-
-	if err := a.store.DeleteIntegration(id); err != nil {
-		if errors.Is(err, store.ErrIntegrationNotFound) {
-			// Race condition: already deleted between GetIntegrationByID and DeleteIntegration
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "integration not found"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
+	deleted := change.Before
 
 	// Reload cache
 	a.reloadIntegrationCache()
 
 	// Stop usergroup syncer if Slack integration was deleted
-	if integration.Type == model.IntegrationTypeSlack {
+	if deleted.Type == model.IntegrationTypeSlack {
 		a.restartUsergroupSyncer()
 	}
 
-	// Clear the Telegram webhook using the deleted integration's bot token
-	// (the cache is empty after the reload above, so use the snapshot).
-	if integration.Type == model.IntegrationTypeTelegram {
-		a.deleteTelegramWebhookForConfig(c.Request().Context(), integration.Config)
+	if deleted.Type == model.IntegrationTypeTelegram {
+		a.reconcileTelegramWebhook(c.Request().Context(), id, deleted)
 	}
 
 	return c.NoContent(http.StatusNoContent)
+}
+
+// integrationCommandFailed answers for a lifecycle command that did not run.
+// Busy is a 409 and not a wait: the command already waited as long as a
+// command waits, and the caller repeats it against whatever state the other
+// command left.
+func (a *API) integrationCommandFailed(c echo.Context, err error) error {
+	switch {
+	case errors.Is(err, store.ErrIntegrationNotFound):
+		return c.JSON(http.StatusNotFound, ErrorResponse{Error: "integration not found"})
+	case errors.Is(err, store.ErrIntegrationBusy):
+		return c.JSON(http.StatusConflict, ErrorResponse{Error: "integration is being changed by another request, try again"})
+	default:
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+	}
 }
 
 // telegramWebhookURL returns the public webhook URL for setWebhook, or "" if
@@ -454,22 +423,78 @@ func (a *API) RegisterTelegramWebhookOnStartup(ctx context.Context) {
 		// ErrIntegrationNotFound (none configured / disabled) is normal - nothing to do.
 		return
 	}
-	a.setTelegramWebhook(ctx, integ)
+	a.reconcileTelegramWebhook(ctx, integ.ID)
 }
 
-// deleteTelegramWebhookForConfig clears the Bot API webhook using the bot token in
-// the given (old) config. Best-effort; a missing token or parse error is a no-op.
-func (a *API) deleteTelegramWebhookForConfig(ctx context.Context, cfgRaw json.RawMessage) {
-	if a.telegram == nil || len(cfgRaw) == 0 {
+// reconcileTelegramWebhook brings the Bot API into line with the durable row.
+//
+// The effect of a lifecycle command is decided by the row as it stands AFTER
+// the commit, read under an advisory lock - not by the command's arguments.
+// Transactions are serialised; their effects are not. Two instances rotating
+// the token T1 -> T2 and T2 -> T3 can run their effects in the reverse order,
+// and an effect acting on its own (before, after) would register T2 again after
+// T3 had been set; an edit racing a deletion would register the webhook of an
+// integration that no longer exists. Under the lock each reconcile reads the
+// current row and acts on that, one reconcile's read and calls finish before
+// another's begin, and the last one to run sees the newest row.
+//
+// The rows a command saw contribute CANDIDATES for deregistration, nothing
+// more: every token they carry that is not the current enabled one is removed.
+// The current token itself is never removed, so T1 -> T2 -> T1 does not take
+// the live webhook down. Best-effort throughout, like every Telegram effect
+// here: a failure is logged and never fails the request.
+func (a *API) reconcileTelegramWebhook(ctx context.Context, id string, seen ...*model.Integration) {
+	if a.telegram == nil {
 		return
+	}
+	candidates := telegramTokensOf(seen)
+	err := a.store.WithIntegrationLocked(ctx, id, func(current *model.Integration) error {
+		keep := ""
+		if current != nil && current.Type == model.IntegrationTypeTelegram && current.Enabled {
+			keep = telegramTokenOf(current)
+		}
+		for _, token := range candidates {
+			if token == keep {
+				continue
+			}
+			if err := a.telegram.DeleteWebhook(ctx, token); err != nil {
+				log.Printf("telegram deleteWebhook failed: %v", err)
+			}
+		}
+		if keep != "" {
+			a.setTelegramWebhook(ctx, current)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("telegram webhook reconcile for integration %s: %v", id, err)
+	}
+}
+
+// telegramTokensOf is the distinct bot tokens the given rows carry, in order.
+func telegramTokensOf(rows []*model.Integration) []string {
+	var tokens []string
+	seen := map[string]bool{}
+	for _, row := range rows {
+		token := telegramTokenOf(row)
+		if token == "" || seen[token] {
+			continue
+		}
+		seen[token] = true
+		tokens = append(tokens, token)
+	}
+	return tokens
+}
+
+func telegramTokenOf(row *model.Integration) string {
+	if row == nil || row.Type != model.IntegrationTypeTelegram {
+		return ""
 	}
 	var cfg model.TelegramConfig
-	if err := json.Unmarshal(cfgRaw, &cfg); err != nil || cfg.BotToken == "" {
-		return
+	if err := json.Unmarshal(row.Config, &cfg); err != nil {
+		return ""
 	}
-	if err := a.telegram.DeleteWebhook(ctx, cfg.BotToken); err != nil {
-		log.Printf("telegram deleteWebhook failed: %v", err)
-	}
+	return cfg.BotToken
 }
 
 // TestIntegrationRequest represents a request to test an integration
