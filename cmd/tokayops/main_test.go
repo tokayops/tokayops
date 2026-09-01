@@ -250,3 +250,22 @@ func TestShutdownStopsAcceptingBeforeItWaits(t *testing.T) {
 		t.Fatal("the process did not exit after its workers were done")
 	}
 }
+
+// TestTheCatalogueOffersNoWebhookChannel: the channels a policy step may name
+// are slack and telegram. The webhook channel delivers events to subscribers and
+// is not among them - a policy that paged a URL is not a thing this build lets
+// anyone write, and the catalogue is where that is decided.
+func TestTheCatalogueOffersNoWebhookChannel(t *testing.T) {
+	channels := channelCatalog()
+	for _, name := range []string{"slack", "telegram"} {
+		if _, ok := channels.Capabilities(name); !ok {
+			t.Errorf("the catalogue lacks %s", name)
+		}
+	}
+	if _, ok := channels.Capabilities("webhook"); ok {
+		t.Fatal("the catalogue offers the webhook channel to policy steps")
+	}
+	if got := len(channels.AllCapabilities()); got != 2 {
+		t.Fatalf("the catalogue lists %d channels, want 2", got)
+	}
+}

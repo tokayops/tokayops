@@ -177,6 +177,7 @@ func (e *webhookEnv) deliverOnce(t *testing.T) {
 }
 
 type settled struct {
+	ID              string
 	Status          string
 	ReceiptRecorded bool
 	Receipt         sql.NullString
@@ -191,14 +192,14 @@ func (e *webhookEnv) commitmentOf(t *testing.T, subscriber string) settled {
 	t.Helper()
 	var got settled
 	err := e.s.GetDB().QueryRow(`
-		SELECT i.status, i.receipt_recorded, i.receipt::text, i.receipt_ref,
+		SELECT i.id, i.status, i.receipt_recorded, i.receipt::text, i.receipt_ref,
 		       (SELECT count(*) FROM outbound_attempts a WHERE a.intent_id = i.id AND a.record_kind = 'attempt'),
 		       (SELECT a.operation FROM outbound_attempts a WHERE a.intent_id = i.id ORDER BY a.attempt_no DESC LIMIT 1),
 		       (SELECT a.outcome FROM outbound_attempts a WHERE a.intent_id = i.id ORDER BY a.attempt_no DESC LIMIT 1),
 		       (SELECT a.provider_status FROM outbound_attempts a WHERE a.intent_id = i.id ORDER BY a.attempt_no DESC LIMIT 1)
 		FROM outbound_intents i
 		WHERE i.delivery_family = 'webhook' AND i.target_ref = $1`, subscriber).
-		Scan(&got.Status, &got.ReceiptRecorded, &got.Receipt, &got.ReceiptRef,
+		Scan(&got.ID, &got.Status, &got.ReceiptRecorded, &got.Receipt, &got.ReceiptRef,
 			&got.Attempts, &got.LastOperation, &got.LastOutcome, &got.LastStatus)
 	if err != nil {
 		t.Fatalf("read the commitment: %v", err)
@@ -801,5 +802,101 @@ func TestTheHistoryOfADeletedSubscriberIsReadAndNotReplayed(t *testing.T) {
 	}
 	if got := env.call(t, http.MethodGet, "/api/v1/integrations/"+slack.ID+"/deliveries", nil).Code; got != http.StatusNotFound {
 		t.Fatalf("a deleted Slack integration's history route answered %d", got)
+	}
+}
+
+// TestTheAttemptIsWrittenBeforeTheCall: while the request is on the wire the
+// journal already holds an open attempt for it. A worker that died here would
+// leave a record for recovery to close, not a call nobody knew was made.
+func TestTheAttemptIsWrittenBeforeTheCall(t *testing.T) {
+	env := setupWebhookEnv(t)
+	rec := newGatedReceiver(http.StatusOK)
+	srv := rec.serve(t)
+	subscriber := env.subscribe(t, srv.URL)
+	env.event(t)
+	ctx := context.Background()
+	env.fanOut.Tick(ctx)
+	env.worker.Tick(ctx)
+	select {
+	case <-rec.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request never went out")
+	}
+
+	var open int
+	if err := env.s.GetDB().QueryRow(`
+		SELECT count(*) FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
+		WHERE i.target_ref = $1 AND a.record_kind = 'attempt' AND a.started_at IS NOT NULL AND a.finished_at IS NULL`,
+		subscriber).Scan(&open); err != nil || open != 1 {
+		t.Fatalf("%d open attempts while the request is on the wire (%v), want 1", open, err)
+	}
+	close(rec.release)
+	env.worker.Drain()
+	if got := env.commitmentOf(t, subscriber); got.Status != "succeeded" || got.Attempts != 1 {
+		t.Fatalf("after the answer the commitment reads %+v", got)
+	}
+}
+
+// TestOneSubscribersFailureLeavesTheOthersDeliveryAlone: one event, two
+// subscribers, two commitments; the one whose subscriber failed is retried, the
+// other is done.
+func TestOneSubscribersFailureLeavesTheOthersDeliveryAlone(t *testing.T) {
+	env := setupWebhookEnv(t)
+	failing := &receiver{}
+	failing.status.Store(http.StatusInternalServerError)
+	fine := &receiver{}
+	fine.status.Store(http.StatusOK)
+	unlucky := env.subscribe(t, failing.serve(t).URL)
+	lucky := env.subscribe(t, fine.serve(t).URL)
+	env.event(t)
+
+	env.deliverOnce(t)
+	if failing.calls.Load() != 1 || fine.calls.Load() != 1 {
+		t.Fatalf("calls: failing %d, fine %d", failing.calls.Load(), fine.calls.Load())
+	}
+	if got := env.commitmentOf(t, unlucky); got.Status != "pending" || got.LastOutcome.String != "ambiguous" {
+		t.Fatalf("the failing subscriber's commitment reads %+v", got)
+	}
+	if got := env.commitmentOf(t, lucky); got.Status != "succeeded" {
+		t.Fatalf("the other subscriber's commitment reads %+v", got)
+	}
+}
+
+// TestADeadSubscriberStaysOwedAndIsRetriedOnTheCurve: twenty answers of 500 in
+// a row, and the commitment is still owed - no attempt limit ends it - with a
+// failure streak the backoff curve is read from, and its next attempt no
+// further away than the family's ceiling allows.
+func TestADeadSubscriberStaysOwedAndIsRetriedOnTheCurve(t *testing.T) {
+	env := setupWebhookEnv(t)
+	rec := &receiver{}
+	rec.status.Store(http.StatusInternalServerError)
+	subscriber := env.subscribe(t, rec.serve(t).URL)
+	env.event(t)
+
+	for round := 1; round <= 20; round++ {
+		if round > 1 {
+			env.dueNow(t, env.commitmentOf(t, subscriber).ID)
+		}
+		env.deliverOnce(t)
+		if rec.calls.Load() != int32(round) {
+			t.Fatalf("round %d: the subscriber was called %d times", round, rec.calls.Load())
+		}
+	}
+	got := env.commitmentOf(t, subscriber)
+	if got.Status != "pending" || got.Attempts != 20 {
+		t.Fatalf("after twenty failures the commitment reads %+v", got)
+	}
+	var streak int
+	var wait float64
+	if err := env.s.GetDB().QueryRow(`SELECT failure_streak, EXTRACT(EPOCH FROM (next_attempt_at - now()))
+		FROM outbound_intents WHERE id = $1`, got.ID).Scan(&streak, &wait); err != nil {
+		t.Fatal(err)
+	}
+	if streak != 20 {
+		t.Fatalf("failure_streak = %d, want 20", streak)
+	}
+	ceiling := (outbound.WebhookBackoffCap + outbound.WebhookBackoffCap/5).Seconds()
+	if wait <= 0 || wait > ceiling {
+		t.Fatalf("the next attempt is %.0fs away; want within the 30 minute ceiling and its jitter", wait)
 	}
 }

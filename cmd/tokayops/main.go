@@ -93,6 +93,28 @@ func checkCommand(args []string) error {
 	return errors.New(msg)
 }
 
+// channelCatalog is what the channels of this build can do, as the policy
+// editor and the handoff fan-out read it. A channel is in it when a policy step
+// may name it. The webhook channel is deliberately not: an outgoing webhook is
+// a subscription to the alert's events, not a step of an escalation, and a
+// catalogue entry would let a policy be written that pages a URL.
+func channelCatalog() *providers.Catalog {
+	channels := providers.NewCatalog()
+	channels.Register(providers.Capability{
+		Name:                 "slack",
+		IntegrationType:      model.IntegrationTypeSlack,
+		SupportedTargetKinds: []string{"dm", "channel"},
+	})
+	// The registration here is what makes telegram appear in the policy editor
+	// and in the handoff fan-out.
+	channels.Register(providers.Capability{
+		Name:                 "telegram",
+		IntegrationType:      model.IntegrationTypeTelegram,
+		SupportedTargetKinds: []string{"dm", "channel"},
+	})
+	return channels
+}
+
 func main() {
 	// Arguments are checked before anything is loaded, connected to or migrated.
 	if err := checkCommand(os.Args); err != nil {
@@ -346,28 +368,16 @@ func main() {
 
 	// What the channels of this build can do. Read by the policy editor, and by
 	// the detector before it promises an announcement.
-	channels := providers.NewCatalog()
+	channels := channelCatalog()
 
 	// The Slack provider is the API layer's SlackMessenger. Nothing resolves it
 	// through the catalogue any more: what the catalogue answers is what a
 	// channel CAN do, and who holds the instance is the wiring's business.
 	slackProvider := slackprovider.NewProvider(integrationCache)
-	channels.Register(providers.Capability{
-		Name:                 "slack",
-		IntegrationType:      model.IntegrationTypeSlack,
-		SupportedTargetKinds: []string{"dm", "channel"},
-	})
 
-	// The Telegram provider. The capability registration here is what makes
-	// telegram appear in the policy editor and in the handoff fan-out; the
-	// incoming webhook and interactivity need the provider in the API layer as
-	// well, the way slackProvider is wired above.
+	// The Telegram provider. The incoming webhook and interactivity need it in
+	// the API layer as well, the way slackProvider is wired above.
 	telegramProvider := telegramprovider.NewProvider(integrationCache)
-	channels.Register(providers.Capability{
-		Name:                 "telegram",
-		IntegrationType:      model.IntegrationTypeTelegram,
-		SupportedTargetKinds: []string{"dm", "channel"},
-	})
 
 	// 5. Ingester (HTTP) - uses integration cache for webhook auth
 	ingesterService := ingester.NewIngester(st, cfg, integrationCache)
