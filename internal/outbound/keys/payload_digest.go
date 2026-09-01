@@ -22,6 +22,8 @@ func KnowsPayloadSchema(kind Kind, schemaVersion int) bool {
 		return schemaVersion == EscalationPayloadV1{}.SchemaVersion()
 	case KindHandoff:
 		return schemaVersion == HandoffPayloadV1{}.SchemaVersion()
+	case KindWebhookEvent, KindWebhookReplay:
+		return schemaVersion == WebhookPayloadV1{}.SchemaVersion()
 	default:
 		return false
 	}
@@ -94,6 +96,12 @@ func decodePayload(kind Kind, schemaVersion int, raw []byte) (Payload, error) {
 		return decoded, nil
 	case KindHandoff:
 		decoded, err := DecodeHandoffPayloadV1(schemaVersion, raw)
+		if err != nil {
+			return nil, err
+		}
+		return decoded, nil
+	case KindWebhookEvent, KindWebhookReplay:
+		decoded, err := DecodeWebhookPayloadV1(schemaVersion, raw)
 		if err != nil {
 			return nil, err
 		}

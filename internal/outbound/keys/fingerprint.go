@@ -262,14 +262,17 @@ func DecodeEscalationPayloadV1(schemaVersion int, raw []byte) (EscalationPayload
 	if err := payload.Slot.validate(); err != nil {
 		return payload, err
 	}
-	if err := payload.Target.validate(); err != nil {
+	// A person or a channel. The grammar also knows subscribers, and an
+	// escalation aimed at one would be a message nothing in Slack or Telegram
+	// can be handed.
+	if err := payload.Target.addressedTo(TargetChannel, TargetUser); err != nil {
 		return payload, err
 	}
 	return payload, nil
 }
 
 func (p EscalationPayloadV1) encode(buf *bytes.Buffer) error {
-	if err := p.Target.validate(); err != nil {
+	if err := p.Target.addressedTo(TargetChannel, TargetUser); err != nil {
 		return err
 	}
 	if err := p.Slot.encode(buf); err != nil {
@@ -412,7 +415,11 @@ func batchFingerprint(version int, outcome AdmissionOutcome, content []byte, enc
 	if outcome == OutcomeAdmitted && len(encoded) == 0 {
 		return nil, contractf("an admission of nothing")
 	}
-	if len(content) != sha256.Size {
+	// The content reference is optional in the protocol - encOptBytes below
+	// writes absence as its own marker - and a webhook admission has none: what
+	// its commitments are about is the event, which is already the claim. When
+	// one IS given it is a digest, and only a whole one.
+	if content != nil && len(content) != sha256.Size {
 		return nil, contractf("a content reference of %d bytes, expected %d",
 			len(content), sha256.Size)
 	}

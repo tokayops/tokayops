@@ -105,7 +105,7 @@ func (c EscalationCommitment) validate() error {
 	if c.Provider == "" {
 		return contractf("an escalation commitment with no provider")
 	}
-	if err := c.Target.validate(); err != nil {
+	if err := c.Target.addressedTo(TargetChannel, TargetUser); err != nil {
 		return err
 	}
 	if err := c.Timing.validate(); err != nil {

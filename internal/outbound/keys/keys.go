@@ -25,6 +25,25 @@ const FamilyNotification Family = "notification"
 // family label.
 const FamilyHandoff Family = "handoff"
 
+// FamilyWebhook is the partition an outgoing webhook runs in.
+//
+// Its own for the same two reasons handoff's is. The slot scheduler is fair by
+// COUNT and paging pays in TIME: a call to a subscriber that neither answers
+// nor refuses holds a slot for the whole of its timeout, two orders of
+// magnitude longer than a direct message, so sharing a pool would let a dead
+// subscriber slow a page. And the alerting rules differ: nobody to notify is a
+// page nobody sees, but nobody subscribed is an installation without webhooks.
+const FamilyWebhook Family = "webhook"
+
+// ProviderWebhook is the one provider of the webhook family.
+//
+// A literal rather than the integration type's name, by the same convention
+// that spells Slack's as "slack". It is the value of the provider column, the
+// key of the worker's channel map, the provider label of the attempt metric
+// and the group the queue snapshot is taken by - and it is NOT part of the
+// business key, which names the event and the subscriber and nothing else.
+const ProviderWebhook = "webhook"
+
 // Kind is the identity grammar a key is written in.
 type Kind string
 
@@ -48,6 +67,21 @@ const (
 	// render snapshot - everything it says is in its own payload - and no
 	// acknowledgement, which is why it is the first kind to carry a deadline.
 	KindHandoff Kind = "handoff"
+
+	// KindWebhookEvent is one alert event delivered to one subscriber.
+	//
+	// It is about an event of the alert outbox and the integration that
+	// subscribed to it. The payload carries a COPY of the event body, so the
+	// commitment reads nothing else at delivery time; and like a handover it
+	// creates no addressable object - a POST leaves nothing to name.
+	KindWebhookEvent Kind = "webhook_event"
+
+	// KindWebhookReplay is an operator sending an event to a subscriber again.
+	//
+	// A new commitment with the operator's request id in its key, never the
+	// old one revived: a delivered commitment is done, and the family's one
+	// door to a second external effect is this kind.
+	KindWebhookReplay Kind = "webhook_replay"
 )
 
 // GrammarV1 is the only version any of these grammars has.
@@ -72,6 +106,8 @@ func supportedVersions(kind Kind) ([]int, error) {
 	case KindEscalationReplay:
 		return []int{GrammarV1}, nil
 	case KindHandoff:
+		return []int{GrammarV1}, nil
+	case KindWebhookEvent, KindWebhookReplay:
 		return []int{GrammarV1}, nil
 	default:
 		return nil, contractf("unknown key kind %q", kind)
@@ -129,6 +165,8 @@ func familyOf(kind Kind) (Family, error) {
 		return FamilyNotification, nil
 	case KindHandoff:
 		return FamilyHandoff, nil
+	case KindWebhookEvent, KindWebhookReplay:
+		return FamilyWebhook, nil
 	default:
 		return "", contractf("unknown key kind %q", kind)
 	}
@@ -229,6 +267,12 @@ type TargetKind string
 const (
 	TargetChannel TargetKind = "channel"
 	TargetUser    TargetKind = "user"
+
+	// TargetSubscriber is an integration that subscribed to alert events. Its
+	// ref is the integration id as this system names it; the URL it will be
+	// posted to is preparation's business and can change without changing
+	// what was promised.
+	TargetSubscriber TargetKind = "subscriber"
 )
 
 // Target is who a commitment is for, in one place.
@@ -247,7 +291,7 @@ type Target struct {
 
 func (t Target) validate() error {
 	switch t.Kind {
-	case TargetChannel, TargetUser:
+	case TargetChannel, TargetUser, TargetSubscriber:
 	default:
 		return contractf("unknown target kind %q", t.Kind)
 	}
@@ -255,6 +299,25 @@ func (t Target) validate() error {
 		return contractf("a %s target with no recipient", t.Kind)
 	}
 	return nil
+}
+
+// addressedTo refuses a target outside the kinds a claim can be aimed at.
+//
+// The set is per kind of claim, not per grammar: an escalation goes to a
+// person or a channel, a handover to a person, a webhook to a subscriber. A
+// target the grammar knows but this claim cannot address is a statement the
+// claim cannot make - and each kind says so in its own words, because the
+// reader who meets the refusal needs to know which rule they broke.
+func (t Target) addressedTo(kinds ...TargetKind) error {
+	if err := t.validate(); err != nil {
+		return err
+	}
+	for _, kind := range kinds {
+		if t.Kind == kind {
+			return nil
+		}
+	}
+	return contractf("a %s target where this claim addresses only %v", t.Kind, kinds)
 }
 
 // escalationIntent is the identity of one commitment.
@@ -282,7 +345,10 @@ func (i escalationIntent) key(kind Kind, version int) (string, error) {
 	if i.Provider == "" {
 		return "", contractf("an escalation commitment with no provider")
 	}
-	if err := i.Target.validate(); err != nil {
+	// A person or a channel. The grammar also knows subscribers, and an
+	// escalation aimed at one would be a message nothing in Slack or Telegram
+	// can be handed.
+	if err := i.Target.addressedTo(TargetChannel, TargetUser); err != nil {
 		return "", err
 	}
 	if err := requestIDFor(kind, i.ClientRequestID); err != nil {
@@ -373,18 +439,26 @@ func CandidateBatchKeys(b BatchIdentity) ([]string, error) {
 // and which are refused for carrying one.
 func requestIDFor(kind Kind, id string) error {
 	switch kind {
-	case KindEscalation:
+	case KindEscalation, KindWebhookEvent:
 		if id != "" {
 			return contractf("a first admission carries no client request id")
 		}
 		return nil
-	case KindEscalationReplay:
+	case KindEscalationReplay, KindWebhookReplay:
 		if id == "" {
 			return contractf("a re-admission with no client request id")
 		}
 		if len(id) > MaxClientRequestID {
 			return contractf("client request id is %d bytes, the limit is %d",
 				len(id), MaxClientRequestID)
+		}
+		return nil
+	case KindHandoff:
+		// A handover is admitted by its occurrence, and nobody re-admits one:
+		// the same shift change is the same claim however many times it is
+		// seen. An id here would be an identity the grammar does not have.
+		if id != "" {
+			return contractf("a handover admission carries no client request id")
 		}
 		return nil
 	default:
