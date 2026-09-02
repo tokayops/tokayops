@@ -101,6 +101,17 @@ test-delivery:
 	@./scripts/run_integration_tests.sh --failures \
 		--pkg "./internal/outbound/... ./internal/handoff/..."
 
+# The SLO profiles, measured rather than reasoned about: paging on a quiet
+# instance, paging under the webhook steady state, the webhook burst on a free
+# pool, and the handover burst. Minutes each, on purpose, and not in the
+# ordinary run - the flag is what lets them run at all, and the numbers they
+# print are what the sprint plan records.
+test-profile:
+	@TOKAY_PROFILE_SLO=1 ./scripts/run_integration_tests.sh \
+		--pkg ./internal/integration/... \
+		--run 'Profile|WebhookBacklog|WebhookBurst' \
+		--timeout 45m
+
 # =============================================================================
 # E2E Testing
 # =============================================================================

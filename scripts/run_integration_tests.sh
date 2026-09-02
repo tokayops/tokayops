@@ -44,6 +44,12 @@ while [[ $# -gt 0 ]]; do
             PACKAGE="$2"
             shift 2
             ;;
+        # The SLO profiles run for minutes each, past go test's default ten
+        # per package; the profile target passes the budget they need.
+        --timeout)
+            TIMEOUT="$2"
+            shift 2
+            ;;
         --summary)
             OUTPUT_MODE="summary"
             VERBOSE=""
@@ -107,6 +113,9 @@ if $SHUFFLE; then
 fi
 if [ -n "$RUN_PATTERN" ]; then
     TEST_CMD="$TEST_CMD -run $RUN_PATTERN"
+fi
+if [ -n "${TIMEOUT:-}" ]; then
+    TEST_CMD="$TEST_CMD -timeout $TIMEOUT"
 fi
 TEST_CMD="$TEST_CMD $PACKAGE"
 
