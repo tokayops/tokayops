@@ -140,13 +140,12 @@ func isPublic(ip net.IP) bool {
 		}
 		return true
 	}
-	// An IPv6 address that names no IPv4: public means an address inside a
-	// block the IANA registry has ACTUALLY allocated, or one of the
-	// special-purpose assignments IANA marks globally reachable. 2000::/3 is
-	// the space allocations are made FROM, not the allocation: what is not in
-	// the registry - 3ffe::/16 (reserved, the retired 6bone), 2200::, the rest
-	// of the unassigned space - fails closed and takes the operator's
-	// allowlist, the same door every other non-public address takes.
+	// An IPv6 address that names no IPv4, against the two registries above.
+	// 2000::/3 is the space allocations are made FROM, not the allocation:
+	// what the registry does not hold - 3ffe::/16 (RESERVED, the retired
+	// 6bone), 2200::, the rest of the unassigned space - fails closed and
+	// takes the operator's allowlist, the same door every other non-public
+	// address takes.
 	for _, r := range reachableSpecialPurposeV6 {
 		if r.Contains(ip) {
 			return true
@@ -162,7 +161,7 @@ func isPublic(ip net.IP) bool {
 	if !allocated {
 		return false
 	}
-	for _, r := range reservedIPv6 {
+	for _, r := range notReachableInsideAllocatedV6 {
 		if r.Contains(ip) {
 			return false
 		}
@@ -184,20 +183,27 @@ var reservedIPv4 = parseCIDRs(
 	"240.0.0.0/4",     // reserved, and the broadcast address
 )
 
-// allocatedGlobalUnicastV6 is the IANA IPv6 Global Unicast Address
-// Assignments registry
-// (https://www.iana.org/assignments/ipv6-unicast-address-assignments),
-// transcribed 2026-09-02. FAIL-CLOSED: an address in none of these blocks is
-// not public, however plausible it looks, and a new IANA allocation reaches
-// subscribers by updating this list (or, until then, by the installation's
-// allowlist).
+// The two IANA registries this build is judged against, transcribed from the
+// registries themselves on 2026-09-02:
 //
-// Two deliberate absences. 2001:0000::/23 is IANA's own special-purpose block:
-// nothing in it is public wholesale - its reachable assignments are allowed
-// one by one below, and the rest (Teredo, benchmarking, ORCHID, drone ID) fail
-// closed by not being listed. And 2002::/16 (6to4) is judged as the IPv4 it
-// embeds, never as itself. 2001:2000::/19 is kept as the three blocks the /19
-// consolidated so its recovered corner (2001:3c00::/22) stays closed.
+//   - IPv6 Global Unicast Address Assignments
+//     https://www.iana.org/assignments/ipv6-unicast-address-assignments
+//   - IPv6 Special-Purpose Address Registry
+//     https://www.iana.org/assignments/iana-ipv6-special-registry
+//
+// The rule, with nothing left to judgement: an IPv6 address that names no IPv4
+// is public when it is inside a block the unicast registry has ALLOCATED to a
+// regional registry and outside any special-purpose assignment the second
+// registry marks NOT globally reachable, or when it is inside one it marks
+// globally reachable. FAIL-CLOSED: an address in none of them is refused,
+// however plausible it looks, and a new IANA allocation reaches subscribers by
+// updating this list - or, until then, through the installation's allowlist.
+//
+// Two rows of the unicast registry are ALLOCATED to something other than a
+// regional registry, and each has its own rule instead of being taken whole:
+// 2001::/23 is IANA's own block, so only its globally reachable assignments
+// below are public and the rest of it (Teredo, benchmarking, the deprecated
+// ORCHID) fails closed; and 2002::/16 is 6to4, judged by the IPv4 it embeds.
 var allocatedGlobalUnicastV6 = parseCIDRs(
 	"2001:200::/23",  // APNIC
 	"2001:400::/23",  // ARIN
@@ -210,9 +216,7 @@ var allocatedGlobalUnicastV6 = parseCIDRs(
 	"2001:1800::/23", // ARIN
 	"2001:1a00::/23", // RIPE NCC
 	"2001:1c00::/22", // RIPE NCC
-	"2001:2000::/20", // RIPE NCC
-	"2001:3000::/21", // RIPE NCC
-	"2001:3800::/22", // RIPE NCC
+	"2001:2000::/19", // RIPE NCC
 	"2001:4000::/23", // RIPE NCC
 	"2001:4200::/23", // AFRINIC
 	"2001:4400::/23", // APNIC
@@ -226,6 +230,7 @@ var allocatedGlobalUnicastV6 = parseCIDRs(
 	"2001:b000::/20", // APNIC
 	"2003::/18",      // RIPE NCC
 	"2400::/12",      // APNIC
+	"2410::/12",      // APNIC
 	"2600::/12",      // ARIN
 	"2610::/23",      // ARIN
 	"2620::/23",      // ARIN
@@ -236,20 +241,31 @@ var allocatedGlobalUnicastV6 = parseCIDRs(
 	"2c00::/12",      // AFRINIC
 )
 
-// reachableSpecialPurposeV6 are the special-purpose assignments the IANA IPv6
-// Special-Purpose Address Registry marks globally reachable. They live inside
-// 2001:0000::/23, which the allocated list refuses wholesale, so each is
-// allowed by name.
+// reachableSpecialPurposeV6 is every assignment the special-purpose registry
+// marks globally reachable, minus one: 64:ff9b::/96. That prefix is marked
+// reachable and is a TRANSLATION prefix - 64:ff9b::a00:7 reaches 10.0.0.7
+// through a translator - so an address in it never gets here, having been
+// judged as the IPv4 it embeds several lines earlier. It is left out because
+// the two rules must not contradict each other on paper either; what actually
+// keeps that address out is the order, and the test that refuses
+// 64:ff9b::a00:7 is what holds the order in place.
+//
+// 2620:4f:8000::/48 (Direct Delegation AS112) needs no entry: it is inside
+// ARIN's 2620::/23 and public already.
 var reachableSpecialPurposeV6 = parseCIDRs(
 	"2001:1::1/128",   // Port Control Protocol anycast
 	"2001:1::2/128",   // Traversal Using Relays around NAT anycast
+	"2001:1::3/128",   // DNS-SD Service Registration Protocol anycast
 	"2001:3::/32",     // AMT
 	"2001:4:112::/48", // AS112-v6
+	"2001:20::/28",    // ORCHIDv2
+	"2001:30::/28",    // Drone Remote ID Protocol Entity Tags
 )
 
-// reservedIPv6 are the not-globally-reachable ranges INSIDE the allocated
-// blocks above.
-var reservedIPv6 = parseCIDRs(
+// notReachableInsideAllocatedV6 are the special-purpose assignments marked NOT
+// globally reachable that lie INSIDE an allocated block, and so are not
+// refused by the registry check above. Today the registry holds exactly one.
+var notReachableInsideAllocatedV6 = parseCIDRs(
 	"2001:db8::/32", // documentation, inside APNIC's 2001:c00::/23
 )
 

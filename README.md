@@ -240,9 +240,9 @@ to 24 hours from the event, after which the delivery expires. A subscriber's
 posted to: every address the subscriber's name resolves to is checked before
 any request is made and again when the connection is opened. For IPv6 the rule
 is fail-closed - public means inside a block the IANA Global Unicast
-Assignments registry has actually allocated (or one of the globally reachable
-special-purpose anycasts), so reserved and unassigned space is refused without
-being named - and for IPv4 the whole space minus the IANA special-purpose
+Assignments registry has allocated to a regional registry, or inside an
+assignment the IANA Special-Purpose registry marks globally reachable, so
+reserved and unassigned space is refused without being named - and for IPv4 the whole space minus the IANA special-purpose
 registry; private, loopback, link-local, unique-local, site-local,
 shared-address-space, multicast, unspecified, SRv6, local-NAT64, reserved and
 unallocated addresses are all refused unless the operator allows the range with

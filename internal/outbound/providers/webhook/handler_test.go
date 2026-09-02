@@ -561,32 +561,45 @@ func TestOnlyAPublicAddressMayBePostedTo(t *testing.T) {
 		"fec0::1",            // site-local, deprecated but routed by old gear
 		"4000::1", "a000::1", // unallocated
 		"::2", // beside the unspecified address
-		// Special-purpose inside 2000::/3.
+		// Inside IANA's own 2001::/23, which is allocated to no registry: only
+		// its globally reachable assignments are public, and these are not them.
 		"2001::1",     // Teredo
 		"2001:2::1",   // benchmarking
-		"2001:10::1",  // ORCHID
-		"2001:20::1",  // ORCHIDv2
-		"2001:30::1",  // drone remote ID
-		"3fff::1",     // documentation
-		"2001:db8::1", // documentation, inside an allocated block
+		"2001:10::1",  // deprecated ORCHID
+		"2001:5::1",   // no assignment at all
+		"3fff::1",     // documentation, RESERVED in the unicast registry
+		"2001:db8::1", // documentation, and it lives INSIDE an allocated block
 		"192.88.99.1", // 6to4 relay anycast, deprecated
 		// Inside 2000::/3 and NOT in the IANA unicast assignments registry:
 		// the space allocations are made from is not the allocation.
-		"3ffe::1",      // reserved - the retired 6bone, RESERVED in the registry
+		"3ffe::1",      // RESERVED - the retired 6bone
 		"2200::1",      // unassigned
-		"2001:3c00::1", // the corner the 2001:2000::/19 consolidation recovered
-		"2001:5::1",    // IANA's special-purpose block, no reachable assignment
 		"21ff:ffff::1", // unassigned, right below the first allocation
 	}
+	// Every one of these is a subscriber somebody could really have, and a
+	// block dropped from the list is a public subscriber answered with
+	// permanent_failed before a request is made - a support call, not an
+	// outage anyone can see. So: one address per allocated block, and every
+	// assignment the special-purpose registry marks globally reachable.
 	public := []string{"93.184.216.34", "8.8.8.8", "2606:4700::1111", "2001:4860:4860::8888",
 		"::ffff:93.184.216.34", "64:ff9b::5db8:d822", "2002:5db8:d822::",
-		"2001:1::1", "2001:4:112::1", // reachable special-purpose: PCP anycast, AS112
-		// One address per registry region, so a dropped block is a red test
-		// and not a support call: APNIC old and new, ARIN old and new, RIPE
-		// old and new, LACNIC, AFRINIC.
-		"2001:200::1", "2400::1", "2001:400::1", "2620:4f:8000::1",
-		"2001:600::1", "2a10::1", "2800::1", "2c0f::1",
-		"2a00:1450:4001:80f::200e"}
+		"2a00:1450:4001:80f::200e",
+		// Globally reachable special-purpose, all of it.
+		"2001:1::1", "2001:1::2", "2001:1::3", // PCP, TURN and DNS-SD SRP anycasts
+		"2001:3::1", "2001:4:112::1", // AMT, AS112-v6
+		"2001:20::1", "2001:30::1", // ORCHIDv2, drone remote ID
+		"2620:4f:8000::1", // Direct Delegation AS112, inside ARIN's 2620::/23
+		// One per allocated block of the unicast registry, in its order.
+		"2001:200::1", "2001:400::1", "2001:600::1", "2001:800::1",
+		"2001:c00::1", "2001:e00::1", "2001:1200::1", "2001:1400::1",
+		"2001:1800::1", "2001:1a00::1", "2001:1c00::1", "2001:2000::1",
+		"2001:3c00::1", // the /19 is allocated WHOLE: this corner is not free
+		"2001:4000::1", "2001:4200::1", "2001:4400::1", "2001:4600::1",
+		"2001:4800::1", "2001:4a00::1", "2001:4c00::1", "2001:5000::1",
+		"2001:8000::1", "2001:a000::1", "2001:b000::1", "2003::1",
+		"2400::1", "2410::1", // 2410::/12 is allocated to APNIC like 2400::/12
+		"2600::1", "2610::1", "2620::1", "2630::1", "2800::1",
+		"2a00::1", "2a10::1", "2c00::1"}
 	none := ipPolicy{}
 	for _, a := range blocked {
 		if none.allowedIP(net.ParseIP(a)) {
@@ -614,6 +627,24 @@ func TestOnlyAPublicAddressMayBePostedTo(t *testing.T) {
 		if allowing.allowedIP(net.ParseIP(a)) {
 			t.Errorf("allowing two ranges opened %s", a)
 		}
+	}
+
+	// A subscriber at an allocated address is PREPARED, not refused. This is
+	// the point where a block missing from the list turns a working public
+	// subscriber into permanent_failed with no request made - which is how
+	// 2410::/12 and the recovered corner of 2001:2000::/19 were found.
+	for _, a := range []string{"2410::1", "2410:1000:2::5", "2001:3c00::1", "2001:2000::1", "2001:1::3"} {
+		address := a
+		t.Run("a subscriber at "+address+" is prepared", func(t *testing.T) {
+			resolve := func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP(address)}, nil }
+			cfg := model.GenericWebhookConfig{URL: "https://hooks.example.com/a"}
+			h := NewHandlerResolving(&configs{found: true, cfg: cfg}, nil, resolve)
+			intent := intentFor(t, subscriberID)
+			req := h.Prepare(context.Background(), intent).Request(intent.ID, "lease", "worker")
+			if req.Preparation != outbound.PreparationReady || req.BoundEndpoint != cfg.URL {
+				t.Fatalf("prepared as %s / %q: a public subscriber was refused", req.Preparation, req.ErrorClass)
+			}
+		})
 	}
 
 	// Both points, for addresses one of the two lists this replaced let
