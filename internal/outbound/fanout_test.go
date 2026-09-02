@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/tokayops/tokayops/internal/metrics"
 )
 
@@ -167,4 +169,32 @@ func TestACancelledFanOutStopsAsking(t *testing.T) {
 	if done := newFanOutFor(t, st).Tick(ctx); done != 0 || st.calls != 0 {
 		t.Fatalf("a cancelled fan-out did %d and asked %d times", done, st.calls)
 	}
+}
+
+// TestEveryFanOutTickIsCountedEvenAnEmptyOne: the tick counter is the liveness
+// of the loop, so a tick that found no event counts exactly like one that
+// fanned out eight. A counter that only moved on work would be silent for the
+// same reason on a stopped loop and on an empty queue.
+func TestEveryFanOutTickIsCountedEvenAnEmptyOne(t *testing.T) {
+	f := newFanOutFor(t, &scriptedFanOut{answers: []func() (FanOutResult, error){nothingPending}})
+
+	before := plainCounterValue(t, metrics.OutboundFanOutTicksTotal)
+	if got := f.Tick(context.Background()); got != 0 {
+		t.Fatalf("an empty tick fanned out %d", got)
+	}
+	f.Tick(context.Background())
+	after := plainCounterValue(t, metrics.OutboundFanOutTicksTotal)
+
+	if after-before != 2 {
+		t.Fatalf("two empty ticks moved outbound_fanout_ticks_total by %v, want 2", after-before)
+	}
+}
+
+func plainCounterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("read the counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
 }

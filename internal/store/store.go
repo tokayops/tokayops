@@ -2532,12 +2532,55 @@ func (s *Store) queryPolicies(query string, args ...interface{}) ([]*model.Escal
 	return policies, nil
 }
 
-// GetMetricsSnapshot returns all data needed by the Prometheus business metrics collector.
-func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
+// snapshotSeam is a test hook, called before each step of the metrics
+// snapshot with the step's number. Production leaves it nil. It exists so a
+// test can make ONE named step hang - by taking a table lock just before it -
+// and prove that the deadline cancels that step and no other; a lock taken in
+// advance would stop the first statement on that table instead, and a
+// mutation of a later statement would never be reached.
+var snapshotSeam func(step int)
+
+// snapshotSteps is how many statements one snapshot runs, in order, and the
+// tables each one reads. Named so that the cancellation test walks every one
+// of them rather than the first that happens to hang.
+var snapshotSteps = []struct {
+	name  string
+	table string
+}{
+	{"active alert groups", "alert_groups"},            // 1
+	{"alert groups by status", "alert_groups"},         // 2
+	{"teams without on-call", "teams"},                 // 3
+	{"teams with permanent on-call", "schedules"},      // 4
+	{"teams without policy", "teams"},                  // 5
+	{"outbox events by status", "event_outbox"},        // 6
+	{"outbound intents by status", "outbound_intents"}, // 7
+	{"outbound queue lateness", "outbound_intents"},    // 8
+	{"outbound cards behind", "outbound_intents"},      // 9
+	{"no-targets admissions", "outbound_batches"},      // 10
+}
+
+func snapshotStep(step int) {
+	if snapshotSeam != nil {
+		snapshotSeam(step)
+	}
+}
+
+// GetMetricsSnapshot returns all data needed by the Prometheus business metrics
+// collector.
+//
+// Every statement runs under the caller's context, and the collector gives it
+// a deadline shorter than the scrape's: a scrape that Prometheus gives up on
+// must not leave a statement running against the database, because the next
+// scrape would start another, and a database that has stopped answering would
+// end up holding the connection pool. When the deadline cuts a statement, the
+// whole snapshot fails and the collector reports nothing - a partial answer
+// would look like a healthy one with some zeroes in it.
+func (s *Store) GetMetricsSnapshot(ctx context.Context) (*model.MetricsSnapshot, error) {
 	snap := &model.MetricsSnapshot{}
 
 	// 1. Active alert groups by team/severity
-	rows, err := s.db.Query(`
+	snapshotStep(1)
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT COALESCE(team_id, ''), COALESCE(severity, ''), COUNT(*) FROM alert_groups
 		WHERE status NOT IN ('resolved', 'closed')
 		GROUP BY COALESCE(team_id, ''), COALESCE(severity, '')`)
@@ -2556,8 +2599,9 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, err
 	}
 
-	// 1b. Alert groups by team/severity/status
-	rows2, err := s.db.Query(`
+	// 2. Alert groups by team/severity/status
+	snapshotStep(2)
+	rows2, err := s.db.QueryContext(ctx, `
 		SELECT COALESCE(team_id, ''), COALESCE(severity, ''), status, COUNT(*) FROM alert_groups
 		GROUP BY COALESCE(team_id, ''), COALESCE(severity, ''), status`)
 	if err != nil {
@@ -2575,7 +2619,7 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, err
 	}
 
-	// 2. Teams without on-call: no schedule, or one whose configuration in force
+	// 3. Teams without on-call: no schedule, or one whose configuration in force
 	// puts nobody on duty.
 	//
 	// The state is read from the revision in force (the open-ended tail), which
@@ -2585,7 +2629,8 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 	// and l1.enabled is checked because a disabled layer keeps its groups in the
 	// snapshot - only the phase pair is cleared - so groups alone would report a
 	// switched-off rotation as covered.
-	err = s.db.QueryRow(`
+	snapshotStep(3)
+	err = s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM teams t WHERE NOT EXISTS (
 			SELECT 1 FROM schedules s
 			JOIN schedule_revisions r ON r.schedule_id = s.id AND r.effective_to IS NULL
@@ -2596,7 +2641,7 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, fmt.Errorf("teams without oncall query: %w", err)
 	}
 
-	// 3. Teams with permanent on-call: exactly one person carries L1, forever.
+	// 4. Teams with permanent on-call: exactly one person carries L1, forever.
 	//
 	// "Exactly one person", not "exactly one group". The two were the same thing
 	// when user_ids was a flat list of users, and the query said so; the
@@ -2605,7 +2650,8 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 	// a permanent on-call ever since - though those people are all paged
 	// together and nobody is alone. This restores what the metric has always
 	// claimed to measure (see its HELP text): bus factor one.
-	err = s.db.QueryRow(`
+	snapshotStep(4)
+	err = s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM schedules s
 		JOIN schedule_revisions r ON r.schedule_id = s.id AND r.effective_to IS NULL
 		WHERE s.deleted_at IS NULL AND r.kind = 'active'
@@ -2617,16 +2663,18 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, fmt.Errorf("teams with permanent oncall query: %w", err)
 	}
 
-	// 4. Teams without escalation policy
-	err = s.db.QueryRow(`
+	// 5. Teams without escalation policy
+	snapshotStep(5)
+	err = s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM teams
 		WHERE default_policy_id IS NULL OR default_policy_id = ''`).Scan(&snap.TeamsWithoutPolicy)
 	if err != nil {
 		return nil, fmt.Errorf("teams without policy query: %w", err)
 	}
 
-	// 5. Outbox events by status
-	rows3, err := s.db.Query(`SELECT status, COUNT(*) FROM event_outbox GROUP BY status`)
+	// 6. Outbox events by status
+	snapshotStep(6)
+	rows3, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM event_outbox GROUP BY status`)
 	if err != nil {
 		return nil, fmt.Errorf("outbox events by status query: %w", err)
 	}
@@ -2642,11 +2690,12 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, err
 	}
 
-	// 6. Outbound commitments by family and status. (Webhook deliveries are
+	// 7. Outbound commitments by family and status. (Webhook deliveries are
 	// among them: the table the old worker kept them in is not read here, and
 	// on a fresh database it does not exist - a query against it would fail the
 	// whole snapshot, and the collector answers a failed snapshot with nothing.)
-	rows5, err := s.db.Query(`
+	snapshotStep(7)
+	rows5, err := s.db.QueryContext(ctx, `
 		SELECT delivery_family, status, COUNT(*) FROM outbound_intents
 		GROUP BY delivery_family, status`)
 	if err != nil {
@@ -2680,7 +2729,8 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 	// Every family that has rows at all reports a number, zero included, so a
 	// backlog that has been worked off stops ringing instead of leaving its last
 	// value behind forever.
-	rows6, err := s.db.Query(`
+	snapshotStep(8)
+	rows6, err := s.db.QueryContext(ctx, `
 		SELECT delivery_family,
 		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(next_attempt_at)
 		           FILTER (WHERE status = 'pending' AND next_attempt_at <= now()))), 0)::double precision
@@ -2705,15 +2755,52 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 	// first time somebody is paged or comes on duty. A graph that only starts
 	// when the thing it watches first happens is a graph nobody can alert on
 	// until then.
-	for _, family := range []string{outbound.FamilyNotification, outbound.FamilyHandoff, outbound.FamilyWebhook} {
+	for _, family := range outbound.Families() {
 		if !hasFamily(snap.OutboundLatenessSeconds, family) {
 			snap.OutboundLatenessSeconds = append(snap.OutboundLatenessSeconds,
 				model.OutboundLateness{Family: family})
 		}
 	}
 
-	if err := s.readCardsBehind(snap); err != nil {
+	// 9. Messages behind their alert.
+	snapshotStep(9)
+	if err := s.readCardsBehind(ctx, snap); err != nil {
 		return nil, err
+	}
+
+	// 10. Admissions that promised nobody, counted from the claims themselves.
+	//
+	// This is the durable twin of outbound_admissions_total{outcome="no_targets"}:
+	// the process counter can miss an increment when the process dies between
+	// the commit and the Inc, and starts from zero on every restart, and the
+	// alert for "an alert had nobody to page" must not depend on either. Claim
+	// rows are never deleted (OB-1), so the count only grows, and a rule over
+	// increase() reads it as the counter it is. The partial index under it
+	// keeps the scan to exactly the rows counted.
+	snapshotStep(10)
+	rows7, err := s.db.QueryContext(ctx, `
+		SELECT delivery_family, COUNT(*) FROM outbound_batches
+		WHERE admission_outcome = 'no_targets'
+		GROUP BY delivery_family`)
+	if err != nil {
+		return nil, fmt.Errorf("no-targets admissions query: %w", err)
+	}
+	defer rows7.Close()
+	for rows7.Next() {
+		var c model.OutboundFamilyCount
+		if err := rows7.Scan(&c.Family, &c.Count); err != nil {
+			return nil, err
+		}
+		snap.OutboundNoTargetsAdmissions = append(snap.OutboundNoTargetsAdmissions, c)
+	}
+	if err := rows7.Err(); err != nil {
+		return nil, err
+	}
+	for _, family := range outbound.Families() {
+		if !hasFamilyCount(snap.OutboundNoTargetsAdmissions, family) {
+			snap.OutboundNoTargetsAdmissions = append(snap.OutboundNoTargetsAdmissions,
+				model.OutboundFamilyCount{Family: family})
+		}
 	}
 
 	return snap, nil
@@ -2764,8 +2851,8 @@ const behindSince = `(
 // Staleness covers queued and stuck only. An abandoned card is one a person
 // decided not to catch up; counting its age would leave the gauge high forever
 // after a single operator decision, and nothing would ever bring it down.
-func (s *Store) readCardsBehind(snap *model.MetricsSnapshot) error {
-	rows, err := s.db.Query(`
+func (s *Store) readCardsBehind(ctx context.Context, snap *model.MetricsSnapshot) error {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT state, count(*),
 		       COALESCE(MAX(EXTRACT(EPOCH FROM (now() - since))), 0)::double precision,
 		       (array_agg(id ORDER BY id))[1]
@@ -2825,6 +2912,15 @@ func (s *Store) readCardsBehind(snap *model.MetricsSnapshot) error {
 func hasCardState(rows []model.OutboundCardsBehind, state string) bool {
 	for _, row := range rows {
 		if row.State == state {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFamilyCount(rows []model.OutboundFamilyCount, family string) bool {
+	for _, row := range rows {
+		if row.Family == family {
 			return true
 		}
 	}

@@ -71,7 +71,7 @@ func TestAFreshDatabaseHasNoDeliveryTablesAndTheSnapshotStillAnswers(t *testing.
 		}
 	}
 
-	if _, err := s.GetMetricsSnapshot(); err != nil {
+	if _, err := s.GetMetricsSnapshot(context.Background()); err != nil {
 		t.Fatalf("the snapshot fails on a fresh database: %v", err)
 	}
 	empty := families(t, s)

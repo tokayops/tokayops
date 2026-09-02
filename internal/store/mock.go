@@ -1834,7 +1834,7 @@ func (m *MockStore) GetAPITokenByID(id string) (*model.APIToken, error) {
 }
 
 // GetMetricsSnapshot returns mock metrics data.
-func (m *MockStore) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
+func (m *MockStore) GetMetricsSnapshot(context.Context) (*model.MetricsSnapshot, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 

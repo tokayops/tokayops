@@ -1,6 +1,7 @@
 package metrics_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -182,7 +183,7 @@ func TestBusinessCollector_OutboxEventsByStatus(t *testing.T) {
 // series would leave every one of them green.
 type snapshotStub struct{ snap *model.MetricsSnapshot }
 
-func (s snapshotStub) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
+func (s snapshotStub) GetMetricsSnapshot(context.Context) (*model.MetricsSnapshot, error) {
 	return s.snap, nil
 }
 

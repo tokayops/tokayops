@@ -47,6 +47,11 @@ type fakeStore struct {
 	expiries  int
 	recovers  int
 	nextID    int
+
+	// expired and recovered are what housekeeping answers, for the tests about
+	// what the worker says and counts when it finds abandoned work.
+	expired   []Expired
+	recovered []Recovered
 }
 
 // queues is one provider's work, split the way the store splits it.
@@ -75,14 +80,14 @@ func (f *fakeStore) ExpireDueIntents(context.Context, string, int) ([]Expired, e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.expiries++
-	return nil, nil
+	return f.expired, nil
 }
 
 func (f *fakeStore) RecoverStaleAttempts(context.Context, string, int) ([]Recovered, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.recovers++
-	return nil, nil
+	return f.recovered, nil
 }
 
 func (f *fakeStore) DueSnapshot(context.Context, string) ([]ProviderDue, error) {

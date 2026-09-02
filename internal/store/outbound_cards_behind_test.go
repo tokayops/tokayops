@@ -70,7 +70,7 @@ func TestACardBehindItsAlertIsCountedByWhoCanFixIt(t *testing.T) {
 		t.Fatalf("age the withdrawn card: %v", err)
 	}
 
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("scrape: %v", err)
 	}
@@ -136,7 +136,7 @@ func ageRevisions(t *testing.T, s *Store, intentID string, above int64, ago stri
 
 func staleness(t *testing.T, s *Store) float64 {
 	t.Helper()
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("scrape: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestARefusalBeforeTheNetworkIsStuckAndHasAnAge(t *testing.T) {
 		t.Fatalf("the preparation came back %s", refused.Outcome)
 	}
 
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("scrape: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestEveryStateReportsEvenWithNothingBehind(t *testing.T) {
 	s := setupTestDB(t)
 	s.SetRenderEnvironment("https://tokay.example", "UTC")
 
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("scrape: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestASettledCommitmentBehindItsAlertIsSaidOutLoud(t *testing.T) {
 	before := testutil.ToFloat64(
 		metrics.StorageContractFailuresTotal.WithLabelValues("desired_revision"))
 
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("scrape: %v", err)
 	}

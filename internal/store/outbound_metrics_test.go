@@ -20,7 +20,7 @@ import (
 
 func latenessOf(t *testing.T, s *Store, family string) (float64, bool) {
 	t.Helper()
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("read the snapshot: %v", err)
 	}
@@ -34,7 +34,7 @@ func latenessOf(t *testing.T, s *Store, family string) (float64, bool) {
 
 func intentsByStatus(t *testing.T, s *Store, family, status string) int {
 	t.Helper()
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("read the snapshot: %v", err)
 	}

@@ -416,6 +416,13 @@ CREATE INDEX IF NOT EXISTS idx_outbound_intents_status
 CREATE INDEX IF NOT EXISTS idx_outbound_intents_subscriber
 	ON outbound_intents (target_ref, created_at DESC)
 	WHERE delivery_family = 'webhook';
+-- The admissions that promised nobody, by family: the metrics snapshot counts
+-- them on every scrape, and this is the one number an alert reads from the
+-- rows rather than from a process counter, because a claim row survives what
+-- a counter does not. The predicate keeps the index to exactly those rows.
+CREATE INDEX IF NOT EXISTS idx_outbound_batches_no_targets
+	ON outbound_batches (delivery_family)
+	WHERE admission_outcome = 'no_targets';
 
 -- The journal is read by (intent, number) and by (intent, sequence), and both
 -- of those already have an index: the unique constraints that make those pairs

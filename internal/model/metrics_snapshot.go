@@ -36,6 +36,21 @@ type MetricsSnapshot struct {
 	// behind, counted only over the ones somebody or something is still going
 	// to catch up.
 	OutboundCardStalenessSeconds float64
+
+	// OutboundNoTargetsAdmissions is how many admission claims of each family
+	// were accepted and promised nobody, counted from the claim rows
+	// themselves. Claims are never deleted, so the number only grows, and it
+	// is the durable form of "an alert had nobody to page" - the one the alert
+	// rule reads, because the process counter beside it can miss an increment
+	// when the process dies between commit and Inc. Every family reports, zero
+	// included, so increase() has a base from the first scrape.
+	OutboundNoTargetsAdmissions []OutboundFamilyCount
+}
+
+// OutboundFamilyCount is one delivery family's count of something.
+type OutboundFamilyCount struct {
+	Family string
+	Count  int
 }
 
 // OutboundCardsBehind is one state's count of messages behind their alert.

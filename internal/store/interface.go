@@ -151,7 +151,7 @@ type StoreInterface interface {
 	ReplayWebhookDelivery(ctx context.Context, req WebhookReplayRequest) (WebhookReplayResult, error)
 
 	// Metrics
-	GetMetricsSnapshot() (*model.MetricsSnapshot, error)
+	GetMetricsSnapshot(ctx context.Context) (*model.MetricsSnapshot, error)
 
 	// Lifecycle
 	Close() error

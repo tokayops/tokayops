@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -168,6 +169,9 @@ func (w *Worker) Tick(ctx context.Context) { w.tick(ctx) }
 
 func (w *Worker) tick(ctx context.Context) {
 	tick := w.ticks.Add(1)
+	// Counted first, before anything that could hang: the tick that is stuck
+	// in housekeeping is one this counter has to stop showing.
+	metrics.OutboundWorkerTicksTotal.WithLabelValues(w.family).Inc()
 
 	// Housekeeping runs whether or not this instance has room. It is mostly
 	// about work OTHER instances abandoned, and skipping it while busy is how a
@@ -175,13 +179,25 @@ func (w *Worker) tick(ctx context.Context) {
 	if expired, err := w.store.ExpireDueIntents(ctx, w.family, w.pool); err != nil {
 		log.Printf("outbound worker %s: expire: %v", w.workerID, err)
 	} else if len(expired) > 0 {
-		log.Printf("outbound worker %s: %d commitments passed their deadline unsent",
-			w.workerID, len(expired))
+		// The count says how many; the operator needs which. The first few
+		// are named, the way the engine names the groups it picked, and the
+		// rest are a number - a line that lists a thousand ids is a line
+		// nobody reads.
+		log.Printf("outbound worker %s: %d commitments passed their deadline unsent: %s",
+			w.workerID, len(expired), namedExpired(expired))
 	}
 	if recovered, err := w.store.RecoverStaleAttempts(ctx, w.family, w.pool); err != nil {
 		log.Printf("outbound worker %s: recover: %v", w.workerID, err)
-	} else if len(recovered) > 0 {
-		log.Printf("outbound worker %s: %d abandoned attempts closed", w.workerID, len(recovered))
+	} else {
+		for _, r := range recovered {
+			// One line per attempt, because each is a call whose worker never
+			// came back: the operator is going to want to know which, and where
+			// the commitment went. The counter beside it is what the alert on
+			// "leases are expiring in bulk" reads.
+			log.Printf("outbound worker %s: lease expired with an attempt open: intent=%s attempt=%s -> %s (%s)",
+				w.workerID, r.IntentID, r.AttemptID, r.To, r.Row)
+			metrics.OutboundLeasesExpiredTotal.WithLabelValues(w.family, string(r.To)).Inc()
+		}
 	}
 
 	free := w.pool - int(w.inflight.Load())
@@ -334,6 +350,13 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 		return
 	}
 	if begun.Outcome != BeginStarted {
+		// Not an error and not a call: the store decided the attempt does not
+		// start - the lease was taken by recovery, the commitment was
+		// finalised by an acknowledgement, the preparation refused. The other
+		// side of each of those writes its own line; this is the only place
+		// the worker that LOST says so, and a log where a claimed commitment
+		// simply stops being mentioned is a log that hides the interleaving.
+		log.Printf("outbound worker %s: begin %s answered %s", w.workerID, leased.Intent.ID, begun.Outcome)
 		return
 	}
 
@@ -426,6 +449,25 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 		"outcome=%s status=%s%s", w.workerID, leased.Intent.ID, leased.Intent.Provider,
 		leased.Intent.GenerationNo, begun.AttemptID, concluded.Outcome(),
 		recorded.To, detail(concluded))
+}
+
+// namedExpired lists the commitments that expired, the first ten by id with
+// the group they belonged to, and the rest as a count.
+func namedExpired(expired []Expired) string {
+	const shown = 10
+	parts := make([]string, 0, shown+1)
+	for i, e := range expired {
+		if i == shown {
+			parts = append(parts, fmt.Sprintf("(and %d more)", len(expired)-shown))
+			break
+		}
+		if e.AlertGroupID != "" {
+			parts = append(parts, e.IntentID+" (group "+e.AlertGroupID+")")
+		} else {
+			parts = append(parts, e.IntentID)
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // errorClass is the channel's own classification of a failure, and empty for a

@@ -91,6 +91,9 @@ func (f *FanOut) Run(ctx context.Context) {
 // Exported so that something other than the clock can drive it. It returns how
 // many events were fanned out, which is what a test asks.
 func (f *FanOut) Tick(ctx context.Context) int {
+	// Counted before the first read, empty tick included: this counter is the
+	// liveness of the loop, not of the queue.
+	metrics.OutboundFanOutTicksTotal.Inc()
 	done := 0
 	for i := 0; i < f.perTick; i++ {
 		if ctx.Err() != nil {

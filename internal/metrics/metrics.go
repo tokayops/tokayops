@@ -278,6 +278,44 @@ var (
 			120, 180, 240, 300, 360, 600, 900,
 		},
 	}, []string{"family"})
+
+	// OutboundWorkerTicksTotal counts passes of each family's worker, empty
+	// ones included.
+	//
+	// It is the liveness signal, and the only one: a worker whose goroutine
+	// died, or that hangs inside housekeeping on a lock, leaves the queue
+	// gauges exactly as they were - and an empty queue looks the same whether
+	// somebody is watching it or not. The series is initialised to zero for
+	// every family at start-up (see outbound.init), because a counter that only
+	// appears on its first increment gives a rule over rate() nothing to be
+	// zero ABOUT when the worker never started.
+	OutboundWorkerTicksTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_worker_ticks_total",
+		Help: "Passes of the delivery worker of each family, including passes that found nothing to do. A stopped rate is a stopped worker.",
+	}, []string{"family"})
+
+	// OutboundFanOutTicksTotal is the same signal for the webhook family's
+	// producer, which runs in a loop of its own.
+	OutboundFanOutTicksTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "outbound_fanout_ticks_total",
+		Help: "Passes of the webhook fan-out loop, including passes that found no event. A stopped rate is a stopped fan-out.",
+	})
+
+	// OutboundLeasesExpiredTotal counts attempts that recovery closed because
+	// the worker holding them never came back, by where the commitment went.
+	//
+	// One of these is a process that died with a call in flight, and it is
+	// already visible as a restart. Five in a quarter of an hour is either a
+	// provider answering slower than the lease or a fleet being restarted in a
+	// circle, and that is what the alert is written against. "to" is the
+	// status the commitment was moved to: pending under the retry policy,
+	// manual_review under manual review, and the rest as the machine decides.
+	// Initialised to zero for every family and target at start-up, like the
+	// tick counters.
+	OutboundLeasesExpiredTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_leases_expired_total",
+		Help: "Attempts closed by recovery because their worker's lease ran out, by the status the commitment went to.",
+	}, []string{"family", "to"})
 )
 
 // Tier 8 - storage contract
@@ -340,6 +378,9 @@ func init() {
 	prometheus.MustRegister(OutboundAdmissionsTotal)
 	prometheus.MustRegister(OutboundDesiredRevisionsTotal)
 	prometheus.MustRegister(OutboundAdmissionLatencySeconds)
+	prometheus.MustRegister(OutboundWorkerTicksTotal)
+	prometheus.MustRegister(OutboundFanOutTicksTotal)
+	prometheus.MustRegister(OutboundLeasesExpiredTotal)
 	prometheus.MustRegister(StorageContractFailuresTotal)
 }
 
