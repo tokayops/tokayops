@@ -140,9 +140,26 @@ func isPublic(ip net.IP) bool {
 		}
 		return true
 	}
-	// An IPv6 address that names no IPv4: public means allocated global
-	// unicast, minus the special-purpose ranges carved out inside it.
-	if !globalUnicastV6.Contains(ip) {
+	// An IPv6 address that names no IPv4: public means an address inside a
+	// block the IANA registry has ACTUALLY allocated, or one of the
+	// special-purpose assignments IANA marks globally reachable. 2000::/3 is
+	// the space allocations are made FROM, not the allocation: what is not in
+	// the registry - 3ffe::/16 (reserved, the retired 6bone), 2200::, the rest
+	// of the unassigned space - fails closed and takes the operator's
+	// allowlist, the same door every other non-public address takes.
+	for _, r := range reachableSpecialPurposeV6 {
+		if r.Contains(ip) {
+			return true
+		}
+	}
+	allocated := false
+	for _, r := range allocatedGlobalUnicastV6 {
+		if r.Contains(ip) {
+			allocated = true
+			break
+		}
+	}
+	if !allocated {
 		return false
 	}
 	for _, r := range reservedIPv6 {
@@ -167,23 +184,73 @@ var reservedIPv4 = parseCIDRs(
 	"240.0.0.0/4",     // reserved, and the broadcast address
 )
 
-// globalUnicastV6 is the one third of the IPv6 space IANA allocates global
-// unicast from. Nothing outside it is a public host address.
-var globalUnicastV6 = parseCIDRs("2000::/3")[0]
+// allocatedGlobalUnicastV6 is the IANA IPv6 Global Unicast Address
+// Assignments registry
+// (https://www.iana.org/assignments/ipv6-unicast-address-assignments),
+// transcribed 2026-09-02. FAIL-CLOSED: an address in none of these blocks is
+// not public, however plausible it looks, and a new IANA allocation reaches
+// subscribers by updating this list (or, until then, by the installation's
+// allowlist).
+//
+// Two deliberate absences. 2001:0000::/23 is IANA's own special-purpose block:
+// nothing in it is public wholesale - its reachable assignments are allowed
+// one by one below, and the rest (Teredo, benchmarking, ORCHID, drone ID) fail
+// closed by not being listed. And 2002::/16 (6to4) is judged as the IPv4 it
+// embeds, never as itself. 2001:2000::/19 is kept as the three blocks the /19
+// consolidated so its recovered corner (2001:3c00::/22) stays closed.
+var allocatedGlobalUnicastV6 = parseCIDRs(
+	"2001:200::/23",  // APNIC
+	"2001:400::/23",  // ARIN
+	"2001:600::/23",  // RIPE NCC
+	"2001:800::/22",  // RIPE NCC
+	"2001:c00::/23",  // APNIC
+	"2001:e00::/23",  // APNIC
+	"2001:1200::/23", // LACNIC
+	"2001:1400::/22", // RIPE NCC
+	"2001:1800::/23", // ARIN
+	"2001:1a00::/23", // RIPE NCC
+	"2001:1c00::/22", // RIPE NCC
+	"2001:2000::/20", // RIPE NCC
+	"2001:3000::/21", // RIPE NCC
+	"2001:3800::/22", // RIPE NCC
+	"2001:4000::/23", // RIPE NCC
+	"2001:4200::/23", // AFRINIC
+	"2001:4400::/23", // APNIC
+	"2001:4600::/23", // RIPE NCC
+	"2001:4800::/23", // ARIN
+	"2001:4a00::/23", // RIPE NCC
+	"2001:4c00::/23", // RIPE NCC
+	"2001:5000::/20", // RIPE NCC
+	"2001:8000::/19", // APNIC
+	"2001:a000::/20", // APNIC
+	"2001:b000::/20", // APNIC
+	"2003::/18",      // RIPE NCC
+	"2400::/12",      // APNIC
+	"2600::/12",      // ARIN
+	"2610::/23",      // ARIN
+	"2620::/23",      // ARIN
+	"2630::/12",      // ARIN
+	"2800::/12",      // LACNIC
+	"2a00::/12",      // RIPE NCC
+	"2a10::/12",      // RIPE NCC
+	"2c00::/12",      // AFRINIC
+)
 
-// reservedIPv6 are the special-purpose ranges INSIDE 2000::/3 that are not
-// globally reachable (or, like Teredo, are tunneling machinery no subscriber
-// lives at). 2002::/16 is absent on purpose: a 6to4 address is judged as the
-// IPv4 it embeds. The globally reachable carve-outs - the PCP, TURN, AMT and
-// AS112 anycasts - are deliberately not here.
+// reachableSpecialPurposeV6 are the special-purpose assignments the IANA IPv6
+// Special-Purpose Address Registry marks globally reachable. They live inside
+// 2001:0000::/23, which the allocated list refuses wholesale, so each is
+// allowed by name.
+var reachableSpecialPurposeV6 = parseCIDRs(
+	"2001:1::1/128",   // Port Control Protocol anycast
+	"2001:1::2/128",   // Traversal Using Relays around NAT anycast
+	"2001:3::/32",     // AMT
+	"2001:4:112::/48", // AS112-v6
+)
+
+// reservedIPv6 are the not-globally-reachable ranges INSIDE the allocated
+// blocks above.
 var reservedIPv6 = parseCIDRs(
-	"2001::/32",     // Teredo
-	"2001:2::/48",   // benchmarking
-	"2001:10::/28",  // ORCHID, deprecated
-	"2001:20::/28",  // ORCHIDv2
-	"2001:30::/28",  // drone remote ID
-	"2001:db8::/32", // documentation
-	"3fff::/20",     // documentation
+	"2001:db8::/32", // documentation, inside APNIC's 2001:c00::/23
 )
 
 var (

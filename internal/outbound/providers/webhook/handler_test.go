@@ -550,9 +550,9 @@ func TestOnlyAPublicAddressMayBePostedTo(t *testing.T) {
 		"224.0.0.1", "239.255.255.250", "ff02::1", // multicast
 		"240.0.0.1", "255.255.255.255", // reserved, and broadcast
 		"::ffff:10.0.0.7", "::ffff:127.0.0.1", // IPv4 written as IPv6
-		"64:ff9b::a00:7",        // 10.0.0.7 through NAT64
-		"2002:a00:7::",          // 10.0.0.7 through 6to4
-		"100::1", "2001:db8::1", // discard-only, documentation
+		"64:ff9b::a00:7", // 10.0.0.7 through NAT64
+		"2002:a00:7::",   // 10.0.0.7 through 6to4
+		"100::1",         // discard-only
 		// IPv6 outside the allocated global-unicast third: refused by the
 		// positive rule, not by being named.
 		"64:ff9b:1::1",       // local-use NAT64 (RFC 8215): embeds an IPv4 nobody can find
@@ -568,12 +568,25 @@ func TestOnlyAPublicAddressMayBePostedTo(t *testing.T) {
 		"2001:20::1",  // ORCHIDv2
 		"2001:30::1",  // drone remote ID
 		"3fff::1",     // documentation
+		"2001:db8::1", // documentation, inside an allocated block
 		"192.88.99.1", // 6to4 relay anycast, deprecated
+		// Inside 2000::/3 and NOT in the IANA unicast assignments registry:
+		// the space allocations are made from is not the allocation.
+		"3ffe::1",      // reserved - the retired 6bone, RESERVED in the registry
+		"2200::1",      // unassigned
+		"2001:3c00::1", // the corner the 2001:2000::/19 consolidation recovered
+		"2001:5::1",    // IANA's special-purpose block, no reachable assignment
+		"21ff:ffff::1", // unassigned, right below the first allocation
 	}
 	public := []string{"93.184.216.34", "8.8.8.8", "2606:4700::1111", "2001:4860:4860::8888",
 		"::ffff:93.184.216.34", "64:ff9b::5db8:d822", "2002:5db8:d822::",
-		"2001:1::1",                           // PCP anycast: a reachable carve-out stays reachable
-		"2a00:1450:4001:80f::200e", "3ffe::1"} // global unicast, incl. the retired 6bone corner of 2000::/3
+		"2001:1::1", "2001:4:112::1", // reachable special-purpose: PCP anycast, AS112
+		// One address per registry region, so a dropped block is a red test
+		// and not a support call: APNIC old and new, ARIN old and new, RIPE
+		// old and new, LACNIC, AFRINIC.
+		"2001:200::1", "2400::1", "2001:400::1", "2620:4f:8000::1",
+		"2001:600::1", "2a10::1", "2800::1", "2c0f::1",
+		"2a00:1450:4001:80f::200e"}
 	none := ipPolicy{}
 	for _, a := range blocked {
 		if none.allowedIP(net.ParseIP(a)) {
@@ -607,7 +620,8 @@ func TestOnlyAPublicAddressMayBePostedTo(t *testing.T) {
 	// through - the second batch is the space outside 2000::/3 that the first
 	// rewrite still answered "public" for.
 	for _, a := range []string{"fc00::1", "::", "100.64.0.1", "64:ff9b::a00:7", "::ffff:10.0.0.7",
-		"64:ff9b:1::1", "5f00::1", "fec0::1", "4000::1"} {
+		"64:ff9b:1::1", "5f00::1", "fec0::1", "4000::1",
+		"3ffe::1", "2200::1"} {
 		address := a
 		t.Run("at the preparation: "+address, func(t *testing.T) {
 			resolve := func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP(address)}, nil }
