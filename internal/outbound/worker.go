@@ -186,18 +186,24 @@ func (w *Worker) tick(ctx context.Context) {
 		log.Printf("outbound worker %s: %d commitments passed their deadline unsent: %s",
 			w.workerID, len(expired), namedExpired(expired))
 	}
-	if recovered, err := w.store.RecoverStaleAttempts(ctx, w.family, w.pool); err != nil {
+	// Recovery commits one attempt per transaction and answers with the ones it
+	// closed even when a later one failed - a row held by another transaction
+	// past lock_timeout, say. What was committed is real whether or not the
+	// pass finished, so it is counted and named FIRST and the error reported
+	// after; the other order threw away every closed attempt of a pass that
+	// ended early.
+	recovered, err := w.store.RecoverStaleAttempts(ctx, w.family, w.pool)
+	for _, r := range recovered {
+		// One line per attempt, because each is a call whose worker never came
+		// back: the operator is going to want to know which, and where the
+		// commitment went. The counter beside it is what the alert on "leases
+		// are expiring in bulk" reads.
+		log.Printf("outbound worker %s: lease expired with an attempt open: intent=%s attempt=%s -> %s (%s)",
+			w.workerID, r.IntentID, r.AttemptID, r.To, r.Row)
+		metrics.OutboundLeasesExpiredTotal.WithLabelValues(w.family, string(r.To)).Inc()
+	}
+	if err != nil {
 		log.Printf("outbound worker %s: recover: %v", w.workerID, err)
-	} else {
-		for _, r := range recovered {
-			// One line per attempt, because each is a call whose worker never
-			// came back: the operator is going to want to know which, and where
-			// the commitment went. The counter beside it is what the alert on
-			// "leases are expiring in bulk" reads.
-			log.Printf("outbound worker %s: lease expired with an attempt open: intent=%s attempt=%s -> %s (%s)",
-				w.workerID, r.IntentID, r.AttemptID, r.To, r.Row)
-			metrics.OutboundLeasesExpiredTotal.WithLabelValues(w.family, string(r.To)).Inc()
-		}
 	}
 
 	free := w.pool - int(w.inflight.Load())

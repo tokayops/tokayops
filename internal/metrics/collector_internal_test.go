@@ -1,7 +1,11 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +34,10 @@ func TestTheCollectorGivesUpOnTheSnapshotAndSaysSo(t *testing.T) {
 	snapshotTimeout = 150 * time.Millisecond
 	t.Cleanup(func() { snapshotTimeout = previous })
 
+	var written bytes.Buffer
+	log.SetOutput(&written)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
 	reg := prometheus.NewRegistry()
 	source := hangingSource{entered: make(chan struct{})}
 	RegisterCollectorWith(reg, source)
@@ -50,6 +58,12 @@ func TestTheCollectorGivesUpOnTheSnapshotAndSaysSo(t *testing.T) {
 	}
 	for _, mf := range gathered {
 		t.Errorf("a series was reported from a snapshot that never came: %s", mf.GetName())
+	}
+	// "And says so": the line is what an operator reads when every business
+	// series vanishes at once, and it has to name the deadline rather than
+	// report a bare context error.
+	if want := "metrics collector: snapshot timed out after 150ms"; !strings.Contains(written.String(), want) {
+		t.Fatalf("the log does not say %q:\n%s", want, written.String())
 	}
 }
 
