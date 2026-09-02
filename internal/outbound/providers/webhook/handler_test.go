@@ -553,9 +553,27 @@ func TestOnlyAPublicAddressMayBePostedTo(t *testing.T) {
 		"64:ff9b::a00:7",        // 10.0.0.7 through NAT64
 		"2002:a00:7::",          // 10.0.0.7 through 6to4
 		"100::1", "2001:db8::1", // discard-only, documentation
+		// IPv6 outside the allocated global-unicast third: refused by the
+		// positive rule, not by being named.
+		"64:ff9b:1::1",       // local-use NAT64 (RFC 8215): embeds an IPv4 nobody can find
+		"100:0:0:1::1",       // beside the discard prefix
+		"5f00::1",            // SRv6 SID space
+		"fec0::1",            // site-local, deprecated but routed by old gear
+		"4000::1", "a000::1", // unallocated
+		"::2", // beside the unspecified address
+		// Special-purpose inside 2000::/3.
+		"2001::1",     // Teredo
+		"2001:2::1",   // benchmarking
+		"2001:10::1",  // ORCHID
+		"2001:20::1",  // ORCHIDv2
+		"2001:30::1",  // drone remote ID
+		"3fff::1",     // documentation
+		"192.88.99.1", // 6to4 relay anycast, deprecated
 	}
 	public := []string{"93.184.216.34", "8.8.8.8", "2606:4700::1111", "2001:4860:4860::8888",
-		"::ffff:93.184.216.34", "64:ff9b::5db8:d822", "2002:5db8:d822::"}
+		"::ffff:93.184.216.34", "64:ff9b::5db8:d822", "2002:5db8:d822::",
+		"2001:1::1",                           // PCP anycast: a reachable carve-out stays reachable
+		"2a00:1450:4001:80f::200e", "3ffe::1"} // global unicast, incl. the retired 6bone corner of 2000::/3
 	none := ipPolicy{}
 	for _, a := range blocked {
 		if none.allowedIP(net.ParseIP(a)) {
@@ -585,8 +603,11 @@ func TestOnlyAPublicAddressMayBePostedTo(t *testing.T) {
 		}
 	}
 
-	// Both points, for addresses the list this replaced let through.
-	for _, a := range []string{"fc00::1", "::", "100.64.0.1", "64:ff9b::a00:7", "::ffff:10.0.0.7"} {
+	// Both points, for addresses one of the two lists this replaced let
+	// through - the second batch is the space outside 2000::/3 that the first
+	// rewrite still answered "public" for.
+	for _, a := range []string{"fc00::1", "::", "100.64.0.1", "64:ff9b::a00:7", "::ffff:10.0.0.7",
+		"64:ff9b:1::1", "5f00::1", "fec0::1", "4000::1"} {
 		address := a
 		t.Run("at the preparation: "+address, func(t *testing.T) {
 			resolve := func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP(address)}, nil }

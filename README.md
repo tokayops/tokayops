@@ -238,10 +238,13 @@ with exponential backoff (2s doubling, capped at 30 minutes, with jitter) for up
 to 24 hours from the event, after which the delivery expires. A subscriber's
 `timeout_seconds` is honoured up to 30 seconds. Only a public address may be
 posted to: every address the subscriber's name resolves to is checked before
-any request is made and again when the connection is opened, and private,
-loopback, link-local, unique-local, shared-address-space, multicast,
-unspecified and other reserved addresses are refused unless the operator allows
-the range with `TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS`. Disabling or deleting the
+any request is made and again when the connection is opened. For IPv6 that is a
+positive rule - only the allocated global-unicast space (`2000::/3`), minus its
+special-purpose carve-outs, is public - and for IPv4 the whole space minus the
+IANA special-purpose registry; private, loopback, link-local, unique-local,
+site-local, shared-address-space, multicast, unspecified, SRv6, local-NAT64 and
+unallocated addresses are all refused unless the operator allows the range with
+`TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS`. Disabling or deleting the
 integration withdraws its undelivered deliveries; the delivery history of a
 deleted integration stays readable.
 

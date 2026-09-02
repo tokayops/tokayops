@@ -107,18 +107,24 @@ func EffectiveTimeout(cfg model.GenericWebhookConfig) time.Duration {
 // the metadata service, the database, or anything else this process can reach
 // and they cannot.
 //
-// "Public" is decided by what the address IS. The list this replaced named what
-// it was not - the three RFC 1918 ranges, loopback, link-local - and let through
-// everything it had not thought of: the IPv6 unique-local range, the unspecified
-// address, the shared address space carriers use, multicast, the reserved
-// quarter of IPv4. Each of those can be a way in.
+// "Public" is a POSITIVE classification, and for IPv6 that is the load-bearing
+// half. IPv4 space is fully allocated, so there "public" is the whole space
+// minus the closed IANA special-purpose registry. IPv6 is mostly unallocated:
+// only 2000::/3 is global unicast, and everything outside it - site-local,
+// the SRv6 SID space, the local-use NAT64 prefix, the unallocated sevenths of
+// the space - is refused without being named. A rule that ended in "anything
+// else is public" was still a denylist, and IANA keeps adding to what it had
+// not named.
 func isPublic(ip net.IP) bool {
 	if len(ip) == 0 {
 		return false
 	}
 	// An IPv4 address carried inside an IPv6 one - mapped, or embedded by a
 	// translation prefix - is judged as the IPv4 address it names: through
-	// NAT64 or 6to4, 64:ff9b::a00:7 is 10.0.0.7.
+	// NAT64 or 6to4, 64:ff9b::a00:7 is 10.0.0.7. Only the well-known NAT64
+	// prefix embeds predictably; the local-use one (64:ff9b:1::/48) puts the
+	// IPv4 wherever the network chose, cannot be judged, and falls outside
+	// 2000::/3 below.
 	if v4 := embeddedIPv4(ip); v4 != nil {
 		ip = v4
 	}
@@ -126,7 +132,20 @@ func isPublic(ip net.IP) bool {
 		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
 		return false
 	}
-	for _, r := range reservedRanges {
+	if v4 := ip.To4(); v4 != nil {
+		for _, r := range reservedIPv4 {
+			if r.Contains(v4) {
+				return false
+			}
+		}
+		return true
+	}
+	// An IPv6 address that names no IPv4: public means allocated global
+	// unicast, minus the special-purpose ranges carved out inside it.
+	if !globalUnicastV6.Contains(ip) {
+		return false
+	}
+	for _, r := range reservedIPv6 {
 		if r.Contains(ip) {
 			return false
 		}
@@ -134,19 +153,37 @@ func isPublic(ip net.IP) bool {
 	return true
 }
 
-// reservedRanges are the special-purpose ranges of the IANA registries that are
-// not globally reachable and that net.IP has no predicate for.
-var reservedRanges = parseCIDRs(
+// reservedIPv4 are the special-purpose IPv4 ranges of the IANA registry that
+// are not globally reachable and that net.IP has no predicate for.
+var reservedIPv4 = parseCIDRs(
 	"0.0.0.0/8",       // "this" network
 	"100.64.0.0/10",   // shared address space (RFC 6598)
 	"192.0.0.0/24",    // IETF protocol assignments
 	"192.0.2.0/24",    // documentation (TEST-NET-1)
+	"192.88.99.0/24",  // 6to4 relay anycast, deprecated
 	"198.18.0.0/15",   // benchmarking
 	"198.51.100.0/24", // documentation (TEST-NET-2)
 	"203.0.113.0/24",  // documentation (TEST-NET-3)
 	"240.0.0.0/4",     // reserved, and the broadcast address
-	"100::/64",        // discard-only
-	"2001:db8::/32",   // documentation
+)
+
+// globalUnicastV6 is the one third of the IPv6 space IANA allocates global
+// unicast from. Nothing outside it is a public host address.
+var globalUnicastV6 = parseCIDRs("2000::/3")[0]
+
+// reservedIPv6 are the special-purpose ranges INSIDE 2000::/3 that are not
+// globally reachable (or, like Teredo, are tunneling machinery no subscriber
+// lives at). 2002::/16 is absent on purpose: a 6to4 address is judged as the
+// IPv4 it embeds. The globally reachable carve-outs - the PCP, TURN, AMT and
+// AS112 anycasts - are deliberately not here.
+var reservedIPv6 = parseCIDRs(
+	"2001::/32",     // Teredo
+	"2001:2::/48",   // benchmarking
+	"2001:10::/28",  // ORCHID, deprecated
+	"2001:20::/28",  // ORCHIDv2
+	"2001:30::/28",  // drone remote ID
+	"2001:db8::/32", // documentation
+	"3fff::/20",     // documentation
 )
 
 var (
