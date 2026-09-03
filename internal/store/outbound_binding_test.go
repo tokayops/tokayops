@@ -863,7 +863,7 @@ func TestADirectMessageIgnoresAnAlertThatMovedBeforeItWasSent(t *testing.T) {
 
 	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
 	if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 	}); err != nil {
 		t.Fatalf("raise the desired state: %v", err)
 	}
@@ -902,7 +902,7 @@ func TestADirectMessageRetriesWithTheBytesItWasAdmittedWith(t *testing.T) {
 	// The alert moves on between the two attempts.
 	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
 	if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 	}); err != nil {
 		t.Fatalf("raise the desired state: %v", err)
 	}
@@ -1324,7 +1324,7 @@ func TestAWithdrawalDoesNotNeedTheState(t *testing.T) {
 	// read a good one.
 	_, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
 		IntentID: intentID, Decision: outbound.DecisionAssumeAccepted,
-		Actor: "nina", Reason: "the recipient said so",
+		Actor: byUser("nina"), Reason: "the recipient said so",
 	})
 	if !errors.Is(err, ErrUndeliverable) {
 		t.Fatalf("a delivery was assumed against state nobody can read: %v", err)

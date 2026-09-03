@@ -31,7 +31,7 @@ import (
 // subscriber is an integration, and whether it still exists is the fan-out's
 // business, decided under the share lock it takes on the audience.
 func admitWebhookTx(ctx context.Context, tx *sql.Tx, batch keys.WebhookBatch,
-	actor string) (outbound.SubmitResult, error) {
+	actor outbound.Actor) (outbound.SubmitResult, error) {
 
 	admission, err := batch.Admit()
 	if err != nil {
@@ -161,7 +161,7 @@ func (s *Store) FanOutNextEvent(ctx context.Context) (outbound.FanOutResult, err
 		Expiry:             policy.Expiry,
 		GrammarVersion:     grammar,
 		FingerprintVersion: keys.CurrentBatchFingerprintVersion(),
-	}, "fan-out")
+	}, outbound.ActorFanOut)
 	if err != nil {
 		if errors.Is(err, ErrOutboundContract) {
 			found.Refused = true

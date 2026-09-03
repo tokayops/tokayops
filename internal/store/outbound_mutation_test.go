@@ -51,7 +51,7 @@ func aim(t *testing.T, s *Store, agID string) int64 {
 		Labels:   map[string]string{"alertname": "DiskSlow"},
 	}})
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: "ingester",
+		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: outbound.ActorSystem,
 	})
 	if err != nil || result.Outcome != outbound.DesiredApplied {
 		t.Fatalf("raise the desired state: %s (%v)", result.Outcome, err)
@@ -270,7 +270,7 @@ func TestProofThatAMessageIsGoneIsRecordedAndReadBack(t *testing.T) {
 	// And it is what lets an operator make a second one.
 	result, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
 		IntentID: intentID, Decision: outbound.DecisionRetryNewGeneration,
-		Actor: "nina", Reason: "the card is gone",
+		Actor: byUser("nina"), Reason: "the card is gone",
 	})
 	if err != nil {
 		t.Fatalf("decide: %v", err)
@@ -318,7 +318,7 @@ func TestAChangeThatFailedForItsOwnReasonsDoesNotLicenseASecondCard(t *testing.T
 
 	result, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
 		IntentID: intentID, Decision: outbound.DecisionRetryNewGeneration,
-		AcceptedDuplicateRisk: true, Actor: "nina", Reason: "just make a new one",
+		AcceptedDuplicateRisk: true, Actor: byUser("nina"), Reason: "just make a new one",
 	})
 	if err != nil {
 		t.Fatalf("decide: %v", err)
@@ -426,7 +426,7 @@ func TestProofFromALateAnswerSurvivesTheAttemptsAfterIt(t *testing.T) {
 	// flag and allowed with it.
 	refused, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
 		IntentID: intentID, Decision: outbound.DecisionRetryNewGeneration,
-		Actor: "nina", Reason: "the card is gone",
+		Actor: byUser("nina"), Reason: "the card is gone",
 	})
 	if err != nil {
 		t.Fatalf("decide: %v", err)
@@ -438,7 +438,7 @@ func TestProofFromALateAnswerSurvivesTheAttemptsAfterIt(t *testing.T) {
 
 	result, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
 		IntentID: intentID, Decision: outbound.DecisionRetryNewGeneration,
-		AcceptedDuplicateRisk: true, Actor: "nina", Reason: "the card is gone",
+		AcceptedDuplicateRisk: true, Actor: byUser("nina"), Reason: "the card is gone",
 	})
 	if err != nil {
 		t.Fatalf("decide: %v", err)

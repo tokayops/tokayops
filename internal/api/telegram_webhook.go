@@ -184,7 +184,7 @@ func (a *API) handleTelegramCallback(ctx context.Context, upd *telegramUpdate) {
 		return
 	}
 
-	actor := alertgroup.Actor{Name: actorName(user), Email: user.Email}
+	actor := alertgroup.Actor{ID: user.ID, Name: actorName(user), Email: user.Email}
 	var result *alertgroup.TransitionResult
 	if action == rbac.ActionAlertAck {
 		result, err = a.agService.Ack(agID, actor, telegramMeta)

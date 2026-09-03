@@ -807,8 +807,8 @@ func TestOutboundJournalIdentities(t *testing.T) {
 
 	event := func(seq int) error {
 		_, err := s.db.Exec(`
-			INSERT INTO outbound_intent_events (id, intent_id, seq, kind)
-			VALUES ($1, $2, $3, 'created')`,
+			INSERT INTO outbound_intent_events (id, intent_id, seq, kind, actor, actor_kind)
+			VALUES ($1, $2, $3, 'created', 'engine', 'system')`,
 			uuid.New().String(), intent.ID, seq)
 		return err
 	}

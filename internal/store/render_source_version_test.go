@@ -54,7 +54,7 @@ func TestWhatMovesTheRenderSourceVersion(t *testing.T) {
 		{
 			name: "a user acknowledges", moves: true,
 			do: func(t *testing.T, agID string) {
-				moved, err := s.AckAlertGroupAtomic(agID, "denis", nil, nil)
+				moved, err := s.AckAlertGroupAtomic(agID, actorNamed("denis"), nil, nil)
 				if err != nil || !moved {
 					t.Fatalf("acknowledge: moved=%v err=%v", moved, err)
 				}
@@ -63,7 +63,7 @@ func TestWhatMovesTheRenderSourceVersion(t *testing.T) {
 		{
 			name: "a user resolves", moves: true,
 			do: func(t *testing.T, agID string) {
-				moved, err := s.ResolveAlertGroupAtomic(agID, "denis", nil, nil)
+				moved, err := s.ResolveAlertGroupAtomic(agID, actorNamed("denis"), nil, nil)
 				if err != nil || !moved {
 					t.Fatalf("resolve: moved=%v err=%v", moved, err)
 				}
@@ -92,7 +92,7 @@ func TestWhatMovesTheRenderSourceVersion(t *testing.T) {
 		{
 			name: "the group changes status", moves: true,
 			do: func(t *testing.T, agID string) {
-				changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+				changed, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 				if err != nil || !changed {
 					t.Fatalf("acknowledge: changed=%v err=%v", changed, err)
 				}

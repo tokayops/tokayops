@@ -82,7 +82,7 @@ func outboundAdmission(t *testing.T, groupID, title string,
 			// being paged.
 			OnCallSnapshot: json.RawMessage(`{"l1_users":[],"source":"` + title + `"}`),
 		}),
-		Actor: "engine",
+		Actor: outbound.ActorEngine,
 	}
 }
 

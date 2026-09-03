@@ -53,6 +53,10 @@ const (
 	// Global, because the journal is; a group's own deliveries go under
 	// alert.view with the group's scope, like its timeline.
 	ActionDeliveryView Action = "delivery.view"
+	// ActionDeliveryResolve is a person deciding what a stuck commitment does.
+	// Global for the same reason the journal is: the commitment may have no
+	// team at all.
+	ActionDeliveryResolve Action = "delivery.resolve"
 
 	// Token actions (typically self-service)
 	ActionTokenList   Action = "token.list"
@@ -151,13 +155,14 @@ var teamAdminActions = map[Action]bool{
 
 // globalAdminActions require global admin role.
 var globalAdminActions = map[Action]bool{
-	ActionTeamCreate:     true,
-	ActionTeamDelete:     true,
-	ActionUserCreate:     true,
-	ActionUserUpdate:     true,
-	ActionUserDelete:     true,
-	ActionUserRoleAssign: true,
-	ActionDeliveryView:   true,
+	ActionTeamCreate:      true,
+	ActionTeamDelete:      true,
+	ActionUserCreate:      true,
+	ActionUserUpdate:      true,
+	ActionUserDelete:      true,
+	ActionUserRoleAssign:  true,
+	ActionDeliveryView:    true,
+	ActionDeliveryResolve: true,
 }
 
 // HasPermission evaluates whether a user has permission to perform an action.

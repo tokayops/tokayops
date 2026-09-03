@@ -871,7 +871,7 @@ func existingAdmission(ctx context.Context, tx *sql.Tx,
 // deterministic unique-violation instead of as a deadlock nobody can read.
 func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 	admission keys.Admission, family string, admittedAt time.Time,
-	actor string) ([]string, error) {
+	actor outbound.Actor) ([]string, error) {
 
 	ids := make([]string, 0, len(admission.Commitments))
 	for _, c := range admission.Commitments {
@@ -1013,13 +1013,13 @@ func admissionTimelineTx(ctx context.Context, tx *sql.Tx, batch outbound.Batch,
 	if admission.Outcome == keys.OutcomeNoTargets {
 		if err := addTimelineTx(ctx, tx, admission.AlertGroupID,
 			model.TimelineEventNotificationFailed,
-			"Escalation admitted with nobody to notify", batch.Actor); err != nil {
+			"Escalation admitted with nobody to notify", batch.Actor.Ref()); err != nil {
 			return err
 		}
 	}
 	for _, step := range about.Unpromised {
 		if err := addTimelineWithTx(ctx, tx, admission.AlertGroupID,
-			model.TimelineEventNotificationFailed, unpromisedMessage(step), batch.Actor,
+			model.TimelineEventNotificationFailed, unpromisedMessage(step), batch.Actor.Ref(),
 			map[string]string{"step": step.Step, "reason": string(step.Reason)}); err != nil {
 			return err
 		}
@@ -1091,7 +1091,7 @@ func addTimelineWithTx(ctx context.Context, tx *sql.Tx, alertGroupID string,
 // that happen to it without a network call - it was created, withdrawn, expired
 // before anything was tried, decided on by a person.
 func appendIntentEventTx(ctx context.Context, tx *sql.Tx,
-	intentID string, seq int, kind, reason, actor string) error {
+	intentID string, seq int, kind, reason string, actor outbound.Actor) error {
 
 	return appendIntentEventDetailTx(ctx, tx, intentID, seq, kind, reason, actor, nil)
 }
@@ -1103,7 +1103,13 @@ func appendIntentEventTx(ctx context.Context, tx *sql.Tx,
 // which revision was raised is what says when a card started being out of date,
 // and it is the only durable record of that moment.
 func appendIntentEventDetailTx(ctx context.Context, tx *sql.Tx,
-	intentID string, seq int, kind, reason, actor string, detail []byte) error {
+	intentID string, seq int, kind, reason string, actor outbound.Actor, detail []byte) error {
+
+	// A line signed by nobody is not written. The kind is a column with a
+	// closed vocabulary, and the zero actor has none.
+	if actor.IsZero() {
+		return outboundContractf("%s for commitment %s has no actor", kind, intentID)
+	}
 
 	// seq 0 means "whatever comes next": the caller of a lifecycle event knows
 	// what happened, not how many things happened before it.
@@ -1113,14 +1119,14 @@ func appendIntentEventDetailTx(ctx context.Context, tx *sql.Tx,
 	}
 
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO outbound_intent_events (id, intent_id, seq, kind, reason, actor, detail)
+		INSERT INTO outbound_intent_events (id, intent_id, seq, kind, reason, actor, actor_kind, detail)
 		VALUES ($1, $2,
 		        COALESCE($3::int,
 		                 (SELECT COALESCE(max(seq), 0) + 1
 		                  FROM outbound_intent_events WHERE intent_id = $2)),
-		        $4, $5, $6, $7)`,
-		uuid.New().String(), intentID, sequence, kind, nilIfEmpty(reason), nilIfEmpty(actor),
-		nullableJSON(detail))
+		        $4, $5, $6, $7, $8)`,
+		uuid.New().String(), intentID, sequence, kind, nilIfEmpty(reason), actor.Ref(),
+		string(actor.Kind()), nullableJSON(detail))
 	if err != nil {
 		return fmt.Errorf("record %s for commitment %s: %w", kind, intentID, err)
 	}
@@ -1293,7 +1299,7 @@ type transitionWrite struct {
 	AttemptIsFinal bool
 	Receipt        json.RawMessage
 	NewExpires     *time.Time
-	Actor          string
+	Actor          outbound.Actor
 	Reason         string
 }
 
@@ -1963,7 +1969,7 @@ func journalEventsTx(ctx context.Context, tx *sql.Tx,
 	intentID string) ([]outbound.IntentEvent, error) {
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT seq, kind, COALESCE(reason, ''), COALESCE(actor, ''),
+		SELECT seq, kind, COALESCE(reason, ''), COALESCE(actor, ''), actor_kind,
 		       COALESCE(from_status, ''), COALESCE(to_status, ''), created_at
 		FROM outbound_intent_events WHERE intent_id = $1 ORDER BY seq`, intentID)
 	if err != nil {
@@ -1974,7 +1980,7 @@ func journalEventsTx(ctx context.Context, tx *sql.Tx,
 	var events []outbound.IntentEvent
 	for rows.Next() {
 		var e outbound.IntentEvent
-		if err := rows.Scan(&e.Seq, &e.Kind, &e.Reason, &e.Actor,
+		if err := rows.Scan(&e.Seq, &e.Kind, &e.Reason, &e.Actor, &e.ActorKind,
 			&e.FromStatus, &e.ToStatus, &e.At); err != nil {
 			return nil, err
 		}

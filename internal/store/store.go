@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"log"
 	"strconv"
 	"strings"
@@ -1101,7 +1102,14 @@ func insertOutboxEventTx(tx *sql.Tx, event *model.OutboxEvent) error {
 // Timeline event and status update happen in a single transaction.
 // Returns (true, nil) if the ack was applied, (false, nil) if the alert group
 // was not in 'processing' or 'triggered' status (idempotent/race loser), or (false, err) on failure.
-func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (s *Store) AckAlertGroupAtomic(id string, who alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	// The timeline signs with the name; the commitments' journal with the
+	// person, by id.
+	actor := who.Name
+	by, err := outbound.UserActor(who.ID)
+	if err != nil {
+		return false, outboundContractf("acknowledge %s: %v", id, err)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -1167,7 +1175,7 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	// After the line above, and said so: the withdrawal happened because of the
 	// acknowledgement, and a history that puts it first says the opposite.
 	withdrawn, err := cancelIntentsAtTx(context.Background(), tx, id,
-		"the alert was acknowledged", actor, now.Add(time.Microsecond))
+		"the alert was acknowledged", by, actor, now.Add(time.Microsecond))
 	if err != nil {
 		return false, err
 	}
@@ -1177,7 +1185,7 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 	// is something new to show.
 	desired, err := setDesiredStateTx(context.Background(), tx, s.render,
 		outbound.DesiredStateRequest{
-			AlertGroupID: id, Reason: outbound.DesiredAck, Actor: actor,
+			AlertGroupID: id, Reason: outbound.DesiredAck, Actor: by,
 		})
 	if err != nil {
 		return false, err
@@ -1197,7 +1205,12 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 // Timeline event and status update happen in a single transaction.
 // Returns (true, nil) if the resolve was applied, (false, nil) if the alert group
 // was not in 'processing', 'triggered', or 'acknowledged' status, or (false, err) on failure.
-func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (s *Store) ResolveAlertGroupAtomic(id string, who alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	actor := who.Name
+	by, err := outbound.UserActor(who.ID)
+	if err != nil {
+		return false, outboundContractf("resolve %s: %v", id, err)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -1257,7 +1270,7 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	// one fact: split in two, a crash between them pages somebody for an alert
 	// that is already being handled.
 	withdrawn, err := cancelIntentsAtTx(context.Background(), tx, id,
-		"the alert was resolved", actor, now.Add(time.Microsecond))
+		"the alert was resolved", by, actor, now.Add(time.Microsecond))
 	if err != nil {
 		return false, err
 	}
@@ -1268,7 +1281,7 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 	// reach the card.
 	desired, err := setDesiredStateTx(context.Background(), tx, s.render,
 		outbound.DesiredStateRequest{
-			AlertGroupID: id, Reason: outbound.DesiredResolve, Actor: actor,
+			AlertGroupID: id, Reason: outbound.DesiredResolve, Actor: by,
 		})
 	if err != nil {
 		return false, err

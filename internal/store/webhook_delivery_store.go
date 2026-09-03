@@ -47,7 +47,7 @@ type WebhookReplayRequest struct {
 	// ClientRequestID is the operator's idempotency key: one per decision. A
 	// repeat of the request with the same key finds the same commitment.
 	ClientRequestID string
-	Actor           string
+	Actor           outbound.Actor
 }
 
 // WebhookReplayResult is the commitment the replay stands for - created now, or

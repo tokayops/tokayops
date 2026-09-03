@@ -926,6 +926,77 @@
                 }
             }
         },
+        "/api/v1/deliveries/{id}/decisions": {
+            "post": {
+                "description": "A person deciding about a commitment in manual_review, permanent_failed or expired. The reason is required (1 to 500 characters). resolved answers 200 with the commitment and the row of the decision table that applied; already_resolved 409 with the current status; invalid_decision 422 with the guard's words in detail; business_closed and recipient_erased 409 with detail; an unknown commitment 404.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "deliveries"
+                ],
+                "summary": "Decide what a stuck delivery does",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Delivery ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "The decision",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.DecisionRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.DecisionResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.DecisionResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/api.DecisionResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/integrations": {
             "get": {
                 "description": "Get integrations visible to the current user",
@@ -3292,6 +3363,55 @@
                 }
             }
         },
+        "api.DecisionRequest": {
+            "type": "object",
+            "properties": {
+                "accepted_duplicate_risk": {
+                    "description": "AcceptedDuplicateRisk is the person saying, on the record, that a second\nmessage may exist. Some decisions need it; the refusal says so.",
+                    "type": "boolean"
+                },
+                "decision": {
+                    "description": "Decision is one of assume_accepted, cancel, retry_current_generation,\nretry_new_generation.",
+                    "type": "string"
+                },
+                "new_expires_at": {
+                    "description": "NewExpiresAt is the new deadline a retry of an expired commitment needs.\nIt has to be ahead of the moment it is written.",
+                    "type": "string"
+                },
+                "reason": {
+                    "description": "Reason is required: a decision without one is \"somebody decided\nsomething\". At most 500 characters, counted as characters.",
+                    "type": "string"
+                }
+            }
+        },
+        "api.DecisionResponse": {
+            "type": "object",
+            "properties": {
+                "delivery": {
+                    "description": "Delivery is the commitment after the decision applied.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/api.DeliveryDTO"
+                        }
+                    ]
+                },
+                "detail": {
+                    "description": "Detail is the words of the guard that refused the decision.",
+                    "type": "string"
+                },
+                "outcome": {
+                    "type": "string"
+                },
+                "row": {
+                    "description": "Row is the line of the decision table that applied.",
+                    "type": "string"
+                },
+                "status": {
+                    "description": "Status is where the commitment stands after the answer - the new state\nwhen the decision applied, the current one when it did not.",
+                    "type": "string"
+                }
+            }
+        },
         "api.DeliveriesResponse": {
             "type": "object",
             "properties": {
@@ -3491,6 +3611,10 @@
             "type": "object",
             "properties": {
                 "actor": {
+                    "type": "string"
+                },
+                "actor_kind": {
+                    "description": "ActorKind says what Actor is: the id of a user, the name of a component, or the text of a build before this one.",
                     "type": "string"
                 },
                 "at": {

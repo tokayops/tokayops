@@ -366,7 +366,7 @@ func TestAckAlertGroupAtomic_Success(t *testing.T) {
 	agID := createTestTeamAndAG(t, s, "team-atomic-ack", model.AlertGroupStatusTriggered)
 
 	meta := map[string]string{"source": "slack"}
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", meta, nil)
+	changed, err := s.AckAlertGroupAtomic(agID, actorNamed("TestUser"), meta, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic failed: %v", err)
 	}
@@ -413,7 +413,7 @@ func TestAckAlertGroupAtomic_AlreadyAcked(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-atomic-ack2", model.AlertGroupStatusAcknowledged)
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil)
+	changed, err := s.AckAlertGroupAtomic(agID, actorNamed("TestUser"), nil, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic failed: %v", err)
 	}
@@ -438,7 +438,7 @@ func TestAckAlertGroupAtomic_Resolved(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-atomic-ack3", model.AlertGroupStatusResolved)
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil)
+	changed, err := s.AckAlertGroupAtomic(agID, actorNamed("TestUser"), nil, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic failed: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestResolveAlertGroupAtomic_FromTriggered(t *testing.T) {
 	agID := createTestTeamAndAG(t, s, "team-atomic-res1", model.AlertGroupStatusTriggered)
 
 	meta := map[string]string{"source": "slack"}
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", meta, nil)
+	changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("TestUser"), meta, nil)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic failed: %v", err)
 	}
@@ -495,7 +495,7 @@ func TestResolveAlertGroupAtomic_FromAcknowledged(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-atomic-res2", model.AlertGroupStatusAcknowledged)
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil)
+	changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("TestUser"), nil, nil)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic failed: %v", err)
 	}
@@ -517,7 +517,7 @@ func TestResolveAlertGroupAtomic_AlreadyResolved(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-atomic-res3", model.AlertGroupStatusResolved)
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil)
+	changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("TestUser"), nil, nil)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic failed: %v", err)
 	}
@@ -541,7 +541,7 @@ func TestAckAtomicConcurrent(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			changed, err := s.AckAlertGroupAtomic(agID, "User"+uuid.New().String()[:4], nil, nil)
+			changed, err := s.AckAlertGroupAtomic(agID, actorNamed("User"+uuid.New().String()[:4]), nil, nil)
 			winners[idx] = changed
 			errs[idx] = err
 		}(i)
@@ -588,7 +588,7 @@ func TestAckAlertGroupAtomic_FromProcessing(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-ack-proc", model.AlertGroupStatusProcessing)
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, nil)
+	changed, err := s.AckAlertGroupAtomic(agID, actorNamed("TestUser"), nil, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic failed: %v", err)
 	}
@@ -624,7 +624,7 @@ func TestResolveAlertGroupAtomic_FromProcessing(t *testing.T) {
 
 	agID := createTestTeamAndAG(t, s, "team-res-proc", model.AlertGroupStatusProcessing)
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, nil)
+	changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("TestUser"), nil, nil)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic failed: %v", err)
 	}
@@ -812,7 +812,7 @@ func TestAckAlertGroupAtomic_OutboxEvent(t *testing.T) {
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, outboxEvent)
+	changed, err := s.AckAlertGroupAtomic(agID, actorNamed("TestUser"), nil, outboxEvent)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic: %v", err)
 	}
@@ -874,7 +874,7 @@ func TestAckAlertGroupAtomic_NoOutboxWhenNotChanged(t *testing.T) {
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.AckAlertGroupAtomic(agID, "TestUser", nil, outboxEvent)
+	changed, err := s.AckAlertGroupAtomic(agID, actorNamed("TestUser"), nil, outboxEvent)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic: %v", err)
 	}
@@ -924,7 +924,7 @@ func TestResolveAlertGroupAtomic_OutboxEvent(t *testing.T) {
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, outboxEvent)
+	changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("TestUser"), nil, outboxEvent)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic: %v", err)
 	}
@@ -978,7 +978,7 @@ func TestResolveAlertGroupAtomic_NoOutboxWhenNotChanged(t *testing.T) {
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.ResolveAlertGroupAtomic(agID, "TestUser", nil, outboxEvent)
+	changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("TestUser"), nil, outboxEvent)
 	if err != nil {
 		t.Fatalf("ResolveAlertGroupAtomic: %v", err)
 	}
@@ -1025,7 +1025,7 @@ func TestAckAtomicConcurrent_WithOutbox(t *testing.T) {
 				Actor:        actor,
 				Payload:      payload,
 			}
-			changed, err := s.AckAlertGroupAtomic(agID, actor, nil, oe)
+			changed, err := s.AckAlertGroupAtomic(agID, actorNamed(actor), nil, oe)
 			winners[idx] = changed
 			errs[idx] = err
 		}(i)
@@ -1274,13 +1274,13 @@ func TestTheDoorsThatStopADeliveryStopAllOfIt(t *testing.T) {
 
 	doors := map[string]func(t *testing.T, agID string){
 		"a user acknowledged": func(t *testing.T, agID string) {
-			changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+			changed, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 			if err != nil || !changed {
 				t.Fatalf("AckAlertGroupAtomic = %v, %v", changed, err)
 			}
 		},
 		"a user resolved": func(t *testing.T, agID string) {
-			changed, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+			changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 			if err != nil || !changed {
 				t.Fatalf("ResolveAlertGroupAtomic = %v, %v", changed, err)
 			}
@@ -1346,7 +1346,7 @@ func TestADoorLeavesAnotherAlertAlone(t *testing.T) {
 	bystander := outboundGroup(t, s)
 	stillOwed := admitOne(t, s, bystander)[0]
 
-	if _, err := s.AckAlertGroupAtomic(acknowledged, "nina", nil, nil); err != nil {
+	if _, err := s.AckAlertGroupAtomic(acknowledged, actorNamed("nina"), nil, nil); err != nil {
 		t.Fatalf("acknowledge: %v", err)
 	}
 

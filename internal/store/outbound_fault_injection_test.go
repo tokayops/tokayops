@@ -52,14 +52,14 @@ func TestADoorThatCannotRaiseItsRevisionDoesNotOpen(t *testing.T) {
 		{
 			name: "an acknowledgement",
 			open: func(t *testing.T, s *Store, agID string) error {
-				_, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+				_, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 				return err
 			},
 		},
 		{
 			name: "a resolution",
 			open: func(t *testing.T, s *Store, agID string) error {
-				_, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+				_, err := s.ResolveAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 				return err
 			},
 		},
@@ -180,7 +180,7 @@ func TestTheCommitFaultLandsWhereItIsMeantTo(t *testing.T) {
 
 	result, err := setDesiredStateTx(context.Background(), tx, s.render,
 		outbound.DesiredStateRequest{
-			AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+			AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 		})
 	if err != nil || result.Outcome != outbound.DesiredApplied {
 		t.Fatalf("the raise was refused before the commit: %s (%v)", result.Outcome, err)
@@ -205,14 +205,14 @@ func TestADoorWhoseCommitFailsReportsIt(t *testing.T) {
 		{
 			name: "an acknowledgement",
 			open: func(t *testing.T, s *Store, agID string) error {
-				_, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+				_, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 				return err
 			},
 		},
 		{
 			name: "a resolution",
 			open: func(t *testing.T, s *Store, agID string) error {
-				_, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+				_, err := s.ResolveAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 				return err
 			},
 		},
@@ -284,7 +284,7 @@ func TestAnAcknowledgementDuringTheFirstSendEndsAcknowledgedEitherWay(t *testing
 
 			// The call is out. Nobody here knows what it did.
 			moveGroup(t, s, agID, model.AlertGroupStatusTriggered)
-			if _, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil {
+			if _, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil {
 				t.Fatalf("acknowledge: %v", err)
 			}
 			if got := statusOf(t, s, intentID); got != outbound.StatusSending {

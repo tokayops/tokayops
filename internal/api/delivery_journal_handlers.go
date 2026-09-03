@@ -112,10 +112,12 @@ type DeliveryObservationDTO struct {
 // DeliveryEventDTO is one thing that happened to a commitment without a
 // network call: its creation, a withdrawal, an expiry, a person's decision.
 type DeliveryEventDTO struct {
-	Seq        int       `json:"seq"`
-	Kind       string    `json:"kind"`
-	Reason     string    `json:"reason,omitempty"`
-	Actor      string    `json:"actor,omitempty"`
+	Seq    int    `json:"seq"`
+	Kind   string `json:"kind"`
+	Reason string `json:"reason,omitempty"`
+	Actor  string `json:"actor,omitempty"`
+	// ActorKind says what Actor is: the id of a user, the name of a component, or the text of a build before this one.
+	ActorKind  string    `json:"actor_kind"`
 	FromStatus string    `json:"from_status,omitempty"`
 	ToStatus   string    `json:"to_status,omitempty"`
 	At         time.Time `json:"at"`
@@ -243,7 +245,7 @@ func journalResponse(j *outbound.Journal) DeliveryJournalResponse {
 	}
 	for _, e := range j.Events {
 		out.Events = append(out.Events, DeliveryEventDTO{
-			Seq: e.Seq, Kind: e.Kind, Reason: e.Reason, Actor: e.Actor,
+			Seq: e.Seq, Kind: e.Kind, Reason: e.Reason, Actor: e.Actor, ActorKind: string(e.ActorKind),
 			FromStatus: e.FromStatus, ToStatus: e.ToStatus, At: e.At,
 		})
 	}

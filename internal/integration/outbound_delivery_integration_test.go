@@ -772,7 +772,7 @@ func announcement(t *testing.T, scheduleID string) outbound.Batch {
 		t.Fatalf("build the announcement for %s: %v", scheduleID, err)
 	}
 	return outbound.Batch{
-		Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: "notifier",
+		Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: outbound.ActorNotifier,
 	}
 }
 
@@ -896,7 +896,7 @@ func TestAShiftChangeReachesBothChannels(t *testing.T) {
 		t.Fatalf("build the announcement: %v", err)
 	}
 	result, err := env.S.SubmitBatch(ctx, outbound.Batch{
-		Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: "notifier",
+		Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: outbound.ActorNotifier,
 	})
 	if err != nil {
 		t.Fatalf("admit the announcement: %v", err)

@@ -69,7 +69,7 @@ func (s *Store) ExpireDueIntents(ctx context.Context, family string, limit int) 
 		// A commitment that ended without a single attempt leaves nothing in
 		// the journal but a changed status, which is not an explanation.
 		if err := appendIntentEventTx(ctx, tx, e.IntentID, nextEventSeq, "expired",
-			"the deadline passed before anything was sent", ""); err != nil {
+			"the deadline passed before anything was sent", outbound.ActorWorker); err != nil {
 			return nil, err
 		}
 		// Set-based, so the machine cannot be asked per row - but the alert
@@ -392,7 +392,7 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 		Transition:      transition,
 		Backoff:         backoff,
 		AppliedRevision: nullableRevision(attemptRevision),
-		Actor:           "recovery",
+		Actor:           outbound.ActorRecovery,
 		Reason:          "the lease expired with an attempt in flight",
 	}); err != nil {
 		return nil, err
@@ -647,9 +647,17 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	}
 
 	if transition.Effects.OpenGeneration {
-		if err := appendIntentEventTx(ctx, tx, req.IntentID, nextEventSeq,
+		// The worker is the actor; which worker is a fact of the line, and
+		// goes where facts go.
+		detail, err := json.Marshal(struct {
+			WorkerID string `json:"worker_id"`
+		}{req.WorkerID})
+		if err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+		if err := appendIntentEventDetailTx(ctx, tx, req.IntentID, nextEventSeq,
 			"effect_bound", "the address and key of this generation are settled",
-			req.WorkerID); err != nil {
+			outbound.ActorWorker, detail); err != nil {
 			return outbound.BeginAttemptResult{}, err
 		}
 	}
@@ -907,7 +915,7 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 		Intent:     intent,
 		Transition: transition,
 		Backoff:    backoff,
-		Actor:      req.WorkerID,
+		Actor:      outbound.ActorWorker,
 		Reason:     req.ErrorClass,
 	}); err != nil {
 		return outbound.BeginAttemptResult{}, err
@@ -1243,7 +1251,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		AttemptIsFinal:  final,
 		Receipt:         settledReceipt,
 		ReceiptRef:      settledRef,
-		Actor:           "worker",
+		Actor:           outbound.ActorWorker,
 	}); err != nil {
 		return outbound.FinalizeResult{}, err
 	}

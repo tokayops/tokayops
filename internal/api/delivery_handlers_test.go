@@ -219,7 +219,7 @@ func TestAReplayNeedsAKeyAndAnswersWithTheNewDelivery(t *testing.T) {
 		t.Fatalf("the wire name of the new delivery: %s", rec.Body.String())
 	}
 	got := r.fake.replayed[0]
-	if got.IntegrationID != "hooks" || got.DeliveryID != "d-1" || got.ClientRequestID != key || got.Actor != "denis" {
+	if got.IntegrationID != "hooks" || got.DeliveryID != "d-1" || got.ClientRequestID != key || got.Actor != byUser("denis") {
 		t.Fatalf("the store was asked %+v", got)
 	}
 

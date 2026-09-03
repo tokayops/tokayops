@@ -41,7 +41,7 @@ func admitWebhook(t *testing.T, s *Store, batch keys.WebhookBatch) (outbound.Sub
 		t.Fatalf("begin: %v", err)
 	}
 	defer tx.Rollback()
-	result, err := admitWebhookTx(context.Background(), tx, batch, "test")
+	result, err := admitWebhookTx(context.Background(), tx, batch, byUser("test"))
 	if err != nil {
 		return result, err
 	}
@@ -290,7 +290,7 @@ func TestSubmitBatchIsNotTheWebhookFamilysDoor(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := s.SubmitBatch(context.Background(), outbound.Batch{
-				Admission: admission, Context: ctx, Actor: "test",
+				Admission: admission, Context: ctx, Actor: byUser("test"),
 			})
 			if !errors.Is(err, ErrOutboundContract) {
 				t.Fatalf("expected a contract violation, got: %v", err)

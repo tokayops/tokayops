@@ -74,7 +74,7 @@ func ended(t *testing.T, s *Store, intentID string, status outbound.Status) {
 
 func replay(s *Store, integrationID, deliveryID, key string) (WebhookReplayResult, error) {
 	return s.ReplayWebhookDelivery(context.Background(), WebhookReplayRequest{
-		IntegrationID: integrationID, DeliveryID: deliveryID, ClientRequestID: key, Actor: "nina",
+		IntegrationID: integrationID, DeliveryID: deliveryID, ClientRequestID: key, Actor: byUser("nina"),
 	})
 }
 
@@ -244,7 +244,7 @@ func TestReplayAndDeletionLeaveNoLiveCommitmentInEitherOrder(t *testing.T) {
 		}
 		batch := webhookBatch(keys.KindWebhookReplay, eventID, id)
 		batch.ClientRequestID = "k-race"
-		if _, err := admitWebhookTx(ctx, tx, batch, "nina"); err != nil {
+		if _, err := admitWebhookTx(ctx, tx, batch, byUser("nina")); err != nil {
 			t.Fatalf("admit the replay under the lock: %v", err)
 		}
 
@@ -324,7 +324,7 @@ func TestOperatorRetriesAreRefusedForWebhookCommitments(t *testing.T) {
 	for intentID, state := range states {
 		for _, decision := range []outbound.Decision{outbound.DecisionRetryCurrentGeneration, outbound.DecisionRetryNewGeneration} {
 			result, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
-				IntentID: intentID, Decision: decision, Actor: "nina", Reason: "try again", AcceptedDuplicateRisk: true,
+				IntentID: intentID, Decision: decision, Actor: byUser("nina"), Reason: "try again", AcceptedDuplicateRisk: true,
 			})
 			if err != nil || result.Outcome != outbound.ResolveInvalidDecision {
 				t.Fatalf("%s on a %s webhook commitment answered %+v (%v)", decision, state, result, err)
@@ -427,7 +427,7 @@ func TestReplayAndDisablingLeaveNoLiveCommitmentInEitherOrder(t *testing.T) {
 		}
 		batch := webhookBatch(keys.KindWebhookReplay, eventID, id)
 		batch.ClientRequestID = "k-race"
-		if _, err := admitWebhookTx(ctx, tx, batch, "nina"); err != nil {
+		if _, err := admitWebhookTx(ctx, tx, batch, byUser("nina")); err != nil {
 			t.Fatalf("admit the replay under the lock: %v", err)
 		}
 

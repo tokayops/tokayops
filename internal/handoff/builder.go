@@ -155,7 +155,7 @@ func (b announcementBuilder) build(sc schedulerender.ScheduleOnCall, kind string
 	return outbound.Batch{
 		Admission: admission,
 		Context:   outbound.AnnouncingShiftChange(),
-		Actor:     "notifier",
+		Actor:     outbound.ActorNotifier,
 	}, left, nil
 }
 

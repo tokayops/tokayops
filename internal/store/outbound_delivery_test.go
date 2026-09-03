@@ -620,7 +620,7 @@ func TestBeginRefusesWhatItCannotAuthorise(t *testing.T) {
 		intentID := admitOne(t, s, agID)[0]
 		token := claimOne(t, s, intentID)
 
-		if _, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 
@@ -1033,7 +1033,7 @@ func TestAcknowledgementMeetsADeliveryInFlight(t *testing.T) {
 		agID := outboundGroup(t, s)
 		intentID := admitOne(t, s, agID)[0]
 
-		if _, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 		if got := statusOf(t, s, intentID); got != outbound.StatusCanceled {
@@ -1057,7 +1057,7 @@ func TestAcknowledgementMeetsADeliveryInFlight(t *testing.T) {
 		token := claimOne(t, s, intentID)
 		begun := beginOne(t, s, intentID, token)
 
-		if _, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 		if got := statusOf(t, s, intentID); got != outbound.StatusSending {
@@ -1082,7 +1082,7 @@ func TestAcknowledgementMeetsADeliveryInFlight(t *testing.T) {
 		token := claimOne(t, s, intentID)
 		begun := beginOne(t, s, intentID, token)
 
-		if _, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 
@@ -1118,7 +1118,7 @@ func TestAcknowledgementMeetsADeliveryInFlight(t *testing.T) {
 			t.Fatalf("a retryable failure left the commitment %s", got)
 		}
 
-		if _, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 		if got := statusOf(t, s, intentID); got != outbound.StatusCanceled {

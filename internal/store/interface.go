@@ -36,8 +36,8 @@ type StoreInterface interface {
 	CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) error
 
 	// Atomic ack/resolve (single-winner semantics, timeline + status + escalation cancel in one transaction)
-	AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
-	ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	AckAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	ResolveAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
 
 	// Atomic resolve with alerts update (ingester auto-resolve: alerts + status + timeline + outbox in one transaction)
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string, incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
@@ -156,6 +156,8 @@ type StoreInterface interface {
 	// outbound_journal_store.go.
 	ListIntents(ctx context.Context, filter IntentFilter, limit, offset int) ([]outbound.Intent, int, error)
 	IntentJournal(ctx context.Context, intentID string) (*outbound.Journal, error)
+	// ResolveAmbiguity is a person deciding what a stuck commitment does.
+	ResolveAmbiguity(ctx context.Context, req outbound.ResolveAmbiguityRequest) (outbound.ResolveAmbiguityResult, error)
 	AlertGroupDeliveries(ctx context.Context, alertGroupID string) (*outbound.GroupDeliveries, error)
 
 	// Metrics

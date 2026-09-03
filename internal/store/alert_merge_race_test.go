@@ -129,7 +129,7 @@ func TestAFiringPayloadAgainstAResolutionLosesNothing(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			resolved, resolveErr = s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+			resolved, resolveErr = s.ResolveAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 		}()
 		wg.Wait()
 
@@ -198,7 +198,7 @@ func TestAResolvingPayloadAgainstAnAcknowledgementEndsTheIncidentOnce(t *testing
 		}()
 		go func() {
 			defer wg.Done()
-			_, ackErr = s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+			_, ackErr = s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 		}()
 		wg.Wait()
 
@@ -252,7 +252,7 @@ func TestAMergeThatCommitsFirstIsInTheIncidentThatEnds(t *testing.T) {
 		t.Fatalf("the merge came back %s (%v)", applied.Outcome, err)
 	}
 
-	resolved, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+	resolved, err := s.ResolveAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 	if err != nil || !resolved {
 		t.Fatalf("resolve: %v %v", resolved, err)
 	}
@@ -283,7 +283,7 @@ func TestAResolutionThatCommitsFirstSendsTheAlertToTheNextIncident(t *testing.T)
 
 	agID, key := mergeRaceGroup(t, s)
 
-	resolved, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+	resolved, err := s.ResolveAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 	if err != nil || !resolved {
 		t.Fatalf("resolve: %v %v", resolved, err)
 	}

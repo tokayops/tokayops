@@ -183,6 +183,7 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	// it is the administrator's and not the group's.
 	v1.GET("/deliveries", a.ListDeliveries, a.Require(rbac.ActionDeliveryView, ScopeGlobal()))
 	v1.GET("/deliveries/:id", a.GetDeliveryJournal, a.Require(rbac.ActionDeliveryView, ScopeGlobal()))
+	v1.POST("/deliveries/:id/decisions", a.DecideDelivery, a.Require(rbac.ActionDeliveryResolve, ScopeGlobal()))
 
 	// Legacy Incidents (alias)
 	v1.GET("/incidents", a.ListAlertGroups, a.Require(rbac.ActionAlertView, ScopeGlobal()))
@@ -654,7 +655,7 @@ func (a *API) ResolveAlertGroup(c echo.Context) error {
 // resolveRESTActor resolves the authenticated user from JWT context into an alertgroup.Actor.
 func (a *API) resolveRESTActor(c echo.Context) alertgroup.Actor {
 	userID, _ := c.Get("user_id").(string)
-	actor := alertgroup.Actor{Name: "user"}
+	actor := alertgroup.Actor{ID: userID, Name: "user"}
 	if userID != "" {
 		// Display read on purpose, as above: this is an audit label.
 		if user, err := a.store.GetUserByID(userID); err == nil && user != nil {

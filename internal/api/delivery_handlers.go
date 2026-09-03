@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"net/http"
 	"strconv"
 
@@ -157,7 +158,11 @@ func (a *API) ReplayDelivery(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error: "Idempotency-Key header is required and must be 1 to 128 bytes"})
 	}
-	actor, _ := c.Get("user_id").(string)
+	userID, _ := c.Get("user_id").(string)
+	actor, err := outbound.UserActor(userID)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "no user in the session"})
+	}
 
 	result, err := a.store.ReplayWebhookDelivery(c.Request().Context(), store.WebhookReplayRequest{
 		IntegrationID: integrationID, DeliveryID: deliveryID, ClientRequestID: key, Actor: actor,

@@ -41,7 +41,7 @@ func TestWhatCameOfARevisionIsCounted(t *testing.T) {
 		agID := desiredGroup(t, s, "Disk filling up")
 		changeableCard(t, s, agID)
 		before := count(outbound.DesiredAck, outbound.DesiredApplied)
-		changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+		changed, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 		if err != nil || !changed {
 			t.Fatalf("acknowledge: changed=%v err=%v", changed, err)
 		}
@@ -52,7 +52,7 @@ func TestWhatCameOfARevisionIsCounted(t *testing.T) {
 		agID := desiredGroup(t, s, "Disk quiet")
 		moveGroup(t, s, agID, model.AlertGroupStatusTriggered)
 		before := count(outbound.DesiredAck, outbound.DesiredNoSnapshot)
-		changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil)
+		changed, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 		if err != nil || !changed {
 			t.Fatalf("acknowledge: changed=%v err=%v", changed, err)
 		}
@@ -108,7 +108,7 @@ func TestWhatCameOfARevisionIsCounted(t *testing.T) {
 		changeableCard(t, s, agID)
 
 		before := count(outbound.DesiredResolve, outbound.DesiredApplied)
-		changed, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil)
+		changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("nina"), nil, nil)
 		if err != nil || !changed {
 			t.Fatalf("resolve: changed=%v err=%v", changed, err)
 		}

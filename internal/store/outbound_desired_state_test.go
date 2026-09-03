@@ -133,7 +133,7 @@ func TestDesiredStateRaisesARevisionAndAimsTheCards(t *testing.T) {
 	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
 
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 	})
 	if err != nil {
 		t.Fatalf("raise the desired state: %v", err)
@@ -236,14 +236,14 @@ func TestDesiredStateIsUnchangedWhenTheMessageWouldNotMove(t *testing.T) {
 		channelCommitment("C-ops", 0)))
 
 	first, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: "ingester",
+		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: outbound.ActorSystem,
 	})
 	if err != nil || first.Outcome != outbound.DesiredApplied {
 		t.Fatalf("the first proposal came back %s (%v)", first.Outcome, err)
 	}
 
 	second, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: "ingester",
+		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: outbound.ActorSystem,
 	})
 	if err != nil {
 		t.Fatalf("raise the desired state again: %v", err)
@@ -282,7 +282,7 @@ func TestTheFinalRevisionIsRaisedEvenWhenNothingMoved(t *testing.T) {
 		channelCommitment("C-ops", 0)))
 
 	if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: "ingester",
+		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: outbound.ActorSystem,
 	}); err != nil {
 		t.Fatalf("raise the desired state: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestTheFinalRevisionIsRaisedEvenWhenNothingMoved(t *testing.T) {
 
 	moveGroup(t, s, agID, model.AlertGroupStatusResolved)
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: byUser("nina"),
 	})
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -327,7 +327,7 @@ func TestDesiredStateRefusesToMoveAfterFinal(t *testing.T) {
 
 	moveGroup(t, s, agID, model.AlertGroupStatusResolved)
 	if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: byUser("nina"),
 	}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestDesiredStateRefusesToMoveAfterFinal(t *testing.T) {
 	}})
 
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredResolve, Actor: byUser("nina"),
 	})
 	if err != nil {
 		t.Fatalf("raise the desired state: %v", err)
@@ -363,7 +363,7 @@ func TestDesiredStateWithoutASnapshotChangesNothing(t *testing.T) {
 	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
 
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 	})
 	if err != nil {
 		t.Fatalf("raise the desired state: %v", err)
@@ -411,7 +411,7 @@ func TestAStateThatCannotBeFrozenEndsTheWholeTransition(t *testing.T) {
 	}
 	if _, err := setDesiredStateTx(context.Background(), tx, s.render,
 		outbound.DesiredStateRequest{
-			AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+			AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 		}); err == nil {
 		tx.Rollback()
 		t.Fatal("a state that cannot be frozen was accepted")
@@ -459,7 +459,7 @@ func TestAReasonThatTheGroupContradictsIsRefused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			moveGroup(t, s, agID, tc.status)
 			if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-				AlertGroupID: agID, Reason: tc.reason, Actor: "nina",
+				AlertGroupID: agID, Reason: tc.reason, Actor: byUser("nina"),
 			}); err == nil {
 				t.Fatal("the desired state was raised for a transition nobody made")
 			}
@@ -492,7 +492,7 @@ func TestAStateThisBuildCannotWriteIsLeftAlone(t *testing.T) {
 	}
 
 	if _, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 	}); err == nil {
 		t.Fatal("a state from a newer schema was overwritten")
 	}
@@ -572,7 +572,7 @@ func TestTheHistoryOfATransitionReadsInTheOrderItHappened(t *testing.T) {
 		{
 			name: "an acknowledgement", transition: model.TimelineEventAcknowledged,
 			close: func(t *testing.T, s *Store, agID string) {
-				if changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil || !changed {
+				if changed, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil || !changed {
 					t.Fatalf("acknowledge: %v %v", changed, err)
 				}
 			},
@@ -580,7 +580,7 @@ func TestTheHistoryOfATransitionReadsInTheOrderItHappened(t *testing.T) {
 		{
 			name: "a resolution", transition: model.TimelineEventResolved,
 			close: func(t *testing.T, s *Store, agID string) {
-				if changed, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil); err != nil || !changed {
+				if changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil || !changed {
 					t.Fatalf("resolve: %v %v", changed, err)
 				}
 			},
@@ -713,7 +713,7 @@ func TestARaiseTouchesExactlyTheFourRowsOfTheTable(t *testing.T) {
 
 	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
 	result, raiseErr := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 	})
 	if raiseErr != nil {
 		t.Fatalf("raise the desired state: %v", raiseErr)
@@ -805,7 +805,7 @@ func TestADamagedAlertDoesNotEndAnAcknowledgementItHasNoCardFor(t *testing.T) {
 	}
 
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+		AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 	})
 	if err != nil {
 		t.Fatalf("the acknowledgement was ended by alerts no card needed: %v", err)
@@ -861,7 +861,7 @@ func TestTwoRaisesWithoutTheGroupLockCannotBothWin(t *testing.T) {
 	go func() {
 		_, err := setDesiredStateTx(context.Background(), loser, s.render,
 			outbound.DesiredStateRequest{
-				AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+				AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 			})
 		raised <- err
 	}()
@@ -946,7 +946,7 @@ func TestTheFourWritesCommitTogether(t *testing.T) {
 	}
 	result, err := setDesiredStateTx(context.Background(), tx, s.render,
 		outbound.DesiredStateRequest{
-			AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: "nina",
+			AlertGroupID: agID, Reason: outbound.DesiredAck, Actor: byUser("nina"),
 		})
 	if err != nil || result.Outcome != outbound.DesiredApplied {
 		tx.Rollback()

@@ -182,7 +182,12 @@ func lockIntegrationTx(ctx context.Context, tx *sql.Tx, id string) (*model.Integ
 // outright; a send in flight is flagged and the outcome decides; a commitment
 // waiting for a person about an unknown outcome is withdrawn, and the history
 // keeps the doubt. It returns how many it withdrew outright.
-func withdrawSubscriberTx(ctx context.Context, tx *sql.Tx, integrationID, reason, actor string) (int, error) {
+func withdrawSubscriberTx(ctx context.Context, tx *sql.Tx, integrationID, reason, actorID string) (int, error) {
+	// The switch is a person's: the handler hands in the id of the user.
+	actor, err := outbound.UserActor(actorID)
+	if err != nil {
+		return 0, outboundContractf("%v", err)
+	}
 	notSent, err := cancelRowsTx(ctx, tx, `
 		UPDATE outbound_intents
 		SET status = 'canceled', lease_token = NULL, locked_until = NULL,

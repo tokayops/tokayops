@@ -25,6 +25,7 @@ func TestTheSwaggerDescribesEveryDeliveryRoute(t *testing.T) {
 	for path, method := range map[string]string{
 		"/api/v1/deliveries":                                       "get",
 		"/api/v1/deliveries/{id}":                                  "get",
+		"/api/v1/deliveries/{id}/decisions":                        "post",
 		"/api/v1/alert-groups/{id}/deliveries":                     "get",
 		"/api/v1/integrations/{id}/deliveries":                     "get",
 		"/api/v1/integrations/{id}/deliveries/{deliveryId}":        "get",

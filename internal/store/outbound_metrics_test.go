@@ -181,7 +181,7 @@ func TestTheSnapshotCountsCommitmentsByStatus(t *testing.T) {
 		t.Fatalf("the snapshot says %d commitments are owed, want 2", got)
 	}
 
-	if _, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil {
+	if _, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil {
 		t.Fatalf("acknowledge: %v", err)
 	}
 

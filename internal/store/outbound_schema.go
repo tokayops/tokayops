@@ -378,6 +378,7 @@ CREATE TABLE IF NOT EXISTS outbound_intent_events (
 	kind           TEXT NOT NULL,
 	reason         TEXT,
 	actor          TEXT,
+	actor_kind     TEXT NOT NULL,
 	from_status    TEXT,
 	to_status      TEXT,
 	generation_no  INT,
@@ -905,6 +906,9 @@ func (s *Store) applyOutboundSchema() error {
 		return err
 	}
 	if err := applyJournalSchema(context.Background(), tx); err != nil {
+		return err
+	}
+	if err := applyActorSchema(context.Background(), tx); err != nil {
 		return err
 	}
 

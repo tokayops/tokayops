@@ -704,7 +704,8 @@ func (m *MockStore) TouchAlertGroup(id string) error {
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (m *MockStore) AckAlertGroupAtomic(id string, who alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	actor := who.Name
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -740,7 +741,8 @@ func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string
 	return true, nil
 }
 
-func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (m *MockStore) ResolveAlertGroupAtomic(id string, who alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	actor := who.Name
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2003,6 +2005,11 @@ func (m *MockStore) ListIntents(_ context.Context, _ IntentFilter, _, _ int) ([]
 
 func (m *MockStore) IntentJournal(_ context.Context, _ string) (*outbound.Journal, error) {
 	return nil, nil
+}
+
+// ResolveAmbiguity: the mock holds no commitments, so there is nothing to decide.
+func (m *MockStore) ResolveAmbiguity(_ context.Context, _ outbound.ResolveAmbiguityRequest) (outbound.ResolveAmbiguityResult, error) {
+	return outbound.ResolveAmbiguityResult{Outcome: outbound.ResolveNotFound}, nil
 }
 
 func (m *MockStore) AlertGroupDeliveries(_ context.Context, _ string) (*outbound.GroupDeliveries, error) {

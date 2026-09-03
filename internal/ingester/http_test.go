@@ -280,7 +280,7 @@ func TestMergeIntoGroup_PreservesAcknowledgedStatus(t *testing.T) {
 	if err := s.SetAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing); err != nil {
 		t.Fatalf("UpdateAlertGroupStatus: %v", err)
 	}
-	if changed, err := s.AckAlertGroupAtomic(ag.ID, "user1", nil, nil); err != nil || !changed {
+	if changed, err := s.AckAlertGroupAtomic(ag.ID, actorNamed("user1"), nil, nil); err != nil || !changed {
 		t.Fatalf("AckAlertGroupAtomic: changed=%v err=%v", changed, err)
 	}
 	ag, _ = s.GetAlertGroupByID(ag.ID)

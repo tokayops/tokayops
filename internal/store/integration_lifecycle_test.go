@@ -281,7 +281,7 @@ func holdingTheAudience(t *testing.T, s *Store, subscriberID, eventID string) *s
 		t.Fatalf("take the audience lock: %v", err)
 	}
 	if eventID != "" {
-		if _, err := admitWebhookTx(ctx, tx, webhookBatch(keys.KindWebhookEvent, eventID, subscriberID), "fan-out"); err != nil {
+		if _, err := admitWebhookTx(ctx, tx, webhookBatch(keys.KindWebhookEvent, eventID, subscriberID), outbound.ActorFanOut); err != nil {
 			t.Fatalf("admit under the lock: %v", err)
 		}
 	}

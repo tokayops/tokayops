@@ -376,7 +376,7 @@ func TestTheAddressDoesNotComeBack(t *testing.T) {
 			outbound.DecisionRetryNewGeneration, outbound.DecisionAssumeAccepted,
 		} {
 			result, err := s.ResolveAmbiguity(ctx, outbound.ResolveAmbiguityRequest{
-				IntentID: intentID, Decision: decision, Actor: "nina",
+				IntentID: intentID, Decision: decision, Actor: byUser("nina"),
 				Reason: "trying anyway", AcceptedDuplicateRisk: true,
 			})
 			if err != nil {
@@ -391,7 +391,7 @@ func TestTheAddressDoesNotComeBack(t *testing.T) {
 		// is a commitment nobody can ever close.
 		result, err := s.ResolveAmbiguity(ctx, outbound.ResolveAmbiguityRequest{
 			IntentID: intentID, Decision: outbound.DecisionCancel,
-			Actor: "nina", Reason: "the recipient is gone",
+			Actor: byUser("nina"), Reason: "the recipient is gone",
 		})
 		if err != nil || result.Outcome != outbound.ResolveResolved {
 			t.Fatalf("withdrawing an erased recipient's commitment answered %q: %v",

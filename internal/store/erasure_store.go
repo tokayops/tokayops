@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/erasure"
@@ -343,7 +344,7 @@ func (t *erasureTx) withdrawOutbound(ctx context.Context, query, userID, kind, r
 	byFamily := map[string]int{}
 	for _, w := range withdrawn {
 		if err := appendIntentEventTx(ctx, t.tx, w.id, nextEventSeq, kind,
-			reason, "erasure"); err != nil {
+			reason, outbound.ActorErasure); err != nil {
 			return nil, err
 		}
 		byFamily[w.family]++

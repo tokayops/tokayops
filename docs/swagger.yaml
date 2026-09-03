@@ -159,6 +159,49 @@ definitions:
         description: 'Optional: "admin" or "user"'
         type: string
     type: object
+  api.DecisionRequest:
+    properties:
+      accepted_duplicate_risk:
+        description: |-
+          AcceptedDuplicateRisk is the person saying, on the record, that a second
+          message may exist. Some decisions need it; the refusal says so.
+        type: boolean
+      decision:
+        description: |-
+          Decision is one of assume_accepted, cancel, retry_current_generation,
+          retry_new_generation.
+        type: string
+      new_expires_at:
+        description: |-
+          NewExpiresAt is the new deadline a retry of an expired commitment needs.
+          It has to be ahead of the moment it is written.
+        type: string
+      reason:
+        description: |-
+          Reason is required: a decision without one is "somebody decided
+          something". At most 500 characters, counted as characters.
+        type: string
+    type: object
+  api.DecisionResponse:
+    properties:
+      delivery:
+        allOf:
+        - $ref: '#/definitions/api.DeliveryDTO'
+        description: Delivery is the commitment after the decision applied.
+      detail:
+        description: Detail is the words of the guard that refused the decision.
+        type: string
+      outcome:
+        type: string
+      row:
+        description: Row is the line of the decision table that applied.
+        type: string
+      status:
+        description: |-
+          Status is where the commitment stands after the answer - the new state
+          when the decision applied, the current one when it did not.
+        type: string
+    type: object
   api.DeliveriesResponse:
     properties:
       deliveries:
@@ -294,6 +337,10 @@ definitions:
   api.DeliveryEventDTO:
     properties:
       actor:
+        type: string
+      actor_kind:
+        description: 'ActorKind says what Actor is: the id of a user, the name of
+          a component, or the text of a build before this one.'
         type: string
       at:
         type: string
@@ -2186,6 +2233,58 @@ paths:
           schema:
             $ref: '#/definitions/api.ErrorResponse'
       summary: The journal of one delivery
+      tags:
+      - deliveries
+  /api/v1/deliveries/{id}/decisions:
+    post:
+      consumes:
+      - application/json
+      description: A person deciding about a commitment in manual_review, permanent_failed
+        or expired. The reason is required (1 to 500 characters). resolved answers
+        200 with the commitment and the row of the decision table that applied; already_resolved
+        409 with the current status; invalid_decision 422 with the guard's words in
+        detail; business_closed and recipient_erased 409 with detail; an unknown commitment
+        404.
+      parameters:
+      - description: Delivery ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: The decision
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.DecisionRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.DecisionResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.DecisionResponse'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.DecisionResponse'
+      summary: Decide what a stuck delivery does
       tags:
       - deliveries
   /api/v1/integrations:

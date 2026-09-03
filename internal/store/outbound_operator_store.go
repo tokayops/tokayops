@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,8 +35,9 @@ import (
 // once its transaction has committed. Counted inside, a transaction that then
 // rolled back would report an ending that never happened - and the alert on
 // that counter fires on any increment at all.
-func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, actor string) (int, error) {
-	return cancelIntentsAtTx(ctx, tx, alertGroupID, reason, actor, time.Time{})
+func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason string,
+	actor outbound.Actor, timelineActor string) (int, error) {
+	return cancelIntentsAtTx(ctx, tx, alertGroupID, reason, actor, timelineActor, time.Time{})
 }
 
 // cancelIntentsAtTx is the same withdrawal with the instant its history line
@@ -47,8 +49,12 @@ func cancelIntentsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, acto
 // notifications were withdrawn before the alert that withdrew them cleared. The
 // zero value means "whenever this lands", which is right for a transition that
 // wrote nothing before it.
-func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, actor string,
-	at time.Time) (int, error) {
+//
+// Two actors, because two journals: the commitments' lines carry the typed
+// actor, and the alert's timeline carries the name the alert domain signs
+// with.
+func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason string,
+	actor outbound.Actor, timelineActor string, at time.Time) (int, error) {
 	// Nothing has gone out and nothing will: these are withdrawn outright, and
 	// the lease goes with them so the worker holding one finds out at its next
 	// compare-and-set.
@@ -115,7 +121,7 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, ac
 	line := fmt.Sprintf("%d pending notification(s) withdrawn: %s", touched, reason)
 	if at.IsZero() {
 		if err := addTimelineTx(ctx, tx, alertGroupID,
-			model.TimelineEventNotificationFailed, line, actor); err != nil {
+			model.TimelineEventNotificationFailed, line, timelineActor); err != nil {
 			return 0, err
 		}
 	} else if err := addTimelineEventsTx(ctx, tx, []*model.TimelineEvent{{
@@ -123,7 +129,7 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason, ac
 		AlertGroupID: alertGroupID,
 		Type:         model.TimelineEventNotificationFailed,
 		Message:      line,
-		Actor:        actor,
+		Actor:        timelineActor,
 		CreatedAt:    at,
 	}}); err != nil {
 		return 0, err
@@ -221,6 +227,7 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	if intent.RecipientErased && req.Decision != outbound.DecisionCancel {
 		return outbound.ResolveAmbiguityResult{
 			Outcome: outbound.ResolveRecipientErased, Status: intent.Status,
+			Detail: "the recipient was erased; the only decision left is cancel",
 		}, nil
 	}
 
@@ -229,7 +236,29 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	} else if closed {
 		return outbound.ResolveAmbiguityResult{
 			Outcome: outbound.ResolveBusinessClosed, Status: intent.Status,
+			Detail: "the alert this commitment belongs to is over; nothing is retried for it",
 		}, nil
+	}
+
+	// A new deadline has to be ahead of the moment it is written, and the
+	// moment is read from the database AFTER the lock: now() is the start of
+	// the transaction, which may have waited on the row for as long as the
+	// lock timeout allows, and a deadline a second ahead of that start would
+	// land already past - the next sweep would expire the commitment again,
+	// and the decision would have been a no-op with a history line saying it
+	// revived something.
+	if req.NewExpiresAt != nil {
+		var past bool
+		if err := tx.QueryRowContext(ctx, `SELECT $1::timestamptz <= clock_timestamp()`,
+			*req.NewExpiresAt).Scan(&past); err != nil {
+			return outbound.ResolveAmbiguityResult{}, err
+		}
+		if past {
+			return outbound.ResolveAmbiguityResult{
+				Outcome: outbound.ResolveInvalidDecision, Status: intent.Status,
+				Detail: "the new deadline is already past",
+			}, nil
+		}
 	}
 
 	facts, err := lastAttemptFactsTx(ctx, tx, req.IntentID, intent.GenerationNo)
@@ -286,6 +315,7 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	if errors.Is(err, outbound.ErrInvalidTransition) {
 		return outbound.ResolveAmbiguityResult{
 			Outcome: outbound.ResolveInvalidDecision, Status: intent.Status,
+			Detail: guardText(err),
 		}, nil
 	}
 	if err != nil {
@@ -319,6 +349,14 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	return outbound.ResolveAmbiguityResult{
 		Outcome: outbound.ResolveResolved, Status: transition.To, Row: transition.Row,
 	}, nil
+}
+
+// guardText is what the machine said after its prefix: the words of the
+// guard, for the person who has to satisfy it. The prefix names the error
+// class, which the outcome already does.
+func guardText(err error) string {
+	return strings.TrimPrefix(strings.TrimPrefix(err.Error(),
+		outbound.ErrInvalidTransition.Error()), ": ")
 }
 
 // decisionNeedsState says whether a decision has to look at the state the

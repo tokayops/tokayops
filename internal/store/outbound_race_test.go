@@ -221,7 +221,7 @@ func TestAcknowledgementRacesADeliveryThatLanded(t *testing.T) {
 		startTogether(
 			func() {
 				timed(&round.ackTook, func() {
-					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, actorNamed("nina"), nil, nil)
 				})
 			},
 			func() {
@@ -267,7 +267,7 @@ func TestAcknowledgementRacesAnAssumedDelivery(t *testing.T) {
 		startTogether(
 			func() {
 				timed(&round.ackTook, func() {
-					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, actorNamed("nina"), nil, nil)
 				})
 			},
 			func() {
@@ -305,7 +305,7 @@ func TestAcknowledgementRacesRecovery(t *testing.T) {
 		startTogether(
 			func() {
 				timed(&round.ackTook, func() {
-					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil)
+					_, round.ackErr = s.AckAlertGroupAtomic(round.groupID, actorNamed("nina"), nil, nil)
 				})
 			},
 			// The two recoverers start together with each other as well: their
@@ -464,7 +464,7 @@ func TestAnAcknowledgementAndADeliveryInEitherOrder(t *testing.T) {
 	t.Run("the acknowledgement lands first", func(t *testing.T) {
 		round := inFlight(t, s, dmCommitment("U0001"))
 
-		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(round.groupID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 		result, err := s.FinalizeDeliveryAttempt(context.Background(),
@@ -508,7 +508,7 @@ func TestAnAcknowledgementAndADeliveryInEitherOrder(t *testing.T) {
 			t.Fatalf("the alert is %s after its notification landed", got)
 		}
 
-		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(round.groupID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 		if got := groupStatusOf(t, s, round.groupID); got != model.AlertGroupStatusAcknowledged {
@@ -534,7 +534,7 @@ func TestAnAcknowledgementAndADoubtfulResultInEitherOrder(t *testing.T) {
 	t.Run("the acknowledgement lands first", func(t *testing.T) {
 		round := inFlight(t, s, assumeAccepted("U0001"))
 
-		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(round.groupID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 		result, err := s.FinalizeDeliveryAttempt(context.Background(),
@@ -599,7 +599,7 @@ func TestAnAcknowledgementAndADoubtfulResultInEitherOrder(t *testing.T) {
 			t.Fatal("a delivery nobody confirmed is recorded as if it were confirmed")
 		}
 
-		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(round.groupID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 		if got := statusOf(t, s, round.intentID); got != outbound.StatusSucceeded {
@@ -623,7 +623,7 @@ func TestAnAcknowledgementAndRecoveryInEitherOrder(t *testing.T) {
 	t.Run("the acknowledgement lands first", func(t *testing.T) {
 		round := stale("U0001")
 
-		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(round.groupID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 		recovered, err := s.RecoverStaleAttempts(context.Background(), testFamily, 10)
@@ -652,7 +652,7 @@ func TestAnAcknowledgementAndRecoveryInEitherOrder(t *testing.T) {
 			t.Fatalf("the alert is %s after its only notification was assumed delivered", got)
 		}
 
-		if _, err := s.AckAlertGroupAtomic(round.groupID, "nina", nil, nil); err != nil {
+		if _, err := s.AckAlertGroupAtomic(round.groupID, actorNamed("nina"), nil, nil); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
 		if got := statusOf(t, s, round.intentID); got != outbound.StatusSucceeded {

@@ -138,7 +138,7 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup,
 			OnCallSnapshot: plan.onCallSnapshot(ag.ID, people, teamOnCall),
 			Unpromised:     unpromised,
 		}),
-		Actor: "engine",
+		Actor: outbound.ActorEngine,
 	}, nil
 }
 

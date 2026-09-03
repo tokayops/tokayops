@@ -403,6 +403,23 @@ func TestTelegramPipeline_ResolveCallback(t *testing.T) {
 	if unsent != 0 {
 		t.Errorf("%d unsent notifications are still owed for a resolved alert", unsent)
 	}
+	// What the resolution did to the card - raised its desired state, and
+	// withdrew whatever was still owed - is signed by the person who pressed
+	// the button, by their id, a user known to the users table, and not by the
+	// name the timeline shows.
+	var withdrawn, byKnownUser int
+	if err := env.S.GetDB().QueryRow(`
+		SELECT count(*),
+		       count(*) FILTER (WHERE e.actor_kind = 'user' AND EXISTS (SELECT 1 FROM users u WHERE u.id = e.actor))
+		FROM outbound_intent_events e
+		JOIN outbound_intents i ON i.id = e.intent_id
+		WHERE i.alert_group_id = $1 AND e.kind IN ('desired_raised', 'canceled', 'cancellation_requested')`, ag.ID).
+		Scan(&withdrawn, &byKnownUser); err != nil {
+		t.Fatalf("read the withdrawals: %v", err)
+	}
+	if withdrawn == 0 || byKnownUser != withdrawn {
+		t.Errorf("%d of %d lines of the resolution are signed by the person who resolved, by id", byKnownUser, withdrawn)
+	}
 
 	var final bool
 	if err := env.S.GetDB().QueryRow(

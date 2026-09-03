@@ -240,7 +240,7 @@ func TestAcknowledgingTheAlertLeavesItsWebhookAlone(t *testing.T) {
 	firing := onlyOne(t, commitmentsOwedTo(t, s, id))
 	canceledBefore := terminalCount(t, "webhook", "canceled")
 
-	changed, err := s.AckAlertGroupAtomic(agID, "nina", nil, &model.OutboxEvent{
+	changed, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, &model.OutboxEvent{
 		ID: uuid.New().String(), EventType: model.OutboxEventAcknowledged, AlertGroupID: agID, TeamID: "team-1",
 		Payload: json.RawMessage(`{"event":"alert_group.acknowledged","alert_group":{"id":"` + agID + `"}}`),
 	})

@@ -139,7 +139,7 @@ func TestEveryDoorIntoATerminalStateIsCounted(t *testing.T) {
 			open: func(t *testing.T) {
 				agID := outboundGroup(t, s)
 				admitOne(t, s, agID, channelCommitment("C0001", 0), dmCommitment("U0001"))
-				if _, err := s.AckAlertGroupAtomic(agID, "nina", nil, nil); err != nil {
+				if _, err := s.AckAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil {
 					t.Fatalf("acknowledge: %v", err)
 				}
 			},
@@ -151,7 +151,7 @@ func TestEveryDoorIntoATerminalStateIsCounted(t *testing.T) {
 				intentID := stuckInReview(t, s, outboundGroup(t, s))
 				result, err := s.ResolveAmbiguity(ctx, outbound.ResolveAmbiguityRequest{
 					IntentID: intentID, Decision: outbound.DecisionCancel,
-					Actor: "nina", Reason: "the alert is handled",
+					Actor: byUser("nina"), Reason: "the alert is handled",
 				})
 				if err != nil || result.Outcome != outbound.ResolveResolved {
 					t.Fatalf("resolve the ambiguity: %v %v", result.Outcome, err)
@@ -225,7 +225,7 @@ func TestEveryDoorIntoATerminalStateIsCounted(t *testing.T) {
 			open: func(t *testing.T) {
 				agID := outboundGroup(t, s)
 				admitOne(t, s, agID, channelCommitment("C0001", 0), dmCommitment("U0001"))
-				if changed, err := s.ResolveAlertGroupAtomic(agID, "nina", nil, nil); err != nil || !changed {
+				if changed, err := s.ResolveAlertGroupAtomic(agID, actorNamed("nina"), nil, nil); err != nil || !changed {
 					t.Fatalf("resolve: %v %v", changed, err)
 				}
 			},

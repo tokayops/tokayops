@@ -104,7 +104,7 @@ func (s *Store) mergeAlertsTx(ctx context.Context, tx *sql.Tx, group *model.Aler
 	}
 
 	desired, err := setDesiredStateTx(ctx, tx, s.render, outbound.DesiredStateRequest{
-		AlertGroupID: group.ID, Reason: outbound.DesiredMerge, Actor: actor,
+		AlertGroupID: group.ID, Reason: outbound.DesiredMerge, Actor: outbound.ActorSystem,
 	})
 	if err != nil {
 		return alertgroup.MergeResult{}, err
@@ -183,12 +183,13 @@ func (s *Store) resolveByAlertmanagerTx(ctx context.Context, tx *sql.Tx,
 		return alertgroup.MergeResult{}, err
 	}
 
-	withdrawn, err := cancelIntentsAtTx(ctx, tx, group.ID, "the alert cleared", actor, withdrawalAt)
+	withdrawn, err := cancelIntentsAtTx(ctx, tx, group.ID, "the alert cleared",
+		outbound.ActorSystem, actor, withdrawalAt)
 	if err != nil {
 		return alertgroup.MergeResult{}, err
 	}
 	desired, err := setDesiredStateTx(ctx, tx, s.render, outbound.DesiredStateRequest{
-		AlertGroupID: group.ID, Reason: outbound.DesiredResolve, Actor: actor,
+		AlertGroupID: group.ID, Reason: outbound.DesiredResolve, Actor: outbound.ActorSystem,
 	})
 	if err != nil {
 		return alertgroup.MergeResult{}, err

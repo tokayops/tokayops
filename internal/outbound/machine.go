@@ -82,6 +82,14 @@ const (
 	DecisionRetryNewGeneration     Decision = "retry_new_generation"
 )
 
+// Decisions is the closed set, for the door that reads one from a request.
+func Decisions() []Decision {
+	return []Decision{
+		DecisionAssumeAccepted, DecisionCancel,
+		DecisionRetryCurrentGeneration, DecisionRetryNewGeneration,
+	}
+}
+
 // TimelineKind is what the alert group's history is told. The wording of a
 // success matters: "sent", "delivered" and "assumed delivered" are three
 // different claims, and only the first two are claims about the world.

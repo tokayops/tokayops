@@ -62,7 +62,7 @@ func handoffAnnouncedFor(t *testing.T, schedule string, slotStart time.Time,
 	return outbound.Batch{
 		Admission: admission,
 		Context:   outbound.AnnouncingShiftChange(),
-		Actor:     "notifier",
+		Actor:     outbound.ActorNotifier,
 	}
 }
 
@@ -493,7 +493,7 @@ func TestOnlyAHandoverMayCarryABoundedDeadline(t *testing.T) {
 			t.Fatalf("build the admission: %v", err)
 		}
 		result, err := s.SubmitBatch(context.Background(), outbound.Batch{
-			Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: "notifier",
+			Admission: admission, Context: outbound.AnnouncingShiftChange(), Actor: outbound.ActorNotifier,
 		})
 		if err != nil {
 			t.Fatalf("admit: %v", err)
@@ -815,7 +815,7 @@ func TestAnAnnouncementIsGoodUntilTheEarlierOfTwoThings(t *testing.T) {
 			}
 			result, err := s.SubmitBatch(context.Background(), outbound.Batch{
 				Admission: admission, Context: outbound.AnnouncingShiftChange(),
-				Actor: "notifier",
+				Actor: outbound.ActorNotifier,
 			})
 			if err != nil {
 				t.Fatalf("admit: %v", err)

@@ -66,8 +66,8 @@ func stuckInReview(t *testing.T, s *Store, agID string) string {
 
 func resolve(t *testing.T, s *Store, req outbound.ResolveAmbiguityRequest) outbound.ResolveAmbiguityResult {
 	t.Helper()
-	if req.Actor == "" {
-		req.Actor = "nina"
+	if req.Actor.IsZero() {
+		req.Actor = byUser("nina")
 	}
 	result, err := s.ResolveAmbiguity(context.Background(), req)
 	if err != nil {
@@ -359,7 +359,7 @@ func TestTwoOperatorsAtOnce(t *testing.T) {
 			<-start
 			results[i], errs[i] = s.ResolveAmbiguity(context.Background(),
 				outbound.ResolveAmbiguityRequest{
-					IntentID: intentID, Decision: decisions[i], Actor: "operator",
+					IntentID: intentID, Decision: decisions[i], Actor: byUser("operator"),
 				})
 		}(i)
 	}

@@ -73,7 +73,7 @@ func raiseFor(t *testing.T, s *Store, agID string, step int) {
 		Labels:   map[string]string{"alertname": fmt.Sprintf("Alert%d", step)},
 	}})
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: "ingester",
+		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: outbound.ActorSystem,
 	})
 	if err != nil {
 		t.Fatalf("raise the desired state: %v", err)

@@ -730,14 +730,14 @@ func (s *errorStore) GetUserTeamRole(userID, teamID string) (model.TeamMemberRol
 	return s.MockStore.GetUserTeamRole(userID, teamID)
 }
 
-func (s *errorStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (s *errorStore) AckAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	if s.ackAlertGroupAtomicErr != nil {
 		return false, s.ackAlertGroupAtomicErr
 	}
 	return s.MockStore.AckAlertGroupAtomic(id, actor, meta, outboxEvent)
 }
 
-func (s *errorStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (s *errorStore) ResolveAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
 	if s.resolveAlertGroupAtomicErr != nil {
 		return false, s.resolveAlertGroupAtomicErr
 	}
@@ -1322,7 +1322,7 @@ func TestSlackInteractiveHandlerAnswersTheClicker(t *testing.T) {
 		api.agService = alertgroup.NewService(counting)
 		captured := newCapturedEphemeral()
 		api.respondEphemeral = captured.post
-		s.AckAlertGroupAtomic(agID, "Other User", nil, nil)
+		s.AckAlertGroupAtomic(agID, actorNamed("Other User"), nil, nil)
 		counting.reads.Store(0)
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")

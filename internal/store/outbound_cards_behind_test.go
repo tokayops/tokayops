@@ -56,7 +56,7 @@ func TestACardBehindItsAlertIsCountedByWhoCanFixIt(t *testing.T) {
 	}
 	result, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
 		IntentID: goneID, Decision: outbound.DecisionCancel,
-		Actor: "nina", Reason: "the channel is being retired",
+		Actor: byUser("nina"), Reason: "the channel is being retired",
 	})
 	if err != nil || result.Outcome != outbound.ResolveResolved {
 		t.Fatalf("withdraw the card: %s (%v)", result.Outcome, err)
@@ -105,7 +105,7 @@ func aimAgain(t *testing.T, s *Store, agID, alertName string) int64 {
 		Labels:   map[string]string{"alertname": alertName},
 	}})
 	result, err := raiseDesired(t, s, outbound.DesiredStateRequest{
-		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: "ingester",
+		AlertGroupID: agID, Reason: outbound.DesiredMerge, Actor: outbound.ActorSystem,
 	})
 	if err != nil || result.Outcome != outbound.DesiredApplied {
 		t.Fatalf("raise the desired state again: %s (%v)", result.Outcome, err)

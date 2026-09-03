@@ -1629,7 +1629,7 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetActiveAlertGroup: %v", err)
 	}
-	changed, err := env.S.AckAlertGroupAtomic(ag.ID, "test-user", nil, nil)
+	changed, err := env.S.AckAlertGroupAtomic(ag.ID, actorNamed("test-user"), nil, nil)
 	if err != nil {
 		t.Fatalf("AckAlertGroupAtomic: %v", err)
 	}

@@ -89,7 +89,7 @@ type DesiredStateRequest struct {
 	// no separate flag to contradict it.
 	Reason DesiredReason
 
-	Actor string
+	Actor Actor
 }
 
 // DesiredStateResult is what the proposal did.
@@ -121,7 +121,9 @@ type Batch struct {
 	// Context is what this admission is about, in one of the two closed forms.
 	Context BatchContext
 
-	Actor string
+	// Actor is who admitted it: the engine, the notifier, the fan-out, or the
+	// person replaying a delivery.
+	Actor Actor
 }
 
 // ContextForm says which sort of claim a batch is.
@@ -568,8 +570,9 @@ type FinalizeResult struct {
 type ResolveAmbiguityRequest struct {
 	IntentID string
 	Decision Decision
-	Actor    string
-	Reason   string
+	// Actor is the person deciding. A decision is never a component's.
+	Actor  Actor
+	Reason string
 
 	// AcceptedDuplicateRisk is the operator saying, on the record, that a
 	// second message may exist. Required for a new effect after an attempt
@@ -612,6 +615,12 @@ type ResolveAmbiguityResult struct {
 	Outcome ResolveOutcome
 	Status  Status
 	Row     string
+	// Detail is why a decision was refused, in the words of the guard that
+	// refused it: the machine's text for invalid_decision, the store's one
+	// phrase for business_closed and recipient_erased. It is what the person
+	// reads, so that nothing outside the store has to repeat the guards to
+	// explain them. Empty for every other outcome.
+	Detail string
 }
 
 // StatusCount is how many commitments of a family are in one status, for the
@@ -701,10 +710,13 @@ type Observation struct {
 // IntentEvent is one thing that happened to a commitment without a network call
 // being involved.
 type IntentEvent struct {
-	Seq        int
-	Kind       string
-	Reason     string
+	Seq    int
+	Kind   string
+	Reason string
+	// Actor is the reference - the id of a user, the name of a component, or
+	// the text a build before this one wrote - and ActorKind says which.
 	Actor      string
+	ActorKind  ActorKind
 	FromStatus string
 	ToStatus   string
 	// At is when it happened. A journal line without a time answers "what"

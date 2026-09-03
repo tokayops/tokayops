@@ -225,7 +225,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 	}
 
 	// 7. Execute transition via service
-	actor := alertgroup.Actor{Name: actorName(user), Email: user.Email}
+	actor := alertgroup.Actor{ID: user.ID, Name: actorName(user), Email: user.Email}
 	var result *alertgroup.TransitionResult
 
 	switch actionID {

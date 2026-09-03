@@ -77,7 +77,7 @@ func replayThrough(t *testing.T, s *Store, integrationID, deliveryID, key string
 		t.Fatalf("switch %s on: %v", integrationID, err)
 	}
 	result, err := s.ReplayWebhookDelivery(ctx, WebhookReplayRequest{
-		IntegrationID: integrationID, DeliveryID: deliveryID, ClientRequestID: key, Actor: "tester",
+		IntegrationID: integrationID, DeliveryID: deliveryID, ClientRequestID: key, Actor: byUser("tester"),
 	})
 	if err != nil {
 		t.Fatalf("replay %s: %v", deliveryID, err)
@@ -242,7 +242,7 @@ func TestTheGroupsDeliveriesAreFourStatementsHoweverManyClaims(t *testing.T) {
 	replays := []string{replayThrough(t, s, a, original, "key-1")}
 	for _, key := range []string{"key-2", "key-3"} {
 		result, err := s.ReplayWebhookDelivery(ctx, WebhookReplayRequest{
-			IntegrationID: a, DeliveryID: original, ClientRequestID: key, Actor: "tester",
+			IntegrationID: a, DeliveryID: original, ClientRequestID: key, Actor: byUser("tester"),
 		})
 		if err != nil {
 			t.Fatalf("replay under %s: %v", key, err)
