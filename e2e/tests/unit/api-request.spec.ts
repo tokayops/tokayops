@@ -70,6 +70,14 @@ test.describe('api request wrapper', () => {
     expect(sent['content-type']).toBe('application/json');
   });
 
+  test('a decision carries the CSRF token and declares its body', async ({ page }) => {
+    const sent = await headersSentBy(page,
+      '/api/v1/deliveries/d-1/decisions',
+      `API.deliveries.decide('d-1', { decision: 'cancel', reason: 'nobody is listening' })`);
+    expect(sent['x-csrf-token']).toBe('e2e-csrf-token');
+    expect(sent['content-type']).toBe('application/json');
+  });
+
   test('a mutating request without headers of its own carries the token too', async ({ page }) => {
     const sent = await headersSentBy(page,
       '/api/v1/integrations/int-1',

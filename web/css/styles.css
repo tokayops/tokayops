@@ -6839,3 +6839,206 @@ body::before {
 .oncall-status-badge.unavailable {
     color: var(--status-critical, #dc2626);
 }
+
+/* ========================================
+   Deliveries: the group's block, the journal, the decision, the log
+   ======================================== */
+.delivery-status-sending,
+.delivery-status-idle,
+.delivery-status-succeeded {
+    background: rgba(16, 185, 129, 0.15);
+    color: #059669;
+}
+.delivery-status-manual_review,
+.delivery-status-expired {
+    background: rgba(245, 158, 11, 0.15);
+    color: #d97706;
+}
+.delivery-status-permanent_failed {
+    background: rgba(220, 38, 38, 0.15);
+    color: #dc2626;
+}
+.delivery-status-canceled {
+    background: rgba(107, 114, 128, 0.15);
+    color: var(--text-muted, #6b7280);
+}
+
+.deliveries-block .detail-subtitle {
+    margin-top: var(--space-md, 16px);
+}
+.deliveries-empty {
+    color: var(--text-muted, #6b7280);
+    font-size: 0.85rem;
+    padding: var(--space-sm, 8px) 0;
+}
+.delivery-target {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.delivery-target svg {
+    width: 14px;
+    height: 14px;
+}
+.delivery-target.is-erased,
+.journal-actor.is-erased {
+    color: var(--text-muted, #6b7280);
+    font-style: italic;
+}
+.delivery-row-actions {
+    text-align: right;
+    white-space: nowrap;
+}
+.delivery-row-actions .btn svg {
+    width: 12px;
+    height: 12px;
+}
+
+.delivery-event {
+    border: 1px solid var(--border-color, #e5e7eb);
+    border-radius: 6px;
+    padding: var(--space-sm, 8px);
+    margin-bottom: var(--space-sm, 8px);
+}
+.delivery-event-header,
+.delivery-batch-header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm, 8px);
+    align-items: baseline;
+    font-size: 0.85rem;
+}
+.delivery-event-type {
+    font-weight: 600;
+}
+.delivery-event-status {
+    color: var(--text-muted, #6b7280);
+}
+.delivery-batch {
+    margin: var(--space-sm, 8px) 0 0 var(--space-md, 16px);
+}
+.delivery-batch-kind {
+    font-weight: 500;
+}
+
+.timeline-delivery {
+    flex-wrap: wrap;
+}
+.timeline-delivery-provider {
+    color: var(--text-muted, #6b7280);
+}
+.timeline-delivery .btn-link {
+    background: none;
+    border: none;
+    color: var(--accent-primary, #2563eb);
+    cursor: pointer;
+    padding: 0;
+    font: inherit;
+    font-size: 0.8rem;
+    text-decoration: underline;
+}
+
+.journal-summary {
+    margin-bottom: var(--space-md, 16px);
+}
+.journal-status {
+    margin-bottom: var(--space-sm, 8px);
+}
+.journal-id {
+    font-family: monospace;
+    font-size: 0.8rem;
+}
+.journal-reason {
+    color: var(--text-muted, #6b7280);
+    font-size: 0.8rem;
+    font-weight: normal;
+}
+.journal-actor-system {
+    color: var(--text-muted, #6b7280);
+}
+.journal-actor-tag {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    border: 1px solid var(--border-color, #e5e7eb);
+    border-radius: 3px;
+    padding: 0 4px;
+    margin-left: 4px;
+    color: var(--text-muted, #6b7280);
+}
+
+.decision-context {
+    display: flex;
+    gap: var(--space-sm, 8px);
+    align-items: center;
+    margin-bottom: var(--space-md, 16px);
+    font-size: 0.9rem;
+}
+.decision-options {
+    border: none;
+    padding: 0;
+    margin: 0 0 var(--space-md, 16px);
+    display: grid;
+    gap: var(--space-sm, 8px);
+}
+.decision-options legend {
+    font-weight: 600;
+    margin-bottom: var(--space-sm, 8px);
+}
+.decision-option {
+    display: flex;
+    gap: var(--space-sm, 8px);
+    align-items: flex-start;
+    padding: var(--space-sm, 8px);
+    border: 1px solid var(--border-color, #e5e7eb);
+    border-radius: 6px;
+    cursor: pointer;
+}
+.decision-option:has(input:checked) {
+    border-color: var(--accent-primary, #2563eb);
+}
+.decision-option-body {
+    display: flex;
+    flex-direction: column;
+}
+.decision-option-hint {
+    color: var(--text-muted, #6b7280);
+    font-size: 0.8rem;
+}
+.decision-refusal {
+    border: 1px solid #dc2626;
+    background: rgba(220, 38, 38, 0.08);
+    border-radius: 6px;
+    padding: var(--space-sm, 8px) var(--space-md, 16px);
+    margin-top: var(--space-md, 16px);
+}
+.decision-refusal-outcome {
+    font-weight: 600;
+    color: #dc2626;
+}
+
+.activity-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-md, 16px);
+    align-items: flex-end;
+    margin-bottom: var(--space-md, 16px);
+}
+.activity-filters label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.8rem;
+}
+.activity-pagination {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--space-md, 16px) 0;
+    font-size: 0.8rem;
+    color: var(--text-muted, #6b7280);
+}
+.activity-pagination div {
+    display: flex;
+    gap: var(--space-sm, 8px);
+    align-items: center;
+}

@@ -32,6 +32,10 @@ e2e/
 │   │   └── policies-crud.spec.ts  # CRUD политик
 │   ├── integrations/
 │   │   └── integrations-crud.spec.ts # CRUD интеграций
+│   ├── deliveries/
+│   │   ├── group-deliveries.spec.ts # Блок доставок в деталях группы
+│   │   ├── activity.spec.ts       # Операционный журнал #/ops/activity
+│   │   └── decision.spec.ts       # Решение оператора о застрявшей доставке
 │   ├── navigation/
 │   │   └── navigation.spec.ts     # Навигация и режимы
 │   └── smoke/

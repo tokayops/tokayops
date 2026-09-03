@@ -292,6 +292,15 @@ const API = {
         },
 
         /**
+         * The deliveries of an alert group: its paging, and its events with
+         * every claim taken on them and the webhook deliveries under those.
+         * @param {string} id - Alert group ID
+         */
+        deliveries: (id) => {
+            return request(`/alert-groups/${encodeURIComponent(id)}/deliveries`);
+        },
+
+        /**
          * Add a note to an alert group
          * @param {string} id - Alert Group ID
          * @param {string} message - Note message
@@ -424,6 +433,39 @@ const API = {
     // ========================================
     // Users API
     // ========================================
+    /**
+     * The delivery journal: every family, every team, one form. The list and
+     * the journal of one delivery are the administrator's; a decision is too.
+     */
+    deliveries: {
+        /**
+         * The operational log over a period - the last day unless from/to
+         * say otherwise.
+         * @param {Object} params - family, provider, status, target_kind,
+         *   target_ref, alert_group_id, event_id, from, to, page, limit
+         */
+        list: (params = {}) => request(`/deliveries${buildQuery(params)}`),
+
+        /**
+         * The journal of one delivery: the commitment, its attempts, the
+         * observations and the lifecycle events.
+         * @param {string} id - Delivery ID
+         */
+        get: (id) => request(`/deliveries/${encodeURIComponent(id)}`),
+
+        /**
+         * A person deciding what a stuck delivery does. The body names the
+         * decision and the reason; the answer is the outcome, and for a
+         * refusal the words of the guard that refused it.
+         * @param {string} id - Delivery ID
+         * @param {{decision: string, reason: string, accepted_duplicate_risk?: boolean, new_expires_at?: string}} decision
+         */
+        decide: (id, decision) => request(`/deliveries/${encodeURIComponent(id)}/decisions`, {
+            method: 'POST',
+            body: JSON.stringify(decision),
+        }),
+    },
+
     users: {
         /**
          * List all users
