@@ -339,6 +339,17 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 		return outbound.ResolveAmbiguityResult{}, err
 	}
 
+	// The commitment as this decision leaves it, read here, under the lock,
+	// so the answer and the decision are one moment.
+	decided, err := intentsWhereTx(ctx, tx, `id = $1`, req.IntentID)
+	if err != nil {
+		return outbound.ResolveAmbiguityResult{}, fmt.Errorf("read the decided commitment: %w", err)
+	}
+	if len(decided) != 1 {
+		return outbound.ResolveAmbiguityResult{}, outboundContractf(
+			"the commitment %s vanished under its own lock", req.IntentID)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return outbound.ResolveAmbiguityResult{}, err
 	}
@@ -348,6 +359,7 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	countTerminal(intent.Family, transition.To)
 	return outbound.ResolveAmbiguityResult{
 		Outcome: outbound.ResolveResolved, Status: transition.To, Row: transition.Row,
+		Intent: &decided[0],
 	}, nil
 }
 

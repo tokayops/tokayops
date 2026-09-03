@@ -707,6 +707,11 @@ type errorStore struct {
 	getUserTeamRoleErr         error
 	ackAlertGroupAtomicErr     error
 	resolveAlertGroupAtomicErr error
+
+	// acked and resolved are the actors the door handed the store, in order.
+	// The mock ignores the id; the real store refuses an empty one, so the
+	// door is proven here rather than by the mock accepting anything.
+	acked, resolved []alertgroup.Actor
 }
 
 func (s *errorStore) GetAlertGroupByID(id string) (*model.AlertGroup, error) {
@@ -731,6 +736,7 @@ func (s *errorStore) GetUserTeamRole(userID, teamID string) (model.TeamMemberRol
 }
 
 func (s *errorStore) AckAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	s.acked = append(s.acked, actor)
 	if s.ackAlertGroupAtomicErr != nil {
 		return false, s.ackAlertGroupAtomicErr
 	}
@@ -738,6 +744,7 @@ func (s *errorStore) AckAlertGroupAtomic(id string, actor alertgroup.Actor, meta
 }
 
 func (s *errorStore) ResolveAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	s.resolved = append(s.resolved, actor)
 	if s.resolveAlertGroupAtomicErr != nil {
 		return false, s.resolveAlertGroupAtomicErr
 	}
@@ -1355,4 +1362,36 @@ type countingReads struct {
 func (c *countingReads) GetAlertGroupByID(id string) (*model.AlertGroup, error) {
 	c.reads.Add(1)
 	return c.StoreInterface.GetAlertGroupByID(id)
+}
+
+// TestSlackButtonsSignAsTheUser: both buttons hand the store the person by
+// id, not only by name. The mock behind these tests would accept an actor
+// with no id; the real store refuses one, so the id is checked here, where
+// the door is.
+func TestSlackButtonsSignAsTheUser(t *testing.T) {
+	es := &errorStore{MockStore: store.NewMockStore()}
+	_, e, agID := setupErrorAPI(t, es)
+	denis, err := es.GetUserByEmail("denis@example.com")
+	if err != nil || denis == nil {
+		t.Fatalf("the linked user: %v", err)
+	}
+	secret := "handler-test-secret"
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ack: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(es.acked) != 1 || es.acked[0].ID != denis.ID || es.acked[0].Name == "" {
+		t.Fatalf("the acknowledgement was signed %+v, want the id of %s", es.acked, denis.ID)
+	}
+
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, signedSlackInteractiveRequest(t, secret, SlackActionResolveAlertGroup, agID, "U_DENIS"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(es.resolved) != 1 || es.resolved[0].ID != denis.ID || es.resolved[0].Name == "" {
+		t.Fatalf("the resolution was signed %+v, want the id of %s", es.resolved, denis.ID)
+	}
 }

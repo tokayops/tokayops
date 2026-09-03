@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,7 +25,11 @@ type decisionStoreFake struct {
 	store.StoreInterface
 	requests []outbound.ResolveAmbiguityRequest
 	result   outbound.ResolveAmbiguityResult
-	journal  *outbound.Journal
+	// readsAfter counts reads of the commitment the door makes after the
+	// decision. The decision has committed by then: a read that fails would
+	// answer 500 about a decision that applied, and one that succeeds may
+	// describe a later moment. There must be none.
+	readsAfter int
 }
 
 func (f *decisionStoreFake) ResolveAmbiguity(_ context.Context, req outbound.ResolveAmbiguityRequest) (outbound.ResolveAmbiguityResult, error) {
@@ -32,11 +37,19 @@ func (f *decisionStoreFake) ResolveAmbiguity(_ context.Context, req outbound.Res
 	return f.result, nil
 }
 
-func (f *decisionStoreFake) IntentJournal(_ context.Context, id string) (*outbound.Journal, error) {
-	if f.journal != nil && f.journal.Intent.ID == id {
-		return f.journal, nil
-	}
-	return nil, nil
+func (f *decisionStoreFake) IntentJournal(_ context.Context, _ string) (*outbound.Journal, error) {
+	f.readsAfter++
+	return nil, errors.New("the database went away after the commit")
+}
+
+func (f *decisionStoreFake) ListIntents(_ context.Context, _ store.IntentFilter, _, _ int) ([]outbound.Intent, int, error) {
+	f.readsAfter++
+	return nil, 0, errors.New("the database went away after the commit")
+}
+
+// decided is the commitment as a decision leaves it.
+func decided(id string, status outbound.Status) *outbound.Intent {
+	return &outbound.Intent{ID: id, Status: status, Family: outbound.FamilyNotification, Provider: "slack"}
 }
 
 type decisionRoutes struct {
@@ -51,8 +64,8 @@ func setupDecisionRoutes(t *testing.T) *decisionRoutes {
 		t.Fatal(err)
 	}
 	fake := &decisionStoreFake{StoreInterface: s,
-		result:  outbound.ResolveAmbiguityResult{Outcome: outbound.ResolveResolved, Status: outbound.StatusCanceled, Row: "T30"},
-		journal: &outbound.Journal{Intent: outbound.Intent{ID: "d-1", Status: outbound.StatusCanceled}},
+		result: outbound.ResolveAmbiguityResult{Outcome: outbound.ResolveResolved, Status: outbound.StatusCanceled,
+			Row: "T30", Intent: decided("d-1", outbound.StatusCanceled)},
 	}
 	a := NewAPI(fake, nil, nil, nil, "", nil)
 	e := echo.New()
@@ -85,7 +98,8 @@ func TestADecisionAnswersByItsOutcome(t *testing.T) {
 		result outbound.ResolveAmbiguityResult
 		code   int
 	}{
-		{outbound.ResolveAmbiguityResult{Outcome: outbound.ResolveResolved, Status: outbound.StatusCanceled, Row: "T30"}, http.StatusOK},
+		{outbound.ResolveAmbiguityResult{Outcome: outbound.ResolveResolved, Status: outbound.StatusCanceled, Row: "T30",
+			Intent: decided("d-1", outbound.StatusCanceled)}, http.StatusOK},
 		{outbound.ResolveAmbiguityResult{Outcome: outbound.ResolveAlreadyResolved, Status: outbound.StatusSucceeded}, http.StatusConflict},
 		{outbound.ResolveAmbiguityResult{Outcome: outbound.ResolveInvalidDecision, Status: outbound.StatusManualReview,
 			Detail: "a new generation after an ambiguous attempt needs the duplicate risk accepted"}, http.StatusUnprocessableEntity},
@@ -116,6 +130,12 @@ func TestADecisionAnswersByItsOutcome(t *testing.T) {
 		} else if resp.Delivery != nil {
 			t.Errorf("%s carries a commitment: %+v", tt.result.Outcome, resp)
 		}
+	}
+	// Nothing was read after a decision: the store that answers every read
+	// with an error was never asked, and the decision that applied answered
+	// 200 regardless.
+	if r.fake.readsAfter != 0 {
+		t.Errorf("the door read the commitment %d time(s) after the decision had committed", r.fake.readsAfter)
 	}
 }
 

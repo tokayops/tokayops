@@ -255,8 +255,12 @@ func TestARefusalSaysWhy(t *testing.T) {
 		IntentID: stuck, Decision: outbound.DecisionRetryNewGeneration, Reason: "the channel is back",
 		AcceptedDuplicateRisk: true,
 	})
-	if got.Outcome != outbound.ResolveResolved || got.Detail != "" {
+	if got.Outcome != outbound.ResolveResolved || got.Detail != "" ||
+		got.Intent == nil || got.Intent.Status != got.Status {
 		t.Errorf("a new generation with the flag answered %+v", got)
+	}
+	if got.Intent != nil && got.Intent.GenerationNo == 0 {
+		t.Errorf("the decided commitment is still in generation 0: %+v", got.Intent)
 	}
 
 	// Retrying an expired commitment needs a new deadline.
@@ -383,5 +387,12 @@ func TestANewDeadlineIsJudgedAfterTheLock(t *testing.T) {
 	})
 	if got.Outcome != outbound.ResolveResolved || got.Status != outbound.StatusPending {
 		t.Fatalf("a deadline ahead answered %+v", got)
+	}
+	// The answer carries the commitment as the decision left it - with the
+	// new deadline and the new status - read in the same transaction, not
+	// after it.
+	if got.Intent == nil || got.Intent.ID != overdue || got.Intent.Status != outbound.StatusPending ||
+		got.Intent.ExpiresAt == nil || got.Intent.ExpiresAt.Sub(later).Abs() > time.Millisecond {
+		t.Fatalf("the decided commitment reads %+v", got.Intent)
 	}
 }

@@ -621,6 +621,13 @@ type ResolveAmbiguityResult struct {
 	// reads, so that nothing outside the store has to repeat the guards to
 	// explain them. Empty for every other outcome.
 	Detail string
+	// Intent is the commitment as the transaction that applied the decision
+	// left it, read under the same lock before the commit. It is what a door
+	// answers with: a read after the commit would be a second moment - the
+	// worker may already have moved the commitment on, and a failure of that
+	// read would report a decision that had applied as one that had not.
+	// Nil for every outcome but resolved.
+	Intent *Intent
 }
 
 // StatusCount is how many commitments of a family are in one status, for the

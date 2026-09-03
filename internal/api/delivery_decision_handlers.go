@@ -107,12 +107,11 @@ func (a *API) DecideDelivery(c echo.Context) error {
 	}
 	switch result.Outcome {
 	case outbound.ResolveResolved:
-		journal, err := a.store.IntentJournal(c.Request().Context(), id)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-		}
-		if journal != nil {
-			delivery := deliveryDTO(journal.Intent)
+		// The commitment comes from the transaction that decided, not from a
+		// read after it: the decision has applied by now, and nothing that
+		// happens after the commit may turn it into a 500.
+		if result.Intent != nil {
+			delivery := deliveryDTO(*result.Intent)
 			resp.Delivery = &delivery
 		}
 		log.Printf("outbound: user %s decided %s for %s: %s -> %s (%s)",
