@@ -370,29 +370,21 @@ func webhookCommitments(t *testing.T, env *IntegrationTestEnv) int {
 
 // webhookWatch samples the webhook family once a second while a test runs:
 // the lateness gauge an alert reads and the number of commitments in flight,
-// which is the pool's occupancy as the database sees it.
-type webhookWatch struct {
-	mu           sync.Mutex
-	peakLateness float64
-	maxInFlight  int
-	samples      int
-	lateness     []float64 // every sample, one a second
-	afterWave    []float64
-	waveOver     bool
+// which is the pool's occupancy as the database sees it. Every sample carries
+// the moment it was taken, because what the tests ask is about TIME - how
+// long the gauge stayed over a threshold, how much of a window the slots were
+// held for - and a ticker promises neither a sample every second nor one at
+// all when a scrape runs long.
+type webhookSample struct {
+	at       time.Time
+	late     float64
+	reported bool
+	inFlight int
 }
 
-// secondsOver is how many samples - one a second - the gauge spent at or over
-// the threshold, which is what a rule with a `for` clause measures.
-func (w *webhookWatch) secondsOver(threshold float64) int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	over := 0
-	for _, late := range w.lateness {
-		if late >= threshold {
-			over++
-		}
-	}
-	return over
+type webhookWatch struct {
+	mu      sync.Mutex
+	samples []webhookSample
 }
 
 func (w *webhookWatch) run(ctx context.Context, t *testing.T, env *IntegrationTestEnv, registry *prometheus.Registry) {
@@ -413,33 +405,96 @@ func (w *webhookWatch) run(ctx context.Context, t *testing.T, env *IntegrationTe
 			return
 		}
 		w.mu.Lock()
-		if reported {
-			w.samples++
-			w.lateness = append(w.lateness, late)
-			if late > w.peakLateness {
-				w.peakLateness = late
-			}
-			if w.waveOver {
-				w.afterWave = append(w.afterWave, late)
-			}
-		}
-		if inFlight > w.maxInFlight {
-			w.maxInFlight = inFlight
-		}
+		w.samples = append(w.samples, webhookSample{at: time.Now(), late: late, reported: reported, inFlight: inFlight})
 		w.mu.Unlock()
 	}
 }
 
-func (w *webhookWatch) markWaveOver() {
-	w.mu.Lock()
-	w.waveOver = true
-	w.mu.Unlock()
-}
-
-func (w *webhookWatch) read() (peak float64, maxInFlight, samples int, afterWave []float64) {
+func (w *webhookWatch) snapshot() []webhookSample {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.peakLateness, w.maxInFlight, w.samples, append([]float64(nil), w.afterWave...)
+	return append([]webhookSample(nil), w.samples...)
+}
+
+// lateness is the gauge's peak, how many scrapes reported it, and its range
+// over the samples taken after a given moment.
+func (w *webhookWatch) lateness(after time.Time) (peak float64, reported int, lowestAfter, highestAfter float64, countAfter int) {
+	lowestAfter = -1
+	for _, s := range w.snapshot() {
+		if !s.reported {
+			continue
+		}
+		reported++
+		if s.late > peak {
+			peak = s.late
+		}
+		if !s.at.After(after) {
+			continue
+		}
+		countAfter++
+		if lowestAfter < 0 || s.late < lowestAfter {
+			lowestAfter = s.late
+		}
+		if s.late > highestAfter {
+			highestAfter = s.late
+		}
+	}
+	return peak, reported, lowestAfter, highestAfter, countAfter
+}
+
+// longestOver is the longest CONTIGUOUS stretch of time the gauge spent at or
+// over the threshold, which is what a rule's `for` clause measures: two
+// excursions with a dip between them are two short alerts that never fire,
+// however long they add up to. Measured between the first sample over and the
+// first sample under, by the samples' own clocks.
+func longestOver(samples []webhookSample, threshold float64) time.Duration {
+	var longest time.Duration
+	var since time.Time
+	over := false
+	for _, s := range samples {
+		if !s.reported {
+			continue
+		}
+		switch {
+		case s.late >= threshold && !over:
+			over, since = true, s.at
+		case s.late < threshold && over:
+			over = false
+			if d := s.at.Sub(since); d > longest {
+				longest = d
+			}
+		}
+	}
+	if over {
+		if d := samples[len(samples)-1].at.Sub(since); d > longest {
+			longest = d
+		}
+	}
+	return longest
+}
+
+// occupancy integrates the commitments in flight over a window - slot-seconds
+// held, against slot-seconds available - and says how many samples the
+// integral stands on. A pool that idled for a wave shows it here and nowhere
+// else: the maximum in flight says only that eight were held once.
+func occupancy(samples []webhookSample, from, to time.Time, pool int) (held, available float64, maxInFlight, counted int) {
+	var previous *webhookSample
+	for i := range samples {
+		s := samples[i]
+		if s.at.Before(from) || s.at.After(to) {
+			continue
+		}
+		counted++
+		if s.inFlight > maxInFlight {
+			maxInFlight = s.inFlight
+		}
+		if previous != nil {
+			held += float64(previous.inFlight) * s.at.Sub(previous.at).Seconds()
+		}
+		previous = &samples[i]
+	}
+	available = float64(pool) * to.Sub(from).Seconds()
+	return held, available, maxInFlight, counted
 }
 
 // longestWebhookAttempt is how long the longest call to a subscriber lasted,
@@ -541,8 +596,14 @@ func TestAWebhookBacklogDoesNotSlowPaging(t *testing.T) {
 	stopWebhook := startOutboundWorkerAtItsOwnPace(t, webhookWorker)
 	stopPaging := startOutboundWorkerAtItsOwnPace(t, paging)
 
+	// The window the percentile is measured over, and therefore the window
+	// the pool has to be held for: from the first page to the last delivery.
+	// The webhook worker started a moment earlier, so the backlog is on the
+	// slots before the first page arrives.
+	windowStart := time.Now()
 	pageAtTheProfileRate(t, env)
 	untilPagingSettled(t, env, 5*time.Minute)
+	windowEnd := time.Now()
 	stopPaging()
 	stopFanOut()
 	stopWatch()
@@ -550,34 +611,44 @@ func TestAWebhookBacklogDoesNotSlowPaging(t *testing.T) {
 
 	assertPagingProfile(t, env, before, "under a saturated webhook backlog")
 
-	peak, maxInFlight, samples, _ := watch.read()
-	t.Logf("webhook backlog: lateness peaked at %.1fs over %d samples; at most %d in flight",
-		peak, samples, maxInFlight)
-	if samples == 0 {
+	samples := watch.snapshot()
+	peak, reported, _, _, _ := watch.lateness(windowEnd)
+	held, available, maxInFlight, counted := occupancy(samples, windowStart, windowEnd, outbound.WebhookPoolSize)
+	share := held / available
+	t.Logf("webhook backlog over the %.0fs paging window: %.0f of %.0f slot-seconds held (%.1f%%) on %d samples; "+
+		"at most %d in flight; lateness peaked at %.1fs over %d scrapes",
+		windowEnd.Sub(windowStart).Seconds(), held, available, share*100, counted, maxInFlight, peak, reported)
+	if reported == 0 {
 		t.Fatal("the webhook lateness series was never on a scrape")
 	}
 	if maxInFlight > outbound.WebhookPoolSize {
 		t.Errorf("%d webhook commitments in flight at once, the pool is %d", maxInFlight, outbound.WebhookPoolSize)
 	}
-	// The backlog really was one, and it was the pool's whole capacity: a
-	// round is 32s (a 31s hold aligned to the 2s tick), so five minutes hold
-	// at most nine rounds of eight attempts, and a pool that was busy the
-	// whole time made all but the last of them. Nothing got through a
-	// subscriber that never answers.
-	var delivered, attempts int
+
+	// The condition the percentile was measured under, proven for the whole
+	// window rather than for one moment of it. A slot is held for the 31s of
+	// the subscriber's timeout plus two writes, and freed only at the next
+	// claim tick; measured over the window that is about 93% of the
+	// slot-seconds (92.7% on the first run), not the 97% a 31-in-32 round
+	// would give. 88% is the measurement with room for scrape jitter and not
+	// for an idle wave: one wave of eight slots idle for 32s in a 300s window
+	// is 11% of it, and a claim that skipped it - a DueSnapshot error is
+	// logged and the tick moves on - lands near 82%. The integral needs
+	// samples to stand on: four a five-second stretch at the least, or a
+	// watcher that stalled would integrate nothing and pass.
+	if counted < int(windowEnd.Sub(windowStart).Seconds())*4/5 {
+		t.Errorf("only %d samples over a %.0fs window; the occupancy integral has nothing to stand on",
+			counted, windowEnd.Sub(windowStart).Seconds())
+	}
+	if share < 0.88 {
+		t.Errorf("the webhook pool was held for %.1f%% of the paging window; the percentile was measured under a saturated pool, and this is not one",
+			share*100)
+	}
+	// And nothing got through a subscriber that never answers.
+	var delivered int
 	if err := env.S.GetDB().QueryRow(`
-		SELECT (SELECT count(*) FROM outbound_intents WHERE delivery_family = 'webhook' AND status = 'succeeded'),
-		       (SELECT count(*) FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
-		        WHERE i.delivery_family = 'webhook' AND a.record_kind = 'attempt')`).Scan(&delivered, &attempts); err != nil {
+		SELECT count(*) FROM outbound_intents WHERE delivery_family = 'webhook' AND status = 'succeeded'`).Scan(&delivered); err != nil {
 		t.Fatalf("read the webhook queue: %v", err)
-	}
-	rounds := int(profileMinutes*time.Minute/(32*time.Second)) - 1
-	if attempts < rounds*outbound.WebhookPoolSize {
-		t.Errorf("%d webhook attempts in %d minutes; a pool of %d busy the whole time makes at least %d",
-			attempts, profileMinutes, outbound.WebhookPoolSize, rounds*outbound.WebhookPoolSize)
-	}
-	if maxInFlight != outbound.WebhookPoolSize {
-		t.Errorf("at most %d webhook commitments in flight; a saturated pool of %d holds all of them", maxInFlight, outbound.WebhookPoolSize)
 	}
 	if delivered != 0 {
 		t.Errorf("%d webhook commitments succeeded against a subscriber that never answered", delivered)
@@ -650,13 +721,15 @@ func TestAWebhookBurstDrainsOnAFreePool(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 	waveTook := time.Since(waveStart)
-	watch.markWaveOver()
+	waveOver := time.Now()
 	time.Sleep(90 * time.Second)
 	stopWatch()
 	stop()
 
-	peak, maxInFlight, samples, afterWave := watch.read()
-	overThreshold := watch.secondsOver(300)
+	samples := watch.snapshot()
+	peak, reported, lowestAfter, highestAfter, countAfter := watch.lateness(waveOver)
+	overThreshold := longestOver(samples, 300)
+	_, _, maxInFlight, _ := occupancy(samples, waveStart, waveOver, outbound.WebhookPoolSize)
 	var worstFirst float64
 	if err := env.S.GetDB().QueryRow(`
 		SELECT max(EXTRACT(EPOCH FROM (a.started_at - b.admitted_at)))::double precision
@@ -666,23 +739,13 @@ func TestAWebhookBurstDrainsOnAFreePool(t *testing.T) {
 		WHERE i.delivery_family = 'webhook' AND a.attempt_no = 1`).Scan(&worstFirst); err != nil {
 		t.Fatalf("measure the wave: %v", err)
 	}
-	lowestAfter := -1.0
-	highestAfter := 0.0
-	for _, late := range afterWave {
-		if lowestAfter < 0 || late < lowestAfter {
-			lowestAfter = late
-		}
-		if late > highestAfter {
-			highestAfter = late
-		}
-	}
 	t.Logf("webhook burst of %d on a free pool: the wave took %.0fs, the last first attempt started %.1fs after admission; "+
-		"lateness peaked at %.1fs and was over 300s for %ds of %d samples, at most %d in flight; "+
+		"lateness peaked at %.1fs and its longest stretch over 300s lasted %.0fs (%d scrapes), at most %d in flight; "+
 		"after the wave it ranged %.1fs..%.1fs over %d samples",
-		burst, waveTook.Seconds(), worstFirst, peak, overThreshold, samples, maxInFlight,
-		lowestAfter, highestAfter, len(afterWave))
+		burst, waveTook.Seconds(), worstFirst, peak, overThreshold.Seconds(), reported, maxInFlight,
+		lowestAfter, highestAfter, countAfter)
 
-	if samples == 0 {
+	if reported == 0 {
 		t.Fatal("the webhook lateness series was never on a scrape")
 	}
 	// The floor is 386s by the arithmetic above and by measurement; 480s is
@@ -693,11 +756,13 @@ func TestAWebhookBurstDrainsOnAFreePool(t *testing.T) {
 	if peak > 480 {
 		t.Errorf("outbound_queue_lateness_seconds{family=webhook} peaked at %.1fs, over the 480s the profile allows", peak)
 	}
-	// The rule fires on ten minutes over 300s. A burst is over it for a
-	// minute and a half; five minutes is the most this test lets it be, and
-	// still half the rule's window.
-	if overThreshold >= 300 {
-		t.Errorf("the lateness was over 300s for %ds; the rule's ten-minute window would not tell this from a stopped queue", overThreshold)
+	// The rule fires on ten minutes CONTINUOUSLY over 300s, and that is what
+	// is measured: the longest single stretch, by the samples' clocks. A
+	// burst is over it for a minute and a half; five minutes is the most this
+	// test lets it be, and still half the rule's window.
+	if overThreshold >= 300*time.Second {
+		t.Errorf("the lateness was over 300s for %.0fs without a break; the rule's ten-minute window would not tell this from a stopped queue",
+			overThreshold.Seconds())
 	}
 	if maxInFlight > outbound.WebhookPoolSize {
 		t.Errorf("%d webhook commitments in flight at once, the pool is %d", maxInFlight, outbound.WebhookPoolSize)
@@ -708,7 +773,7 @@ func TestAWebhookBurstDrainsOnAFreePool(t *testing.T) {
 	// "Does not hold": after the wave the gauge is about retries waiting for
 	// a slot, and every sample of it is under the threshold - a queue that
 	// stopped would show the peak standing still.
-	if len(afterWave) == 0 {
+	if countAfter == 0 {
 		t.Fatal("nothing was sampled after the wave")
 	}
 	if highestAfter >= 300 {
