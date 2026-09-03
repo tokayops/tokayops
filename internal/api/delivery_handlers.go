@@ -40,6 +40,19 @@ type ReplayDeliveryResponse struct {
 const idempotencyKeyLimit = 128
 
 // ListIntegrationDeliveries returns paginated deliveries for an integration.
+//
+// ListIntegrationDeliveries godoc
+// @Summary List the deliveries of a webhook integration
+// @Description The deliveries made to one generic webhook subscriber, newest first, in the subscriber's own vocabulary (pending, retry, sent, failed). History before the cutover to the delivery domain is not carried. Readable after the integration is deleted.
+// @Tags integrations
+// @Produce json
+// @Param id path string true "Integration ID"
+// @Param page query int false "Page (default 1)"
+// @Param limit query int false "Page size (default 50, at most 200)"
+// @Success 200 {object} DeliveryListResponse
+// @Failure 403 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Router /api/v1/integrations/{id}/deliveries [get]
 func (a *API) ListIntegrationDeliveries(c echo.Context) error {
 	integrationID := c.Param("id")
 
@@ -79,6 +92,18 @@ func (a *API) ListIntegrationDeliveries(c echo.Context) error {
 
 // GetDeliveryDetail returns a delivery with its attempt history. A delivery
 // that is not this integration's is not found, whoever asks.
+//
+// GetDeliveryDetail godoc
+// @Summary One delivery of a webhook integration, with its attempts
+// @Description The delivery and every attempt made for it. The delivery id is the same id the journal under /deliveries answers about.
+// @Tags integrations
+// @Produce json
+// @Param id path string true "Integration ID"
+// @Param deliveryId path string true "Delivery ID"
+// @Success 200 {object} DeliveryDetailResponse
+// @Failure 403 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Router /api/v1/integrations/{id}/deliveries/{deliveryId} [get]
 func (a *API) GetDeliveryDetail(c echo.Context) error {
 	integrationID := c.Param("id")
 	deliveryID := c.Param("deliveryId")
@@ -108,6 +133,21 @@ func (a *API) GetDeliveryDetail(c echo.Context) error {
 // beside it would reach the subscriber twice for certain - and neither is
 // anything to a subscriber that is switched off: the switch withdrew its work,
 // and a replay would give it back.
+//
+// ReplayDelivery godoc
+// @Summary Deliver a finished delivery's event to the subscriber again
+// @Description Creates a NEW delivery of the same event to the same subscriber, at its current address. The Idempotency-Key header is required and names the decision: a repeat with the same key answers with the same delivery. A delivery still in progress is not replayed (409), and neither is one of a disabled integration (409).
+// @Tags integrations
+// @Produce json
+// @Param id path string true "Integration ID"
+// @Param deliveryId path string true "Delivery ID"
+// @Param Idempotency-Key header string true "1 to 128 bytes"
+// @Success 200 {object} ReplayDeliveryResponse
+// @Failure 400 {object} ErrorResponse
+// @Failure 403 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse
+// @Router /api/v1/integrations/{id}/deliveries/{deliveryId}/replay [post]
 func (a *API) ReplayDelivery(c echo.Context) error {
 	integrationID := c.Param("id")
 	deliveryID := c.Param("deliveryId")

@@ -942,6 +942,9 @@ func TestOutboundIndexesAreDeclaredOnce(t *testing.T) {
 		"idx_outbound_intents_status":          false,
 		"idx_outbound_intents_subscriber":      false,
 		"idx_outbound_batches_no_targets":      false,
+		"idx_outbound_batches_event":           false,
+		"idx_outbound_intents_batch":           false,
+		"idx_outbound_intents_journal":         false,
 	}
 
 	rows, err := s.db.Query(`

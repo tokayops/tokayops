@@ -162,6 +162,8 @@ func insertWebhookRows(s *Store, override func(batch, intent map[string]any)) er
 	batchID, intentID := uuid.New().String(), uuid.New().String()
 	batch := map[string]any{
 		"key_kind": "webhook_event", "delivery_family": "webhook",
+		// A webhook claim names its event, and the schema insists on it.
+		"event_id": "evt-1",
 	}
 	intent := map[string]any{
 		"key_kind": "webhook_event", "delivery_family": "webhook",
@@ -179,9 +181,10 @@ func insertWebhookRows(s *Store, override func(batch, intent map[string]any)) er
 	if _, err := tx.Exec(`
 		INSERT INTO outbound_batches
 			(id, batch_key, key_kind, delivery_family, grammar_version,
-			 fingerprint, fingerprint_version, admission_outcome, intent_count)
-		VALUES ($1, $2, $3, $4, 1, $5, 1, 'admitted', 1)`,
-		batchID, "evt-"+batchID, batch["key_kind"], batch["delivery_family"], digest32(0x20)); err != nil {
+			 fingerprint, fingerprint_version, admission_outcome, intent_count, event_id)
+		VALUES ($1, $2, $3, $4, 1, $5, 1, 'admitted', 1, $6)`,
+		batchID, "evt-"+batchID, batch["key_kind"], batch["delivery_family"], digest32(0x20),
+		batch["event_id"]); err != nil {
 		return err
 	}
 	payload := `{"target":{"kind":"` + intent["payload_kind"].(string) + `","ref":"` +

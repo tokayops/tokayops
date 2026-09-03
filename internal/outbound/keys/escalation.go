@@ -189,6 +189,13 @@ type Admission struct {
 	Snapshot              RenderSnapshot
 	SnapshotSchemaVersion int
 	Commitments           []AdmittedCommitment
+
+	// EventID is the alert event a webhook admission is about, and empty for
+	// every other kind. It is the one durable link from an event to ALL of its
+	// claims - the fan-out's and every replay's, whose keys differ - and the
+	// store writes it beside the key so that the group's delivery history and
+	// the retention of the event can find them without parsing a key.
+	EventID string
 }
 
 // Admit derives every identity in one pass.

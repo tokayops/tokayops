@@ -1994,6 +1994,21 @@ func (m *MockStore) ReplayWebhookDelivery(_ context.Context, _ WebhookReplayRequ
 	return WebhookReplayResult{}, ErrWebhookDeliveryNotFound
 }
 
+// The delivery journal is not mirrored here: it is a read over the outbound
+// tables, which the mock does not have. The routes are tested over a fake that
+// answers what it is told, and the reads against Postgres.
+func (m *MockStore) ListIntents(_ context.Context, _ IntentFilter, _, _ int) ([]outbound.Intent, int, error) {
+	return []outbound.Intent{}, 0, nil
+}
+
+func (m *MockStore) IntentJournal(_ context.Context, _ string) (*outbound.Journal, error) {
+	return nil, nil
+}
+
+func (m *MockStore) AlertGroupDeliveries(_ context.Context, _ string) (*outbound.GroupDeliveries, error) {
+	return &outbound.GroupDeliveries{}, nil
+}
+
 // Ensure Store implements StoreInterface
 var _ StoreInterface = (*Store)(nil)
 var _ StoreInterface = (*MockStore)(nil)

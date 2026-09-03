@@ -590,8 +590,8 @@ func claimBatchTx(ctx context.Context, tx *sql.Tx, admission keys.Admission,
 			(id, batch_key, key_kind, delivery_family, grammar_version, alert_group_id,
 			 fingerprint, fingerprint_version, admission_outcome, intent_count,
 			 admission_snapshot, admission_digest, admission_schema_version,
-			 admission_revision)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			 admission_revision, event_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		ON CONFLICT (batch_key) DO NOTHING
 		RETURNING id, admitted_at`,
 		batchID, admission.BatchKey, string(admission.Kind), family,
@@ -600,6 +600,7 @@ func claimBatchTx(ctx context.Context, tx *sql.Tx, admission keys.Admission,
 		string(admission.Outcome), len(admission.Commitments),
 		nullableJSON(frozen), nilIfEmptyBytes(digest),
 		nilIfZero(schemaVersion), nilIfZeroRevision(schemaVersion, revision),
+		nilIfEmpty(admission.EventID),
 	).Scan(&batchID, &admittedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1163,7 +1164,7 @@ const outboundIntentColumns = `
 	       accepted_duplicate_risk, not_before, next_attempt_at, expires_at,
 	       create_key IS NOT NULL, payload_schema_version,
 	       provider_key_codec_version, payload, payload_digest, receipt, receipt_ref,
-	       COALESCE(expires_at <= now(), FALSE)`
+	       COALESCE(expires_at <= now(), FALSE), created_at, updated_at`
 
 // scanIntent turns one row of outboundIntentColumns into a commitment, and is
 // the only place that mapping exists: two readers that disagreed about it would
@@ -1191,7 +1192,7 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		&intent.GenerationBound, &intent.PayloadSchemaVersion,
 		&intent.ProviderKeyCodecVersion, &payload, &intent.PayloadDigest,
 		&coordinates, &name,
-		&deadlinePassed); err != nil {
+		&deadlinePassed, &intent.CreatedAt, &intent.UpdatedAt); err != nil {
 		return nil, false, err
 	}
 
@@ -1963,7 +1964,7 @@ func journalEventsTx(ctx context.Context, tx *sql.Tx,
 
 	rows, err := tx.QueryContext(ctx, `
 		SELECT seq, kind, COALESCE(reason, ''), COALESCE(actor, ''),
-		       COALESCE(from_status, ''), COALESCE(to_status, '')
+		       COALESCE(from_status, ''), COALESCE(to_status, ''), created_at
 		FROM outbound_intent_events WHERE intent_id = $1 ORDER BY seq`, intentID)
 	if err != nil {
 		return nil, fmt.Errorf("read the events of %s: %w", intentID, err)
@@ -1974,7 +1975,7 @@ func journalEventsTx(ctx context.Context, tx *sql.Tx,
 	for rows.Next() {
 		var e outbound.IntentEvent
 		if err := rows.Scan(&e.Seq, &e.Kind, &e.Reason, &e.Actor,
-			&e.FromStatus, &e.ToStatus); err != nil {
+			&e.FromStatus, &e.ToStatus, &e.At); err != nil {
 			return nil, err
 		}
 		events = append(events, e)

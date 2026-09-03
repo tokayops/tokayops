@@ -275,6 +275,12 @@ const (
 	TargetSubscriber TargetKind = "subscriber"
 )
 
+// TargetKinds is every kind of recipient this build names, for the doors that
+// take a kind from a caller and have to refuse one this build does not know.
+func TargetKinds() []TargetKind {
+	return []TargetKind{TargetChannel, TargetUser, TargetSubscriber}
+}
+
 // Target is who a commitment is for, in one place.
 //
 // One place matters more than it looks. The recipient appears in the business

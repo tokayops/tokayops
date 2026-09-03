@@ -266,3 +266,20 @@ func TestIsAdmin(t *testing.T) {
 		t.Error("alex should not be admin")
 	}
 }
+
+// TestTheDeliveryJournalIsTheAdministrators is an inventory of the maps, not a
+// request: an administrator passes before any map is consulted, and an action
+// nobody put in a map falls to the default deny for everybody else - so a
+// request-level test cannot tell "in the right map" from "in no map at all".
+func TestTheDeliveryJournalIsTheAdministrators(t *testing.T) {
+	if !globalAdminActions[ActionDeliveryView] {
+		t.Errorf("%s is not a global-admin action", ActionDeliveryView)
+	}
+	for name, m := range map[string]map[Action]bool{
+		"public": publicInternalActions, "team member": teamMemberActions, "team admin": teamAdminActions,
+	} {
+		if m[ActionDeliveryView] {
+			t.Errorf("%s is granted to %s", ActionDeliveryView, name)
+		}
+	}
+}

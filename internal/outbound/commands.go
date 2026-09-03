@@ -707,6 +707,9 @@ type IntentEvent struct {
 	Actor      string
 	FromStatus string
 	ToStatus   string
+	// At is when it happened. A journal line without a time answers "what"
+	// and not "when", and the second is the question a journal is for.
+	At time.Time
 }
 
 // Journal is everything the system knows about one commitment: what it is, what

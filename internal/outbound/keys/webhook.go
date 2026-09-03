@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sort"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -65,8 +66,8 @@ func (i webhookIntent) key(version int) (string, error) {
 	if err := checkVersion(i.Kind, version); err != nil {
 		return "", err
 	}
-	if i.EventID == "" {
-		return "", contractf("a webhook commitment with no event")
+	if err := checkEventID(i.EventID); err != nil {
+		return "", err
 	}
 	if i.IntegrationID == "" {
 		return "", contractf("a webhook commitment with no subscriber")
@@ -100,8 +101,8 @@ func webhookBatchKey(kind Kind, version int, eventID, integrationID, clientReque
 	if err := checkVersion(kind, version); err != nil {
 		return "", err
 	}
-	if eventID == "" {
-		return "", contractf("a webhook admission with no event")
+	if err := checkEventID(eventID); err != nil {
+		return "", err
 	}
 	if err := requestIDFor(kind, clientRequestID); err != nil {
 		return "", err
@@ -295,8 +296,8 @@ func (b WebhookBatch) Admit() (Admission, error) {
 	if err := checkBatchFingerprintVersion(b.FingerprintVersion); err != nil {
 		return Admission{}, err
 	}
-	if b.EventID == "" {
-		return Admission{}, contractf("a webhook admission with no event")
+	if err := checkEventID(b.EventID); err != nil {
+		return Admission{}, err
 	}
 	if err := b.EventType.validate(); err != nil {
 		return Admission{}, err
@@ -422,5 +423,22 @@ func (b WebhookBatch) Admit() (Admission, error) {
 		Fingerprint:        fingerprint,
 		FingerprintVersion: b.FingerprintVersion,
 		Commitments:        admitted,
+		EventID:            b.EventID,
 	}, nil
+}
+
+// checkEventID is the grammar of an event id as the key needs it: non-empty,
+// and without the separator the key puts after it. A webhook key is
+// <event_id>:<hex>, and an id with a colon in it would make the prefix
+// unreadable to anything holding only the key - which is exactly how the
+// upgrade that gives old claims their event_id reads them. The producer writes
+// UUIDs; the rule names what is already true and refuses what would break it.
+func checkEventID(eventID string) error {
+	if eventID == "" {
+		return contractf("a webhook admission with no event")
+	}
+	if strings.Contains(eventID, ":") {
+		return contractf("event id %q contains ':', which the key grammar reserves", eventID)
+	}
+	return nil
 }

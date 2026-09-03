@@ -262,6 +262,12 @@ type Intent struct {
 	NotBefore     time.Time
 	NextAttemptAt time.Time
 	ExpiresAt     *time.Time
+
+	// CreatedAt is the admission; UpdatedAt moves with every transition, so
+	// for a commitment that has ended it is the moment it ended. The journal
+	// orders by the first and retention measures from the second.
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // GroupBound reports whether this commitment belongs to an alert group, which

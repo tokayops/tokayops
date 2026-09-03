@@ -11,6 +11,13 @@ func Families() []string {
 	return []string{FamilyNotification, FamilyHandoff, FamilyWebhook}
 }
 
+// Statuses is every status a commitment can be in, for the doors that take a
+// status from a caller and have to refuse one this build does not know.
+func Statuses() []Status {
+	return []Status{StatusPending, StatusSending, StatusIdle, StatusManualReview,
+		StatusSucceeded, StatusPermanentFailed, StatusExpired, StatusCanceled}
+}
+
 // RecoveryTargets is every status recovery can move a commitment to when its
 // worker's lease ran out with an attempt open - the "to" label of
 // outbound_leases_expired_total. It is the closed set of T7's answers in the

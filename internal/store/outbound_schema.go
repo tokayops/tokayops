@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS outbound_batches (
 	-- Which alert group this admission belongs to, asked by the producer's own
 	-- query. NULL for the families that have no group.
 	alert_group_id      TEXT REFERENCES alert_groups(id),
+	-- Which alert event a webhook claim is about - the fan-out's and every
+	-- replay's, whose keys differ - and NULL for every other kind. No foreign
+	-- key on purpose: a claim is never deleted and an event is, once nothing
+	-- is owed for it, so the claim outlives the event. The rule that a webhook
+	-- claim names its event, and the index, are added beside the backfill in
+	-- outbound_journal_schema.go.
+	event_id            TEXT,
 	fingerprint         BYTEA NOT NULL,
 	fingerprint_version INT  NOT NULL,
 	-- The outcome of admission, stated rather than inferred from a counter:
@@ -895,6 +902,9 @@ func (s *Store) applyOutboundSchema() error {
 	}
 
 	if err := applyPayloadDigest(context.Background(), tx); err != nil {
+		return err
+	}
+	if err := applyJournalSchema(context.Background(), tx); err != nil {
 		return err
 	}
 

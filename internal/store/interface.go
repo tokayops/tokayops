@@ -6,6 +6,7 @@ import (
 
 	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 )
 
 // StoreInterface defines the interface for data persistence.
@@ -149,6 +150,13 @@ type StoreInterface interface {
 	ListWebhookDeliveries(ctx context.Context, integrationID string, limit, offset int) ([]*model.OutboxDelivery, int, error)
 	WebhookDelivery(ctx context.Context, integrationID, deliveryID string) (*model.OutboxDelivery, []*model.DeliveryAttempt, error)
 	ReplayWebhookDelivery(ctx context.Context, req WebhookReplayRequest) (WebhookReplayResult, error)
+
+	// The delivery journal: the outbound domain read from the outside, for the
+	// routes under /deliveries and an alert group's delivery block. See
+	// outbound_journal_store.go.
+	ListIntents(ctx context.Context, filter IntentFilter, limit, offset int) ([]outbound.Intent, int, error)
+	IntentJournal(ctx context.Context, intentID string) (*outbound.Journal, error)
+	AlertGroupDeliveries(ctx context.Context, alertGroupID string) (*outbound.GroupDeliveries, error)
 
 	// Metrics
 	GetMetricsSnapshot(ctx context.Context) (*model.MetricsSnapshot, error)

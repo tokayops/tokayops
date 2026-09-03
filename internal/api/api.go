@@ -174,6 +174,15 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.PATCH("/alert-groups/:id/resolve", a.ResolveAlertGroup, a.Require(rbac.ActionAlertResolve, ScopeFromResource("alert_group", "id")))
 	v1.GET("/alert-groups/:id/timeline", a.GetAlertGroupTimeline, a.Require(rbac.ActionAlertView, ScopeFromResource("alert_group", "id")))
 	v1.POST("/alert-groups/:id/notes", a.AddAlertGroupNote, a.Require(rbac.ActionAlertNoteAdd, ScopeFromResource("alert_group", "id")))
+	// The group's deliveries go under the same action and scope as its
+	// timeline: whoever may read "notification sent" may read to whom.
+	v1.GET("/alert-groups/:id/deliveries", a.GetAlertGroupDeliveries, a.Require(rbac.ActionAlertView, ScopeFromResource("alert_group", "id")))
+
+	// The delivery journal: every family, every team, one form. The journal of
+	// one commitment carries the attempts and their addresses, which is why
+	// it is the administrator's and not the group's.
+	v1.GET("/deliveries", a.ListDeliveries, a.Require(rbac.ActionDeliveryView, ScopeGlobal()))
+	v1.GET("/deliveries/:id", a.GetDeliveryJournal, a.Require(rbac.ActionDeliveryView, ScopeGlobal()))
 
 	// Legacy Incidents (alias)
 	v1.GET("/incidents", a.ListAlertGroups, a.Require(rbac.ActionAlertView, ScopeGlobal()))

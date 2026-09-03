@@ -48,6 +48,11 @@ const (
 	ActionIntegrationCreate  Action = "integration.create"
 	ActionIntegrationUpdate  Action = "integration.update"
 	ActionIntegrationDelete  Action = "integration.delete"
+	// ActionDeliveryView is the delivery journal across every family and team:
+	// the operational log under /deliveries and the journal of one commitment.
+	// Global, because the journal is; a group's own deliveries go under
+	// alert.view with the group's scope, like its timeline.
+	ActionDeliveryView Action = "delivery.view"
 
 	// Token actions (typically self-service)
 	ActionTokenList   Action = "token.list"
@@ -152,6 +157,7 @@ var globalAdminActions = map[Action]bool{
 	ActionUserUpdate:     true,
 	ActionUserDelete:     true,
 	ActionUserRoleAssign: true,
+	ActionDeliveryView:   true,
 }
 
 // HasPermission evaluates whether a user has permission to perform an action.
