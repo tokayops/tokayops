@@ -719,10 +719,10 @@ const Components = {
             // the delivery is the administrator's, and offered only to them.
             const target = Components.deliveryTarget(meta.target_kind, meta.target_ref);
             const journal = window.Permissions && Permissions.isAdmin()
-                ? `<button type="button" class="btn-link journal-link" data-delivery-id="${escapeHtml(meta.intent_id)}">journal</button>`
+                ? `<button type="button" class="btn-link journal-link" data-delivery-id="${escapeAttr(meta.intent_id)}">journal</button>`
                 : '';
             notificationDetails = `
-                <div class="timeline-notification-details timeline-delivery" data-delivery-id="${escapeHtml(meta.intent_id)}">
+                <div class="timeline-notification-details timeline-delivery" data-delivery-id="${escapeAttr(meta.intent_id)}">
                     ${target}
                     <span class="timeline-delivery-provider">via ${escapeHtml(meta.provider || '')}</span>
                     ${journal}
@@ -767,7 +767,7 @@ const Components = {
         const id = escapeHtml(ref || '');
         switch (kind) {
             case 'user':
-                return `<span class="delivery-target" data-user-id="${id}"><i data-lucide="user"></i><span class="delivery-target-name">${id}</span></span>`;
+                return `<span class="delivery-target" data-user-id="${escapeAttr(ref || '')}"><i data-lucide="user"></i><span class="delivery-target-name">${id}</span></span>`;
             case 'channel':
                 return `<span class="delivery-target"><i data-lucide="hash"></i><span>${id}</span></span>`;
             case 'subscriber':

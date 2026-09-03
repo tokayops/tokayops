@@ -104,6 +104,19 @@ test.describe('Alert group deliveries', () => {
     await expect(journal.locator('.journal-events [data-kind="created"] .journal-actor-system')).toHaveText('Escalation engine');
     await journal.locator('#delivery-modal-close').click();
     await expect(journal).toBeHidden();
+
+    // A webhook delivery that failed for good has one door to a new effect,
+    // the replay: the dialog offers a withdrawal and nothing the server
+    // would refuse.
+    await fanOut.locator('.delivery-row', { hasText: webhookIntegrationId }).locator('.journal-link').click();
+    await expect(journal).toBeVisible();
+    await expect(journal.locator('.journal-status .delivery-status-permanent_failed')).toBeVisible();
+    await journal.locator('#delivery-decide-btn').click();
+    await expect(journal.locator('.decision-option input[name="decision"]')).toHaveCount(1);
+    await expect(journal.locator('.decision-option input[name="decision"]')).toHaveValue('cancel');
+    await expect(journal.locator('.decision-replay-hint')).toContainText('replay');
+    await journal.locator('#delivery-modal-close').click();
+    await expect(journal).toBeHidden();
   });
 
   test('a user who is not an administrator sees the deliveries and is not offered the journal', async ({ browser }) => {

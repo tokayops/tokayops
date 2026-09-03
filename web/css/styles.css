@@ -6880,10 +6880,11 @@ body::before {
     width: 14px;
     height: 14px;
 }
-.delivery-target.is-erased,
-.journal-actor.is-erased {
+.delivery-target.is-unknown,
+.journal-actor.is-unknown {
     color: var(--text-muted, #6b7280);
-    font-style: italic;
+    font-family: monospace;
+    font-size: 0.8rem;
 }
 .delivery-row-actions {
     text-align: right;

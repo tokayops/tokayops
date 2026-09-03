@@ -9,13 +9,13 @@
  * Activity. A decision about a stuck delivery is taken from the journal.
  *
  * Who wrote a journal line is read from actor_kind, never from the text of
- * the actor: a person is named through the users directory (and "Deleted
- * user" once erased), a component by its label, and a line a build before
- * this one wrote is shown as the text it wrote, marked as such.
+ * the actor: a person is named through the users directory - which answers
+ * "Deleted user" for somebody erased - a component by its label, and a line a
+ * build before this one wrote is shown as the text it wrote, marked as such.
  */
 
 import { State } from '/js/core/state.js';
-import { Elements, showToast, escapeHtml, openModal, closeModalById } from '/js/core/utils.js';
+import { Elements, showToast, escapeHtml, escapeAttr, openModal, closeModalById } from '/js/core/utils.js';
 import { Permissions } from '/js/modules/permissions.js';
 import { resolveNames } from '/js/core/users-directory.js';
 
@@ -36,6 +36,35 @@ const DECISIONS_BY_STATUS = {
     permanent_failed: ['cancel', 'retry_current_generation', 'retry_new_generation'],
     expired: ['retry_current_generation', 'retry_new_generation'],
 };
+
+// A webhook delivery has another door to a new effect: the replay, from the
+// subscriber's deliveries, which makes a NEW delivery. A retry of this one
+// would be a second live delivery beside it, and the server refuses it for
+// every webhook - so it is not offered. What is left is to withdraw, or, in
+// review, to assume the call landed; an expired webhook is only ever replayed.
+const WEBHOOK_DECISIONS_BY_STATUS = {
+    manual_review: ['assume_accepted', 'cancel'],
+    permanent_failed: ['cancel'],
+    expired: [],
+};
+
+const REPLAY_HINT = 'A webhook delivery is sent again by a replay from the subscriber\'s deliveries, which makes a new delivery; this one is not retried.';
+
+/**
+ * The decisions offered for a delivery: by its status, and by its family.
+ */
+export function decisionsFor(delivery) {
+    const byStatus = delivery?.family === 'webhook' ? WEBHOOK_DECISIONS_BY_STATUS : DECISIONS_BY_STATUS;
+    return byStatus[delivery?.status] || [];
+}
+
+/**
+ * Whether the status is one a person decides about at all - even when this
+ * family offers nothing for it, which the journal then says.
+ */
+function isDecidableStatus(status) {
+    return Boolean(DECISIONS_BY_STATUS[status]);
+}
 
 const DECISION_LABELS = {
     assume_accepted: 'Assume it was delivered',
@@ -108,7 +137,7 @@ export function targetLabel(kind, ref) {
     const id = escapeHtml(ref || '');
     switch (kind) {
         case 'user':
-            return `<span class="delivery-target" data-user-id="${id}"><i data-lucide="user"></i><span class="delivery-target-name">${id}</span></span>`;
+            return `<span class="delivery-target" data-user-id="${escapeAttr(ref || '')}"><i data-lucide="user"></i><span class="delivery-target-name">${id}</span></span>`;
         case 'channel':
             return `<span class="delivery-target"><i data-lucide="hash"></i><span>${id}</span></span>`;
         case 'subscriber':
@@ -125,7 +154,7 @@ export function actorLabel(event) {
     const ref = escapeHtml(event.actor || '');
     switch (event.actor_kind) {
         case 'user':
-            return `<span class="journal-actor journal-actor-user" data-user-id="${ref}"><span class="delivery-target-name">${ref}</span></span>`;
+            return `<span class="journal-actor journal-actor-user" data-user-id="${escapeAttr(event.actor || '')}"><span class="delivery-target-name">${ref}</span></span>`;
         case 'system':
             return `<span class="journal-actor journal-actor-system">${escapeHtml(COMPONENT_LABELS[event.actor] || event.actor || 'system')}</span>`;
         case 'legacy':
@@ -136,9 +165,11 @@ export function actorLabel(event) {
 }
 
 /**
- * Turn the user ids a render left behind into names. An id the directory
- * does not know belongs to a person who was erased, and is shown as such
- * rather than as an id nobody can look up.
+ * Turn the user ids a render left behind into names. An erased person comes
+ * back from the directory under the name erasure left them - "Deleted user" -
+ * and is shown as that. An id the directory does not know at all is a
+ * reference nothing can explain: it stays an id, marked as unknown, rather
+ * than being dressed up as a person.
  */
 export async function hydrateUserNames(root) {
     if (!root) return;
@@ -158,8 +189,8 @@ export async function hydrateUserNames(root) {
         if (name) {
             slot.textContent = name;
         } else {
-            slot.textContent = 'Deleted user';
-            el.classList.add('is-erased');
+            el.classList.add('is-unknown');
+            el.title = 'No user with this id';
         }
     }
 }
@@ -179,7 +210,7 @@ function canReadJournal() {
 
 function journalButton(deliveryId) {
     if (!canReadJournal()) return '';
-    return `<button type="button" class="btn btn-sm btn-secondary journal-link" data-delivery-id="${escapeHtml(deliveryId)}" title="Open the journal">
+    return `<button type="button" class="btn btn-sm btn-secondary journal-link" data-delivery-id="${escapeAttr(deliveryId)}" title="Open the journal">
         <i data-lucide="scroll-text"></i> Journal
     </button>`;
 }
@@ -193,7 +224,7 @@ function pagingTable(paging) {
         return '<div class="deliveries-empty">Nobody was paged for this alert.</div>';
     }
     const rows = paging.map(d => `
-        <tr class="delivery-row" data-delivery-id="${escapeHtml(d.id)}">
+        <tr class="delivery-row" data-delivery-id="${escapeAttr(d.id)}">
             <td>${statusBadge(d.status)}</td>
             <td>${escapeHtml(d.provider)}</td>
             <td>${targetLabel(d.target_kind, d.target_ref)}</td>
@@ -220,14 +251,14 @@ function eventsList(events) {
     return events.map(event => {
         const batches = (event.batches || []).map(batch => {
             const deliveries = (batch.deliveries || []).map(d => `
-                <tr class="delivery-row" data-delivery-id="${escapeHtml(d.id)}">
+                <tr class="delivery-row" data-delivery-id="${escapeAttr(d.id)}">
                     <td>${statusBadge(d.status)}</td>
                     <td>${targetLabel(d.target_kind, d.target_ref)}</td>
                     <td>${when(d.created_at)}</td>
                     <td class="delivery-row-actions">${journalButton(d.id)}</td>
                 </tr>`).join('');
             return `
-                <div class="delivery-batch" data-batch-kind="${escapeHtml(batch.kind)}" data-batch-outcome="${escapeHtml(batch.outcome)}">
+                <div class="delivery-batch" data-batch-kind="${escapeAttr(batch.kind)}" data-batch-outcome="${escapeAttr(batch.outcome)}">
                     <div class="delivery-batch-header">
                         <span class="delivery-batch-kind">${escapeHtml(batchLabel(batch))}</span>
                         <span class="text-muted">${batch.intent_count} ${batch.intent_count === 1 ? 'delivery' : 'deliveries'} · ${when(batch.admitted_at)}</span>
@@ -237,7 +268,7 @@ function eventsList(events) {
         }).join('');
         const pending = !event.batches || event.batches.length === 0;
         return `
-            <div class="delivery-event" data-event-id="${escapeHtml(event.event_id)}" data-event-status="${escapeHtml(event.status)}">
+            <div class="delivery-event" data-event-id="${escapeAttr(event.event_id)}" data-event-status="${escapeAttr(event.status)}">
                 <div class="delivery-event-header">
                     <span class="delivery-event-type">${escapeHtml(event.event_type)}</span>
                     <span class="delivery-event-status">${escapeHtml(pending ? 'not fanned out yet' : event.status)}</span>
@@ -308,7 +339,7 @@ function attemptsTable(attempts) {
             ? '<span class="text-muted" title="The coordinates were removed by an erasure">redacted</span>'
             : (a.receipt_recorded ? 'recorded' : '—');
         return `
-            <tr class="journal-attempt" data-outcome="${escapeHtml(a.outcome || '')}">
+            <tr class="journal-attempt" data-outcome="${escapeAttr(a.outcome || '')}">
                 <td>${a.attempt_no}</td>
                 <td>${escapeHtml(a.record_kind)}${a.record_kind !== 'attempt' ? '' : ` · ${escapeHtml(a.attempt_kind)}`}</td>
                 <td>${escapeHtml(a.outcome || '—')}${a.error_class ? `<div class="text-muted">${escapeHtml(a.error_class)}</div>` : ''}</td>
@@ -329,7 +360,7 @@ function eventsTable(events) {
         return '<div class="deliveries-empty">No events.</div>';
     }
     const rows = events.map(e => `
-        <tr class="journal-event" data-kind="${escapeHtml(e.kind)}">
+        <tr class="journal-event" data-kind="${escapeAttr(e.kind)}">
             <td>${e.seq}</td>
             <td><strong>${escapeHtml(e.kind.replace(/_/g, ' '))}</strong>${e.reason ? `<div class="journal-reason">${escapeHtml(e.reason)}</div>` : ''}</td>
             <td>${actorLabel(e)}</td>
@@ -363,7 +394,7 @@ export function journalPanel(journal) {
                     <dt>Created</dt><dd>${when(d.created_at)}</dd>
                     <dt>Updated</dt><dd>${when(d.updated_at)}</dd>
                     ${d.expires_at ? `<dt>Expires</dt><dd>${when(d.expires_at)}${d.expired ? ' (passed)' : ''}</dd>` : ''}
-                    ${d.alert_group_id ? `<dt>Alert group</dt><dd><a href="#/ops/alert-groups/${escapeHtml(d.alert_group_id)}" class="journal-group-link">${escapeHtml(d.alert_group_id)}</a></dd>` : ''}
+                    ${d.alert_group_id ? `<dt>Alert group</dt><dd><a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="journal-group-link">${escapeHtml(d.alert_group_id)}</a></dd>` : ''}
                     <dt>Delivery id</dt><dd class="journal-id">${escapeHtml(d.id)}</dd>
                 </dl>
             </div>
@@ -378,7 +409,7 @@ export function journalPanel(journal) {
 }
 
 export function canDecide(delivery) {
-    return canReadJournal() && Boolean(DECISIONS_BY_STATUS[delivery?.status]);
+    return canReadJournal() && decisionsFor(delivery).length > 0;
 }
 
 /**
@@ -395,7 +426,12 @@ export async function openDeliveryJournal(deliveryId) {
         const journal = await API.deliveries.get(deliveryId);
         if (openJournalId !== deliveryId) return;
         Elements.deliveryModalTitle.textContent = `Delivery · ${journal.delivery.status.replace(/_/g, ' ')}`;
-        Elements.deliveryModalBody.innerHTML = journalPanel(journal);
+        // A status a person decides about, in a family that offers nothing
+        // for it, is told where its door is instead of a button.
+        const replayOnly = canReadJournal() && isDecidableStatus(journal.delivery.status) && !canDecide(journal.delivery);
+        Elements.deliveryModalBody.innerHTML = journalPanel(journal) + (replayOnly
+            ? `<div class="deliveries-empty journal-replay-hint" id="journal-replay-hint">${escapeHtml(REPLAY_HINT)}</div>`
+            : '');
         Elements.deliveryModalFooter.innerHTML = `
             <div class="modal-footer-right">
                 ${canDecide(journal.delivery) ? `
@@ -431,7 +467,7 @@ function localDateTimeValue(date) {
 }
 
 export function decisionForm(delivery) {
-    const decisions = DECISIONS_BY_STATUS[delivery.status] || [];
+    const decisions = decisionsFor(delivery);
     const options = decisions.map((decision, i) => `
         <label class="decision-option">
             <input type="radio" name="decision" value="${decision}" ${i === 0 ? 'checked' : ''}>
@@ -443,11 +479,12 @@ export function decisionForm(delivery) {
     const needsDeadline = delivery.status === 'expired';
     const inAnHour = new Date(Date.now() + 60 * 60 * 1000);
     return `
-        <form id="decision-form" class="decision-form" data-delivery-id="${escapeHtml(delivery.id)}">
+        <form id="decision-form" class="decision-form" data-delivery-id="${escapeAttr(delivery.id)}">
             <div class="decision-context">
                 ${statusBadge(delivery.status)}
                 <span>${escapeHtml(delivery.provider)} · </span>${targetLabel(delivery.target_kind, delivery.target_ref)}
             </div>
+            ${delivery.family === 'webhook' ? `<div class="form-hint decision-replay-hint">${escapeHtml(REPLAY_HINT)}</div>` : ''}
             <fieldset class="decision-options">
                 <legend>Decision</legend>
                 ${options}
@@ -586,7 +623,7 @@ async function submitDecision(delivery) {
 // ========================================
 
 function activityFilters() {
-    const option = (value, label, selected) => `<option value="${escapeHtml(value)}" ${selected ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    const option = (value, label, selected) => `<option value="${escapeAttr(value)}" ${selected ? 'selected' : ''}>${escapeHtml(label)}</option>`;
     return `
         <div class="activity-filters">
             <label>Family
@@ -602,10 +639,10 @@ function activityFilters() {
                 </select>
             </label>
             <label>From
-                <input type="datetime-local" id="activity-from" value="${escapeHtml(activity.from)}">
+                <input type="datetime-local" id="activity-from" value="${escapeAttr(activity.from)}">
             </label>
             <label>To
-                <input type="datetime-local" id="activity-to" value="${escapeHtml(activity.to)}">
+                <input type="datetime-local" id="activity-to" value="${escapeAttr(activity.to)}">
             </label>
             <button type="button" class="btn btn-secondary btn-sm" id="activity-apply">Apply</button>
             <span class="activity-period text-muted" id="activity-period"></span>
@@ -618,13 +655,13 @@ function activityTable(response) {
         return '<div class="empty-state" id="activity-empty"><i data-lucide="inbox" class="empty-icon"></i><p>No deliveries in this period.</p></div>';
     }
     const rows = deliveries.map(d => `
-        <tr class="delivery-row activity-row" data-delivery-id="${escapeHtml(d.id)}" data-family="${escapeHtml(d.family)}" data-status="${escapeHtml(d.status)}">
+        <tr class="delivery-row activity-row" data-delivery-id="${escapeAttr(d.id)}" data-family="${escapeAttr(d.family)}" data-status="${escapeAttr(d.status)}">
             <td>${when(d.created_at)}</td>
             <td>${escapeHtml(d.family)}<div class="text-muted">${escapeHtml(d.kind)}</div></td>
             <td>${escapeHtml(d.provider)}</td>
             <td>${targetLabel(d.target_kind, d.target_ref)}</td>
             <td>${statusBadge(d.status)}</td>
-            <td>${d.alert_group_id ? `<a href="#/ops/alert-groups/${escapeHtml(d.alert_group_id)}" class="activity-group-link" title="${escapeHtml(d.alert_group_id)}">alert</a>` : '<span class="text-muted">—</span>'}</td>
+            <td>${d.alert_group_id ? `<a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="activity-group-link" title="${escapeAttr(d.alert_group_id)}">alert</a>` : '<span class="text-muted">—</span>'}</td>
             <td class="delivery-row-actions">${journalButton(d.id)}</td>
         </tr>`).join('');
     const page = response.page || 1;
@@ -730,4 +767,4 @@ export function bindDeliveriesEvents() {
     });
 }
 
-export const _internal = { DECISIONS_BY_STATUS, DECISION_LABELS, COMPONENT_LABELS, activity };
+export const _internal = { DECISIONS_BY_STATUS, WEBHOOK_DECISIONS_BY_STATUS, DECISION_LABELS, COMPONENT_LABELS, activity };
