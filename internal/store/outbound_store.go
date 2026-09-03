@@ -1155,7 +1155,7 @@ func intentIDsOfBatch(ctx context.Context, tx *sql.Tx, batchID string) ([]string
 // in Go, because the process clock is not the one the leases are written
 // against.
 const outboundIntentColumns = `
-	SELECT id, COALESCE(alert_group_id, ''), delivery_family, key_kind, provider, target_kind, target_ref,
+	SELECT id, batch_id, COALESCE(alert_group_id, ''), delivery_family, key_kind, provider, target_kind, target_ref,
 	       form, completion_mode,
 	       ambiguity_policy, status, generation_no, attempts_in_generation,
 	       failure_streak, desired_revision, applied_revision,
@@ -1181,7 +1181,7 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		deadlinePassed bool
 	)
 	if err := row.Scan(
-		&intent.ID, &groupID, &intent.Family, &intent.KeyKind, &intent.Provider,
+		&intent.ID, &intent.BatchID, &groupID, &intent.Family, &intent.KeyKind, &intent.Provider,
 		&intent.TargetKind, &intent.TargetRef,
 		&intent.Form, &intent.CompletionMode,
 		&intent.AmbiguityPolicy, &intent.Status, &intent.GenerationNo,

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -150,6 +151,9 @@ func TestTheGroupsDeliveriesStartFromItsEvents(t *testing.T) {
 	targets := map[string]bool{}
 	for _, d := range fan.Deliveries {
 		targets[d.TargetRef] = true
+		if d.BatchID != fan.BatchID {
+			t.Errorf("delivery %s of claim %s is shown under claim %s", d.ID, d.BatchID, fan.BatchID)
+		}
 	}
 	if !targets[a] || !targets[b] {
 		t.Errorf("the fan-out's deliveries go to %v, want %s and %s", targets, a, b)
@@ -216,6 +220,68 @@ func TestTheGroupsDeliveriesAreOneSnapshot(t *testing.T) {
 	}
 	if after.Events[0].Status != string(model.OutboxEventStatusFannedOut) || len(after.Events[0].Batches) != 1 {
 		t.Fatalf("the fan-out that committed is not in the next read: %+v", after.Events[0])
+	}
+}
+
+// TestTheGroupsDeliveriesAreFourStatementsHoweverManyClaims: every replay
+// under a new key is one more claim on the same event, and claims are never
+// deleted; the read must not grow with them, because it holds a REPEATABLE
+// READ connection for as long as it runs. The seam is called once before each
+// statement, so its record is the count.
+func TestTheGroupsDeliveriesAreFourStatementsHoweverManyClaims(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+	t.Cleanup(func() { groupDeliveriesSeam = nil })
+
+	group := outboundGroup(t, s)
+	teamOne(t, s)
+	a := subscriber(t, s, "a", model.WebhookScopeTeam, "team-1", true)
+	event := eventForGroup(t, s, group, "team-1", model.OutboxEventFiring)
+	fanOutNext(t, s)
+	original := webhookCommitmentTo(t, s, a)
+	replays := []string{replayThrough(t, s, a, original, "key-1")}
+	for _, key := range []string{"key-2", "key-3"} {
+		result, err := s.ReplayWebhookDelivery(ctx, WebhookReplayRequest{
+			IntegrationID: a, DeliveryID: original, ClientRequestID: key, Actor: "tester",
+		})
+		if err != nil {
+			t.Fatalf("replay under %s: %v", key, err)
+		}
+		replays = append(replays, result.DeliveryID)
+	}
+
+	var statements []int
+	groupDeliveriesSeam = func(step int) { statements = append(statements, step) }
+	got, err := s.AlertGroupDeliveries(ctx, group)
+	if err != nil {
+		t.Fatalf("read the group's deliveries: %v", err)
+	}
+	if want := []int{1, 2, 3, 4}; fmt.Sprint(statements) != fmt.Sprint(want) {
+		t.Errorf("the read ran statements %v with four claims, want %v", statements, want)
+	}
+
+	if len(got.Events) != 1 || got.Events[0].EventID != event || len(got.Events[0].Batches) != 4 {
+		t.Fatalf("the event reads %+v", got.Events)
+	}
+	seen := map[string]string{}
+	for _, batch := range got.Events[0].Batches {
+		if len(batch.Deliveries) != 1 {
+			t.Errorf("claim %s (%s) shows %d deliveries, want 1", batch.BatchID, batch.Kind, len(batch.Deliveries))
+			continue
+		}
+		d := batch.Deliveries[0]
+		if d.BatchID != batch.BatchID {
+			t.Errorf("delivery %s of claim %s is shown under claim %s", d.ID, d.BatchID, batch.BatchID)
+		}
+		seen[d.ID] = batch.BatchID
+	}
+	if seen[original] == "" {
+		t.Error("the fan-out's delivery is not under its claim")
+	}
+	for _, id := range replays {
+		if seen[id] == "" {
+			t.Errorf("replay %s is not under its claim", id)
+		}
 	}
 }
 

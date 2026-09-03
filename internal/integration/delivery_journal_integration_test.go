@@ -208,10 +208,10 @@ func TestTheJournalShowsTheThreeStatesOfAReceipt(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	journalOf := func(id string) api.DeliveryJournalResponse {
+	getAs := func(user, path string) *httptest.ResponseRecorder {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/deliveries/"+id, nil)
-		token, err := auth.GenerateToken("root")
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		token, err := auth.GenerateToken(user)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -219,10 +219,14 @@ func TestTheJournalShowsTheThreeStatesOfAReceipt(t *testing.T) {
 		rec := httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("journal of %s: %d %s", id, rec.Code, rec.Body.String())
+			t.Fatalf("%s as %s: %d %s", path, user, rec.Code, rec.Body.String())
 		}
+		return rec
+	}
+	journalOf := func(id string) api.DeliveryJournalResponse {
+		t.Helper()
 		var resp api.DeliveryJournalResponse
-		decodeInto(t, rec, &resp)
+		decodeInto(t, getAs("root", "/api/v1/deliveries/"+id), &resp)
 		return resp
 	}
 
@@ -263,6 +267,26 @@ func TestTheJournalShowsTheThreeStatesOfAReceipt(t *testing.T) {
 	}
 	if !before.Delivery.ReceiptRecorded || before.Delivery.ReceiptRef == "" || before.Delivery.RecipientErased {
 		t.Errorf("the delivery reads %+v", before.Delivery)
+	}
+
+	// The group's readers see the same delivery with its receipt recorded and
+	// without the reference: a user who is not an administrator may read the
+	// group, and the reference is an address at the provider.
+	bob := testutil.SeedUser(t, env.S, "bob@pipeline.test").ID
+	rec := getAs(bob, "/api/v1/alert-groups/"+before.Delivery.AlertGroupID+"/deliveries")
+	if bytes.Contains(rec.Body.Bytes(), []byte("receipt_ref")) {
+		t.Errorf("the group's deliveries name a receipt reference: %s", rec.Body.String())
+	}
+	var group api.AlertGroupDeliveriesResponse
+	decodeInto(t, rec, &group)
+	shown := false
+	for _, d := range group.Paging {
+		if d.ID == id {
+			shown = d.ReceiptRecorded
+		}
+	}
+	if !shown {
+		t.Errorf("the group's readers do not see the delivery with its receipt recorded: %+v", group.Paging)
 	}
 
 	if err := erasure.NewService(env.S.ErasureRepository()).Erase(ctx, "U_TEST"); err != nil {

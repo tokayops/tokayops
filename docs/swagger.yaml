@@ -48,7 +48,7 @@ definitions:
         type: array
       paging:
         items:
-          $ref: '#/definitions/api.DeliveryDTO'
+          $ref: '#/definitions/api.GroupDeliveryDTO'
         type: array
     type: object
   api.AlertGroupListResponse:
@@ -73,7 +73,7 @@ definitions:
         type: string
       deliveries:
         items:
-          $ref: '#/definitions/api.DeliveryDTO'
+          $ref: '#/definitions/api.GroupDeliveryDTO'
         type: array
       intent_count:
         type: integer
@@ -237,6 +237,8 @@ definitions:
         type: integer
       attempts_in_generation:
         type: integer
+      batch_id:
+        type: string
       cancellation_requested:
         type: boolean
       created_at:
@@ -387,6 +389,59 @@ definitions:
       event_type:
         type: string
       status:
+        type: string
+    type: object
+  api.GroupDeliveryDTO:
+    properties:
+      accepted_duplicate_risk:
+        type: boolean
+      alert_group_id:
+        type: string
+      applied_revision:
+        type: integer
+      attempts_in_generation:
+        type: integer
+      batch_id:
+        type: string
+      cancellation_requested:
+        type: boolean
+      created_at:
+        type: string
+      desired_revision:
+        type: integer
+      expires_at:
+        type: string
+      failure_streak:
+        type: integer
+      family:
+        type: string
+      final_revision_applied:
+        type: boolean
+      form:
+        type: string
+      generation_no:
+        type: integer
+      id:
+        type: string
+      kind:
+        type: string
+      next_attempt_at:
+        type: string
+      not_before:
+        type: string
+      provider:
+        type: string
+      receipt_recorded:
+        type: boolean
+      recipient_erased:
+        type: boolean
+      status:
+        type: string
+      target_kind:
+        type: string
+      target_ref:
+        type: string
+      updated_at:
         type: string
     type: object
   api.IntegrationListResponse:

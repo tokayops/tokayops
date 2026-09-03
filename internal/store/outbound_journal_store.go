@@ -119,11 +119,15 @@ func nullTime(t *time.Time) sql.NullTime {
 	return sql.NullTime{Time: *t, Valid: true}
 }
 
-// groupDeliveriesSeam is a test hook, called before each read of the group's
-// deliveries with the read's number. Production leaves it nil. It exists so a
-// test can put a fan-out between two of the reads and prove that the answer is
-// one snapshot: an event still pending in the first read and already claimed
-// in the second is a state the database was never in.
+// groupDeliveriesSeam is a test hook, called once before each statement of the
+// group's deliveries with the statement's number - there are four, whatever
+// the group holds. Production leaves it nil. It exists so a test can put a
+// fan-out between two of the reads and prove that the answer is one snapshot -
+// an event still pending in the first read and already claimed in the second
+// is a state the database was never in - and so a test can count the
+// statements: a replay under a new key is one more claim on the same event,
+// claims are never deleted, and a read that grew with them would hold a
+// REPEATABLE READ connection through hundreds of round trips.
 var groupDeliveriesSeam func(step int)
 
 func groupDeliveriesStep(step int) {
@@ -136,7 +140,8 @@ func groupDeliveriesStep(step int) {
 // owns, and its alert events with every claim on them and the webhook
 // commitments under those.
 //
-// Four reads, one snapshot. They run under REPEATABLE READ, read-only, the way
+// Four reads, one snapshot, and four however many claims the group's events
+// carry. They run under REPEATABLE READ, read-only, the way
 // the commitment journal does, because a fan-out or a replay committing between
 // two of them would splice two states into one answer - a pending event with a
 // batch under it - and this is the view people reach for to establish what
@@ -196,6 +201,7 @@ func (s *Store) AlertGroupDeliveries(ctx context.Context, alertGroupID string) (
 		return nil, fmt.Errorf("read the claims on the group's events: %w", err)
 	}
 	byEvent := map[string][]outbound.BatchDeliveries{}
+	var batchIDs []string
 	for rows.Next() {
 		var b outbound.BatchDeliveries
 		var eventID string
@@ -205,27 +211,34 @@ func (s *Store) AlertGroupDeliveries(ctx context.Context, alertGroupID string) (
 		}
 		b.Deliveries = []outbound.Intent{}
 		byEvent[eventID] = append(byEvent[eventID], b)
+		batchIDs = append(batchIDs, b.BatchID)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
+	// One statement for every claim's commitments, sorted out by claim here:
+	// the number of claims is the number of replays plus one, and grows for as
+	// long as the event is kept.
 	groupDeliveriesStep(4)
-	for eventID, batches := range byEvent {
-		for i := range batches {
-			batches[i].Deliveries, err = intentsWhereTx(ctx, tx,
-				`batch_id = $1 ORDER BY idempotency_key`, batches[i].BatchID)
-			if err != nil {
-				return nil, fmt.Errorf("read the commitments of claim %s: %w", batches[i].BatchID, err)
-			}
-		}
-		byEvent[eventID] = batches
+	deliveries, err := intentsWhereTx(ctx, tx,
+		`batch_id = ANY($1) ORDER BY batch_id, idempotency_key`, pq.Array(batchIDs))
+	if err != nil {
+		return nil, fmt.Errorf("read the commitments of the group's claims: %w", err)
+	}
+	byBatch := map[string][]outbound.Intent{}
+	for _, d := range deliveries {
+		byBatch[d.BatchID] = append(byBatch[d.BatchID], d)
 	}
 	for i := range out.Events {
-		if batches, ok := byEvent[out.Events[i].EventID]; ok {
-			out.Events[i].Batches = batches
+		batches := byEvent[out.Events[i].EventID]
+		for j := range batches {
+			if owed, ok := byBatch[batches[j].BatchID]; ok {
+				batches[j].Deliveries = owed
+			}
 		}
+		out.Events[i].Batches = batches
 	}
 	return out, tx.Commit()
 }

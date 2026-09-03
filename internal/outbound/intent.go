@@ -171,7 +171,10 @@ const (
 // Intent is a commitment as the domain reasons about it. It carries no
 // database concerns: the store maps rows onto it and back.
 type Intent struct {
-	ID           string
+	ID string
+	// BatchID is the claim this commitment came out of. A group's deliveries
+	// are read claim by claim, and a replay is its own claim on the same event.
+	BatchID      string
 	AlertGroupID string
 	// Family is the execution partition this commitment runs in. It travels
 	// with the commitment because everything that ends one - a finalisation, an

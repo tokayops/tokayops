@@ -25,9 +25,14 @@ import (
 // "scheduled for". The projection the webhook routes make of the same rows
 // is not changed by this: that one is a subscriber's contract.
 
-// DeliveryDTO is one commitment as the journal shows it.
-type DeliveryDTO struct {
+// GroupDeliveryDTO is one commitment as the readers of its alert group see
+// it: what was promised, to whom, and where it stands. It carries no
+// coordinates - no receipt reference, which names an object at the provider
+// the way an address does - because the group's deliveries are read under the
+// group's own permission, and that is not the administrator's.
+type GroupDeliveryDTO struct {
 	ID           string `json:"id"`
+	BatchID      string `json:"batch_id"`
 	AlertGroupID string `json:"alert_group_id,omitempty"`
 	Family       string `json:"family"`
 	Kind         string `json:"kind"`
@@ -45,11 +50,10 @@ type DeliveryDTO struct {
 	AppliedRevision      *int64 `json:"applied_revision,omitempty"`
 	FinalRevisionApplied bool   `json:"final_revision_applied"`
 
-	ReceiptRecorded       bool   `json:"receipt_recorded"`
-	ReceiptRef            string `json:"receipt_ref,omitempty"`
-	RecipientErased       bool   `json:"recipient_erased"`
-	CancellationRequested bool   `json:"cancellation_requested"`
-	AcceptedDuplicateRisk bool   `json:"accepted_duplicate_risk"`
+	ReceiptRecorded       bool `json:"receipt_recorded"`
+	RecipientErased       bool `json:"recipient_erased"`
+	CancellationRequested bool `json:"cancellation_requested"`
+	AcceptedDuplicateRisk bool `json:"accepted_duplicate_risk"`
 
 	NotBefore     time.Time  `json:"not_before"`
 	NextAttemptAt time.Time  `json:"next_attempt_at"`
@@ -141,7 +145,7 @@ type DeliveriesResponse struct {
 // AlertGroupDeliveriesResponse is one group's deliveries: the paging it owns,
 // and its alert events with every claim on them.
 type AlertGroupDeliveriesResponse struct {
-	Paging []DeliveryDTO        `json:"paging"`
+	Paging []GroupDeliveryDTO   `json:"paging"`
 	Events []EventDeliveriesDTO `json:"events"`
 }
 
@@ -159,28 +163,47 @@ type EventDeliveriesDTO struct {
 // BatchDeliveriesDTO is one claim on an event - the fan-out's or a replay's -
 // and the commitments it made.
 type BatchDeliveriesDTO struct {
-	BatchID     string        `json:"batch_id"`
-	Kind        string        `json:"kind"`
-	Outcome     string        `json:"outcome"`
-	IntentCount int           `json:"intent_count"`
-	AdmittedAt  time.Time     `json:"admitted_at"`
-	Deliveries  []DeliveryDTO `json:"deliveries"`
+	BatchID     string             `json:"batch_id"`
+	Kind        string             `json:"kind"`
+	Outcome     string             `json:"outcome"`
+	IntentCount int                `json:"intent_count"`
+	AdmittedAt  time.Time          `json:"admitted_at"`
+	Deliveries  []GroupDeliveryDTO `json:"deliveries"`
 }
 
-func deliveryDTO(i outbound.Intent) DeliveryDTO {
-	return DeliveryDTO{
-		ID: i.ID, AlertGroupID: i.AlertGroupID, Family: i.Family, Kind: string(i.KeyKind),
+// DeliveryDTO is one commitment as the journal shows it to the administrator:
+// the group's view and the receipt reference.
+type DeliveryDTO struct {
+	GroupDeliveryDTO
+	ReceiptRef string `json:"receipt_ref,omitempty"`
+}
+
+func groupDeliveryDTO(i outbound.Intent) GroupDeliveryDTO {
+	return GroupDeliveryDTO{
+		ID: i.ID, BatchID: i.BatchID, AlertGroupID: i.AlertGroupID, Family: i.Family, Kind: string(i.KeyKind),
 		Provider: i.Provider, TargetKind: string(i.TargetKind), TargetRef: i.TargetRef,
 		Form: string(i.Form), Status: string(i.Status),
 		GenerationNo: i.GenerationNo, AttemptsInGeneration: i.AttemptsInGeneration,
 		FailureStreak:   i.FailureStreak,
 		DesiredRevision: i.DesiredRevision, AppliedRevision: i.AppliedRevision,
 		FinalRevisionApplied: i.FinalRevisionApplied,
-		ReceiptRecorded:      i.HasReceipt, ReceiptRef: i.ReceiptRef, RecipientErased: i.RecipientErased,
+		ReceiptRecorded:      i.HasReceipt, RecipientErased: i.RecipientErased,
 		CancellationRequested: i.CancellationRequested, AcceptedDuplicateRisk: i.AcceptedDuplicateRisk,
 		NotBefore: i.NotBefore, NextAttemptAt: i.NextAttemptAt, ExpiresAt: i.ExpiresAt,
 		CreatedAt: i.CreatedAt, UpdatedAt: i.UpdatedAt,
 	}
+}
+
+func groupDeliveryDTOs(intents []outbound.Intent) []GroupDeliveryDTO {
+	out := make([]GroupDeliveryDTO, 0, len(intents))
+	for _, i := range intents {
+		out = append(out, groupDeliveryDTO(i))
+	}
+	return out
+}
+
+func deliveryDTO(i outbound.Intent) DeliveryDTO {
+	return DeliveryDTO{GroupDeliveryDTO: groupDeliveryDTO(i), ReceiptRef: i.ReceiptRef}
 }
 
 func deliveryDTOs(intents []outbound.Intent) []DeliveryDTO {
@@ -408,7 +431,7 @@ func (a *API) GetAlertGroupDeliveries(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 	out := AlertGroupDeliveriesResponse{
-		Paging: deliveryDTOs(deliveries.Paging),
+		Paging: groupDeliveryDTOs(deliveries.Paging),
 		Events: []EventDeliveriesDTO{},
 	}
 	for _, e := range deliveries.Events {
@@ -420,7 +443,7 @@ func (a *API) GetAlertGroupDeliveries(c echo.Context) error {
 			event.Batches = append(event.Batches, BatchDeliveriesDTO{
 				BatchID: b.BatchID, Kind: string(b.Kind), Outcome: b.Outcome,
 				IntentCount: b.IntentCount, AdmittedAt: b.AdmittedAt,
-				Deliveries: deliveryDTOs(b.Deliveries),
+				Deliveries: groupDeliveryDTOs(b.Deliveries),
 			})
 		}
 		out.Events = append(out.Events, event)

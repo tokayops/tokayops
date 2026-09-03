@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -201,7 +202,8 @@ func TestTheGroupsDeliveriesRouteShapesBothHalves(t *testing.T) {
 	at := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	r.fake.group = &outbound.GroupDeliveries{
 		Paging: []outbound.Intent{{ID: "p-1", AlertGroupID: "ag-a", Family: outbound.FamilyNotification,
-			Provider: "slack", Status: outbound.StatusSucceeded, CreatedAt: at, UpdatedAt: at, NotBefore: at, NextAttemptAt: at}},
+			Provider: "slack", Status: outbound.StatusSucceeded, HasReceipt: true, ReceiptRef: "C1/1700000000.000100",
+			CreatedAt: at, UpdatedAt: at, NotBefore: at, NextAttemptAt: at}},
 		Events: []outbound.EventDeliveries{
 			{EventID: "evt-1", EventType: "alert_group.firing", Status: "fanned_out", CreatedAt: at,
 				Batches: []outbound.BatchDeliveries{
@@ -224,8 +226,13 @@ func TestTheGroupsDeliveriesRouteShapesBothHalves(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Paging) != 1 || resp.Paging[0].ID != "p-1" {
+	if len(resp.Paging) != 1 || resp.Paging[0].ID != "p-1" || !resp.Paging[0].ReceiptRecorded {
 		t.Errorf("the paging reads %+v", resp.Paging)
+	}
+	// The group's readers learn that a message exists, never where: the
+	// receipt reference is the administrator's.
+	if strings.Contains(rec.Body.String(), "receipt_ref") {
+		t.Errorf("the group's deliveries name a receipt reference: %s", rec.Body.String())
 	}
 	if len(resp.Events) != 2 || len(resp.Events[0].Batches) != 2 || resp.Events[0].Batches[1].Kind != "webhook_replay" ||
 		resp.Events[0].Batches[1].Deliveries[0].ID != "w-2" {
