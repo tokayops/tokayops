@@ -84,8 +84,8 @@ const (
 )
 
 func init() {
-	prometheus.MustRegister(ScheduleOnCallNotificationsTotal)
-	prometheus.MustRegister(HandoffRecipientsSkippedTotal)
-	prometheus.MustRegister(ScheduleOnCallProjectionFailuresTotal)
-	prometheus.MustRegister(ScheduleOnCallProjectionDuration)
+	register(ScheduleOnCallNotificationsTotal)
+	register(HandoffRecipientsSkippedTotal)
+	register(ScheduleOnCallProjectionFailuresTotal)
+	register(ScheduleOnCallProjectionDuration)
 }

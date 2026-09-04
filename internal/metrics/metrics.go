@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -359,55 +360,100 @@ var (
 	}, []string{"field"})
 )
 
+// registered is every collector this package registers, so that a test can
+// ask what the registry describes - including vectors that have no series
+// yet, which Gather does not show.
+var registered []prometheus.Collector
+
+func register(c prometheus.Collector) {
+	prometheus.MustRegister(c)
+	registered = append(registered, c)
+}
+
+// Described is the name of every metric family this package registers, from
+// the collectors' own descriptions.
+func Described() []string {
+	var names []string
+	for _, c := range registered {
+		names = append(names, DescribedBy(c)...)
+	}
+	return names
+}
+
+// DescribedBy reads the family names out of one collector's descriptions.
+func DescribedBy(c prometheus.Collector) []string {
+	ch := make(chan *prometheus.Desc, 64)
+	go func() {
+		c.Describe(ch)
+		close(ch)
+	}()
+	var names []string
+	for desc := range ch {
+		// The Desc renders as Desc{fqName: "name", help: ...}: the name is
+		// the first quoted string.
+		text := desc.String()
+		start := strings.Index(text, `"`)
+		if start < 0 {
+			continue
+		}
+		end := strings.Index(text[start+1:], `"`)
+		if end < 0 {
+			continue
+		}
+		names = append(names, text[start+1:start+1+end])
+	}
+	return names
+}
+
 func init() {
 	// Tier 1
-	prometheus.MustRegister(HTTPRequestsTotal)
-	prometheus.MustRegister(HTTPRequestDuration)
+	register(HTTPRequestsTotal)
+	register(HTTPRequestDuration)
 
 	// Tier 2
-	prometheus.MustRegister(AlertsReceivedTotal)
-	prometheus.MustRegister(AlertGroupsCreatedTotal)
-	prometheus.MustRegister(UnknownTeamAlertGroupsTotal)
-	prometheus.MustRegister(AlertGroupsResolvedTotal)
+	register(AlertsReceivedTotal)
+	register(AlertGroupsCreatedTotal)
+	register(UnknownTeamAlertGroupsTotal)
+	register(AlertGroupsResolvedTotal)
 
 	// Tier 4
-	prometheus.MustRegister(EngineRunsTotal)
-	prometheus.MustRegister(EngineAlertGroupsPickedTotal)
-	prometheus.MustRegister(EngineEscalationBuildDeferralsTotal)
-	prometheus.MustRegister(EngineEscalationSourceChangedTotal)
+	register(EngineRunsTotal)
+	register(EngineAlertGroupsPickedTotal)
+	register(EngineEscalationBuildDeferralsTotal)
+	register(EngineEscalationSourceChangedTotal)
 
 	// Tier 5
-	prometheus.MustRegister(HandoffWarmupNotComplete)
+	register(HandoffWarmupNotComplete)
 
 	// MTTR
-	prometheus.MustRegister(AlertGroupResolutionDuration)
+	register(AlertGroupResolutionDuration)
 
 	// MTTA
-	prometheus.MustRegister(AlertGroupAckDuration)
+	register(AlertGroupAckDuration)
 
 	// Tier 6
-	prometheus.MustRegister(SlackUserLinkedTotal)
-	prometheus.MustRegister(SlackInteractionTotal)
-	prometheus.MustRegister(SlackUnlinkedUserTotal)
+	register(SlackUserLinkedTotal)
+	register(SlackInteractionTotal)
+	register(SlackUnlinkedUserTotal)
 
-	prometheus.MustRegister(TelegramUserLinkedTotal)
-	prometheus.MustRegister(TelegramInteractionTotal)
-	prometheus.MustRegister(TelegramUnlinkedUserTotal)
+	register(TelegramUserLinkedTotal)
+	register(TelegramInteractionTotal)
+	register(TelegramUnlinkedUserTotal)
 
 	// Tier 8
-	prometheus.MustRegister(OutboundAttemptsTotal)
-	prometheus.MustRegister(OutboundIntentsTerminalTotal)
-	prometheus.MustRegister(OutboundContractViolationsTotal)
-	prometheus.MustRegister(OutboundAdmissionsTotal)
-	prometheus.MustRegister(OutboundDesiredRevisionsTotal)
-	prometheus.MustRegister(OutboundAdmissionLatencySeconds)
-	prometheus.MustRegister(OutboundWorkerTicksTotal)
-	prometheus.MustRegister(OutboundFanOutTicksTotal)
-	prometheus.MustRegister(OutboundLeasesExpiredTotal)
-	prometheus.MustRegister(OutboundRetentionWindowDays)
-	prometheus.MustRegister(OutboundRetentionLastSuccess)
-	prometheus.MustRegister(OutboundRetentionDeletedTotal)
-	prometheus.MustRegister(StorageContractFailuresTotal)
+	register(OutboundAttemptsTotal)
+	register(OutboundIntentsTerminalTotal)
+	register(OutboundContractViolationsTotal)
+	register(OutboundAdmissionsTotal)
+	register(OutboundDesiredRevisionsTotal)
+	register(OutboundAdmissionLatencySeconds)
+	register(OutboundWorkerTicksTotal)
+	register(OutboundFanOutTicksTotal)
+	register(OutboundLeasesExpiredTotal)
+	register(OutboundRetentionWindowDays)
+	register(OutboundRetentionLastSuccess)
+	register(OutboundRetentionDeletedTotal)
+	register(StorageContractFailuresTotal)
 }
 
 // ObserveAck records the ack duration (MTTA) for an alert group.

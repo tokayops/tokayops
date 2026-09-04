@@ -1,0 +1,400 @@
+# Unit tests for tokayops.rules.yml: every alert fires on the situation it is
+# for and stays silent on the one it is not. Run with
+#   promtool test rules deploy/prometheus/tokayops.rules.test.yml
+# Time in these tests starts at the Unix epoch; time() at eval_time is the
+# number of seconds since it.
+
+rule_files:
+  - tokayops.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---- lateness ----
+  - interval: 1m
+    input_series:
+      - series: 'outbound_queue_lateness_seconds{family="notification"}'
+        values: '30 30 30 30 30 30 30 90 90 90 90 90 90 90 0 0'
+      - series: 'outbound_queue_lateness_seconds{family="handoff"}'
+        values: '1000x40'
+      - series: 'outbound_queue_lateness_seconds{family="webhook"}'
+        values: '400x20'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: OutboundPagingLate
+        exp_alerts: []
+      - eval_time: 13m
+        alertname: OutboundPagingLate
+        exp_alerts:
+          - exp_labels: {severity: critical, family: notification}
+            exp_annotations:
+              summary: "Paging is 1m 30s behind"
+              description: "The oldest due notification has been waiting for 1m 30s. Check the notification worker's ticks and the provider's latency."
+      - eval_time: 15m
+        alertname: OutboundPagingLate
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OutboundHandoffLate
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: OutboundHandoffLate
+        exp_alerts:
+          - exp_labels: {severity: warning, family: handoff}
+            exp_annotations:
+              summary: "Shift-change announcements are 16m 40s behind"
+              description: "The handoff family has a small pool of its own; a backlog here does not slow paging, but people are told late about their shift."
+      - eval_time: 11m
+        alertname: OutboundWebhookLate
+        exp_alerts:
+          - exp_labels: {severity: warning, family: webhook}
+            exp_annotations:
+              summary: "Webhook deliveries are 6m 40s behind"
+              description: "The webhook pool is saturated - a subscriber that does not answer holds a slot for its whole timeout. Find the slow subscriber in the delivery journal."
+
+  # ---- speed ----
+  - interval: 1m
+    input_series:
+      # Every page took between 10 and 30 seconds: p99 lands near 30.
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="5"}'
+        values: '0x30'
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="10"}'
+        values: '0x30'
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="30"}'
+        values: '0+10x30'
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="+Inf"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OutboundPagingSlow
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: OutboundPagingSlow
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "p99 of paging latency is 29.8s over the last hour"
+              description: "The objective is p95 under 5s and p99 under 10s. This is the hourly view; the 30-day report is the recording rule outbound:admission_latency_seconds:p99_30d."
+  - interval: 1m
+    input_series:
+      # Every page took under five seconds: silent.
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="5"}'
+        values: '0+10x30'
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="10"}'
+        values: '0+10x30'
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="30"}'
+        values: '0+10x30'
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="+Inf"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: OutboundPagingSlow
+        exp_alerts: []
+
+  # ---- levels: fire while the row is there, clear the moment it is not ----
+  - interval: 1m
+    input_series:
+      - series: 'outbound_intents_by_status{family="notification",status="permanent_failed"}'
+        values: '0 0 1 1 0 0'
+      - series: 'outbound_intents_by_status{family="handoff",status="permanent_failed"}'
+        values: '0 0 0 0 0 2'
+      - series: 'outbound_intents_by_status{family="webhook",status="permanent_failed"}'
+        values: '3x20'
+      - series: 'outbound_intents_by_status{family="notification",status="expired"}'
+        values: '0 1 0'
+      - series: 'outbound_intents_by_status{family="notification",status="manual_review"}'
+        values: '1x10'
+      - series: 'outbound_intents_by_status{family="notification",status="pending"}'
+        values: '5x20'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: OutboundPagingFailed
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: OutboundPagingFailed
+        exp_alerts:
+          - exp_labels: {severity: critical, family: notification, status: permanent_failed}
+            exp_annotations:
+              summary: "1 notification deliveries failed for good"
+              description: "Open the delivery journal (Activity, status permanent_failed) and decide: cancel, retry, or retry as a new message. The alert clears when no row is left in this state."
+      # Cleared without delay once the row is decided about.
+      - eval_time: 4m
+        alertname: OutboundPagingFailed
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: OutboundPagingFailed
+        exp_alerts:
+          - exp_labels: {severity: critical, family: handoff, status: permanent_failed}
+            exp_annotations:
+              summary: "2 handoff deliveries failed for good"
+              description: "Open the delivery journal (Activity, status permanent_failed) and decide: cancel, retry, or retry as a new message. The alert clears when no row is left in this state."
+      - eval_time: 5m
+        alertname: OutboundWebhookFailed
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: OutboundWebhookFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, family: webhook, status: permanent_failed}
+            exp_annotations:
+              summary: "3 webhook deliveries failed for good"
+              description: "A subscriber refused (4xx). Fix the subscriber and replay the delivery from its integration's deliveries; a failed webhook delivery is never retried in place."
+      - eval_time: 1m
+        alertname: OutboundPagingExpired
+        exp_alerts:
+          - exp_labels: {severity: critical, family: notification, status: expired}
+            exp_annotations:
+              summary: "1 pages expired before they were sent"
+              description: "Decide in the delivery journal: retry with a new deadline is the only decision an expired delivery takes."
+      - eval_time: 2m
+        alertname: OutboundPagingExpired
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: OutboundAwaitingDecision
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OutboundAwaitingDecision
+        exp_alerts:
+          - exp_labels: {severity: warning, family: notification, status: manual_review}
+            exp_annotations:
+              summary: "1 notification deliveries are waiting for a person"
+              description: "A call was made and nobody knows whether it landed. Decide in the delivery journal: assume it was delivered, cancel, retry, or retry as a new message (accepting that a duplicate may exist)."
+
+  # ---- nobody to page: a durable counter that grew ----
+  - interval: 1m
+    input_series:
+      - series: 'outbound_no_targets_admissions_total{family="notification"}'
+        values: '2 2 2 2 3 3 3 3 3 3 3 3 3 3 3 3 3'
+      - series: 'outbound_no_targets_admissions_total{family="handoff"}'
+        values: '0+1x16'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OutboundNobodyToPage
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: OutboundNobodyToPage
+        exp_alerts:
+          - exp_labels: {severity: critical, family: notification}
+            exp_annotations:
+              summary: "An alert was admitted with nobody to page"
+              description: "The team's policy resolved to no recipient: no on-call, no linked account, or no policy. The alert's timeline names the step. Fix the schedule or the policy; the alert stays firing in the UI."
+      - eval_time: 16m
+        alertname: OutboundNobodyToPage
+        exp_alerts: []
+
+  # ---- liveness ----
+  - interval: 1m
+    input_series:
+      - series: 'outbound_worker_ticks_total{family="notification"}'
+        values: '0+60x20'
+      - series: 'outbound_worker_ticks_total{family="handoff"}'
+        values: '7x20'
+      - series: 'outbound_worker_ticks_total{family="webhook"}'
+        values: '0+30x20'
+      - series: 'outbound_fanout_ticks_total'
+        values: '3x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OutboundWorkerStopped
+        exp_alerts:
+          - exp_labels: {severity: critical, family: handoff}
+            exp_annotations:
+              summary: "The handoff delivery worker has not ticked for 5 minutes"
+              description: "Nothing of the handoff family is being delivered. Check the process log and restart if the loop is gone."
+      - eval_time: 12m
+        alertname: OutboundFanOutStopped
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "The webhook fan-out has not ticked for 5 minutes"
+              description: "Alert events are not being turned into webhook deliveries; they wait in event_outbox as pending. Check the process log."
+
+  # ---- retention: a fleet of two, and the success of any one of them ----
+  - interval: 1m
+    input_series:
+      - series: 'outbound_retention_window_days{instance="a"}'
+        values: '30x200'
+      - series: 'outbound_retention_window_days{instance="b"}'
+        values: '30x200'
+      # a succeeded once, at the epoch, and never again; b keeps succeeding
+      # (its value follows the clock) until minute 60, then stops.
+      - series: 'outbound_retention_last_success_timestamp_seconds{instance="a"}'
+        values: '0x200'
+      - series: 'outbound_retention_last_success_timestamp_seconds{instance="b"}'
+        values: '0+60x60 3600x140'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: OutboundRetentionStalled
+        exp_alerts: []
+      - eval_time: 181m
+        alertname: OutboundRetentionStalled
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Delivery history retention has not succeeded for over two hours"
+              description: "The sweep runs hourly; a busy pass or a failed chunk records no success. Check the process log for 'outbound retention' lines and for a transaction holding the advisory lock."
+      - eval_time: 181m
+        alertname: OutboundRetentionNeverSucceeded
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # Retention is on and no pass has ever succeeded: the loop was not
+      # started.
+      - series: 'outbound_retention_window_days'
+        values: '30x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OutboundRetentionNeverSucceeded
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: OutboundRetentionNeverSucceeded
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Delivery history retention is on and has never succeeded"
+              description: "No pass has reached its commit since the process started. Check the process log for 'outbound retention' lines."
+      - eval_time: 16m
+        alertname: OutboundRetentionStalled
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # Retention is off: nothing to expect.
+      - series: 'outbound_retention_window_days'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OutboundRetentionNeverSucceeded
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: OutboundRetentionStalled
+        exp_alerts: []
+
+  # ---- the metrics themselves: absent, not zero ----
+  - interval: 1m
+    input_series:
+      - series: 'outbound_queue_lateness_seconds{family="notification"}'
+        values: '0 0 0 0 0 0 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: OutboundMetricsAbsent
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: OutboundMetricsAbsent
+        exp_alerts:
+          - exp_labels: {severity: critical, family: notification}
+            exp_annotations:
+              summary: "The delivery metrics are not being served"
+              description: "The metrics snapshot reads the database on every scrape and gives up after five seconds; check the target, then the database, then the log for 'snapshot timed out'."
+
+  # ---- contract violations, leases, doubt ----
+  - interval: 1m
+    input_series:
+      - series: 'outbound_contract_violations_total{op="finalize",kind="escalation"}'
+        values: '0 0 0 1 1 1 1 1 1 1'
+      - series: 'storage_contract_failures_total{field="event_outbox"}'
+        values: '4x10'
+      - series: 'outbound_leases_expired_total{family="notification",to="pending"}'
+        values: '0 0 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6'
+      - series: 'outbound_leases_expired_total{family="webhook",to="manual_review"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: OutboundContractBroken
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: OutboundContractBroken
+        exp_alerts:
+          - exp_labels: {severity: warning, op: finalize, kind: escalation}
+            exp_annotations:
+              summary: "A delivery contract was violated (finalize, escalation)"
+              description: "A row this build cannot act on, or a call it refused to make. The log names the row. The durable consequence - a queue that does not move - is caught by the lateness rules."
+      - eval_time: 8m
+        alertname: StorageContractBroken
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: OutboundLeasesExpiring
+        exp_alerts:
+          - exp_labels: {severity: warning, family: notification, to: pending}
+            exp_annotations:
+              summary: "6 delivery leases expired in 15 minutes (notification, to pending)"
+              description: "Recovery closed attempts whose worker never came back. Check for restarts, and for a provider taking longer than the lease."
+      - eval_time: 19m
+        alertname: OutboundLeasesExpiring
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: 'outbound_attempts_total{family="notification",provider="slack",operation="send",outcome="ambiguous",error_class="no_response"}'
+        values: '0+1x40'
+      - series: 'outbound_attempts_total{family="notification",provider="slack",operation="send",outcome="accepted",error_class=""}'
+        values: '0+1x40'
+      - series: 'outbound_attempts_total{family="webhook",provider="webhook",operation="send",outcome="accepted",error_class=""}'
+        values: '0+5x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OutboundAmbiguityRising
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: OutboundAmbiguityRising
+        exp_alerts:
+          - exp_labels: {severity: warning, family: notification, provider: slack}
+            exp_annotations:
+              summary: "50% of slack attempts (notification) end in doubt"
+              description: "Calls go out and no answer is recorded. Check the provider's status and the attempt deadline; expect deliveries waiting for a decision."
+
+  # ---- cards ----
+  - interval: 1m
+    input_series:
+      - series: 'outbound_cards_behind{state="stuck"}'
+        values: '2x20'
+      - series: 'outbound_cards_behind{state="catching_up"}'
+        values: '5x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: OutboundCardsStuck
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: OutboundCardsStuck
+        exp_alerts:
+          - exp_labels: {severity: warning, state: stuck}
+            exp_annotations:
+              summary: "2 alert cards are behind the alert they show"
+              description: "The desired state of a card was raised and no attempt has applied it for ten minutes. Check the notification worker and the provider."
+
+  # The recording rules are checked for syntax by `promtool check rules`;
+  # their value is a quantile over rates, which promtool can only compare for
+  # exact floating-point equality, so no sample is asserted here.
+
+  # ---- alerting and schedules, carried over ----
+  - interval: 1m
+    input_series:
+      - series: 'teams_without_oncall'
+        values: '1x10'
+      - series: 'engine_escalation_build_deferrals_total'
+        values: '0 0 0 2 2 2 2 2 2 2 2 2'
+      - series: 'schedule_oncall_projection_duration_seconds_count{consumer="handoff_notifier"}'
+        values: '5x30'
+      - series: 'schedule_oncall_projection_failures_total{consumer="handoff_notifier",reason="snapshot_decode"}'
+        values: '0 0 0 0 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: TeamsWithoutOnCall
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "1 team(s) have no one on-call"
+      - eval_time: 4m
+        alertname: EscalationBuildDeferred
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "An escalation build was deferred in the last 5 minutes - an alert group may not have paged its on-call"
+      - eval_time: 26m
+        alertname: OnCallProjectionStopped
+        exp_alerts:
+          - exp_labels: {severity: critical, consumer: handoff_notifier}
+            exp_annotations:
+              summary: "The handoff notifier has not projected on-call state for 15m"
+      - eval_time: 10m
+        alertname: OnCallProjectionFailures
+        exp_alerts:
+          - exp_labels: {severity: critical, consumer: handoff_notifier, reason: snapshot_decode}
+            exp_annotations:
+              summary: "A schedule cannot be projected (snapshot_decode); the log names it"

@@ -1,0 +1,311 @@
+# Prometheus rules for a TokayOps deployment.
+#
+# One deployment per Prometheus: the rules aggregate over every instance they
+# see. Load with `rule_files`, and scrape the internal port with a
+# scrape_timeout STRICTLY greater than 5s - the metrics snapshot gives up on
+# the database after five seconds, and a scrape that gives up at the same
+# moment races it. The 30-day recording rules need Prometheus to keep at
+# least 30 days (--storage.tsdb.retention.time=30d or more).
+#
+# Two natures of series. A gauge or counter the collector reads FROM THE
+# DATABASE on every scrape is durable: it says what is true now, whatever any
+# process saw. A counter a process increments after its commit is best
+# effort: a process that dies between the two loses the observation. A rule
+# that must not stay silent stands on a durable series; a rule on a process
+# counter is a warning, for noticing. Each rule below says which it is.
+#
+# Checked in CI: `promtool check rules` and `promtool test rules` against
+# tokayops.rules.test.yml, and a Go test that every series a rule names is one
+# the registry exports.
+
+groups:
+  - name: tokayops-outbound-delivery
+    rules:
+      # ---- lateness: how far behind the queue of a family is (durable) ----
+
+      # The oldest due page has waited longer than a minute. The worker of the
+      # notification family is stuck, out of slots, or the provider is slow for
+      # everyone.
+      - alert: OutboundPagingLate
+        expr: outbound_queue_lateness_seconds{family="notification"} > 60
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Paging is {{ $value | humanizeDuration }} behind"
+          description: "The oldest due notification has been waiting for {{ $value | humanizeDuration }}. Check the notification worker's ticks and the provider's latency."
+
+      - alert: OutboundHandoffLate
+        expr: outbound_queue_lateness_seconds{family="handoff"} > 900
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Shift-change announcements are {{ $value | humanizeDuration }} behind"
+          description: "The handoff family has a small pool of its own; a backlog here does not slow paging, but people are told late about their shift."
+
+      - alert: OutboundWebhookLate
+        expr: outbound_queue_lateness_seconds{family="webhook"} > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook deliveries are {{ $value | humanizeDuration }} behind"
+          description: "The webhook pool is saturated - a subscriber that does not answer holds a slot for its whole timeout. Find the slow subscriber in the delivery journal."
+
+      # ---- speed: how long a page takes from admission to acceptance (process) ----
+
+      - alert: OutboundPagingSlow
+        expr: histogram_quantile(0.99, sum by (le) (rate(outbound_admission_latency_seconds_bucket{family="notification"}[1h]))) > 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 of paging latency is {{ $value | humanizeDuration }} over the last hour"
+          description: "The objective is p95 under 5s and p99 under 10s. This is the hourly view; the 30-day report is the recording rule outbound:admission_latency_seconds:p99_30d."
+
+      # ---- levels: commitments in a state somebody has to act on (durable) ----
+
+      # A page or an announcement failed for good and nobody has decided about
+      # it. The rule holds for as long as the row does: it is cleared by an
+      # operator's decision (cancel or retry) or by retention after the
+      # window, never by time alone.
+      - alert: OutboundPagingFailed
+        expr: outbound_intents_by_status{family=~"notification|handoff",status="permanent_failed"} > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} {{ $labels.family }} deliveries failed for good"
+          description: "Open the delivery journal (Activity, status permanent_failed) and decide: cancel, retry, or retry as a new message. The alert clears when no row is left in this state."
+
+      - alert: OutboundWebhookFailed
+        expr: outbound_intents_by_status{family="webhook",status="permanent_failed"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} webhook deliveries failed for good"
+          description: "A subscriber refused (4xx). Fix the subscriber and replay the delivery from its integration's deliveries; a failed webhook delivery is never retried in place."
+
+      # Expired in the notification family needs a producer that sets a
+      # deadline; none does today, so this stays at zero and is written for the
+      # day one does. The only way out of expired is a retry with a new deadline.
+      - alert: OutboundPagingExpired
+        expr: outbound_intents_by_status{family="notification",status="expired"} > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} pages expired before they were sent"
+          description: "Decide in the delivery journal: retry with a new deadline is the only decision an expired delivery takes."
+
+      - alert: OutboundAwaitingDecision
+        expr: outbound_intents_by_status{status="manual_review"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} {{ $labels.family }} deliveries are waiting for a person"
+          description: "A call was made and nobody knows whether it landed. Decide in the delivery journal: assume it was delivered, cancel, retry, or retry as a new message (accepting that a duplicate may exist)."
+
+      # An escalation that found nobody to page. Durable: the count is read
+      # from the claims, so a process that died after admitting one still
+      # shows it.
+      - alert: OutboundNobodyToPage
+        expr: increase(outbound_no_targets_admissions_total{family="notification"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "An alert was admitted with nobody to page"
+          description: "The team's policy resolved to no recipient: no on-call, no linked account, or no policy. The alert's timeline names the step. Fix the schedule or the policy; the alert stays firing in the UI."
+
+      # ---- liveness: loops that stopped (process, but the absence of an increment is the signal) ----
+
+      # The series exist from registration with a zero value, so a worker that
+      # never started is a flat line here, not a missing one.
+      - alert: OutboundWorkerStopped
+        expr: rate(outbound_worker_ticks_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The {{ $labels.family }} delivery worker has not ticked for 5 minutes"
+          description: "Nothing of the {{ $labels.family }} family is being delivered. Check the process log and restart if the loop is gone."
+
+      - alert: OutboundFanOutStopped
+        expr: rate(outbound_fanout_ticks_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The webhook fan-out has not ticked for 5 minutes"
+          description: "Alert events are not being turned into webhook deliveries; they wait in event_outbox as pending. Check the process log."
+
+      # ---- retention (process) ----
+
+      # max over instances: a success on any instance is the fleet's success -
+      # only one sweeps at a time, the others answer busy and record nothing.
+      # A maximum that stopped moving is a loop that stopped or a lock nobody
+      # releases. Two hours is two missed hourly passes.
+      - alert: OutboundRetentionStalled
+        expr: max(outbound_retention_window_days) > 0 and (time() - max(outbound_retention_last_success_timestamp_seconds)) > 7200
+        labels:
+          severity: warning
+        annotations:
+          summary: "Delivery history retention has not succeeded for over two hours"
+          description: "The sweep runs hourly; a busy pass or a failed chunk records no success. Check the process log for 'outbound retention' lines and for a transaction holding the advisory lock."
+
+      # Enabled and never succeeded: the loop was never started, or every pass
+      # has failed since the start. The first pass runs a minute after the
+      # start; fifteen minutes is the grace for a slow database.
+      - alert: OutboundRetentionNeverSucceeded
+        expr: max(outbound_retention_window_days) > 0 unless max(outbound_retention_last_success_timestamp_seconds)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Delivery history retention is on and has never succeeded"
+          description: "No pass has reached its commit since the process started. Check the process log for 'outbound retention' lines."
+
+      # ---- the metrics themselves ----
+
+      # The lateness series of the notification family is normative: the
+      # snapshot exports it at zero when nothing is due. Its absence means the
+      # snapshot is not being served - the database query timed out, or the
+      # target is gone.
+      - alert: OutboundMetricsAbsent
+        expr: absent(outbound_queue_lateness_seconds{family="notification"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The delivery metrics are not being served"
+          description: "The metrics snapshot reads the database on every scrape and gives up after five seconds; check the target, then the database, then the log for 'snapshot timed out'."
+
+      # ---- contract violations and doubt (process, best effort) ----
+
+      - alert: OutboundContractBroken
+        expr: increase(outbound_contract_violations_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A delivery contract was violated ({{ $labels.op }}, {{ $labels.kind }})"
+          description: "A row this build cannot act on, or a call it refused to make. The log names the row. The durable consequence - a queue that does not move - is caught by the lateness rules."
+
+      - alert: StorageContractBroken
+        expr: increase(storage_contract_failures_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A stored row cannot be read ({{ $labels.field }})"
+          description: "A row is holding a queue because this build cannot read it. The log names the row and the field; an operator repairs or removes it."
+
+      # One expiry is a process that died with a call in flight; five in a
+      # quarter of an hour is a provider that answers slower than the lease, or
+      # a fleet being restarted in a loop.
+      - alert: OutboundLeasesExpiring
+        expr: increase(outbound_leases_expired_total[15m]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} delivery leases expired in 15 minutes ({{ $labels.family }}, to {{ $labels.to }})"
+          description: "Recovery closed attempts whose worker never came back. Check for restarts, and for a provider taking longer than the lease."
+
+      # A healthy provider's share of ambiguous outcomes is timeouts after the
+      # request went out - a few per thousand. Ten percent is a provider that
+      # accepts and does not answer, and duplicates become regular.
+      - alert: OutboundAmbiguityRising
+        expr: sum by (family, provider) (rate(outbound_attempts_total{outcome="ambiguous"}[15m])) / sum by (family, provider) (rate(outbound_attempts_total[15m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of {{ $labels.provider }} attempts ({{ $labels.family }}) end in doubt"
+          description: "Calls go out and no answer is recorded. Check the provider's status and the attempt deadline; expect deliveries waiting for a decision."
+
+      # A card whose message is behind the alert it shows (durable).
+      - alert: OutboundCardsStuck
+        expr: outbound_cards_behind{state="stuck"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} alert cards are behind the alert they show"
+          description: "The desired state of a card was raised and no attempt has applied it for ten minutes. Check the notification worker and the provider."
+
+  # The service-level report: p95 and p99 of paging latency over the last 30
+  # days, by family. A report, not an alert - a 30-day window notices a
+  # degradation a week late. Meaningful only when Prometheus keeps 30 days.
+  - name: tokayops-outbound-slo
+    interval: 5m
+    rules:
+      - record: outbound:admission_latency_seconds:p95_30d
+        expr: histogram_quantile(0.95, sum by (family, le) (rate(outbound_admission_latency_seconds_bucket[30d])))
+      - record: outbound:admission_latency_seconds:p99_30d
+        expr: histogram_quantile(0.99, sum by (family, le) (rate(outbound_admission_latency_seconds_bucket[30d])))
+
+  - name: tokayops-alerting-and-schedules
+    rules:
+      - alert: TeamsWithoutOnCall
+        expr: teams_without_oncall > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} team(s) have no one on-call"
+
+      # Says a deferral happened in the window, not that one is happening now:
+      # the counter cannot express "currently waiting", and the condition stays
+      # true for the rest of the window after the reads recover. No `for` - it
+      # would only delay the alert, not prove the trouble continues.
+      - alert: EscalationBuildDeferred
+        expr: increase(engine_escalation_build_deferrals_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "An escalation build was deferred in the last 5 minutes - an alert group may not have paged its on-call"
+
+      - alert: HighMTTR
+        expr: |
+          (rate(alert_group_resolution_duration_seconds_sum{severity="critical"}[7d])
+           / rate(alert_group_resolution_duration_seconds_count{severity="critical"}[7d]))
+          > 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Average MTTR for critical alerts exceeds 1 hour"
+
+      # The one of the three schedule alerts that fires in normal operation:
+      # the notifier stopped ticking, so no on-call DM will be sent at all.
+      - alert: OnCallProjectionStopped
+        expr: |
+          rate(schedule_oncall_projection_duration_seconds_count{consumer="handoff_notifier"}[15m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The handoff notifier has not projected on-call state for 15m"
+
+      # increase(), not `> 0`: a counter does not go down after a repair, so a
+      # bare threshold would keep firing forever.
+      - alert: OnCallProjectionFailures
+        expr: |
+          increase(schedule_oncall_projection_failures_total{consumer="handoff_notifier"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A schedule cannot be projected ({{ $labels.reason }}); the log names it"
+
+      # The threshold for reworking the read path into batch queries. 5s is a
+      # bucket boundary, so the quantile does not interpolate across it.
+      - alert: OnCallProjectionSlow
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(
+            schedule_oncall_projection_duration_seconds_bucket{consumer="handoff_notifier"}[30m]
+          ))) > 5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 of the on-call projection tick is over 5s"

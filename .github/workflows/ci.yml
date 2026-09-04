@@ -86,9 +86,30 @@ jobs:
         ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       run: go test -p 1 -tags=integration -v ./internal/...
 
+  # The Prometheus rules ship with the product and are checked like code:
+  # syntax, and the unit tests beside them. The image is pinned so that a new
+  # promtool cannot change what passes without a change here.
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Check the rules
+      run: |
+        docker run --rm --entrypoint promtool \
+          -v "$PWD/deploy/prometheus:/rules:ro" prom/prometheus:v3.5.0 \
+          check rules /rules/tokayops.rules.yml
+
+    - name: Test the rules
+      run: |
+        docker run --rm --entrypoint promtool \
+          -v "$PWD/deploy/prometheus:/rules:ro" -w /rules prom/prometheus:v3.5.0 \
+          test rules /rules/tokayops.rules.test.yml
+
   build-and-push:
     runs-on: ubuntu-latest
-    needs: [test, integration-test]  # Run both test jobs first
+    needs: [test, integration-test, rules]  # Every check first
     permissions:
       contents: read
       packages: write   # push images to GHCR via GITHUB_TOKEN
