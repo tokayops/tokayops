@@ -814,6 +814,11 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		// by user id, the same class as users.id, which the directory turns
 		// into names on read - and into "Deleted user" for somebody erased.
 		"schedule_revisions.snapshot": true,
+		// The escalation policy as it was applied to the alert: its name and
+		// its steps, a direct target among them by user id - the same class as
+		// outbound_intents.target_ref. No name of a person is in it. The alert
+		// domain's snapshot, kept for the same reason as its acknowledged_by.
+		"alert_groups.policy_snapshot": true,
 		// The alert domain's snapshot of who was on call: full users with their
 		// email. Outside this epic, and named here with the bug that owns it
 		// (bug 14, "ids in the snapshot, names on read") rather than glossed.
@@ -895,9 +900,11 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		       OR column_name = 'admission_snapshot'
 		       OR column_name = 'snapshot'
 		       OR column_name = 'oncall_snapshot'
+		       OR column_name = 'policy_snapshot'
 		       OR column_name = 'actor'
 		       OR column_name = 'actor_kind'
 		       OR column_name = 'reason'
+		       OR column_name = 'change_reason'
 		       OR column_name = 'detail'
 		       OR column_name = 'metadata'
 		       OR (table_name = 'users' AND column_name IN
@@ -952,17 +959,17 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 	// here for a while - `alert_groups.acked_by` and `alert_groups.assigned_to`
 	// - while the real column, `acknowledged_by`, was never even scanned.
 	//
-	// Only classifications of a SCANNED column name are checked: `reason` and
-	// `change_reason` are classified deliberately and are outside this query's
-	// filter, so their absence from `seen` means nothing.
+	// Only classifications of a SCANNED column name are checked; every name
+	// the query asks for is in this set, so that a classification under any
+	// of them names a column that exists.
 	scannedNames := map[string]bool{
 		"user_id": true, "created_by": true, "recorded_by": true,
 		"acknowledged_by": true, "resolved_by": true,
 		"target_ref": true, "bound_endpoint": true,
 		"receipt": true, "response_summary": true, "completion_fingerprint": true,
 		"receipt_ref": true, "payload": true, "admission_snapshot": true, "snapshot": true,
-		"oncall_snapshot": true, "actor": true, "actor_kind": true, "reason": true,
-		"detail": true, "metadata": true,
+		"oncall_snapshot": true, "policy_snapshot": true, "actor": true, "actor_kind": true,
+		"reason": true, "change_reason": true, "detail": true, "metadata": true,
 	}
 	var phantom []string
 	for _, set := range []map[string]bool{erased, byDesign, liveThenRetention} {

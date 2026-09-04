@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
@@ -954,12 +955,13 @@ func TestRetentionRemovesAnEventTheOldTableStillNames(t *testing.T) {
 	}
 }
 
-// TestAnErasedActorLeavesTheEventAndItsCommitmentUntilRetention: the person
-// who acknowledged is erased; the event raised under their name and the
-// webhook body derived from it are left byte for byte - live data under a
+// TestAnErasedActorLeavesTheEventAndItsCommitmentUntilRetention: Alice
+// acknowledges an alert, which raises an event under her name and, through
+// the fan-out, a webhook body carrying it; then Alice is erased. The event's
+// actor and payload and the body are left byte for byte - live data under a
 // digest - and once both are finished and past the window the sweep takes
-// both rows. That is the policy for what erasure leaves alone: a term, not
-// a scrub.
+// both rows. That is the policy for what erasure leaves alone: a term, not a
+// scrub.
 func TestAnErasedActorLeavesTheEventAndItsCommitmentUntilRetention(t *testing.T) {
 	s := setupTestDB(t)
 	ctx := context.Background()
@@ -978,23 +980,48 @@ func TestAnErasedActorLeavesTheEventAndItsCommitmentUntilRetention(t *testing.T)
 	hooks := subscriber(t, s, "hooks", model.WebhookScopeGlobal, "", true)
 	agID := uuid.New().String()
 	if err := s.CreateAlertGroup(&model.AlertGroup{
-		ID: agID, AlertKey: "erasure-" + agID, Status: model.AlertGroupStatusNew, Title: "Disk", Severity: "critical",
+		ID: agID, AlertKey: "erasure-" + agID, Status: model.AlertGroupStatusTriggered, Title: "Disk", Severity: "critical",
 		TeamID: "devops", Alerts: []model.Alert{{Fingerprint: "fp", Status: "firing"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	webhookEventFor(t, s, agID, "devops", model.OutboxEventAcknowledged,
-		`{"event":"alert_group.acknowledged","actor":{"name":"Alice","email":"alice@example.com"}}`)
-	owed := onlyOne(t, commitmentsOwedTo(t, s, hooks))
-	var eventID string
-	var eventBefore, eventActorBefore string
+
+	// The acknowledgement, the way the doors make it: the event is raised
+	// under the person's name, with the body the subscribers will get.
+	ag, err := s.GetAlertGroupByID(agID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := model.BuildWebhookEventPayload(model.OutboxEventAcknowledged, ag, "devops",
+		"Alice", "alice@example.com", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := s.AckAlertGroupAtomic(agID, alertgroup.Actor{ID: "alice", Name: "Alice", Email: "alice@example.com"},
+		nil, &model.OutboxEvent{
+			EventType: model.OutboxEventAcknowledged, AlertGroupID: agID, TeamID: "devops",
+			Actor: "Alice", Payload: body,
+		})
+	if err != nil || !changed {
+		t.Fatalf("acknowledge as Alice: %v (changed %v)", err, changed)
+	}
+	fanOutNext(t, s)
+	owed := webhookCommitmentTo(t, s, hooks)
+
+	var eventID, eventBefore, eventActorBefore string
 	if err := s.db.QueryRow(`SELECT id, payload::text, actor FROM event_outbox WHERE alert_group_id = $1`, agID).
 		Scan(&eventID, &eventBefore, &eventActorBefore); err != nil {
 		t.Fatalf("read the event: %v", err)
 	}
-	intentBefore, err := s.GetIntent(ctx, owed.ID)
+	if eventActorBefore != "Alice" || !strings.Contains(eventBefore, "alice@example.com") {
+		t.Fatalf("the event was not raised under Alice: actor %q, payload %s", eventActorBefore, eventBefore)
+	}
+	intentBefore, err := s.GetIntent(ctx, owed)
 	if err != nil || intentBefore == nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(string(intentBefore.Payload), "alice@example.com") {
+		t.Fatalf("the body does not carry Alice: %s", intentBefore.Payload)
 	}
 
 	if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "alice"); err != nil {
@@ -1005,14 +1032,14 @@ func TestAnErasedActorLeavesTheEventAndItsCommitmentUntilRetention(t *testing.T)
 		Scan(&eventAfter, &eventActorAfter); err != nil {
 		t.Fatalf("read the event again: %v", err)
 	}
-	intentAfter, err := s.GetIntent(ctx, owed.ID)
+	intentAfter, err := s.GetIntent(ctx, owed)
 	if err != nil || intentAfter == nil {
 		t.Fatal(err)
 	}
 	if eventAfter != eventBefore || eventActorAfter != eventActorBefore {
 		t.Fatalf("erasure changed the event:\n  %s %s\n  %s %s", eventActorBefore, eventBefore, eventActorAfter, eventAfter)
 	}
-	if !bytes.Equal(intentBefore.Payload, intentAfter.Payload) || !strings.Contains(string(intentAfter.Payload), "alice@example.com") {
+	if !bytes.Equal(intentBefore.Payload, intentAfter.Payload) {
 		t.Fatalf("erasure changed the body:\n  %s\n  %s", intentBefore.Payload, intentAfter.Payload)
 	}
 
@@ -1024,13 +1051,13 @@ func TestAnErasedActorLeavesTheEventAndItsCommitmentUntilRetention(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	ageIntent(t, s, owed.ID, 31*day)
+	ageIntent(t, s, owed, 31*day)
 	ageEvent(t, s, eventID, 31*day)
 	got := sweepOlderThan(t, s, 30*day)
 	if got.Deleted.Intents != 1 || got.Deleted.Outbox != 1 {
 		t.Fatalf("the sweep reports %+v; want the commitment and the event gone", got.Deleted)
 	}
-	if countWhere(t, s, `SELECT count(*) FROM outbound_intents WHERE id = $1`, owed.ID) != 0 ||
+	if countWhere(t, s, `SELECT count(*) FROM outbound_intents WHERE id = $1`, owed) != 0 ||
 		countWhere(t, s, `SELECT count(*) FROM event_outbox WHERE id = $1`, eventID) != 0 {
 		t.Fatal("a row naming the erased person outlived the window")
 	}
