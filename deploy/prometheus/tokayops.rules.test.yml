@@ -15,10 +15,12 @@ tests:
     input_series:
       - series: 'outbound_queue_lateness_seconds{family="notification"}'
         values: '30 30 30 30 30 30 30 90 90 90 90 90 90 90 0 0'
+      # Behind, but under the threshold, for longer than the rule's window;
+      # then over it: the silent half is the threshold's, not the window's.
       - series: 'outbound_queue_lateness_seconds{family="handoff"}'
-        values: '1000x40'
+        values: '500x20 1000x40'
       - series: 'outbound_queue_lateness_seconds{family="webhook"}'
-        values: '400x20'
+        values: '100x12 400x24'
     alert_rule_test:
       - eval_time: 6m
         alertname: OutboundPagingLate
@@ -33,10 +35,10 @@ tests:
       - eval_time: 15m
         alertname: OutboundPagingLate
         exp_alerts: []
-      - eval_time: 10m
+      - eval_time: 19m
         alertname: OutboundHandoffLate
         exp_alerts: []
-      - eval_time: 16m
+      - eval_time: 36m
         alertname: OutboundHandoffLate
         exp_alerts:
           - exp_labels: {severity: warning, family: handoff}
@@ -44,6 +46,9 @@ tests:
               summary: "Shift-change announcements are 16m 40s behind"
               description: "The handoff family has a small pool of its own; a backlog here does not slow paging, but people are told late about their shift."
       - eval_time: 11m
+        alertname: OutboundWebhookLate
+        exp_alerts: []
+      - eval_time: 23m
         alertname: OutboundWebhookLate
         exp_alerts:
           - exp_labels: {severity: warning, family: webhook}
@@ -136,7 +141,7 @@ tests:
           - exp_labels: {severity: warning, family: webhook, status: permanent_failed}
             exp_annotations:
               summary: "3 webhook deliveries failed for good"
-              description: "A subscriber refused (4xx). Fix the subscriber and replay the delivery from its integration's deliveries; a failed webhook delivery is never retried in place."
+              description: "Refused for good: a 4xx from the subscriber, a redirect that was not followed, or an address the policy refuses before any call (ip_policy - the name resolved to a private address), or a subscriber with no usable URL. The journal names the class. Fix the subscriber and replay the delivery from its integration's deliveries; a failed webhook delivery is never retried in place."
       - eval_time: 1m
         alertname: OutboundPagingExpired
         exp_alerts:
@@ -156,7 +161,7 @@ tests:
           - exp_labels: {severity: warning, family: notification, status: manual_review}
             exp_annotations:
               summary: "1 notification deliveries are waiting for a person"
-              description: "A call was made and nobody knows whether it landed. Decide in the delivery journal: assume it was delivered, cancel, retry, or retry as a new message (accepting that a duplicate may exist)."
+              description: "A call was made and nobody knows whether it landed. Decide in the delivery journal; the dialog offers what the family allows - a page may be assumed delivered, canceled or retried (as a new message only with the duplicate risk accepted), a webhook may be assumed delivered or canceled and is sent again by a replay."
 
   # ---- nobody to page: a durable counter that grew ----
   - interval: 1m
@@ -192,6 +197,12 @@ tests:
       - series: 'outbound_fanout_ticks_total'
         values: '3x20'
     alert_rule_test:
+      - eval_time: 3m
+        alertname: OutboundWorkerStopped
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: OutboundFanOutStopped
+        exp_alerts: []
       - eval_time: 12m
         alertname: OutboundWorkerStopped
         exp_alerts:
@@ -290,7 +301,7 @@ tests:
       - series: 'outbound_contract_violations_total{op="finalize",kind="escalation"}'
         values: '0 0 0 1 1 1 1 1 1 1'
       - series: 'storage_contract_failures_total{field="event_outbox"}'
-        values: '4x10'
+        values: '4 4 4 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5'
       - series: 'outbound_leases_expired_total{family="notification",to="pending"}'
         values: '0 0 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6'
       - series: 'outbound_leases_expired_total{family="webhook",to="manual_review"}'
@@ -306,7 +317,17 @@ tests:
             exp_annotations:
               summary: "A delivery contract was violated (finalize, escalation)"
               description: "A row this build cannot act on, or a call it refused to make. The log names the row. The durable consequence - a queue that does not move - is caught by the lateness rules."
-      - eval_time: 8m
+      - eval_time: 2m
+        alertname: StorageContractBroken
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: StorageContractBroken
+        exp_alerts:
+          - exp_labels: {severity: warning, field: event_outbox}
+            exp_annotations:
+              summary: "A stored row cannot be read (event_outbox)"
+              description: "A row is holding a queue because this build cannot read it. The log names the row and the field; an operator repairs or removes it."
+      - eval_time: 12m
         alertname: StorageContractBroken
         exp_alerts: []
       - eval_time: 4m
@@ -358,9 +379,32 @@ tests:
               summary: "2 alert cards are behind the alert they show"
               description: "The desired state of a card was raised and no attempt has applied it for ten minutes. Check the notification worker and the provider."
 
-  # The recording rules are checked for syntax by `promtool check rules`;
-  # their value is a quantile over rates, which promtool can only compare for
-  # exact floating-point equality, so no sample is asserted here.
+  # ---- the report: quantiles by family over 30 days ----
+  # A day of pages, then four days of nothing. Sixty of every hundred pages
+  # took under a second and the rest under five, so the quantiles are known:
+  # p50 = 0.83, p90 = 4.0, p95 = 4.5, p99 = 4.9. The assertions are bounds
+  # (bool comparisons multiply to 1), so that the wrong quantile fails and
+  # floating point does not; and they are evaluated on the fourth day, where
+  # a window shorter than the history would see no rate at all.
+  - interval: 5m
+    input_series:
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="1"}'
+        values: '0+60x288 17280x1200'
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="5"}'
+        values: '0+100x288 28800x1200'
+      - series: 'outbound_admission_latency_seconds_bucket{family="notification",le="+Inf"}'
+        values: '0+100x288 28800x1200'
+    promql_expr_test:
+      - expr: (outbound:admission_latency_seconds:p95_30d{family="notification"} > bool 4.25) * (outbound:admission_latency_seconds:p95_30d{family="notification"} < bool 4.75)
+        eval_time: 96h
+        exp_samples:
+          - labels: '{family="notification"}'
+            value: 1
+      - expr: (outbound:admission_latency_seconds:p99_30d{family="notification"} > bool 4.75) * (outbound:admission_latency_seconds:p99_30d{family="notification"} < bool 5)
+        eval_time: 96h
+        exp_samples:
+          - labels: '{family="notification"}'
+            value: 1
 
   # ---- alerting and schedules, carried over ----
   - interval: 1m
@@ -398,3 +442,87 @@ tests:
           - exp_labels: {severity: critical, consumer: handoff_notifier, reason: snapshot_decode}
             exp_annotations:
               summary: "A schedule cannot be projected (snapshot_decode); the log names it"
+  - interval: 1m
+    input_series:
+      # Everybody on call, the engine never deferring, the notifier ticking and
+      # never failing: all four silent.
+      - series: 'teams_without_oncall'
+        values: '0x30'
+      - series: 'engine_escalation_build_deferrals_total'
+        values: '2x30'
+      - series: 'schedule_oncall_projection_duration_seconds_count{consumer="handoff_notifier"}'
+        values: '0+1x30'
+      - series: 'schedule_oncall_projection_failures_total{consumer="handoff_notifier",reason="snapshot_decode"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: TeamsWithoutOnCall
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: EscalationBuildDeferred
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: OnCallProjectionStopped
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OnCallProjectionFailures
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # Critical alerts take an hour and ten minutes each to resolve: the
+      # average over the week is over an hour.
+      - series: 'alert_group_resolution_duration_seconds_sum{severity="critical",team="devops"}'
+        values: '0+4200x80'
+      - series: 'alert_group_resolution_duration_seconds_count{severity="critical",team="devops"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: HighMTTR
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: HighMTTR
+        exp_alerts:
+          - exp_labels: {severity: warning, team: devops}
+            exp_annotations:
+              summary: "Average MTTR for critical alerts exceeds 1 hour"
+  - interval: 1m
+    input_series:
+      - series: 'alert_group_resolution_duration_seconds_sum{severity="critical",team="devops"}'
+        values: '0+600x80'
+      - series: 'alert_group_resolution_duration_seconds_count{severity="critical",team="devops"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: HighMTTR
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # Every projection of the notifier takes between five and ten seconds.
+      - series: 'schedule_oncall_projection_duration_seconds_bucket{consumer="handoff_notifier",le="5"}'
+        values: '0x60'
+      - series: 'schedule_oncall_projection_duration_seconds_bucket{consumer="handoff_notifier",le="10"}'
+        values: '0+1x60'
+      - series: 'schedule_oncall_projection_duration_seconds_bucket{consumer="handoff_notifier",le="+Inf"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OnCallProjectionSlow
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: OnCallProjectionSlow
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "p99 of the on-call projection tick is over 5s"
+  - interval: 1m
+    input_series:
+      - series: 'schedule_oncall_projection_duration_seconds_bucket{consumer="handoff_notifier",le="5"}'
+        values: '0+1x60'
+      - series: 'schedule_oncall_projection_duration_seconds_bucket{consumer="handoff_notifier",le="10"}'
+        values: '0+1x60'
+      - series: 'schedule_oncall_projection_duration_seconds_bucket{consumer="handoff_notifier",le="+Inf"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: OnCallProjectionSlow
+        exp_alerts: []

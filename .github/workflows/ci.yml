@@ -87,8 +87,9 @@ jobs:
       run: go test -p 1 -tags=integration -v ./internal/...
 
   # The Prometheus rules ship with the product and are checked like code:
-  # syntax, and the unit tests beside them. The image is pinned so that a new
-  # promtool cannot change what passes without a change here.
+  # syntax, and the unit tests beside them. The image is pinned by digest -
+  # prom/prometheus v3.5.0 - because a tag can be moved and a digest cannot;
+  # a new promtool cannot change what passes without a change here.
   rules:
     runs-on: ubuntu-latest
     steps:
@@ -98,13 +99,15 @@ jobs:
     - name: Check the rules
       run: |
         docker run --rm --entrypoint promtool \
-          -v "$PWD/deploy/prometheus:/rules:ro" prom/prometheus:v3.5.0 \
+          -v "$PWD/deploy/prometheus:/rules:ro" \
+          prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
           check rules /rules/tokayops.rules.yml
 
     - name: Test the rules
       run: |
         docker run --rm --entrypoint promtool \
-          -v "$PWD/deploy/prometheus:/rules:ro" -w /rules prom/prometheus:v3.5.0 \
+          -v "$PWD/deploy/prometheus:/rules:ro" -w /rules \
+          prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
           test rules /rules/tokayops.rules.test.yml
 
   build-and-push:

@@ -181,3 +181,135 @@ func TestEveryRuleNamesAMetricTheRegistryExports(t *testing.T) {
 		t.Fatalf("rules on series nothing exports:\n  %s", strings.Join(unknown, "\n  "))
 	}
 }
+
+// The unit tests beside the rules file: every alert is tried both ways, and
+// every recording rule is read back.
+
+type rulesTestFile struct {
+	Tests []struct {
+		AlertRuleTests []struct {
+			AlertName string `yaml:"alertname"`
+			ExpAlerts []any  `yaml:"exp_alerts"`
+		} `yaml:"alert_rule_test"`
+		PromQLExprTests []struct {
+			Expr string `yaml:"expr"`
+		} `yaml:"promql_expr_test"`
+	} `yaml:"tests"`
+}
+
+// TestEveryRuleIsTriedBothWays: each alert of the rules file has at least one
+// case in the promtool tests where it fires and one where it stays silent -
+// a rule tried one way only would keep passing with its threshold inverted -
+// and each recording rule is read back by at least one expression test.
+// Every name the tests use is a rule that exists.
+func TestEveryRuleIsTriedBothWays(t *testing.T) {
+	rulesBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "prometheus", "tokayops.rules.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rules rulesFile
+	if err := yaml.Unmarshal(rulesBody, &rules); err != nil {
+		t.Fatal(err)
+	}
+	testsBody, err := os.ReadFile(filepath.Join("..", "..", "deploy", "prometheus", "tokayops.rules.test.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tests rulesTestFile
+	if err := yaml.Unmarshal(testsBody, &tests); err != nil {
+		t.Fatal(err)
+	}
+
+	type tried struct{ fires, silent bool }
+	alerts := map[string]*tried{}
+	records := map[string]bool{}
+	for _, group := range rules.Groups {
+		for _, rule := range group.Rules {
+			if rule.Alert != "" {
+				alerts[rule.Alert] = &tried{}
+			}
+			if rule.Record != "" {
+				records[rule.Record] = false
+			}
+		}
+	}
+	var unknown []string
+	for _, test := range tests.Tests {
+		for _, c := range test.AlertRuleTests {
+			seen, ok := alerts[c.AlertName]
+			if !ok {
+				unknown = append(unknown, c.AlertName)
+				continue
+			}
+			if len(c.ExpAlerts) > 0 {
+				seen.fires = true
+			} else {
+				seen.silent = true
+			}
+		}
+		for _, c := range test.PromQLExprTests {
+			for name := range records {
+				if strings.Contains(c.Expr, name) {
+					records[name] = true
+				}
+			}
+		}
+	}
+	var gaps []string
+	for name, seen := range alerts {
+		switch {
+		case !seen.fires && !seen.silent:
+			gaps = append(gaps, name+" is never tried")
+		case !seen.fires:
+			gaps = append(gaps, name+" is never shown firing")
+		case !seen.silent:
+			gaps = append(gaps, name+" is never shown silent")
+		}
+	}
+	for name, read := range records {
+		if !read {
+			gaps = append(gaps, name+" is never read back")
+		}
+	}
+	sort.Strings(gaps)
+	sort.Strings(unknown)
+	if len(unknown) > 0 {
+		t.Errorf("tests name rules that do not exist: %v", unknown)
+	}
+	if len(gaps) > 0 {
+		t.Errorf("rules the tests do not hold:\n  %s", strings.Join(gaps, "\n  "))
+	}
+}
+
+// TestTheProjectionSeriesExistBeforeTheFirstTick: the liveness rule of each
+// consumer reads the rate of its duration histogram, and a rate over a
+// series that does not exist is an empty vector, not a zero. A consumer
+// whose first projection hangs on the database would never make the series;
+// registration makes it, with no observations.
+func TestTheProjectionSeriesExistBeforeTheFirstTick(t *testing.T) {
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumers := map[string]bool{}
+	for _, family := range families {
+		if family.GetName() != "schedule_oncall_projection_duration_seconds" {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			for _, label := range m.GetLabel() {
+				if label.GetName() == "consumer" {
+					consumers[label.GetValue()] = true
+				}
+			}
+		}
+	}
+	for _, consumer := range metrics.ProjectionConsumers() {
+		if !consumers[consumer] {
+			t.Errorf("no duration series for %s before its first projection; its liveness rule would read an empty vector", consumer)
+		}
+	}
+	if len(metrics.ProjectionConsumers()) != 2 {
+		t.Errorf("%d consumers, want the notifier and the syncer", len(metrics.ProjectionConsumers()))
+	}
+}

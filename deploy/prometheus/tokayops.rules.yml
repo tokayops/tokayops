@@ -85,7 +85,7 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $value }} webhook deliveries failed for good"
-          description: "A subscriber refused (4xx). Fix the subscriber and replay the delivery from its integration's deliveries; a failed webhook delivery is never retried in place."
+          description: "Refused for good: a 4xx from the subscriber, a redirect that was not followed, or an address the policy refuses before any call (ip_policy - the name resolved to a private address), or a subscriber with no usable URL. The journal names the class. Fix the subscriber and replay the delivery from its integration's deliveries; a failed webhook delivery is never retried in place."
 
       # Expired in the notification family needs a producer that sets a
       # deadline; none does today, so this stays at zero and is written for the
@@ -105,7 +105,7 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $value }} {{ $labels.family }} deliveries are waiting for a person"
-          description: "A call was made and nobody knows whether it landed. Decide in the delivery journal: assume it was delivered, cancel, retry, or retry as a new message (accepting that a duplicate may exist)."
+          description: "A call was made and nobody knows whether it landed. Decide in the delivery journal; the dialog offers what the family allows - a page may be assumed delivered, canceled or retried (as a new message only with the duplicate risk accepted), a webhook may be assumed delivered or canceled and is sent again by a replay."
 
       # An escalation that found nobody to page. Durable: the count is read
       # from the claims, so a process that died after admitting one still

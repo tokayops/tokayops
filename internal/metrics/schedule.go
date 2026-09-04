@@ -83,9 +83,22 @@ const (
 	ConsumerUsergroupSyncer = "usergroup_syncer"
 )
 
+// ProjectionConsumers is the closed set, for the zero series and the tests.
+func ProjectionConsumers() []string {
+	return []string{ConsumerHandoffNotifier, ConsumerUsergroupSyncer}
+}
+
 func init() {
 	register(ScheduleOnCallNotificationsTotal)
 	register(HandoffRecipientsSkippedTotal)
 	register(ScheduleOnCallProjectionFailuresTotal)
 	register(ScheduleOnCallProjectionDuration)
+	// The duration histogram doubles as the liveness of each consumer: its
+	// rate is what the rule reads, and a rate over a series that does not
+	// exist is an empty vector, not a zero. A consumer whose very first
+	// projection hangs would never create the series - so it is created here,
+	// with no observations, before any tick.
+	for _, consumer := range ProjectionConsumers() {
+		ScheduleOnCallProjectionDuration.WithLabelValues(consumer)
+	}
 }
