@@ -44,4 +44,7 @@ func init() {
 			metrics.OutboundLeasesExpiredTotal.WithLabelValues(family, string(to))
 		}
 	}
+	for _, table := range RetentionTables() {
+		metrics.OutboundRetentionDeletedTotal.WithLabelValues(table)
+	}
 }

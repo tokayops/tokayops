@@ -355,6 +355,13 @@ definitions:
       to_status:
         type: string
     type: object
+  api.DeliveryGoneResponse:
+    properties:
+      error:
+        type: string
+      retention_days:
+        type: integer
+    type: object
   api.DeliveryJournalResponse:
     properties:
       attempts:
@@ -2231,7 +2238,7 @@ paths:
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/api.ErrorResponse'
+            $ref: '#/definitions/api.DeliveryGoneResponse'
       summary: The journal of one delivery
       tags:
       - deliveries
@@ -2552,6 +2559,10 @@ paths:
             $ref: '#/definitions/api.ErrorResponse'
         "409":
           description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "410":
+          description: Gone
           schema:
             $ref: '#/definitions/api.ErrorResponse'
       summary: Deliver a finished delivery's event to the subscriber again

@@ -189,4 +189,22 @@ test.describe('delivery actors', () => {
     expect(result.webhook.permanent_failed).toEqual({ decisions: ['cancel'], rendered: ['cancel'], deadline: false, replayHint: true });
     expect(result.webhook.expired).toEqual({ decisions: [], rendered: [], deadline: true, replayHint: true });
   });
+
+  // A journal that is not there says whether history has a term, and how long.
+  test('a missing journal says how long history is kept', async ({ page }) => {
+    const result = await page.evaluate(async (module: string) => {
+      (window as any).API = { users: { resolve: async () => ({ users: [] }) } };
+      const mod = await import(module);
+      return {
+        kept: mod.journalMissingMessage({ error: 'delivery not found', retention_days: 30 }),
+        one: mod.journalMissingMessage({ error: 'delivery not found', retention_days: 1 }),
+        forever: mod.journalMissingMessage({ error: 'delivery not found', retention_days: 0 }),
+        unknown: mod.journalMissingMessage(undefined),
+      };
+    }, MODULE);
+    expect(result.kept).toBe('This delivery is not in the journal. Delivery history is kept for 30 days.');
+    expect(result.one).toBe('This delivery is not in the journal. Delivery history is kept for 1 day.');
+    expect(result.forever).toBe('This delivery is not in the journal.');
+    expect(result.unknown).toBe('This delivery is not in the journal.');
+  });
 });

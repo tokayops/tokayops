@@ -253,3 +253,19 @@ func TestAReplayNeedsAKeyAndAnswersWithTheNewDelivery(t *testing.T) {
 		}
 	}
 }
+
+// TestARepeatedKeyAfterRetentionIsGone: the claim is held and holds no
+// commitment any more; the answer is 410, and a new key is the way on.
+func TestARepeatedKeyAfterRetentionIsGone(t *testing.T) {
+	r := setupDeliveryRoutes(t)
+	r.fake.replay = func(store.WebhookReplayRequest) (store.WebhookReplayResult, error) {
+		return store.WebhookReplayResult{}, store.ErrWebhookReplayRetired
+	}
+	rec := r.call(http.MethodPost, "/api/v1/integrations/hooks/deliveries/d-1/replay", "press-1")
+	if rec.Code != http.StatusGone {
+		t.Fatalf("a retired replay answered %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Idempotency-Key") {
+		t.Fatalf("the answer does not say a new key is needed: %s", rec.Body.String())
+	}
+}

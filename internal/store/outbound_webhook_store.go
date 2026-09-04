@@ -177,8 +177,11 @@ func (s *Store) FanOutNextEvent(ctx context.Context) (outbound.FanOutResult, err
 			eventID, admitted.Outcome)
 	}
 
+	// The date of the fan-out is written with the status: retention counts
+	// from it, and an event that waited behind a stopped fan-out is as old as
+	// its commitments, not as its creation.
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE event_outbox SET status = $2 WHERE id = $1`,
+		`UPDATE event_outbox SET status = $2, fanned_out_at = now() WHERE id = $1`,
 		eventID, model.OutboxEventStatusFannedOut); err != nil {
 		return found, fmt.Errorf("mark event %s fanned out: %w", eventID, err)
 	}

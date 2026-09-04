@@ -64,6 +64,9 @@ type API struct {
 	scheduleRead     scheduleconfig.ScheduleReadRepository
 	scheduleRenderer *schedulerender.Service
 	userEraser       *erasure.Service
+	// deliveryRetentionDays is how long delivery history is kept, for the
+	// answer about a delivery that is not in the journal any more; 0 is never.
+	deliveryRetentionDays int
 }
 
 // NewAPI creates a new API instance. Pass nil for oidc if not using OIDC.
@@ -106,6 +109,12 @@ func (a *API) SetScheduleRenderer(svc *schedulerender.Service) {
 
 // SetUserEraser wires the user erasure command. Without it DeleteUser has no
 // safe implementation and refuses rather than falling back to a hard delete.
+// SetDeliveryRetention tells the API the retention window, so that a journal
+// that is not there can say why.
+func (a *API) SetDeliveryRetention(days int) {
+	a.deliveryRetentionDays = days
+}
+
 func (a *API) SetUserEraser(svc *erasure.Service) {
 	a.userEraser = svc
 }

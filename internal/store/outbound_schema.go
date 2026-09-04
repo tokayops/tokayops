@@ -911,6 +911,9 @@ func (s *Store) applyOutboundSchema() error {
 	if err := applyActorSchema(context.Background(), tx); err != nil {
 		return err
 	}
+	if err := applyRetentionSchema(context.Background(), tx); err != nil {
+		return err
+	}
 
 	return tx.Commit()
 }

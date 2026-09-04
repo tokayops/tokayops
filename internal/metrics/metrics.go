@@ -301,6 +301,29 @@ var (
 		Help: "Passes of the webhook fan-out loop, including passes that found no event. A stopped rate is a stopped fan-out.",
 	})
 
+	// OutboundRetentionWindowDays is the configured window; zero when the
+	// sweep is off. The rules read it to know whether to expect a success.
+	OutboundRetentionWindowDays = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "outbound_retention_window_days",
+		Help: "The delivery history retention window in days, as configured; 0 when retention is off.",
+	})
+
+	// OutboundRetentionLastSuccess is when a pass last held the lock and
+	// reached its commit - including a pass that found nothing to remove. A
+	// vector with no labels so that the series does not exist until the first
+	// success: "enabled and never succeeded" is a state the rules alert on,
+	// and a zero would read as a success in 1970.
+	OutboundRetentionLastSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "outbound_retention_last_success_timestamp_seconds",
+		Help: "Unix time of the last retention pass that held the lock and committed. Absent until the first; a busy pass or a failed one does not move it.",
+	}, []string{})
+
+	// OutboundRetentionDeletedTotal counts what retention removed, by table.
+	OutboundRetentionDeletedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_retention_deleted_total",
+		Help: "Rows the delivery history retention removed, by table.",
+	}, []string{"table"})
+
 	// OutboundLeasesExpiredTotal counts attempts that recovery closed because
 	// the worker holding them never came back, by where the commitment went.
 	//
@@ -381,6 +404,9 @@ func init() {
 	prometheus.MustRegister(OutboundWorkerTicksTotal)
 	prometheus.MustRegister(OutboundFanOutTicksTotal)
 	prometheus.MustRegister(OutboundLeasesExpiredTotal)
+	prometheus.MustRegister(OutboundRetentionWindowDays)
+	prometheus.MustRegister(OutboundRetentionLastSuccess)
+	prometheus.MustRegister(OutboundRetentionDeletedTotal)
 	prometheus.MustRegister(StorageContractFailuresTotal)
 }
 

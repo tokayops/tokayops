@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -155,6 +156,25 @@ func cancelRowsTx(ctx context.Context, tx *sql.Tx, query, owner string) ([]strin
 	return ids, rows.Err()
 }
 
+// ErrCommitmentBusy is a commitment held by another transaction for longer
+// than the lock timeout: a retention pass removing it, or another decision.
+var ErrCommitmentBusy = errors.New("the delivery is held by another operation, try again")
+
+// commitmentBusyOr is the lock timeout as the door's answer, and any other
+// error as it is.
+func commitmentBusyOr(err error) error {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code.Name() == "lock_not_available" {
+		return ErrCommitmentBusy
+	}
+	return err
+}
+
+// afterOperatorLock is a test hook, called with the commitment's row locked
+// and before the decision is judged. Production leaves it nil. It exists so
+// a test can hold a decision here while a retention pass runs against it.
+var afterOperatorLock func()
+
 // ResolveAmbiguity is a person deciding what a stuck commitment does.
 //
 // Every path through it is an explicit decision with an audit record. Nothing
@@ -203,10 +223,16 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 
 	intent, _, err := lockIntentTx(ctx, tx, req.IntentID)
 	if err != nil {
-		return outbound.ResolveAmbiguityResult{}, err
+		// Held by somebody else for longer than the lock timeout - retention
+		// removing it, most likely. The person asks again and finds out what
+		// became of it.
+		return outbound.ResolveAmbiguityResult{}, commitmentBusyOr(err)
 	}
 	if intent == nil {
 		return outbound.ResolveAmbiguityResult{Outcome: outbound.ResolveNotFound}, nil
+	}
+	if afterOperatorLock != nil {
+		afterOperatorLock()
 	}
 
 	switch intent.Status {

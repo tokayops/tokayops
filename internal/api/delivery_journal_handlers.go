@@ -123,6 +123,13 @@ type DeliveryEventDTO struct {
 	At         time.Time `json:"at"`
 }
 
+// DeliveryGoneResponse is the 404 of the journal: not found, and how long
+// delivery history is kept - 0 when it is kept for good.
+type DeliveryGoneResponse struct {
+	Error         string `json:"error"`
+	RetentionDays int    `json:"retention_days"`
+}
+
 // DeliveryJournalResponse is everything the system knows about one commitment.
 type DeliveryJournalResponse struct {
 	Delivery     DeliveryDTO              `json:"delivery"`
@@ -405,7 +412,7 @@ func (a *API) ListDeliveries(c echo.Context) error {
 // @Param id path string true "Delivery ID"
 // @Success 200 {object} DeliveryJournalResponse
 // @Failure 403 {object} ErrorResponse
-// @Failure 404 {object} ErrorResponse
+// @Failure 404 {object} DeliveryGoneResponse
 // @Router /api/v1/deliveries/{id} [get]
 func (a *API) GetDeliveryJournal(c echo.Context) error {
 	journal, err := a.store.IntentJournal(c.Request().Context(), c.Param("id"))
@@ -413,7 +420,12 @@ func (a *API) GetDeliveryJournal(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 	if journal == nil {
-		return c.JSON(http.StatusNotFound, ErrorResponse{Error: "delivery not found"})
+		// A delivery that is not here was never here, or was here and is past
+		// the window. The answer says how long history is kept, so that the
+		// person reading it knows which.
+		return c.JSON(http.StatusNotFound, DeliveryGoneResponse{
+			Error: "delivery not found", RetentionDays: a.deliveryRetentionDays,
+		})
 	}
 	return c.JSON(http.StatusOK, journalResponse(journal))
 }

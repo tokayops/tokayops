@@ -445,11 +445,23 @@ export async function openDeliveryJournal(deliveryId) {
         document.getElementById('delivery-modal-close-btn')?.addEventListener('click', closeDeliveryModal);
         document.getElementById('delivery-decide-btn')?.addEventListener('click', () => openDecision(journal));
     } catch (error) {
-        const message = error.status === 404 ? 'This delivery is not in the journal.' : error.message;
+        const message = error.status === 404 ? journalMissingMessage(error.body) : error.message;
         Elements.deliveryModalBody.innerHTML = `<div class="empty-state"><p>${escapeHtml(message)}</p></div>`;
         Elements.deliveryModalFooter.innerHTML = `<div class="modal-footer-right"><button type="button" class="btn btn-secondary" id="delivery-modal-close-btn">Close</button></div>`;
         document.getElementById('delivery-modal-close-btn')?.addEventListener('click', closeDeliveryModal);
     }
+}
+
+/**
+ * What a journal that is not there says: whether history has a term, and
+ * how long it is, is in the answer.
+ */
+export function journalMissingMessage(body) {
+    const days = Number(body?.retention_days);
+    if (Number.isFinite(days) && days > 0) {
+        return `This delivery is not in the journal. Delivery history is kept for ${days} day${days === 1 ? '' : 's'}.`;
+    }
+    return 'This delivery is not in the journal.';
 }
 
 export function closeDeliveryModal() {

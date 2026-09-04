@@ -835,6 +835,12 @@ func (s *Store) buildSchema() error {
 		IF to_regclass('event_outbox_deliveries') IS NOT NULL THEN
 			ALTER TABLE event_outbox_deliveries
 				DROP CONSTRAINT IF EXISTS event_outbox_deliveries_integration_id_fkey;
+			-- And the key to event_outbox, for the same reason: retention
+			-- removes finished events, and a key from a table nothing reads to
+			-- the table it sweeps would roll every pass back, forever. The rows
+			-- it leaves orphaned go with the table, by hand.
+			ALTER TABLE event_outbox_deliveries
+				DROP CONSTRAINT IF EXISTS event_outbox_deliveries_event_id_fkey;
 		END IF;
 	END $$;`); err != nil {
 		return err

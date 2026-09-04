@@ -148,6 +148,7 @@ func (a *API) GetDeliveryDetail(c echo.Context) error {
 // @Failure 403 {object} ErrorResponse
 // @Failure 404 {object} ErrorResponse
 // @Failure 409 {object} ErrorResponse
+// @Failure 410 {object} ErrorResponse
 // @Router /api/v1/integrations/{id}/deliveries/{deliveryId}/replay [post]
 func (a *API) ReplayDelivery(c echo.Context) error {
 	integrationID := c.Param("id")
@@ -174,8 +175,10 @@ func (a *API) ReplayDelivery(c echo.Context) error {
 		return c.JSON(http.StatusConflict, ErrorResponse{Error: "delivery is already in progress"})
 	case errors.Is(err, store.ErrWebhookSubscriberDisabled):
 		return c.JSON(http.StatusConflict, ErrorResponse{Error: "integration is disabled; enable it to replay"})
+	case errors.Is(err, store.ErrWebhookReplayRetired):
+		return c.JSON(http.StatusGone, ErrorResponse{Error: err.Error()})
 	case errors.Is(err, store.ErrIntegrationBusy):
-		return c.JSON(http.StatusConflict, ErrorResponse{Error: "integration is being changed by another request, try again"})
+		return c.JSON(http.StatusConflict, ErrorResponse{Error: "the delivery or its integration is being changed by another request, try again"})
 	case err != nil:
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}

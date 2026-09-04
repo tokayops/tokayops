@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/store"
 )
 
 // The operator's door: a person deciding what a stuck commitment does. One
@@ -98,6 +100,9 @@ func (a *API) DecideDelivery(c echo.Context) error {
 		IntentID: id, Decision: decision, Actor: actor, Reason: reason,
 		AcceptedDuplicateRisk: req.AcceptedDuplicateRisk, NewExpiresAt: req.NewExpiresAt,
 	})
+	if errors.Is(err, store.ErrCommitmentBusy) {
+		return c.JSON(http.StatusConflict, ErrorResponse{Error: err.Error()})
+	}
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}

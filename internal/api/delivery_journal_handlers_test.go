@@ -77,6 +77,7 @@ func setupJournalRoutes(t *testing.T) *journalRoutes {
 		Paging: []outbound.Intent{}, Events: []outbound.EventDeliveries{},
 	}}
 	a := NewAPI(fake, nil, nil, nil, "", nil)
+	a.SetDeliveryRetention(30)
 	e := echo.New()
 	a.RegisterRoutes(e)
 	return &journalRoutes{fake: fake, e: e}
@@ -150,8 +151,18 @@ func TestTheJournalReadsThePeriodAndTheFilters(t *testing.T) {
 
 func TestTheJournalOfOneDelivery(t *testing.T) {
 	r := setupJournalRoutes(t)
-	if rec := r.get("/api/v1/deliveries/nothing", "denis"); rec.Code != http.StatusNotFound {
+	rec := r.get("/api/v1/deliveries/nothing", "denis")
+	if rec.Code != http.StatusNotFound {
 		t.Fatalf("an unknown delivery answered %d", rec.Code)
+	}
+	// The answer says how long history is kept - a delivery that is not here
+	// may be one that was, and is past the window.
+	var gone DeliveryGoneResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &gone); err != nil {
+		t.Fatal(err)
+	}
+	if gone.RetentionDays != 30 || gone.Error == "" {
+		t.Fatalf("the 404 reads %+v, want the window of 30 days", gone)
 	}
 
 	at := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
@@ -172,7 +183,7 @@ func TestTheJournalOfOneDelivery(t *testing.T) {
 		}},
 		Events: []outbound.IntentEvent{{Seq: 1, Kind: "created", Actor: "engine", At: at}},
 	}
-	rec := r.get("/api/v1/deliveries/d-1", "denis")
+	rec = r.get("/api/v1/deliveries/d-1", "denis")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}

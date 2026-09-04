@@ -37,6 +37,11 @@ var (
 	// would hand the work back through the other door. "Off" means "do not
 	// send" at every door.
 	ErrWebhookSubscriberDisabled = errors.New("webhook subscriber is disabled")
+
+	// ErrWebhookReplayRetired is a repeat of an Idempotency-Key whose result
+	// retention has removed: the claim is still held, and holds no commitment
+	// any more. The decision it named is over; a new one needs a new key.
+	ErrWebhookReplayRetired = errors.New("the result of this replay was removed by retention; use a new Idempotency-Key")
 )
 
 // WebhookReplayRequest is one operator asking for one event to be delivered to
@@ -267,6 +272,11 @@ func nullable(s sql.NullString) *string {
 	return &value
 }
 
+// beforeReplayAdmission is a test hook, called with the integration and the
+// original commitment held and before the replay's claim is admitted.
+// Production leaves it nil.
+var beforeReplayAdmission func()
+
 // ReplayWebhookDelivery admits a new commitment for the same event to the same
 // subscriber, in one transaction with the reads that decide whether it may.
 //
@@ -344,6 +354,25 @@ func (s *Store) ReplayWebhookDelivery(ctx context.Context, req WebhookReplayRequ
 		return WebhookReplayResult{}, ErrWebhookSubscriberDisabled
 	}
 
+	// The original is held under FOR SHARE for the rest of the transaction -
+	// after the integration, which is the order every door takes the two in.
+	// Retention chooses what it removes with FOR UPDATE SKIP LOCKED, so a
+	// commitment held here is skipped, and the event under it, which the new
+	// claim will name, is kept by the commitment that is still there. Gone
+	// already: the sweep took it, and this replay is late by one pass.
+	var stillThere string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM outbound_intents WHERE id = $1 FOR SHARE`,
+		req.DeliveryID).Scan(&stillThere)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WebhookReplayResult{}, ErrWebhookDeliveryNotFound
+	}
+	if err != nil {
+		return WebhookReplayResult{}, busyOr(err)
+	}
+	if beforeReplayAdmission != nil {
+		beforeReplayAdmission()
+	}
+
 	admitted, err := admitWebhookTx(ctx, tx, keys.WebhookBatch{
 		Kind:               keys.KindWebhookReplay,
 		EventID:            payload.EventID,
@@ -366,6 +395,19 @@ func (s *Store) ReplayWebhookDelivery(ctx context.Context, req WebhookReplayRequ
 		return WebhookReplayResult{}, outboundContractf(
 			"replay %s of %s answered %q: another composition under the same key",
 			req.ClientRequestID, req.DeliveryID, admitted.Outcome)
+	}
+	if admitted.Outcome == outbound.SubmitExisting && len(admitted.IntentIDs) == 0 {
+		// The claim is held and holds nothing: its commitment has been removed
+		// by retention. A claim that never held one would be a defect, and is
+		// told apart by what it recorded.
+		var promised int
+		if err := tx.QueryRowContext(ctx, `SELECT intent_count FROM outbound_batches WHERE id = $1`,
+			admitted.BatchID).Scan(&promised); err != nil {
+			return WebhookReplayResult{}, fmt.Errorf("read the claim %s: %w", admitted.BatchID, err)
+		}
+		if promised > 0 {
+			return WebhookReplayResult{}, ErrWebhookReplayRetired
+		}
 	}
 	if len(admitted.IntentIDs) != 1 {
 		return WebhookReplayResult{}, outboundContractf(

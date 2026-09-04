@@ -87,6 +87,7 @@ TokayOps uses a YAML configuration file (`tokay.yaml`) and environment variables
 | `CSRF_ENABLED` | Explicitly enable CSRF protection | `false` (auto-enabled in production) |
 | `TOKAY_SELF_URL` | TokayOps base URL for clickable links in Slack (e.g. `https://tokayops.example.com`) | - |
 | `ENCRYPTION_KEY` | 32-byte hex key for integrations config encryption | **Required** |
+| `TOKAY_DELIVERY_RETENTION_DAYS` | How many days the history of finished deliveries is kept; `0` keeps it for good | `30` |
 
 **OIDC Authentication** (optional, requires `TOKAY_SELF_URL`):
 | Variable | Description |
@@ -249,6 +250,14 @@ unallocated addresses are all refused unless the operator allows the range with
 `TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS`. Disabling or deleting the
 integration withdraws its undelivered deliveries; the delivery history of a
 deleted integration stays readable.
+
+The history of finished deliveries - of every kind, not only webhooks - is kept
+for `TOKAY_DELIVERY_RETENTION_DAYS` days (30 by default; `0` keeps it for good)
+and then removed, an hour at a time, together with the alert events nothing
+refers to any more. A delivery still in progress, or waiting for a person, is
+kept whatever its age. Repeating a replay's `Idempotency-Key` after its result
+has been removed answers `410 Gone`: the decision it named is over, and a new
+replay needs a new key.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|

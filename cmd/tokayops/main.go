@@ -492,6 +492,24 @@ func main() {
 		log.Fatalf("Failed to build the webhook fan-out: %v", err)
 	}
 
+	// How long the history of finished deliveries is kept. Read from the
+	// environment like the other infrastructure settings; zero keeps it for
+	// good, and anything that is not a whole number of days refuses the start.
+	retentionDays, err := outbound.ParseRetentionWindow(os.Getenv(outbound.RetentionEnv))
+	if err != nil {
+		log.Fatalf("Failed to read the delivery retention window: %v", err)
+	}
+	metrics.OutboundRetentionWindowDays.Set(float64(retentionDays))
+	apiService.SetDeliveryRetention(retentionDays)
+	var retention *outbound.Retention
+	if retentionDays > 0 {
+		if retention, err = outbound.NewRetention(st, retentionDays); err != nil {
+			log.Fatalf("Failed to build the delivery retention: %v", err)
+		}
+	} else {
+		log.Printf("outbound retention is off: %s=0, delivery history is kept for good", outbound.RetentionEnv)
+	}
+
 	// 9. Start Background Workers
 	go eng.Run(ctx)
 
@@ -525,6 +543,10 @@ func main() {
 		running.Wait()
 	}()
 	go fanOut.Run(ctx)
+	// Not waited for either: a chunk cut off rolls back whole.
+	if retention != nil {
+		go retention.Run(ctx)
+	}
 
 	// Usergroup Syncer Manager - allows dynamic start/stop when Slack integration changes
 	syncerManager := slacksync.NewUsergroupSyncerManager(st, scheduleRenderer, 5*time.Minute)

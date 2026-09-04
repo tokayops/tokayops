@@ -25,6 +25,7 @@ type decisionStoreFake struct {
 	store.StoreInterface
 	requests []outbound.ResolveAmbiguityRequest
 	result   outbound.ResolveAmbiguityResult
+	err      error
 	// readsAfter counts reads of the commitment the door makes after the
 	// decision. The decision has committed by then: a read that fails would
 	// answer 500 about a decision that applied, and one that succeeds may
@@ -34,7 +35,7 @@ type decisionStoreFake struct {
 
 func (f *decisionStoreFake) ResolveAmbiguity(_ context.Context, req outbound.ResolveAmbiguityRequest) (outbound.ResolveAmbiguityResult, error) {
 	f.requests = append(f.requests, req)
-	return f.result, nil
+	return f.result, f.err
 }
 
 func (f *decisionStoreFake) IntentJournal(_ context.Context, _ string) (*outbound.Journal, error) {
@@ -225,5 +226,17 @@ func TestTheDecisionIsTheAdministrators(t *testing.T) {
 	}
 	if rec := r.decide("denis", "d-1", `{"decision":"cancel","reason":"nobody is listening"}`); rec.Code != http.StatusOK {
 		t.Errorf("the administrator could not decide: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestADecisionAgainstAHeldDeliveryIsAConflict: a commitment held by another
+// transaction past the lock timeout - retention removing it - answers 409,
+// and the person asks again.
+func TestADecisionAgainstAHeldDeliveryIsAConflict(t *testing.T) {
+	r := setupDecisionRoutes(t)
+	r.fake.err = store.ErrCommitmentBusy
+	rec := r.decide("denis", "d-1", `{"decision":"cancel","reason":"nobody is listening"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("a held delivery answered %d: %s", rec.Code, rec.Body.String())
 	}
 }

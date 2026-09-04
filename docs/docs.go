@@ -927,7 +927,7 @@ const docTemplate = `{
                     "404": {
                         "description": "Not Found",
                         "schema": {
-                            "$ref": "#/definitions/api.ErrorResponse"
+                            "$ref": "#/definitions/api.DeliveryGoneResponse"
                         }
                     }
                 }
@@ -1390,6 +1390,12 @@ const docTemplate = `{
                     },
                     "409": {
                         "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "410": {
+                        "description": "Gone",
                         "schema": {
                             "$ref": "#/definitions/api.ErrorResponse"
                         }
@@ -3641,6 +3647,17 @@ const docTemplate = `{
                 },
                 "to_status": {
                     "type": "string"
+                }
+            }
+        },
+        "api.DeliveryGoneResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "retention_days": {
+                    "type": "integer"
                 }
             }
         },
