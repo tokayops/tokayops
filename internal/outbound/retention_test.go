@@ -3,9 +3,12 @@ package outbound
 import (
 	"context"
 	"errors"
+	"log"
 	"math"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -211,4 +214,93 @@ func TestOnlyAPassThatSweptIsASuccess(t *testing.T) {
 	if lastSuccess() != float64(clock.Add(-time.Hour).Unix()) {
 		t.Fatalf("a busy pass moved the success to %v", lastSuccess())
 	}
+}
+
+// ticking is a store that reports each call on a channel, for a loop running
+// in its own goroutine.
+type ticking struct{ calls chan time.Time }
+
+func (s *ticking) SweepDeliveryHistory(context.Context, time.Time, int) (SweepResult, error) {
+	s.calls <- time.Now()
+	return SweepResult{}, nil
+}
+
+// lockedLog is a log sink a test can read while the loop writes it.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// TestTheFirstPassWaitsForTheStartDelay: the loop's first pass is at the
+// start delay and not at the start - an instance coming up is building its
+// schema and starting its workers, and a sweep in the same second would
+// compete with them for the database - and not at the first tick of the
+// hourly interval either. After it, the interval; and every pass writes the
+// line an operator reads the first pass by.
+func TestTheFirstPassWaitsForTheStartDelay(t *testing.T) {
+	sink := &lockedLog{}
+	log.SetOutput(sink)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	st := &ticking{calls: make(chan time.Time, 8)}
+	r := &Retention{store: st, window: 24 * time.Hour, interval: time.Hour,
+		first: 200 * time.Millisecond, chunk: 10, maxChunks: 3, now: time.Now}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := time.Now()
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+
+	select {
+	case at := <-st.calls:
+		t.Fatalf("the first pass ran %s after the start, before the delay", at.Sub(started))
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case at := <-st.calls:
+		if since := at.Sub(started); since < r.first {
+			t.Fatalf("the first pass ran %s after the start, before the delay of %s", since, r.first)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no first pass within five seconds; the loop is waiting for the interval")
+	}
+	cancel()
+	<-done
+	for _, line := range []string{
+		"outbound retention started: window 24h0m0s, every 1h0m0s, first pass in 200ms",
+		"outbound retention: removed 0 commitments, 0 attempts, 0 observations, 0 events, 0 outbox events older than",
+		"outbound retention stopped",
+	} {
+		if !strings.Contains(sink.String(), line) {
+			t.Errorf("the log does not say %q:\n%s", line, sink.String())
+		}
+	}
+
+	// And after the first pass, the interval.
+	st = &ticking{calls: make(chan time.Time, 8)}
+	r = &Retention{store: st, window: 24 * time.Hour, interval: 100 * time.Millisecond,
+		first: time.Millisecond, chunk: 10, maxChunks: 3, now: time.Now}
+	ctx, cancel = context.WithCancel(context.Background())
+	done = make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	for i := 0; i < 3; i++ {
+		select {
+		case <-st.calls:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d passes within five seconds; the loop does not keep ticking", i)
+		}
+	}
+	cancel()
+	<-done
 }

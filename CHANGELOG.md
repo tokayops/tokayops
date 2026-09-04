@@ -66,6 +66,61 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   is left uninformed about being on call - the schedule says who is on duty, and
   the announcement is a convenience beside it - but for that reason **do not
   pick an hour boundary for the stop window**, which is when shifts change.
+- **Delivery history is kept for 30 days by default, and the first sweep runs
+  a minute after this version starts.** `TOKAY_DELIVERY_RETENTION_DAYS` sets
+  the window; `0` keeps everything for good. The sweep removes deliveries that
+  ended more than that long ago, with their attempts and journals, and webhook
+  events nothing is owed for any more - including the events the previous
+  version's webhook worker had finished, measured from when it sent them. What
+  a sweep removes cannot be brought back, so an operator who wants more than a
+  month of history sets the variable **before the first start** of this
+  version, not after. The record that an alert was admitted for delivery is
+  never removed.
+- **Outgoing webhooks are delivered by the same machinery as pages now, and the
+  change is a cutover, not a migration.** The delivery history from before
+  this version is not carried over: every subscriber's delivery list starts
+  empty and fills from the first delivery this version makes. The old worker's
+  tables (`event_outbox_deliveries`, `event_outbox_delivery_attempts`) are no
+  longer created; an upgraded database keeps them and their rows, unread, and
+  the start removes their foreign keys to events and integrations so that
+  neither retention nor deleting an integration is blocked by rows nobody
+  reads. An event the old worker had not finished is picked up by the new
+  fan-out and sent to **every** current subscriber, including ones the old
+  worker had already reached; receivers deduplicate by `X-Tokay-Event-ID`.
+  `migrations/drop-webhook-outbox.sql` removes the two tables, and the events
+  the old worker had finished, once rolling back is no longer an option - the
+  same rules as `drop-job-engine.sql` below.
+- **Review your webhook subscribers before upgrading.** Delivery is stricter
+  in four ways, and nothing in the upgrade itself reports a subscriber that
+  the new rules refuse - the first delivery to it does, in its delivery list.
+  A URL that answers with a redirect is refused for good (redirects are no
+  longer followed); a URL that resolves to anything but a public address is
+  refused before any call is made, under a policy that now follows the IANA
+  registries rather than a list of private ranges; a `timeout_seconds` above
+  30 is clamped to 30; and a custom header named `Content-Type` or `X-Tokay-*`
+  is ignored.
+- **Prometheus needs three things checked.** Load
+  `deploy/prometheus/tokayops.rules.yml` (its unit tests run in CI) and drop
+  any alert you wrote on the `outbox_*` metrics or on
+  `notification_errors_total`: those series are gone, and a rule on a series
+  nobody exports never fires and never says so. Set `scrape_timeout` for the
+  TokayOps job **strictly greater than 5 seconds** - `/metrics` gives the
+  database five seconds for its snapshot and answers without those series
+  after that, and a scrape timeout of five or less races it. Keep **at least
+  30 days** of samples (`--storage.tsdb.retention.time`; the default is 15):
+  the SLO recording rules read a 30-day window, and a shorter store makes them
+  report on less history without saying so. If you followed `:develop` builds
+  that already exported `outbound_admission_latency_seconds`, its buckets
+  changed, and the 30-day quantiles are approximate until the window has
+  passed the upgrade.
+- The schema changes on this start: three columns are added and filled in
+  from existing rows (`outbound_batches.event_id`,
+  `event_outbox.fanned_out_at`, `outbound_intent_events.actor_kind`), six
+  indexes are created, and the old webhook worker's foreign keys are removed
+  as described above. The start refuses a database in which a webhook
+  delivery names an event that no longer exists - it says which row - and
+  applies nothing of the delivery domain's block until the row is repaired or
+  removed.
 
 ### Changed
 
@@ -146,6 +201,49 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   and withdraws anything still owed to them. What was already delivered is kept
   as a record that it happened, without the coordinates of the message; nothing
   written afterwards can put an address back.
+- **A webhook that keeps failing keeps being retried, for a day.** The eight
+  attempts and the `failed` that followed them are gone: a delivery is retried
+  with a growing wait - two seconds, doubling, capped at thirty minutes, with
+  some jitter - until the receiver accepts it, until the subscriber is disabled
+  or deleted, or until a day has passed since the event was admitted, when it
+  ends as `expired` and says so in the API.
+- **What a receiver's answer means changed.** 429 and 408 are retried. Every
+  other 4xx, and every 3xx, ends the delivery for good: redirects are no longer
+  followed, and a subscriber whose URL answers 301 has to be corrected. A 5xx,
+  or anything the client cannot classify, is retried with the same
+  `X-Tokay-Event-ID`, which is what a receiver deduplicates by.
+- **A URL that does not resolve to a public address is refused before any
+  call is made**, as a permanent failure named `ip_policy`, where it used to be
+  retried to the attempt limit. What counts as public follows the IANA
+  registries for IPv4 and IPv6, with a dated snapshot in the code; an IPv4
+  address embedded in IPv6 is judged as the IPv4 address. The allowlist works
+  as before.
+- `timeout_seconds` of a webhook subscriber is at most 30 (was 60); a saved
+  value between 31 and 60 is clamped at 30 on every delivery. Custom headers
+  can no longer replace the headers TokayOps sets: a reserved name is refused
+  when a subscriber is saved, and ignored in a subscriber saved before the
+  check existed.
+- **Replaying a webhook delivery creates a new delivery** rather than resetting
+  the old one to pending. The request needs an `Idempotency-Key` (400 without
+  one), and a repeat with the same key answers with the same `delivery_id`. A
+  delivery still in progress is not replayed (409, as before), and neither is
+  one of a disabled subscriber (409).
+- **Disabling a webhook subscriber withdraws what has not been delivered to it
+  yet**, the same as deleting it does. A subscriber created between an event
+  and its fan-out receives the event.
+- **The webhook event about an alert goes out regardless of what happens to
+  the alert.** An acknowledgement or a resolution no longer withdraws the
+  event about the state before it.
+- `response_body_trunc` in the webhook delivery list holds up to 500
+  characters of the receiver's answer (was 1024 bytes). `last_error` of a
+  delivery that ended without an attempt names how it ended (`expired`,
+  `canceled`) rather than staying empty.
+- **Testing a webhook subscriber (`POST /integrations/{id}/test`) goes through
+  the same channel as a delivery**: the same address policy, headers and
+  signature, the same 30-second ceiling, and no redirects. It used to have a
+  sender of its own, with a 60-second timeout and redirects followed.
+- `PUT` and `DELETE` on an integration wait up to three seconds for a busy row
+  and answer 409 instead of waiting indefinitely; repeat the request.
 
 ### Fixed
 
@@ -200,6 +298,16 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   instance - notifier, syncer and workers - beside the running one. The binary
   now refuses, lists the commands it knows, and does so before it opens the
   database.
+- Deleting a webhook subscriber that has delivery history no longer answers
+  500. The subscriber is deleted, what was still owed to it is withdrawn, and
+  its history stays readable through the delivery list and detail routes.
+- Replaying a delivery of a disabled subscriber no longer creates a delivery
+  that goes out anyway; it answers 409 until the subscriber is enabled again.
+- Two instances editing or deleting the same Telegram integration at once no
+  longer leave an intermediate bot token registered with Telegram: the webhook
+  is reconciled against the current row under a lock rather than set from the
+  arguments of whichever request finished last.
+database.
 
 ### Added
 
@@ -237,6 +345,51 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   counter is where the people who were missed are visible at all.
 - `storage_contract_failures_total` counts durable rows that no longer parse.
   Any increase is a data problem to look at, not a transient failure.
+- **Delivery history, readable.** `GET /alert-groups/{id}/deliveries` lists
+  what was owed for an alert group - pages, shift-change announcements and
+  webhook events with the deliveries made for them - and the same block is on
+  the group's page in the UI, with the group's timeline naming the provider
+  and target of each delivery and linking to its journal.
+  `GET /deliveries` is the journal across everything, filtered by family,
+  provider, status, target, alert group or event, over a period that defaults
+  to the last day, and is the Activity page in the UI. `GET /deliveries/{id}`
+  is one delivery's journal: its attempts, what was observed about each, and
+  every event in its life with who or what caused it. All three, like the
+  webhook delivery routes, are in the Swagger document.
+- **A decision on a delivery that has stopped.** `POST /deliveries/{id}/decisions`
+  takes one of `assume_accepted`, `cancel`, `retry_current_generation` and
+  `retry_new_generation` with a reason, for a delivery in `manual_review`,
+  `permanent_failed` or `expired`. A decision the delivery's state does not
+  allow is refused with the words of the rule that refuses it; a new deadline
+  is judged by the database's clock after the row is locked, so two operators
+  cannot both win; and the decision is recorded in the delivery's journal
+  under the operator's name. A webhook delivery takes only `cancel` here: its
+  door to a new send is the replay.
+- The RBAC actions `delivery.view` and `delivery.resolve`, both held by the
+  global administrator role.
+- Every event in a delivery's journal says what kind of actor caused it:
+  `user`, `system`, or `legacy` for a row written by a previous version, which
+  is shown as the text it recorded rather than resolved to a person or a
+  component. Existing rows are classified at start by the path that wrote
+  them.
+- `TOKAY_DELIVERY_RETENTION_DAYS` (see the upgrade notes). A replay whose
+  result has since been removed by retention answers 410 to a repeat of its
+  `Idempotency-Key`: the answer cannot be reproduced, and a new key starts a
+  new replay.
+- Metrics: `outbound_worker_ticks_total` and `outbound_fanout_ticks_total` for
+  the liveness of the workers and of the webhook fan-out;
+  `outbound_leases_expired_total` for attempts abandoned by a worker that
+  died; `outbound_retention_window_days`,
+  `outbound_retention_last_success_timestamp_seconds` (absent until the first
+  successful pass) and `outbound_retention_deleted_total{table}` for the
+  sweep; and `outbound_no_targets_admissions_total`, read from the database,
+  for alerts admitted with nobody to page. `/metrics` gives the database
+  snapshot five seconds and answers without those series after that instead
+  of holding the scrape.
+- `deploy/prometheus/tokayops.rules.yml`: the alerting and recording rules
+  for a TokayOps installation, with the unit tests beside them
+  (`tokayops.rules.test.yml`), checked in CI against the metrics the build
+  exports.
 
 ### Removed
 
@@ -258,6 +411,18 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 - `job_steps_processed_total`, `notification_sent_total` and
   `notification_errors_total`. Nothing writes them any more; what a delivery
   attempted and what came of it is counted by `outbound_attempts_total`.
+- `outbox_events_claimed_total`, `outbox_events_completed_total`,
+  `outbox_delivery_attempts_total`, `outbox_delivery_duration_seconds`,
+  `outbox_delivery_blocked_total` and `outbox_deliveries_by_status`. What a
+  webhook delivery attempted and what came of it is counted by the
+  `outbound_*` metrics under `family="webhook"`. `outbox_events_by_status`
+  stays, and gains the `fanned_out` status.
+- **The old webhook worker and its tables.** A fresh installation has no
+  `event_outbox_deliveries` or `event_outbox_delivery_attempts`; an upgraded
+  one keeps them unread until `migrations/drop-webhook-outbox.sql` removes
+  them by hand, together with the events the old worker had finished. The
+  same warning as for the job engine applies: an older image started
+  afterwards comes up on an empty delivery history and says nothing about it.
 
 ## [0.1.0] - 2026-08-18
 

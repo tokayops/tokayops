@@ -3,10 +3,13 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
@@ -97,9 +100,21 @@ func sprint3OutboundShape(t *testing.T, s *Store) {
 		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundWebhookProviderConstraint,
 		`DROP INDEX IF EXISTS idx_outbound_intents_subscriber`,
 		`DROP TABLE IF EXISTS integration_tombstones`,
-		// The old worker's two tables, in the exact form the previous release
-		// created them - with the foreign key to integrations that the start
-		// removes. This build does not create them, so the shape has to.
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatalf("build the Sprint 3 shape: %v", err)
+		}
+	}
+	legacyWebhookWorker(t, s)
+}
+
+// legacyWebhookWorker is the old worker's two tables, in the exact form the
+// previous release created them - with the foreign keys to event_outbox and
+// integrations that the start removes. This build does not create them, so a
+// shape that has them has to.
+func legacyWebhookWorker(t *testing.T, s *Store) {
+	t.Helper()
+	for _, statement := range []string{
 		`DROP TABLE IF EXISTS event_outbox_delivery_attempts`,
 		`DROP TABLE IF EXISTS event_outbox_deliveries`,
 		`CREATE TABLE event_outbox_deliveries (
@@ -132,7 +147,7 @@ func sprint3OutboundShape(t *testing.T, s *Store) {
 		`CREATE INDEX idx_delivery_attempts_delivery ON event_outbox_delivery_attempts (delivery_id)`,
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
-			t.Fatalf("build the Sprint 3 shape: %v", err)
+			t.Fatalf("build the old worker's tables: %v", err)
 		}
 	}
 	t.Cleanup(func() {
@@ -859,3 +874,174 @@ func TestAStartRefusesAPayloadItCannotDigest(t *testing.T) {
 		t.Error("the refusal added the column anyway")
 	}
 }
+
+// TestAStartUpgradesTheDatabaseOfThePreviousRelease is the upgrade as an
+// installation meets it, in one start: the delivery domain as the version
+// before this one wrote it - no event on a claim, no fan-out date on an
+// event, no kind on a journal line, and none of the indexes those came with -
+// and beside it the job engine's tables and the old webhook worker's tables,
+// still standing and still holding rows, with the old worker's keys to the
+// events and the subscribers. Each thing the start fills in is read back
+// against what it was filled in from.
+func TestAStartUpgradesTheDatabaseOfThePreviousRelease(t *testing.T) {
+	s := setupTestDB(t)
+	teamOne(t, s)
+	group := outboundGroup(t, s)
+	a := subscriber(t, s, "a", model.WebhookScopeTeam, "team-1", true)
+
+	// What the previous version had done: an escalation; an event it fanned
+	// out to the subscriber; an event the old worker had sent and one it had
+	// given up on, both before the port; and an event still waiting.
+	escalation := admitOne(t, s, group, dmCommitment("U0001"))[0]
+	fanned := eventForGroup(t, s, group, "team-1", model.OutboxEventFiring)
+	fanOutNext(t, s)
+	delivered := webhookCommitmentTo(t, s, a)
+	sent := eventForGroup(t, s, group, "team-1", model.OutboxEventAcknowledged)
+	failed := eventForGroup(t, s, group, "team-1", model.OutboxEventResolved)
+	pending := eventForGroup(t, s, group, "team-1", model.OutboxEventFiring)
+
+	// Back to the shape of the previous release, rows kept: the delivery
+	// domain already knowing the webhook family, and the two engines it
+	// replaced still standing beside it.
+	legacyWebhookWorker(t, s)
+	legacyJobEngine(t, s)
+	oldDelivery := uuid.New().String()
+	for _, statement := range []string{
+		`UPDATE event_outbox SET status = 'completed', sent_at = now() - interval '3 days',
+			created_at = now() - interval '4 days' WHERE id = '` + sent + `'`,
+		`UPDATE event_outbox SET status = 'failed', created_at = now() - interval '5 days'
+			WHERE id = '` + failed + `'`,
+		// Dropping a column takes its index and its rule with it.
+		`ALTER TABLE outbound_batches DROP COLUMN IF EXISTS event_id`,
+		`ALTER TABLE event_outbox DROP COLUMN IF EXISTS fanned_out_at`,
+		`DROP INDEX IF EXISTS idx_outbound_intents_batch, idx_outbound_intents_journal,
+			idx_outbound_intents_retention, idx_outbound_batches_no_targets`,
+		`DELETE FROM outbound_intent_events`,
+		`ALTER TABLE outbound_intent_events DROP COLUMN IF EXISTS actor_kind`,
+		// The rows of the previous release in the tables it owned.
+		`INSERT INTO jobs (id, type, status, alert_group_id)
+			VALUES ('job-1', 'escalation', 'completed', '` + group + `')`,
+		`INSERT INTO event_outbox_deliveries (id, event_id, integration_id, status, attempts, sent_at)
+			VALUES ('` + oldDelivery + `', '` + sent + `', '` + a + `', 'sent', 1, now() - interval '3 days')`,
+		`INSERT INTO event_outbox_delivery_attempts (id, delivery_id, attempt, http_status)
+			VALUES ('` + uuid.New().String() + `', '` + oldDelivery + `', 1, 200)`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatalf("build the previous release: %v", err)
+		}
+	}
+	// Journal lines as that version wrote them, with no kind: one by each
+	// write path the classification tells apart - a component, the fan-out
+	// under its old name, and an acknowledgement under a person's display
+	// name that happens to read like a component.
+	lines := []struct {
+		id, intent, kind    string
+		reason, actor       *string
+		wantKind, wantActor string
+	}{
+		{uuid.New().String(), escalation, "created", nil, str("engine"), "system", "engine"},
+		{uuid.New().String(), delivered, "created", nil, str("fan-out"), "system", "fanout"},
+		{uuid.New().String(), escalation, "canceled", str("the alert was acknowledged"), str("system"), "legacy", "system"},
+	}
+	for i, line := range lines {
+		if _, err := s.db.Exec(`INSERT INTO outbound_intent_events (id, intent_id, seq, kind, reason, actor)
+			VALUES ($1, $2, $3, $4, $5, $6)`, line.id, line.intent, i+1, line.kind, line.reason, line.actor); err != nil {
+			t.Fatalf("write the old journal line %d: %v", i, err)
+		}
+	}
+	for _, key := range []string{"event_outbox_deliveries_event_id_fkey", "event_outbox_deliveries_integration_id_fkey"} {
+		if countWhere(t, s, `SELECT count(*) FROM pg_constraint WHERE conname = $1`, key) != 1 {
+			t.Fatalf("the previous release has no %s to remove", key)
+		}
+	}
+
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("the start refused the database of the previous release: %v", err)
+	}
+
+	// The claims name their event, and every event named exists.
+	var named string
+	if err := s.db.QueryRow(`SELECT event_id FROM outbound_batches WHERE key_kind = 'webhook_event'
+		AND batch_key LIKE $1`, fanned+":%").Scan(&named); err != nil || named != fanned {
+		t.Errorf("the claim on the fanned-out event names %q, %v; want %q", named, err, fanned)
+	}
+	if n := countWhere(t, s, `SELECT count(*) FROM outbound_batches b
+		WHERE b.key_kind IN ('webhook_event', 'webhook_replay')
+		  AND (b.event_id IS NULL OR NOT EXISTS (SELECT 1 FROM event_outbox e WHERE e.id = b.event_id))`); n != 0 {
+		t.Errorf("%d webhook claims name no event, or one that does not exist", n)
+	}
+
+	// The events are dated: a fanned-out one by its claim, a finished one by
+	// when the old worker sent it or, failing that, made it; a waiting one
+	// not at all.
+	dated := func(id string) *time.Time {
+		var at *time.Time
+		if err := s.db.QueryRow(`SELECT fanned_out_at FROM event_outbox WHERE id = $1`, id).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	var admittedAt time.Time
+	if err := s.db.QueryRow(`SELECT admitted_at FROM outbound_batches
+		WHERE event_id = $1 AND key_kind = 'webhook_event'`, fanned).Scan(&admittedAt); err != nil {
+		t.Fatal(err)
+	}
+	if at := dated(fanned); at == nil || !at.Equal(admittedAt) {
+		t.Errorf("the fanned-out event is dated %v, want its claim's %v", at, admittedAt)
+	}
+	if at := dated(sent); at == nil || time.Since(*at) < 2*day || time.Since(*at) > 4*day {
+		t.Errorf("the event the old worker sent is dated %v, want when it was sent", at)
+	}
+	if at := dated(failed); at == nil || time.Since(*at) < 4*day || time.Since(*at) > 6*day {
+		t.Errorf("the event the old worker gave up on is dated %v, want when it was made", at)
+	}
+	if at := dated(pending); at != nil {
+		t.Errorf("the waiting event is dated %v, want no date", at)
+	}
+
+	// The journal lines are classified by the path that wrote them.
+	for i, line := range lines {
+		var actor sql.NullString
+		var kind string
+		if err := s.db.QueryRow(`SELECT actor, actor_kind FROM outbound_intent_events WHERE id = $1`, line.id).
+			Scan(&actor, &kind); err != nil {
+			t.Fatalf("read the old journal line %d: %v", i, err)
+		}
+		if kind != line.wantKind || actor.String != line.wantActor {
+			t.Errorf("line %d (%s by %v) is classified %s:%s, want %s:%s",
+				i, line.kind, deref(line.actor), kind, actor.String, line.wantKind, line.wantActor)
+		}
+	}
+
+	// The six indexes.
+	for _, index := range []string{
+		"idx_outbound_batches_event", "idx_outbound_intents_batch", "idx_outbound_intents_journal",
+		"idx_outbound_batches_no_targets", "idx_outbound_intents_retention", "idx_event_outbox_retention",
+	} {
+		if !relationExists(t, s, index) {
+			t.Errorf("%s did not arrive", index)
+		}
+	}
+
+	// The old worker's keys are gone; its rows, and the job engine's, are
+	// exactly where they were.
+	for _, key := range []string{"event_outbox_deliveries_event_id_fkey", "event_outbox_deliveries_integration_id_fkey"} {
+		if countWhere(t, s, `SELECT count(*) FROM pg_constraint WHERE conname = $1`, key) != 0 {
+			t.Errorf("the start left %s", key)
+		}
+	}
+	for table, want := range map[string]int{"jobs": 1, "event_outbox_deliveries": 1, "event_outbox_delivery_attempts": 1} {
+		if n := countWhere(t, s, `SELECT count(*) FROM `+table); n != want {
+			t.Errorf("%s holds %d rows after the start, want %d untouched", table, n, want)
+		}
+	}
+
+	// And the domain goes on from there: the event that was waiting is fanned
+	// out by this build, under a claim that names it.
+	fanOutNext(t, s)
+	if n := countWhere(t, s, `SELECT count(*) FROM outbound_batches WHERE event_id = $1 AND key_kind = 'webhook_event'`, pending); n != 1 {
+		t.Errorf("the waiting event has %d claims after the first fan-out, want one", n)
+	}
+}
+
+func str(v string) *string { return &v }
