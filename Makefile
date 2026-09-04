@@ -2,7 +2,7 @@
        test-db-start test-db-stop test-db-status \
        test-integration test-integration-quick test-integration-run \
        test-integration-shuffle \
-       test-pipeline test-dispatcher \
+       test-pipeline test-delivery \
        e2e-install e2e-test e2e-test-ui e2e-test-headed e2e-up e2e-down \
        e2e-wait e2e-seed \
        webhook-receiver webhook-receiver-build
@@ -44,6 +44,21 @@ build: swagger
 test:
 	go test ./...
 
+# The Prometheus rules ship with the product and are checked like code: the
+# syntax, then the unit tests beside them. promtool comes from the
+# prom/prometheus image, pinned by digest (v3.5.0) because a tag can be moved
+# and a digest cannot: a new promtool cannot change what passes without a
+# change here. CI runs this same target.
+PROMETHEUS_IMAGE = prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+
+check-rules:
+	docker run --rm --entrypoint promtool \
+		-v "$(CURDIR)/deploy/prometheus:/rules:ro" $(PROMETHEUS_IMAGE) \
+		check rules /rules/tokayops.rules.yml
+	docker run --rm --entrypoint promtool \
+		-v "$(CURDIR)/deploy/prometheus:/rules:ro" -w /rules $(PROMETHEUS_IMAGE) \
+		test rules /rules/tokayops.rules.test.yml
+
 clean:
 	rm -f tokayops
 	rm -f docs/docs.go docs/swagger.json docs/swagger.yaml
@@ -73,10 +88,10 @@ test-integration:
 # see the --shuffle comment in the script.
 #
 # Scoped to ./internal/store/... deliberately. The tree as a whole has never
-# been order-independent - `-shuffle=on` over ./internal/... fails on `epic10`
-# too, in api, dispatcher and integration - and fixing that is a separate piece
-# of work, recorded in tokay-docs. Widening this target before then would give
-# it a red baseline and make it useless for the thing it was added to check.
+# been order-independent - `-shuffle=on` over ./internal/... fails in api and
+# integration too - and fixing that is a separate piece of work. Widening this
+# target before then would give it a red baseline and make it useless for the
+# thing it was added to check.
 test-integration-shuffle:
 	@./scripts/run_integration_tests.sh --shuffle --pkg ./internal/store/... --failures
 
@@ -93,9 +108,24 @@ test-integration-run:
 test-pipeline:
 	@./scripts/run_integration_tests.sh --run TestPipeline
 
-# Run dispatcher tests only
-test-dispatcher:
-	@./scripts/run_integration_tests.sh --pkg ./internal/dispatcher/... --failures
+# Run delivery tests only. One invocation with both patterns in a single --pkg:
+# the script keeps one package string and expands it unquoted, so a second
+# --pkg would silently replace the first, and a second invocation would collide
+# on the ephemeral database container.
+test-delivery:
+	@./scripts/run_integration_tests.sh --failures \
+		--pkg "./internal/outbound/... ./internal/handoff/..."
+
+# The SLO profiles, measured rather than reasoned about: paging on a quiet
+# instance, paging under the webhook steady state, the webhook burst on a free
+# pool, and the handover burst. Minutes each, on purpose, and not in the
+# ordinary run - the flag is what lets them run at all, and the numbers they
+# print are what the sprint plan records.
+test-profile:
+	@TOKAY_PROFILE_SLO=1 ./scripts/run_integration_tests.sh \
+		--pkg ./internal/integration/... \
+		--run 'Profile|WebhookBacklog|WebhookBurst' \
+		--timeout 45m
 
 # =============================================================================
 # E2E Testing

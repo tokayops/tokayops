@@ -26,7 +26,7 @@ async function seedTestEnv(page: Page, suffix: string): Promise<TestEnv> {
   });
   expect([200, 201, 409]).toContain(teamRes.status());
 
-  // Create two users (may already exist — ignore errors)
+  // Create two users (may already exist - ignore errors)
   for (const user of [
     { id: 'e2e-alice', email: 'e2e-alice@test.com', name: 'E2E Alice' },
     { id: 'e2e-bob', email: 'e2e-bob@test.com', name: 'E2E Bob' },
@@ -443,7 +443,7 @@ test.describe('Calendar Edit Return Flow', () => {
     // Override modal should be open
     await schedulesPage.expectOverrideModalVisible();
 
-    // Cancel — should return to calendar (modal stays active)
+    // Cancel - should return to calendar (modal stays active)
     await schedulesPage.cancelOverrideAndReturnToCalendar();
 
     // Calendar list should be visible again
@@ -467,7 +467,7 @@ test.describe('Calendar Edit Return Flow', () => {
     // Override modal should be open in edit mode
     await schedulesPage.expectOverrideModalVisible();
 
-    // Press Escape — should close override edit and return to parent view
+    // Press Escape - should close override edit and return to parent view
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
 
@@ -498,7 +498,7 @@ test.describe('Calendar Edit Return Flow', () => {
     // Override modal should be open in edit mode
     await schedulesPage.expectOverrideModalVisible();
 
-    // Click X button — should return to calendar, NOT close modal
+    // Click X button - should return to calendar, NOT close modal
     await schedulesPage.page.locator('#modal-close').click();
 
     // Calendar list should be visible (modal stays active)

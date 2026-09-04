@@ -40,6 +40,17 @@ definitions:
         description: Required
         type: string
     type: object
+  api.AlertGroupDeliveriesResponse:
+    properties:
+      events:
+        items:
+          $ref: '#/definitions/api.EventDeliveriesDTO'
+        type: array
+      paging:
+        items:
+          $ref: '#/definitions/api.GroupDeliveryDTO'
+        type: array
+    type: object
   api.AlertGroupListResponse:
     properties:
       alert_groups:
@@ -53,6 +64,23 @@ definitions:
         type: array
       total:
         type: integer
+    type: object
+  api.BatchDeliveriesDTO:
+    properties:
+      admitted_at:
+        type: string
+      batch_id:
+        type: string
+      deliveries:
+        items:
+          $ref: '#/definitions/api.GroupDeliveryDTO'
+        type: array
+      intent_count:
+        type: integer
+      kind:
+        type: string
+      outcome:
+        type: string
     type: object
   api.ConfirmSlackCodeRequest:
     properties:
@@ -131,11 +159,343 @@ definitions:
         description: 'Optional: "admin" or "user"'
         type: string
     type: object
+  api.DecisionRequest:
+    properties:
+      accepted_duplicate_risk:
+        description: |-
+          AcceptedDuplicateRisk is the person saying, on the record, that a second
+          message may exist. Some decisions need it; the refusal says so.
+        type: boolean
+      decision:
+        description: |-
+          Decision is one of assume_accepted, cancel, retry_current_generation,
+          retry_new_generation.
+        type: string
+      new_expires_at:
+        description: |-
+          NewExpiresAt is the new deadline a retry of an expired commitment needs.
+          It has to be ahead of the moment it is written.
+        type: string
+      reason:
+        description: |-
+          Reason is required: a decision without one is "somebody decided
+          something". At most 500 characters, counted as characters.
+        type: string
+    type: object
+  api.DecisionResponse:
+    properties:
+      delivery:
+        allOf:
+        - $ref: '#/definitions/api.DeliveryDTO'
+        description: Delivery is the commitment after the decision applied.
+      detail:
+        description: Detail is the words of the guard that refused the decision.
+        type: string
+      outcome:
+        type: string
+      row:
+        description: Row is the line of the decision table that applied.
+        type: string
+      status:
+        description: |-
+          Status is where the commitment stands after the answer - the new state
+          when the decision applied, the current one when it did not.
+        type: string
+    type: object
+  api.DeliveriesResponse:
+    properties:
+      deliveries:
+        items:
+          $ref: '#/definitions/api.DeliveryDTO'
+        type: array
+      from:
+        type: string
+      has_next:
+        type: boolean
+      has_prev:
+        type: boolean
+      page:
+        type: integer
+      to:
+        type: string
+      total:
+        type: integer
+      total_pages:
+        type: integer
+    type: object
+  api.DeliveryAttemptDTO:
+    properties:
+      applied_revision:
+        type: integer
+      attempt_kind:
+        type: string
+      attempt_no:
+        type: integer
+      bound_endpoint:
+        type: string
+      error_class:
+        type: string
+      finish_reason:
+        type: string
+      finished_at:
+        type: string
+      generation_no:
+        type: integer
+      id:
+        type: string
+      operation:
+        type: string
+      outcome:
+        type: string
+      provider:
+        type: string
+      provider_status:
+        type: string
+      receipt:
+        type: object
+      receipt_recorded:
+        description: |-
+          ReceiptRecorded and ReceiptRedactedAt are the three states of the
+          object an attempt made: none, present, and removed by an erasure - the
+          last being proof without coordinates, which is not the same as no proof.
+        type: boolean
+      receipt_redacted_at:
+        type: string
+      record_kind:
+        type: string
+      result_detail:
+        type: string
+      started_at:
+        type: string
+      summary:
+        type: string
+    type: object
+  api.DeliveryDTO:
+    properties:
+      accepted_duplicate_risk:
+        type: boolean
+      alert_group_id:
+        type: string
+      applied_revision:
+        type: integer
+      attempts_in_generation:
+        type: integer
+      batch_id:
+        type: string
+      cancellation_requested:
+        type: boolean
+      created_at:
+        type: string
+      desired_revision:
+        type: integer
+      expires_at:
+        type: string
+      failure_streak:
+        type: integer
+      family:
+        type: string
+      final_revision_applied:
+        type: boolean
+      form:
+        type: string
+      generation_no:
+        type: integer
+      id:
+        type: string
+      kind:
+        type: string
+      next_attempt_at:
+        type: string
+      not_before:
+        type: string
+      provider:
+        type: string
+      receipt_recorded:
+        type: boolean
+      receipt_ref:
+        type: string
+      recipient_erased:
+        type: boolean
+      status:
+        type: string
+      target_kind:
+        type: string
+      target_ref:
+        type: string
+      updated_at:
+        type: string
+    type: object
+  api.DeliveryDetailResponse:
+    properties:
+      attempts:
+        items:
+          $ref: '#/definitions/model.DeliveryAttempt'
+        type: array
+      delivery:
+        $ref: '#/definitions/model.OutboxDelivery'
+    type: object
+  api.DeliveryEventDTO:
+    properties:
+      actor:
+        type: string
+      actor_kind:
+        description: 'ActorKind says what Actor is: the id of a user, the name of
+          a component, or the text of a build before this one.'
+        type: string
+      at:
+        type: string
+      from_status:
+        type: string
+      kind:
+        type: string
+      reason:
+        type: string
+      seq:
+        type: integer
+      to_status:
+        type: string
+    type: object
+  api.DeliveryGoneResponse:
+    properties:
+      error:
+        type: string
+      retention_days:
+        type: integer
+    type: object
+  api.DeliveryJournalResponse:
+    properties:
+      attempts:
+        items:
+          $ref: '#/definitions/api.DeliveryAttemptDTO'
+        type: array
+      delivery:
+        $ref: '#/definitions/api.DeliveryDTO'
+      events:
+        items:
+          $ref: '#/definitions/api.DeliveryEventDTO'
+        type: array
+      observations:
+        items:
+          $ref: '#/definitions/api.DeliveryObservationDTO'
+        type: array
+    type: object
+  api.DeliveryListResponse:
+    properties:
+      deliveries:
+        items:
+          $ref: '#/definitions/model.OutboxDelivery'
+        type: array
+      has_next:
+        type: boolean
+      has_prev:
+        type: boolean
+      page:
+        type: integer
+      total:
+        type: integer
+      total_pages:
+        type: integer
+    type: object
+  api.DeliveryObservationDTO:
+    properties:
+      applied_revision:
+        type: integer
+      attempt_id:
+        type: string
+      error_class:
+        type: string
+      kind:
+        type: string
+      observed_at:
+        type: string
+      outcome:
+        type: string
+      provider_status:
+        type: string
+      receipt:
+        type: object
+      receipt_recorded:
+        type: boolean
+      receipt_redacted_at:
+        type: string
+      result_detail:
+        type: string
+      summary:
+        type: string
+    type: object
   api.ErrorResponse:
     properties:
       code:
         type: string
       error:
+        type: string
+    type: object
+  api.EventDeliveriesDTO:
+    properties:
+      batches:
+        items:
+          $ref: '#/definitions/api.BatchDeliveriesDTO'
+        type: array
+      created_at:
+        type: string
+      event_id:
+        type: string
+      event_type:
+        type: string
+      status:
+        type: string
+    type: object
+  api.GroupDeliveryDTO:
+    properties:
+      accepted_duplicate_risk:
+        type: boolean
+      alert_group_id:
+        type: string
+      applied_revision:
+        type: integer
+      attempts_in_generation:
+        type: integer
+      batch_id:
+        type: string
+      cancellation_requested:
+        type: boolean
+      created_at:
+        type: string
+      desired_revision:
+        type: integer
+      expires_at:
+        type: string
+      failure_streak:
+        type: integer
+      family:
+        type: string
+      final_revision_applied:
+        type: boolean
+      form:
+        type: string
+      generation_no:
+        type: integer
+      id:
+        type: string
+      kind:
+        type: string
+      next_attempt_at:
+        type: string
+      not_before:
+        type: string
+      provider:
+        type: string
+      receipt_recorded:
+        type: boolean
+      recipient_erased:
+        type: boolean
+      status:
+        type: string
+      target_kind:
+        type: string
+      target_ref:
+        type: string
+      updated_at:
         type: string
     type: object
   api.IntegrationListResponse:
@@ -292,6 +652,15 @@ definitions:
         type: string
       version:
         type: integer
+    type: object
+  api.ReplayDeliveryResponse:
+    properties:
+      delivery_id:
+        type: string
+      message:
+        type: string
+      ok:
+        type: boolean
     type: object
   api.RequestSlackCodeRequest:
     properties:
@@ -715,9 +1084,6 @@ definitions:
     type: object
   model.AlertGroup:
     properties:
-      ack_processed_at:
-        description: When ack update job was processed
-        type: string
       acknowledged_by:
         description: Acknowledgement
         type: string
@@ -731,7 +1097,18 @@ definitions:
       current_step:
         type: integer
       dedup_key:
-        description: groupKey from Alertmanager (fingerprint)
+        description: |-
+          AlertKey is what the alerting system calls the alert this group is
+          about: Alertmanager's group key, or a single alert's fingerprint. It
+          names the ALERT, not this incident - the same key comes back every time
+          the same thing breaks, and each time it opens a new group with a new ID.
+
+          It is not the identity of any work done about the alert. An escalation
+          that once keyed itself by this string paged nobody for the second
+          incident.
+
+          The JSON name is the one this field has always had, and stays: it is
+          what the API, the webhooks and the UI already read.
         type: string
       external_url:
         description: External Link to Alertmanager Source (for clickable titles)
@@ -760,9 +1137,6 @@ definitions:
         type: string
       severity:
         type: string
-      slack_update_pending:
-        description: Slack Update Tracking
-        type: boolean
       status:
         $ref: '#/definitions/model.AlertGroupStatus'
       team_id:
@@ -807,6 +1181,23 @@ definitions:
     x-enum-varnames:
     - AlertStatusFiring
     - AlertStatusResolved
+  model.DeliveryAttempt:
+    properties:
+      attempt:
+        type: integer
+      created_at:
+        type: string
+      delivery_id:
+        type: string
+      error:
+        type: string
+      http_status:
+        type: integer
+      id:
+        type: string
+      response_body_trunc:
+        type: string
+    type: object
   model.EscalationPolicy:
     properties:
       created_at:
@@ -974,6 +1365,45 @@ definitions:
           point at. Empty on snapshots written before it existed.
         type: string
     type: object
+  model.OutboxDelivery:
+    properties:
+      attempts:
+        type: integer
+      created_at:
+        type: string
+      event_id:
+        type: string
+      id:
+        type: string
+      integration_id:
+        type: string
+      last_error:
+        type: string
+      last_http_status:
+        type: integer
+      next_attempt_at:
+        type: string
+      request_payload:
+        type: string
+      response_body_trunc:
+        type: string
+      sent_at:
+        type: string
+      status:
+        $ref: '#/definitions/model.OutboxDeliveryStatus'
+    type: object
+  model.OutboxDeliveryStatus:
+    enum:
+    - pending
+    - retry
+    - sent
+    - failed
+    type: string
+    x-enum-varnames:
+    - OutboxDeliveryPending
+    - OutboxDeliveryRetry
+    - OutboxDeliverySent
+    - OutboxDeliveryFailed
   model.Team:
     properties:
       created_at:
@@ -1587,6 +2017,33 @@ paths:
       summary: Acknowledge an alert group
       tags:
       - alert-groups
+  /api/v1/alert-groups/{id}/deliveries:
+    get:
+      description: 'The paging commitments the group owns, and its alert events with
+        every claim taken on them - the fan-out''s and each replay''s - and the webhook
+        deliveries under those. An event with no batches has not been fanned out yet;
+        a batch with no deliveries found nobody subscribed. One snapshot: nothing
+        here is spliced from two moments.'
+      parameters:
+      - description: Alert Group ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.AlertGroupDeliveriesResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: The deliveries of an alert group
+      tags:
+      - alert-groups
   /api/v1/alert-groups/{id}/notes:
     post:
       consumes:
@@ -1684,6 +2141,159 @@ paths:
       summary: Get timeline for an alert group
       tags:
       - alert-groups
+  /api/v1/deliveries:
+    get:
+      description: Commitments of every delivery family admitted in a period, newest
+        first. The period defaults to the last day by the server's clock; with only
+        `to`, it is the day before it. Unknown values of family, status and target_kind
+        are rejected.
+      parameters:
+      - description: notification | handoff | webhook
+        in: query
+        name: family
+        type: string
+      - description: slack | telegram | webhook
+        in: query
+        name: provider
+        type: string
+      - description: 'Comma-separated statuses: pending, sending, idle, manual_review,
+          succeeded, permanent_failed, expired, canceled'
+        in: query
+        name: status
+        type: string
+      - description: user | channel | subscriber
+        in: query
+        name: target_kind
+        type: string
+      - description: 'The recipient as this system names it: a user id, a channel
+          id, an integration id'
+        in: query
+        name: target_ref
+        type: string
+      - description: Commitments owned by this alert group (paging)
+        in: query
+        name: alert_group_id
+        type: string
+      - description: Commitments of every claim on this alert event, replays included
+        in: query
+        name: event_id
+        type: string
+      - description: RFC 3339
+        in: query
+        name: from
+        type: string
+      - description: RFC 3339
+        in: query
+        name: to
+        type: string
+      - description: Page (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Page size (default 50, at most 200)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.DeliveriesResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: The delivery journal
+      tags:
+      - deliveries
+  /api/v1/deliveries/{id}:
+    get:
+      description: 'Everything the system knows about one commitment: what it is,
+        every attempt with its outcome, results that arrived late, and what happened
+        to it without a call - withdrawals, expiry, decisions. The id is the same
+        one the webhook routes call a delivery.'
+      parameters:
+      - description: Delivery ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.DeliveryJournalResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.DeliveryGoneResponse'
+      summary: The journal of one delivery
+      tags:
+      - deliveries
+  /api/v1/deliveries/{id}/decisions:
+    post:
+      consumes:
+      - application/json
+      description: A person deciding about a commitment in manual_review, permanent_failed
+        or expired. The reason is required (1 to 500 characters). resolved answers
+        200 with the commitment and the row of the decision table that applied; already_resolved
+        409 with the current status; invalid_decision 422 with the guard's words in
+        detail; business_closed and recipient_erased 409 with detail; an unknown commitment
+        404.
+      parameters:
+      - description: Delivery ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: The decision
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.DecisionRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.DecisionResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.DecisionResponse'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.DecisionResponse'
+      summary: Decide what a stuck delivery does
+      tags:
+      - deliveries
   /api/v1/integrations:
     get:
       description: Get integrations visible to the current user
@@ -1754,6 +2364,10 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: the integration is being changed by another request; retry
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
         "500":
           description: Internal Server Error
           schema:
@@ -1819,11 +2433,139 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: the integration is being changed by another request; retry
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
         "500":
           description: Internal Server Error
           schema:
             $ref: '#/definitions/api.ErrorResponse'
       summary: Update integration
+      tags:
+      - integrations
+  /api/v1/integrations/{id}/deliveries:
+    get:
+      description: The deliveries made to one generic webhook subscriber, newest first,
+        in the subscriber's own vocabulary (pending, retry, sent, failed). History
+        before the cutover to the delivery domain is not carried. Readable after the
+        integration is deleted.
+      parameters:
+      - description: Integration ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Page (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Page size (default 50, at most 200)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.DeliveryListResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: List the deliveries of a webhook integration
+      tags:
+      - integrations
+  /api/v1/integrations/{id}/deliveries/{deliveryId}:
+    get:
+      description: The delivery and every attempt made for it. The delivery id is
+        the same id the journal under /deliveries answers about.
+      parameters:
+      - description: Integration ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Delivery ID
+        in: path
+        name: deliveryId
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.DeliveryDetailResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: One delivery of a webhook integration, with its attempts
+      tags:
+      - integrations
+  /api/v1/integrations/{id}/deliveries/{deliveryId}/replay:
+    post:
+      description: 'Creates a NEW delivery of the same event to the same subscriber,
+        at its current address. The Idempotency-Key header is required and names the
+        decision: a repeat with the same key answers with the same delivery. A delivery
+        still in progress is not replayed (409), and neither is one of a disabled
+        integration (409).'
+      parameters:
+      - description: Integration ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Delivery ID
+        in: path
+        name: deliveryId
+        required: true
+        type: string
+      - description: 1 to 128 bytes
+        in: header
+        name: Idempotency-Key
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ReplayDeliveryResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "410":
+          description: Gone
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Deliver a finished delivery's event to the subscriber again
       tags:
       - integrations
   /api/v1/integrations/{id}/test:

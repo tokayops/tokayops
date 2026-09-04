@@ -1,9 +1,12 @@
 package store
 
 import (
+	"context"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 )
 
 // StoreInterface defines the interface for data persistence.
@@ -14,20 +17,12 @@ type StoreInterface interface {
 	CreateAlertGroup(ag *model.AlertGroup) error
 	UpdateAlertGroupPolicy(id string, policyID string, snapshot *model.EscalationPolicySnapshot) error
 	UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResult) error
-	UpdateAlertGroupAlerts(id string, alerts []model.Alert) error
-	GetNewAlertGroups() ([]*model.AlertGroup, error)
+	// GetEscalationSources is the read a producer plans from: the groups
+	// nobody has been paged for, with the alerts and the history their cards
+	// are drawn from, and the version they were read at - all from one
+	// consistent view of the database.
+	GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, error)
 	GetProcessingAlertGroups() ([]*model.AlertGroup, error)
-	GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error)
-	GetResolvedAlertGroups() ([]*model.AlertGroup, error)
-	MarkAckProcessed(agID string) error
-	// The two halves of one gate, and they are not symmetrical. It is raised by
-	// the write that changes the group - in the same statement, so no crash can
-	// separate the alert from the fact that the message is stale - and lowered
-	// for one version, which is how a producer avoids clearing away a change
-	// that arrived while it worked.
-	UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error
-	ClearSlackUpdate(id string, observedGeneration int64) (bool, error)
-	GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error)
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
 	GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset int) ([]*model.AlertGroup, int, error)
 	GetAlertGroupsByTeam(teamID string, limit, offset int) ([]*model.AlertGroup, int, error)
@@ -41,24 +36,17 @@ type StoreInterface interface {
 	CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) error
 
 	// Atomic ack/resolve (single-winner semantics, timeline + status + escalation cancel in one transaction)
-	AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
-	ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	AckAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	ResolveAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
 
 	// Atomic resolve with alerts update (ingester auto-resolve: alerts + status + timeline + outbox in one transaction)
-	ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string, incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
 
-	// Conditional status transition (CAS semantics)
-	TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error)
-
-	// Notification Deliveries
-	UpsertNotificationDelivery(d *model.NotificationDelivery) error
-	SetPrimaryDeliveryIfNone(alertGroupID, deliveryID string) (bool, error)
-	GetPrimaryDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error)
-	GetFirehoseDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error)
-	GetDeliveryByID(id string) (*model.NotificationDelivery, error)
-	UpdateDeliveryPayload(deliveryID, payload string) error
-	ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error)
-	HasPrimaryDelivery(alertGroupID, provider string) (bool, error)
+	// notification_deliveries has no methods anywhere any more. It had one
+	// reader and one writer, both in the job path that kept an alert group's
+	// messages current, and what was delivered and where it landed is an
+	// outbound commitment now. The table itself stands until the cutover under
+	// migrations/, holding rows nothing reads.
 
 	// Incidents (stub for future, business-level events)
 	CreateIncident(i *model.Incident) error
@@ -90,7 +78,7 @@ type StoreInterface interface {
 	UpdateUserAuthProvider(id, provider string) error
 	DeleteUser(id string) error
 
-	// External Identities (Epic 7 Sprint 3 — replaces User.SlackUserID + slack_otp_codes)
+	// External Identities (replaces User.SlackUserID + slack_otp_codes)
 	BindExternalIdentity(ei *model.ExternalIdentity) error
 	BindExternalIdentityIfAbsent(userID, provider, externalID, displayName string) (changed bool, err error)
 	GetExternalIdentity(userID, provider string) (*model.ExternalIdentity, error)
@@ -127,24 +115,6 @@ type StoreInterface interface {
 	UpdateAPITokenLastUsed(id string) error
 	DeleteAPIToken(id string) error
 
-	// Jobs (Phase 2)
-	//
-	// CreateJobWithDedup reports whether the job was inserted: false means the
-	// identity was already claimed under its own policy and nothing was
-	// written. A caller that counts notifications actually sent needs that
-	// answer. The existing job's ID is not returned, because no caller ever
-	// read it.
-	CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (created bool, err error)
-	EnsureEscalationJob(agID string, job *model.Job, stages []*model.JobStage, steps []*model.JobStep, snapshot *model.EscalationPolicySnapshot) (bool, error)
-	GetJobByID(id string) (*model.Job, error)
-	GetJobStepByID(stepID string) (*model.JobStep, error)
-	ClaimNextJobSteps(limit int, duration time.Duration) ([]*model.JobStep, error)
-	UpdateJobStepIfOwned(step *model.JobStep, leaseToken string) (bool, error)
-	FinishStepAndAdvance(stepID string, leaseToken string, outcome model.JobStepStatus, result string, stepError string) (model.AdvanceResult, error)
-	CancelEscalationJobByAlertGroupID(alertGroupID string) error
-	ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error
-	FailJob(jobID string, errorMsg string) error
-
 	// Escalation Policies (Phase 4)
 	CreateEscalationPolicy(p *model.EscalationPolicy) error
 	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
@@ -160,31 +130,38 @@ type StoreInterface interface {
 	GetIntegrationByType(integrationType model.IntegrationType) (*model.Integration, error)
 	GetIntegrationsByType(integrationType model.IntegrationType) ([]*model.Integration, error)
 	GetAllIntegrations() ([]*model.Integration, error)
-	UpdateIntegration(i *model.Integration) error
-	DeleteIntegration(id string) error
+	// The lifecycle commands: one transaction each over the row and the
+	// webhook commitments owed to it. See integration_lifecycle_store.go.
+	UpdateIntegration(ctx context.Context, id string, patch IntegrationPatch, actor string) (IntegrationChange, error)
+	DeleteIntegration(ctx context.Context, id, actor string) (IntegrationChange, error)
+	WithIntegrationLocked(ctx context.Context, id string, fn func(current *model.Integration) error) error
+	IntegrationTombstone(ctx context.Context, id string) (model.IntegrationTombstone, bool, error)
 
-	// Outbox (Phase 6)
+	// The alert outbox: the events the alert transactions write, and what the
+	// fan-out turns into commitments. Written by the atomic transactions, read
+	// by the fan-out; the pending read is how a test sees what a transaction
+	// promised.
 	CreateOutboxEvent(event *model.OutboxEvent) error
 	GetOutboxEventByID(id string) (*model.OutboxEvent, error)
 	GetPendingOutboxEvents(limit int) ([]*model.OutboxEvent, error)
-	UpdateOutboxEvent(event *model.OutboxEvent) error
-	UpdateOutboxEventIfOwned(event *model.OutboxEvent, workerID string) (bool, error)
-	ClaimOutboxEvents(workerID string, limit int, leaseDuration time.Duration) ([]*model.OutboxEvent, error)
-	ExtendOutboxEventLease(eventID, workerID string, until time.Time) (bool, error)
 
-	CreateOutboxDelivery(delivery *model.OutboxDelivery) error
-	GetOutboxDeliveryByID(id string) (*model.OutboxDelivery, error)
-	GetOutboxDelivery(eventID, integrationID string) (*model.OutboxDelivery, error)
-	GetDeliveriesByEventID(eventID string) ([]*model.OutboxDelivery, error)
-	GetDeliveriesByIntegrationID(integrationID string, limit, offset int) ([]*model.OutboxDelivery, int, error)
-	UpdateOutboxDelivery(delivery *model.OutboxDelivery) error
-	ReplayOutboxDelivery(deliveryID string) error
+	// Webhook deliveries: the delivery routes over the outbound domain's
+	// commitments. See webhook_delivery_store.go.
+	ListWebhookDeliveries(ctx context.Context, integrationID string, limit, offset int) ([]*model.OutboxDelivery, int, error)
+	WebhookDelivery(ctx context.Context, integrationID, deliveryID string) (*model.OutboxDelivery, []*model.DeliveryAttempt, error)
+	ReplayWebhookDelivery(ctx context.Context, req WebhookReplayRequest) (WebhookReplayResult, error)
 
-	CreateDeliveryAttempt(attempt *model.DeliveryAttempt) error
-	GetDeliveryAttempts(deliveryID string) ([]*model.DeliveryAttempt, error)
+	// The delivery journal: the outbound domain read from the outside, for the
+	// routes under /deliveries and an alert group's delivery block. See
+	// outbound_journal_store.go.
+	ListIntents(ctx context.Context, filter IntentFilter, limit, offset int) ([]outbound.Intent, int, error)
+	IntentJournal(ctx context.Context, intentID string) (*outbound.Journal, error)
+	// ResolveAmbiguity is a person deciding what a stuck commitment does.
+	ResolveAmbiguity(ctx context.Context, req outbound.ResolveAmbiguityRequest) (outbound.ResolveAmbiguityResult, error)
+	AlertGroupDeliveries(ctx context.Context, alertGroupID string) (*outbound.GroupDeliveries, error)
 
 	// Metrics
-	GetMetricsSnapshot() (*model.MetricsSnapshot, error)
+	GetMetricsSnapshot(ctx context.Context) (*model.MetricsSnapshot, error)
 
 	// Lifecycle
 	Close() error

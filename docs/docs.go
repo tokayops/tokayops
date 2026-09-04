@@ -610,6 +610,41 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/alert-groups/{id}/deliveries": {
+            "get": {
+                "description": "The paging commitments the group owns, and its alert events with every claim taken on them - the fan-out's and each replay's - and the webhook deliveries under those. An event with no batches has not been fanned out yet; a batch with no deliveries found nobody subscribed. One snapshot: nothing here is spliced from two moments.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "alert-groups"
+                ],
+                "summary": "The deliveries of an alert group",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Alert Group ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.AlertGroupDeliveriesResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/alert-groups/{id}/notes": {
             "post": {
                 "description": "Add a user note to an alert group's timeline",
@@ -752,6 +787,218 @@ const docTemplate = `{
                         "description": "Internal Server Error",
                         "schema": {
                             "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/deliveries": {
+            "get": {
+                "description": "Commitments of every delivery family admitted in a period, newest first. The period defaults to the last day by the server's clock; with only ` + "`" + `to` + "`" + `, it is the day before it. Unknown values of family, status and target_kind are rejected.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "deliveries"
+                ],
+                "summary": "The delivery journal",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "notification | handoff | webhook",
+                        "name": "family",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "slack | telegram | webhook",
+                        "name": "provider",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Comma-separated statuses: pending, sending, idle, manual_review, succeeded, permanent_failed, expired, canceled",
+                        "name": "status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "user | channel | subscriber",
+                        "name": "target_kind",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "The recipient as this system names it: a user id, a channel id, an integration id",
+                        "name": "target_ref",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Commitments owned by this alert group (paging)",
+                        "name": "alert_group_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Commitments of every claim on this alert event, replays included",
+                        "name": "event_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "RFC 3339",
+                        "name": "from",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "RFC 3339",
+                        "name": "to",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page (default 1)",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 50, at most 200)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.DeliveriesResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/deliveries/{id}": {
+            "get": {
+                "description": "Everything the system knows about one commitment: what it is, every attempt with its outcome, results that arrived late, and what happened to it without a call - withdrawals, expiry, decisions. The id is the same one the webhook routes call a delivery.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "deliveries"
+                ],
+                "summary": "The journal of one delivery",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Delivery ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.DeliveryJournalResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.DeliveryGoneResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/deliveries/{id}/decisions": {
+            "post": {
+                "description": "A person deciding about a commitment in manual_review, permanent_failed or expired. The reason is required (1 to 500 characters). resolved answers 200 with the commitment and the row of the decision table that applied; already_resolved 409 with the current status; invalid_decision 422 with the guard's words in detail; business_closed and recipient_erased 409 with detail; an unknown commitment 404.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "deliveries"
+                ],
+                "summary": "Decide what a stuck delivery does",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Delivery ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "The decision",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.DecisionRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.DecisionResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.DecisionResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/api.DecisionResponse"
                         }
                     }
                 }
@@ -928,6 +1175,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/api.ErrorResponse"
                         }
                     },
+                    "409": {
+                        "description": "the integration is being changed by another request; retry",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -961,8 +1214,188 @@ const docTemplate = `{
                             "$ref": "#/definitions/api.ErrorResponse"
                         }
                     },
+                    "409": {
+                        "description": "the integration is being changed by another request; retry",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/integrations/{id}/deliveries": {
+            "get": {
+                "description": "The deliveries made to one generic webhook subscriber, newest first, in the subscriber's own vocabulary (pending, retry, sent, failed). History before the cutover to the delivery domain is not carried. Readable after the integration is deleted.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "integrations"
+                ],
+                "summary": "List the deliveries of a webhook integration",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Integration ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page (default 1)",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 50, at most 200)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.DeliveryListResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/integrations/{id}/deliveries/{deliveryId}": {
+            "get": {
+                "description": "The delivery and every attempt made for it. The delivery id is the same id the journal under /deliveries answers about.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "integrations"
+                ],
+                "summary": "One delivery of a webhook integration, with its attempts",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Integration ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Delivery ID",
+                        "name": "deliveryId",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.DeliveryDetailResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/integrations/{id}/deliveries/{deliveryId}/replay": {
+            "post": {
+                "description": "Creates a NEW delivery of the same event to the same subscriber, at its current address. The Idempotency-Key header is required and names the decision: a repeat with the same key answers with the same delivery. A delivery still in progress is not replayed (409), and neither is one of a disabled integration (409).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "integrations"
+                ],
+                "summary": "Deliver a finished delivery's event to the subscriber again",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Integration ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Delivery ID",
+                        "name": "deliveryId",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "1 to 128 bytes",
+                        "name": "Idempotency-Key",
+                        "in": "header",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.ReplayDeliveryResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "410": {
+                        "description": "Gone",
                         "schema": {
                             "$ref": "#/definitions/api.ErrorResponse"
                         }
@@ -2765,6 +3198,23 @@ const docTemplate = `{
                 }
             }
         },
+        "api.AlertGroupDeliveriesResponse": {
+            "type": "object",
+            "properties": {
+                "events": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.EventDeliveriesDTO"
+                    }
+                },
+                "paging": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.GroupDeliveryDTO"
+                    }
+                }
+            }
+        },
         "api.AlertGroupListResponse": {
             "type": "object",
             "properties": {
@@ -2783,6 +3233,32 @@ const docTemplate = `{
                 },
                 "total": {
                     "type": "integer"
+                }
+            }
+        },
+        "api.BatchDeliveriesDTO": {
+            "type": "object",
+            "properties": {
+                "admitted_at": {
+                    "type": "string"
+                },
+                "batch_id": {
+                    "type": "string"
+                },
+                "deliveries": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.GroupDeliveryDTO"
+                    }
+                },
+                "intent_count": {
+                    "type": "integer"
+                },
+                "kind": {
+                    "type": "string"
+                },
+                "outcome": {
+                    "type": "string"
                 }
             }
         },
@@ -2900,6 +3376,384 @@ const docTemplate = `{
                 }
             }
         },
+        "api.DecisionRequest": {
+            "type": "object",
+            "properties": {
+                "accepted_duplicate_risk": {
+                    "description": "AcceptedDuplicateRisk is the person saying, on the record, that a second\nmessage may exist. Some decisions need it; the refusal says so.",
+                    "type": "boolean"
+                },
+                "decision": {
+                    "description": "Decision is one of assume_accepted, cancel, retry_current_generation,\nretry_new_generation.",
+                    "type": "string"
+                },
+                "new_expires_at": {
+                    "description": "NewExpiresAt is the new deadline a retry of an expired commitment needs.\nIt has to be ahead of the moment it is written.",
+                    "type": "string"
+                },
+                "reason": {
+                    "description": "Reason is required: a decision without one is \"somebody decided\nsomething\". At most 500 characters, counted as characters.",
+                    "type": "string"
+                }
+            }
+        },
+        "api.DecisionResponse": {
+            "type": "object",
+            "properties": {
+                "delivery": {
+                    "description": "Delivery is the commitment after the decision applied.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/api.DeliveryDTO"
+                        }
+                    ]
+                },
+                "detail": {
+                    "description": "Detail is the words of the guard that refused the decision.",
+                    "type": "string"
+                },
+                "outcome": {
+                    "type": "string"
+                },
+                "row": {
+                    "description": "Row is the line of the decision table that applied.",
+                    "type": "string"
+                },
+                "status": {
+                    "description": "Status is where the commitment stands after the answer - the new state\nwhen the decision applied, the current one when it did not.",
+                    "type": "string"
+                }
+            }
+        },
+        "api.DeliveriesResponse": {
+            "type": "object",
+            "properties": {
+                "deliveries": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.DeliveryDTO"
+                    }
+                },
+                "from": {
+                    "type": "string"
+                },
+                "has_next": {
+                    "type": "boolean"
+                },
+                "has_prev": {
+                    "type": "boolean"
+                },
+                "page": {
+                    "type": "integer"
+                },
+                "to": {
+                    "type": "string"
+                },
+                "total": {
+                    "type": "integer"
+                },
+                "total_pages": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.DeliveryAttemptDTO": {
+            "type": "object",
+            "properties": {
+                "applied_revision": {
+                    "type": "integer"
+                },
+                "attempt_kind": {
+                    "type": "string"
+                },
+                "attempt_no": {
+                    "type": "integer"
+                },
+                "bound_endpoint": {
+                    "type": "string"
+                },
+                "error_class": {
+                    "type": "string"
+                },
+                "finish_reason": {
+                    "type": "string"
+                },
+                "finished_at": {
+                    "type": "string"
+                },
+                "generation_no": {
+                    "type": "integer"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "operation": {
+                    "type": "string"
+                },
+                "outcome": {
+                    "type": "string"
+                },
+                "provider": {
+                    "type": "string"
+                },
+                "provider_status": {
+                    "type": "string"
+                },
+                "receipt": {
+                    "type": "object"
+                },
+                "receipt_recorded": {
+                    "description": "ReceiptRecorded and ReceiptRedactedAt are the three states of the\nobject an attempt made: none, present, and removed by an erasure - the\nlast being proof without coordinates, which is not the same as no proof.",
+                    "type": "boolean"
+                },
+                "receipt_redacted_at": {
+                    "type": "string"
+                },
+                "record_kind": {
+                    "type": "string"
+                },
+                "result_detail": {
+                    "type": "string"
+                },
+                "started_at": {
+                    "type": "string"
+                },
+                "summary": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.DeliveryDTO": {
+            "type": "object",
+            "properties": {
+                "accepted_duplicate_risk": {
+                    "type": "boolean"
+                },
+                "alert_group_id": {
+                    "type": "string"
+                },
+                "applied_revision": {
+                    "type": "integer"
+                },
+                "attempts_in_generation": {
+                    "type": "integer"
+                },
+                "batch_id": {
+                    "type": "string"
+                },
+                "cancellation_requested": {
+                    "type": "boolean"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "desired_revision": {
+                    "type": "integer"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "failure_streak": {
+                    "type": "integer"
+                },
+                "family": {
+                    "type": "string"
+                },
+                "final_revision_applied": {
+                    "type": "boolean"
+                },
+                "form": {
+                    "type": "string"
+                },
+                "generation_no": {
+                    "type": "integer"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "kind": {
+                    "type": "string"
+                },
+                "next_attempt_at": {
+                    "type": "string"
+                },
+                "not_before": {
+                    "type": "string"
+                },
+                "provider": {
+                    "type": "string"
+                },
+                "receipt_recorded": {
+                    "type": "boolean"
+                },
+                "receipt_ref": {
+                    "type": "string"
+                },
+                "recipient_erased": {
+                    "type": "boolean"
+                },
+                "status": {
+                    "type": "string"
+                },
+                "target_kind": {
+                    "type": "string"
+                },
+                "target_ref": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.DeliveryDetailResponse": {
+            "type": "object",
+            "properties": {
+                "attempts": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.DeliveryAttempt"
+                    }
+                },
+                "delivery": {
+                    "$ref": "#/definitions/model.OutboxDelivery"
+                }
+            }
+        },
+        "api.DeliveryEventDTO": {
+            "type": "object",
+            "properties": {
+                "actor": {
+                    "type": "string"
+                },
+                "actor_kind": {
+                    "description": "ActorKind says what Actor is: the id of a user, the name of a component, or the text of a build before this one.",
+                    "type": "string"
+                },
+                "at": {
+                    "type": "string"
+                },
+                "from_status": {
+                    "type": "string"
+                },
+                "kind": {
+                    "type": "string"
+                },
+                "reason": {
+                    "type": "string"
+                },
+                "seq": {
+                    "type": "integer"
+                },
+                "to_status": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.DeliveryGoneResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "retention_days": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.DeliveryJournalResponse": {
+            "type": "object",
+            "properties": {
+                "attempts": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.DeliveryAttemptDTO"
+                    }
+                },
+                "delivery": {
+                    "$ref": "#/definitions/api.DeliveryDTO"
+                },
+                "events": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.DeliveryEventDTO"
+                    }
+                },
+                "observations": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.DeliveryObservationDTO"
+                    }
+                }
+            }
+        },
+        "api.DeliveryListResponse": {
+            "type": "object",
+            "properties": {
+                "deliveries": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.OutboxDelivery"
+                    }
+                },
+                "has_next": {
+                    "type": "boolean"
+                },
+                "has_prev": {
+                    "type": "boolean"
+                },
+                "page": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
+                },
+                "total_pages": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.DeliveryObservationDTO": {
+            "type": "object",
+            "properties": {
+                "applied_revision": {
+                    "type": "integer"
+                },
+                "attempt_id": {
+                    "type": "string"
+                },
+                "error_class": {
+                    "type": "string"
+                },
+                "kind": {
+                    "type": "string"
+                },
+                "observed_at": {
+                    "type": "string"
+                },
+                "outcome": {
+                    "type": "string"
+                },
+                "provider_status": {
+                    "type": "string"
+                },
+                "receipt": {
+                    "type": "object"
+                },
+                "receipt_recorded": {
+                    "type": "boolean"
+                },
+                "receipt_redacted_at": {
+                    "type": "string"
+                },
+                "result_detail": {
+                    "type": "string"
+                },
+                "summary": {
+                    "type": "string"
+                }
+            }
+        },
         "api.ErrorResponse": {
             "type": "object",
             "properties": {
@@ -2907,6 +3761,109 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "error": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.EventDeliveriesDTO": {
+            "type": "object",
+            "properties": {
+                "batches": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.BatchDeliveriesDTO"
+                    }
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "event_id": {
+                    "type": "string"
+                },
+                "event_type": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.GroupDeliveryDTO": {
+            "type": "object",
+            "properties": {
+                "accepted_duplicate_risk": {
+                    "type": "boolean"
+                },
+                "alert_group_id": {
+                    "type": "string"
+                },
+                "applied_revision": {
+                    "type": "integer"
+                },
+                "attempts_in_generation": {
+                    "type": "integer"
+                },
+                "batch_id": {
+                    "type": "string"
+                },
+                "cancellation_requested": {
+                    "type": "boolean"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "desired_revision": {
+                    "type": "integer"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "failure_streak": {
+                    "type": "integer"
+                },
+                "family": {
+                    "type": "string"
+                },
+                "final_revision_applied": {
+                    "type": "boolean"
+                },
+                "form": {
+                    "type": "string"
+                },
+                "generation_no": {
+                    "type": "integer"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "kind": {
+                    "type": "string"
+                },
+                "next_attempt_at": {
+                    "type": "string"
+                },
+                "not_before": {
+                    "type": "string"
+                },
+                "provider": {
+                    "type": "string"
+                },
+                "receipt_recorded": {
+                    "type": "boolean"
+                },
+                "recipient_erased": {
+                    "type": "boolean"
+                },
+                "status": {
+                    "type": "string"
+                },
+                "target_kind": {
+                    "type": "string"
+                },
+                "target_ref": {
+                    "type": "string"
+                },
+                "updated_at": {
                     "type": "string"
                 }
             }
@@ -3138,6 +4095,20 @@ const docTemplate = `{
                 },
                 "version": {
                     "type": "integer"
+                }
+            }
+        },
+        "api.ReplayDeliveryResponse": {
+            "type": "object",
+            "properties": {
+                "delivery_id": {
+                    "type": "string"
+                },
+                "message": {
+                    "type": "string"
+                },
+                "ok": {
+                    "type": "boolean"
                 }
             }
         },
@@ -3751,10 +4722,6 @@ const docTemplate = `{
         "model.AlertGroup": {
             "type": "object",
             "properties": {
-                "ack_processed_at": {
-                    "description": "When ack update job was processed",
-                    "type": "string"
-                },
                 "acknowledged_by": {
                     "description": "Acknowledgement",
                     "type": "string"
@@ -3773,7 +4740,7 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "dedup_key": {
-                    "description": "groupKey from Alertmanager (fingerprint)",
+                    "description": "AlertKey is what the alerting system calls the alert this group is\nabout: Alertmanager's group key, or a single alert's fingerprint. It\nnames the ALERT, not this incident - the same key comes back every time\nthe same thing breaks, and each time it opens a new group with a new ID.\n\nIt is not the identity of any work done about the alert. An escalation\nthat once keyed itself by this string paged nobody for the second\nincident.\n\nThe JSON name is the one this field has always had, and stays: it is\nwhat the API, the webhooks and the UI already read.",
                     "type": "string"
                 },
                 "external_url": {
@@ -3816,10 +4783,6 @@ const docTemplate = `{
                 },
                 "severity": {
                     "type": "string"
-                },
-                "slack_update_pending": {
-                    "description": "Slack Update Tracking",
-                    "type": "boolean"
                 },
                 "status": {
                     "$ref": "#/definitions/model.AlertGroupStatus"
@@ -3879,6 +4842,32 @@ const docTemplate = `{
                 "AlertStatusFiring",
                 "AlertStatusResolved"
             ]
+        },
+        "model.DeliveryAttempt": {
+            "type": "object",
+            "properties": {
+                "attempt": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "delivery_id": {
+                    "type": "string"
+                },
+                "error": {
+                    "type": "string"
+                },
+                "http_status": {
+                    "type": "integer"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "response_body_trunc": {
+                    "type": "string"
+                }
+            }
         },
         "model.EscalationPolicy": {
             "type": "object",
@@ -4115,6 +5104,62 @@ const docTemplate = `{
                     "type": "string"
                 }
             }
+        },
+        "model.OutboxDelivery": {
+            "type": "object",
+            "properties": {
+                "attempts": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "event_id": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "integration_id": {
+                    "type": "string"
+                },
+                "last_error": {
+                    "type": "string"
+                },
+                "last_http_status": {
+                    "type": "integer"
+                },
+                "next_attempt_at": {
+                    "type": "string"
+                },
+                "request_payload": {
+                    "type": "string"
+                },
+                "response_body_trunc": {
+                    "type": "string"
+                },
+                "sent_at": {
+                    "type": "string"
+                },
+                "status": {
+                    "$ref": "#/definitions/model.OutboxDeliveryStatus"
+                }
+            }
+        },
+        "model.OutboxDeliveryStatus": {
+            "type": "string",
+            "enum": [
+                "pending",
+                "retry",
+                "sent",
+                "failed"
+            ],
+            "x-enum-varnames": [
+                "OutboxDeliveryPending",
+                "OutboxDeliveryRetry",
+                "OutboxDeliverySent",
+                "OutboxDeliveryFailed"
+            ]
         },
         "model.Team": {
             "type": "object",

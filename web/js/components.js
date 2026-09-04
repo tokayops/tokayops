@@ -163,7 +163,10 @@ const Components = {
                     <i data-lucide="calendar" class="nav-icon"></i>
                     <span class="nav-text">On-Call</span>
                 </a>
-                <a href="#/ops/activity" class="nav-item disabled" title="Coming soon">
+                <a href="${Permissions.isAdmin() ? '#/ops/activity' : 'javascript:void(0)'}"
+                   class="nav-item ${Permissions.isAdmin() ? '' : 'disabled'}"
+                   data-route="activity"
+                   ${Permissions.isAdmin() ? '' : 'title="The delivery journal is available to administrators"'}>
                     <i data-lucide="activity" class="nav-icon"></i>
                     <span class="nav-text">Activity</span>
                 </a>
@@ -548,6 +551,13 @@ const Components = {
                 </div>
             ` : '')}
 
+            <div class="detail-section deliveries-section">
+                <h3 class="detail-section-title">Deliveries</h3>
+                <div id="alert-group-deliveries" class="deliveries-container">
+                    <div class="loading-spinner">Loading deliveries...</div>
+                </div>
+            </div>
+
             <div class="detail-section timeline-section">
                 <h3 class="detail-section-title">Timeline</h3>
                 <div id="alert-group-timeline" class="timeline-container">
@@ -698,12 +708,26 @@ const Components = {
         const keyTypes = new Set(['created', 'acknowledged', 'resolved']);
         const emphasisClass = keyTypes.has(event.type) ? ' is-key' : ' is-minor';
 
-        // Build notification details from metadata. Sprint 4 renamed
+        // Build notification details from metadata. A rename moved
         // step_type values (slack_dm → dm, slack_channel → channel) and
         // introduced recipient_id in place of slack_user_id; firehose stays.
         let notificationDetails = '';
-        if (event.type === 'notification_sent' && event.metadata) {
-            const meta = event.metadata;
+        const meta = event.metadata || {};
+        if (meta.intent_id) {
+            // A line the delivery domain wrote: who it went to and through
+            // what, from the row rather than from the prose. The journal of
+            // the delivery is the administrator's, and offered only to them.
+            const target = Components.deliveryTarget(meta.target_kind, meta.target_ref);
+            const journal = window.Permissions && Permissions.isAdmin()
+                ? `<button type="button" class="btn-link journal-link" data-delivery-id="${escapeAttr(meta.intent_id)}">journal</button>`
+                : '';
+            notificationDetails = `
+                <div class="timeline-notification-details timeline-delivery" data-delivery-id="${escapeAttr(meta.intent_id)}">
+                    ${target}
+                    <span class="timeline-delivery-provider">via ${escapeHtml(meta.provider || '')}</span>
+                    ${journal}
+                </div>`;
+        } else if (event.type === 'notification_sent' && event.metadata) {
             if (meta.step_type === 'dm' && (meta.user_name || meta.recipient_id)) {
                 const userName = meta.user_name || meta.recipient_id;
                 notificationDetails = `
@@ -733,6 +757,24 @@ const Components = {
                 </div>
             </div>
         `;
+    },
+
+    /**
+     * Where a delivery went, as the deliveries module labels it: a person by
+     * id until the directory answers with a name, a channel, a subscriber.
+     */
+    deliveryTarget: (kind, ref) => {
+        const id = escapeHtml(ref || '');
+        switch (kind) {
+            case 'user':
+                return `<span class="delivery-target" data-user-id="${escapeAttr(ref || '')}"><i data-lucide="user"></i><span class="delivery-target-name">${id}</span></span>`;
+            case 'channel':
+                return `<span class="delivery-target"><i data-lucide="hash"></i><span>${id}</span></span>`;
+            case 'subscriber':
+                return `<span class="delivery-target"><i data-lucide="webhook"></i><span>subscriber ${id}</span></span>`;
+            default:
+                return `<span class="delivery-target">${escapeHtml(kind || '')} ${id}</span>`;
+        }
     },
 
     /**
@@ -1347,7 +1389,7 @@ const Components = {
                 chips.push(`<span class="step-delay">(${delayStr})</span>`);
             }
 
-            // Sprint 4: chips read step.target_kind ("dm" / "channel").
+            // Chips read step.target_kind ("dm" / "channel").
             const isChannel = step.target_kind === 'channel';
             const icon = isChannel ? 'hash' : 'user';
             const label = isChannel ? 'Channel' : 'DM';
@@ -1366,7 +1408,7 @@ const Components = {
      * @param {string} policyTeamId - Current policy's team ID
      */
     policyStepRow: (step, index, users = [], teams = [], policyTeamId = '', scheduleId = '', providers = []) => {
-        // Sprint 4: build the type dropdown from provider capabilities. Each
+        // The type dropdown is built from provider capabilities. Each
         // <option> value is "<provider>:<target_kind>", and the human label
         // capitalizes both pieces. If the registry is empty (offline / bad
         // wiring) fall back to a single Slack DM option so the editor stays

@@ -52,7 +52,7 @@ type telegramUpdate struct {
 
 // TelegramSecretMiddleware verifies the X-Telegram-Bot-Api-Secret-Token header
 // (set when we call setWebhook) against the configured secret via a constant-time
-// compare. Unlike Slack this is NOT an HMAC — Telegram echoes the secret verbatim.
+// compare. Unlike Slack this is NOT an HMAC - Telegram echoes the secret verbatim.
 // Returns 503 when no secret is configured (mirrors SlackSignatureMiddleware).
 func (a *API) TelegramSecretMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
@@ -86,8 +86,8 @@ func (a *API) TelegramSecretMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 // HandleTelegramWebhook processes Bot API updates: `/start <token>` links the
 // sender's Telegram account, and a callback_query acks/resolves an alert group.
 // It always returns 200 (Telegram retries non-200) and answers the callback so
-// the button stops spinning. The card edit itself is driven by the existing
-// ack/resolution loop via TelegramProvider.Update/Resolve — not here.
+// the button stops spinning. The card itself is not touched here: it belongs to
+// the delivery domain, which brings it to the acknowledged revision.
 func (a *API) HandleTelegramWebhook(c echo.Context) error {
 	var upd telegramUpdate
 	if err := json.NewDecoder(c.Request().Body).Decode(&upd); err != nil {
@@ -138,7 +138,7 @@ func (a *API) handleTelegramStart(ctx context.Context, upd *telegramUpdate) {
 	}
 }
 
-// handleTelegramCallback handles an Ack/Resolve button — mirror of HandleSlackInteractive.
+// handleTelegramCallback handles an Ack/Resolve button - mirror of HandleSlackInteractive.
 func (a *API) handleTelegramCallback(ctx context.Context, upd *telegramUpdate) {
 	cb := upd.CallbackQuery
 
@@ -184,7 +184,7 @@ func (a *API) handleTelegramCallback(ctx context.Context, upd *telegramUpdate) {
 		return
 	}
 
-	actor := alertgroup.Actor{Name: actorName(user), Email: user.Email}
+	actor := alertgroup.Actor{ID: user.ID, Name: actorName(user), Email: user.Email}
 	var result *alertgroup.TransitionResult
 	if action == rbac.ActionAlertAck {
 		result, err = a.agService.Ack(agID, actor, telegramMeta)

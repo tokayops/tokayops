@@ -32,11 +32,10 @@ const storePackage = "internal/store"
 // with the reason each is still on the list. Removing an entry is the goal;
 // adding one is a decision that belongs in domains.md as well as here.
 var mayReachStore = map[string]string{
-	"internal/store":      "it is the persistence layer",
-	"internal/api":        "the HTTP layer still writes to every domain directly - the main known violation",
-	"internal/dispatcher": "parts of four things in one package; narrowed together with the job engine contract",
-	"internal/testutil":   "test scaffolding: it hands tests a real store",
-	"cmd/tokayops":        "the wiring that constructs the store and passes it to everyone else",
+	"internal/store":    "it is the persistence layer",
+	"internal/api":      "the HTTP layer still writes to every domain directly - the main known violation",
+	"internal/testutil": "test scaffolding: it hands tests a real store",
+	"cmd/tokayops":      "the wiring that constructs the store and passes it to everyone else",
 }
 
 // TestDomainPackagesDoNotReachTheStore is rule 2 of domains.md: a domain

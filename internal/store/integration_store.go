@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -72,43 +73,6 @@ func (s *Store) CreateIntegration(i *model.Integration) error {
 	return nil
 }
 
-// UpdateIntegration updates an integration, keeping existing secrets if new ones are empty
-func (s *Store) UpdateIntegration(i *model.Integration) error {
-	i.UpdatedAt = time.Now()
-
-	// Get existing integration to merge secrets
-	existing, err := s.GetIntegrationByID(i.ID)
-	if err != nil {
-		return err
-	}
-
-	// Merge secrets: if new secret is empty or "****", keep existing
-	mergedConfig := mergeSecrets(existing.Type, existing.Config, i.Config)
-
-	// Encrypt merged config
-	encryptedConfig, err := encryptConfig(mergedConfig)
-	if err != nil {
-		return err
-	}
-
-	query := `UPDATE integrations SET name = $1, enabled = $2, scope = $3, team_id = $4, config = $5, updated_at = $6 WHERE id = $7`
-	result, err := s.db.Exec(query, i.Name, i.Enabled, scopeToNullString(i.Scope), stringPtrToNullString(i.TeamID), encryptedConfig, i.UpdatedAt, i.ID)
-	if err != nil {
-		// Same race as on create, reachable the same way: moving an existing
-		// integration onto a team scope writes team_id too.
-		if isIntegrationTeamFKViolation(err) {
-			return ErrIntegrationTeamNotFound
-		}
-		return err
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return ErrIntegrationNotFound
-	}
-	return nil
-}
-
 // GetIntegrationByID retrieves an integration by ID with decrypted config
 func (s *Store) GetIntegrationByID(id string) (*model.Integration, error) {
 	query := `SELECT id, type, direction, name, enabled, scope, team_id, config, created_at, updated_at FROM integrations WHERE id = $1`
@@ -145,19 +109,6 @@ func (s *Store) GetAllIntegrations() ([]*model.Integration, error) {
 	}
 	defer rows.Close()
 	return scanIntegrations(rows)
-}
-
-// DeleteIntegration deletes an integration by ID
-func (s *Store) DeleteIntegration(id string) error {
-	result, err := s.db.Exec(`DELETE FROM integrations WHERE id = $1`, id)
-	if err != nil {
-		return err
-	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return ErrIntegrationNotFound
-	}
-	return nil
 }
 
 // scanIntegration scans a single integration row
@@ -393,4 +344,42 @@ func stringPtrToNullString(s *string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: *s, Valid: true}
+}
+
+// SubscriberConfig reads one generic webhook integration's configuration for the
+// delivery channel, under the caller's context.
+//
+// From the database, not the cache: the cache holds no generic webhooks and is
+// refreshed only by the process that handled a change, so a secret rotated on
+// one instance would leave every other signing with the old one. Under the
+// caller's context, because the channel reads this inside an attempt whose
+// every step has a deadline, and a read that could outlive them would hold a
+// slot the deadlines exist to free.
+//
+// The bool is whether the subscriber exists; an id that names an integration of
+// another type is not a subscriber either. An error is the database failing,
+// and the two are different answers to a delivery.
+func (s *Store) SubscriberConfig(ctx context.Context, integrationID string) (model.GenericWebhookConfig, bool, error) {
+	var kind model.IntegrationType
+	var encrypted string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT type, config FROM integrations WHERE id = $1`, integrationID).Scan(&kind, &encrypted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.GenericWebhookConfig{}, false, nil
+	}
+	if err != nil {
+		return model.GenericWebhookConfig{}, false, err
+	}
+	if kind != model.IntegrationTypeGenericWebhook {
+		return model.GenericWebhookConfig{}, false, nil
+	}
+	raw, err := decryptConfig(encrypted)
+	if err != nil {
+		return model.GenericWebhookConfig{}, false, err
+	}
+	var cfg model.GenericWebhookConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return model.GenericWebhookConfig{}, false, fmt.Errorf("subscriber %s: configuration does not read: %w", integrationID, err)
+	}
+	return cfg, true, nil
 }

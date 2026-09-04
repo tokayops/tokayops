@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"net"
+	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -117,5 +122,150 @@ func TestUnknownCommandRefusedBeforeTheDatabase(t *testing.T) {
 	// refusal came from the database, not from the argument.
 	if strings.Contains(output, "Using DB:") {
 		t.Errorf("the binary reached the database before refusing the command:\n%s", output)
+	}
+}
+
+// TestShutdownWaitsForTheWorkersItWasGiven.
+//
+// The outbound worker holds calls that have BEEN MADE. A process that cancels
+// its context and exits leaves an answer arriving a moment later with nowhere
+// to go, and the delivery becomes ambiguous - a message that may or may not
+// have been sent, with nothing saying which. That is what this waits for, and
+// it was missing: the workers were started fire-and-forget.
+func TestShutdownWaitsForTheWorkersItWasGiven(t *testing.T) {
+	quit := make(chan os.Signal, 1)
+	stopped := make(chan struct{})
+
+	var cancelled atomic.Bool
+	cancelledFirst := make(chan struct{})
+	cancel := func() {
+		cancelled.Store(true)
+		close(cancelledFirst)
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		awaitShutdown(quit, cancel, nil, stopped)
+	}()
+
+	// Nothing happens until the signal.
+	select {
+	case <-returned:
+		t.Fatal("the process gave up before it was told to")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	quit <- syscall.SIGTERM
+
+	// The worker is told to stop before it is waited for, or the wait would be
+	// for something that has no reason to end.
+	select {
+	case <-cancelledFirst:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the background context was never cancelled")
+	}
+
+	// And the process stays while the worker is still finishing.
+	select {
+	case <-returned:
+		t.Fatal("the process exited while a worker was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(stopped)
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the process did not exit after its workers were done")
+	}
+	if !cancelled.Load() {
+		t.Error("the workers were waited for without being told to stop")
+	}
+}
+
+// TestShutdownStopsAcceptingBeforeItWaits.
+//
+// Waiting for the delivery worker can take a minute. A process that spends that
+// minute still serving its API and its ingestion endpoint is taking on alerts,
+// acknowledgements and webhook deliveries that nothing behind them is running
+// any more: the engine and the worker are stopping. Before the join was added
+// this could not happen, because the process simply exited - which is how the
+// window got here.
+func TestShutdownStopsAcceptingBeforeItWaits(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+
+	url := "http://" + ln.Addr().String() + "/"
+	if resp, err := http.Get(url); err != nil {
+		t.Fatalf("the server was not serving to begin with: %v", err)
+	} else {
+		resp.Body.Close()
+	}
+
+	quit := make(chan os.Signal, 1)
+	// The worker is still draining, and stays that way for the whole test.
+	stopped := make(chan struct{})
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		awaitShutdown(quit, func() {}, []listener{srv}, stopped)
+	}()
+
+	quit <- syscall.SIGTERM
+
+	// The port has to be refusing while the worker is still running. That is
+	// the window this test is about; the wait itself is the previous test.
+	refused := false
+	for i := 0; i < 200; i++ {
+		resp, err := http.Get(url)
+		if err != nil {
+			refused = true
+			break
+		}
+		resp.Body.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !refused {
+		t.Fatal("the API was still accepting requests while the process was draining")
+	}
+
+	select {
+	case <-returned:
+		t.Fatal("the process exited while a worker was still running")
+	default:
+	}
+
+	close(stopped)
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the process did not exit after its workers were done")
+	}
+}
+
+// TestTheCatalogueOffersNoWebhookChannel: the channels a policy step may name
+// are slack and telegram. The webhook channel delivers events to subscribers and
+// is not among them - a policy that paged a URL is not a thing this build lets
+// anyone write, and the catalogue is where that is decided.
+func TestTheCatalogueOffersNoWebhookChannel(t *testing.T) {
+	channels := channelCatalog()
+	for _, name := range []string{"slack", "telegram"} {
+		if _, ok := channels.Capabilities(name); !ok {
+			t.Errorf("the catalogue lacks %s", name)
+		}
+	}
+	if _, ok := channels.Capabilities("webhook"); ok {
+		t.Fatal("the catalogue offers the webhook channel to policy steps")
+	}
+	if got := len(channels.AllCapabilities()); got != 2 {
+		t.Fatalf("the catalogue lists %d channels, want 2", got)
 	}
 }

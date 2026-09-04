@@ -296,7 +296,7 @@ export class SchedulesPage {
 
   /**
    * Cancel override form expecting to return to a parent view (e.g. calendar).
-   * The modal stays active — only the content changes back.
+   * The modal stays active - only the content changes back.
    */
   async cancelOverrideAndReturnToCalendar() {
     await this.overrideCancelBtn.click();

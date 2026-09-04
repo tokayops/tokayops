@@ -34,6 +34,7 @@ import {
 } from '/js/modules/schedules.js';
 import { bindPoliciesEvents, showPoliciesView } from '/js/modules/policies.js';
 import { bindIntegrationsEvents, showIntegrationsView } from '/js/modules/integrations.js';
+import { bindDeliveriesEvents, showActivityView } from '/js/modules/deliveries.js';
 
 // ========================================
 // Auto-Refresh
@@ -286,22 +287,11 @@ function handleHashRoute() {
                 }
             }
         } else if (path.startsWith('/activity')) {
-            // Ops Activity View
+            // The operational log: every delivery of every family.
             ViewManager.show('activity', { showStats: false, showViewToggle: false });
             clearPageActions();
-            updatePageTitle('Activity Log');
-            if (Elements.opsActivityView) {
-                Elements.opsActivityView.innerHTML = `
-                    <div class="section-header">
-                        <h2 class="section-title"><i data-lucide="activity"></i> Activity Log</h2>
-                    </div>
-                    <div class="empty-state">
-                        <i data-lucide="construction" class="empty-icon"></i>
-                        <p>Global activity log coming soon</p>
-                    </div>
-                `;
-                if (window.lucide) lucide.createIcons();
-            }
+            updatePageTitle('Activity');
+            showActivityView();
         }
     } else if (mode === 'cfg') {
         clearPageActions();
@@ -705,6 +695,7 @@ async function init() {
     bindUserMenuEvents();
     bindPoliciesEvents();
     bindIntegrationsEvents();
+    bindDeliveriesEvents();
 
     // 4. Load Data
     const savedTeamId = localStorage.getItem('tokay.selectedTeamId');

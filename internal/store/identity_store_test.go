@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -11,7 +12,7 @@ import (
 )
 
 // TestStore_IdentityLink_HappyPath issues a Slack OTP via IssueLinkToken and
-// confirms it via ConfirmIdentityLink — the Sprint 3 replacement for SaveSlackOTP/ConfirmSlackOTP.
+// confirms it via ConfirmIdentityLink - what replaced SaveSlackOTP/ConfirmSlackOTP.
 // `testutil.SeedUser` itself binds a `slack` identity, so we use a fresh provider name
 // to exercise the link flow end-to-end without conflicting with the seed binding.
 func TestStore_IdentityLink_HappyPath(t *testing.T) {
@@ -127,7 +128,7 @@ func TestStore_BindIfAbsent_GuardSemantics(t *testing.T) {
 	if err != nil || !changed {
 		t.Fatalf("first bind: changed=%v err=%v", changed, err)
 	}
-	// Same user, second call — no-op (don't overwrite).
+	// Same user, second call - no-op (don't overwrite).
 	changed, err = s.BindExternalIdentityIfAbsent(u1.ID, provider, "U_GUARD_B", "")
 	if err != nil || changed {
 		t.Errorf("re-bind for same user should be no-op: changed=%v err=%v", changed, err)
@@ -143,7 +144,7 @@ func TestStore_BindIfAbsent_GuardSemantics(t *testing.T) {
 }
 
 // TestStore_BindIfAbsent_DoesNotOverwrite_RealDB verifies the atomic
-// `INSERT ... ON CONFLICT (user_id, provider) DO NOTHING` semantics — the previous
+// `INSERT ... ON CONFLICT (user_id, provider) DO NOTHING` semantics - the previous
 // check-then-bind implementation overwrote an existing identity via DO UPDATE.
 func TestStore_BindIfAbsent_DoesNotOverwrite_RealDB(t *testing.T) {
 	s := testutil.SetupDB(t)
@@ -196,15 +197,15 @@ func TestStore_UnbindExternalIdentity(t *testing.T) {
 }
 
 // TestStore_ConsumeLinkToken_DeepLink issues a deep-link token (empty external_id)
-// and consumes it bot-side by (provider, token), writing chat_id/display_name — the
-// Epic 8 Sprint 3 path where the bot has no logged-in user.
+// and consumes it bot-side by (provider, token), writing chat_id/display_name - the
+// path where the bot has no logged-in user.
 func TestStore_ConsumeLinkToken_DeepLink(t *testing.T) {
 	s := testutil.SetupDB(t)
 	user := testutil.SeedUser(t, s, "consume-happy@example.com")
 	const provider = "tgtest"
 	const token = "deeplink-secret-abc"
 
-	// Issue with empty external_id — from.id is unknown until /start.
+	// Issue with empty external_id - from.id is unknown until /start.
 	if err := s.IssueLinkToken(user.ID, provider, "", token, time.Now().Add(5*time.Minute)); err != nil {
 		t.Fatalf("IssueLinkToken: %v", err)
 	}
@@ -299,5 +300,28 @@ func TestMockStore_ConsumeLinkToken(t *testing.T) {
 	}
 	if _, err := s.ConsumeLinkToken(provider, "tok-1", "TG_1", "C_1", "Mock"); !errors.Is(err, store.ErrLinkTokenInvalid) {
 		t.Errorf("second consume should be invalid, got %v", err)
+	}
+}
+
+// TestTheIdentityLookupHonoursItsDeadline. Resolving a person's address is the
+// slow half of preparing an attempt, and it runs under a deadline
+// (outbound.NotificationPrepareDeadline) so a database that hangs costs one
+// delivery slot for five seconds rather than for the length of a lease.
+//
+// Handed a context the query never passes on, that deadline is a comment: the
+// call blocks for as long as the database wants, and the worker's slot goes
+// with it. This asks the cheapest question that tells the two apart - a context
+// that is already cancelled has to come back as cancelled, not as "no such
+// identity".
+func TestTheIdentityLookupHonoursItsDeadline(t *testing.T) {
+	s := testutil.SetupDB(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := s.GetExternalIdentityContext(ctx, "some-user", "slack")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled lookup answered %v, so the preparation deadline "+
+			"never reaches the database", err)
 	}
 }

@@ -63,10 +63,10 @@ func ParseAllowedPrivateCIDRs() ([]*net.IPNet, error) {
 // LogWebhookSecurityWarnings logs warnings for insecure webhook settings.
 func LogWebhookSecurityWarnings() {
 	if strings.EqualFold(os.Getenv(WebhookAllowHTTPEnv), "true") {
-		log.Printf("WARN: %s is enabled — webhook URLs may use plain HTTP", WebhookAllowHTTPEnv)
+		log.Printf("WARN: %s is enabled - webhook URLs may use plain HTTP", WebhookAllowHTTPEnv)
 	}
 	cidrs, _ := ParseAllowedPrivateCIDRs()
 	if len(cidrs) > 0 {
-		log.Printf("WARN: %s is set — webhooks may target private IPs: %v", WebhookAllowPrivateCIDREnv, cidrs)
+		log.Printf("WARN: %s is set - webhooks may target private IPs: %v", WebhookAllowPrivateCIDREnv, cidrs)
 	}
 }

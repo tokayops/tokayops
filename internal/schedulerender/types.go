@@ -88,9 +88,9 @@ const (
 // Three codes are gone - revision_gap, revision_overlap, override_overlap.
 // Each described damage the write paths cannot produce, and each came attached
 // to a calendar the renderer had drawn around the damage. A plausible answer
-// about who was on duty is worse than no answer: it is the same failure the
-// epic refused when it stopped reporting "nobody" for a schedule it could not
-// read. They are errors now.
+// about who was on duty is worse than no answer: it is the same failure this
+// package refused when it stopped reporting "nobody" for a schedule it could
+// not read. They are errors now.
 
 // Warning is structured because both the API and the tests consume it: a
 // message string would force either to parse prose.

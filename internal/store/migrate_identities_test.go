@@ -6,7 +6,7 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// addLegacySlackColumn re-creates the pre-Epic-7 users.slack_user_id column to
+// addLegacySlackColumn re-creates the legacy users.slack_user_id column to
 // simulate an un-migrated database, and drops it again on cleanup so the shared
 // package schema is left untouched for other tests.
 func addLegacySlackColumn(t *testing.T, s *Store) {
@@ -56,12 +56,12 @@ func TestMigrateLegacySlackIdentities(t *testing.T) {
 		t.Fatal("fresh schema should not have the legacy slack_user_id column")
 	}
 
-	// Simulate a pre-Epic-7 DB.
+	// Simulate a database from before identities moved out of the user row.
 	addLegacySlackColumn(t, s)
 
 	mustCreateUser(t, s, "u1", "u1@migrate.test")
 	mustCreateUser(t, s, "u2", "u2@migrate.test")
-	mustCreateUser(t, s, "u3", "u3@migrate.test") // no slack id — not a candidate
+	mustCreateUser(t, s, "u3", "u3@migrate.test") // no slack id - not a candidate
 	mustCreateUser(t, s, "u4", "u4@migrate.test") // already linked
 	setLegacySlack(t, s, "u1", "S1")
 	setLegacySlack(t, s, "u2", "S2")

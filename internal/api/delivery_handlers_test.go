@@ -1,436 +1,271 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
-func setupDeliveryTestEnv(t *testing.T) (*store.MockStore, *echo.Echo, string, string, string) {
+// The delivery routes keep their form over the new source. What the store
+// decides - the projection, the replay's admission - is tested against
+// Postgres; what the routes do with the answer is tested here, over a double
+// that answers what it is told.
+
+type deliveryStoreFake struct {
+	store.StoreInterface
+	deliveries []*model.OutboxDelivery
+	attempts   map[string][]*model.DeliveryAttempt
+	replay     func(store.WebhookReplayRequest) (store.WebhookReplayResult, error)
+	replayed   []store.WebhookReplayRequest
+}
+
+func (f *deliveryStoreFake) ListWebhookDeliveries(_ context.Context, integrationID string, limit, offset int) ([]*model.OutboxDelivery, int, error) {
+	var mine []*model.OutboxDelivery
+	for _, d := range f.deliveries {
+		if d.IntegrationID == integrationID {
+			mine = append(mine, d)
+		}
+	}
+	total := len(mine)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return mine[offset:end], total, nil
+}
+
+func (f *deliveryStoreFake) WebhookDelivery(_ context.Context, integrationID, deliveryID string) (*model.OutboxDelivery, []*model.DeliveryAttempt, error) {
+	for _, d := range f.deliveries {
+		if d.ID == deliveryID && d.IntegrationID == integrationID {
+			return d, f.attempts[deliveryID], nil
+		}
+	}
+	return nil, nil, store.ErrWebhookDeliveryNotFound
+}
+
+func (f *deliveryStoreFake) ReplayWebhookDelivery(_ context.Context, req store.WebhookReplayRequest) (store.WebhookReplayResult, error) {
+	f.replayed = append(f.replayed, req)
+	return f.replay(req)
+}
+
+type deliveryRoutes struct {
+	fake *deliveryStoreFake
+	e    *echo.Echo
+	hook string
+}
+
+func setupDeliveryRoutes(t *testing.T) *deliveryRoutes {
 	t.Helper()
 	s := store.NewMockStore()
-	api := NewAPI(s, nil, nil, nil, "", nil)
-	e := echo.New()
-	api.RegisterRoutes(e)
-
-	// Create a generic_webhook integration
 	scope := model.WebhookScopeGlobal
-	integ := &model.Integration{
-		Type:      model.IntegrationTypeGenericWebhook,
-		Direction: model.IntegrationDirectionOutbound,
-		Name:      "Test Webhook",
-		Enabled:   true,
-		Scope:     &scope,
-		Config:    json.RawMessage(`{"url":"https://example.com/hook","secret":"s3cret"}`),
+	for _, name := range []string{"hooks", "other"} {
+		if err := s.CreateIntegration(&model.Integration{
+			ID: name, Type: model.IntegrationTypeGenericWebhook, Name: name, Enabled: true, Scope: &scope,
+			Config: json.RawMessage(`{"url":"https://example.com/` + name + `","secret":"s"}`),
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := s.CreateIntegration(integ); err != nil {
-		t.Fatalf("CreateIntegration: %v", err)
-	}
-
-	// Create an outbox event
-	event := &model.OutboxEvent{
-		ID:           "evt-1",
-		EventType:    model.OutboxEventFiring,
-		AlertGroupID: "ag-1",
-		TeamID:       "devops",
-		Payload:      json.RawMessage(`{"event":"alert_group.firing"}`),
-		Status:       model.OutboxEventStatusCompleted,
-	}
-	if err := s.CreateOutboxEvent(event); err != nil {
-		t.Fatalf("CreateOutboxEvent: %v", err)
-	}
-
-	// Create a delivery
-	now := time.Now()
-	httpOK := 200
-	delivery := &model.OutboxDelivery{
-		ID:             "del-1",
-		EventID:        "evt-1",
-		IntegrationID:  integ.ID,
-		Status:         model.OutboxDeliverySent,
-		Attempts:       1,
-		LastHTTPStatus: &httpOK,
-		SentAt:         &now,
-	}
-	if err := s.CreateOutboxDelivery(delivery); err != nil {
-		t.Fatalf("CreateOutboxDelivery: %v", err)
-	}
-
-	// Create a delivery attempt
-	if err := s.CreateDeliveryAttempt(&model.DeliveryAttempt{
-		DeliveryID: "del-1",
-		Attempt:    0,
-		HTTPStatus: &httpOK,
-	}); err != nil {
-		t.Fatalf("CreateDeliveryAttempt: %v", err)
-	}
-
-	return s, e, integ.ID, delivery.ID, event.ID
-}
-
-// --- ListIntegrationDeliveries ---
-
-func TestListIntegrationDeliveries(t *testing.T) {
-	_, e, integID, _, _ := setupDeliveryTestEnv(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrations/"+integID+"/deliveries", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
-	}
-
-	var resp DeliveryListResponse
-	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if len(resp.Deliveries) != 1 {
-		t.Errorf("deliveries count = %d, want 1", len(resp.Deliveries))
-	}
-	if resp.Total != 1 {
-		t.Errorf("total = %d, want 1", resp.Total)
-	}
-	if resp.Page != 1 {
-		t.Errorf("page = %d, want 1", resp.Page)
-	}
-}
-
-func TestListIntegrationDeliveries_Empty(t *testing.T) {
-	s := store.NewMockStore()
-	api := NewAPI(s, nil, nil, nil, "", nil)
+	fake := &deliveryStoreFake{StoreInterface: s, attempts: map[string][]*model.DeliveryAttempt{}}
+	a := NewAPI(fake, nil, nil, nil, "", nil)
 	e := echo.New()
-	api.RegisterRoutes(e)
+	a.RegisterRoutes(e)
+	return &deliveryRoutes{fake: fake, e: e, hook: "hooks"}
+}
 
-	scope := model.WebhookScopeGlobal
-	integ := &model.Integration{
-		Type:    model.IntegrationTypeGenericWebhook,
-		Name:    "Empty WH",
-		Enabled: true,
-		Scope:   &scope,
-		Config:  json.RawMessage(`{"url":"https://example.com","secret":"s"}`),
+func (r *deliveryRoutes) call(method, path, key string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
 	}
-	s.CreateIntegration(integ)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrations/"+integ.ID+"/deliveries", nil)
 	addAuth(req, "denis")
 	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
+	r.e.ServeHTTP(rec, req)
+	return rec
+}
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
+func ptr[T any](v T) *T { return &v }
+
+func TestTheDeliveryListKeepsItsForm(t *testing.T) {
+	r := setupDeliveryRoutes(t)
+	at := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	r.fake.deliveries = []*model.OutboxDelivery{
+		{ID: "d-3", EventID: "evt-3", IntegrationID: "hooks", Status: model.OutboxDeliveryRetry, Attempts: 1,
+			NextAttemptAt: ptr(at.Add(time.Minute)), LastHTTPStatus: ptr(500), LastError: ptr("ambiguous"),
+			RequestPayload: ptr(`{"event":"alert_group.firing"}`), CreatedAt: at.Add(2 * time.Second)},
+		{ID: "d-2", EventID: "evt-2", IntegrationID: "hooks", Status: model.OutboxDeliveryFailed, Attempts: 1,
+			LastHTTPStatus: ptr(404), LastError: ptr("permanent_rejection"), CreatedAt: at.Add(time.Second)},
+		{ID: "d-1", EventID: "evt-1", IntegrationID: "hooks", Status: model.OutboxDeliverySent, Attempts: 1,
+			LastHTTPStatus: ptr(200), ResponseBodyTrunc: ptr("HTTP 200: ok"), CreatedAt: at, SentAt: ptr(at.Add(time.Second))},
+		{ID: "d-x", EventID: "evt-1", IntegrationID: "other", Status: model.OutboxDeliverySent, CreatedAt: at},
 	}
 
+	rec := r.call(http.MethodGet, "/api/v1/integrations/hooks/deliveries?page=1&limit=2", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
 	var resp DeliveryListResponse
-	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if len(resp.Deliveries) != 0 {
-		t.Errorf("deliveries count = %d, want 0", len(resp.Deliveries))
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
 	}
-	if resp.Total != 0 {
-		t.Errorf("total = %d, want 0", resp.Total)
+	if resp.Total != 3 || len(resp.Deliveries) != 2 || !resp.HasNext || resp.HasPrev || resp.TotalPages != 2 {
+		t.Fatalf("page 1 of 2: %+v", resp)
+	}
+	if resp.Deliveries[0].ID != "d-3" || resp.Deliveries[1].ID != "d-2" {
+		t.Fatalf("the other integration's delivery leaked, or the order changed: %+v", resp.Deliveries)
+	}
+	// The wire names, as the UI reads them.
+	body := rec.Body.String()
+	for _, field := range []string{`"status":"retry"`, `"attempts":1`, `"next_attempt_at":"2026-09-01T10:01:00Z"`,
+		`"last_http_status":500`, `"last_error":"ambiguous"`, `"request_payload":"{\"event\":\"alert_group.firing\"}"`,
+		`"event_id":"evt-3"`, `"integration_id":"hooks"`} {
+		if !strings.Contains(body, field) {
+			t.Errorf("the list does not carry %s: %s", field, body)
+		}
+	}
+	rec = r.call(http.MethodGet, "/api/v1/integrations/hooks/deliveries?page=2&limit=2", "")
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if len(resp.Deliveries) != 1 || resp.Deliveries[0].ID != "d-1" || resp.HasNext || !resp.HasPrev {
+		t.Fatalf("page 2 of 2: %+v", resp)
+	}
+	if !strings.Contains(rec.Body.String(), `"sent_at":"2026-09-01T10:00:01Z"`) ||
+		strings.Contains(rec.Body.String(), `"next_attempt_at"`) {
+		t.Fatalf("a sent delivery carries sent_at and no next attempt: %s", rec.Body.String())
 	}
 }
 
-func TestListIntegrationDeliveries_Pagination(t *testing.T) {
-	s, e, integID, _, _ := setupDeliveryTestEnv(t)
+func TestTheDeliveryDetailKeepsItsForm(t *testing.T) {
+	r := setupDeliveryRoutes(t)
+	at := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	r.fake.deliveries = []*model.OutboxDelivery{
+		{ID: "d-1", EventID: "evt-1", IntegrationID: "hooks", Status: model.OutboxDeliverySent, Attempts: 2, CreatedAt: at},
+	}
+	r.fake.attempts["d-1"] = []*model.DeliveryAttempt{
+		{ID: "a-1", DeliveryID: "d-1", Attempt: 0, HTTPStatus: ptr(500), Error: ptr("ambiguous"), CreatedAt: at},
+		{ID: "a-2", DeliveryID: "d-1", Attempt: 1, HTTPStatus: ptr(200), ResponseBodyTrunc: ptr("HTTP 200: ok"), CreatedAt: at.Add(time.Minute)},
+	}
 
-	// Add 2 more deliveries (total 3) — need distinct event IDs for unique(event_id, integration_id)
-	s.CreateOutboxEvent(&model.OutboxEvent{
-		ID: "evt-2", EventType: model.OutboxEventFiring, AlertGroupID: "ag-2", TeamID: "devops",
-		Payload: json.RawMessage(`{}`), Status: model.OutboxEventStatusCompleted,
-	})
-	s.CreateOutboxEvent(&model.OutboxEvent{
-		ID: "evt-3", EventType: model.OutboxEventFiring, AlertGroupID: "ag-3", TeamID: "devops",
-		Payload: json.RawMessage(`{}`), Status: model.OutboxEventStatusCompleted,
-	})
-	s.CreateOutboxDelivery(&model.OutboxDelivery{
-		ID: "del-2", EventID: "evt-2", IntegrationID: integID, Status: model.OutboxDeliveryFailed,
-	})
-	s.CreateOutboxDelivery(&model.OutboxDelivery{
-		ID: "del-3", EventID: "evt-3", IntegrationID: integID, Status: model.OutboxDeliveryRetry,
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrations/"+integID+"/deliveries?page=1&limit=2", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
+	rec := r.call(http.MethodGet, "/api/v1/integrations/hooks/deliveries/d-1", "")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
 	}
-
-	var resp DeliveryListResponse
-	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if resp.Total != 3 {
-		t.Errorf("total = %d, want 3", resp.Total)
-	}
-	if !resp.HasNext {
-		t.Error("has_next should be true")
-	}
-	if resp.HasPrev {
-		t.Error("has_prev should be false")
-	}
-}
-
-func TestListIntegrationDeliveries_NotFound(t *testing.T) {
-	_, e, _, _, _ := setupDeliveryTestEnv(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrations/nonexistent/deliveries", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", rec.Code)
-	}
-}
-
-// --- GetDeliveryDetail ---
-
-func TestGetDeliveryDetail(t *testing.T) {
-	_, e, integID, delID, _ := setupDeliveryTestEnv(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrations/"+integID+"/deliveries/"+delID, nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
-	}
-
 	var resp DeliveryDetailResponse
-	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if resp.Delivery == nil {
-		t.Fatal("delivery should not be nil")
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
 	}
-	if resp.Delivery.ID != delID {
-		t.Errorf("delivery.ID = %s, want %s", resp.Delivery.ID, delID)
+	if resp.Delivery == nil || resp.Delivery.ID != "d-1" || len(resp.Attempts) != 2 {
+		t.Fatalf("detail: %+v", resp)
 	}
-	if len(resp.Attempts) != 1 {
-		t.Errorf("attempts count = %d, want 1", len(resp.Attempts))
+	if resp.Attempts[0].Attempt != 0 || *resp.Attempts[0].HTTPStatus != 500 || resp.Attempts[1].Attempt != 1 ||
+		*resp.Attempts[1].HTTPStatus != 200 || resp.Attempts[1].Error != nil {
+		t.Fatalf("attempts: %+v %+v", resp.Attempts[0], resp.Attempts[1])
 	}
-}
+	if !strings.Contains(rec.Body.String(), `"http_status":500`) || !strings.Contains(rec.Body.String(), `"attempt":0`) {
+		t.Fatalf("the attempt form changed: %s", rec.Body.String())
+	}
 
-func TestGetDeliveryDetail_NotFound(t *testing.T) {
-	_, e, integID, _, _ := setupDeliveryTestEnv(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrations/"+integID+"/deliveries/nonexistent", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", rec.Code)
+	// Another integration's id, or no such delivery: not found, whoever asks.
+	if rec := r.call(http.MethodGet, "/api/v1/integrations/other/deliveries/d-1", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("a delivery reached through another integration answered %d", rec.Code)
+	}
+	if rec := r.call(http.MethodGet, "/api/v1/integrations/hooks/deliveries/nobody", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("an unknown delivery answered %d", rec.Code)
 	}
 }
 
-func TestGetDeliveryDetail_IDOR(t *testing.T) {
-	s, e, _, delID, _ := setupDeliveryTestEnv(t)
-
-	// Create a second integration
-	scope := model.WebhookScopeGlobal
-	other := &model.Integration{
-		Type: model.IntegrationTypeGenericWebhook, Name: "Other",
-		Enabled: true, Scope: &scope,
-		Config: json.RawMessage(`{"url":"https://other.com","secret":"s"}`),
+func TestAReplayNeedsAKeyAndAnswersWithTheNewDelivery(t *testing.T) {
+	r := setupDeliveryRoutes(t)
+	r.fake.replay = func(req store.WebhookReplayRequest) (store.WebhookReplayResult, error) {
+		return store.WebhookReplayResult{Outcome: outbound.SubmitCreated, DeliveryID: "new-" + req.ClientRequestID}, nil
 	}
-	s.CreateIntegration(other)
+	path := "/api/v1/integrations/hooks/deliveries/d-1/replay"
 
-	// Try to access del-1 (belongs to integ-1) via other integration
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrations/"+other.ID+"/deliveries/"+delID, nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404 (IDOR protection)", rec.Code)
+	// No key, or too long a key: refused before the store is asked.
+	if rec := r.call(http.MethodPost, path, ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a replay without a key answered %d", rec.Code)
 	}
-}
+	if rec := r.call(http.MethodPost, path, strings.Repeat("k", 129)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a replay with a 129-byte key answered %d", rec.Code)
+	}
+	if len(r.fake.replayed) != 0 {
+		t.Fatalf("the store was asked %d times for refused requests", len(r.fake.replayed))
+	}
 
-// --- ReplayDelivery ---
-
-func TestReplayDelivery_Sent(t *testing.T) {
-	s, e, integID, delID, _ := setupDeliveryTestEnv(t)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/"+integID+"/deliveries/"+delID+"/replay", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
+	// The key and the person reach the store; the answer names the new delivery.
+	key := strings.Repeat("k", 128)
+	rec := r.call(http.MethodPost, path, key)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
 	}
-
 	var resp ReplayDeliveryResponse
-	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if !resp.OK {
-		t.Error("ok should be true")
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if !resp.OK || resp.DeliveryID != "new-"+key {
+		t.Fatalf("response %+v", resp)
+	}
+	if !strings.Contains(rec.Body.String(), `"delivery_id":"new-`) {
+		t.Fatalf("the wire name of the new delivery: %s", rec.Body.String())
+	}
+	got := r.fake.replayed[0]
+	if got.IntegrationID != "hooks" || got.DeliveryID != "d-1" || got.ClientRequestID != key || got.Actor != byUser("denis") {
+		t.Fatalf("the store was asked %+v", got)
 	}
 
-	// Delivery should be reset to pending
-	delivery, _ := s.GetOutboxDeliveryByID(delID)
-	if delivery.Status != model.OutboxDeliveryPending {
-		t.Errorf("delivery status = %s, want pending", delivery.Status)
+	// A repeat found already admitted is the same answer.
+	r.fake.replay = func(req store.WebhookReplayRequest) (store.WebhookReplayResult, error) {
+		return store.WebhookReplayResult{Outcome: outbound.SubmitExisting, DeliveryID: "new-" + req.ClientRequestID}, nil
 	}
-	if delivery.Attempts != 0 {
-		t.Errorf("delivery attempts = %d, want 0", delivery.Attempts)
-	}
-	if delivery.SentAt != nil {
-		t.Error("delivery sent_at should be nil")
-	}
-	if delivery.LastHTTPStatus != nil {
-		t.Error("delivery last_http_status should be nil")
-	}
-}
-
-func TestReplayDelivery_Failed(t *testing.T) {
-	s, e, integID, delID, _ := setupDeliveryTestEnv(t)
-
-	// Set delivery to failed
-	delivery, _ := s.GetOutboxDeliveryByID(delID)
-	delivery.Status = model.OutboxDeliveryFailed
-	errMsg := "HTTP 500"
-	delivery.LastError = &errMsg
-	s.UpdateOutboxDelivery(delivery)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/"+integID+"/deliveries/"+delID+"/replay", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
+	rec = r.call(http.MethodPost, path, key)
+	var again ReplayDeliveryResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &again)
+	if rec.Code != http.StatusOK || again != resp {
+		t.Fatalf("the repeat answered %d %+v, the first %+v", rec.Code, again, resp)
 	}
 
-	updated, _ := s.GetOutboxDeliveryByID(delID)
-	if updated.Status != model.OutboxDeliveryPending {
-		t.Errorf("delivery status = %s, want pending", updated.Status)
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"no such delivery", store.ErrWebhookDeliveryNotFound, http.StatusNotFound},
+		{"still in progress", store.ErrWebhookDeliveryNotTerminal, http.StatusConflict},
+		{"the subscriber is switched off", store.ErrWebhookSubscriberDisabled, http.StatusConflict},
+		{"the subscriber is being changed", store.ErrIntegrationBusy, http.StatusConflict},
+		{"anything else", errors.New("the database is unwell"), http.StatusInternalServerError},
+	} {
+		r.fake.replay = func(store.WebhookReplayRequest) (store.WebhookReplayResult, error) {
+			return store.WebhookReplayResult{}, tc.err
+		}
+		if rec := r.call(http.MethodPost, path, "k"); rec.Code != tc.want {
+			t.Errorf("%s: answered %d, want %d", tc.name, rec.Code, tc.want)
+		}
 	}
 }
 
-func TestReplayDelivery_Pending(t *testing.T) {
-	s, e, integID, delID, _ := setupDeliveryTestEnv(t)
-
-	// Set delivery to pending (in progress)
-	delivery, _ := s.GetOutboxDeliveryByID(delID)
-	delivery.Status = model.OutboxDeliveryPending
-	s.UpdateOutboxDelivery(delivery)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/"+integID+"/deliveries/"+delID+"/replay", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusConflict {
-		t.Errorf("status = %d, want 409", rec.Code)
+// TestARepeatedKeyAfterRetentionIsGone: the claim is held and holds no
+// commitment any more; the answer is 410, and a new key is the way on.
+func TestARepeatedKeyAfterRetentionIsGone(t *testing.T) {
+	r := setupDeliveryRoutes(t)
+	r.fake.replay = func(store.WebhookReplayRequest) (store.WebhookReplayResult, error) {
+		return store.WebhookReplayResult{}, store.ErrWebhookReplayRetired
 	}
-}
-
-func TestReplayDelivery_ReopensEvent(t *testing.T) {
-	s, e, integID, delID, eventID := setupDeliveryTestEnv(t)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/"+integID+"/deliveries/"+delID+"/replay", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
+	rec := r.call(http.MethodPost, "/api/v1/integrations/hooks/deliveries/d-1/replay", "press-1")
+	if rec.Code != http.StatusGone {
+		t.Fatalf("a retired replay answered %d: %s", rec.Code, rec.Body.String())
 	}
-
-	// Parent event should be re-opened
-	event, _ := s.GetOutboxEventByID(eventID)
-	if event.Status != model.OutboxEventStatusProcessing {
-		t.Errorf("event status = %s, want processing", event.Status)
-	}
-	if event.SentAt != nil {
-		t.Error("event sent_at should be nil after replay")
-	}
-}
-
-func TestReplayDelivery_EventAlreadyProcessing(t *testing.T) {
-	s, e, integID, delID, eventID := setupDeliveryTestEnv(t)
-
-	// Set event to processing (not terminal)
-	event, _ := s.GetOutboxEventByID(eventID)
-	event.Status = model.OutboxEventStatusProcessing
-	s.UpdateOutboxEvent(event)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/"+integID+"/deliveries/"+delID+"/replay", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-
-	// Event should still be processing (not changed)
-	updated, _ := s.GetOutboxEventByID(eventID)
-	if updated.Status != model.OutboxEventStatusProcessing {
-		t.Errorf("event status = %s, want processing (unchanged)", updated.Status)
-	}
-}
-
-func TestReplayDelivery_IDOR(t *testing.T) {
-	s, e, _, delID, _ := setupDeliveryTestEnv(t)
-
-	scope := model.WebhookScopeGlobal
-	other := &model.Integration{
-		Type: model.IntegrationTypeGenericWebhook, Name: "Other",
-		Enabled: true, Scope: &scope,
-		Config: json.RawMessage(`{"url":"https://other.com","secret":"s"}`),
-	}
-	s.CreateIntegration(other)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/"+other.ID+"/deliveries/"+delID+"/replay", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404 (IDOR protection)", rec.Code)
-	}
-}
-
-func TestReplayDelivery_NotFound(t *testing.T) {
-	_, e, integID, _, _ := setupDeliveryTestEnv(t)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/"+integID+"/deliveries/nonexistent/replay", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", rec.Code)
-	}
-}
-
-func TestReplayDelivery_StoreError(t *testing.T) {
-	s, e, integID, delID, _ := setupDeliveryTestEnv(t)
-
-	// Inject error into the atomic replay method
-	s.ReplayOutboxDeliveryError = fmt.Errorf("tx commit failed")
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/"+integID+"/deliveries/"+delID+"/replay", nil)
-	addAuth(req, "denis")
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500, body: %s", rec.Code, rec.Body.String())
-	}
-
-	// Delivery should NOT be reset (error was injected)
-	delivery, _ := s.GetOutboxDeliveryByID(delID)
-	if delivery.Status != model.OutboxDeliverySent {
-		t.Errorf("delivery status = %s, want sent (unchanged)", delivery.Status)
+	if !strings.Contains(rec.Body.String(), "Idempotency-Key") {
+		t.Fatalf("the answer does not say a new key is needed: %s", rec.Body.String())
 	}
 }

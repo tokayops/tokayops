@@ -11,15 +11,18 @@ container, your Postgres.
 ## Architecture
 
 TokayOps is an asynchronous pipeline: ingest (Alertmanager webhook) -> store
-(PostgreSQL) -> policy engine -> dispatcher (pluggable providers) -> Slack /
-Telegram. The primary runtime entity is the **AlertGroup**: the alerts
+(PostgreSQL) -> policy engine -> outbound delivery (pluggable channels) ->
+Slack / Telegram. The primary runtime entity is the **AlertGroup**: the alerts
 Alertmanager grouped, deduplicated by `groupKey`, with a status lifecycle,
 timeline and escalation state.
 
 Delivery is built to be reliable and horizontally safe: a transactional outbox
-commits events in the same transaction as the status change, and job steps run
-under DB leases with compare-and-swap ownership, so a crashed worker's work is
-re-claimed instead of lost.
+commits events in the same transaction as the status change, and everything the
+system owes somebody is a durable commitment written before the network is
+touched. Workers claim commitments under DB leases with compare-and-swap
+ownership and journal every attempt before making the call, so a crashed
+worker's work is re-claimed rather than lost, and a call whose answer never
+arrived is recorded as exactly that rather than guessed at.
 
 ## Features
 
@@ -31,9 +34,13 @@ re-claimed instead of lost.
 - On-call schedules with multi-user groups (1+ users per rotation slot), L2
   backup, overrides and calendar.
 - Parallel notification fan-out: every member of the on-call group is DM'd in
-  parallel within one escalation step; failures are isolated per member.
-- Stage-based job execution with per-step leases and stage-aware claim; failed
-  workers are reclaimed automatically.
+  parallel within one escalation step; failures are isolated per member, and a
+  delivery that keeps failing keeps being retried until it succeeds, is
+  withdrawn, or reaches its deadline.
+- Two delivery queues that cannot delay each other: paging and shift-change
+  announcements are claimed separately, by separate workers with pools of their
+  own, so a hundred schedules turning over at once never stands between an
+  alert and the person on call.
 - Group handoff notifications: every incoming on-call member with a linked
   account gets a shift-start DM.
 - Dual-send: team channel + firehose logging.
@@ -41,8 +48,9 @@ re-claimed instead of lost.
   signature-verified endpoint. Toggled per integration.
 - Telegram channel: outbound delivery, policy routing and Ack/Resolve buttons
   via a secret-verified webhook. Toggled per integration.
-- Generic outgoing webhooks through a transactional outbox: HMAC-signed,
-  SSRF-guarded, retried with backoff, with a delivery log and replay.
+- Generic outgoing webhooks as durable deliveries: HMAC-signed, SSRF-guarded,
+  retried with backoff for up to a day, with a per-subscriber delivery log and
+  an idempotent replay. The contract is under "Outgoing Webhooks" below.
 - Observability: Prometheus metrics endpoint including MTTA/MTTR histograms and
   on-call health gauges.
 - OIDC/SSO: optional single sign-on with auto-registration.
@@ -79,6 +87,7 @@ TokayOps uses a YAML configuration file (`tokay.yaml`) and environment variables
 | `CSRF_ENABLED` | Explicitly enable CSRF protection | `false` (auto-enabled in production) |
 | `TOKAY_SELF_URL` | TokayOps base URL for clickable links in Slack (e.g. `https://tokayops.example.com`) | - |
 | `ENCRYPTION_KEY` | 32-byte hex key for integrations config encryption | **Required** |
+| `TOKAY_DELIVERY_RETENTION_DAYS` | How many days the history of finished deliveries is kept; `0` keeps it for good | `30` |
 
 **OIDC Authentication** (optional, requires `TOKAY_SELF_URL`):
 | Variable | Description |
@@ -99,14 +108,12 @@ Enable dual-send to L2 Support channels in `tokay.yaml`:
 global:
   firehose_critical_channel: "C_L2_CRITICAL_CHANNEL_ID"
   firehose_warning_channel: "C_L2_WARNING_CHANNEL_ID"
-  dm_fallback_to_firehose: true # Default true. If no primary delivery, use firehose permalink in DMs
 ```
 
 Firehose sends full messages with timeline, updates and resolve notifications.
 
-**DM fallback:**
-- `dm_fallback_to_firehose: true` (default) - if no primary delivery, DM links to firehose message.
-- `dm_fallback_to_firehose: false` - DM omits the Slack link when primary is missing.
+A direct message about an alert links to the alert in TokayOps rather than to
+the firehose message, so the link works whether or not a firehose card exists.
 
 ### Running Locally
 1. Start the database using Docker Compose:
@@ -204,6 +211,66 @@ curl -X PATCH http://localhost:8080/api/auth/me \
   -d '{"slack_user_id": "U12345678"}'
 ```
 Note: SSO users cannot change their name (synced from provider).
+
+### Outgoing Webhooks
+A `generic_webhook` integration subscribes to alert group events
+(`alert_group.firing`, `alert_group.acknowledged`, `alert_group.resolved`),
+globally or for one team. Each event is committed together with the alert
+group's own transition and delivered to every subscriber as its own delivery.
+
+What a subscriber receives is one `POST` per event with a JSON body and these
+headers:
+
+| Header | Value |
+|--------|-------|
+| `Content-Type` | `application/json` |
+| `X-Tokay-Event` | Event type, e.g. `alert_group.firing` |
+| `X-Tokay-Event-ID` | The event's id; every retry and replay of the same event carries the same id, so receivers can deduplicate on it |
+| `X-Tokay-Timestamp` | Unix timestamp of the request |
+| `X-Tokay-Signature` | `sha256=<hex>` of `HMAC-SHA256(timestamp + "." + body, secret)`, present when the integration has a secret |
+
+The subscriber's `custom_headers` are added to every request; the names above
+and `Content-Type` are reserved and cannot be overridden.
+
+How a delivery is treated depends on the answer: a `2xx` finishes it; `429`
+and `408` are retried; any other `4xx`, and any `3xx` (redirects are not
+followed), ends it as failed; a `5xx`, a timeout or a connection error is retried
+with exponential backoff (2s doubling, capped at 30 minutes, with jitter) for up
+to 24 hours from the event, after which the delivery expires. A subscriber's
+`timeout_seconds` is honoured up to 30 seconds. Only a public address may be
+posted to: every address the subscriber's name resolves to is checked before
+any request is made and again when the connection is opened. For IPv6 the rule
+is fail-closed - public means inside a block the IANA Global Unicast
+Assignments registry has allocated to a regional registry, or inside an
+assignment the IANA Special-Purpose registry marks globally reachable, so
+reserved and unassigned space is refused without being named - and for IPv4 the whole space minus the IANA special-purpose
+registry; private, loopback, link-local, unique-local, site-local,
+shared-address-space, multicast, unspecified, SRv6, local-NAT64, reserved and
+unallocated addresses are all refused unless the operator allows the range with
+`TOKAY_WEBHOOK_ALLOW_PRIVATE_CIDRS`. Disabling or deleting the
+integration withdraws its undelivered deliveries; the delivery history of a
+deleted integration stays readable.
+
+The history of finished deliveries - of every kind, not only webhooks - is kept
+for `TOKAY_DELIVERY_RETENTION_DAYS` days (30 by default; `0` keeps it for good)
+and then removed, an hour at a time, together with the alert events nothing
+refers to any more. A delivery still in progress, or waiting for a person, is
+kept whatever its age. Repeating a replay's `Idempotency-Key` after its result
+has been removed answers `410 Gone`: the decision it named is over, and a new
+replay needs a new key.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/integrations/:id/deliveries` | Delivery log of a subscriber (paginated) |
+| GET | `/api/v1/integrations/:id/deliveries/:deliveryId` | One delivery with its attempts |
+| POST | `/api/v1/integrations/:id/deliveries/:deliveryId/replay` | Deliver the event again, as a new delivery |
+
+A replay requires an `Idempotency-Key` header (1 to 128 bytes): repeating the
+request with the same key returns the same new delivery, so a retried request
+never delivers twice. Only a finished delivery (`sent` or `failed`) of an
+enabled integration can be replayed (a delivery in progress, or a disabled
+integration, answers `409`); the new delivery uses the integration's current
+URL, secret and headers, and the response names it in `delivery_id`.
 
 ### Legacy Endpoints
 `/api/v1/incidents/*` endpoints are aliased to `/api/v1/alert-groups/*` for backward compatibility.
@@ -306,10 +373,11 @@ then, read the release notes before every minor upgrade.
 - `internal/api`: REST API implementation (Echo).
 - `internal/auth`: Authentication logic (JWT, BCrypt).
 - `internal/config`: Configuration loading (YAML).
-- `internal/dispatcher`: Notification dispatch (Slack, Telegram) behind a provider abstraction.
 - `internal/engine`: Policy assignment engine.
+- `internal/handoff`: Detects shift changes and admits the announcement.
 - `internal/ingester`: Alertmanager webhook ingestion.
 - `internal/model`: Data models (AlertGroup, User, etc.).
+- `internal/outbound`: Outbound delivery: durable commitments, the delivery workers, the fan-out of alert events to webhook subscribers, and the Slack, Telegram and outgoing webhook channels under `providers/`.
 - `internal/store`: Database access layer (PostgreSQL).
 - `web`: Frontend assets (Vanilla JS + CSS).
 

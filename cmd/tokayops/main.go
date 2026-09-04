@@ -10,11 +10,14 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -22,15 +25,21 @@ import (
 	"github.com/tokayops/tokayops/internal/api"
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/engine"
 	"github.com/tokayops/tokayops/internal/erasure"
+	"github.com/tokayops/tokayops/internal/handoff"
 	"github.com/tokayops/tokayops/internal/ingester"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/outbox"
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
+	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
+	webhookprovider "github.com/tokayops/tokayops/internal/outbound/providers/webhook"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
+	"github.com/tokayops/tokayops/internal/slacksync"
 	"github.com/tokayops/tokayops/internal/store"
 
 	_ "github.com/tokayops/tokayops/docs" // swagger docs
@@ -83,6 +92,28 @@ func checkCommand(args []string) error {
 		msg += "\nthat looks like a path rather than a command - the image already runs the binary, so pass only the command"
 	}
 	return errors.New(msg)
+}
+
+// channelCatalog is what the channels of this build can do, as the policy
+// editor and the handoff fan-out read it. A channel is in it when a policy step
+// may name it. The webhook channel is deliberately not: an outgoing webhook is
+// a subscription to the alert's events, not a step of an escalation, and a
+// catalogue entry would let a policy be written that pages a URL.
+func channelCatalog() *providers.Catalog {
+	channels := providers.NewCatalog()
+	channels.Register(providers.Capability{
+		Name:                 "slack",
+		IntegrationType:      model.IntegrationTypeSlack,
+		SupportedTargetKinds: []string{"dm", "channel"},
+	})
+	// The registration here is what makes telegram appear in the policy editor
+	// and in the handoff fan-out.
+	channels.Register(providers.Capability{
+		Name:                 "telegram",
+		IntegrationType:      model.IntegrationTypeTelegram,
+		SupportedTargetKinds: []string{"dm", "channel"},
+	})
+	return channels
 }
 
 func main() {
@@ -142,10 +173,15 @@ func main() {
 	// TOKAY_SELF_URL gates all inbound-callback / clickable-link features. Warn loudly
 	// when it's unset so operators understand why interactivity is silently off.
 	if cfg.Global.SelfURL == "" {
-		log.Println("WARN: TOKAY_SELF_URL not set — clickable links and provider interactivity are disabled: " +
+		log.Println("WARN: TOKAY_SELF_URL not set - clickable links and provider interactivity are disabled: " +
 			"Slack/Telegram Ack/Resolve buttons are hidden, the Telegram webhook is not registered, " +
 			"and Telegram account linking (/start) cannot complete. Set TOKAY_SELF_URL to a public HTTPS URL to enable them.")
 	}
+
+	// What a message needs that an alert group does not carry, frozen into
+	// every revision of a card the same way the producer of revision 0 freezes
+	// it: two instances, or one instance a month later, render the same bytes.
+	st.SetRenderEnvironment(cfg.Global.SelfURL, providers.ProcessZone())
 
 	// CLI Commands
 	if len(os.Args) > 1 {
@@ -161,8 +197,9 @@ func main() {
 
 		case "migrate-slack-identities":
 			// Backfill external_identities(provider=slack) from the legacy
-			// users.slack_user_id column (Epic 7 upgrade — the only per-user data
-			// to carry forward). Idempotent. Pass --dry-run to preview.
+			// users.slack_user_id column, which is the only per-user data an
+			// upgrade from that shape has to carry forward. Idempotent. Pass
+			// --dry-run to preview.
 			//
 			// Accept ONLY no args (apply) or exactly "--dry-run". Reject anything
 			// else so a typo (--dryrun, --dry-run=true) cannot silently run a live
@@ -181,7 +218,7 @@ func main() {
 				log.Fatalf("Slack identity migration failed: %v", err)
 			}
 			if !res.LegacyColumnPresent {
-				log.Println("No legacy users.slack_user_id column found — nothing to migrate (fresh install).")
+				log.Println("No legacy users.slack_user_id column found - nothing to migrate (fresh install).")
 				return
 			}
 			mode := "applied"
@@ -191,7 +228,7 @@ func main() {
 			log.Printf("Slack identity migration [%s]: %d candidate(s), %d migrated, %d already linked, %d conflict(s)",
 				mode, res.Candidates, res.Migrated, res.AlreadySatisfied, len(res.Conflicts))
 			for _, c := range res.Conflicts {
-				log.Printf("  CONFLICT: user %q slack id %q is already linked to another user — skipped", c.UserID, c.SlackUserID)
+				log.Printf("  CONFLICT: user %q slack id %q is already linked to another user - skipped", c.UserID, c.SlackUserID)
 			}
 			if len(res.Conflicts) > 0 {
 				log.Printf("Resolve conflicts manually: the Slack ID belongs to a different TokayOps user.")
@@ -318,61 +355,30 @@ func main() {
 	// WithClock - visibly in tests, silently in production.
 	scheduleRenderer := schedulerender.New(st.ScheduleReadRepository())
 
-	// Engine
-	eng := engine.NewEngine(st, scheduleRenderer, cfg)
-
 	// 4. Integration Cache (for webhook secrets and Slack config)
 	integrationCache := store.NewIntegrationCache()
 	if err := integrationCache.LoadAll(st); err != nil {
 		log.Fatalf("Failed to load integrations from DB: %v", err)
 	}
 
-	// Dispatcher
-	disp, err := dispatcher.NewDispatcher(st, cfg)
-	if err != nil {
-		log.Fatalf("Failed to initialize dispatcher: %v", err)
-	}
+	// Engine. It is built after the integration cache because a plan freezes
+	// whether a channel's messages carry buttons: that is configuration a
+	// MESSAGE depends on, so it is decided when the escalation is admitted
+	// rather than read again by whoever sends it.
+	eng := engine.NewEngine(st, scheduleRenderer, integrationCache, cfg)
 
-	// Register Providers - from DB with dynamic token lookup.
-	// An alert group's team is a label carried by the alert, not a foreign key,
-	// so it can name a team that was never set up here. Both providers ask this
-	// before offering Ack/Resolve.
-	teamLookup := func(teamID string) (bool, error) {
-		if _, err := st.GetTeamByID(teamID); err != nil {
-			if err == sql.ErrNoRows {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}
+	// What the channels of this build can do. Read by the policy editor, and by
+	// the detector before it promises an announcement.
+	channels := channelCatalog()
 
-	// The concrete slackProvider instance is also used by the API layer (SlackMessenger
-	// + SlackCardRenderer below), so the dispatcher factory returns that same instance;
-	// the registry keys it by integration ID.
-	slackProvider := dispatcher.NewSlackProvider(integrationCache, cfg.Global.SelfURL, teamLookup)
-	disp.RegisterProviderFactory("slack", model.IntegrationTypeSlack, func(integ *model.Integration) (dispatcher.Provider, error) {
-		return slackProvider, nil
-	})
-	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
-		Name:                 "slack",
-		IntegrationType:      model.IntegrationTypeSlack,
-		SupportedTargetKinds: []string{"dm", "channel"},
-	})
+	// The Slack provider is the API layer's SlackMessenger. Nothing resolves it
+	// through the catalogue any more: what the catalogue answers is what a
+	// channel CAN do, and who holds the instance is the wiring's business.
+	slackProvider := slackprovider.NewProvider(integrationCache)
 
-	// Telegram provider (Epic 8). No API-layer wiring in Sprint 1 — the incoming
-	// webhook + interactivity (which would need the provider in the API layer like
-	// slackProvider above) land in Sprint 3. The capability registration here is
-	// what makes telegram appear in the policy editor and handoff fan-out.
-	telegramProvider := dispatcher.NewTelegramProvider(integrationCache, cfg.Global.SelfURL, dispatcher.WithTeamLookup(teamLookup))
-	disp.RegisterProviderFactory("telegram", model.IntegrationTypeTelegram, func(integ *model.Integration) (dispatcher.Provider, error) {
-		return telegramProvider, nil
-	})
-	disp.RegisterProviderCapabilities(dispatcher.ProviderCapabilities{
-		Name:                 "telegram",
-		IntegrationType:      model.IntegrationTypeTelegram,
-		SupportedTargetKinds: []string{"dm", "channel"},
-	})
+	// The Telegram provider. The incoming webhook and interactivity need it in
+	// the API layer as well, the way slackProvider is wired above.
+	telegramProvider := telegramprovider.NewProvider(integrationCache)
 
 	// 5. Ingester (HTTP) - uses integration cache for webhook auth
 	ingesterService := ingester.NewIngester(st, cfg, integrationCache)
@@ -397,8 +403,7 @@ func main() {
 	}
 
 	// 8. API
-	apiService := api.NewAPI(st, oidcProvider, slackProvider, integrationCache, cfg.Global.SelfURL, api.NewProviderCapsAdapter(disp.Providers()))
-	apiService.SetCardRenderer(slackProvider)
+	apiService := api.NewAPI(st, oidcProvider, slackProvider, integrationCache, cfg.Global.SelfURL, api.NewProviderCapsAdapter(channels))
 
 	// Schedule configuration (revision model). The command service, the read
 	// side and the renderer are built from the store's narrow repositories
@@ -409,24 +414,142 @@ func main() {
 	apiService.SetScheduleReadRepository(st.ScheduleReadRepository())
 	apiService.SetScheduleRenderer(scheduleRenderer)
 	apiService.SetUserEraser(erasure.NewService(st.ErasureRepository()))
-	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle (Epic 8 Sprint 3)
+	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle
 	// Register the Telegram webhook at boot so TOKAY_SELF_URL + restart suffices (no
 	// need to re-save the integration). Best-effort; goroutine so a slow/unreachable
 	// setWebhook never blocks startup.
 	go apiService.RegisterTelegramWebhookOnStartup(ctx)
 
+	// The outbound delivery worker: what actually sends what the engine
+	// promised. The engine admits commitments and never sends anything itself,
+	// so without this process nothing an escalation owes goes out.
+	//
+	// It takes the store as its own narrow interface and a channel per
+	// provider. A provider missing from the map is one this instance cannot
+	// serve; it is left alone rather than failed, because what this process was
+	// configured with is not a property of the commitment.
+	//
+	// The token source is the same integration cache the channels use, read
+	// at each attempt on purpose: a rotated token has to apply to work that has
+	// not gone out yet. What a MESSAGE depends on was frozen at admission
+	// instead - see the engine above.
+	identityLookup := func(ctx context.Context, userID, provider string) (string, error) {
+		identity, err := st.GetExternalIdentityContext(ctx, userID, provider)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", providers.ErrNotLinked
+		}
+		if err != nil {
+			return "", err
+		}
+		if identity == nil || identity.ExternalID == "" {
+			return "", providers.ErrNotLinked
+		}
+		return identity.ExternalID, nil
+	}
+	// One worker per execution family, over the same channels.
+	//
+	// The channels are shared because a Slack message is a Slack message
+	// whichever family asked for it; the WORKERS are not, because a hundred
+	// schedules turning over on one hour boundary must not stand between an
+	// alert and the person on call. Each family's numbers come from its policy,
+	// and the second pool is small on purpose: it is a second set of concurrent
+	// calls to the same providers.
+	outboundChannels := func() map[string]outbound.Channel {
+		return map[string]outbound.Channel{
+			"slack":    slackprovider.NewHandler(integrationCache, identityLookup),
+			"telegram": telegramprovider.NewHandler(integrationCache, identityLookup),
+		}
+	}
+	outboundWorker := outbound.NewWorker(st, uuid.New().String(), outboundChannels())
+	handoffWorker, err := outbound.NewWorkerFor(outbound.FamilyHandoff, st,
+		uuid.New().String(), outboundChannels())
+	if err != nil {
+		log.Fatalf("Failed to build the handover worker: %v", err)
+	}
+
+	// The third family, and the only channel it has. Outgoing webhooks run in a
+	// pool of their own because a subscriber that neither answers nor refuses
+	// holds a slot for the whole of its timeout, which is two orders of
+	// magnitude longer than a direct message; the channel reads the
+	// subscriber's configuration from the store, not from the cache, because
+	// the cache is refreshed only by the process that handled a change. The
+	// channel is NOT registered in the catalogue above: the catalogue says what
+	// may be a step of an escalation policy, and a webhook is not one.
+	allowedCIDRs, _ := config.ParseAllowedPrivateCIDRs()
+	webhookWorker, err := outbound.NewWorkerFor(outbound.FamilyWebhook, st,
+		uuid.New().String(), map[string]outbound.Channel{
+			keys.ProviderWebhook: webhookprovider.NewHandler(st, allowedCIDRs),
+		})
+	if err != nil {
+		log.Fatalf("Failed to build the webhook worker: %v", err)
+	}
+	// The family's producer: it turns each event of the alert outbox into
+	// commitments to the subscribers that are enabled and in scope. A loop of
+	// its own, beside the engine and the shift-change detector, not a step of
+	// the worker's tick.
+	fanOut, err := outbound.NewFanOut(st)
+	if err != nil {
+		log.Fatalf("Failed to build the webhook fan-out: %v", err)
+	}
+
+	// How long the history of finished deliveries is kept. Read from the
+	// environment like the other infrastructure settings; zero keeps it for
+	// good, and anything that is not a whole number of days refuses the start.
+	retentionDays, err := outbound.ParseRetentionWindow(os.Getenv(outbound.RetentionEnv))
+	if err != nil {
+		log.Fatalf("Failed to read the delivery retention window: %v", err)
+	}
+	metrics.OutboundRetentionWindowDays.Set(float64(retentionDays))
+	apiService.SetDeliveryRetention(retentionDays)
+	var retention *outbound.Retention
+	if retentionDays > 0 {
+		if retention, err = outbound.NewRetention(st, retentionDays); err != nil {
+			log.Fatalf("Failed to build the delivery retention: %v", err)
+		}
+	} else {
+		log.Printf("outbound retention is off: %s=0, delivery history is kept for good", outbound.RetentionEnv)
+	}
+
 	// 9. Start Background Workers
 	go eng.Run(ctx)
-	go disp.Run(ctx)
 
-	// Outbox Delivery Worker
-	allowedCIDRs, _ := config.ParseAllowedPrivateCIDRs()
-	outboxSender := outbox.NewHTTPSender(allowedCIDRs)
-	outboxWorker := outbox.New(st, outboxSender)
-	go outboxWorker.Run(ctx)
+	// The outbound worker is the one that gets waited for on the way out.
+	//
+	// The others can be abandoned mid-tick: their work is a row in a queue that
+	// the next process picks up. This one is holding calls that have BEEN MADE,
+	// and walking away from an answer that has just arrived is the one outcome
+	// the whole domain exists to avoid - the delivery becomes ambiguous, and
+	// somebody has to decide whether it happened. Run drains what it holds and
+	// returns; nothing else waited for it, so every restart risked a handful of
+	// those.
+	//
+	// They are given no deadline here on purpose. Each worker has its own -
+	// its family's shutdown deadline, the longest one commitment of that family
+	// can take - and a shorter one wrapped round them would defeat the reason
+	// those numbers are sums rather than guesses. The container's stop grace
+	// period has to be longer than it - see docker-compose.prod.yml.
+	// All three of them, for the same reason: each is holding calls that have
+	// been made, and none may be walked away from. The fan-out is not waited
+	// for: it makes no network calls, and a transaction cut off mid-tick rolls
+	// back whole and leaves the event for the next process.
+	outboundStopped := make(chan struct{})
+	go func() {
+		defer close(outboundStopped)
+		var running sync.WaitGroup
+		running.Add(3)
+		go func() { defer running.Done(); outboundWorker.Run(ctx) }()
+		go func() { defer running.Done(); handoffWorker.Run(ctx) }()
+		go func() { defer running.Done(); webhookWorker.Run(ctx) }()
+		running.Wait()
+	}()
+	go fanOut.Run(ctx)
+	// Not waited for either: a chunk cut off rolls back whole.
+	if retention != nil {
+		go retention.Run(ctx)
+	}
 
 	// Usergroup Syncer Manager - allows dynamic start/stop when Slack integration changes
-	syncerManager := dispatcher.NewUsergroupSyncerManager(st, scheduleRenderer, 5*time.Minute)
+	syncerManager := slacksync.NewUsergroupSyncerManager(st, scheduleRenderer, 5*time.Minute)
 	apiService.SetUsergroupSyncerManager(ctx, syncerManager)
 
 	// Start syncer if token is already available
@@ -445,8 +568,8 @@ func main() {
 
 	// Handoff Notifier - DMs on-call user when shift starts. Provider lookup
 	// supplies the dm-capable set so the notifier doesn't fan out to
-	// identities from unregistered providers (Sprint 4 / Epic 7 L7).
-	handoffNotifier := dispatcher.NewHandoffNotifier(st, scheduleRenderer, disp.Providers(), 60*time.Second)
+	// identities from unregistered providers.
+	handoffNotifier := handoff.NewNotifier(st, scheduleRenderer, channels, 60*time.Second)
 	go handoffNotifier.Run(ctx)
 	log.Println("Handoff notifier enabled (60 second interval)")
 
@@ -494,9 +617,7 @@ func main() {
 		}))
 	}
 
-	// Static files for Web UI
-	e.Static("/", "web")
-	e.File("/", "web/index.html")
+	registerUI(e, "web")
 
 	// Register Routes
 	ingesterService.RegisterRoutes(e)
@@ -542,15 +663,65 @@ func main() {
 	// Graceful Shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	awaitShutdown(quit, cancel, []listener{e, internalSrv}, outboundStopped)
+}
+
+// listener is a server this process stops before it waits for anything.
+// Both *echo.Echo and *http.Server are one.
+type listener interface {
+	Shutdown(ctx context.Context) error
+}
+
+// awaitShutdown is the exit path, in one place so the order is testable: what
+// stops accepting, what gets cancelled, and what the process waits for before
+// it returns.
+//
+// The order is the whole point, and both halves of it were wrong.
+//
+// The listeners close FIRST. Waiting for the workers can take a minute, and a
+// process that spent that minute still serving its API and its ingestion
+// endpoint would be taking on alerts, acknowledgements and webhook deliveries
+// that nothing behind them is running any more - the engine and the delivery
+// worker are stopping. Closed first, the load balancer sees a refused
+// connection and goes elsewhere, which is what it is for.
+//
+// The workers are waited for LAST, and that is what was missing entirely: they
+// were started fire-and-forget, so a SIGTERM cancelled their context and the
+// process exited while the outbound worker was still holding a call it had
+// already made. The answer arriving a moment later went nowhere, and the
+// delivery became ambiguous - a message that may or may not have been sent,
+// with nothing saying which.
+//
+// No deadline is imposed on that wait. Each worker handed in has its own (the
+// outbound one: outbound.NotificationShutdownDeadline), and a shorter one
+// wrapped round it would defeat the reason that number exists. The container's
+// stop grace period bounds it from outside - see docker-compose.prod.yml.
+func awaitShutdown(quit <-chan os.Signal, cancel context.CancelFunc,
+	listeners []listener, workers ...<-chan struct{}) {
+
 	<-quit
 
 	log.Println("Shutting down...")
+
+	// Bounded, unlike the wait below: this one is for requests already in
+	// flight, and a client holding a connection open must not keep the process
+	// from getting on with the part that cannot be hurried.
+	closing, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	for _, srv := range listeners {
+		if srv == nil {
+			continue
+		}
+		if err := srv.Shutdown(closing); err != nil {
+			log.Printf("Server shutdown error: %v", err)
+		}
+	}
+
 	cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := internalSrv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Internal server shutdown error: %v", err)
+	for _, stopped := range workers {
+		<-stopped
 	}
 }
 
@@ -559,4 +730,28 @@ func getEnvOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// registerUI serves the web UI from dir, and every file of it with
+// Cache-Control: no-cache.
+//
+// One strategy for the whole UI, because it is one program: the HTML names
+// scripts, the module script imports other modules by bare URL, and a browser
+// that keeps one of them from the release before this one runs a UI that is
+// half upgraded - a module that asks the page for elements the old page does
+// not have, or a page that never loads the module the new feature lives in.
+// Version parameters on the script tags do not reach the imports, and
+// versioning only some of the imports would load the same module twice under
+// two URLs, each with its own state. no-cache does not forbid caching; it
+// makes every load revalidate, which the static handler answers with a 304
+// when the file has not changed.
+func registerUI(e *echo.Echo, dir string) {
+	ui := e.Group("", func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			c.Response().Header().Set("Cache-Control", "no-cache")
+			return next(c)
+		}
+	})
+	ui.Static("/", dir)
+	ui.File("/", filepath.Join(dir, "index.html"))
 }

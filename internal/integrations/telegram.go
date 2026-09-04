@@ -7,9 +7,9 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// Telegram integration descriptor (Epic 8). Mirrors slack.go: one Register call
+// Telegram integration descriptor. Mirrors slack.go: one Register call
 // declares the type, direction, secret fields (for masking), and config validation.
-// Masking is fully driven by SecretFields via MaskSecrets — no per-type code.
+// Masking is fully driven by SecretFields via MaskSecrets - no per-type code.
 func init() {
 	Register(Descriptor{
 		Type:         model.IntegrationTypeTelegram,

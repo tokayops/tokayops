@@ -86,7 +86,10 @@ func (c *IntegrationCache) LoadAll(store StoreInterface) error {
 				c.webhookSecrets = append(c.webhookSecrets, webhookCfg.Secret)
 			}
 		case model.IntegrationTypeGenericWebhook:
-			// Generic webhook subscriptions are handled by the outbox worker, not cached here
+			// Generic webhook subscribers are not cached: the webhook channel reads
+			// a subscriber's configuration from the database on every attempt
+			// (SubscriberConfig), so a rotated secret is used by every instance at
+			// once rather than by the one that handled the change.
 		}
 	}
 
@@ -138,8 +141,8 @@ func (c *IntegrationCache) GetTelegramToken() string {
 }
 
 // GetTelegramSecretToken returns the cached Telegram webhook secret token
-// (X-Telegram-Bot-Api-Secret-Token). Consumed by the webhook middleware in
-// Sprint 3; lives on the concrete cache, not the provider TokenSource interface.
+// (X-Telegram-Bot-Api-Secret-Token). Consumed by the webhook middleware; lives
+// on the concrete cache, not on the provider TokenSource interface.
 func (c *IntegrationCache) GetTelegramSecretToken() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

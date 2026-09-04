@@ -21,7 +21,6 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rbac"
-	"github.com/tokayops/tokayops/internal/slackcard"
 )
 
 // Re-export Slack action IDs from model for use in tests and this package.
@@ -61,7 +60,7 @@ func (a *API) SlackSignatureMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 		}
 
 		// 2. Read raw body (capped at 1 MB to prevent memory abuse) and restore it for the handler
-		const maxBodySize = 1 << 20 // 1 MB — Slack payloads are typically <100 KB
+		const maxBodySize = 1 << 20 // 1 MB - Slack payloads are typically <100 KB
 		body, err := io.ReadAll(io.LimitReader(c.Request().Body, maxBodySize+1))
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "failed to read body"})
@@ -109,7 +108,7 @@ func (a *API) resolveSlackUser(ctx context.Context, slackUserID string) *model.U
 			user, err := a.store.GetUserByEmail(email)
 			if err == nil && user != nil {
 				// BindExternalIdentityIfAbsent returns (false, ErrExternalIdentityAlreadyLinked)
-				// if the Slack id is bound to a *different* user — we silently fall through to OTP
+				// if the Slack id is bound to a *different* user - we silently fall through to OTP
 				// rather than overwriting.
 				changed, _ := a.store.BindExternalIdentityIfAbsent(user.ID, "slack", slackUserID, "")
 				if changed {
@@ -131,7 +130,13 @@ func (a *API) resolveSlackUser(ctx context.Context, slackUserID string) *model.U
 //	parse payload → resolve user → RBAC → atomic ack/resolve → return HTTP 200
 //
 // Async (goroutine): ephemeral feedback via response_url.
-// Async (background loop): Slack message appearance update (already handled by ackUpdateProcessingLoop).
+//
+// The card itself is not touched here. It belongs to the delivery domain, which
+// brings it to the state the alert is in on its own schedule - and a second
+// writer replacing the message from the live group would race it: an alert that
+// arrived between the click and the replacement would be rendered out of the
+// card until the next revision. The person who clicked sees their confirmation
+// immediately either way.
 func (a *API) HandleSlackInteractive(c echo.Context) error {
 	// 1. Parse: form value "payload" → InteractionCallback
 	var callback slack.InteractionCallback
@@ -167,7 +172,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 	case SlackActionResolveAlertGroup:
 		rbacAction = rbac.ActionAlertResolve
 	default:
-		// Unknown action — ignore gracefully
+		// Unknown action - ignore gracefully
 		return c.NoContent(http.StatusOK)
 	}
 
@@ -220,7 +225,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 	}
 
 	// 7. Execute transition via service
-	actor := alertgroup.Actor{Name: actorName(user), Email: user.Email}
+	actor := alertgroup.Actor{ID: user.ID, Name: actorName(user), Email: user.Email}
 	var result *alertgroup.TransitionResult
 
 	switch actionID {
@@ -240,25 +245,23 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 	switch result.Outcome {
 	case alertgroup.OutcomeApplied:
 		metrics.SlackInteractionTotal.WithLabelValues(slackActionLabel(actionID), "success").Inc()
+		done := fmt.Sprintf("Alert group acknowledged by %s.", actor.Name)
 		if isResolve {
-			go a.replaceOrEphemeral(responseURL, alertGroupID, result.AlertGroup, true,
-				fmt.Sprintf("Alert group resolved by %s.", actor.Name))
-		} else {
-			go a.replaceOrEphemeral(responseURL, alertGroupID, result.AlertGroup, false,
-				fmt.Sprintf("Alert group acknowledged by %s.", actor.Name))
+			done = fmt.Sprintf("Alert group resolved by %s.", actor.Name)
 		}
+		go a.respondEphemeral(responseURL, done)
 	case alertgroup.OutcomeAlreadyDone:
 		metrics.SlackInteractionTotal.WithLabelValues(slackActionLabel(actionID), "already_done").Inc()
-		if isResolve {
-			go a.replaceOrEphemeral(responseURL, alertGroupID, nil, true,
-				"Alert group is already resolved.")
-		} else {
-			go a.replaceOrEphemeral(responseURL, alertGroupID, nil, false,
-				"Alert group is already acknowledged or resolved.")
-		}
+		// Somebody got there first, and which of the two things they did is
+		// worth saying exactly. The group that says so is already in hand: the
+		// service read it to decide, and hands it back on this outcome. Reading
+		// it again would put a query on the three-second budget Slack allows
+		// this handler - and not inside the goroutine either, because the
+		// argument of a `go` call is evaluated before the goroutine starts.
+		go a.respondEphemeral(responseURL, fallbackFromAG(result.AlertGroup))
 	}
 
-	// 11. Return 200 empty body — background loop handles other deliveries + timeline
+	// 11. Return 200 empty body: the card is the delivery domain's to update.
 	return c.NoContent(http.StatusOK)
 }
 
@@ -302,74 +305,6 @@ func postResponseURL(responseURL, text string) {
 		return // fire-and-forget
 	}
 	resp.Body.Close()
-}
-
-// postResponseURLReplace replaces the original Slack message via response_url.
-// Sends top-level text + blocks (for unfurl preview) and the colored attachment.
-// Returns an error so the caller can fall back to ephemeral feedback.
-func postResponseURLReplace(responseURL string, card slackcard.Card) error {
-	if responseURL == "" {
-		return fmt.Errorf("empty response URL")
-	}
-	body, err := json.Marshal(map[string]interface{}{
-		"replace_original": true,
-		"text":             card.Text,
-		"blocks":           card.Blocks,
-		"attachments":      []slack.Attachment{card.Attachment},
-	})
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(responseURL, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("post: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("slack response_url returned %d", resp.StatusCode)
-	}
-	return nil
-}
-
-// replaceOrEphemeral tries to replace the Slack card via response_url.
-// If cardRenderer is nil or replace fails, falls back to ephemeral text.
-// When ag is nil (idempotent/already_done path), re-fetches from DB once
-// for both card rendering and fallback text generation.
-func (a *API) replaceOrEphemeral(responseURL, alertGroupID string, ag *model.AlertGroup, isResolved bool, fallbackText string) {
-	if a.cardRenderer == nil || a.replaceOriginal == nil {
-		if ag == nil {
-			fallbackText = a.alreadyDoneFallback(alertGroupID, fallbackText)
-		}
-		a.respondEphemeral(responseURL, fallbackText)
-		return
-	}
-	renderAG := ag
-	if renderAG == nil {
-		current, err := a.store.GetAlertGroupByID(alertGroupID)
-		if err != nil {
-			a.respondEphemeral(responseURL, fallbackText)
-			return
-		}
-		renderAG = current
-		fallbackText = fallbackFromAG(current)
-		isResolved = renderAG.Status == model.AlertGroupStatusResolved ||
-			renderAG.Status == model.AlertGroupStatusClosed
-	}
-	card := a.cardRenderer.RenderCard(renderAG, isResolved)
-	if err := a.replaceOriginal(responseURL, card); err != nil {
-		a.respondEphemeral(responseURL, fallbackText)
-	}
-}
-
-// alreadyDoneFallback re-fetches the AG once and builds a specific fallback message.
-// Used only when cardRenderer is nil (no card replacement attempt).
-func (a *API) alreadyDoneFallback(alertGroupID, defaultText string) string {
-	current, err := a.store.GetAlertGroupByID(alertGroupID)
-	if err != nil {
-		return defaultText
-	}
-	return fallbackFromAG(current)
 }
 
 // fallbackFromAG builds a human-readable ephemeral message from an already-fetched alert group.

@@ -17,6 +17,10 @@ const (
 )
 
 type Actor struct {
+	// ID is the user, for the journal of the commitments the transition
+	// withdraws. Name and Email are the audit labels the alert's own timeline
+	// keeps.
+	ID    string
 	Name  string
 	Email string
 }
@@ -39,8 +43,8 @@ type Service struct {
 // any more" are one fact rather than two writes that can be interrupted.
 type transitions interface {
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
-	AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
-	ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	AckAlertGroupAtomic(id string, actor Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	ResolveAlertGroupAtomic(id string, actor Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
 }
 
 func NewService(s transitions) *Service {
@@ -75,7 +79,7 @@ func (s *Service) Ack(alertGroupID string, actor Actor, meta map[string]string) 
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.store.AckAlertGroupAtomic(alertGroupID, actor.Name, meta, outboxEvent)
+	changed, err := s.store.AckAlertGroupAtomic(alertGroupID, actor, meta, outboxEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +128,7 @@ func (s *Service) Resolve(alertGroupID string, actor Actor, meta map[string]stri
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.store.ResolveAlertGroupAtomic(alertGroupID, actor.Name, meta, outboxEvent)
+	changed, err := s.store.ResolveAlertGroupAtomic(alertGroupID, actor, meta, outboxEvent)
 	if err != nil {
 		return nil, err
 	}

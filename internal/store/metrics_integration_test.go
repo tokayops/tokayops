@@ -33,7 +33,7 @@ func TestGetMetricsSnapshot_ActiveAlertGroups(t *testing.T) {
 	createAG("ag-m-2", "warning", model.AlertGroupStatusTriggered)
 	createAG("ag-m-3", "critical", model.AlertGroupStatusResolved)
 
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("GetMetricsSnapshot: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestGetMetricsSnapshotOnCallGauges(t *testing.T) {
 	// No schedule at all.
 	seedTeam(t, s, "team-none")
 
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("GetMetricsSnapshot: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestGetMetricsSnapshot_TeamsWithoutPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snap, err := s.GetMetricsSnapshot()
+	snap, err := s.GetMetricsSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("GetMetricsSnapshot: %v", err)
 	}

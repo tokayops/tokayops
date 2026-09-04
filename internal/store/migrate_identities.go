@@ -16,7 +16,7 @@ type SlackIdentityConflict struct {
 // SlackIdentityMigrationResult summarises a MigrateLegacySlackIdentities run.
 type SlackIdentityMigrationResult struct {
 	DryRun              bool
-	LegacyColumnPresent bool // false on fresh installs — nothing to migrate
+	LegacyColumnPresent bool // false on fresh installs - nothing to migrate
 	Candidates          int  // users with a non-empty legacy users.slack_user_id
 	Migrated            int  // identities newly bound (or would-be, when DryRun)
 	AlreadySatisfied    int  // users that already had a slack external identity
@@ -24,9 +24,10 @@ type SlackIdentityMigrationResult struct {
 }
 
 // MigrateLegacySlackIdentities backfills external_identities(provider='slack') from the
-// legacy users.slack_user_id column. Epic 7 Sprint 3 dropped that column from the model
-// but InitDB does NOT remove it from existing databases, so the values survive and can be
-// migrated in place — this is the only per-user data an Epic 7 upgrade must carry forward.
+// legacy users.slack_user_id column. The model dropped that column, but InitDB
+// does NOT remove it from existing databases, so the values survive and can be
+// migrated in place - the only per-user data such an upgrade has to carry
+// forward.
 //
 // Behaviour:
 //   - Idempotent: users that already have a slack identity are left untouched.
@@ -104,7 +105,7 @@ func (s *Store) MigrateLegacySlackIdentities(dryRun bool) (SlackIdentityMigratio
 }
 
 // classifySlackBackfill reports what the backfill would do for one (userID, slackID)
-// pair without writing — "already", "conflict", or "migrate". Used by the dry-run path.
+// pair without writing - "already", "conflict", or "migrate". Used by the dry-run path.
 func (s *Store) classifySlackBackfill(userID, slackID string) (string, error) {
 	var existsForUser bool
 	if err := s.db.QueryRow(

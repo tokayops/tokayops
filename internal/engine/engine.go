@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher/builders"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -31,31 +31,25 @@ type onCallProjection interface {
 }
 
 type Engine struct {
-	store      escalationStore
-	oncall     onCallProjection
-	escBuilder *builders.EscalationJobBuilder
+	store  escalationStore
+	oncall onCallProjection
+	plan   *planner
 }
 
-// NewEngine builds the alert engine. The on-call projection is shared with the
-// escalation builder rather than constructed here: the snapshot the engine
-// stores on an alert group and the users the builder escalates to must be the
-// same answer, and two projections would be two clocks.
-//
-// The builder is built once, here, rather than per alert group. It holds no
-// state between builds - what one build remembers lives for that build - so a
-// shared instance is the same object the loop was allocating each time round.
 // escalationStore is the store as the escalation engine needs it: find the
 // groups nobody has been paged for, learn who to page, and admit the escalation.
 //
-// EnsureEscalationJob is the one that carries the boundary. It is not "insert a
-// job": in one commit it moves the group to processing, stores the policy
-// snapshot the escalation will be executed against, and admits the job under its
-// forever claim. Split into separate calls, a crash between them leaves a group
-// that looks handled and is not.
+// SubmitBatch is the one that carries the boundary, and everything the
+// engine decides about a group goes through it. Anything written beside it -
+// the policy, who was on duty - would be written by producers that lost the
+// claim as readily as by the one that won.
 type escalationStore interface {
-	GetNewAlertGroups() ([]*model.AlertGroup, error)
-	TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error)
-	UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResult) error
+	// GetEscalationSources is the read a plan is built from: the groups nobody
+	// has been paged for, with the alerts and the history their cards are drawn
+	// from, and the version they were read at - all from one consistent view of
+	// the database. A group read here, a history read there and a version read
+	// somewhere else could already describe three different alerts.
+	GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, error)
 	GetTeamByID(id string) (*model.Team, error)
 	GetUsersByIDs(ids []string) ([]*model.User, error)
 
@@ -64,17 +58,29 @@ type escalationStore interface {
 	// it: whatever the builder may read, the engine may read.
 	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
 
-	EnsureEscalationJob(agID string, job *model.Job, stages []*model.JobStage,
-		steps []*model.JobStep, snapshot *model.EscalationPolicySnapshot) (bool, error)
+	// SubmitBatch admits the whole escalation in one commit: the
+	// claim over the group, its commitments, the state they render from, the
+	// policy they were built against and who was on duty when the alert
+	// arrived. Split into separate calls, a crash between them leaves a group
+	// that looks handled and is not - and a loser of the claim describing an
+	// escalation somebody else is running.
+	SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound.SubmitResult, error)
 }
 
-func NewEngine(s escalationStore, oncall onCallProjection, cfg *config.Config) *Engine {
-	// cfg is not kept: the only thing the engine did with it was hand it to the
-	// builder, which now holds it.
+// NewEngine builds the alert engine. The on-call projection is shared with the
+// producer rather than constructed here: who the group records and who it pages
+// must be the same answer, and two projections would be two clocks.
+//
+// The producer is built once, here, rather than per alert group. It holds no
+// state between plans - what one plan remembers lives for that plan - so a
+// shared instance is the same object the loop was allocating each time round.
+func NewEngine(s escalationStore, oncall onCallProjection, settings channelSettings,
+	cfg *config.Config) *Engine {
+
 	return &Engine{
-		store:      s,
-		oncall:     oncall,
-		escBuilder: builders.NewEscalationJobBuilder(s, oncall, cfg),
+		store:  s,
+		oncall: oncall,
+		plan:   &planner{store: s, oncall: oncall, settings: settings, cfg: cfg},
 	}
 }
 
@@ -94,18 +100,18 @@ func (e *Engine) Run(ctx context.Context) {
 
 func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 	metrics.EngineRunsTotal.Inc()
-	alertGroups, err := e.store.GetNewAlertGroups()
+	alertGroups, err := e.store.GetEscalationSources(ctx)
 	if err != nil {
-		log.Printf("AlertEngine: Error fetching new alert groups: %v", err)
+		log.Printf("AlertEngine: Error reading the escalation sources: %v", err)
 		return
 	}
 	metrics.EngineAlertGroupsPickedTotal.Add(float64(len(alertGroups)))
 
 	// The tick names the batch before it touches it, because every other line
 	// below is written after the work it describes. Without this one, a hang or
-	// a panic - in resolvePolicy, which reads the database without a context at
-	// all, or anywhere inside Build - leaves nothing at all to go on, and a
-	// poison group in a crash loop cannot be narrowed down.
+	// a panic - anywhere inside the plan, which reads the team, the policy and
+	// the schedule - leaves nothing at all to go on, and a poison group in a
+	// crash loop cannot be narrowed down.
 	//
 	// One line per tick rather than one per group: a group that cannot be built
 	// is back in the next tick's batch, so anything written per group is written
@@ -130,9 +136,6 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 	var deferredErr error
 
 	for _, ag := range alertGroups {
-		// Resolve Policy (may be empty - that's OK for firehose-only)
-		policyID := e.resolvePolicy(ag.TeamID, ag.Severity)
-
 		// Who is on duty is read ONCE per alert group, and the same answer both
 		// escalates and is recorded. Reading it again for the snapshot would put
 		// a handoff or a save between the two, and the alert group would then
@@ -144,18 +147,19 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		// may name a schedule this team no longer owns.
 		teamOnCall := schedulerender.TeamOnCallRead(e.oncall.CurrentTeamOnCallNow(ctx, ag.TeamID))
 
-		// Build unified job (includes firehose as step 0 if configured)
-		job, stages, steps, snapshot, err := e.escBuilder.Build(ctx, ag, policyID, teamOnCall)
+		// What this alert promises, and to whom: the state every message will
+		// be rendered from, and one commitment per recipient.
+		admission, err := e.plan.buildPlan(ctx, ag, teamOnCall)
 
-		// The recipients could not be resolved, so no job is committed and the
-		// alert group stays "new" for the next tick to try again. Committing
-		// one would spend this alert's only chance to page its on-call: nothing
-		// picks up an alert group that already has an escalation job.
+		// The recipients could not be resolved, so nothing is admitted and the
+		// alert group stays "new" for the next tick to try again. Admitting
+		// would spend this alert's only chance to page its on-call: nothing
+		// picks up a group that already holds an admission.
 		//
 		// Nothing is logged for this group: it will be back next tick, and the
 		// tick after that. The tally declared above the loop reports all of
 		// them in one line once the loop is done.
-		if errors.Is(err, builders.ErrOnCallResolutionUnavailable) {
+		if errors.Is(err, ErrOnCallResolutionUnavailable) {
 			metrics.EngineEscalationBuildDeferralsTotal.Inc()
 			deferred++
 			if deferredErr == nil {
@@ -172,61 +176,51 @@ func (e *Engine) ProcessNewAlertGroups(ctx context.Context) {
 		}
 		log.Printf("AlertEngine: Processing %s (Team: %s, Sev: %s)", ag.ID, ag.TeamID, ag.Severity)
 		// Still reachable, and worth one line: a policy with no schedule-typed
-		// step builds fine without this answer, and damaged schedule data
-		// degrades to a marker rather than deferring. Both commit a job, so
+		// step plans fine without this answer, and damaged schedule data
+		// degrades to a recorded reason rather than deferring. Both admit, so
 		// this group is processed once rather than every tick.
 		if err := teamOnCall.Err(); err != nil {
 			log.Printf("AlertEngine: Failed to fetch oncall for %s: %v", ag.ID, err)
 		}
 
 		if err != nil {
-			// Build failed — leave AG as "new" so it retries on next tick
-			log.Printf("AlertEngine: Failed to build job for %s (will retry): %v", ag.ID, err)
+			// The plan could not be built - a state that cannot be frozen, a
+			// grammar that refuses it. Nothing is admitted and the group stays
+			// new, so the next tick tries again rather than spending this
+			// alert's only chance to page on a half-built escalation.
+			log.Printf("AlertEngine: Failed to build the escalation for %s (will retry): %v", ag.ID, err)
 			continue
 		}
 
-		if job != nil {
-			// Atomic: lock AG row, check status, transition to processing,
-			// create job with dedup, save snapshot — all in one TX.
-			created, err := e.store.EnsureEscalationJob(ag.ID, job, stages, steps, snapshot)
-			if err != nil {
-				log.Printf("AlertEngine: Failed to ensure job for %s (will retry): %v", ag.ID, err)
-				continue
-			}
-			if created {
-				log.Printf("AlertEngine: Job created for %s (policy=%s, steps=%d)", ag.ID, snapshot.PolicyID, len(steps))
-			} else {
-				log.Printf("AlertEngine: Job already exists or AG status changed for %s", ag.ID)
-			}
-		} else {
-			// job == nil: no firehose and no policy
-			// CAS new→processing (for new AG) + touch updated_at (for stale processing)
-			if ag.Status == model.AlertGroupStatusNew {
-				if _, err := e.store.TransitionAlertGroupStatus(ag.ID, model.AlertGroupStatusNew, model.AlertGroupStatusProcessing); err != nil {
-					log.Printf("AlertEngine: Failed to transition %s to processing: %v", ag.ID, err)
-				}
-			} else {
-				// Stale processing without job — touch updated_at to prevent re-pickup
-				if _, err := e.store.TransitionAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing, model.AlertGroupStatusProcessing); err != nil {
-					log.Printf("AlertEngine: Failed to touch %s: %v", ag.ID, err)
-				}
-			}
-			log.Printf("AlertEngine: No job created for %s (no firehose, no policy)", ag.ID)
-		}
-
-		// Save OnCall snapshot (regardless of job creation), from the very
-		// projection the job was built from. A tick that could not read it
-		// writes nothing rather than recording "nobody was on call", which is a
-		// claim about the schedule and not about the database.
-		if teamOnCall.Err() != nil {
-			continue
-		}
-		oncallSnapshot, err := e.onCallSnapshot(teamOnCall.OnCall())
+		result, err := e.store.SubmitBatch(ctx, admission)
 		if err != nil {
-			log.Printf("AlertEngine: Failed to resolve oncall users for %s: %v", ag.ID, err)
-		} else if err := e.store.UpdateAlertGroupOnCall(ag.ID, oncallSnapshot); err != nil {
-			log.Printf("AlertEngine: Failed to save oncall snapshot for %s: %v", ag.ID, err)
+			log.Printf("AlertEngine: Failed to admit the escalation for %s (will retry): %v", ag.ID, err)
+			continue
 		}
+		if result.Outcome == outbound.SubmitSourceChanged {
+			// The alert changed between being read and being admitted, so this
+			// plan describes a state it is no longer in. Nothing was claimed;
+			// the next tick plans it again from what is now there.
+			//
+			// Counted rather than logged, like the deferrals above and for the
+			// same reason: the group comes straight back, so a line here is a
+			// line every tick for as long as the alert keeps moving.
+			metrics.EngineEscalationSourceChangedTotal.Inc()
+			continue
+		}
+
+		// One shape for every other answer, so that "what happened to this
+		// alert's escalation" is one grep rather than three phrasings.
+		//
+		// commitments is what the CLAIM holds, not what this tick planned: on a
+		// repeat that is the winner's set, which is the number that matters -
+		// how many messages this alert is going to produce. Nobody to notify is
+		// an answer rather than a failure, and it reads as commitments=0 with
+		// the reasons in the alert's own history.
+		about, _ := admission.Context.Escalation()
+		log.Printf("AlertEngine: %s admission=%s policy=%s commitments=%d unpromised=%d",
+			ag.ID, outbound.AdmissionLabel(result.Outcome, len(admission.Admission.Commitments)),
+			about.PolicyID, len(result.IntentIDs), len(about.Unpromised))
 	}
 
 	if deferred > 0 {
@@ -255,83 +249,4 @@ func alertGroupIDs(ags []*model.AlertGroup) string {
 		b.WriteString(ag.ID)
 	}
 	return b.String()
-}
-
-// onCallSnapshot records who was on duty when the alert arrived.
-//
-// It takes the projection rather than fetching one: this is the same answer the
-// job was built from, and that is the whole point of it being a parameter.
-//
-// A team with no schedule, or one between shifts, gets an empty snapshot rather
-// than none: "nobody was on call" is a fact worth having on the alert group, and
-// the readers of the field already treat an empty group as exactly that.
-//
-// Source is what survives of the override information now that the projection
-// answers instead of a legacy override row: L1Users already names the stand-in,
-// and Source says that is why.
-func (e *Engine) onCallSnapshot(team schedulerender.TeamOnCall) (*model.OnCallResult, error) {
-	out := &model.OnCallResult{}
-	if l1 := team.OnCall.L1; l1 != nil {
-		users, err := e.usersByIDs(l1.UserIDs)
-		if err != nil {
-			return nil, err
-		}
-		since, until := l1.AssignmentStart, l1.AssignmentEnd
-		out.L1Users = users
-		out.L1Since = &since
-		out.L1Until = &until
-		out.Source = l1.Source
-	}
-	if l2 := team.OnCall.L2; l2 != nil && len(l2.UserIDs) > 0 {
-		users, err := e.usersByIDs(l2.UserIDs[:1])
-		if err != nil {
-			return nil, err
-		}
-		if len(users) > 0 {
-			out.L2User = users[0]
-		}
-	}
-	return out, nil
-}
-
-// usersByIDs hydrates IDs into user records, preserving the projection's order
-// and dropping anyone the store no longer has.
-func (e *Engine) usersByIDs(ids []string) ([]*model.User, error) {
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	fetched, err := e.store.GetUsersByIDs(ids)
-	if err != nil {
-		return nil, err
-	}
-	byID := make(map[string]*model.User, len(fetched))
-	for _, u := range fetched {
-		byID[u.ID] = u
-	}
-	out := make([]*model.User, 0, len(ids))
-	for _, id := range ids {
-		if u, ok := byID[id]; ok {
-			out = append(out, u)
-		}
-	}
-	return out, nil
-}
-
-func (e *Engine) resolvePolicy(teamID, severity string) string {
-	// Try to get team from Store
-	team, err := e.store.GetTeamByID(teamID)
-	if err != nil {
-		log.Printf("AlertEngine: Team '%s' not found: %v", teamID, err)
-		return ""
-	}
-
-	// Check severity-specific route
-	if team.SeverityRoutes != nil {
-		if policyID, ok := team.SeverityRoutes[severity]; ok && policyID != "" {
-			return policyID
-		}
-	}
-
-	// Fall back to default policy
-	return team.DefaultPolicyID
 }

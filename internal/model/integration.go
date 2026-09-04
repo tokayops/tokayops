@@ -45,6 +45,18 @@ type Integration struct {
 	UpdatedAt time.Time            `json:"updated_at"`
 }
 
+// IntegrationTombstone is what remains of a deleted integration: enough to
+// decide who may still read its delivery history, and nothing else. The scope
+// is the one it had when it was deleted, on purpose - it describes a
+// historical object, and who could see that history does not change afterwards.
+type IntegrationTombstone struct {
+	ID        string
+	Type      IntegrationType
+	Scope     *WebhookScope
+	TeamID    *string
+	DeletedAt time.Time
+}
+
 // SlackConfig is the config schema for Slack integrations
 type SlackConfig struct {
 	Token          string `json:"token"`                     // Bot token for notifications
@@ -69,8 +81,7 @@ type TelegramConfig struct {
 }
 
 // IsInteractive reports whether Ack/Resolve buttons are enabled, defaulting to
-// true when the field was never set. Mirrors config.GlobalConfig's
-// DmFallbackToFirehose accessor.
+// true when the field was never set.
 func (c TelegramConfig) IsInteractive() bool {
 	if c.Interactive == nil {
 		return true
@@ -95,6 +106,6 @@ type GenericWebhookConfig struct {
 const MaskedSecret = "****"
 
 // Note: ValidIntegrationTypes / IsValidIntegrationType / GetDirectionForType
-// (Sprint 4) and MaskSecrets (Sprint 5) moved to internal/integrations. Type
-// metadata — including which config fields are secret — is declared next to the
+// and MaskSecrets moved to internal/integrations. Type
+// metadata - including which config fields are secret - is declared next to the
 // per-type Descriptor instead of as a switch here. Use integrations.MaskSecrets.

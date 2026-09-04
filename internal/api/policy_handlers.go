@@ -11,20 +11,19 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 )
 
-// ProviderCapabilitiesLookup is the read-only view of the dispatcher's
-// capability registry that the API layer needs. Capability lookup is
-// compile-time data (which provider class supports which target kinds) —
-// it never touches the DB and never fails because an integration is
-// disabled. The dispatcher's *ProviderRegistry implements this.
+// ProviderCapabilitiesLookup is the read-only view of the channel catalogue
+// that the API layer needs. What it answers is declared at start-up - which
+// provider class carries which target kinds - so it never touches the database
+// and never fails because an integration is disabled.
 type ProviderCapabilitiesLookup interface {
 	Capabilities(name string) (capabilities ProviderCapability, ok bool)
 	AllCapabilities() []ProviderCapability
 }
 
-// ProviderCapability mirrors dispatcher.ProviderCapabilities at the API
-// boundary so the api package doesn't import dispatcher just for the type.
-// (api already imports dispatcher elsewhere, but the read-only contract is
-// nicer to keep narrow.)
+// ProviderCapability mirrors providers.Capability at the API boundary. The
+// duplication is deliberate: this is what the HTTP response is shaped like, and
+// a response shaped by another package's struct changes whenever that struct
+// does.
 type ProviderCapability struct {
 	Name                 string                `json:"name"`
 	IntegrationType      model.IntegrationType `json:"integration_type"`
@@ -45,7 +44,7 @@ type PolicyRequest struct {
 
 // PolicyStepRequest represents a step in a policy request.
 //
-// Sprint 4: provider + target_kind replace the flat step_type.
+// provider + target_kind, which replaced a flat step_type.
 //   - provider: e.g. "slack", validated against the capability registry.
 //   - target_kind: "dm" | "channel"; validated against the provider's
 //     SupportedTargetKinds.
@@ -281,7 +280,7 @@ var targetKindForTargetType = map[string]map[string]bool{
 // validatePolicyStep checks the (provider, target_kind, target_type) triple
 // is consistent and that the provider supports target_kind. caps is the
 // capability registry view (nil during tests that don't exercise the
-// registry — guarded below).
+// registry - guarded below).
 func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup) error {
 	if step.Provider == "" {
 		return fmt.Errorf("provider is required")
@@ -291,7 +290,7 @@ func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup)
 	}
 
 	// Capability check: provider registered, and target_kind supported.
-	// caps == nil means this binary has no dispatcher wired in (test setup);
+	// caps == nil means this binary has no channel catalogue wired in (test setup);
 	// fall back to validating the legacy {dm,channel} pair without provider
 	// existence checks so unit tests that don't supply a registry still pass.
 	if caps != nil {
@@ -320,12 +319,12 @@ func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup)
 		return fmt.Errorf("%s step requires one of %v target types, got %s", step.TargetKind, keysOf(allowedTargetTypes), step.TargetType)
 	}
 
-	// target_id is required for concrete targets — schedules resolve at dispatch.
+	// target_id is required for concrete targets - schedules resolve at dispatch.
 	if (step.TargetType == "user" || step.TargetType == "channel") && step.TargetID == "" {
 		return fmt.Errorf("target_id is required for %s target type", step.TargetType)
 	}
 
-	// Timing field guards (unchanged from before Sprint 4).
+	// Timing field guards, which the step shape never touched.
 	if step.DelaySeconds < 0 {
 		return fmt.Errorf("delay_seconds must be >= 0")
 	}

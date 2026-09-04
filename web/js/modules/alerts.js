@@ -5,6 +5,7 @@
 
 import { State, STATE_STATUS_MAP } from '/js/core/state.js';
 import { Elements, showToast, escapeHtml } from '/js/core/utils.js';
+import { renderGroupDeliveries, afterTimelineRender } from '/js/modules/deliveries.js';
 import { ViewManager } from '/js/core/viewManager.js';
 
 const STATUS_STATE_MAP = {
@@ -448,6 +449,7 @@ export async function openAlertGroupModal(alertGroupId) {
         Elements.modalFooter.innerHTML = Components.alertGroupActions(alertGroup);
         bindModalActions();
         loadAlertGroupTimeline(alertGroupId);
+        renderGroupDeliveries(alertGroupId);
     } catch (error) {
         Elements.modalBody.innerHTML = `<div class="empty-state"><p>Failed to load: ${escapeHtml(error.message)}</p></div>`;
     }
@@ -583,11 +585,21 @@ async function loadAlertGroupTimeline(alertGroupId) {
         const events = response.events || [];
         timelineContainer.innerHTML = Components.timeline(events);
         if (window.lucide) lucide.createIcons();
+        afterTimelineRender(timelineContainer);
     } catch (error) {
         timelineContainer.innerHTML = '<div class="timeline-empty">Failed to load timeline</div>';
         console.warn('Failed to load timeline:', error);
     }
 }
+
+// A decision taken from the journal changes what the group shows: its
+// deliveries and, through the timeline line the decision wrote, its history.
+document.addEventListener('tokay:delivery-decided', (e) => {
+    const groupId = e.detail?.alertGroupId;
+    if (!groupId || State.selectedAlertGroup?.id !== groupId) return;
+    loadAlertGroupTimeline(groupId);
+    renderGroupDeliveries(groupId);
+});
 
 /**
  * Close modal
@@ -736,7 +748,7 @@ export function bindAlertsEvents() {
         });
     }
 
-    // Severity Chips (multi-select) — reload from server
+    // Severity Chips (multi-select) - reload from server
     if (Elements.severityChips) {
         Elements.severityChips.addEventListener('click', (e) => {
             const chip = e.target.closest('.severity-chip');
@@ -774,7 +786,7 @@ export function bindAlertsEvents() {
         });
     }
 
-    // Pagination — reload from server
+    // Pagination - reload from server
     if (Elements.prevPage) {
         Elements.prevPage.addEventListener('click', () => {
             if (State.isLoading || Elements.prevPage.disabled) return;

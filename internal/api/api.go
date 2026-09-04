@@ -14,13 +14,12 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/auth"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/rbac"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
-	"github.com/tokayops/tokayops/internal/slackcard"
+	"github.com/tokayops/tokayops/internal/slacksync"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -31,14 +30,9 @@ type SlackMessenger interface {
 	GetEmailBySlackID(ctx context.Context, slackUserID string) (string, error)
 }
 
-// SlackCardRenderer renders alert group cards for immediate Slack message replacement.
-type SlackCardRenderer interface {
-	RenderCard(ag *model.AlertGroup, isResolved bool) slackcard.Card
-}
-
 // TelegramAPI is the slice of the Telegram provider the API layer needs:
 // answering callbacks, the /start link confirmation, webhook lifecycle, and the
-// bot username for deep links. Satisfied by *dispatcher.TelegramProvider.
+// bot username for deep links. Satisfied by *telegram.Provider.
 type TelegramAPI interface {
 	AnswerCallback(ctx context.Context, callbackQueryID, text string) error
 	SendText(ctx context.Context, chatID, text string) error
@@ -55,14 +49,12 @@ type API struct {
 	rbac             *rbac.Checker
 	slack            SlackMessenger
 	integrationCache *store.IntegrationCache
-	syncerManager    *dispatcher.UsergroupSyncerManager
+	syncerManager    *slacksync.UsergroupSyncerManager
 	syncerCtx        context.Context
 	respondEphemeral func(responseURL, text string)
-	cardRenderer     SlackCardRenderer                                   // optional, nil = no instant card updates
-	replaceOriginal  func(responseURL string, card slackcard.Card) error // injectable for tests
-	selfURL          string                                              // TokayOps base URL for manifest generation
-	providerCaps     ProviderCapabilitiesLookup                          // capability registry view (read-only)
-	telegram         TelegramAPI                                         // optional, nil = telegram interactivity disabled
+	selfURL          string                     // TokayOps base URL for manifest generation
+	providerCaps     ProviderCapabilitiesLookup // capability registry view (read-only)
+	telegram         TelegramAPI                // optional, nil = telegram interactivity disabled
 
 	// Schedule configuration is deliberately NOT reached through
 	// store.StoreInterface. The revision model is not mirrored into MockStore,
@@ -72,10 +64,13 @@ type API struct {
 	scheduleRead     scheduleconfig.ScheduleReadRepository
 	scheduleRenderer *schedulerender.Service
 	userEraser       *erasure.Service
+	// deliveryRetentionDays is how long delivery history is kept, for the
+	// answer about a delivery that is not in the journal any more; 0 is never.
+	deliveryRetentionDays int
 }
 
 // NewAPI creates a new API instance. Pass nil for oidc if not using OIDC.
-// providerCaps is the dispatcher's capability registry view, used by policy
+// providerCaps is the channel catalogue as this layer reads it, used by policy
 // validation and the GET /providers endpoint. nil is tolerated by individual
 // handlers (policy validation falls back to taxonomy-only checks) but the
 // production wiring in main.go always supplies it.
@@ -112,16 +107,16 @@ func (a *API) SetScheduleRenderer(svc *schedulerender.Service) {
 	a.scheduleRenderer = svc
 }
 
+// SetDeliveryRetention tells the API the retention window, so that a journal
+// that is not there can say why.
+func (a *API) SetDeliveryRetention(days int) {
+	a.deliveryRetentionDays = days
+}
+
 // SetUserEraser wires the user erasure command. Without it DeleteUser has no
 // safe implementation and refuses rather than falling back to a hard delete.
 func (a *API) SetUserEraser(svc *erasure.Service) {
 	a.userEraser = svc
-}
-
-// SetCardRenderer enables instant Slack card replacement on Ack/Resolve button clicks.
-func (a *API) SetCardRenderer(r SlackCardRenderer) {
-	a.cardRenderer = r
-	a.replaceOriginal = postResponseURLReplace
 }
 
 // SetTelegram wires the Telegram provider into the API layer so the webhook
@@ -132,7 +127,7 @@ func (a *API) SetTelegram(t TelegramAPI) {
 }
 
 // SetUsergroupSyncerManager sets the usergroup syncer manager for dynamic start/stop.
-func (a *API) SetUsergroupSyncerManager(ctx context.Context, manager *dispatcher.UsergroupSyncerManager) {
+func (a *API) SetUsergroupSyncerManager(ctx context.Context, manager *slacksync.UsergroupSyncerManager) {
 	a.syncerCtx = ctx
 	a.syncerManager = manager
 }
@@ -188,6 +183,16 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.PATCH("/alert-groups/:id/resolve", a.ResolveAlertGroup, a.Require(rbac.ActionAlertResolve, ScopeFromResource("alert_group", "id")))
 	v1.GET("/alert-groups/:id/timeline", a.GetAlertGroupTimeline, a.Require(rbac.ActionAlertView, ScopeFromResource("alert_group", "id")))
 	v1.POST("/alert-groups/:id/notes", a.AddAlertGroupNote, a.Require(rbac.ActionAlertNoteAdd, ScopeFromResource("alert_group", "id")))
+	// The group's deliveries go under the same action and scope as its
+	// timeline: whoever may read "notification sent" may read to whom.
+	v1.GET("/alert-groups/:id/deliveries", a.GetAlertGroupDeliveries, a.Require(rbac.ActionAlertView, ScopeFromResource("alert_group", "id")))
+
+	// The delivery journal: every family, every team, one form. The journal of
+	// one commitment carries the attempts and their addresses, which is why
+	// it is the administrator's and not the group's.
+	v1.GET("/deliveries", a.ListDeliveries, a.Require(rbac.ActionDeliveryView, ScopeGlobal()))
+	v1.GET("/deliveries/:id", a.GetDeliveryJournal, a.Require(rbac.ActionDeliveryView, ScopeGlobal()))
+	v1.POST("/deliveries/:id/decisions", a.DecideDelivery, a.Require(rbac.ActionDeliveryResolve, ScopeGlobal()))
 
 	// Legacy Incidents (alias)
 	v1.GET("/incidents", a.ListAlertGroups, a.Require(rbac.ActionAlertView, ScopeGlobal()))
@@ -253,7 +258,7 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.POST("/tokens", a.CreateAPIToken, a.Require(rbac.ActionTokenCreate, ScopeCurrentUser()))
 	v1.DELETE("/tokens/:id", a.DeleteAPIToken, a.Require(rbac.ActionTokenDelete, ScopeFromResource("token", "id")))
 
-	// Providers (Sprint 4): read-only capability discovery for the policy editor.
+	// Providers: read-only capability discovery for the policy editor.
 	v1.GET("/providers", a.ListProviders)
 
 	// Escalation Policies (Phase 4)
@@ -273,14 +278,17 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	v1.POST("/integrations/:id/test", a.TestIntegration, a.Require(rbac.ActionIntegrationUpdate, ScopeFromIntegration("id")))
 
 	// Delivery logs and replay
-	v1.GET("/integrations/:id/deliveries", a.ListIntegrationDeliveries, a.Require(rbac.ActionIntegrationView, ScopeFromIntegration("id")))
-	v1.GET("/integrations/:id/deliveries/:deliveryId", a.GetDeliveryDetail, a.Require(rbac.ActionIntegrationView, ScopeFromIntegration("id")))
+	// The two reading routes resolve through the tombstone once the integration
+	// is gone; the replay does not - it makes a new delivery, and a deleted
+	// subscriber gets none.
+	v1.GET("/integrations/:id/deliveries", a.ListIntegrationDeliveries, a.Require(rbac.ActionIntegrationView, ScopeFromIntegrationHistory("id")))
+	v1.GET("/integrations/:id/deliveries/:deliveryId", a.GetDeliveryDetail, a.Require(rbac.ActionIntegrationView, ScopeFromIntegrationHistory("id")))
 	v1.POST("/integrations/:id/deliveries/:deliveryId/replay", a.ReplayDelivery, a.Require(rbac.ActionIntegrationUpdate, ScopeFromIntegration("id")))
 
-	// Slack Interactive (Public — no AuthMiddleware, uses Slack signature verification)
+	// Slack Interactive (Public - no AuthMiddleware, uses Slack signature verification)
 	e.POST("/slack/interactive", a.HandleSlackInteractive, a.SlackSignatureMiddleware)
 
-	// Telegram webhook (Public — no AuthMiddleware, uses X-Telegram-Bot-Api-Secret-Token verification)
+	// Telegram webhook (Public - no AuthMiddleware, uses X-Telegram-Bot-Api-Secret-Token verification)
 	e.POST("/telegram/webhook", a.HandleTelegramWebhook, a.TelegramSecretMiddleware)
 }
 
@@ -656,7 +664,7 @@ func (a *API) ResolveAlertGroup(c echo.Context) error {
 // resolveRESTActor resolves the authenticated user from JWT context into an alertgroup.Actor.
 func (a *API) resolveRESTActor(c echo.Context) alertgroup.Actor {
 	userID, _ := c.Get("user_id").(string)
-	actor := alertgroup.Actor{Name: "user"}
+	actor := alertgroup.Actor{ID: userID, Name: "user"}
 	if userID != "" {
 		// Display read on purpose, as above: this is an audit label.
 		if user, err := a.store.GetUserByID(userID); err == nil && user != nil {
@@ -1333,8 +1341,8 @@ func (a *API) GetUser(c echo.Context) error {
 
 // CreateUserRequest represents a request to create a user.
 //
-// External account links (Slack, Telegram, ...) are NOT accepted here — they are
-// established only via the link flow (POST /me/slack/request-code, …) per Epic 7 Sprint 3.
+// External account links (Slack, Telegram, ...) are NOT accepted here - they are
+// established only via the link flow (POST /me/slack/request-code, and so on).
 type CreateUserRequest struct {
 	ID       string `json:"id"`                 // Optional, will be generated if not provided
 	Email    string `json:"email"`              // Required
@@ -1410,7 +1418,7 @@ func (a *API) CreateUser(c echo.Context) error {
 }
 
 // UpdateUserRequest represents a request to update a user. External account links
-// are not editable here — use the link flow (POST /me/slack/request-code, …).
+// are not editable here - use the link flow (POST /me/slack/request-code, …).
 type UpdateUserRequest struct {
 	Email string `json:"email,omitempty"`
 	Name  string `json:"name,omitempty"`

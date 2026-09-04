@@ -44,9 +44,9 @@ type AlertGroup struct {
 	// names the ALERT, not this incident - the same key comes back every time
 	// the same thing breaks, and each time it opens a new group with a new ID.
 	//
-	// It is not the identity of any background work. Jobs declare that through
-	// jobdedup, and an escalation that once keyed itself by this string paged
-	// nobody for the second incident.
+	// It is not the identity of any work done about the alert. An escalation
+	// that once keyed itself by this string paged nobody for the second
+	// incident.
 	//
 	// The JSON name is the one this field has always had, and stays: it is
 	// what the API, the webhooks and the UI already read.
@@ -73,22 +73,43 @@ type AlertGroup struct {
 	Alerts []Alert `json:"alerts"`
 
 	// Acknowledgement
-	AcknowledgedBy string     `json:"acknowledged_by,omitempty"`
-	ResolvedBy     string     `json:"resolved_by,omitempty"`
-	AckProcessedAt *time.Time `json:"ack_processed_at,omitempty"` // When ack update job was processed
+	AcknowledgedBy string `json:"acknowledged_by,omitempty"`
+	ResolvedBy     string `json:"resolved_by,omitempty"`
 
 	// Slack Update Tracking
-	SlackUpdatePending bool `json:"slack_update_pending,omitempty"` // Set when alerts change; cleared after Slack update job created
 
-	// SlackUpdateGeneration counts the times the flag above was raised, and is
-	// what lets the producer lower it without losing an alert that arrived
-	// while it worked: it clears the flag only if the generation it read is
-	// still the current one.
+	// RenderSourceVersion is the version of the state a message about this
+	// alert is drawn from. Every write that changes what such a message would
+	// say increments it.
 	//
-	// Not part of the group as the API presents it - it is the token of an
-	// internal gate, and a reader outside this repository can do nothing with
-	// it but be confused.
-	SlackUpdateGeneration int64 `json:"-"`
+	// Two things read it, and it is named after neither. A producer that froze
+	// a snapshot hands the version back when it admits the escalation, and the
+	// admission refuses a plan built from state that has moved since - the
+	// snapshot is what every message renders from for as long as the
+	// escalation lives, so a plan built a moment too early would page about a
+	// state the alert is no longer in. The flag above uses it as its token: the
+	// producer clears the flag only if the version it read is still current,
+	// which is how an alert arriving mid-build keeps the flag up.
+	//
+	// It moves when the ALERT changes - its alerts, its status, who
+	// acknowledged or resolved it - and two things are deliberately left out,
+	// for the same reason: a version moved by the act of recording work would
+	// leave nothing ever current.
+	//
+	// The history, although a card shows it: deliveries write history, so a
+	// line moving the version would make every update invalidate the state it
+	// was drawn from and the flag above would never come down. And the write
+	// that admits an escalation, which moves the group to "processing": it is
+	// not news about the alert, and a snapshot stale the moment it was accepted
+	// is no snapshot at all.
+	//
+	// A card can be one line of history behind the audit. It cannot be about
+	// the wrong alert.
+	//
+	// Not part of the group as the API presents it - it is an internal token,
+	// and a reader outside this repository can do nothing with it but be
+	// confused.
+	RenderSourceVersion int64 `json:"-"`
 
 	// External Link to Alertmanager Source (for clickable titles)
 	ExternalURL string `json:"external_url,omitempty"`
@@ -124,25 +145,6 @@ type AlertGroupSummary struct {
 	ResolvedAt     *time.Time       `json:"resolved_at,omitempty"`
 	AlertsCount    int              `json:"alerts_count"`
 	FiringCount    int              `json:"firing_count"`
-}
-
-// NotificationDelivery represents a single notification delivery attempt.
-// It is tied to an AlertGroup and typically to a JobStep.
-type NotificationDelivery struct {
-	ID              string    `json:"id"`
-	AlertGroupID    string    `json:"alert_group_id"`
-	JobStepID       *string   `json:"job_step_id,omitempty"`
-	Provider        string    `json:"provider"`
-	Kind            string    `json:"kind"` // slack_channel, slack_dm, firehose
-	TargetType      string    `json:"target_type,omitempty"`
-	TargetID        string    `json:"target_id,omitempty"`
-	ProviderPayload string    `json:"provider_payload,omitempty"`
-	SupportsUpdate  bool      `json:"supports_update"`
-	IsPrimary       bool      `json:"is_primary"`
-	IsFirehose      bool      `json:"is_firehose"`
-	Attempt         int       `json:"attempt"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // IncidentStatus represents the lifecycle state of a business incident.
@@ -188,7 +190,7 @@ const (
 // User represents an individual who can be notified and assigned to incidents.
 //
 // External account links (Slack user IDs, Telegram chat IDs, ...) live in
-// `external_identities` and are surfaced via Identities on demand by handlers —
+// `external_identities` and are surfaced via Identities on demand by handlers -
 // they are NOT loaded by the user-row scan (mirrors AlertGroup.TimelineEvents).
 type User struct {
 	ID           string              `json:"id"`                      // UUID
@@ -217,7 +219,7 @@ type ExternalIdentity struct {
 // LinkToken is a short-lived, single-use token for linking an external account.
 // For Slack OTP, Token is the 6-digit code DM'd to the user; for Telegram deep-link
 // it is the opaque token in the /start <token> URL. The store persists only the
-// SHA-256 hash — Token is never stored at rest.
+// SHA-256 hash - Token is never stored at rest.
 type LinkToken struct {
 	ID         string    `json:"id"`
 	UserID     string    `json:"user_id"`
@@ -339,10 +341,10 @@ type EscalationPolicy struct {
 
 // EscalationStep defines a single step in an escalation policy.
 //
-// Sprint 4 (Epic 7 L6) replaced the flat StepType enum with
-// (Provider, TargetKind):
+// A flat StepType enum used to say both of these at once. It is
+// (Provider, TargetKind) now:
 //   - Provider: provider key (e.g. "slack"); resolved at dispatch time.
-//   - TargetKind: "dm" or "channel" — what kind of recipient the step targets.
+//   - TargetKind: "dm" or "channel" - what kind of recipient the step targets.
 //     The pair must be supported by the provider's capabilities.
 //
 // The legacy combined enum (`slack_dm` / `slack_channel`) was a one-provider

@@ -1,10 +1,13 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/alertgroup"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +15,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 )
 
 // activeUserCTE is the head of every statement that creates something owned by
@@ -74,6 +79,18 @@ var ErrLastAdmin = errors.New("store: cannot demote the last admin")
 
 type Store struct {
 	db *sql.DB
+
+	// lockTimeout is how long a point mutation waits for a row somebody else
+	// is holding. It is a field rather than the constant it is set from
+	// because a test that measures the lock ORDER has to be able to raise it:
+	// at three seconds, a loaded machine produces timeouts that say nothing
+	// about who took which row first.
+	lockTimeout time.Duration
+
+	// render is what a message needs that an alert group does not carry: the
+	// base URL of this installation and the zone times are printed in. Set once
+	// at wiring - see SetRenderEnvironment.
+	render renderEnvironment
 }
 
 func (s *Store) Close() error {
@@ -82,7 +99,7 @@ func (s *Store) Close() error {
 
 // GetDB returns the underlying sql.DB connection.
 // STRICTLY FOR TESTING PURPOSES ONLY.
-// Do not use this method in application code (api, engine, dispatcher).
+// Do not use this method in application code (api, engine, the producers).
 // Always add new methods to Store interface instead of bypassing it.
 func (s *Store) GetDB() *sql.DB {
 	return s.db
@@ -98,10 +115,146 @@ func NewStore(dsn string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, lockTimeout: outbound.OutboundLockTimeout}, nil
 }
 
+// legacyColumnMigrationsLock is what makes the block below safe for instances
+// starting at the same moment.
+//
+// Every step in it is guarded, which is enough to run it twice in a row and not
+// enough to run it twice at once: the guard and the ALTER it protects are two
+// statements, and a rename committing between them leaves the other instance
+// adding a column that now exists. One start fails, the container restarts, and
+// on a bad day that is a crash loop over a schema that is already correct.
+//
+// The number is arbitrary and only has to stay stable and distinct from the
+// other schema locks: "toka" plus the next sequence number.
+const legacyColumnMigrationsLock int64 = 0x746F6B6113
+
+// legacyColumnMigrationsDDL renames what older schemas called things.
+//
+// It runs after the tables are created, and every step is guarded, so a fresh
+// database executes it and changes nothing. Never executed on its own - see
+// applyLegacyColumnMigrations, which is what holds the lock.
+const legacyColumnMigrationsDDL = `
+	DO $$
+	BEGIN
+		-- 1. Rename incident_id to alert_group_id in timeline_events (legacy migration)
+		IF EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='timeline_events' AND column_name='incident_id') THEN
+			ALTER TABLE timeline_events RENAME COLUMN incident_id TO alert_group_id;
+		END IF;
+        
+        -- 3. Add external_url column if not exists (for clickable Alertmanager links)
+        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='external_url') THEN
+            ALTER TABLE alert_groups ADD COLUMN external_url TEXT;
+        END IF;
+        
+        -- 4. Add notification_states column if not exists (for per-target retry tracking)
+        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='notification_states') THEN
+            ALTER TABLE alert_groups ADD COLUMN notification_states TEXT;
+        END IF;
+        
+        -- 5. Add auth_provider column to users table if not exists (OIDC support)
+        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='auth_provider') THEN
+            ALTER TABLE users ADD COLUMN auth_provider TEXT;
+        END IF;
+
+		-- 7. Add resolved_by column
+		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='resolved_by') THEN
+			ALTER TABLE alert_groups ADD COLUMN resolved_by TEXT;
+		END IF;
+
+		-- 8. The version of the state a card is drawn from. Every write that
+		-- changes what a message about this alert would say increments it.
+		--
+		-- A producer that froze a snapshot hands the version back when it
+		-- admits the escalation, and the admission refuses a plan built from
+		-- state that has moved since.
+		--
+		-- It was called slack_update_generation, after a loop that no longer
+		-- exists. The flag that loop read, slack_update_pending, is not added
+		-- to a database that never had one and is dropped from those that do -
+		-- see the cutover file under migrations/.
+		IF EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_generation')
+		   AND NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='render_source_version') THEN
+			ALTER TABLE alert_groups RENAME COLUMN slack_update_generation TO render_source_version;
+		END IF;
+		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='render_source_version') THEN
+			ALTER TABLE alert_groups ADD COLUMN render_source_version BIGINT NOT NULL DEFAULT 0;
+		END IF;
+
+	END $$;
+	`
+
+// applyLegacyColumnMigrations brings an older schema onto the current names, in
+// one transaction, on every start.
+//
+// The lock is taken first and the whole block runs inside it, so instances
+// starting together queue rather than race: the second one re-reads the
+// catalogue with the first one's work already committed, and its own statements
+// become no-ops.
+func (s *Store) applyLegacyColumnMigrations() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, legacyColumnMigrationsLock); err != nil {
+		return fmt.Errorf("failed to take the legacy column migration lock: %w", err)
+	}
+
+	if _, err := tx.Exec(legacyColumnMigrationsDDL); err != nil {
+		return fmt.Errorf("failed to migrate the legacy columns: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// schemaInitLock serialises the WHOLE start-up schema build, not only the
+// guarded migrations inside it.
+//
+// `CREATE TABLE IF NOT EXISTS` is not a serialisation primitive: two backends
+// running it at the same moment both find the table missing, and the loser
+// fails on a duplicate key in `pg_type` rather than becoming a no-op. The same
+// check-then-act gap sits in every guarded ALTER and every
+// `CREATE INDEX IF NOT EXISTS` below. Every instance calls InitDB on start-up,
+// so a rollout is exactly the moment several of them do this at once.
+//
+// The number is arbitrary and only has to stay stable and distinct from the
+// other schema locks: "toka" plus the next sequence number.
+const schemaInitLock int64 = 0x746F6B6114
+
+// InitDB builds the schema this build expects, and holds the schema lock for as
+// long as that takes.
+//
+// The lock lives in a transaction of its own that does nothing else: the build
+// below spans many transactions - three of them take their own locks - and one
+// statement cannot cover them all. An instance that waits here comes in after
+// the winner has committed everything, and finds every statement a no-op.
+//
+// The inner locks stay. They are each function's own guarantee, and they cost
+// nothing while this one is held: the order is always outer first, so there is
+// no way round to invert.
 func (s *Store) InitDB() error {
+	guard, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer guard.Rollback()
+
+	if _, err := guard.Exec(`SELECT pg_advisory_xact_lock($1)`, schemaInitLock); err != nil {
+		return fmt.Errorf("failed to take the schema lock: %w", err)
+	}
+
+	if err := s.buildSchema(); err != nil {
+		return err
+	}
+
+	return guard.Commit()
+}
+
+func (s *Store) buildSchema() error {
 	// PostgreSQL Schema for Phase 2 - Create tables FIRST
 	query := `
 	-- Alert Groups table (renamed from incidents)
@@ -112,9 +265,9 @@ func (s *Store) InitDB() error {
 		-- not this row - the same key comes back every time the same thing
 		-- breaks, and each time it is a new incident with a new id.
 		--
-		-- Not to be confused with jobs.dedup_key, which names a piece of
-		-- background work. Confusing the two is how an escalation once came to
-		-- be identified by the alert instead of by the incident.
+		-- It is not the identity of the work done about it either. An
+		-- escalation identified by the alert instead of by the incident is how
+		-- the second occurrence of a problem once went unpaged.
 		alert_key TEXT NOT NULL,
 		status TEXT NOT NULL,
 		title TEXT,
@@ -204,7 +357,7 @@ func (s *Store) InitDB() error {
 		ON external_identities(provider, external_id);
 
 	-- Generic link tokens: issue/consume/TTL/single-use for linking external accounts.
-	-- Used by Slack OTP today (token = 6-digit code) and Telegram deep-link in Epic 8.
+	-- Used by Slack OTP (token = 6-digit code) and by the Telegram deep link.
 	CREATE TABLE IF NOT EXISTS link_tokens (
 		id           TEXT PRIMARY KEY,
 		user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -252,88 +405,6 @@ func (s *Store) InitDB() error {
 		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 
-	-- Jobs (Phase 2)
-	CREATE TABLE IF NOT EXISTS jobs (
-		id TEXT PRIMARY KEY,
-		type TEXT NOT NULL,
-		status TEXT NOT NULL,
-		payload TEXT NOT NULL DEFAULT '{}',
-		-- Identity and policy: (dedup_namespace, dedup_key) names the work,
-		-- dedup_scope says how long that name is exclusive. All three or none;
-		-- the uniqueness rules themselves live with the migration that
-		-- introduces them (job_dedup_migration.go).
-		dedup_namespace TEXT,
-		dedup_key TEXT,
-		dedup_scope TEXT,
-		alert_group_id TEXT,
-		current_stage INTEGER DEFAULT 0,
-		error TEXT,
-		created_at TIMESTAMPTZ DEFAULT NOW(),
-		updated_at TIMESTAMPTZ DEFAULT NOW(),
-		finished_at TIMESTAMPTZ,
-		canceled_at TIMESTAMPTZ
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-
-	-- Job Stages (Phase 2: sequential execution groups within a job)
-	CREATE TABLE IF NOT EXISTS job_stages (
-		id TEXT PRIMARY KEY,
-		job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-		stage_index INTEGER NOT NULL,
-		status TEXT NOT NULL DEFAULT 'blocked',
-		created_at TIMESTAMPTZ DEFAULT NOW(),
-		updated_at TIMESTAMPTZ DEFAULT NOW(),
-		UNIQUE(job_id, stage_index)
-	);
-	CREATE INDEX IF NOT EXISTS idx_job_stages_job_status ON job_stages(job_id, status);
-
-	-- Job Steps (Phase 2)
-	CREATE TABLE IF NOT EXISTS job_steps (
-		id TEXT PRIMARY KEY,
-		job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-		stage_id TEXT NOT NULL REFERENCES job_stages(id),
-		step_index INTEGER NOT NULL,
-		step_type TEXT NOT NULL,
-		status TEXT NOT NULL,
-		data TEXT NOT NULL DEFAULT '{}',
-		result TEXT,
-		error TEXT,
-		next_run_at TIMESTAMPTZ,
-		locked_until TIMESTAMPTZ,
-		locked_by TEXT,
-		attempt_count INTEGER DEFAULT 0,
-		timeout_seconds INTEGER,
-		max_attempts INTEGER DEFAULT 5,
-		continue_on_failure BOOLEAN DEFAULT FALSE,
-		created_at TIMESTAMPTZ DEFAULT NOW(),
-		updated_at TIMESTAMPTZ DEFAULT NOW()
-	);
-	
-	CREATE INDEX IF NOT EXISTS idx_job_steps_status_next_run ON job_steps(status, next_run_at) 
-	WHERE status IN ('pending', 'retry');
-	CREATE INDEX IF NOT EXISTS idx_job_steps_job_id_index ON job_steps(job_id, step_index);
-
-	-- Notification Deliveries (Phase 3+)
-	CREATE TABLE IF NOT EXISTS notification_deliveries (
-		id TEXT PRIMARY KEY,
-		alert_group_id TEXT NOT NULL REFERENCES alert_groups(id),
-		job_step_id TEXT UNIQUE REFERENCES job_steps(id) ON DELETE SET NULL,
-		provider TEXT NOT NULL,
-		kind TEXT NOT NULL,
-		target_type TEXT,
-		target_id TEXT,
-		provider_payload TEXT,
-		supports_update BOOLEAN DEFAULT FALSE,
-		is_primary BOOLEAN DEFAULT FALSE,
-		is_firehose BOOLEAN DEFAULT FALSE,
-		attempt INTEGER DEFAULT 0,
-		created_at TIMESTAMPTZ DEFAULT NOW(),
-		updated_at TIMESTAMPTZ DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_notification_deliveries_alert_group ON notification_deliveries(alert_group_id);
-	CREATE INDEX IF NOT EXISTS idx_notification_deliveries_primary ON notification_deliveries(alert_group_id, is_primary);
-	CREATE INDEX IF NOT EXISTS idx_notification_deliveries_firehose ON notification_deliveries(alert_group_id, is_firehose);
 	`
 	if _, err := s.db.Exec(query); err != nil {
 		return err
@@ -341,83 +412,7 @@ func (s *Store) InitDB() error {
 
 	// Migration Phase: Rename legacy columns/tables if they exist
 	// This runs AFTER table creation to handle upgrades from older schemas
-	migrationQuery := `
-	DO $$
-	BEGIN
-		-- 1. Rename incident_id to alert_group_id in timeline_events (legacy migration)
-		IF EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='timeline_events' AND column_name='incident_id') THEN
-			ALTER TABLE timeline_events RENAME COLUMN incident_id TO alert_group_id;
-		END IF;
-        
-        -- 3. Add external_url column if not exists (for clickable Alertmanager links)
-        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='external_url') THEN
-            ALTER TABLE alert_groups ADD COLUMN external_url TEXT;
-        END IF;
-        
-        -- 4. Add notification_states column if not exists (for per-target retry tracking)
-        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='notification_states') THEN
-            ALTER TABLE alert_groups ADD COLUMN notification_states TEXT;
-        END IF;
-        
-        -- 5. Add auth_provider column to users table if not exists (OIDC support)
-        IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='auth_provider') THEN
-            ALTER TABLE users ADD COLUMN auth_provider TEXT;
-        END IF;
-
-		-- 6. Add FK for notification_deliveries.job_step_id if missing
-		IF NOT EXISTS(
-			SELECT 1 FROM information_schema.table_constraints
-			WHERE table_name = 'notification_deliveries'
-			  AND constraint_name = 'notification_deliveries_job_step_id_fkey'
-		) THEN
-			ALTER TABLE notification_deliveries
-			ADD CONSTRAINT notification_deliveries_job_step_id_fkey
-			FOREIGN KEY (job_step_id) REFERENCES job_steps(id) ON DELETE SET NULL;
-		END IF;
-
-		-- 7. Add resolved_by column
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='resolved_by') THEN
-			ALTER TABLE alert_groups ADD COLUMN resolved_by TEXT;
-		END IF;
-
-		-- 8. Add ack_processed_at column for tracking when ack update was processed
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='ack_processed_at') THEN
-			ALTER TABLE alert_groups ADD COLUMN ack_processed_at TIMESTAMPTZ;
-		END IF;
-
-		-- 8. Add slack_update_pending flag for tracking when Slack messages need updating
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_pending') THEN
-			ALTER TABLE alert_groups ADD COLUMN slack_update_pending BOOLEAN NOT NULL DEFAULT FALSE;
-		END IF;
-
-		-- 8. The version of the flag above. Raising the flag increments it, and
-		-- the producer clears the flag only for the version it read, so an
-		-- alert that arrives while the update job is being created keeps the
-		-- flag up instead of being cleared away with it.
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='alert_groups' AND column_name='slack_update_generation') THEN
-			ALTER TABLE alert_groups ADD COLUMN slack_update_generation BIGINT NOT NULL DEFAULT 0;
-		END IF;
-
-		-- 9. Add alert_group_id column to jobs table
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns
-		              WHERE table_name='jobs' AND column_name='alert_group_id') THEN
-			ALTER TABLE jobs ADD COLUMN alert_group_id TEXT;
-		END IF;
-
-		-- 9b. Filling alert_group_id and keeping one escalation row per group
-		-- used to happen here, around a unique index this block dropped and
-		-- recreated on every start. Both moved into the one-shot job dedup
-		-- migration: recreating that index after the model exists would put
-		-- back the rule the model replaced.
-	END $$;
-	`
-	if _, err := s.db.Exec(migrationQuery); err != nil {
-		return err
-	}
-
-	// Job dedup model: policy table, one-shot migration and the sweep for
-	// legacy indexes, in that order and under one lock.
-	if err := s.applyJobDedupModel(); err != nil {
+	if err := s.applyLegacyColumnMigrations(); err != nil {
 		return err
 	}
 
@@ -437,72 +432,6 @@ func (s *Store) InitDB() error {
 	ALTER TABLE alert_groups ALTER COLUMN team_name_snapshot SET NOT NULL;
 	`
 	if _, err := s.db.Exec(snapshotMigration); err != nil {
-		return err
-	}
-
-	// Job stages migration: create table, backfill stage_id, rename current_step
-	jobStagesMigration := `
-	DO $$
-	BEGIN
-		-- 1. Create job_stages table if not exists (for upgrades; fresh installs already have it)
-		CREATE TABLE IF NOT EXISTS job_stages (
-			id TEXT PRIMARY KEY,
-			job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-			stage_index INTEGER NOT NULL,
-			status TEXT NOT NULL DEFAULT 'blocked',
-			created_at TIMESTAMPTZ DEFAULT NOW(),
-			updated_at TIMESTAMPTZ DEFAULT NOW(),
-			UNIQUE(job_id, stage_index)
-		);
-		CREATE INDEX IF NOT EXISTS idx_job_stages_job_status ON job_stages(job_id, status);
-
-		-- 2. Add stage_id column to job_steps (nullable initially for migration)
-		IF NOT EXISTS(SELECT 1 FROM information_schema.columns
-		              WHERE table_name='job_steps' AND column_name='stage_id') THEN
-			ALTER TABLE job_steps ADD COLUMN stage_id TEXT REFERENCES job_stages(id);
-		END IF;
-
-		-- 3. Migrate existing steps: each step gets its own stage
-		INSERT INTO job_stages (id, job_id, stage_index, status, created_at, updated_at)
-		SELECT
-			'stage-' || js.id,
-			js.job_id,
-			js.step_index,
-			CASE
-				WHEN js.status IN ('succeeded', 'failed', 'canceled') THEN js.status
-				WHEN js.status = 'blocked' THEN 'blocked'
-				ELSE 'active'
-			END,
-			js.created_at,
-			js.updated_at
-		FROM job_steps js
-		ON CONFLICT (job_id, stage_index) DO NOTHING;
-
-		-- 4. Backfill stage_id on job_steps
-		UPDATE job_steps js SET stage_id = (
-			SELECT jst.id FROM job_stages jst
-			WHERE jst.job_id = js.job_id AND jst.stage_index = js.step_index
-		)
-		WHERE js.stage_id IS NULL;
-
-		-- 5. Enforce NOT NULL if all rows migrated
-		IF NOT EXISTS (SELECT 1 FROM job_steps WHERE stage_id IS NULL) THEN
-			IF EXISTS (
-				SELECT 1 FROM information_schema.columns
-				WHERE table_name='job_steps' AND column_name='stage_id' AND is_nullable='YES'
-			) THEN
-				ALTER TABLE job_steps ALTER COLUMN stage_id SET NOT NULL;
-			END IF;
-		END IF;
-
-		-- 6. Rename jobs.current_step -> current_stage (upgrade path)
-		IF EXISTS(SELECT 1 FROM information_schema.columns
-		          WHERE table_name='jobs' AND column_name='current_step') THEN
-			ALTER TABLE jobs RENAME COLUMN current_step TO current_stage;
-		END IF;
-	END $$;
-	`
-	if _, err := s.db.Exec(jobStagesMigration); err != nil {
 		return err
 	}
 
@@ -670,8 +599,8 @@ func (s *Store) InitDB() error {
 		return err
 	}
 
-	// (Slack OTP codes and users.slack_user_id index were removed in Epic 7 Sprint 3;
-	// see external_identities + link_tokens above.)
+	// (Slack OTP codes and the users.slack_user_id index are gone; see
+	// external_identities + link_tokens above.)
 
 	// RBAC migrations
 	rbacQuery := `
@@ -738,9 +667,9 @@ func (s *Store) InitDB() error {
 
 	-- Escalation Steps table
 	--
-	-- Sprint 4 (Epic 7 L6): step shape is (provider, target_kind) instead of
-	-- the old flat step_type. Provider validity is enforced at the API layer
-	-- against the dispatcher's capability registry — keeping it as TEXT here
+	-- The step shape is (provider, target_kind) rather than the old flat
+	-- step_type. Provider validity is enforced at the API layer
+	-- against the channel catalogue - keeping it as TEXT here
 	-- avoids re-encoding the provider catalog in the DB.
 	CREATE TABLE IF NOT EXISTS escalation_steps (
 		id TEXT PRIMARY KEY,
@@ -777,7 +706,7 @@ func (s *Store) InitDB() error {
 			ALTER TABLE escalation_steps ADD COLUMN continue_on_failure BOOLEAN DEFAULT TRUE;
 		END IF;
 
-		-- 5. Epic 7 Sprint 4: replace step_type with (provider, target_kind).
+		-- 5. Replace step_type with (provider, target_kind).
 		--    CREATE TABLE IF NOT EXISTS above is a no-op on existing DBs, so on
 		--    an upgrade the old step_type column will still be there and the
 		--    new selects/inserts will fail. Per project policy (no backward
@@ -878,54 +807,69 @@ func (s *Store) InitDB() error {
 		WHERE status IN ('pending', 'processing');
 	CREATE INDEX IF NOT EXISTS idx_outbox_alert_group
 		ON event_outbox (alert_group_id);
-
-	CREATE TABLE IF NOT EXISTS event_outbox_deliveries (
-		id TEXT PRIMARY KEY,
-		event_id TEXT NOT NULL REFERENCES event_outbox(id),
-		integration_id TEXT NOT NULL REFERENCES integrations(id),
-		status TEXT NOT NULL DEFAULT 'pending',
-		attempts INT NOT NULL DEFAULT 0,
-		next_attempt_at TIMESTAMPTZ,
-		last_http_status INT,
-		last_error TEXT,
-		request_payload TEXT,
-		response_body_trunc TEXT,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		sent_at TIMESTAMPTZ,
-		UNIQUE(event_id, integration_id)
-	);
-	CREATE INDEX IF NOT EXISTS idx_delivery_retry
-		ON event_outbox_deliveries (next_attempt_at)
-		WHERE status IN ('pending', 'retry');
-	CREATE INDEX IF NOT EXISTS idx_delivery_event
-		ON event_outbox_deliveries (event_id);
 	`
 	if _, err := s.db.Exec(outboxQuery); err != nil {
 		return err
 	}
+	// The event is the root of the webhook family. It stays for as long as a
+	// claim on it holds a commitment; once it is older than the retention
+	// window by its fan-out and nothing holds it, the sweep removes it
+	// (outbound_retention_store.go). What the old worker derived from it -
+	// event_outbox_deliveries and its attempts - is not created any more: a
+	// delivery is a commitment in the outbound tables. On an upgraded database
+	// the two tables stay until migrations/drop-webhook-outbox.sql removes
+	// them by hand; the start removes their keys, so the sweep is not stopped
+	// by rows nothing reads.
 
-	// Delivery attempts audit log (append-only)
-	deliveryAttemptsQuery := `
-	CREATE TABLE IF NOT EXISTS event_outbox_delivery_attempts (
-		id TEXT PRIMARY KEY,
-		delivery_id TEXT NOT NULL REFERENCES event_outbox_deliveries(id),
-		attempt INT NOT NULL,
-		http_status INT,
-		error TEXT,
-		response_body_trunc TEXT,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_delivery_attempts_delivery
-		ON event_outbox_delivery_attempts (delivery_id);
-	`
-	if _, err := s.db.Exec(deliveryAttemptsQuery); err != nil {
-		return err
-	}
-
-	// Drop FK on event_outbox.team_id — unknown teams are a valid runtime case
+	// Drop FK on event_outbox.team_id - unknown teams are a valid runtime case
 	// (firehose-only alerts) and global webhook subscriptions must still fan-out.
 	dropOutboxTeamFK := `ALTER TABLE event_outbox DROP CONSTRAINT IF EXISTS event_outbox_team_id_fkey`
 	if _, err := s.db.Exec(dropOutboxTeamFK); err != nil {
+		return err
+	}
+
+	// The delivery history of a subscriber outlives the subscriber. The old
+	// deliveries table referenced integrations without ON DELETE, so deleting an
+	// integration with any history answered 500; the table stays until the
+	// cutover removes it by hand, but its foreign key goes now, on every start
+	// that finds the table. The table and its rows are not touched.
+	if _, err := s.db.Exec(`
+	DO $$
+	BEGIN
+		IF to_regclass('event_outbox_deliveries') IS NOT NULL THEN
+			ALTER TABLE event_outbox_deliveries
+				DROP CONSTRAINT IF EXISTS event_outbox_deliveries_integration_id_fkey;
+			-- And the key to event_outbox, for the same reason: retention
+			-- removes finished events, and a key from a table nothing reads to
+			-- the table it sweeps would roll every pass back, forever. The rows
+			-- it leaves orphaned go with the table, by hand.
+			ALTER TABLE event_outbox_deliveries
+				DROP CONSTRAINT IF EXISTS event_outbox_deliveries_event_id_fkey;
+		END IF;
+	END $$;`); err != nil {
+		return err
+	}
+
+	// What remains of a deleted integration: enough to decide who may read its
+	// delivery history. Written in the transaction that deletes it, read by the
+	// scope resolver of the delivery routes and by nothing that creates work.
+	// The scope is frozen at deletion on purpose - it describes a historical
+	// object, and who could see that history must not change afterwards.
+	if _, err := s.db.Exec(`
+	CREATE TABLE IF NOT EXISTS integration_tombstones (
+		id         TEXT PRIMARY KEY,
+		type       TEXT NOT NULL,
+		scope      TEXT,
+		team_id    TEXT,
+		deleted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`); err != nil {
+		return err
+	}
+
+	// Outbound delivery: the tables an outgoing commitment lives in. Last,
+	// because two of them reference alert_groups, and under their own lock -
+	// see outbound_schema.go.
+	if err := s.applyOutboundSchema(); err != nil {
 		return err
 	}
 
@@ -940,8 +884,7 @@ func (s *Store) InitDB() error {
 // All query functions should use this to ensure consistent column ordering.
 const alertGroupColumns = `id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step,
 	external_url, alerts_data, policy_snapshot, oncall_snapshot,
-	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, ack_processed_at,
-	slack_update_pending, slack_update_generation`
+	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, render_source_version`
 
 // alertGroupScanner is an interface for scanning rows (works with *sql.Row and *sql.Rows).
 type alertGroupScanner interface {
@@ -952,7 +895,7 @@ type alertGroupScanner interface {
 // The row must contain columns in the order defined by alertGroupColumns.
 func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	var ag model.AlertGroup
-	var resolvedAt, ackProcessedAt sql.NullTime
+	var resolvedAt sql.NullTime
 	var teamID, teamNameSnapshot, severity, policyID, externalURL sql.NullString
 	var alertsData, policySnapshot, oncallSnapshot, acknowledgedBy, resolvedBy sql.NullString
 
@@ -961,8 +904,8 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 		&teamID, &teamNameSnapshot, &severity, &policyID, &ag.CurrentStep,
 		&externalURL, &alertsData,
 		&policySnapshot, &oncallSnapshot,
-		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt, &acknowledgedBy, &resolvedBy, &ackProcessedAt,
-		&ag.SlackUpdatePending, &ag.SlackUpdateGeneration,
+		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt, &acknowledgedBy, &resolvedBy,
+		&ag.RenderSourceVersion,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -983,13 +926,23 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	if resolvedAt.Valid {
 		ag.ResolvedAt = &resolvedAt.Time
 	}
-	if ackProcessedAt.Valid {
-		ag.AckProcessedAt = &ackProcessedAt.Time
-	}
 
-	// Unmarshal JSON fields
+	// The alerts ARE the alert group: they are what a message about it says,
+	// and what an escalation is planned from. A row whose alerts cannot be read
+	// is refused rather than returned as a group with none - swallowed, the
+	// producer would freeze a snapshot describing an alert with nothing wrong
+	// with it, once, for every message of that escalation.
+	//
+	// The two snapshots below are annotations about the group rather than the
+	// group, and a damaged one must not hide the alert it is attached to.
 	if alertsData.Valid && alertsData.String != "" {
-		_ = json.Unmarshal([]byte(alertsData.String), &ag.Alerts)
+		if err := json.Unmarshal([]byte(alertsData.String), &ag.Alerts); err != nil {
+			// Counted as well as returned. The refusal can stop the admission
+			// scan until somebody fixes the row, and a risk taken deliberately
+			// has to be visible before an operator notices the silence.
+			metrics.StorageContractFailuresTotal.WithLabelValues("alerts_data").Inc()
+			return nil, fmt.Errorf("read the alerts of group %s: %w", ag.ID, err)
+		}
 	}
 	if policySnapshot.Valid && policySnapshot.String != "" {
 		_ = json.Unmarshal([]byte(policySnapshot.String), &ag.PolicySnapshot)
@@ -1097,31 +1050,6 @@ func (s *Store) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*m
 	return tx.Commit()
 }
 
-// TransitionAlertGroupStatus moves a group from one status to another and
-// reports whether it was in the status the caller expected.
-//
-// It is the only way this store changes a group's status, and the condition is
-// the point: an assignment - "set this group to closed" - cannot say what it
-// assumed about the group it is closing, so a stale read or a mistaken ID ends
-// an incident nobody has finished. Producers gate their work on status
-// (`ProcessResolvedAlertGroups` closes what it has told everyone about), and a
-// gate that can be lowered from any state is not a gate.
-func (s *Store) TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error) {
-	now := time.Now()
-	res, err := s.db.Exec(
-		`UPDATE alert_groups SET status = $1, updated_at = $2 WHERE id = $3 AND status = $4`,
-		toStatus, now, id, fromStatus,
-	)
-	if err != nil {
-		return false, err
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows > 0, nil
-}
-
 func (s *Store) UpdateAlertGroupPolicy(id string, policyID string, snapshot *model.EscalationPolicySnapshot) error {
 	var snapshotVal sql.NullString
 	if snapshot != nil {
@@ -1184,19 +1112,34 @@ func insertOutboxEventTx(tx *sql.Tx, event *model.OutboxEvent) error {
 // Timeline event and status update happen in a single transaction.
 // Returns (true, nil) if the ack was applied, (false, nil) if the alert group
 // was not in 'processing' or 'triggered' status (idempotent/race loser), or (false, err) on failure.
-func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (s *Store) AckAlertGroupAtomic(id string, who alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	// The timeline signs with the name; the commitments' journal with the
+	// person, by id.
+	actor := who.Name
+	by, err := outbound.UserActor(who.ID)
+	if err != nil {
+		return false, outboundContractf("acknowledge %s: %v", id, err)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
-	now := time.Now()
+	// One instant for everything this transaction writes, and it comes from the
+	// database. The history is read in (created_at, id) order, so a line taken
+	// from the process clock and another from the server's can be returned in
+	// an order neither of them happened in.
+	var now time.Time
+	if err := tx.QueryRow(`SELECT now()`).Scan(&now); err != nil {
+		return false, err
+	}
 
-	// 1. Conditional UPDATE — from 'processing' or 'triggered' (single-winner semantics)
+	// 1. Conditional UPDATE - from 'processing' or 'triggered' (single-winner semantics)
 	res, err := tx.Exec(
 		`UPDATE alert_groups
-		 SET status = $1, acknowledged_by = $2, ack_processed_at = NULL, updated_at = $3
+		 SET status = $1, acknowledged_by = $2, updated_at = $3,
+		     render_source_version = render_source_version + 1
 		 WHERE id = $4 AND status IN ($5, $6)`,
 		model.AlertGroupStatusAcknowledged, actor, now, id,
 		model.AlertGroupStatusProcessing, model.AlertGroupStatusTriggered,
@@ -1235,31 +1178,65 @@ func (s *Store) AckAlertGroupAtomic(id, actor string, meta map[string]string, ou
 		return false, err
 	}
 
-	// 4. Cancel escalation job (same TX)
-	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
+	// 4. Withdraw what the group still owes. In the same commit as the status
+	// change, because "acknowledged" and "nobody is being paged any more" are
+	// one fact: split in two, a crash between them pages somebody for an alert
+	// that is already being handled.
+	// After the line above, and said so: the withdrawal happened because of the
+	// acknowledgement, and a history that puts it first says the opposite.
+	withdrawn, err := cancelIntentsAtTx(context.Background(), tx, id,
+		"the alert was acknowledged", by, actor, now.Add(time.Microsecond))
+	if err != nil {
 		return false, err
 	}
 
-	return true, tx.Commit()
+	// 5. And what the group still HAS out there is told that the alert moved.
+	// The card is the domain's to keep current; this is where it learns there
+	// is something new to show.
+	desired, err := setDesiredStateTx(context.Background(), tx, s.render,
+		outbound.DesiredStateRequest{
+			AlertGroupID: id, Reason: outbound.DesiredAck, Actor: by,
+		})
+	if err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	// By alert group, so every one of them is paging: a handover names no
+	// alert group and cannot be among these.
+	countWithdrawn(map[string]int{outbound.FamilyNotification: withdrawn})
+	countDesired(outbound.DesiredAck, desired.Outcome)
+	return true, nil
 }
 
 // ResolveAlertGroupAtomic atomically resolves an alert group.
 // Timeline event and status update happen in a single transaction.
 // Returns (true, nil) if the resolve was applied, (false, nil) if the alert group
 // was not in 'processing', 'triggered', or 'acknowledged' status, or (false, err) on failure.
-func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (s *Store) ResolveAlertGroupAtomic(id string, who alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	actor := who.Name
+	by, err := outbound.UserActor(who.ID)
+	if err != nil {
+		return false, outboundContractf("resolve %s: %v", id, err)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
-	now := time.Now()
+	var now time.Time
+	if err := tx.QueryRow(`SELECT now()`).Scan(&now); err != nil {
+		return false, err
+	}
 
-	// 1. Conditional UPDATE — from 'processing', 'triggered', or 'acknowledged'
+	// 1. Conditional UPDATE - from 'processing', 'triggered', or 'acknowledged'
 	res, err := tx.Exec(
 		`UPDATE alert_groups
-		 SET status = $1, resolved_at = $2, resolved_by = $3, updated_at = $2
+		 SET status = $1, resolved_at = $2, resolved_by = $3, updated_at = $2,
+		     render_source_version = render_source_version + 1
 		 WHERE id = $4 AND status IN ($5, $6, $7)`,
 		model.AlertGroupStatusResolved, now, actor, id,
 		model.AlertGroupStatusProcessing, model.AlertGroupStatusTriggered, model.AlertGroupStatusAcknowledged,
@@ -1298,407 +1275,56 @@ func (s *Store) ResolveAlertGroupAtomic(id, actor string, meta map[string]string
 		return false, err
 	}
 
-	// 4. Cancel escalation job (same TX)
-	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
-		return false, err
-	}
-
-	return true, tx.Commit()
-}
-
-// ResolveAlertGroupWithAlertsAtomic atomically resolves an alert group while updating its alerts data.
-// Used by the ingester when all incoming alerts are resolved (auto-resolve).
-// Allows transition from new/processing/triggered/acknowledged → resolved.
-// Returns (true, nil) if applied, (false, nil) if already resolved (idempotent).
-func (s *Store) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent) (bool, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-
-	now := time.Now()
-	alertsJSON, _ := json.Marshal(alerts)
-
-	// 1. Conditional UPDATE — alerts_data + status + resolved fields
-	res, err := tx.Exec(
-		`UPDATE alert_groups
-		 SET alerts_data = $1, status = $2, resolved_by = 'system', resolved_at = $3, updated_at = $3
-		 WHERE id = $4 AND status IN ($5, $6, $7, $8)`,
-		string(alertsJSON), model.AlertGroupStatusResolved, now, id,
-		model.AlertGroupStatusNew, model.AlertGroupStatusProcessing,
-		model.AlertGroupStatusTriggered, model.AlertGroupStatusAcknowledged,
-	)
+	// 4. Withdraw what the group still owes. In the same commit as the status
+	// change, because "acknowledged" and "nobody is being paged any more" are
+	// one fact: split in two, a crash between them pages somebody for an alert
+	// that is already being handled.
+	withdrawn, err := cancelIntentsAtTx(context.Background(), tx, id,
+		"the alert was resolved", by, actor, now.Add(time.Microsecond))
 	if err != nil {
 		return false, err
 	}
 
-	rows, err := res.RowsAffected()
+	// 5. The last revision a message will ever be brought to. It is raised even
+	// when nothing else about the alert changed: a commitment parked at an
+	// equal revision takes no further attempt, and the resolution would never
+	// reach the card.
+	desired, err := setDesiredStateTx(context.Background(), tx, s.render,
+		outbound.DesiredStateRequest{
+			AlertGroupID: id, Reason: outbound.DesiredResolve, Actor: by,
+		})
 	if err != nil {
 		return false, err
 	}
-	if rows == 0 {
-		return false, nil
-	}
 
-	// 2. INSERT timeline events
-	for _, e := range timelineEvents {
-		metaJSON := "{}"
-		if e.Metadata != nil {
-			if b, err := json.Marshal(e.Metadata); err == nil {
-				metaJSON = string(b)
-			}
-		}
-		_, err = tx.Exec(
-			`INSERT INTO timeline_events (id, alert_group_id, type, message, actor, metadata, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			e.ID, e.AlertGroupID, e.Type, e.Message, e.Actor, metaJSON, e.CreatedAt,
-		)
-		if err != nil {
-			return false, err
-		}
-	}
-
-	// 3. INSERT outbox event
-	if err := insertOutboxEventTx(tx, outboxEvent); err != nil {
+	if err := tx.Commit(); err != nil {
 		return false, err
 	}
-
-	// 4. Cancel escalation job
-	if err := cancelEscalationJobByAlertGroupIDTx(tx, id); err != nil {
-		return false, err
-	}
-
-	return true, tx.Commit()
-}
-
-// cancelEscalationJobByAlertGroupIDTx cancels the escalation jobs of one alert
-// group, with their stages and their steps.
-//
-// It addresses them by what the caller means - this group's escalation - and not
-// by the dedup key, which is how this was written before. The key is a string
-// whose namespace each builder invents; addressing by it made the correctness of
-// cancellation depend on a uniqueness index rather than on the query, and it
-// would break silently the moment a job's identity changed.
-//
-// Every returned id is collected rather than the first one. The dedup model
-// admits one escalation per alert group, so a single Scan would look correct -
-// and would quietly stop being correct the moment a second namespace is allowed
-// to fill alert_group_id. Cancelling the jobs but only one job's children is the
-// kind of half-done state this function exists to prevent.
-//
-// type = 'escalation' is a schema predicate here, not a statement about
-// families. It does not make alert_group_id an escalation-only column - nothing
-// stops another type from filling it, which is precisely why the type predicate
-// is written out.
-func cancelEscalationJobByAlertGroupIDTx(tx *sql.Tx, alertGroupID string) error {
-	rows, err := tx.Query(`
-		UPDATE jobs SET status='canceled', canceled_at=NOW(), finished_at=NOW(), updated_at=NOW()
-		WHERE type='escalation' AND alert_group_id=$1 AND status IN ('pending','running')
-		RETURNING id`, alertGroupID)
-	if err != nil {
-		return err
-	}
-	var jobIDs []string
-	for rows.Next() {
-		var jobID string
-		if err := rows.Scan(&jobID); err != nil {
-			rows.Close()
-			return err
-		}
-		jobIDs = append(jobIDs, jobID)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	// Closed before the next statement, not deferred: lib/pq serves one
-	// statement at a time per connection, and the transaction has more to do.
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if len(jobIDs) == 0 {
-		return nil
-	}
-
-	_, err = tx.Exec(`UPDATE job_stages SET status='canceled', updated_at=NOW()
-		WHERE job_id = ANY($1) AND status IN ('active','blocked')`, pq.Array(jobIDs))
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(`UPDATE job_steps SET status='canceled', updated_at=NOW()
-		WHERE job_id = ANY($1) AND status IN ('pending','blocked','retry')`, pq.Array(jobIDs))
-	return err
-}
-
-// ========================================
-// Notification Deliveries
-// ========================================
-
-func (s *Store) UpsertNotificationDelivery(d *model.NotificationDelivery) error {
-	if d == nil {
-		return errors.New("delivery is nil")
-	}
-
-	now := time.Now()
-	if d.ID == "" {
-		d.ID = uuid.New().String()
-	}
-	if d.CreatedAt.IsZero() {
-		d.CreatedAt = now
-	}
-	d.UpdatedAt = now
-
-	var jobStepID sql.NullString
-	if d.JobStepID != nil && *d.JobStepID != "" {
-		jobStepID = sql.NullString{String: *d.JobStepID, Valid: true}
-	}
-
-	// NOTE: is_primary is intentionally NOT updated on conflict to avoid clobbering
-	// the chosen primary delivery when a step is retried or re-upserted.
-	query := `
-		INSERT INTO notification_deliveries (
-			id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-			provider_payload, supports_update,
-			is_primary, is_firehose, attempt, created_at, updated_at
-		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-		ON CONFLICT (job_step_id) DO UPDATE SET
-			alert_group_id = EXCLUDED.alert_group_id,
-			provider = EXCLUDED.provider,
-			kind = EXCLUDED.kind,
-			target_type = EXCLUDED.target_type,
-			target_id = EXCLUDED.target_id,
-			provider_payload = EXCLUDED.provider_payload,
-			supports_update = EXCLUDED.supports_update,
-			is_firehose = EXCLUDED.is_firehose,
-			attempt = EXCLUDED.attempt,
-			updated_at = EXCLUDED.updated_at
-	`
-
-	_, err := s.db.Exec(
-		query,
-		d.ID,
-		d.AlertGroupID,
-		jobStepID,
-		d.Provider,
-		d.Kind,
-		d.TargetType,
-		d.TargetID,
-		d.ProviderPayload,
-		d.SupportsUpdate,
-		d.IsPrimary,
-		d.IsFirehose,
-		d.Attempt,
-		d.CreatedAt,
-		d.UpdatedAt,
-	)
-	return err
-}
-
-func (s *Store) SetPrimaryDeliveryIfNone(alertGroupID, deliveryID string) (bool, error) {
-	query := `
-		UPDATE notification_deliveries
-		SET is_primary = TRUE, updated_at = $1
-		WHERE id = $2
-		AND NOT EXISTS (
-			SELECT 1 FROM notification_deliveries WHERE alert_group_id = $3 AND is_primary = TRUE
-		)
-	`
-
-	res, err := s.db.Exec(query, time.Now(), deliveryID, alertGroupID)
-	if err != nil {
-		return false, err
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows > 0, nil
-}
-
-func (s *Store) GetPrimaryDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error) {
-	query := `
-		SELECT id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-		       provider_payload, supports_update,
-		       is_primary, is_firehose, attempt, created_at, updated_at
-		FROM notification_deliveries
-		WHERE alert_group_id = $1 AND provider = $2 AND is_primary = TRUE
-		ORDER BY created_at DESC
-		LIMIT 1
-	`
-
-	row := s.db.QueryRow(query, alertGroupID, provider)
-	return scanNotificationDelivery(row)
-}
-
-func (s *Store) GetFirehoseDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error) {
-	query := `
-		SELECT id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-		       provider_payload, supports_update,
-		       is_primary, is_firehose, attempt, created_at, updated_at
-		FROM notification_deliveries
-		WHERE alert_group_id = $1 AND provider = $2 AND is_firehose = TRUE AND supports_update = TRUE
-		ORDER BY created_at DESC
-		LIMIT 1
-	`
-
-	row := s.db.QueryRow(query, alertGroupID, provider)
-	return scanNotificationDelivery(row)
-}
-
-func (s *Store) GetDeliveryByID(id string) (*model.NotificationDelivery, error) {
-	query := `
-		SELECT id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-		       provider_payload, supports_update,
-		       is_primary, is_firehose, attempt, created_at, updated_at
-		FROM notification_deliveries
-		WHERE id = $1
-	`
-
-	row := s.db.QueryRow(query, id)
-	return scanNotificationDelivery(row)
-}
-
-func (s *Store) UpdateDeliveryPayload(deliveryID, payload string) error {
-	query := `UPDATE notification_deliveries SET provider_payload = $1, updated_at = $2 WHERE id = $3`
-	_, err := s.db.Exec(query, payload, time.Now(), deliveryID)
-	return err
-}
-
-func (s *Store) ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error) {
-	query := `
-		SELECT id, alert_group_id, job_step_id, provider, kind, target_type, target_id,
-		       provider_payload, supports_update,
-		       is_primary, is_firehose, attempt, created_at, updated_at
-		FROM notification_deliveries
-		WHERE alert_group_id = $1
-		ORDER BY created_at ASC
-	`
-
-	rows, err := s.db.Query(query, alertGroupID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var deliveries []*model.NotificationDelivery
-	for rows.Next() {
-		delivery, err := scanNotificationDelivery(rows)
-		if err != nil {
-			return nil, err
-		}
-		if delivery != nil {
-			deliveries = append(deliveries, delivery)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return deliveries, nil
-}
-
-func (s *Store) HasPrimaryDelivery(alertGroupID, provider string) (bool, error) {
-	query := `
-		SELECT 1 FROM notification_deliveries
-		WHERE alert_group_id = $1 AND provider = $2 AND is_primary = TRUE
-		LIMIT 1
-	`
-
-	var dummy int
-	err := s.db.QueryRow(query, alertGroupID, provider).Scan(&dummy)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
+	// By alert group, so every one of them is paging: a handover names no
+	// alert group and cannot be among these.
+	countWithdrawn(map[string]int{outbound.FamilyNotification: withdrawn})
+	countDesired(outbound.DesiredResolve, desired.Outcome)
 	return true, nil
 }
 
-type notificationDeliveryScanner interface {
-	Scan(dest ...any) error
+// countDesired records what came of a proposal to move what an alert's messages
+// have to show.
+//
+// Called after the transaction commits, like countWithdrawn beside it: a
+// rollback would otherwise report a revision that does not exist.
+func countDesired(reason outbound.DesiredReason, outcome outbound.DesiredOutcome) {
+	metrics.OutboundDesiredRevisionsTotal.
+		WithLabelValues(string(reason), string(outcome)).Inc()
 }
 
-func scanNotificationDelivery(scanner notificationDeliveryScanner) (*model.NotificationDelivery, error) {
-	var d model.NotificationDelivery
-	var jobStepID, targetType, targetID, providerPayload sql.NullString
-
-	err := scanner.Scan(
-		&d.ID,
-		&d.AlertGroupID,
-		&jobStepID,
-		&d.Provider,
-		&d.Kind,
-		&targetType,
-		&targetID,
-		&providerPayload,
-		&d.SupportsUpdate,
-		&d.IsPrimary,
-		&d.IsFirehose,
-		&d.Attempt,
-		&d.CreatedAt,
-		&d.UpdatedAt,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if jobStepID.Valid {
-		d.JobStepID = &jobStepID.String
-	}
-	d.TargetType = targetType.String
-	d.TargetID = targetID.String
-	d.ProviderPayload = providerPayload.String
-
-	return &d, nil
-}
-
-func (s *Store) UpdateAlertGroupAlerts(id string, alerts []model.Alert) error {
-	data, _ := json.Marshal(alerts)
-	query := `UPDATE alert_groups SET alerts_data = $1, updated_at = $2 WHERE id = $3`
-	_, err := s.db.Exec(query, string(data), time.Now(), id)
-	return err
-}
-
-func (s *Store) GetNewAlertGroups() ([]*model.AlertGroup, error) {
-	// Also pick up stale "processing" AGs orphaned by a crash between
-	// status update and job creation — but ONLY if no escalation job exists.
-	// If any escalation job exists (succeeded, failed, canceled, etc.), the AG was
-	// already processed and should not spawn a duplicate job.
-	//
-	// Asked by type and alert_group_id rather than by the escalation identity,
-	// for the same reason cancellation is (see cancelEscalationJobByAlertGroupIDTx):
-	// the question is what this group already holds, not what holds a
-	// particular dedup claim. EnsureEscalationJob is what keeps the type and
-	// the namespace from disagreeing.
-	staleThreshold := time.Now().Add(-30 * time.Second)
-	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups ag
-	          WHERE ag.status = $1
-	             OR (ag.status = $2 AND ag.updated_at < $3
-	                 AND NOT EXISTS (
-	                     SELECT 1 FROM jobs j
-	                     WHERE j.alert_group_id = ag.id
-	                       AND j.type = 'escalation'
-	                 ))`
-
-	rows, err := s.db.Query(query, model.AlertGroupStatusNew, model.AlertGroupStatusProcessing, staleThreshold)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var alertGroups []*model.AlertGroup
-	for rows.Next() {
-		ag, err := scanAlertGroupRow(rows)
-		if err != nil {
-			return nil, err
+// countWithdrawn records commitments that ended because the alert did, in the
+// family each of them ran in.
+func countWithdrawn(byFamily map[string]int) {
+	for family, n := range byFamily {
+		for i := 0; i < n; i++ {
+			countTerminal(family, outbound.StatusCanceled)
 		}
-		alertGroups = append(alertGroups, ag)
 	}
-	return alertGroups, nil
 }
 
 func (s *Store) GetProcessingAlertGroups() ([]*model.AlertGroup, error) {
@@ -1706,142 +1332,6 @@ func (s *Store) GetProcessingAlertGroups() ([]*model.AlertGroup, error) {
 	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups WHERE status IN ($1, $2)`
 
 	rows, err := s.db.Query(query, model.AlertGroupStatusProcessing, model.AlertGroupStatusAcknowledged)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var alertGroups []*model.AlertGroup
-	for rows.Next() {
-		ag, err := scanAlertGroupRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		alertGroups = append(alertGroups, ag)
-	}
-
-	if err := s.populateTimelineForAlertGroups(alertGroups); err != nil {
-		return nil, err
-	}
-	return alertGroups, nil
-}
-
-func (s *Store) GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error) {
-	// Only return acknowledged alert groups that haven't been processed yet
-	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups WHERE status = $1 AND ack_processed_at IS NULL`
-
-	rows, err := s.db.Query(query, model.AlertGroupStatusAcknowledged)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var alertGroups []*model.AlertGroup
-	for rows.Next() {
-		ag, err := scanAlertGroupRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		alertGroups = append(alertGroups, ag)
-	}
-
-	if err := s.populateTimelineForAlertGroups(alertGroups); err != nil {
-		return nil, err
-	}
-	return alertGroups, nil
-}
-
-func (s *Store) GetResolvedAlertGroups() ([]*model.AlertGroup, error) {
-	alertGroups, err := s.getAlertGroupsByStatus(model.AlertGroupStatusResolved)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.populateTimelineForAlertGroups(alertGroups); err != nil {
-		return nil, err
-	}
-	return alertGroups, nil
-}
-
-func (s *Store) MarkAckProcessed(agID string) error {
-	_, err := s.db.Exec(`
-		UPDATE alert_groups
-		SET ack_processed_at = NOW(), updated_at = NOW()
-		WHERE id = $1
-	`, agID)
-	return err
-}
-
-// UpdateAlertGroupAlertsAndRaiseSlackUpdate records a changed alert set and
-// says, in the same write, that the group's message no longer shows it.
-//
-// One statement rather than two calls, and that is the whole point: they used
-// to be an alerts write followed by a flag write, and a process that stopped
-// between them left the new alert stored with the gate down. Nothing would
-// raise it again either - Alertmanager repeating the payload finds the alerts
-// already recorded and merges nothing.
-//
-// The version goes up with every such write, monotonically, so a producer can
-// tell the state it read from the state that arrived while it worked.
-//
-// A group that is not there is an error and not a quiet no-op: the alerts have
-// to land somewhere, and a caller that is told nothing would answer its webhook
-// with 200 for a change it lost.
-func (s *Store) UpdateAlertGroupAlertsAndRaiseSlackUpdate(id string, alerts []model.Alert) error {
-	data, err := json.Marshal(alerts)
-	if err != nil {
-		return err
-	}
-	res, err := s.db.Exec(`
-		UPDATE alert_groups
-		   SET alerts_data = $1,
-		       slack_update_pending = TRUE,
-		       slack_update_generation = slack_update_generation + 1,
-		       updated_at = $2
-		 WHERE id = $3
-	`, string(data), time.Now(), id)
-	if err != nil {
-		return err
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
-// ClearSlackUpdate lowers the gate for the version the caller read, and reports
-// whether it did. A group that is not there answers false, like a group that
-// has moved on: the gate is not down because of this call either way.
-//
-// The condition is the whole point. Admitting the update job and lowering the
-// gate are two transactions, and an alert that lands between them raises the
-// flag again; clearing it unconditionally - as this did while it was one
-// setter with a boolean - throws that alert away, and the message never shows
-// it. A false answer is not a failure: it means the work has to be done again,
-// and the next tick does it.
-func (s *Store) ClearSlackUpdate(id string, observedGeneration int64) (bool, error) {
-	res, err := s.db.Exec(`
-		UPDATE alert_groups
-		   SET slack_update_pending = FALSE, updated_at = $1
-		 WHERE id = $2 AND slack_update_generation = $3
-	`, time.Now(), id, observedGeneration)
-	if err != nil {
-		return false, err
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows > 0, nil
-}
-
-func (s *Store) GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error) {
-	query := `SELECT ` + alertGroupColumns + ` FROM alert_groups WHERE slack_update_pending = TRUE AND status IN ($1, $2, $3)`
-
-	rows, err := s.db.Query(query, model.AlertGroupStatusProcessing, model.AlertGroupStatusAcknowledged, model.AlertGroupStatusTriggered)
 	if err != nil {
 		return nil, err
 	}
@@ -2845,8 +2335,8 @@ func (s *Store) DeleteAPIToken(id string) error {
 	return err
 }
 
-// (The old Slack OTP methods — SaveSlackOTP, ConfirmSlackOTP, UnbindSlackUser — were
-// removed in Epic 7 Sprint 3. See external_identities + link_tokens in identity_store.go.)
+// (The old Slack OTP methods - SaveSlackOTP, ConfirmSlackOTP, UnbindSlackUser -
+// are gone. See external_identities + link_tokens in identity_store.go.)
 
 // ========================================
 // Escalation Policy CRUD (Phase 4)
@@ -2911,6 +2401,12 @@ func (s *Store) GetEscalationPolicyByID(id string) (*model.EscalationPolicy, err
 		}
 		step.Message = msg.String
 		p.Steps = append(p.Steps, &step)
+	}
+	// A read that stopped halfway is not a shorter policy: returned as one, an
+	// escalation would quietly skip the steps that did not arrive, and nobody
+	// would be paged by them.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the steps of policy %s: %w", id, err)
 	}
 
 	return &p, nil
@@ -3059,12 +2555,55 @@ func (s *Store) queryPolicies(query string, args ...interface{}) ([]*model.Escal
 	return policies, nil
 }
 
-// GetMetricsSnapshot returns all data needed by the Prometheus business metrics collector.
-func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
+// snapshotSeam is a test hook, called before each step of the metrics
+// snapshot with the step's number. Production leaves it nil. It exists so a
+// test can make ONE named step hang - by taking a table lock just before it -
+// and prove that the deadline cancels that step and no other; a lock taken in
+// advance would stop the first statement on that table instead, and a
+// mutation of a later statement would never be reached.
+var snapshotSeam func(step int)
+
+// snapshotSteps is how many statements one snapshot runs, in order, and the
+// tables each one reads. Named so that the cancellation test walks every one
+// of them rather than the first that happens to hang.
+var snapshotSteps = []struct {
+	name  string
+	table string
+}{
+	{"active alert groups", "alert_groups"},            // 1
+	{"alert groups by status", "alert_groups"},         // 2
+	{"teams without on-call", "teams"},                 // 3
+	{"teams with permanent on-call", "schedules"},      // 4
+	{"teams without policy", "teams"},                  // 5
+	{"outbox events by status", "event_outbox"},        // 6
+	{"outbound intents by status", "outbound_intents"}, // 7
+	{"outbound queue lateness", "outbound_intents"},    // 8
+	{"outbound cards behind", "outbound_intents"},      // 9
+	{"no-targets admissions", "outbound_batches"},      // 10
+}
+
+func snapshotStep(step int) {
+	if snapshotSeam != nil {
+		snapshotSeam(step)
+	}
+}
+
+// GetMetricsSnapshot returns all data needed by the Prometheus business metrics
+// collector.
+//
+// Every statement runs under the caller's context, and the collector gives it
+// a deadline shorter than the scrape's: a scrape that Prometheus gives up on
+// must not leave a statement running against the database, because the next
+// scrape would start another, and a database that has stopped answering would
+// end up holding the connection pool. When the deadline cuts a statement, the
+// whole snapshot fails and the collector reports nothing - a partial answer
+// would look like a healthy one with some zeroes in it.
+func (s *Store) GetMetricsSnapshot(ctx context.Context) (*model.MetricsSnapshot, error) {
 	snap := &model.MetricsSnapshot{}
 
 	// 1. Active alert groups by team/severity
-	rows, err := s.db.Query(`
+	snapshotStep(1)
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT COALESCE(team_id, ''), COALESCE(severity, ''), COUNT(*) FROM alert_groups
 		WHERE status NOT IN ('resolved', 'closed')
 		GROUP BY COALESCE(team_id, ''), COALESCE(severity, '')`)
@@ -3083,8 +2622,9 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, err
 	}
 
-	// 1b. Alert groups by team/severity/status
-	rows2, err := s.db.Query(`
+	// 2. Alert groups by team/severity/status
+	snapshotStep(2)
+	rows2, err := s.db.QueryContext(ctx, `
 		SELECT COALESCE(team_id, ''), COALESCE(severity, ''), status, COUNT(*) FROM alert_groups
 		GROUP BY COALESCE(team_id, ''), COALESCE(severity, ''), status`)
 	if err != nil {
@@ -3102,7 +2642,7 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, err
 	}
 
-	// 2. Teams without on-call: no schedule, or one whose configuration in force
+	// 3. Teams without on-call: no schedule, or one whose configuration in force
 	// puts nobody on duty.
 	//
 	// The state is read from the revision in force (the open-ended tail), which
@@ -3112,7 +2652,8 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 	// and l1.enabled is checked because a disabled layer keeps its groups in the
 	// snapshot - only the phase pair is cleared - so groups alone would report a
 	// switched-off rotation as covered.
-	err = s.db.QueryRow(`
+	snapshotStep(3)
+	err = s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM teams t WHERE NOT EXISTS (
 			SELECT 1 FROM schedules s
 			JOIN schedule_revisions r ON r.schedule_id = s.id AND r.effective_to IS NULL
@@ -3123,7 +2664,7 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, fmt.Errorf("teams without oncall query: %w", err)
 	}
 
-	// 3. Teams with permanent on-call: exactly one person carries L1, forever.
+	// 4. Teams with permanent on-call: exactly one person carries L1, forever.
 	//
 	// "Exactly one person", not "exactly one group". The two were the same thing
 	// when user_ids was a flat list of users, and the query said so; the
@@ -3132,7 +2673,8 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 	// a permanent on-call ever since - though those people are all paged
 	// together and nobody is alone. This restores what the metric has always
 	// claimed to measure (see its HELP text): bus factor one.
-	err = s.db.QueryRow(`
+	snapshotStep(4)
+	err = s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM schedules s
 		JOIN schedule_revisions r ON r.schedule_id = s.id AND r.effective_to IS NULL
 		WHERE s.deleted_at IS NULL AND r.kind = 'active'
@@ -3144,16 +2686,18 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, fmt.Errorf("teams with permanent oncall query: %w", err)
 	}
 
-	// 4. Teams without escalation policy
-	err = s.db.QueryRow(`
+	// 5. Teams without escalation policy
+	snapshotStep(5)
+	err = s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM teams
 		WHERE default_policy_id IS NULL OR default_policy_id = ''`).Scan(&snap.TeamsWithoutPolicy)
 	if err != nil {
 		return nil, fmt.Errorf("teams without policy query: %w", err)
 	}
 
-	// 5. Outbox events by status
-	rows3, err := s.db.Query(`SELECT status, COUNT(*) FROM event_outbox GROUP BY status`)
+	// 6. Outbox events by status
+	snapshotStep(6)
+	rows3, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM event_outbox GROUP BY status`)
 	if err != nil {
 		return nil, fmt.Errorf("outbox events by status query: %w", err)
 	}
@@ -3169,22 +2713,248 @@ func (s *Store) GetMetricsSnapshot() (*model.MetricsSnapshot, error) {
 		return nil, err
 	}
 
-	// 6. Outbox deliveries by status
-	rows4, err := s.db.Query(`SELECT status, COUNT(*) FROM event_outbox_deliveries GROUP BY status`)
+	// 7. Outbound commitments by family and status. (Webhook deliveries are
+	// among them: the table the old worker kept them in is not read here, and
+	// on a fresh database it does not exist - a query against it would fail the
+	// whole snapshot, and the collector answers a failed snapshot with nothing.)
+	snapshotStep(7)
+	rows5, err := s.db.QueryContext(ctx, `
+		SELECT delivery_family, status, COUNT(*) FROM outbound_intents
+		GROUP BY delivery_family, status`)
 	if err != nil {
-		return nil, fmt.Errorf("outbox deliveries by status query: %w", err)
+		return nil, fmt.Errorf("outbound intents by status query: %w", err)
 	}
-	defer rows4.Close()
-	for rows4.Next() {
-		var c model.StatusCount
-		if err := rows4.Scan(&c.Status, &c.Count); err != nil {
+	defer rows5.Close()
+	for rows5.Next() {
+		var c model.OutboundStatusCount
+		if err := rows5.Scan(&c.Family, &c.Status, &c.Count); err != nil {
 			return nil, err
 		}
-		snap.OutboxDeliveriesByStatus = append(snap.OutboxDeliveriesByStatus, c)
+		snap.OutboundIntentsByStatus = append(snap.OutboundIntentsByStatus, c)
 	}
-	if err := rows4.Err(); err != nil {
+	if err := rows5.Err(); err != nil {
 		return nil, err
 	}
 
+	// 8. How far behind each family is.
+	//
+	// The subtraction is the database's, in the same statement that finds the
+	// row: taken from the process's clock instead, this would report the drift
+	// between two machines as a backlog.
+	//
+	// Two predicates carry the definition. `next_attempt_at <= now()` excludes
+	// work that is SCHEDULED - a delayed policy step, a retry on backoff - which
+	// is not lateness but the plan. And nothing is said about the lease: a
+	// commitment claimed by a worker that then hung would otherwise disappear
+	// from this gauge for the length of its lease, which is precisely the moment
+	// somebody needs to be told.
+	//
+	// Every family that has rows at all reports a number, zero included, so a
+	// backlog that has been worked off stops ringing instead of leaving its last
+	// value behind forever.
+	snapshotStep(8)
+	rows6, err := s.db.QueryContext(ctx, `
+		SELECT delivery_family,
+		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(next_attempt_at)
+		           FILTER (WHERE status = 'pending' AND next_attempt_at <= now()))), 0)::double precision
+		FROM outbound_intents
+		GROUP BY delivery_family`)
+	if err != nil {
+		return nil, fmt.Errorf("outbound queue lateness query: %w", err)
+	}
+	defer rows6.Close()
+	for rows6.Next() {
+		var l model.OutboundLateness
+		if err := rows6.Scan(&l.Family, &l.Seconds); err != nil {
+			return nil, err
+		}
+		snap.OutboundLatenessSeconds = append(snap.OutboundLatenessSeconds, l)
+	}
+	if err := rows6.Err(); err != nil {
+		return nil, err
+	}
+	// And every family this build executes reports even when it has no rows at
+	// all, so the series exists from the first scrape rather than appearing the
+	// first time somebody is paged or comes on duty. A graph that only starts
+	// when the thing it watches first happens is a graph nobody can alert on
+	// until then.
+	for _, family := range outbound.Families() {
+		if !hasFamily(snap.OutboundLatenessSeconds, family) {
+			snap.OutboundLatenessSeconds = append(snap.OutboundLatenessSeconds,
+				model.OutboundLateness{Family: family})
+		}
+	}
+
+	// 9. Messages behind their alert.
+	snapshotStep(9)
+	if err := s.readCardsBehind(ctx, snap); err != nil {
+		return nil, err
+	}
+
+	// 10. Admissions that promised nobody, counted from the claims themselves.
+	//
+	// This is the durable twin of outbound_admissions_total{outcome="no_targets"}:
+	// the process counter can miss an increment when the process dies between
+	// the commit and the Inc, and starts from zero on every restart, and the
+	// alert for "an alert had nobody to page" must not depend on either. Claim
+	// rows are never deleted (OB-1), so the count only grows, and a rule over
+	// increase() reads it as the counter it is. The partial index under it
+	// keeps the scan to exactly the rows counted.
+	snapshotStep(10)
+	rows7, err := s.db.QueryContext(ctx, `
+		SELECT delivery_family, COUNT(*) FROM outbound_batches
+		WHERE admission_outcome = 'no_targets'
+		GROUP BY delivery_family`)
+	if err != nil {
+		return nil, fmt.Errorf("no-targets admissions query: %w", err)
+	}
+	defer rows7.Close()
+	for rows7.Next() {
+		var c model.OutboundFamilyCount
+		if err := rows7.Scan(&c.Family, &c.Count); err != nil {
+			return nil, err
+		}
+		snap.OutboundNoTargetsAdmissions = append(snap.OutboundNoTargetsAdmissions, c)
+	}
+	if err := rows7.Err(); err != nil {
+		return nil, err
+	}
+	for _, family := range outbound.Families() {
+		if !hasFamilyCount(snap.OutboundNoTargetsAdmissions, family) {
+			snap.OutboundNoTargetsAdmissions = append(snap.OutboundNoTargetsAdmissions,
+				model.OutboundFamilyCount{Family: family})
+		}
+	}
+
 	return snap, nil
+}
+
+// cardStates is every status an editable commitment can be in while its message
+// is behind, and what that status means for somebody reading the gauge.
+//
+// Exhaustive on purpose. A CASE with a default would let a status nobody
+// thought about fall into one of the three buckets silently, and this gauge is
+// the one that says whether a card anybody is looking at is out of date. The
+// two statuses that CANNOT appear here are named too, as "contract": idle means
+// applied equals desired, and an editable commitment that succeeded applied the
+// final revision, after which there are no more.
+const cardStates = `CASE i.status
+	WHEN 'pending'          THEN 'queued'
+	WHEN 'sending'          THEN 'queued'
+	WHEN 'manual_review'    THEN 'stuck'
+	WHEN 'permanent_failed' THEN 'stuck'
+	WHEN 'canceled'         THEN 'abandoned'
+	WHEN 'expired'          THEN 'abandoned'
+	ELSE 'contract'
+END`
+
+// behindSince is when a message stopped matching its alert.
+//
+// It is the earliest revision event the commitment has not applied, and it is
+// read from the journal because nothing else survives to answer the question:
+// the snapshot row is overwritten by the next revision, and the commitment's
+// own updated_at is moved by every claim and attempt.
+//
+// It answers in all four situations. Before the first attempt there is no
+// attempt to ask. When preparation refused - no integration, an unlinked
+// recipient - there will never be one. When a revision supersedes another the
+// older event stays the minimum, so the wait is measured from when the card
+// first fell behind and not from the last thing that happened to it. And once
+// the commitment catches up, the events stop passing the predicate by
+// themselves.
+const behindSince = `(
+	SELECT MIN(e.created_at) FROM outbound_intent_events e
+	WHERE e.intent_id = i.id AND e.kind = 'desired_raised'
+	  AND (e.detail->>'revision')::bigint > COALESCE(i.applied_revision, -1)
+)`
+
+// readCardsBehind counts the messages that are showing something older than the
+// alert they are about, and how long the oldest has been that way.
+//
+// Staleness covers queued and stuck only. An abandoned card is one a person
+// decided not to catch up; counting its age would leave the gauge high forever
+// after a single operator decision, and nothing would ever bring it down.
+func (s *Store) readCardsBehind(ctx context.Context, snap *model.MetricsSnapshot) error {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT state, count(*),
+		       COALESCE(MAX(EXTRACT(EPOCH FROM (now() - since))), 0)::double precision,
+		       (array_agg(id ORDER BY id))[1]
+		FROM (
+			SELECT i.id, `+cardStates+` AS state, `+behindSince+` AS since
+			FROM outbound_intents i
+			WHERE i.form = $1 AND i.receipt_recorded
+			  AND i.desired_revision > COALESCE(i.applied_revision, -1)
+		) behind
+		GROUP BY state`, string(outbound.FormEditable))
+	if err != nil {
+		return fmt.Errorf("outbound cards behind query: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			state   string
+			count   int
+			seconds float64
+			anyOfIt string
+		)
+		if err := rows.Scan(&state, &count, &seconds, &anyOfIt); err != nil {
+			return err
+		}
+		if state == "contract" {
+			// idle or succeeded with a revision outstanding. Not damage to work
+			// around - an invariant asserted where it is cheap to check, so
+			// that a build which breaks it says so instead of quietly under-
+			// reporting a stale card.
+			metrics.StorageContractFailuresTotal.WithLabelValues("desired_revision").Add(float64(count))
+			log.Printf("outbound: %d settled commitment(s) are behind their alert, "+
+				"which cannot happen; one of them is %s", count, anyOfIt)
+			continue
+		}
+		snap.OutboundCardsBehind = append(snap.OutboundCardsBehind,
+			model.OutboundCardsBehind{State: state, Count: count})
+		if state != "abandoned" && seconds > snap.OutboundCardStalenessSeconds {
+			snap.OutboundCardStalenessSeconds = seconds
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Every state reports, zero included: a gauge nobody touches keeps its last
+	// value, and a backlog that has been caught up would go on ringing.
+	for _, state := range []string{"queued", "stuck", "abandoned"} {
+		if !hasCardState(snap.OutboundCardsBehind, state) {
+			snap.OutboundCardsBehind = append(snap.OutboundCardsBehind,
+				model.OutboundCardsBehind{State: state})
+		}
+	}
+	return nil
+}
+
+func hasCardState(rows []model.OutboundCardsBehind, state string) bool {
+	for _, row := range rows {
+		if row.State == state {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFamilyCount(rows []model.OutboundFamilyCount, family string) bool {
+	for _, row := range rows {
+		if row.Family == family {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFamily(rows []model.OutboundLateness, family string) bool {
+	for _, row := range rows {
+		if row.Family == family {
+			return true
+		}
+	}
+	return false
 }

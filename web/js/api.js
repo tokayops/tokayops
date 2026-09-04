@@ -37,9 +37,15 @@ async function request(endpoint, options = {}) {
         }
     }
 
+    // The caller's options first and the headers LAST. The headers were built
+    // from the caller's own plus Content-Type and the CSRF token, and spreading
+    // the options after them put the caller's bare headers back - without the
+    // token. A request that carried a header of its own, the replay with its
+    // Idempotency-Key, reached a production server that way and was refused as
+    // a forgery; nothing in this environment noticed, because CSRF is off here.
     const config = {
-        headers,
         ...options,
+        headers,
     };
 
     // Statuses that are an answer rather than a failure. A 404 from "does this
@@ -286,6 +292,15 @@ const API = {
         },
 
         /**
+         * The deliveries of an alert group: its paging, and its events with
+         * every claim taken on them and the webhook deliveries under those.
+         * @param {string} id - Alert group ID
+         */
+        deliveries: (id) => {
+            return request(`/alert-groups/${encodeURIComponent(id)}/deliveries`);
+        },
+
+        /**
          * Add a note to an alert group
          * @param {string} id - Alert Group ID
          * @param {string} message - Note message
@@ -418,6 +433,39 @@ const API = {
     // ========================================
     // Users API
     // ========================================
+    /**
+     * The delivery journal: every family, every team, one form. The list and
+     * the journal of one delivery are the administrator's; a decision is too.
+     */
+    deliveries: {
+        /**
+         * The operational log over a period - the last day unless from/to
+         * say otherwise.
+         * @param {Object} params - family, provider, status, target_kind,
+         *   target_ref, alert_group_id, event_id, from, to, page, limit
+         */
+        list: (params = {}) => request(`/deliveries${buildQuery(params)}`),
+
+        /**
+         * The journal of one delivery: the commitment, its attempts, the
+         * observations and the lifecycle events.
+         * @param {string} id - Delivery ID
+         */
+        get: (id) => request(`/deliveries/${encodeURIComponent(id)}`),
+
+        /**
+         * A person deciding what a stuck delivery does. The body names the
+         * decision and the reason; the answer is the outcome, and for a
+         * refusal the words of the guard that refused it.
+         * @param {string} id - Delivery ID
+         * @param {{decision: string, reason: string, accepted_duplicate_risk?: boolean, new_expires_at?: string}} decision
+         */
+        decide: (id, decision) => request(`/deliveries/${encodeURIComponent(id)}/decisions`, {
+            method: 'POST',
+            body: JSON.stringify(decision),
+        }),
+    },
+
     users: {
         /**
          * List all users
@@ -681,7 +729,7 @@ const API = {
     // Policies API (Phase 4)
     // ========================================
     // ========================================
-    // Providers API (Sprint 4 / Epic 7 L6)
+    // Providers API
     // ========================================
     providers: {
         /**
@@ -827,11 +875,17 @@ const API = {
         deliveryDetail: (id, deliveryId) => request(`/integrations/${encodeURIComponent(id)}/deliveries/${encodeURIComponent(deliveryId)}`),
 
         /**
-         * Replay a delivery
+         * Replay a delivery. The replay is a NEW delivery of the same event;
+         * the response carries its delivery_id. The Idempotency-Key names one
+         * decision: a repeat with the same key finds the same new delivery.
          * @param {string} id - Integration ID
          * @param {string} deliveryId - Delivery ID
+         * @param {string} idempotencyKey - one per press of the button
          */
-        replayDelivery: (id, deliveryId) => request(`/integrations/${encodeURIComponent(id)}/deliveries/${encodeURIComponent(deliveryId)}/replay`, { method: 'POST' }),
+        replayDelivery: (id, deliveryId, idempotencyKey) => request(`/integrations/${encodeURIComponent(id)}/deliveries/${encodeURIComponent(deliveryId)}/replay`, {
+            method: 'POST',
+            headers: { 'Idempotency-Key': idempotencyKey },
+        }),
     },
 };
 
@@ -842,7 +896,7 @@ window.API = API;
  * Fetch build metadata from the public /api/version endpoint and render it into
  * the element with the given id. Release builds show the tag ("v0.1.0 · abc1234");
  * untagged builds fall back to "branch@commit · date". Full detail is in the title
- * (hover tooltip). No-ops quietly if the element is missing or the request fails —
+ * (hover tooltip). No-ops quietly if the element is missing or the request fails -
  * version display is non-critical.
  * @param {string} elId - id of the target element
  */

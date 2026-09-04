@@ -1,0 +1,576 @@
+package telegram
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
+)
+
+// The Telegram channel as the outbound worker uses it.
+
+func handlerState(t *testing.T) keys.RenderSnapshot {
+	t.Helper()
+	groupURL := "https://tokay.example/#/ops/alert-groups/ag-1"
+	state, err := keys.NewRenderSnapshot(keys.SnapshotInput{
+		AlertGroupID: "ag-1", Status: keys.GroupTriggered, Title: "Disk filling up",
+		Severity: "critical", TeamOnboarded: true, GroupURL: &groupURL,
+		DisplayTimezone: "UTC",
+		Alerts: []keys.AlertSnapshot{{
+			Fingerprint: "fp-1", Status: keys.AlertFiring,
+			StartsAt:  time.Unix(1700000000, 0).UTC(),
+			AlertName: "DiskWillFill", Severity: "critical",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("build the state: %v", err)
+	}
+	return state
+}
+
+func handlerCall(t *testing.T, kind keys.TargetKind, interactive bool) outbound.Call {
+	t.Helper()
+	payload, err := json.Marshal(keys.EscalationPayloadV1{
+		Slot:   keys.Slot{Kind: keys.SlotFirehose},
+		Target: keys.Target{Kind: kind, Ref: "-1001"},
+		// Direct messages carry the escalation's own words.
+		Interactive: interactive,
+	})
+	if err != nil {
+		t.Fatalf("build the payload: %v", err)
+	}
+	return outbound.Call{
+		IntentID: "intent-1", AttemptID: "attempt-1", Provider: "telegram",
+		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
+		Endpoint: "-1001", ProviderKey: "create-key",
+		KeyKind: keys.KindEscalation, Family: outbound.FamilyNotification,
+		Content: snapshotContent(t, handlerState(t)), Payload: payload,
+		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
+	}
+}
+
+// snapshotContent wraps a frozen state the way BeginAttempt does.
+func snapshotContent(t *testing.T, state keys.RenderSnapshot) outbound.AttemptContent {
+	t.Helper()
+	content, err := outbound.NewSnapshotContent(state, false)
+	if err != nil {
+		t.Fatalf("build the content: %v", err)
+	}
+	return content
+}
+
+type botAPI struct {
+	server *httptest.Server
+	calls  []map[string]any
+	answer func(body map[string]any) (int, map[string]any)
+}
+
+func newBotAPI(t *testing.T) *botAPI {
+	t.Helper()
+	api := &botAPI{}
+	api.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body := map[string]any{}
+		_ = json.Unmarshal(raw, &body)
+		body["_method"] = r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		api.calls = append(api.calls, body)
+
+		w.Header().Set("Content-Type", "application/json")
+		if api.answer != nil {
+			if status, reply := api.answer(body); reply != nil {
+				w.WriteHeader(status)
+				_ = json.NewEncoder(w).Encode(reply)
+				return
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true,
+			"result": map[string]any{
+				"message_id": 42,
+				"chat":       map[string]any{"id": -1001},
+			},
+		})
+	}))
+	t.Cleanup(api.server.Close)
+	return api
+}
+
+func handlerFor(api *botAPI) *Handler {
+	return NewHandler(&mockTelegramTokenSource{token: "tok"}, nil,
+		WithHandlerBaseURL(api.server.URL))
+}
+
+// TestOneAttemptIsOneCall: Telegram has no thread and no permalink, so an
+// attempt is exactly one sendMessage and the answer is already the receipt.
+func TestOneAttemptIsOneCall(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	result, err := handler.ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.TargetChannel, true))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(api.calls) != 1 || api.calls[0]["_method"] != "sendMessage" {
+		t.Fatalf("the attempt made %d calls: %+v", len(api.calls), api.calls)
+	}
+	if result.Status != "ok" || !result.Receipt.Recorded() {
+		t.Fatalf("the send answered %+v", result)
+	}
+	if ref := result.Receipt.Ref(); ref != "-1001/42" {
+		t.Fatalf("the receipt names %q", ref)
+	}
+
+	text, _ := api.calls[0]["text"].(string)
+	if !strings.Contains(text, "Disk filling up") {
+		t.Fatalf("the card does not say what happened: %q", text)
+	}
+	if _, hasKeyboard := api.calls[0]["reply_markup"]; !hasKeyboard {
+		t.Fatal("a delivery admitted with buttons sent none")
+	}
+}
+
+// TestButtonsFollowTheAdmission. An empty keyboard is not the same as no
+// keyboard, and the difference has to survive into the request.
+func TestButtonsFollowTheAdmission(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	if _, err := handler.ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.TargetChannel, false)); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	markup, ok := api.calls[0]["reply_markup"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected an empty keyboard, got %v", api.calls[0]["reply_markup"])
+	}
+	if rows, _ := markup["inline_keyboard"].([]any); len(rows) != 0 {
+		t.Fatalf("a delivery admitted without buttons sent %d rows", len(rows))
+	}
+
+	// And the other way: admitted with buttons, the card goes out carrying the
+	// two a person can press, addressed to the alert group they answer for.
+	withButtons := newBotAPI(t)
+	if _, err := handlerFor(withButtons).ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.TargetChannel, true)); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	offered, err := json.Marshal(withButtons.calls[0]["reply_markup"])
+	if err != nil {
+		t.Fatalf("read the keyboard: %v", err)
+	}
+	if !strings.Contains(string(offered), "ack:ag-1") ||
+		!strings.Contains(string(offered), "res:ag-1") {
+		t.Fatalf("the keyboard offers %s", offered)
+	}
+}
+
+// TestAChangeCarriesTheKeyboardTheAdmissionFroze. Telegram leaves the existing
+// keyboard in place when reply_markup is absent, so a change to a card admitted
+// without buttons has to carry an explicitly empty one - otherwise buttons
+// posted before the switch was flipped stay live in the chat, and pressing one
+// reaches a build that no longer answers it.
+func TestAChangeCarriesTheKeyboardTheAdmissionFroze(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	change := handlerCall(t, keys.TargetChannel, false)
+	change.AttemptKind = outbound.AttemptMutation
+	change.Operation = outbound.OperationUpdate
+	change.Receipt = json.RawMessage(`{"chat_id":"-1001","message_id":42}`)
+	change.ReceiptRef = "-1001/42"
+
+	if _, err := handler.ExecuteAttempt(context.Background(), change); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if method := api.calls[0]["_method"]; method != "editMessageText" {
+		t.Fatalf("a change called %v", method)
+	}
+	markup, ok := api.calls[0]["reply_markup"].(map[string]any)
+	if !ok {
+		t.Fatalf("the change omitted reply_markup, so the old buttons survive: %v",
+			api.calls[0])
+	}
+	if rows, _ := markup["inline_keyboard"].([]any); len(rows) != 0 {
+		t.Fatalf("a change to a card admitted without buttons sent %d rows", len(rows))
+	}
+}
+
+// TestAnAcceptanceThatNamesNothingIsDoubt. Telegram answered ok and would not
+// say what it made.
+//
+// The message may well exist, so this is not a clean failure: calling it one
+// would send the retry to post a second one. It is doubt, and the breach names
+// what was wrong with the answer - an acceptance with nothing to address
+// afterwards.
+func TestAnAcceptanceThatNamesNothingIsDoubt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result map[string]any
+	}{
+		{
+			name:   "no message id",
+			result: map[string]any{"message_id": 0, "chat": map[string]any{"id": -1001}},
+		},
+		{
+			name:   "no chat",
+			result: map[string]any{"message_id": 42},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newBotAPI(t)
+			api.answer = func(map[string]any) (int, map[string]any) {
+				return http.StatusOK, map[string]any{"ok": true, "result": tc.result}
+			}
+			handler := handlerFor(api)
+
+			result, err := handler.ExecuteAttempt(context.Background(),
+				handlerCall(t, keys.TargetChannel, true))
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if result.Receipt.Recorded() {
+				t.Fatalf("coordinates were recorded from %+v", result)
+			}
+
+			concluded, breach := outbound.Conclude(handler,
+				outbound.Call{AttemptKind: outbound.AttemptCreate, KeyKind: keys.KindEscalation}, result, err)
+			if concluded.Outcome() != outbound.OutcomeAmbiguous {
+				t.Fatalf("an acceptance naming nothing concluded %q", concluded.Outcome())
+			}
+			if breach != outbound.BreachAcceptanceWithoutReceipt {
+				t.Fatalf("the breach recorded is %q", breach)
+			}
+			if concluded.Receipt() != nil {
+				t.Fatal("something was recorded as the message's coordinates")
+			}
+		})
+	}
+}
+
+// TestTelegramAnswersAreTranslatedNotInterpreted walks the capability matrix.
+func TestTelegramAnswersAreTranslatedNotInterpreted(t *testing.T) {
+	handler := &Handler{}
+
+	cases := map[string]struct {
+		want  outbound.Outcome
+		known bool
+	}{
+		"ok":                                    {outbound.OutcomeAccepted, true},
+		"429:Too Many Requests: retry after 30": {outbound.OutcomeRetryableRejection, true},
+		"403:Forbidden: bot was blocked by the user": {outbound.OutcomePermanentRejection, true},
+		"400:Bad Request: chat not found":            {outbound.OutcomePermanentRejection, true},
+		"400:Bad Request: message is too long":       {outbound.OutcomePermanentRejection, true},
+		"400:Bad Request: PEER_ID_INVALID":           {outbound.OutcomePermanentRejection, true},
+		"500:Internal Server Error":                  {outbound.OutcomeAmbiguous, true},
+		"502:Bad Gateway":                            {outbound.OutcomeAmbiguous, true},
+		// A 400 nobody recognised is not proof of anything.
+		"400:Bad Request: something new": {"", false},
+		"418:I am a teapot":              {"", false},
+		"":                               {"", false},
+	}
+
+	for status, want := range cases {
+		answer, known := handler.ClassifyResponse(outbound.Result{
+			Evidence: outbound.ProviderResponse, Status: status,
+		})
+		if known != want.known {
+			t.Errorf("status %q: known=%v, want %v", status, known, want.known)
+			continue
+		}
+		if known && answer.Outcome != want.want {
+			t.Errorf("status %q classified %q, want %q", status, answer.Outcome, want.want)
+		}
+	}
+}
+
+// TestARejectedSendCarriesWhatTelegramSaid: the code and the sentence both
+// reach the journal, because the sentence is what the classification reads and
+// what a person reads afterwards.
+func TestARejectedSendCarriesWhatTelegramSaid(t *testing.T) {
+	api := newBotAPI(t)
+	api.answer = func(map[string]any) (int, map[string]any) {
+		return http.StatusOK, map[string]any{
+			"ok": false, "error_code": 403,
+			"description": "Forbidden: bot was blocked by the user",
+		}
+	}
+	handler := handlerFor(api)
+
+	result, err := handler.ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.TargetChannel, true))
+	if err == nil {
+		t.Fatal("a refusal was reported as a success")
+	}
+	if result.Evidence != outbound.ProviderResponse {
+		t.Fatalf("Telegram answered and it was recorded as %q", result.Evidence)
+	}
+	answer, known := handler.ClassifyResponse(result)
+	if !known || answer.Outcome != outbound.OutcomePermanentRejection {
+		t.Fatalf("a blocked bot classified %q (known=%v)", answer.Outcome, known)
+	}
+	if !strings.Contains(result.Summary, "blocked") {
+		t.Fatalf("the journal does not say why: %q", result.Summary)
+	}
+}
+
+// TestWhatTelegramSaysAboutAChange. Three answers to an edit, and they mean
+// three different things - one of them is not a failure at all.
+func TestWhatTelegramSaysAboutAChange(t *testing.T) {
+	handler := NewHandler(nil, nil)
+
+	for _, tc := range []struct {
+		name    string
+		status  string
+		outcome outbound.Outcome
+		absent  bool
+	}{
+		{
+			// The outside already shows what we are asking for. That is the
+			// revision applied, not a failure to apply it.
+			name: "nothing to change", status: "400:Bad Request: message is not modified",
+			outcome: outbound.OutcomeAccepted,
+		},
+		{
+			name: "the message is gone", status: "400:Bad Request: message to edit not found",
+			outcome: outbound.OutcomePermanentRejection, absent: true,
+		},
+		{
+			// There and unchangeable: the opposite fact, and stated as none,
+			// because nobody may make a second message without proof of the
+			// first being gone.
+			name: "the message will not change", status: "400:Bad Request: message can't be edited",
+			outcome: outbound.OutcomePermanentRejection,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			answer, known := handler.ClassifyResponse(outbound.Result{
+				Evidence: outbound.ProviderResponse, Status: tc.status,
+			})
+			if !known {
+				t.Fatalf("%q was not recognised", tc.status)
+			}
+			if answer.Outcome != tc.outcome {
+				t.Errorf("classified %q, want %q", answer.Outcome, tc.outcome)
+			}
+			proved := answer.Detail != nil && *answer.Detail == keys.DetailDefinitelyAbsent
+			if proved != tc.absent {
+				t.Errorf("proof that the message is gone: %v, want %v", proved, tc.absent)
+			}
+		})
+	}
+}
+
+// TestPreparationResolvesAPersonEveryAttempt.
+func TestPreparationResolvesAPersonEveryAttempt(t *testing.T) {
+	handler := NewHandler(&mockTelegramTokenSource{token: "tok"},
+		func(context.Context, string, string) (string, error) { return "5551", nil })
+
+	prepared := handler.Prepare(context.Background(),
+		intentFor(t, keys.Target{Kind: keys.TargetUser, Ref: "user-1"}))
+	if prepared.Outcome() != outbound.PreparationReady {
+		t.Fatalf("a linked person was refused: %+v", prepared)
+	}
+	if got := prepared.Request("i", "t", "w").BoundEndpoint; got != "5551" {
+		t.Fatalf("the resolved chat is %q", got)
+	}
+
+	unlinked := NewHandler(&mockTelegramTokenSource{token: "tok"},
+		func(context.Context, string, string) (string, error) {
+			return "", providers.ErrNotLinked
+		})
+	if got := unlinked.Prepare(context.Background(),
+		intentFor(t, keys.Target{Kind: keys.TargetUser, Ref: "user-1"})).Outcome(); got != outbound.PreparationPermanent {
+		t.Fatalf("an unlinked person was %s", got)
+	}
+}
+
+// TestTheBotTokenNeverReachesTheJournal.
+//
+// The Bot API puts the token in the path, and net/http puts the whole address
+// into every transport error it returns. Those errors are written into a
+// delivery's summary, which is a durable row people read - so one unreachable
+// Telegram host would write the installation's bot token into the journal,
+// where it would stay. Truncation does not help: the token is at the front.
+func TestTheBotTokenNeverReachesTheJournal(t *testing.T) {
+	const token = "0000000000:SECRET-BOT-TOKEN-DO-NOT-STORE"
+
+	// A port that was listening a moment ago and is not any more.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	handler := NewHandler(&mockTelegramTokenSource{token: token}, nil,
+		WithHandlerBaseURL("http://"+address))
+
+	result, err := handler.ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.TargetChannel, true))
+	if err == nil {
+		t.Fatal("a dead address answered")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("the token is in the error the worker logs: %v", err)
+	}
+	if strings.Contains(result.Summary, token) {
+		t.Fatalf("the token is in the summary the journal keeps: %q", result.Summary)
+	}
+
+	// And the cause survives, because what the cause IS decides whether the
+	// message might have gone out.
+	if result.Evidence != outbound.DefinitelyNotSent {
+		t.Fatalf("a refused connection was classified %q", result.Evidence)
+	}
+}
+
+func intentFor(t *testing.T, target keys.Target) outbound.Intent {
+	t.Helper()
+	payload, err := json.Marshal(keys.EscalationPayloadV1{
+		Slot: keys.Slot{Kind: keys.SlotFirehose}, Target: target, Interactive: true,
+	})
+	if err != nil {
+		t.Fatalf("build the payload: %v", err)
+	}
+	return outbound.Intent{
+		ID: "intent-1", Provider: "telegram",
+		// The kind is what decides which shape the payload is read in, so a
+		// commitment without one is not a commitment.
+		KeyKind:    keys.KindEscalation,
+		TargetKind: target.Kind, TargetRef: target.Ref,
+		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
+		Payload:              payload,
+	}
+}
+
+// TestAPayloadNobodyCanReadStopsBeforeTheNetwork: the same rule as the other
+// channel, because the cost is the same - an attempt that never touched the
+// network, retried for as long as the commitment lives.
+func TestAPayloadNobodyCanReadStopsBeforeTheNetwork(t *testing.T) {
+	handler := NewHandler(&mockTelegramTokenSource{token: "tok"}, nil)
+
+	intent := intentFor(t, keys.Target{Kind: keys.TargetChannel, Ref: "-1001"})
+	intent.Payload = []byte(`{"target":{"kind":"chan`)
+
+	prepared := handler.Prepare(context.Background(), intent)
+	if prepared.Outcome() != outbound.PreparationPermanent {
+		t.Fatalf("an unreadable payload was %s, which retries forever", prepared.Outcome())
+	}
+	if got := prepared.Request("i", "t", "w").ErrorClass; got != "payload_unreadable" {
+		t.Fatalf("the refusal says %q", got)
+	}
+}
+
+// TestADirectMessageIsPlainText.
+//
+// The card is HTML this package built and escaped. A direct message is
+// somebody's own words: marking those as HTML makes an ordinary "a < b", or an
+// unclosed tag in an operator's note, unsendable - the message fails to go out
+// for the shape of its text, which is not something the delivery can fix by
+// retrying.
+func TestADirectMessageIsPlainText(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	override := "disk on db-1 is at 95% <check the graph> & escalate"
+	payload, err := json.Marshal(keys.EscalationPayloadV1{
+		Slot:            keys.Slot{Kind: keys.SlotPolicy, Index: 1},
+		Target:          keys.Target{Kind: keys.TargetUser, Ref: "user-1"},
+		MessageOverride: &override,
+		Interactive:     true,
+	})
+	if err != nil {
+		t.Fatalf("build the payload: %v", err)
+	}
+
+	call := handlerCall(t, keys.TargetUser, true)
+	call.Payload = payload
+	call.Endpoint = "5551"
+	if _, err := handler.ExecuteAttempt(context.Background(), call); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	sent := api.calls[0]
+	if got, _ := sent["text"].(string); got != override {
+		t.Fatalf("the message was rewritten: %q", got)
+	}
+	if mode, marked := sent["parse_mode"]; marked {
+		t.Fatalf("a person's own words were sent as %v", mode)
+	}
+	if _, hasKeyboard := sent["reply_markup"]; hasKeyboard {
+		t.Fatal("a direct message carried buttons")
+	}
+}
+
+// TestARedirectIsAnAnswerNotADeadEnd is the same rule for the other channel:
+// what answered the POST decides, not where it pointed.
+func TestARedirectIsAnAnswerNotADeadEnd(t *testing.T) {
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://tokay.invalid./bot0/sendMessage", http.StatusFound)
+	}))
+	t.Cleanup(redirected.Close)
+
+	handler := NewHandler(&mockTelegramTokenSource{token: "tok"}, nil,
+		WithHandlerBaseURL(redirected.URL))
+
+	result, err := handler.ExecuteAttempt(context.Background(),
+		handlerCall(t, keys.TargetChannel, true))
+	if err == nil {
+		t.Fatal("a redirect was taken for a delivery")
+	}
+	if result.Evidence == outbound.DefinitelyNotSent {
+		t.Fatalf("a message that may exist was recorded as never sent: %+v", result)
+	}
+
+	concluded, _ := outbound.Conclude(handler, outbound.Call{AttemptKind: outbound.AttemptCreate, KeyKind: keys.KindEscalation}, result, err)
+	if concluded.Outcome() != outbound.OutcomeAmbiguous {
+		t.Fatalf("a redirect concluded %q", concluded.Outcome())
+	}
+}
+
+// TestACallWithNoStateToRenderIsRefused.
+//
+// This channel draws an alert card from a frozen state. A commitment that
+// carries none is one the delivery domain routed here by mistake, and the
+// answer is a deterministic refusal in front of a person - not an empty card.
+//
+// The check asks the content whether it HAS a state rather than looking at
+// whether the state is empty: a zero snapshot renders a message about no alert,
+// with a title of nothing and no link, and it would go out.
+func TestACallWithNoStateToRenderIsRefused(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	call := handlerCall(t, keys.TargetChannel, true)
+	payloadOnly, err := outbound.NewPayloadContent(handlerState(t).Digest())
+	if err != nil {
+		t.Fatalf("build the content: %v", err)
+	}
+	call.Content = payloadOnly
+
+	result, err := handler.ExecuteAttempt(context.Background(), call)
+	if err == nil {
+		t.Fatal("a commitment with no state to render was sent anyway")
+	}
+	if result.Evidence != outbound.DefinitelyNotSent {
+		t.Fatalf("a call that never went out is recorded as %q", result.Evidence)
+	}
+	if !strings.Contains(result.Summary, string(keys.KindEscalation)) {
+		t.Fatalf("the refusal does not say what it was: %q", result.Summary)
+	}
+	if len(api.calls) != 0 {
+		t.Fatal("the channel was called anyway")
+	}
+}

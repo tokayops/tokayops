@@ -113,7 +113,7 @@ func TestServiceCurrentOnCall(t *testing.T) {
 	}
 }
 
-// TestServiceCurrentOnCallWithoutSchedule: a dispatcher asking who to page
+// TestServiceCurrentOnCallWithoutSchedule: a caller asking who to page
 // must be told nobody, not handed an error it has to interpret.
 func TestServiceCurrentOnCallWithoutSchedule(t *testing.T) {
 	start := utc(2026, 5, 1, 11, 0)

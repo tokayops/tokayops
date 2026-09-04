@@ -57,7 +57,7 @@ func (a *API) RequestTelegramLink(c echo.Context) error {
 	// Fail fast with a clear message instead of issuing a deep link that can never
 	// link (the user would press Start and "Refresh" forever).
 	if a.selfURL == "" {
-		return c.JSON(http.StatusServiceUnavailable, ErrorResponse{Error: "telegram linking unavailable: server TOKAY_SELF_URL is not configured (interactivity disabled) — contact an admin"})
+		return c.JSON(http.StatusServiceUnavailable, ErrorResponse{Error: "telegram linking unavailable: server TOKAY_SELF_URL is not configured (interactivity disabled) - contact an admin"})
 	}
 
 	// Already linked? Avoid issuing a second link / overwriting silently.
@@ -74,7 +74,7 @@ func (a *API) RequestTelegramLink(c echo.Context) error {
 		return c.JSON(http.StatusServiceUnavailable, ErrorResponse{Error: "telegram bot unavailable: " + err.Error()})
 	}
 
-	// Issue a high-entropy token with an empty external_id — the Telegram user id
+	// Issue a high-entropy token with an empty external_id - the Telegram user id
 	// is unknown until /start, where ConsumeLinkToken fills it in.
 	var token string
 	expiresAt := time.Now().Add(telegramLinkTTL)

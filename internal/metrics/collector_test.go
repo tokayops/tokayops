@@ -1,6 +1,7 @@
 package metrics_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,7 +27,7 @@ func TestBusinessCollector_ActiveAlertGroups(t *testing.T) {
 		ID: "ag3", AlertKey: "k3", TeamID: "devops", Severity: "warning",
 		Status: model.AlertGroupStatusAcknowledged,
 	})
-	// Resolved — should NOT count
+	// Resolved - should NOT count
 	s.CreateAlertGroup(&model.AlertGroup{
 		ID: "ag4", AlertKey: "k4", TeamID: "devops", Severity: "critical",
 		Status: model.AlertGroupStatusResolved,
@@ -172,45 +173,55 @@ func TestBusinessCollector_OutboxEventsByStatus(t *testing.T) {
 	}
 }
 
-func TestBusinessCollector_OutboxDeliveriesByStatus(t *testing.T) {
-	s := store.NewMockStore()
-
-	s.CreateOutboxEvent(&model.OutboxEvent{
-		ID: "evt-1", EventType: model.OutboxEventFiring, AlertGroupID: "ag-1",
-		TeamID: "devops", Payload: []byte(`{}`), Status: model.OutboxEventStatusCompleted,
-	})
-
-	s.CreateOutboxDelivery(&model.OutboxDelivery{
-		ID: "del-1", EventID: "evt-1", IntegrationID: "integ-1", Status: model.OutboxDeliverySent,
-	})
-	s.CreateOutboxDelivery(&model.OutboxDelivery{
-		ID: "del-2", EventID: "evt-1", IntegrationID: "integ-2", Status: model.OutboxDeliveryFailed,
-	})
-	s.CreateOutboxDelivery(&model.OutboxDelivery{
-		ID: "del-3", EventID: "evt-1", IntegrationID: "integ-3", Status: model.OutboxDeliveryRetry,
-	})
-
-	collected := collectMetrics(t, s)
-
-	val := findGaugeValue(t, collected, "outbox_deliveries_by_status", map[string]string{"status": "sent"})
-	if val != 1 {
-		t.Errorf("outbox_deliveries_by_status{sent} = %v, want 1", val)
-	}
-
-	val = findGaugeValue(t, collected, "outbox_deliveries_by_status", map[string]string{"status": "failed"})
-	if val != 1 {
-		t.Errorf("outbox_deliveries_by_status{failed} = %v, want 1", val)
-	}
-
-	val = findGaugeValue(t, collected, "outbox_deliveries_by_status", map[string]string{"status": "retry"})
-	if val != 1 {
-		t.Errorf("outbox_deliveries_by_status{retry} = %v, want 1", val)
-	}
-}
-
 // --------------- helpers ---------------
 
 // collectMetrics registers a fresh collector in a temporary registry, gathers, and returns families.
+// snapshotStub is a store that answers with exactly one snapshot.
+//
+// The gauges below are about what the collector EMITS, which the store tests
+// cannot see: they read the snapshot struct, and a collector that dropped a
+// series would leave every one of them green.
+type snapshotStub struct{ snap *model.MetricsSnapshot }
+
+func (s snapshotStub) GetMetricsSnapshot(context.Context) (*model.MetricsSnapshot, error) {
+	return s.snap, nil
+}
+
+// TestBusinessCollector_CardsBehind. Three series, one of them zero, and an age
+// reported exactly as given.
+//
+// The zero one is the point of the test as much as the others: a gauge nobody
+// writes keeps its last value in Prometheus, so a state that stops being
+// emitted when it empties goes on reporting the backlog it had.
+func TestBusinessCollector_CardsBehind(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics.RegisterCollectorWith(reg, snapshotStub{snap: &model.MetricsSnapshot{
+		OutboundCardsBehind: []model.OutboundCardsBehind{
+			{State: "queued", Count: 3},
+			{State: "stuck", Count: 1},
+			{State: "abandoned", Count: 0},
+		},
+		OutboundCardStalenessSeconds: 91.5,
+	}})
+
+	collected, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+
+	for state, want := range map[string]float64{"queued": 3, "stuck": 1, "abandoned": 0} {
+		got := findGaugeValue(t, collected, "outbound_cards_behind",
+			map[string]string{"state": state})
+		if got != want {
+			t.Errorf("outbound_cards_behind{state=%q} = %v, want %v", state, got, want)
+		}
+	}
+
+	if got := findGaugeValue(t, collected, "outbound_card_staleness_seconds", nil); got != 91.5 {
+		t.Errorf("outbound_card_staleness_seconds = %v, want 91.5", got)
+	}
+}
+
 func collectMetrics(t *testing.T, s store.StoreInterface) []*dto.MetricFamily {
 	t.Helper()
 	reg := prometheus.NewRegistry()

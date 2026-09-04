@@ -1,8 +1,8 @@
 import { test, expect } from '../../fixtures/auth.fixture';
 
-// The profile modal exposes a Telegram section (Epic 8 Sprint 3). Linking itself is
+// The profile modal exposes a Telegram section. Linking itself is
 // a deep-link flow that calls the Bot API (unreachable in the e2e stack), so this
-// only asserts the disconnected section + Connect button render — the link issuance
+// only asserts the disconnected section + Connect button render - the link issuance
 // and webhook flow are covered by the Go integration test.
 test.describe('Telegram profile section', () => {
   test('shows a Connect Telegram action', async ({ dashboardPage, page }) => {

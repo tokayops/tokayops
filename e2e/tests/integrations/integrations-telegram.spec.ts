@@ -1,9 +1,9 @@
 import { test, expect } from '../../fixtures/auth.fixture';
 import type { Page } from '@playwright/test';
 
-// Telegram integration UI (Epic 8). Drives the real form/API. A telegram bot is
+// Telegram integration UI. Drives the real form/API. A telegram bot is
 // single-outbound, so each test starts from a clean slate (any pre-existing
-// telegram integration is removed in beforeEach) — the create flow is always
+// telegram integration is removed in beforeEach) - the create flow is always
 // exercised rather than skipped on 409.
 const createdIntegrationIds: string[] = [];
 
@@ -21,7 +21,7 @@ async function deleteExistingTelegram(page: Page) {
 
 test.describe('Telegram integration', () => {
   // A telegram bot is single-outbound, so these tests share one global backend
-  // resource — run them serially so they don't race under fullyParallel.
+  // resource - run them serially so they don't race under fullyParallel.
   test.describe.configure({ mode: 'serial' });
 
   test.beforeEach(async ({ integrationsPage, page }) => {
@@ -60,7 +60,7 @@ test.describe('Telegram integration', () => {
   test('requires a secret token on create', async ({ integrationsPage }) => {
     const suffix = Math.random().toString(36).substring(2, 8);
 
-    // Fill bot token only (no secret) and submit — the form must reject it.
+    // Fill bot token only (no secret) and submit - the form must reject it.
     await integrationsPage.openTelegramForm(`Telegram NoSecret ${Date.now()}-${suffix}`, `123456:bot-${suffix}`);
     await integrationsPage.integrationFormSubmit.click();
 

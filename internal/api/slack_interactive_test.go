@@ -9,20 +9,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/labstack/echo/v4"
-	"github.com/slack-go/slack"
-	"github.com/tokayops/tokayops/internal/dispatcher"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/slackcard"
 	"github.com/tokayops/tokayops/internal/store"
 )
 
@@ -78,7 +78,7 @@ func (m *testSlackMessenger) GetSlackUserIDByEmail(ctx context.Context, email st
 	if id, ok := m.slackIDs[email]; ok {
 		return id, nil
 	}
-	return "", dispatcher.ErrSlackUserNotFound
+	return "", slackprovider.ErrUserNotFound
 }
 
 func (m *testSlackMessenger) GetEmailBySlackID(ctx context.Context, slackUserID string) (string, error) {
@@ -88,7 +88,7 @@ func (m *testSlackMessenger) GetEmailBySlackID(ctx context.Context, slackUserID 
 	if email, ok := m.emails[slackUserID]; ok {
 		return email, nil
 	}
-	return "", dispatcher.ErrSlackUserNotFound
+	return "", slackprovider.ErrUserNotFound
 }
 
 // setupTestAPIWithCache creates an API with a pre-loaded IntegrationCache containing
@@ -144,7 +144,7 @@ func TestSlackInteractive(t *testing.T) {
 	})
 
 	t.Run("no signing secret configured returns 503", func(t *testing.T) {
-		// Use setupTestAPI which passes nil cache — middleware will see empty secret
+		// Use setupTestAPI which passes nil cache - middleware will see empty secret
 		_, _, e := setupTestAPI(t)
 
 		ts := fmt.Sprintf("%d", time.Now().Unix())
@@ -584,7 +584,7 @@ func TestSlackInteractiveHandler(t *testing.T) {
 		}
 		captured.waitOne(t) // drain first ack message
 
-		// Second ack — idempotent
+		// Second ack - idempotent
 		req2 := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec2 := httptest.NewRecorder()
 		e.ServeHTTP(rec2, req2)
@@ -629,7 +629,7 @@ func TestSlackInteractiveHandler(t *testing.T) {
 		}
 		captured.waitOne(t) // drain resolve message
 
-		// Ack after resolve — should be idempotent
+		// Ack after resolve - should be idempotent
 		req2 := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec2 := httptest.NewRecorder()
 		e.ServeHTTP(rec2, req2)
@@ -707,6 +707,11 @@ type errorStore struct {
 	getUserTeamRoleErr         error
 	ackAlertGroupAtomicErr     error
 	resolveAlertGroupAtomicErr error
+
+	// acked and resolved are the actors the door handed the store, in order.
+	// The mock ignores the id; the real store refuses an empty one, so the
+	// door is proven here rather than by the mock accepting anything.
+	acked, resolved []alertgroup.Actor
 }
 
 func (s *errorStore) GetAlertGroupByID(id string) (*model.AlertGroup, error) {
@@ -730,14 +735,16 @@ func (s *errorStore) GetUserTeamRole(userID, teamID string) (model.TeamMemberRol
 	return s.MockStore.GetUserTeamRole(userID, teamID)
 }
 
-func (s *errorStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (s *errorStore) AckAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	s.acked = append(s.acked, actor)
 	if s.ackAlertGroupAtomicErr != nil {
 		return false, s.ackAlertGroupAtomicErr
 	}
 	return s.MockStore.AckAlertGroupAtomic(id, actor, meta, outboxEvent)
 }
 
-func (s *errorStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+func (s *errorStore) ResolveAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	s.resolved = append(s.resolved, actor)
 	if s.resolveAlertGroupAtomicErr != nil {
 		return false, s.resolveAlertGroupAtomicErr
 	}
@@ -999,7 +1006,7 @@ func TestTryLinkSlackUser(t *testing.T) {
 		}
 		api := NewAPI(s, nil, slack, nil, "", nil)
 
-		// Call tryLinkSlackUser directly — store-level guard must prevent overwrite
+		// Call tryLinkSlackUser directly - store-level guard must prevent overwrite
 		api.tryLinkSlackUser("alex", "alex@example.com")
 
 		ident, _ := s.GetExternalIdentity(alex.ID, "slack")
@@ -1009,8 +1016,8 @@ func TestTryLinkSlackUser(t *testing.T) {
 	})
 
 	t.Run("skips Slack API call when already linked", func(t *testing.T) {
-		// Regression guard: Sprint 3 dropped the in-process User.SlackUserID guard,
-		// so tryLinkSlackUser MUST do a cheap GetExternalIdentity pre-check before
+		// Regression guard: there is no in-process User.SlackUserID guard any
+		// more, so tryLinkSlackUser MUST do a cheap GetExternalIdentity pre-check before
 		// hitting Slack's users.lookupByEmail, or every OIDC login hits the API.
 		s := store.NewMockStore()
 		s.BindExternalIdentity(&model.ExternalIdentity{
@@ -1178,7 +1185,7 @@ func TestSlackInteractiveEmailMatch(t *testing.T) {
 	})
 
 	t.Run("Slack API error falls through to OTP ephemeral", func(t *testing.T) {
-		// Slack API is down — should gracefully fall through
+		// Slack API is down - should gracefully fall through
 		slackMsngr := &testSlackMessenger{
 			err: errors.New("network timeout"),
 		}
@@ -1253,89 +1260,15 @@ func TestSlackInteractiveEmailMatch(t *testing.T) {
 	})
 }
 
-// ---------- Instant Card Replacement Tests ----------
-
-// capturedReplace collects card replacements sent via replaceOriginal.
-type capturedReplace struct {
-	mu    sync.Mutex
-	cards []slackcard.Card
-	ch    chan slackcard.Card
-	err   error // if set, post returns this error
-}
-
-func newCapturedReplace() *capturedReplace {
-	return &capturedReplace{ch: make(chan slackcard.Card, 100)}
-}
-
-func (c *capturedReplace) post(_ string, card slackcard.Card) error {
-	if c.err != nil {
-		return c.err
-	}
-	c.mu.Lock()
-	c.cards = append(c.cards, card)
-	c.mu.Unlock()
-	c.ch <- card
-	return nil
-}
-
-func (c *capturedReplace) last() slackcard.Card {
-	return c.cards[len(c.cards)-1]
-}
-
-func (c *capturedReplace) waitOne(t *testing.T) slackcard.Card {
-	t.Helper()
-	select {
-	case card := <-c.ch:
-		return card
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for card replacement")
-		return slackcard.Card{}
-	}
-}
-
-// mockCardRenderer implements SlackCardRenderer for tests.
-type mockCardRenderer struct {
-	mu    sync.Mutex
-	calls []mockRenderCall
-}
-
-type mockRenderCall struct {
-	AlertGroupID   string
-	IsResolved     bool
-	Status         string
-	AcknowledgedBy string
-	ResolvedBy     string
-}
-
-func (m *mockCardRenderer) RenderCard(ag *model.AlertGroup, isResolved bool) slackcard.Card {
-	m.mu.Lock()
-	m.calls = append(m.calls, mockRenderCall{
-		AlertGroupID:   ag.ID,
-		IsResolved:     isResolved,
-		Status:         string(ag.Status),
-		AcknowledgedBy: ag.AcknowledgedBy,
-		ResolvedBy:     ag.ResolvedBy,
-	})
-	m.mu.Unlock()
-	color := "#FF0000"
-	if isResolved {
-		color = "#36a64f"
-	} else if ag.Status == model.AlertGroupStatusAcknowledged {
-		color = "#FFA500"
-	}
-	return slackcard.Card{
-		Text: ag.Title,
-		Blocks: []slack.Block{
-			slack.NewSectionBlock(
-				slack.NewTextBlockObject(slack.MarkdownType, ag.Title, false, false),
-				nil, nil,
-			),
-		},
-		Attachment: slack.Attachment{Color: color, Fallback: ag.Title},
-	}
-}
-
-func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
+// TestSlackInteractiveHandlerAnswersTheClicker. The button says what happened
+// to the person who pressed it and touches nothing else.
+//
+// It used to replace the card itself, rendered from the live group. That made
+// two writers of one message with no order between them: an alert arriving
+// between the click and the replacement would be rendered out of the card until
+// the next revision put it back. The card is the delivery domain's now, and it
+// brings it to the acknowledged revision within a claim cycle.
+func TestSlackInteractiveHandlerAnswersTheClicker(t *testing.T) {
 	const secret = "handler-test-secret"
 
 	setup := func(t *testing.T) (*API, *store.MockStore, *echo.Echo, string) {
@@ -1364,127 +1297,10 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		return api, s, e, agID
 	}
 
-	t.Run("ack with cardRenderer replaces card with orange", func(t *testing.T) {
-		api, s, e, agID := setup(t)
-		renderer := &mockCardRenderer{}
-		replace := newCapturedReplace()
-		api.cardRenderer = renderer
-		api.replaceOriginal = replace.post
-
-		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("Expected 200, got %d", rec.Code)
-		}
-
-		// Verify card replacement (not ephemeral)
-		card := replace.waitOne(t)
-		if card.Attachment.Color != "#FFA500" {
-			t.Errorf("Expected orange card (#FFA500), got %s", card.Attachment.Color)
-		}
-		if card.Text == "" {
-			t.Error("Expected non-empty Card.Text")
-		}
-		if len(card.Blocks) == 0 {
-			t.Error("Expected non-empty Card.Blocks")
-		}
-
-		// Verify DB state
-		ag, _ := s.GetAlertGroupByID(agID)
-		if ag.Status != model.AlertGroupStatusAcknowledged {
-			t.Errorf("Expected acknowledged, got %s", ag.Status)
-		}
-
-		// Verify renderer was called with correct args
-		renderer.mu.Lock()
-		defer renderer.mu.Unlock()
-		if len(renderer.calls) != 1 {
-			t.Fatalf("Expected 1 render call, got %d", len(renderer.calls))
-		}
-		if renderer.calls[0].IsResolved {
-			t.Error("Expected isResolved=false for ack")
-		}
-		if renderer.calls[0].Status != string(model.AlertGroupStatusAcknowledged) {
-			t.Errorf("Expected status acknowledged in render call, got %s", renderer.calls[0].Status)
-		}
-		if renderer.calls[0].AcknowledgedBy != "Denis" {
-			t.Errorf("Expected AcknowledgedBy 'Denis' in render call, got %q", renderer.calls[0].AcknowledgedBy)
-		}
-	})
-
-	t.Run("resolve with cardRenderer replaces card with green", func(t *testing.T) {
-		api, _, e, agID := setup(t)
-		renderer := &mockCardRenderer{}
-		replace := newCapturedReplace()
-		api.cardRenderer = renderer
-		api.replaceOriginal = replace.post
-
-		req := signedSlackInteractiveRequest(t, secret, SlackActionResolveAlertGroup, agID, "U_DENIS")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("Expected 200, got %d", rec.Code)
-		}
-
-		card := replace.waitOne(t)
-		if card.Attachment.Color != "#36a64f" {
-			t.Errorf("Expected green card (#36a64f), got %s", card.Attachment.Color)
-		}
-		if card.Text == "" {
-			t.Error("Expected non-empty Card.Text")
-		}
-		if len(card.Blocks) == 0 {
-			t.Error("Expected non-empty Card.Blocks")
-		}
-
-		renderer.mu.Lock()
-		defer renderer.mu.Unlock()
-		if len(renderer.calls) != 1 {
-			t.Fatalf("Expected 1 render call, got %d", len(renderer.calls))
-		}
-		if !renderer.calls[0].IsResolved {
-			t.Error("Expected isResolved=true for resolve")
-		}
-		if renderer.calls[0].ResolvedBy != "Denis" {
-			t.Errorf("Expected ResolvedBy 'Denis' in render call, got %q", renderer.calls[0].ResolvedBy)
-		}
-	})
-
-	t.Run("replaceOriginal failure falls back to ephemeral", func(t *testing.T) {
-		api, _, e, agID := setup(t)
-		renderer := &mockCardRenderer{}
-		replace := &capturedReplace{
-			ch:  make(chan slackcard.Card, 10),
-			err: errors.New("slack API unavailable"),
-		}
-		captured := newCapturedEphemeral()
-		api.cardRenderer = renderer
-		api.replaceOriginal = replace.post
-		api.respondEphemeral = captured.post
-
-		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("Expected 200, got %d", rec.Code)
-		}
-
-		// Should fall back to ephemeral
-		msg := captured.waitOne(t)
-		if !strings.Contains(msg, "acknowledged by Denis") {
-			t.Errorf("Expected fallback ephemeral containing 'acknowledged by Denis', got %q", msg)
-		}
-	})
-
-	t.Run("no cardRenderer uses ephemeral (backward compat)", func(t *testing.T) {
+	t.Run("the click is confirmed", func(t *testing.T) {
 		api, _, e, agID := setup(t)
 		captured := newCapturedEphemeral()
 		api.respondEphemeral = captured.post
-		// cardRenderer and replaceOriginal are nil by default
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec := httptest.NewRecorder()
@@ -1493,22 +1309,28 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("Expected 200, got %d", rec.Code)
 		}
-
 		msg := captured.waitOne(t)
 		if !strings.Contains(msg, "acknowledged by Denis") {
 			t.Errorf("Expected ephemeral containing 'acknowledged by Denis', got %q", msg)
 		}
 	})
 
-	t.Run("already acked with cardRenderer re-fetches and replaces card", func(t *testing.T) {
+	// Somebody else got there first, and the answer says which of the two
+	// things they did - which is read from the group rather than guessed.
+	//
+	// From the group the SERVICE already read, and not from a second query.
+	// Slack allows this handler three seconds, and the arguments of a `go` call
+	// are evaluated before the goroutine starts: a read written that way looks
+	// asynchronous and is not.
+	t.Run("a click that came too late says what was already done", func(t *testing.T) {
 		api, s, e, agID := setup(t)
-		renderer := &mockCardRenderer{}
-		replace := newCapturedReplace()
-		api.cardRenderer = renderer
-		api.replaceOriginal = replace.post
-
-		// Pre-ack the alert group
-		s.AckAlertGroupAtomic(agID, "Other User", nil, nil)
+		counting := &countingReads{StoreInterface: s}
+		api.store = counting
+		api.agService = alertgroup.NewService(counting)
+		captured := newCapturedEphemeral()
+		api.respondEphemeral = captured.post
+		s.AckAlertGroupAtomic(agID, actorNamed("Other User"), nil, nil)
+		counting.reads.Store(0)
 
 		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
 		rec := httptest.NewRecorder()
@@ -1517,78 +1339,59 @@ func TestSlackInteractiveHandler_InstantCard(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("Expected 200, got %d", rec.Code)
 		}
-
-		// Should still replace the card (re-fetched from DB)
-		card := replace.waitOne(t)
-		if card.Attachment.Color != "#FFA500" {
-			t.Errorf("Expected orange card from re-fetch, got %s", card.Attachment.Color)
+		msg := captured.waitOne(t)
+		if !strings.Contains(msg, "already acknowledged") {
+			t.Errorf("Expected ephemeral about an acknowledged group, got %q", msg)
+		}
+		// Two, and both are decisions: the handler reads the group to know
+		// which team to check permission against, and the service reads it to
+		// decide whether there is anything to do. A third would be the handler
+		// asking the database a question it already has the answer to.
+		if got := counting.reads.Load(); got != 2 {
+			t.Errorf("the click read the alert group %d times, want 2", got)
 		}
 	})
+}
 
-	t.Run("ack cancels escalation job", func(t *testing.T) {
-		api, s, e, agID := setup(t)
-		captured := newCapturedEphemeral()
-		api.respondEphemeral = captured.post
+// countingReads counts what a request costs in reads of the alert group.
+type countingReads struct {
+	store.StoreInterface
+	reads atomic.Int32
+}
 
-		// An escalation job shaped like the real one: cancellation addresses it by
-		// alert group, so alert_group_id is what makes this a job the escalation
-		// builder would actually have produced.
-		jobID := "job-esc-" + agID
-		if err := s.SeedEscalationJob(agID, &model.Job{
-			ID:     jobID,
-			Status: model.JobStatusPending,
-		}, nil, []*model.JobStep{
-			{ID: "step-1", JobID: jobID, Status: model.JobStepStatusPending},
-		}); err != nil {
-			t.Fatalf("SeedEscalationJob: %v", err)
-		}
+func (c *countingReads) GetAlertGroupByID(id string) (*model.AlertGroup, error) {
+	c.reads.Add(1)
+	return c.StoreInterface.GetAlertGroupByID(id)
+}
 
-		req := signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
+// TestSlackButtonsSignAsTheUser: both buttons hand the store the person by
+// id, not only by name. The mock behind these tests would accept an actor
+// with no id; the real store refuses one, so the id is checked here, where
+// the door is.
+func TestSlackButtonsSignAsTheUser(t *testing.T) {
+	es := &errorStore{MockStore: store.NewMockStore()}
+	_, e, agID := setupErrorAPI(t, es)
+	denis, err := es.GetUserByEmail("denis@example.com")
+	if err != nil || denis == nil {
+		t.Fatalf("the linked user: %v", err)
+	}
+	secret := "handler-test-secret"
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("Expected 200, got %d", rec.Code)
-		}
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, signedSlackInteractiveRequest(t, secret, SlackActionAckAlertGroup, agID, "U_DENIS"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ack: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(es.acked) != 1 || es.acked[0].ID != denis.ID || es.acked[0].Name == "" {
+		t.Fatalf("the acknowledgement was signed %+v, want the id of %s", es.acked, denis.ID)
+	}
 
-		// Wait for async goroutine to complete
-		captured.waitOne(t)
-
-		// Verify escalation job was cancelled
-		job, _ := s.GetJobByID(jobID)
-		if job.Status != model.JobStatusCanceled {
-			t.Errorf("Expected escalation job to be canceled, got %s", job.Status)
-		}
-	})
-
-	t.Run("resolve cancels escalation job", func(t *testing.T) {
-		api, s, e, agID := setup(t)
-		captured := newCapturedEphemeral()
-		api.respondEphemeral = captured.post
-
-		jobID := "job-esc-resolve-" + agID
-		if err := s.SeedEscalationJob(agID, &model.Job{
-			ID:     jobID,
-			Status: model.JobStatusPending,
-		}, nil, []*model.JobStep{
-			{ID: "step-1", JobID: jobID, Status: model.JobStepStatusPending},
-		}); err != nil {
-			t.Fatalf("SeedEscalationJob: %v", err)
-		}
-
-		req := signedSlackInteractiveRequest(t, secret, SlackActionResolveAlertGroup, agID, "U_DENIS")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("Expected 200, got %d", rec.Code)
-		}
-
-		captured.waitOne(t)
-
-		job, _ := s.GetJobByID(jobID)
-		if job.Status != model.JobStatusCanceled {
-			t.Errorf("Expected escalation job to be canceled, got %s", job.Status)
-		}
-	})
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, signedSlackInteractiveRequest(t, secret, SlackActionResolveAlertGroup, agID, "U_DENIS"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(es.resolved) != 1 || es.resolved[0].ID != denis.ID || es.resolved[0].Name == "" {
+		t.Fatalf("the resolution was signed %+v, want the id of %s", es.resolved, denis.ID)
+	}
 }
