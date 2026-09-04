@@ -772,4 +772,3 @@ ALTER TABLE ONLY public.team_members
 
 ALTER TABLE ONLY public.timeline_events
     ADD CONSTRAINT timeline_events_alert_group_id_fkey FOREIGN KEY (alert_group_id) REFERENCES public.alert_groups(id);
-

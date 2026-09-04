@@ -1061,6 +1061,9 @@ func str(v string) *string { return &v }
 // exactly what a test of that start on an older shape cannot use.
 func throwawayDatabase(t *testing.T, schemaFile string) *Store {
 	t.Helper()
+	if testStore == nil {
+		t.Skip("TEST_DB_DSN not set")
+	}
 	dsn, err := url.Parse(os.Getenv("TEST_DB_DSN"))
 	if err != nil {
 		t.Fatalf("read TEST_DB_DSN: %v", err)

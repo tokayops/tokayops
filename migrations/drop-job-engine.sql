@@ -10,12 +10,13 @@
 -- not roll back to a build that does.
 --
 -- There is no way back, and the way it fails is quiet. An older build creates
--- these tables itself on start-up, so its process may well come up - on an
--- empty job engine, with none of the work or the history it expects to find,
--- and without the two alert_groups columns below, which it reads. That is not
--- a working rollback: its alert API and its engine fail on the first alert,
--- and nothing says why. Restoring a backup taken before the upgrade is the
--- only way back.
+-- these tables and columns itself on start-up, so its process may well come
+-- up - on an empty job engine, with none of the work or the history it
+-- expects to find. That is not a working rollback: the build that made this
+-- file necessary also renamed the column every alert-group read of the older
+-- one uses, so its alert API and its engine fail on the first alert, and
+-- nothing says why. Restoring a backup taken before the upgrade is the only
+-- way back.
 --
 -- Escalations and shift-change announcements are commitments in the outbound
 -- tables now, and what they did is in outbound_attempts and

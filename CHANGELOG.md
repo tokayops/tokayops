@@ -311,7 +311,6 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   longer leave an intermediate bot token registered with Telegram: the webhook
   is reconciled against the current row under a lock rather than set from the
   arguments of whichever request finished last.
-database.
 
 ### Added
 
@@ -411,10 +410,10 @@ database.
   loop. It is run by hand, never at startup, and there is no way back from it.
   An older image started afterwards may well start - it creates the empty
   tables itself - but that is not a working rollback: this version renamed the
-  column every alert-group read of the older one uses, and the two
-  `alert_groups` columns the file removes are ones it reads, so its alert API
-  and its engine fail on the first alert, and nothing says why. Only a backup
-  taken before the upgrade restores anything. Until then, note that the addresses of
+  column every alert-group read of the older one uses, so its alert API and
+  its engine fail on the first alert, and the rows the file removed are gone
+  for good. Only a backup taken before the upgrade restores anything. Until
+  then, note that the addresses of
   erased users survive in `notification_deliveries`: erasure never covered that
   table, and dropping it is what finally removes them.
 - `job_steps_processed_total`, `notification_sent_total` and
