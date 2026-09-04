@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"time"
 
@@ -44,6 +45,12 @@ const (
 	RetentionInterval = time.Hour
 	// RetentionFirstPassAfter is when the first pass runs after the start.
 	RetentionFirstPassAfter = time.Minute
+
+	// RetentionMaxDays is the largest window a Duration can hold: a day more
+	// would wrap the window negative, put the cutoff in the future, and have
+	// the first pass remove history that finished a moment ago. Refused at
+	// the parser and again at the constructor, before any multiplication.
+	RetentionMaxDays = int(math.MaxInt64 / int64(24*time.Hour))
 )
 
 // ParseRetentionWindow reads the window out of the environment's value: an
@@ -61,6 +68,10 @@ func ParseRetentionWindow(value string) (days int, err error) {
 	if days < 0 {
 		return 0, fmt.Errorf("%s=%d: the retention window cannot be negative (0 turns retention off)",
 			RetentionEnv, days)
+	}
+	if days > RetentionMaxDays {
+		return 0, fmt.Errorf("%s=%d: the retention window is at most %d days",
+			RetentionEnv, days, RetentionMaxDays)
 	}
 	return days, nil
 }
@@ -111,6 +122,9 @@ type Retention struct {
 func NewRetention(st retentionStore, days int) (*Retention, error) {
 	if days <= 0 {
 		return nil, fmt.Errorf("a retention loop needs a window of at least one day, got %d", days)
+	}
+	if days > RetentionMaxDays {
+		return nil, fmt.Errorf("a retention window of %d days does not fit a duration; at most %d", days, RetentionMaxDays)
 	}
 	return &Retention{
 		store:     st,

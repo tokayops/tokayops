@@ -107,14 +107,14 @@ func (a *API) SetScheduleRenderer(svc *schedulerender.Service) {
 	a.scheduleRenderer = svc
 }
 
-// SetUserEraser wires the user erasure command. Without it DeleteUser has no
-// safe implementation and refuses rather than falling back to a hard delete.
 // SetDeliveryRetention tells the API the retention window, so that a journal
 // that is not there can say why.
 func (a *API) SetDeliveryRetention(days int) {
 	a.deliveryRetentionDays = days
 }
 
+// SetUserEraser wires the user erasure command. Without it DeleteUser has no
+// safe implementation and refuses rather than falling back to a hard delete.
 func (a *API) SetUserEraser(svc *erasure.Service) {
 	a.userEraser = svc
 }

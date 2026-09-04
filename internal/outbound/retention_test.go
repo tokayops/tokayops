@@ -3,6 +3,8 @@ package outbound
 import (
 	"context"
 	"errors"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +30,12 @@ func TestTheRetentionWindowIsReadStrictly(t *testing.T) {
 		{"-1", 0, "cannot be negative"},
 		{"abc", 0, "whole number of days"},
 		{"1.5", 0, "whole number of days"},
+		// The largest window a duration holds, and the first that does not: a
+		// day more wraps negative and puts the cutoff in the future.
+		{strconv.Itoa(RetentionMaxDays), RetentionMaxDays, ""},
+		{strconv.Itoa(RetentionMaxDays + 1), 0, "at most"},
+		{"9223372036854775807", 0, "at most"},
+		{"99999999999999999999", 0, "whole number of days"},
 	} {
 		days, err := ParseRetentionWindow(tt.value)
 		if tt.err == "" {
@@ -42,6 +50,25 @@ func TestTheRetentionWindowIsReadStrictly(t *testing.T) {
 	}
 	if _, err := NewRetention(nil, 0); err == nil {
 		t.Error("a loop over a window of zero days was built; zero is off, not a loop")
+	}
+	if _, err := NewRetention(nil, RetentionMaxDays+1); err == nil {
+		t.Error("a loop over a window that does not fit a duration was built")
+	}
+	if _, err := NewRetention(nil, math.MaxInt); err == nil {
+		t.Error("a loop over the largest int was built")
+	}
+	// The largest window that fits still measures from the past.
+	st := &sweeper{}
+	r, err := NewRetention(st, RetentionMaxDays)
+	if err != nil {
+		t.Fatalf("the largest window was refused: %v", err)
+	}
+	if r.window <= 0 {
+		t.Fatalf("the largest window is %s", r.window)
+	}
+	r.Pass(context.Background())
+	if len(st.cutoffs) != 1 || !st.cutoffs[0].Before(time.Now().Add(-time.Hour)) {
+		t.Fatalf("the largest window measured from %v, want the distant past", st.cutoffs)
 	}
 }
 

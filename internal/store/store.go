@@ -811,11 +811,15 @@ func (s *Store) buildSchema() error {
 	if _, err := s.db.Exec(outboxQuery); err != nil {
 		return err
 	}
-	// The event is the root of the webhook family and stays. What the old
-	// worker derived from it - event_outbox_deliveries and its attempts - is
-	// not created any more: a delivery is a commitment in the outbound tables.
-	// On an upgraded database the two tables stay until
-	// migrations/drop-webhook-outbox.sql removes them by hand.
+	// The event is the root of the webhook family. It stays for as long as a
+	// claim on it holds a commitment; once it is older than the retention
+	// window by its fan-out and nothing holds it, the sweep removes it
+	// (outbound_retention_store.go). What the old worker derived from it -
+	// event_outbox_deliveries and its attempts - is not created any more: a
+	// delivery is a commitment in the outbound tables. On an upgraded database
+	// the two tables stay until migrations/drop-webhook-outbox.sql removes
+	// them by hand; the start removes their keys, so the sweep is not stopped
+	// by rows nothing reads.
 
 	// Drop FK on event_outbox.team_id - unknown teams are a valid runtime case
 	// (firehose-only alerts) and global webhook subscriptions must still fan-out.
