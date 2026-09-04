@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -594,9 +595,7 @@ func main() {
 		}))
 	}
 
-	// Static files for Web UI
-	e.Static("/", "web")
-	e.File("/", "web/index.html")
+	registerUI(e, "web")
 
 	// Register Routes
 	ingesterService.RegisterRoutes(e)
@@ -709,4 +708,28 @@ func getEnvOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// registerUI serves the web UI from dir, and every file of it with
+// Cache-Control: no-cache.
+//
+// One strategy for the whole UI, because it is one program: the HTML names
+// scripts, the module script imports other modules by bare URL, and a browser
+// that keeps one of them from the release before this one runs a UI that is
+// half upgraded - a module that asks the page for elements the old page does
+// not have, or a page that never loads the module the new feature lives in.
+// Version parameters on the script tags do not reach the imports, and
+// versioning only some of the imports would load the same module twice under
+// two URLs, each with its own state. no-cache does not forbid caching; it
+// makes every load revalidate, which the static handler answers with a 304
+// when the file has not changed.
+func registerUI(e *echo.Echo, dir string) {
+	ui := e.Group("", func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			c.Response().Header().Set("Cache-Control", "no-cache")
+			return next(c)
+		}
+	})
+	ui.Static("/", dir)
+	ui.File("/", filepath.Join(dir, "index.html"))
 }
