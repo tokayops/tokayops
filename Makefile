@@ -44,6 +44,21 @@ build: swagger
 test:
 	go test ./...
 
+# The Prometheus rules ship with the product and are checked like code: the
+# syntax, then the unit tests beside them. promtool comes from the
+# prom/prometheus image, pinned by digest (v3.5.0) because a tag can be moved
+# and a digest cannot: a new promtool cannot change what passes without a
+# change here. CI runs this same target.
+PROMETHEUS_IMAGE = prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+
+check-rules:
+	docker run --rm --entrypoint promtool \
+		-v "$(CURDIR)/deploy/prometheus:/rules:ro" $(PROMETHEUS_IMAGE) \
+		check rules /rules/tokayops.rules.yml
+	docker run --rm --entrypoint promtool \
+		-v "$(CURDIR)/deploy/prometheus:/rules:ro" -w /rules $(PROMETHEUS_IMAGE) \
+		test rules /rules/tokayops.rules.test.yml
+
 clean:
 	rm -f tokayops
 	rm -f docs/docs.go docs/swagger.json docs/swagger.yaml

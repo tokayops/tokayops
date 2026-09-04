@@ -579,5 +579,9 @@ func truncate(summary string) string {
 	if len(runes) <= SummaryLimit {
 		return summary
 	}
-	return string(runes[:SummaryLimit]) + "..."
+	// The limit is the whole summary, ellipsis included: what the journal
+	// holds is never longer than the limit says.
+	return string(runes[:SummaryLimit-len(ellipsis)]) + ellipsis
 }
+
+const ellipsis = "..."

@@ -87,28 +87,17 @@ jobs:
       run: go test -p 1 -tags=integration -v ./internal/...
 
   # The Prometheus rules ship with the product and are checked like code:
-  # syntax, and the unit tests beside them. The image is pinned by digest -
-  # prom/prometheus v3.5.0 - because a tag can be moved and a digest cannot;
-  # a new promtool cannot change what passes without a change here.
+  # syntax, and the unit tests beside them. The Makefile target is the one
+  # command for it, here and on an operator's machine, and it is where the
+  # promtool image is pinned by digest.
   rules:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
       uses: actions/checkout@v5
 
-    - name: Check the rules
-      run: |
-        docker run --rm --entrypoint promtool \
-          -v "$PWD/deploy/prometheus:/rules:ro" \
-          prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
-          check rules /rules/tokayops.rules.yml
-
-    - name: Test the rules
-      run: |
-        docker run --rm --entrypoint promtool \
-          -v "$PWD/deploy/prometheus:/rules:ro" -w /rules \
-          prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
-          test rules /rules/tokayops.rules.test.yml
+    - name: Check and test the rules
+      run: make check-rules
 
   build-and-push:
     runs-on: ubuntu-latest

@@ -360,15 +360,15 @@ func TestASummaryIsTruncatedWhereverItComesFrom(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build a conclusion: %v", err)
 	}
-	if runes := []rune(direct.Summary()); len(runes) > SummaryLimit+3 {
-		t.Fatalf("a summary of %d runes was kept whole", len(runes))
+	if runes := []rune(direct.Summary()); len(runes) != SummaryLimit || !strings.HasSuffix(direct.Summary(), "...") {
+		t.Fatalf("a summary of %d runes was kept; want exactly the limit, ellipsis included", len(runes))
 	}
 
 	folded, _ := Conclude(&wilfulHandler{}, createCall(), Result{
 		Evidence: PossiblySent, Summary: long,
 	}, nil)
-	if runes := []rune(folded.Summary()); len(runes) > SummaryLimit+3 {
-		t.Fatalf("the fold kept %d runes", len(runes))
+	if runes := []rune(folded.Summary()); len(runes) != SummaryLimit {
+		t.Fatalf("the fold kept %d runes, want exactly the limit", len(runes))
 	}
 }
 

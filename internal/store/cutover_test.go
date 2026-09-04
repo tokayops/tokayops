@@ -15,9 +15,12 @@ import (
 // instead, every statement in it is an IF EXISTS over nothing, and taking any
 // of them out would still pass.
 
-// legacyJobEngine builds the tables as the version before this one had them,
-// foreign keys included - the keys are what make the order the file is written
-// in the only order that works.
+// legacyJobEngine builds the tables as the `:develop` builds before the
+// cutover had them, foreign keys included - the keys are what make the order
+// the file is written in the only order that works. This is a step past the
+// last release: v0.1.0 had no job_dedup_policies and no dedup triple on a
+// job, and its exact schema is testdata/schema-v0.1.0.sql, which the upgrade
+// test starts from and runs the same file against.
 func legacyJobEngine(t *testing.T, s *Store) {
 	t.Helper()
 

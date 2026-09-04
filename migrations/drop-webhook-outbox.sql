@@ -11,10 +11,12 @@
 -- sure you will not roll back to a build that does not.
 --
 -- There is no way back, and the way it fails is quiet. An older build creates
--- these tables itself on start-up, so it comes up perfectly well - with no
+-- these tables itself on start-up, so its process may well come up - with no
 -- delivery history and, after the DELETE below, without the events it had
--- finished. It will not tell you anything is missing. Restoring a backup taken
--- before this ran is the only way back.
+-- finished. It will not tell you anything is missing, and it is not a working
+-- rollback either way: the build that made this file necessary also renamed
+-- the column every alert-group read of the older one uses. Restoring a backup
+-- taken before the upgrade is the only way back.
 --
 -- Webhook deliveries are commitments in the outbound tables now, and what they
 -- did is in outbound_attempts and outbound_intent_events. The delivery history

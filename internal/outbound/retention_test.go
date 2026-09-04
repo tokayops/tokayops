@@ -304,3 +304,26 @@ func TestTheFirstPassWaitsForTheStartDelay(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestTheLoopIsBuiltWithTheProductionCadence: a loop from the constructor
+// passes a minute after the start and hourly after that, in those units -
+// the checklist an operator reads the first pass by says a minute, and the
+// tests above build their loops by hand.
+func TestTheLoopIsBuiltWithTheProductionCadence(t *testing.T) {
+	r, err := NewRetention(&sweeper{}, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.first != time.Minute {
+		t.Errorf("the first pass is %s after the start, want a minute", r.first)
+	}
+	if r.interval != time.Hour {
+		t.Errorf("a pass every %s, want hourly", r.interval)
+	}
+	if r.window != 30*24*time.Hour {
+		t.Errorf("the window is %s, want 30 days", r.window)
+	}
+	if r.chunk != RetentionChunk || r.maxChunks != RetentionMaxChunks {
+		t.Errorf("chunks of %d, at most %d per pass", r.chunk, r.maxChunks)
+	}
+}

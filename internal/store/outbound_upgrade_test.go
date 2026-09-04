@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -875,15 +879,20 @@ func TestAStartRefusesAPayloadItCannotDigest(t *testing.T) {
 	}
 }
 
-// TestAStartUpgradesTheDatabaseOfThePreviousRelease is the upgrade as an
-// installation meets it, in one start: the delivery domain as the version
-// before this one wrote it - no event on a claim, no fan-out date on an
-// event, no kind on a journal line, and none of the indexes those came with -
-// and beside it the job engine's tables and the old webhook worker's tables,
+// TestAStartUpgradesADatabaseThatFollowedDevelop is the upgrade an
+// installation running the `:develop` images before this version meets, in
+// one start: the delivery domain already knowing the webhook family, but
+// with no event on a claim, no fan-out date on an event, no kind on a journal
+// line, and none of the indexes those came with - and beside it the job
+// engine's tables in their last shape and the old webhook worker's tables,
 // still standing and still holding rows, with the old worker's keys to the
 // events and the subscribers. Each thing the start fills in is read back
 // against what it was filled in from.
-func TestAStartUpgradesTheDatabaseOfThePreviousRelease(t *testing.T) {
+//
+// This is not the upgrade from the last release: that database has no
+// delivery domain at all, and TestAStartUpgradesTheDatabaseOfTheLastRelease
+// starts from its exact schema.
+func TestAStartUpgradesADatabaseThatFollowedDevelop(t *testing.T) {
 	s := setupTestDB(t)
 	teamOne(t, s)
 	group := outboundGroup(t, s)
@@ -1045,3 +1054,208 @@ func TestAStartUpgradesTheDatabaseOfThePreviousRelease(t *testing.T) {
 }
 
 func str(v string) *string { return &v }
+
+// throwawayDatabase is a database of the test's own, built from a schema
+// file, with a store open on it; it is dropped when the test ends. The
+// suite's database has been through this version's start already, which is
+// exactly what a test of that start on an older shape cannot use.
+func throwawayDatabase(t *testing.T, schemaFile string) *Store {
+	t.Helper()
+	dsn, err := url.Parse(os.Getenv("TEST_DB_DSN"))
+	if err != nil {
+		t.Fatalf("read TEST_DB_DSN: %v", err)
+	}
+	name := "upgrade_" + strings.ReplaceAll(uuid.New().String()[:13], "-", "")
+	if _, err := testStore.db.Exec(`CREATE DATABASE ` + name); err != nil {
+		t.Fatalf("create the throwaway database: %v", err)
+	}
+	dsn.Path = "/" + name
+	s, err := NewStore(dsn.String())
+	if err != nil {
+		t.Fatalf("open the throwaway database: %v", err)
+	}
+	t.Cleanup(func() {
+		s.Close()
+		if _, err := testStore.db.Exec(`DROP DATABASE ` + name + ` WITH (FORCE)`); err != nil {
+			t.Errorf("drop the throwaway database: %v", err)
+		}
+	})
+	schema, err := os.ReadFile(filepath.Join("testdata", schemaFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(string(schema)); err != nil {
+		t.Fatalf("build %s: %v", schemaFile, err)
+	}
+	return s
+}
+
+// TestAStartUpgradesTheDatabaseOfTheLastRelease is the upgrade every
+// installation on the last release makes: the schema exactly as v0.1.0's own
+// start built it (testdata/schema-v0.1.0.sql, dumped from it), holding the
+// rows that release wrote - a team, an alert group under the old name of its
+// key column, a finished escalation job and the message it delivered, a
+// webhook subscriber, an event the old worker sent with the delivery row and
+// attempt it wrote, an event it gave up on, and an event it had not reached -
+// and no delivery domain at all. One start of this version brings it up, and
+// what the start fills in is read back against the rows it was filled in
+// from.
+func TestAStartUpgradesTheDatabaseOfTheLastRelease(t *testing.T) {
+	s := throwawayDatabase(t, "schema-v0.1.0.sql")
+	if relationExists(t, s, "outbound_intents") || !hasColumn(t, s, "alert_groups", "dedup_key") {
+		t.Fatal("the schema file is not the last release's")
+	}
+
+	cfg, _ := json.Marshal(model.GenericWebhookConfig{URL: "https://example.com/hook", Secret: "s"})
+	sealed, err := encryptConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const group, subscriber, sent, failed, pending, delivery = "ag-1", "int-1", "evt-sent", "evt-failed", "evt-pending", "del-1"
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO teams (id, name, created_at) VALUES ('team-1', 'Team One', now())`, nil},
+		{`INSERT INTO alert_groups (id, dedup_key, status, title, team_id, team_name_snapshot, severity, created_at, updated_at)
+			VALUES ($1, 'group-key', 'resolved', 'Disk filling up', 'team-1', 'Team One', 'critical', now() - interval '6 days', now() - interval '6 days')`, []any{group}},
+		{`INSERT INTO jobs (id, type, status, alert_group_id, created_at, updated_at, finished_at)
+			VALUES ('job-1', 'escalation', 'completed', $1, now() - interval '6 days', now() - interval '6 days', now() - interval '6 days')`, []any{group}},
+		{`INSERT INTO notification_deliveries (id, alert_group_id, provider, kind, target_type, target_id)
+			VALUES ('nd-1', $1, 'slack', 'channel', 'channel', 'C-ops')`, []any{group}},
+		{`INSERT INTO integrations (id, type, direction, name, enabled, config, scope, team_id)
+			VALUES ($1, 'generic_webhook', 'outbound', 'hook', true, $2, 'team', 'team-1')`, []any{subscriber, sealed}},
+		{`INSERT INTO event_outbox (id, event_type, alert_group_id, team_id, payload, status, attempts, created_at, sent_at)
+			VALUES ($1, 'alert_group.firing', $2, 'team-1', $3, 'completed', 1, now() - interval '4 days', now() - interval '3 days')`,
+			[]any{sent, group, `{"event":"alert_group.firing","alert_group":{"id":"` + group + `"}}`}},
+		{`INSERT INTO event_outbox (id, event_type, alert_group_id, team_id, payload, status, attempts, last_error, created_at)
+			VALUES ($1, 'alert_group.acknowledged', $2, 'team-1', $3, 'failed', 8, 'HTTP 404', now() - interval '5 days')`,
+			[]any{failed, group, `{"event":"alert_group.acknowledged","alert_group":{"id":"` + group + `"}}`}},
+		{`INSERT INTO event_outbox (id, event_type, alert_group_id, team_id, payload, status, created_at)
+			VALUES ($1, 'alert_group.resolved', $2, 'team-1', $3, 'pending', now() - interval '1 hour')`,
+			[]any{pending, group, `{"event":"alert_group.resolved","alert_group":{"id":"` + group + `"}}`}},
+		{`INSERT INTO event_outbox_deliveries (id, event_id, integration_id, status, attempts, last_http_status, created_at, sent_at)
+			VALUES ($1, $2, $3, 'sent', 1, 200, now() - interval '4 days', now() - interval '3 days')`, []any{delivery, sent, subscriber}},
+		{`INSERT INTO event_outbox_delivery_attempts (id, delivery_id, attempt, http_status)
+			VALUES ('att-1', $1, 1, 200)`, []any{delivery}},
+	} {
+		if _, err := s.db.Exec(statement.sql, statement.args...); err != nil {
+			t.Fatalf("write the last release's rows: %v\n%s", err, statement.sql)
+		}
+	}
+	for _, key := range []string{"event_outbox_deliveries_event_id_fkey", "event_outbox_deliveries_integration_id_fkey"} {
+		if countWhere(t, s, `SELECT count(*) FROM pg_constraint WHERE conname = $1`, key) != 1 {
+			t.Fatalf("the last release has no %s to remove", key)
+		}
+	}
+
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("the start refused the last release's database: %v", err)
+	}
+
+	// The key column of an alert group is renamed, and the group is still there
+	// under it.
+	if hasColumn(t, s, "alert_groups", "dedup_key") || !hasColumn(t, s, "alert_groups", "alert_key") {
+		t.Error("the alert group's key column was not renamed")
+	}
+	if countWhere(t, s, `SELECT count(*) FROM alert_groups WHERE alert_key = 'group-key'`) != 1 {
+		t.Error("the alert group did not survive the start")
+	}
+
+	// The delivery domain arrives whole, with the six indexes this version
+	// added to it.
+	for _, table := range []string{"outbound_batches", "outbound_intents", "outbound_attempts",
+		"outbound_attempt_observations", "outbound_intent_events", "outbound_group_snapshots",
+		"integration_tombstones"} {
+		if !relationExists(t, s, table) {
+			t.Errorf("%s did not arrive", table)
+		}
+	}
+	for _, index := range []string{
+		"idx_outbound_batches_event", "idx_outbound_intents_batch", "idx_outbound_intents_journal",
+		"idx_outbound_batches_no_targets", "idx_outbound_intents_retention", "idx_event_outbox_retention",
+	} {
+		if !relationExists(t, s, index) {
+			t.Errorf("%s did not arrive", index)
+		}
+	}
+	var notNull bool
+	if err := s.db.QueryRow(`SELECT attnotnull FROM pg_attribute
+		WHERE attrelid = 'outbound_intent_events'::regclass AND attname = 'actor_kind'`).Scan(&notNull); err != nil || !notNull {
+		t.Errorf("actor_kind is not required after the upgrade: %v", err)
+	}
+
+	// The old worker's events are dated by when it sent them or, failing
+	// that, made them; the one it had not reached is not dated.
+	dated := func(id string) *time.Time {
+		var at *time.Time
+		if err := s.db.QueryRow(`SELECT fanned_out_at FROM event_outbox WHERE id = $1`, id).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	if at := dated(sent); at == nil || time.Since(*at) < 2*day || time.Since(*at) > 4*day {
+		t.Errorf("the event the old worker sent is dated %v, want when it was sent", at)
+	}
+	if at := dated(failed); at == nil || time.Since(*at) < 4*day || time.Since(*at) > 6*day {
+		t.Errorf("the event the old worker gave up on is dated %v, want when it was made", at)
+	}
+	if at := dated(pending); at != nil {
+		t.Errorf("the waiting event is dated %v, want no date", at)
+	}
+
+	// The old worker's keys are gone; its rows, and the job engine's, are
+	// exactly where they were.
+	for _, key := range []string{"event_outbox_deliveries_event_id_fkey", "event_outbox_deliveries_integration_id_fkey"} {
+		if countWhere(t, s, `SELECT count(*) FROM pg_constraint WHERE conname = $1`, key) != 0 {
+			t.Errorf("the start left %s", key)
+		}
+	}
+	for table, want := range map[string]int{"jobs": 1, "notification_deliveries": 1,
+		"event_outbox_deliveries": 1, "event_outbox_delivery_attempts": 1} {
+		if n := countWhere(t, s, `SELECT count(*) FROM `+table); n != want {
+			t.Errorf("%s holds %d rows after the start, want %d untouched", table, n, want)
+		}
+	}
+
+	// And the domain goes on from there: the event the old worker had not
+	// reached is fanned out by this build to the subscriber that release
+	// wrote, under a claim that names the event.
+	fanOutNext(t, s)
+	if n := countWhere(t, s, `SELECT count(*) FROM outbound_batches WHERE event_id = $1 AND key_kind = 'webhook_event'`, pending); n != 1 {
+		t.Errorf("the waiting event has %d claims after the first fan-out, want one", n)
+	}
+	if got := webhookCommitmentTo(t, s, subscriber); got == "" {
+		t.Error("nothing is owed to the last release's subscriber")
+	}
+
+	// The transition the checklist ends with, on this database: both files,
+	// in the order they are listed, remove what the last release left and
+	// nothing else, and a start afterwards puts nothing back.
+	for _, file := range []string{"drop-job-engine.sql", "drop-webhook-outbox.sql"} {
+		path := filepath.Join("..", "..", "migrations", file)
+		statements, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec(string(statements)); err != nil {
+			t.Fatalf("%s on the last release's database: %v", file, err)
+		}
+	}
+	assertJobEngineGone(t, s, "the transition")
+	for _, gone := range []string{"event_outbox_deliveries", "event_outbox_delivery_attempts"} {
+		if relationExists(t, s, gone) {
+			t.Errorf("%s survived the transition", gone)
+		}
+	}
+	if n := countWhere(t, s, `SELECT count(*) FROM event_outbox`); n != 1 {
+		t.Errorf("%d events after the transition, want only the one this build fanned out", n)
+	}
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("start after the transition: %v", err)
+	}
+	assertJobEngineGone(t, s, "a start after the transition")
+	if got, err := s.GetAlertGroupByID(group); err != nil || got == nil {
+		t.Fatalf("read the alert group after the transition: %v, %v", got, err)
+	}
+}

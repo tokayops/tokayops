@@ -100,10 +100,13 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   30 is clamped to 30; and a custom header named `Content-Type` or `X-Tokay-*`
   is ignored.
 - **Prometheus needs three things checked.** Load
-  `deploy/prometheus/tokayops.rules.yml` (its unit tests run in CI) and drop
-  any alert you wrote on the `outbox_*` metrics or on
+  `deploy/prometheus/tokayops.rules.yml` (its unit tests run in CI, and
+  `make check-rules` runs the same promtool locally) and drop any alert you
+  wrote on the six removed `outbox_*` metrics listed under Removed below or on
   `notification_errors_total`: those series are gone, and a rule on a series
-  nobody exports never fires and never says so. Set `scrape_timeout` for the
+  nobody exports never fires and never says so. `outbox_events_by_status` is
+  not among them - it stays, and a rule on it keeps working. Set
+  `scrape_timeout` for the
   TokayOps job **strictly greater than 5 seconds** - `/metrics` gives the
   database five seconds for its snapshot and answers without those series
   after that, and a scrape timeout of five or less races it. Keep **at least
@@ -173,15 +176,16 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   One line of text used to be composed once and handed to every channel. The
   facts travel now - the team, the schedule, when the shift starts and ends -
   and each channel writes them its own way.
-- **`outbound_admissions_total` carries a `family` label** (`notification` or
-  `handoff`). Its `no_targets` outcome means different things for a page and for
-  a shift-change announcement, and a rule cannot be written on the two mixed
-  together. `outbound_admission_latency_seconds` gains buckets up to 900
-  seconds, because a queue of announcements lives in the hundreds and with the
-  old last bucket at 60 every healthy observation fell into `+Inf` and read as
-  a minute. `outbound_queue_lateness_seconds` reports both families from the
-  first scrape, so a rule about handover work can be written before the first
-  shift change rather than after it.
+- **`outbound_admissions_total` carries a `family` label** (`notification`,
+  `handoff` or `webhook`). Its `no_targets` outcome means different things for
+  a page, for a shift-change announcement and for a webhook event, and a rule
+  cannot be written on them mixed together. `outbound_admission_latency_seconds`
+  gains buckets up to 900 seconds, because a queue of announcements lives in
+  the hundreds and with the old last bucket at 60 every healthy observation
+  fell into `+Inf` and read as a minute. `outbound_queue_lateness_seconds`
+  reports every family from the first scrape, so a rule about handover or
+  webhook work can be written before the first shift change or event rather
+  than after it.
 - **A notification that keeps failing keeps being retried.** There is no attempt
   limit any more: a delivery that fails in a way worth retrying is tried again,
   with a growing wait between tries, until it succeeds, until the alert is
@@ -296,8 +300,8 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   migrat`, or a command line that repeats the binary's own path because the
   image already runs it, used to fall through and bring up a second full
   instance - notifier, syncer and workers - beside the running one. The binary
-  now refuses, lists the commands it knows, and does so before it opens the
-  database.
+  now refuses, lists the commands it knows, and does so before it opens
+  the database.
 - Deleting a webhook subscriber that has delivery history no longer answers
   500. The subscriber is deleted, what was still owed to it is withdrawn, and
   its history stays readable through the delivery list and detail routes.
@@ -382,8 +386,10 @@ database.
   died; `outbound_retention_window_days`,
   `outbound_retention_last_success_timestamp_seconds` (absent until the first
   successful pass) and `outbound_retention_deleted_total{table}` for the
-  sweep; and `outbound_no_targets_admissions_total`, read from the database,
-  for alerts admitted with nobody to page. `/metrics` gives the database
+  sweep; and `outbound_no_targets_admissions_total`, read from the database
+  and labelled by family, for admissions that found nobody to deliver to: an
+  alert with nobody to page, a shift change with nobody to tell, an event with
+  no subscriber. `/metrics` gives the database
   snapshot five seconds and answers without those series after that instead
   of holding the scrape.
 - `deploy/prometheus/tokayops.rules.yml`: the alerting and recording rules
@@ -402,10 +408,13 @@ database.
 
   When you are sure you will not roll back, `migrations/drop-job-engine.sql`
   removes them, along with two `alert_groups` columns that belonged to the same
-  loop. It is run by hand, never at startup, and there is no way back from it -
-  an older image started afterwards comes up perfectly well on an empty job
-  engine and says nothing about the work and history that are missing. Only a
-  backup taken beforehand restores them. Until then, note that the addresses of
+  loop. It is run by hand, never at startup, and there is no way back from it.
+  An older image started afterwards may well start - it creates the empty
+  tables itself - but that is not a working rollback: this version renamed the
+  column every alert-group read of the older one uses, and the two
+  `alert_groups` columns the file removes are ones it reads, so its alert API
+  and its engine fail on the first alert, and nothing says why. Only a backup
+  taken before the upgrade restores anything. Until then, note that the addresses of
   erased users survive in `notification_deliveries`: erasure never covered that
   table, and dropping it is what finally removes them.
 - `job_steps_processed_total`, `notification_sent_total` and
@@ -422,7 +431,8 @@ database.
   one keeps them unread until `migrations/drop-webhook-outbox.sql` removes
   them by hand, together with the events the old worker had finished. The
   same warning as for the job engine applies: an older image started
-  afterwards comes up on an empty delivery history and says nothing about it.
+  afterwards is not a working rollback, whatever it prints at start-up; only
+  a backup taken before the upgrade is.
 
 ## [0.1.0] - 2026-08-18
 
