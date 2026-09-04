@@ -758,6 +758,11 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		// with channel=D0123" - an address in prose.
 		"outbound_attempts.response_summary":             true,
 		"outbound_attempt_observations.response_summary": true,
+
+		// The name of the message a delivery made - channel/timestamp,
+		// chat/message - which for a direct message is an address. Nulled with
+		// the coordinates, the FACT of the receipt kept beside it.
+		"outbound_intents.receipt_ref": true,
 	}
 	// Columns that survive by design: immutable identity references that
 	// history is joined on.
@@ -790,6 +795,70 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		// database and a candidate list.
 		"outbound_attempts.completion_fingerprint":             true,
 		"outbound_attempt_observations.completion_fingerprint": true,
+
+		// What a delivery wrote into the alert's history: the delivery's id,
+		// its provider, and the target kind and reference - the same class as
+		// outbound_intents.target_ref above, an internal id that keeps the
+		// history explicable after the person is gone.
+		"timeline_events.metadata": true,
+
+		// The state of the alert group at the moment its escalation was
+		// admitted, on a claim that is never deleted. It holds the same names
+		// alert_groups.acknowledged_by holds, and is protected by a digest:
+		// rewriting it would be rewriting the digest, that is, legalising a
+		// substitution.
+		"outbound_batches.admission_snapshot": true,
+		// One row per group, the same composition as alert_groups itself.
+		"outbound_group_snapshots.snapshot": true,
+		// The schedule as it was configured at that revision: rotation members
+		// by user id, the same class as users.id, which the directory turns
+		// into names on read - and into "Deleted user" for somebody erased.
+		"schedule_revisions.snapshot": true,
+		// The alert domain's snapshot of who was on call: full users with their
+		// email. Outside this epic, and named here with the bug that owns it
+		// (bug 14, "ids in the snapshot, names on read") rather than glossed.
+		"alert_groups.oncall_snapshot": true,
+	}
+
+	// Columns that are live data for as long as their row is work, which
+	// erasure leaves alone for the reason it leaves a pending commitment's
+	// payload alone - it is immutable under a digest, and a message half
+	// composed is not a message - and which go with the row when retention
+	// takes it. What "work is over" means is part of the classification, not
+	// a footnote: a live row that is stuck is an incident, not a policy.
+	liveThenRetention := map[string]bool{
+		// The message as admitted. Live while pending, sending, idle or in
+		// review; an idle card lives with its open alert group, whose names
+		// are in alert_groups anyway. Ends with a terminal status - its own, an
+		// acknowledgement's, or an operator's - and then with the sweep.
+		"outbound_intents.payload": true,
+
+		// The event the fan-out has not taken yet, and the name it was raised
+		// under. Live while pending or processing; ends fanned_out, and goes
+		// when its commitments have gone. Stuck live is an incident - the
+		// fan-out stopped, or a row this build cannot read holding the queue -
+		// and the operator fixes the fan-out or the row; there is no command
+		// that deletes an event. Erasing the person who acknowledged leaves
+		// their name in the event and then in the commitments: the same class
+		// as erasing the recipient of a pending commitment. The old worker's
+		// completed and failed events are in the sweep too.
+		"event_outbox.payload": true,
+		"event_outbox.actor":   true,
+
+		// Who wrote a journal line: a user by id, a component by name, or the
+		// text a build before this one wrote - which includes display names of
+		// the people who acknowledged, the same class as timeline_events.actor.
+		// The kind says which. Goes with the commitment.
+		"outbound_intent_events.actor":      true,
+		"outbound_intent_events.actor_kind": true,
+		// The domain's own phrases, and since the operator's door a person's
+		// free text. Goes with the commitment; erasure does not search it.
+		"outbound_intent_events.reason": true,
+		// JSONB of a closed shape: the revision, whether it was final and why
+		// (desired_raised), the worker's id (effect_bound). No personal data by
+		// construction - named so that a future writer does not put a name in
+		// it quietly.
+		"outbound_intent_events.detail": true,
 	}
 
 	rows, err := s.db.Query(`
@@ -815,6 +884,22 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		       OR column_name = 'receipt'
 		       OR column_name = 'response_summary'
 		       OR column_name = 'completion_fingerprint'
+		       -- The name of the message a delivery made; an address for a
+		       -- direct message.
+		       OR column_name = 'receipt_ref'
+		       -- JSON and free text: what the scan cannot read into, and what it
+		       -- can make somebody name a policy for. A message as admitted, an
+		       -- event as raised, the snapshots of alerts and admissions, who
+		       -- wrote a line and why, and the facts beside it.
+		       OR column_name = 'payload'
+		       OR column_name = 'admission_snapshot'
+		       OR column_name = 'snapshot'
+		       OR column_name = 'oncall_snapshot'
+		       OR column_name = 'actor'
+		       OR column_name = 'actor_kind'
+		       OR column_name = 'reason'
+		       OR column_name = 'detail'
+		       OR column_name = 'metadata'
 		       OR (table_name = 'users' AND column_name IN
 		           ('id', 'email', 'name', 'role', 'password_hash', 'auth_provider', 'deleted_at')))
 		ORDER BY table_name, column_name`)
@@ -832,7 +917,7 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		}
 		key := table + "." + column
 		seen[key] = true
-		if !erased[key] && !byDesign[key] {
+		if !erased[key] && !byDesign[key] && !liveThenRetention[key] {
 			unclassified = append(unclassified, key)
 		}
 	}
@@ -840,8 +925,26 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		t.Fatalf("rows: %v", err)
 	}
 	if len(unclassified) > 0 {
-		t.Fatalf("columns referring to a user that nobody classified as erased or kept by design: %v",
-			unclassified)
+		t.Fatalf("columns referring to a user that nobody classified as erased, kept by design, "+
+			"or live then retained: %v", unclassified)
+	}
+
+	// The three categories do not overlap: a column with two policies has
+	// none.
+	var twice []string
+	for key := range erased {
+		if byDesign[key] || liveThenRetention[key] {
+			twice = append(twice, key)
+		}
+	}
+	for key := range byDesign {
+		if liveThenRetention[key] {
+			twice = append(twice, key)
+		}
+	}
+	if len(twice) > 0 {
+		sort.Strings(twice)
+		t.Fatalf("columns classified twice: %v", twice)
 	}
 
 	// The classification is checked in both directions, because a name that
@@ -857,9 +960,12 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 		"acknowledged_by": true, "resolved_by": true,
 		"target_ref": true, "bound_endpoint": true,
 		"receipt": true, "response_summary": true, "completion_fingerprint": true,
+		"receipt_ref": true, "payload": true, "admission_snapshot": true, "snapshot": true,
+		"oncall_snapshot": true, "actor": true, "actor_kind": true, "reason": true,
+		"detail": true, "metadata": true,
 	}
 	var phantom []string
-	for _, set := range []map[string]bool{erased, byDesign} {
+	for _, set := range []map[string]bool{erased, byDesign, liveThenRetention} {
 		for key := range set {
 			column := key[strings.LastIndex(key, ".")+1:]
 			if scannedNames[column] && !seen[key] {

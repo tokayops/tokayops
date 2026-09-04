@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -949,5 +951,87 @@ func TestRetentionRemovesAnEventTheOldTableStillNames(t *testing.T) {
 	}
 	if countWhere(t, s, `SELECT count(*) FROM event_outbox_deliveries WHERE event_id = $1`, event) != 1 {
 		t.Error("the old worker's row did not survive as an orphan")
+	}
+}
+
+// TestAnErasedActorLeavesTheEventAndItsCommitmentUntilRetention: the person
+// who acknowledged is erased; the event raised under their name and the
+// webhook body derived from it are left byte for byte - live data under a
+// digest - and once both are finished and past the window the sweep takes
+// both rows. That is the policy for what erasure leaves alone: a term, not
+// a scrub.
+func TestAnErasedActorLeavesTheEventAndItsCommitmentUntilRetention(t *testing.T) {
+	s := setupTestDB(t)
+	ctx := context.Background()
+	seedTeam(t, s, "devops")
+	for _, u := range []model.User{
+		{ID: "root", Email: "root@example.com", Name: "Root"},
+		{ID: "alice", Email: "alice@example.com", Name: "Alice"},
+	} {
+		if err := s.CreateUser(&u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.AddTeamMember("devops", "alice", model.TeamMemberRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	hooks := subscriber(t, s, "hooks", model.WebhookScopeGlobal, "", true)
+	agID := uuid.New().String()
+	if err := s.CreateAlertGroup(&model.AlertGroup{
+		ID: agID, AlertKey: "erasure-" + agID, Status: model.AlertGroupStatusNew, Title: "Disk", Severity: "critical",
+		TeamID: "devops", Alerts: []model.Alert{{Fingerprint: "fp", Status: "firing"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	webhookEventFor(t, s, agID, "devops", model.OutboxEventAcknowledged,
+		`{"event":"alert_group.acknowledged","actor":{"name":"Alice","email":"alice@example.com"}}`)
+	owed := onlyOne(t, commitmentsOwedTo(t, s, hooks))
+	var eventID string
+	var eventBefore, eventActorBefore string
+	if err := s.db.QueryRow(`SELECT id, payload::text, actor FROM event_outbox WHERE alert_group_id = $1`, agID).
+		Scan(&eventID, &eventBefore, &eventActorBefore); err != nil {
+		t.Fatalf("read the event: %v", err)
+	}
+	intentBefore, err := s.GetIntent(ctx, owed.ID)
+	if err != nil || intentBefore == nil {
+		t.Fatal(err)
+	}
+
+	if err := erasure.NewService(s.ErasureRepository()).Erase(ctx, "alice"); err != nil {
+		t.Fatalf("erase alice: %v", err)
+	}
+	var eventAfter, eventActorAfter string
+	if err := s.db.QueryRow(`SELECT payload::text, actor FROM event_outbox WHERE id = $1`, eventID).
+		Scan(&eventAfter, &eventActorAfter); err != nil {
+		t.Fatalf("read the event again: %v", err)
+	}
+	intentAfter, err := s.GetIntent(ctx, owed.ID)
+	if err != nil || intentAfter == nil {
+		t.Fatal(err)
+	}
+	if eventAfter != eventBefore || eventActorAfter != eventActorBefore {
+		t.Fatalf("erasure changed the event:\n  %s %s\n  %s %s", eventActorBefore, eventBefore, eventActorAfter, eventAfter)
+	}
+	if !bytes.Equal(intentBefore.Payload, intentAfter.Payload) || !strings.Contains(string(intentAfter.Payload), "alice@example.com") {
+		t.Fatalf("erasure changed the body:\n  %s\n  %s", intentBefore.Payload, intentAfter.Payload)
+	}
+
+	// Both finish - the subscriber is switched off, which withdraws the
+	// delivery - and both pass the window.
+	off, on := false, true
+	for _, enabled := range []*bool{&off, &on} {
+		if _, err := s.UpdateIntegration(ctx, hooks, IntegrationPatch{Enabled: enabled}, "root"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ageIntent(t, s, owed.ID, 31*day)
+	ageEvent(t, s, eventID, 31*day)
+	got := sweepOlderThan(t, s, 30*day)
+	if got.Deleted.Intents != 1 || got.Deleted.Outbox != 1 {
+		t.Fatalf("the sweep reports %+v; want the commitment and the event gone", got.Deleted)
+	}
+	if countWhere(t, s, `SELECT count(*) FROM outbound_intents WHERE id = $1`, owed.ID) != 0 ||
+		countWhere(t, s, `SELECT count(*) FROM event_outbox WHERE id = $1`, eventID) != 0 {
+		t.Fatal("a row naming the erased person outlived the window")
 	}
 }
