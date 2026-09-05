@@ -444,10 +444,12 @@ func (s *Store) submitEscalation(ctx context.Context, batch outbound.Batch,
 	// would start from nothing.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO outbound_group_snapshots
-			(alert_group_id, revision, snapshot_schema_version, snapshot, snapshot_digest)
-		VALUES ($1, $2, $3, $4, $5)`,
+			(alert_group_id, revision, snapshot_schema_version, snapshot, snapshot_digest,
+			 card_digest, thread_digest)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		admission.AlertGroupID, admission.Revision, admission.SnapshotSchemaVersion,
-		frozen, admission.Snapshot.Digest()); err != nil {
+		frozen, admission.Snapshot.Digest(),
+		admission.Snapshot.CardDigest(), admission.Snapshot.ThreadDigest()); err != nil {
 		return outbound.SubmitResult{}, fmt.Errorf("store the snapshot: %w", err)
 	}
 

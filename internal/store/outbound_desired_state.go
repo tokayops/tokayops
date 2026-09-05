@@ -81,15 +81,15 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 	}
 
 	var (
-		revision      int64
-		digest        []byte
-		schemaVersion int
-		final         bool
+		revision               int64
+		digest, cards, threads []byte
+		schemaVersion          int
+		final                  bool
 	)
 	err := tx.QueryRowContext(ctx, `
-		SELECT revision, snapshot_digest, snapshot_schema_version, final
+		SELECT revision, snapshot_digest, card_digest, thread_digest, snapshot_schema_version, final
 		FROM outbound_group_snapshots WHERE alert_group_id = $1`,
-		req.AlertGroupID).Scan(&revision, &digest, &schemaVersion, &final)
+		req.AlertGroupID).Scan(&revision, &digest, &cards, &threads, &schemaVersion, &final)
 	if errors.Is(err, sql.ErrNoRows) {
 		return outbound.DesiredStateResult{Outcome: outbound.DesiredNoSnapshot}, nil
 	}
@@ -139,6 +139,15 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 		}, nil
 	}
 
+	// Which forms are raised: a field one form does not show must not send
+	// that form an edit. A note moves the thread and leaves the card alone;
+	// the button switch moves the card and leaves the thread alone; the final
+	// revision reaches everything, because it is the last one there will be.
+	// The two digests see every tag between them, so a changed snapshot
+	// raises at least one form.
+	raiseCards := req.Reason.Final() || !bytes.Equal(candidate.CardDigest(), cards)
+	raiseThreads := req.Reason.Final() || !bytes.Equal(candidate.ThreadDigest(), threads)
+
 	// Rebuilt rather than renumbered: the number lives inside the snapshot as
 	// well as in its column, and storing the candidate under a number it does
 	// not contain makes a row every reader is obliged to refuse.
@@ -156,10 +165,12 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 	written, err := tx.ExecContext(ctx, `
 		UPDATE outbound_group_snapshots
 		SET revision = $2, snapshot = $3, snapshot_digest = $4,
-		    snapshot_schema_version = $5, final = $6, updated_at = now()
+		    snapshot_schema_version = $5, final = $6, updated_at = now(),
+		    card_digest = $8, thread_digest = $9
 		WHERE alert_group_id = $1 AND revision = $7 AND final = FALSE`,
 		req.AlertGroupID, next, encoded, stored.Digest(),
 		stored.SchemaVersion(), req.Reason.Final(), revision,
+		stored.CardDigest(), stored.ThreadDigest(),
 	)
 	if err != nil {
 		return outbound.DesiredStateResult{}, fmt.Errorf(
@@ -188,7 +199,7 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 				"- the group's row was not held", req.AlertGroupID, revision)
 	}
 
-	touched, err := aimEditableIntentsTx(ctx, tx, req, next)
+	touched, err := aimEditableIntentsTx(ctx, tx, req, next, raiseCards, raiseThreads)
 	if err != nil {
 		return outbound.DesiredStateResult{}, err
 	}
@@ -210,8 +221,13 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 // A commitment already retrying keeps its next attempt where it was. It is
 // already coming back, and pulling it forward would let a card being updated
 // every few seconds outrun the backoff its provider asked for.
+//
+// By form: the cards when what a card shows moved, the threads when what a
+// thread shows moved. A commitment left alone stays parked at the revision it
+// applied - legitimately behind the group's number, and not counted as behind
+// by anything, because what it shows is what the group shows.
 func aimEditableIntentsTx(ctx context.Context, tx *sql.Tx,
-	req outbound.DesiredStateRequest, revision int64) ([]string, error) {
+	req outbound.DesiredStateRequest, revision int64, cards, threads bool) ([]string, error) {
 
 	rows, err := tx.QueryContext(ctx, `
 		UPDATE outbound_intents
@@ -221,8 +237,10 @@ func aimEditableIntentsTx(ctx context.Context, tx *sql.Tx,
 		    updated_at = now()
 		WHERE alert_group_id = $1 AND form = $3
 		  AND status IN ('idle', 'pending', 'sending', 'manual_review')
+		  AND ((target_kind <> $6 AND $4) OR (target_kind = $6 AND $5))
 		RETURNING id`,
-		req.AlertGroupID, revision, string(outbound.FormEditable))
+		req.AlertGroupID, revision, string(outbound.FormEditable),
+		cards, threads, string(keys.TargetThread))
 	if err != nil {
 		return nil, fmt.Errorf("aim the commitments of %s: %w", req.AlertGroupID, err)
 	}
@@ -295,11 +313,26 @@ func groupViewTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 			"read the team of %s: %w", req.AlertGroupID, err)
 	}
 
+	// The history the thread shows and the buttons the card shows, from the
+	// database inside this transaction: what this revision is drawn from is
+	// what stood when it was raised.
+	history, omitted, err := timelineTailTx(ctx, tx, req.AlertGroupID)
+	if err != nil {
+		return providers.GroupView{}, err
+	}
+	buttons, err := interactiveProvidersTx(ctx, tx, env.selfURL)
+	if err != nil {
+		return providers.GroupView{}, err
+	}
+
 	return providers.GroupView{
-		Group:         group,
-		SelfURL:       env.selfURL,
-		TeamOnboarded: onboarded,
-		Zone:          env.displayZone(),
+		Group:           group,
+		SelfURL:         env.selfURL,
+		TeamOnboarded:   onboarded,
+		Zone:            env.displayZone(),
+		Timeline:        history,
+		TimelineOmitted: omitted,
+		Interactive:     buttons,
 	}, nil
 }
 
@@ -343,6 +376,10 @@ func reasonMatchesGroup(reason outbound.DesiredReason, status model.AlertGroupSt
 			return outboundContractf(
 				"alerts were merged into %s, an incident that is already over", status)
 		}
+	case outbound.DesiredNote, outbound.DesiredInteractivity:
+		// Any state: a note on a finished incident is still a line of its
+		// history, and a switch moves for every card. What is over is
+		// answered by the snapshot's finality, as stale_after_final.
 	}
 	return nil
 }

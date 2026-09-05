@@ -198,6 +198,7 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	// Components
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
 	renderer := schedulerender.New(s.ScheduleReadRepository())
+	s.SetRenderEnvironment(cfg.Global.SelfURL, "UTC")
 	eng := engine.NewEngine(s, renderer, &testSettings{}, cfg)
 	// The engine admits commitments and the outbound workers send them. The
 	// channel below stands in for Slack, and resolves an address by taking the

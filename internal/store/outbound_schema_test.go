@@ -385,8 +385,8 @@ func TestOutboundFingerprintsAreDigests(t *testing.T) {
 				_, err := s.db.Exec(`
 					INSERT INTO outbound_group_snapshots
 						(alert_group_id, revision, snapshot_schema_version,
-						 snapshot, snapshot_digest)
-					VALUES ($1, 0, 1, '{}'::jsonb, $2)`, outboundGroup(t, s), l.bytes)
+						 snapshot, snapshot_digest, card_digest, thread_digest)
+					VALUES ($1, 0, 1, '{}'::jsonb, $2, $3, $3)`, outboundGroup(t, s), l.bytes, digest32(0x22))
 				rejectedBy(t, err, "outbound_group_snapshots_digest_len")
 			})
 		}
@@ -834,8 +834,9 @@ func TestOutboundSnapshotIsOnePerGroup(t *testing.T) {
 	insert := func(revision int64) error {
 		_, err := s.db.Exec(`
 			INSERT INTO outbound_group_snapshots
-				(alert_group_id, revision, snapshot_schema_version, snapshot, snapshot_digest)
-			VALUES ($1, $2, 1, '{}'::jsonb, $3)`, agID, revision, digest32(3))
+				(alert_group_id, revision, snapshot_schema_version, snapshot, snapshot_digest,
+				 card_digest, thread_digest)
+			VALUES ($1, $2, 1, '{}'::jsonb, $3, $3, $3)`, agID, revision, digest32(3))
 		return err
 	}
 
@@ -946,6 +947,7 @@ func TestOutboundIndexesAreDeclaredOnce(t *testing.T) {
 		"idx_outbound_intents_batch":           false,
 		"idx_outbound_intents_journal":         false,
 		"idx_outbound_intents_retention":       false,
+		"idx_outbound_intents_parent":          false,
 	}
 
 	rows, err := s.db.Query(`

@@ -929,6 +929,13 @@ func TestAStartUpgradesADatabaseThatFollowedDevelop(t *testing.T) {
 			idx_outbound_intents_retention, idx_outbound_batches_no_targets`,
 		`DELETE FROM outbound_intent_events`,
 		`ALTER TABLE outbound_intent_events DROP COLUMN IF EXISTS actor_kind`,
+		// And what the render snapshot's second version brought: the form
+		// digests, the parent and the generation context, their rules.
+		`ALTER TABLE outbound_group_snapshots DROP CONSTRAINT IF EXISTS ` + outboundFormDigestLen,
+		`ALTER TABLE outbound_group_snapshots DROP COLUMN IF EXISTS card_digest, DROP COLUMN IF EXISTS thread_digest`,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundSatelliteNamesParent,
+		`DROP INDEX IF EXISTS idx_outbound_intents_parent`,
+		`ALTER TABLE outbound_intents DROP COLUMN IF EXISTS parent_intent_id, DROP COLUMN IF EXISTS bound_context`,
 		// The rows of the previous release in the tables it owned.
 		`INSERT INTO jobs (id, type, status, alert_group_id)
 			VALUES ('job-1', 'escalation', 'completed', '` + group + `')`,
@@ -968,6 +975,18 @@ func TestAStartUpgradesADatabaseThatFollowedDevelop(t *testing.T) {
 
 	if err := s.InitDB(); err != nil {
 		t.Fatalf("the start refused the database of the previous release: %v", err)
+	}
+
+	// The snapshot's second version is back: the form digests were computed
+	// for the rows that had none, and the two commitment columns exist.
+	if n := countWhere(t, s, `SELECT count(*) FROM outbound_group_snapshots
+		WHERE card_digest IS NULL OR thread_digest IS NULL`); n != 0 {
+		t.Errorf("%d snapshot(s) came back without form digests", n)
+	}
+	for _, column := range []string{"parent_intent_id", "bound_context"} {
+		if !hasColumn(t, s, "outbound_intents", column) {
+			t.Errorf("the start did not add %s", column)
+		}
 	}
 
 	// The claims name their event, and every event named exists.
@@ -1278,21 +1297,8 @@ func TestAnAdmissionFrozenUnderVersionOneStillRenders(t *testing.T) {
 	s := setupTestDB(t)
 	s.SetRenderEnvironment("https://tokay.example", "UTC")
 
-	// asVersionOne rewrites a stored snapshot the way version 1 stored it -
-	// without the three fields version 2 added - and digests it by version 1's
-	// rules, which is what the column beside it said before the upgrade.
 	asVersionOne := func(t *testing.T, table, column, where, id string) []byte {
-		t.Helper()
-		var stripped []byte
-		if err := s.db.QueryRow(`SELECT `+column+` - 'timeline' - 'timeline_omitted' - 'interactive_providers'
-			FROM `+table+` WHERE `+where+` = $1`, id).Scan(&stripped); err != nil {
-			t.Fatalf("read the stored state: %v", err)
-		}
-		older, err := keys.DecodeRenderSnapshotV1(stripped)
-		if err != nil {
-			t.Fatalf("read the state as version 1: %v", err)
-		}
-		return older.Digest()
+		return versionOneDigest(t, s, table, column, where, id)
 	}
 
 	t.Run("a direct message renders what was admitted", func(t *testing.T) {

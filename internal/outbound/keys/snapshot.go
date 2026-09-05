@@ -301,6 +301,18 @@ type SnapshotInput struct {
 	InteractiveProviders []string `json:"interactive_providers"`
 }
 
+// ButtonsOn says whether this state puts action buttons on the provider's
+// card. The renderer asks the snapshot and nothing else: a switch read at
+// send time would let two instances draw two different cards of one revision.
+func (s SnapshotInput) ButtonsOn(provider string) bool {
+	for _, p := range s.InteractiveProviders {
+		if p == provider {
+			return true
+		}
+	}
+	return false
+}
+
 // RenderSnapshot is a snapshot that is canonical and valid, and can be nothing
 // else.
 //

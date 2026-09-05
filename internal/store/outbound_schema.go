@@ -800,7 +800,7 @@ BEGIN
 END $$;
 `
 
-const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_the_target"
+const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_the_target_v2"
 
 // outboundTargetAgreementDDL states that a commitment may only name its
 // recipient one way.
@@ -827,6 +827,11 @@ const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_th
 const outboundTargetAgreementDDL = `
 DO $$
 BEGIN
+	-- The rule under its first name knew one payload schema; this one knows
+	-- two. Renamed rather than redefined in place, so a start is a no-op once
+	-- the new one is there.
+	ALTER TABLE outbound_intents
+		DROP CONSTRAINT IF EXISTS outbound_intents_payload_addresses_the_target;
 	IF NOT EXISTS (
 		SELECT 1 FROM pg_constraint
 		WHERE conname = '` + outboundTargetAgreementConstraint + `'
@@ -835,7 +840,7 @@ BEGIN
 		ALTER TABLE outbound_intents
 			ADD CONSTRAINT ` + outboundTargetAgreementConstraint + ` CHECK (
 				key_kind NOT IN ('escalation', 'escalation_replay')
-				OR payload_schema_version <> 1
+				OR payload_schema_version NOT IN (1, 2)
 				-- IS NOT DISTINCT FROM, not =: a payload with no target at all
 				-- yields NULL, and a CHECK that evaluates to NULL is satisfied.
 				-- Written with =, the one row that names its recipient only
@@ -914,6 +919,9 @@ func (s *Store) applyOutboundSchema() error {
 		return err
 	}
 	if err := applyRetentionSchema(context.Background(), tx); err != nil {
+		return err
+	}
+	if err := applySnapshotV2Schema(context.Background(), tx); err != nil {
 		return err
 	}
 

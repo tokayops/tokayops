@@ -183,6 +183,15 @@ func main() {
 	// it: two instances, or one instance a month later, render the same bytes.
 	st.SetRenderEnvironment(cfg.Global.SelfURL, providers.ProcessZone())
 
+	// Cards drawn with buttons a switch has since moved. The door that brings
+	// them up to date when the switch moves is best-effort - an instance can
+	// die halfway - so every start finishes what one may have left.
+	if raised, err := st.ReconcileInteractivity(context.Background()); err != nil {
+		log.Printf("outbound: bringing the live cards up to date with the button switches: %v", err)
+	} else if raised > 0 {
+		log.Printf("outbound: %d alert group(s) brought up to date with the button switches", raised)
+	}
+
 	// CLI Commands
 	if len(os.Args) > 1 {
 		cmd := os.Args[1]

@@ -423,7 +423,9 @@ func messageFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1) []sl
 	if payload.Target.Kind == keys.TargetUser {
 		return []slackapi.MsgOption{slackapi.MsgOptionText(directMessage(state, payload), false)}
 	}
-	card := Render(state, payload.Interactive)
+	// The buttons come from the snapshot, where the switch can reach them;
+	// what the payload said about them when it was admitted is not read.
+	card := Render(state, state.ButtonsOn(keys.InteractiveSlack))
 	return []slackapi.MsgOption{
 		slackapi.MsgOptionText(card.Text, false),
 		slackapi.MsgOptionBlocks(card.Blocks...),

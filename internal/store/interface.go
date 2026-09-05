@@ -105,6 +105,9 @@ type StoreInterface interface {
 
 	// Timeline
 	AddTimelineEvent(e *model.TimelineEvent) error
+	// AddAlertGroupNoteAtomic writes a note and raises what the thread shows,
+	// under the group's lock; the actor is the authenticated person.
+	AddAlertGroupNoteAtomic(ctx context.Context, alertGroupID, text string, who alertgroup.Actor) (*model.TimelineEvent, error)
 	GetTimelineEvents(alertGroupID string) ([]*model.TimelineEvent, error)
 
 	// API Tokens

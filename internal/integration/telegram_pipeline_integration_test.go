@@ -156,6 +156,9 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 	}
 
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
+	// What a message needs that the group does not carry, frozen the way the
+	// wiring freezes it: from the same self URL the producer plans with.
+	s.SetRenderEnvironment(cfg.Global.SelfURL, "UTC")
 	eng := engine.NewEngine(s, schedulerender.New(s.ScheduleReadRepository()), &testSettings{}, cfg)
 	channels := providers.NewCatalog()
 

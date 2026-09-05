@@ -409,7 +409,7 @@ func (h *Handler) write(call outbound.Call, body map[string]interface{}) (outbou
 		}
 		body["text"] = RenderCard(state)
 		body["parse_mode"] = "HTML"
-		if keyboard := KeyboardFor(state, payload.Interactive); keyboard != nil {
+		if keyboard := KeyboardFor(state, state.ButtonsOn(keys.InteractiveTelegram)); keyboard != nil {
 			body["reply_markup"] = keyboard
 		}
 		return outbound.Result{}, nil

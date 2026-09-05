@@ -12,6 +12,7 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -57,6 +58,7 @@ type escalationStore interface {
 	// is escalated by. Listed here because the engine hands its own store to
 	// it: whatever the builder may read, the engine may read.
 	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
+	RenderInputs(ctx context.Context, alertGroupID string) (providers.RenderInputs, error)
 
 	// SubmitBatch admits the whole escalation in one commit: the
 	// claim over the group, its commitments, the state they render from, the

@@ -19,12 +19,17 @@ import (
 // The Telegram channel as the outbound worker uses it.
 
 func handlerState(t *testing.T) keys.RenderSnapshot {
+	return handlerStateWith(t, nil)
+}
+
+// handlerStateWith is the frozen state with buttons on for the named providers.
+func handlerStateWith(t *testing.T, buttons []string) keys.RenderSnapshot {
 	t.Helper()
 	groupURL := "https://tokay.example/#/ops/alert-groups/ag-1"
 	state, err := keys.NewRenderSnapshot(keys.SnapshotInput{
 		AlertGroupID: "ag-1", Status: keys.GroupTriggered, Title: "Disk filling up",
 		Severity: "critical", TeamOnboarded: true, GroupURL: &groupURL,
-		DisplayTimezone: "UTC",
+		DisplayTimezone: "UTC", InteractiveProviders: buttons,
 		Alerts: []keys.AlertSnapshot{{
 			Fingerprint: "fp-1", Status: keys.AlertFiring,
 			StartsAt:  time.Unix(1700000000, 0).UTC(),
@@ -37,13 +42,24 @@ func handlerState(t *testing.T) keys.RenderSnapshot {
 	return state
 }
 
+// handlerCall is a call whose SNAPSHOT says whether the card has buttons. The
+// payload says the same, as version 1 payloads do, and is not what decides.
 func handlerCall(t *testing.T, kind keys.TargetKind, interactive bool) outbound.Call {
+	t.Helper()
+	var buttons []string
+	if interactive {
+		buttons = []string{keys.InteractiveTelegram}
+	}
+	return handlerCallWith(t, kind, interactive, handlerStateWith(t, buttons))
+}
+
+func handlerCallWith(t *testing.T, kind keys.TargetKind, payloadSays bool, state keys.RenderSnapshot) outbound.Call {
 	t.Helper()
 	payload, err := json.Marshal(keys.EscalationPayloadV1{
 		Slot:   keys.Slot{Kind: keys.SlotFirehose},
 		Target: keys.Target{Kind: kind, Ref: "-1001"},
 		// Direct messages carry the escalation's own words.
-		Interactive: interactive,
+		Interactive: payloadSays,
 	})
 	if err != nil {
 		t.Fatalf("build the payload: %v", err)
@@ -53,7 +69,7 @@ func handlerCall(t *testing.T, kind keys.TargetKind, interactive bool) outbound.
 		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
 		Endpoint: "-1001", ProviderKey: "create-key",
 		KeyKind: keys.KindEscalation, Family: outbound.FamilyNotification,
-		Content: snapshotContent(t, handlerState(t)), Payload: payload,
+		Content: snapshotContent(t, state), Payload: payload,
 		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
 	}
 }
@@ -139,9 +155,23 @@ func TestOneAttemptIsOneCall(t *testing.T) {
 	}
 }
 
-// TestButtonsFollowTheAdmission. An empty keyboard is not the same as no
-// keyboard, and the difference has to survive into the request.
-func TestButtonsFollowTheAdmission(t *testing.T) {
+// TestButtonsFollowTheSnapshot. An empty keyboard is not the same as no
+// keyboard, and the difference has to survive into the request. What decides
+// is the snapshot the revision was frozen with - where the button switch can
+// reach it - and not what the payload said when the commitment was admitted.
+func TestButtonsFollowTheSnapshot(t *testing.T) {
+	// The payload says buttons; the snapshot says none. The snapshot wins.
+	payloadOnly := newBotAPI(t)
+	if _, err := handlerFor(payloadOnly).ExecuteAttempt(context.Background(),
+		handlerCallWith(t, keys.TargetChannel, true, handlerStateWith(t, nil))); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if markup, _ := payloadOnly.calls[0]["reply_markup"].(map[string]any); markup == nil {
+		t.Fatal("expected an empty keyboard from a snapshot without buttons")
+	} else if rows, _ := markup["inline_keyboard"].([]any); len(rows) != 0 {
+		t.Fatalf("the payload's word put %d rows of buttons on a card the snapshot drew without", len(rows))
+	}
+
 	api := newBotAPI(t)
 	handler := handlerFor(api)
 

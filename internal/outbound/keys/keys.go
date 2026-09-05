@@ -273,6 +273,13 @@ const (
 	// posted to is preparation's business and can change without changing
 	// what was promised.
 	TargetSubscriber TargetKind = "subscriber"
+
+	// TargetThread and TargetThreadReply are the satellites of a card in a
+	// channel: the thread under it, and the reply that closes it. Named here
+	// because the schema and the raise refer to them by literal; a claim may
+	// not be aimed at them until the code that follows a parent lands.
+	TargetThread      TargetKind = "thread"
+	TargetThreadReply TargetKind = "thread_reply"
 )
 
 // TargetKinds is every kind of recipient this build names, for the doors that

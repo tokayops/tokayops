@@ -113,6 +113,9 @@ func (s *Store) UpdateIntegration(ctx context.Context, id string, patch Integrat
 	// After the commit and not before: a transaction that then rolled back
 	// would have reported endings that never happened.
 	countWithdrawn(map[string]int{outbound.FamilyWebhook: withdrawn})
+	// And the cards, when the button switch moved: after the commit as well,
+	// because they are brought up to date with what is now stored.
+	s.raiseAfterSwitch(ctx, before, &after, actor)
 	return IntegrationChange{Before: before, After: &after, Withdrawn: withdrawn}, nil
 }
 

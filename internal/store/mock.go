@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/alertgroup"
@@ -20,6 +21,7 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // MockStore is an in-memory implementation of StoreInterface for testing.
@@ -1122,6 +1124,44 @@ func (m *MockStore) GetTeamMembershipsForUser(userID string) (map[string]model.T
 // ========================================
 // Timeline Events
 // ========================================
+
+// RenderInputs hands the producer the group's history as the mock holds it,
+// the most recent keys.TimelineLength lines, and no buttons: the mock has no
+// integrations to read a switch from.
+func (m *MockStore) RenderInputs(_ context.Context, alertGroupID string) (providers.RenderInputs, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	events := m.timelineEvents[alertGroupID]
+	omitted := 0
+	if len(events) > keys.TimelineLength {
+		omitted = len(events) - keys.TimelineLength
+		events = events[omitted:]
+	}
+	return providers.RenderInputs{
+		Timeline: append([]*model.TimelineEvent(nil), events...), TimelineOmitted: int64(omitted),
+	}, nil
+}
+
+// AddAlertGroupNoteAtomic records the note under the caller's name; the mock
+// has no messages to raise.
+func (m *MockStore) AddAlertGroupNoteAtomic(_ context.Context, alertGroupID, text string,
+	who alertgroup.Actor) (*model.TimelineEvent, error) {
+
+	if n := utf8.RuneCountInString(text); n == 0 || n > NoteLimit {
+		return nil, ErrNoteInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.alertGroups[alertGroupID]; !ok {
+		return nil, sql.ErrNoRows
+	}
+	event := &model.TimelineEvent{
+		ID: uuid.New().String(), AlertGroupID: alertGroupID, Type: model.TimelineEventNote,
+		Message: text, Actor: who.Name, CreatedAt: time.Now(),
+	}
+	m.timelineEvents[alertGroupID] = append(m.timelineEvents[alertGroupID], event)
+	return event, nil
+}
 
 func (m *MockStore) AddTimelineEvent(e *model.TimelineEvent) error {
 	m.mu.Lock()

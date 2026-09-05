@@ -24,12 +24,23 @@ const (
 	DesiredAck     DesiredReason = "ack"
 	DesiredResolve DesiredReason = "resolve"
 	DesiredMerge   DesiredReason = "merge"
+
+	// DesiredNote: somebody wrote a line into the alert's history, and the
+	// thread under the card shows it. Not final, and allowed in any state the
+	// group is in; on a group whose last revision is out, the line is written
+	// and nothing is raised.
+	DesiredNote DesiredReason = "note"
+
+	// DesiredInteractivity: the button switch of a provider moved, and the
+	// cards show buttons, or stop showing them. Raised from the switch's own
+	// request and from every start, for the groups whose cards are behind it.
+	DesiredInteractivity DesiredReason = "interactivity"
 )
 
 // Known reports whether a reason is one this build states.
 func (r DesiredReason) Known() bool {
 	switch r {
-	case DesiredAck, DesiredResolve, DesiredMerge:
+	case DesiredAck, DesiredResolve, DesiredMerge, DesiredNote, DesiredInteractivity:
 		return true
 	default:
 		return false

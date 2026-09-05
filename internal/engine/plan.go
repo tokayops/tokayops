@@ -41,6 +41,12 @@ type planStore interface {
 	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
 	GetUsersByIDs(ids []string) ([]*model.User, error)
 	GetTeamByID(id string) (*model.Team, error)
+
+	// RenderInputs is what revision 0 freezes besides the group row: the tail
+	// of the history the thread shows and the providers whose cards carry
+	// buttons. From the database, not from a cache - two instances with two
+	// caches would freeze two different revision 0s.
+	RenderInputs(ctx context.Context, alertGroupID string) (providers.RenderInputs, error)
 }
 
 // channelSettings is the configuration a MESSAGE depends on, as opposed to the
@@ -91,7 +97,7 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup,
 		policyID = ""
 	}
 
-	state, err := p.freeze(ag, team)
+	state, err := p.freeze(ctx, ag, team)
 	if err != nil {
 		return outbound.Batch{}, err
 	}
@@ -337,15 +343,26 @@ func (p *planner) teamFor(teamID string) (teamRead, error) {
 // the links whole rather than a base URL, whether the alert's team is set up in
 // TokayOps, and the zone times are printed in. Two instances, or one instance
 // an hour later, then render the same bytes.
-func (p *planner) freeze(ag *model.AlertGroup, team teamRead) (keys.RenderSnapshot, error) {
+func (p *planner) freeze(ctx context.Context, ag *model.AlertGroup, team teamRead) (keys.RenderSnapshot, error) {
 	selfURL := ""
 	if p.cfg != nil {
 		selfURL = p.cfg.Global.SelfURL
 	}
 
+	// The history and the buttons, read now. The window between this read
+	// and the admission's commit is the named best-effort risk of the button
+	// switch, closed by the switch's own door and by every start.
+	inputs, err := p.store.RenderInputs(ctx, ag.ID)
+	if err != nil {
+		return keys.RenderSnapshot{}, fmt.Errorf("read what the state of %s is drawn from: %w", ag.ID, err)
+	}
+
 	in := providers.ViewOf(providers.GroupView{
-		Group:   ag,
-		SelfURL: selfURL,
+		Group:           ag,
+		SelfURL:         selfURL,
+		Timeline:        inputs.Timeline,
+		TimelineOmitted: inputs.TimelineOmitted,
+		Interactive:     inputs.Interactive,
 		// Whether the alert's team is set up here, from the same read the
 		// routing came from. A card says so where its buttons would be, and
 		// asking again at send time would let that answer change between two
