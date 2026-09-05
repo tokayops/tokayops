@@ -29,8 +29,13 @@ const NoteLimit = 2000
 // ErrNoteInvalid is a note that is empty or longer than NoteLimit.
 var ErrNoteInvalid = errors.New("a note is between 1 and 2000 characters")
 
-// liveEditableStatuses are the states a card can be raised in.
-const liveEditableStatuses = `'pending', 'sending', 'idle', 'manual_review'`
+// reachableCardStatuses are the states from which a card can still be brought
+// to a revision: the four live ones, and the two terminals a person can revive
+// (T31-T34). A revived card is aimed at the revision the group is at, so the
+// group has to have been raised for it while it was down - a switch that
+// skipped it would put buttons on the card that the switch took away.
+// succeeded and canceled are the end of a card, and are left alone.
+const reachableCardStatuses = `'pending', 'sending', 'idle', 'manual_review', 'permanent_failed', 'expired'`
 
 // AddAlertGroupNoteAtomic writes a line of history and raises what the thread
 // shows, in one transaction under the group's lock.
@@ -60,11 +65,17 @@ func (s *Store) AddAlertGroupNoteAtomic(ctx context.Context, alertGroupID, text 
 	}
 	defer tx.Rollback()
 
-	// The group's row first, and taken by name: lockAlertGroupTx forgives a
-	// group that is not there, and a note on one is a 404, not a no-op.
+	// The group's row first, taken by name - a note on a group that is not
+	// there is a 404, not a no-op - and its source version moved with it.
+	// Everything a snapshot renders is a source: a plan that read the history
+	// before this note and admits after it would freeze revision 0 without
+	// the line, and no revision would ever carry it into the first thread.
+	// The moved version has that admission refused as source_changed, and
+	// the next tick plans again from what is now there.
 	var locked string
-	err = tx.QueryRowContext(ctx,
-		`SELECT id FROM alert_groups WHERE id = $1 FOR UPDATE`, alertGroupID).Scan(&locked)
+	err = tx.QueryRowContext(ctx, `
+		UPDATE alert_groups SET render_source_version = render_source_version + 1
+		WHERE id = $1 RETURNING id`, alertGroupID).Scan(&locked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, sql.ErrNoRows
 	}
@@ -98,8 +109,8 @@ func (s *Store) AddAlertGroupNoteAtomic(ctx context.Context, alertGroupID, text 
 	return event, nil
 }
 
-// RaiseInteractivity brings every live card of a provider up to date with its
-// button switch, one transaction per group.
+// RaiseInteractivity brings every reachable card of a provider up to date with
+// its button switch, one transaction per group.
 //
 // It runs in the request that moved the switch, after the switch's own commit.
 // One transaction per group rather than one for all of them: a hundred open
@@ -111,7 +122,7 @@ func (s *Store) RaiseInteractivity(ctx context.Context, provider string, by outb
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT DISTINCT alert_group_id FROM outbound_intents
 		WHERE provider = $1 AND form = $2 AND alert_group_id IS NOT NULL
-		  AND status IN (`+liveEditableStatuses+`)`,
+		  AND status IN (`+reachableCardStatuses+`)`,
 		provider, string(outbound.FormEditable))
 	if err != nil {
 		return 0, fmt.Errorf("find the live cards of %s: %w", provider, err)
@@ -138,9 +149,9 @@ func (s *Store) RaiseInteractivity(ctx context.Context, provider string, by outb
 	return len(groups), nil
 }
 
-// ReconcileInteractivity is what every start does: for each group with a live
-// card, compare the buttons its snapshot was drawn with against the switches
-// as they stand, and raise the ones that differ.
+// ReconcileInteractivity is what every start does: for each group with a
+// reachable card, compare the buttons its snapshot was drawn with against the
+// switches as they stand, and raise the ones that differ.
 //
 // It is the other half of RaiseInteractivity. That door is best-effort - an
 // instance can die halfway, and an admission planned before the switch moved
@@ -159,7 +170,7 @@ func (s *Store) ReconcileInteractivity(ctx context.Context) (int, error) {
 		WHERE NOT g.final AND g.snapshot_schema_version = $1
 		  AND EXISTS (SELECT 1 FROM outbound_intents i
 		              WHERE i.alert_group_id = g.alert_group_id AND i.form = $2
-		                AND i.status IN (`+liveEditableStatuses+`))`,
+		                AND i.status IN (`+reachableCardStatuses+`))`,
 		keys.RenderSnapshotSchemaV2, string(outbound.FormEditable))
 	if err != nil {
 		return 0, fmt.Errorf("read the buttons the live cards were drawn with: %w", err)

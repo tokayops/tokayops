@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
@@ -98,21 +99,21 @@ func applySnapshotV2Schema(ctx context.Context, tx *sql.Tx) error {
 // be a card about something nobody admitted.
 func rebuildRenderSnapshots(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT alert_group_id, revision, snapshot
+		SELECT alert_group_id, revision, snapshot, snapshot_digest
 		FROM outbound_group_snapshots
 		WHERE snapshot_schema_version = $1`, keys.RenderSnapshotSchemaV1)
 	if err != nil {
 		return fmt.Errorf("read the snapshots written under version 1: %w", err)
 	}
 	type stored struct {
-		group    string
-		revision int64
-		raw      []byte
+		group       string
+		revision    int64
+		raw, digest []byte
 	}
 	var older []stored
 	for rows.Next() {
 		var row stored
-		if err := rows.Scan(&row.group, &row.revision, &row.raw); err != nil {
+		if err := rows.Scan(&row.group, &row.revision, &row.raw, &row.digest); err != nil {
 			rows.Close()
 			return err
 		}
@@ -128,6 +129,13 @@ func rebuildRenderSnapshots(ctx context.Context, tx *sql.Tx) error {
 		if err != nil {
 			return fmt.Errorf("the state of alert group %s cannot be read as version 1, "+
 				"so it cannot be rebuilt: %w", row.group, err)
+		}
+		// The row has to be what its digest says before it is signed again:
+		// a rebuild that took a readable row on trust would put the new
+		// digests on content nobody admitted.
+		if !bytes.Equal(snapshot.Digest(), row.digest) {
+			return fmt.Errorf("the state of alert group %s no longer matches the digest "+
+				"its commitments were keyed against, and cannot be rebuilt", row.group)
 		}
 		history, omitted, err := timelineTailTx(ctx, tx, row.group)
 		if err != nil {
@@ -213,14 +221,16 @@ func fillFormDigests(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// drawnButtonsTx reads which providers' live cards of a group were drawn with
-// buttons, from what each card's payload said when it was admitted.
+// drawnButtonsTx reads which providers' cards of a group were drawn with
+// buttons, from what each card's payload said when it was admitted. Every card
+// a person can still bring back counts - a card that failed for good keeps
+// its buttons in the chat until it is redrawn - and only the ended ones do not.
 func drawnButtonsTx(ctx context.Context, tx *sql.Tx, alertGroupID string) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, provider, payload_schema_version, payload
 		FROM outbound_intents
-		WHERE alert_group_id = $1 AND form = $2 AND status NOT IN (`+terminalStatusList+`)`,
-		alertGroupID, "editable")
+		WHERE alert_group_id = $1 AND form = $2 AND status IN (`+reachableCardStatuses+`)`,
+		alertGroupID, string(outbound.FormEditable))
 	if err != nil {
 		return nil, fmt.Errorf("read the cards of %s: %w", alertGroupID, err)
 	}

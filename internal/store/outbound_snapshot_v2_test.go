@@ -15,6 +15,7 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // The second version of the render snapshot in the store: one snapshot, two
@@ -97,6 +98,146 @@ func slackIntegration(t *testing.T, s *Store, interactive bool) *model.Integrati
 }
 
 func nina() alertgroup.Actor { return alertgroup.Actor{ID: "u-nina", Name: "Nina"} }
+
+// planOf is an escalation as the producer builds one: the state frozen from
+// the group and the inputs it read, at the source version it read them at.
+func planOf(t *testing.T, s *Store, agID string, commitments ...keys.EscalationCommitment) outbound.Batch {
+	t.Helper()
+	group, err := s.GetAlertGroupByID(agID)
+	if err != nil {
+		t.Fatalf("read the group: %v", err)
+	}
+	inputs, err := s.RenderInputs(context.Background(), agID)
+	if err != nil {
+		t.Fatalf("read the inputs: %v", err)
+	}
+	snapshot, err := providers.SnapshotOf(providers.GroupView{
+		Group: group, SelfURL: "https://tokay.example", TeamOnboarded: true, Zone: "UTC",
+		Timeline: inputs.Timeline, TimelineOmitted: inputs.TimelineOmitted, Interactive: inputs.Interactive,
+	})
+	if err != nil {
+		t.Fatalf("freeze the group: %v", err)
+	}
+	admission, err := keys.EscalationBatch{
+		Kind: keys.KindEscalation, GrammarVersion: keys.GrammarV1,
+		FingerprintVersion: keys.CurrentBatchFingerprintVersion(),
+		Snapshot:           snapshot, Commitments: commitments,
+	}.Admit()
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	return outbound.Batch{
+		Admission: admission,
+		Context: outbound.EscalatingAlertGroup(outbound.EscalationContext{
+			PolicyID: "policy-1", PolicySnapshot: json.RawMessage(`{"name":"p"}`),
+			SourceVersion:  group.RenderSourceVersion,
+			OnCallSnapshot: json.RawMessage(`{"l1_users":[]}`),
+		}),
+		Actor: outbound.ActorEngine,
+	}
+}
+
+// TestANoteBetweenThePlanAndTheAdmissionRefusesThePlan. The producer reads the
+// history before it admits; a note written in between has no snapshot to
+// raise yet. It moves the group's source version instead, so the plan built
+// before it is refused and the next one carries the line into revision 0.
+func TestANoteBetweenThePlanAndTheAdmissionRefusesThePlan(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+	ctx := context.Background()
+	agID := desiredGroup(t, s, "Disk filling up")
+
+	early := planOf(t, s, agID, channelCommitment("C0001", 0))
+	event, err := s.AddAlertGroupNoteAtomic(ctx, agID, "seen it", nina())
+	if err != nil {
+		t.Fatalf("note before the admission: %v", err)
+	}
+
+	result, err := s.SubmitBatch(ctx, early)
+	if err != nil {
+		t.Fatalf("submit the early plan: %v", err)
+	}
+	if result.Outcome != outbound.SubmitSourceChanged {
+		t.Fatalf("a plan built before the note was answered %q", result.Outcome)
+	}
+	if countWhere(t, s, `SELECT count(*) FROM outbound_batches WHERE alert_group_id = $1`, agID) != 0 {
+		t.Fatal("the refused plan left a claim")
+	}
+
+	// The next tick plans from what is now there.
+	if result := mustSubmit(t, s, planOf(t, s, agID, channelCommitment("C0001", 0))); result.Outcome != outbound.SubmitCreated {
+		t.Fatalf("the next plan was answered %q", result.Outcome)
+	}
+	for _, line := range readSnapshotRow(t, s, agID).content.Timeline {
+		if line.ID == event.ID {
+			return
+		}
+	}
+	t.Fatal("revision 0 was frozen without the note")
+}
+
+// TestTheSwitchReachesACardTheOperatorCanRevive. A card that failed for good
+// is not the end of it: a person can bring it back, and it is then aimed at
+// the revision the group is at. So the group is raised for the switch while
+// the card is down, or the revived card would carry the buttons the switch
+// took away.
+func TestTheSwitchReachesACardTheOperatorCanRevive(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+	ctx := context.Background()
+	agID := desiredGroup(t, s, "Disk filling up")
+	cardID := changeableCard(t, s, agID)
+	aim(t, s, agID)
+
+	// The card's change fails for good; the card keeps its receipt.
+	token := claimOne(t, s, cardID)
+	begun := beginOne(t, s, cardID, token)
+	if _, err := s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token,
+		Conclusion: concluded(outbound.OutcomePermanentRejection, "cant_update_message"),
+	}); err != nil {
+		t.Fatalf("fail the change: %v", err)
+	}
+	if got := statusOf(t, s, cardID); got != outbound.StatusPermanentFailed {
+		t.Fatalf("the card is %s", got)
+	}
+	before := readSnapshotRow(t, s, agID)
+
+	slackIntegration(t, s, true)
+	raised, err := s.RaiseInteractivity(ctx, keys.InteractiveSlack, outbound.ActorSystem)
+	if err != nil || raised != 1 {
+		t.Fatalf("the switch reached %d group(s) (%v); the card down for good still counts", raised, err)
+	}
+	after := readSnapshotRow(t, s, agID)
+	if after.revision != before.revision+1 || !after.content.ButtonsOn(keys.InteractiveSlack) {
+		t.Fatalf("the snapshot is at revision %d with buttons %v", after.revision, after.content.InteractiveProviders)
+	}
+	if status, _ := cardAim(t, s, cardID); status != outbound.StatusPermanentFailed {
+		t.Fatalf("the raise moved a card that failed for good to %s", status)
+	}
+
+	// The person brings it back, and it is aimed at the revision with buttons.
+	if result := resolve(t, s, outbound.ResolveAmbiguityRequest{
+		IntentID: cardID, Decision: outbound.DecisionRetryCurrentGeneration, Reason: "fixed",
+	}); result.Status != outbound.StatusPending {
+		t.Fatalf("the retry answered %q into %s", result.Outcome, result.Status)
+	}
+	if status, aimed := cardAim(t, s, cardID); status != outbound.StatusPending || aimed != after.revision {
+		t.Fatalf("the revived card is %s at %d; want pending at %d", status, aimed, after.revision)
+	}
+
+	// And the start's reconciliation counts it the same way.
+	if _, err := s.db.Exec(`UPDATE integrations SET enabled = false`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE outbound_intents SET status = 'expired', lease_token = NULL, locked_until = NULL
+		WHERE id = $1`, cardID); err != nil {
+		t.Fatal(err)
+	}
+	if raised, err := s.ReconcileInteractivity(ctx); err != nil || raised != 1 {
+		t.Fatalf("the start reached %d group(s) (%v); an expired card still counts", raised, err)
+	}
+}
 
 // TestANoteMovesTheThreadAndLeavesTheCardAlone. A note is a line the thread
 // shows and the card does not: the snapshot moves, the thread's digest moves,
@@ -374,7 +515,15 @@ func TestANoteAndAnAcknowledgementAgreeOnTheRevision(t *testing.T) {
 	agID := desiredGroup(t, s, "Disk filling up")
 	cardID := changeableCard(t, s, agID)
 	moveGroup(t, s, agID, model.AlertGroupStatusTriggered)
+	// Revision 0 was frozen by the fixture, not from the live group, and the
+	// first raise from the group moves the card whichever door makes it. The
+	// race starts from a revision raised from the group itself.
+	if _, err := s.AddAlertGroupNoteAtomic(context.Background(), agID, "first look", nina()); err != nil {
+		t.Fatalf("baseline note: %v", err)
+	}
 	before := readSnapshotRow(t, s, agID)
+	raisedBefore := countWhere(t, s, `SELECT count(*) FROM outbound_intent_events
+		WHERE intent_id = $1 AND kind = 'desired_raised'`, cardID)
 
 	var (
 		wg    sync.WaitGroup
@@ -415,8 +564,9 @@ func TestANoteAndAnAcknowledgementAgreeOnTheRevision(t *testing.T) {
 		t.Fatalf("the card is aimed at %d, and the group went from %d to %d", aimed, before.revision, after.revision)
 	}
 	if raised := countWhere(t, s, `SELECT count(*) FROM outbound_intent_events
-		WHERE intent_id = $1 AND kind = 'desired_raised'`, cardID); raised != 1 {
-		t.Fatalf("the card was raised %d time(s); the acknowledgement raises it once and the note not at all", raised)
+		WHERE intent_id = $1 AND kind = 'desired_raised'`, cardID); raised != raisedBefore+1 {
+		t.Fatalf("the card was raised %d time(s) by the race; the acknowledgement raises it once and the note not at all",
+			raised-raisedBefore)
 	}
 	if after.content.AcknowledgedBy == nil || len(after.content.Timeline) == 0 {
 		t.Fatal("the last revision does not carry both doors")
@@ -596,6 +746,110 @@ func TestAStartRebuildsTheSnapshotsOfThePreviousVersion(t *testing.T) {
 	}
 	if got := readSnapshotRow(t, s, agID).revision; got != 1 {
 		t.Fatalf("the second start moved the revision to %d", got)
+	}
+}
+
+// TestAStartReachesARevivableCardOfThePreviousVersion. The rebuild counts the
+// buttons of a card that failed for good - they are in the chat - and the
+// start's reconciliation raises its group like any other, so the card a
+// person brings back is aimed at a revision drawn by the switch as it stands.
+func TestAStartReachesARevivableCardOfThePreviousVersion(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+	ctx := context.Background()
+	agID := desiredGroup(t, s, "Disk filling up")
+	cardID := changeableCard(t, s, agID)
+	aim(t, s, agID)
+	token := claimOne(t, s, cardID)
+	begun := beginOne(t, s, cardID, token)
+	if _, err := s.FinalizeDeliveryAttempt(ctx, outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token,
+		Conclusion: concluded(outbound.OutcomePermanentRejection, "cant_update_message"),
+	}); err != nil {
+		t.Fatalf("fail the change: %v", err)
+	}
+
+	digest := versionOneDigest(t, s, "outbound_group_snapshots", "snapshot", "alert_group_id", agID)
+	if _, err := s.db.Exec(`
+		UPDATE outbound_group_snapshots
+		SET snapshot = snapshot - 'timeline' - 'timeline_omitted' - 'interactive_providers',
+		    snapshot_schema_version = 1, snapshot_digest = $2
+		WHERE alert_group_id = $1`, agID, digest); err != nil {
+		t.Fatalf("build the previous version: %v", err)
+	}
+	if err := s.InitDB(); err != nil {
+		t.Fatalf("the start refused: %v", err)
+	}
+	rebuilt := readSnapshotRow(t, s, agID)
+	if !rebuilt.content.ButtonsOn(keys.InteractiveSlack) {
+		t.Fatalf("the rebuilt snapshot lost the buttons of a card that failed for good: %v",
+			rebuilt.content.InteractiveProviders)
+	}
+	if raised, err := s.ReconcileInteractivity(ctx); err != nil || raised != 1 {
+		t.Fatalf("the start raised %d (%v), want the group of the failed card", raised, err)
+	}
+	after := readSnapshotRow(t, s, agID)
+	if after.revision != rebuilt.revision+1 || after.content.ButtonsOn(keys.InteractiveSlack) {
+		t.Fatalf("after the start the snapshot is at %d with buttons %v", after.revision, after.content.InteractiveProviders)
+	}
+	if result := resolve(t, s, outbound.ResolveAmbiguityRequest{
+		IntentID: cardID, Decision: outbound.DecisionRetryCurrentGeneration, Reason: "fixed",
+	}); result.Status != outbound.StatusPending {
+		t.Fatalf("the retry answered %q into %s", result.Outcome, result.Status)
+	}
+	if _, aimed := cardAim(t, s, cardID); aimed != after.revision {
+		t.Fatalf("the revived card is aimed at %d, the group is at %d", aimed, after.revision)
+	}
+}
+
+// TestAStartRefusesAVersionOneSnapshotSomebodyAltered. A row that reads as
+// version 1 but no longer digests to what its column says is not rebuilt: the
+// rebuild would sign content nobody admitted. Unreachable through the doors;
+// what is refused is damage, by name.
+func TestAStartRefusesAVersionOneSnapshotSomebodyAltered(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+	agID := desiredGroup(t, s, "Disk filling up")
+	changeableCard(t, s, agID)
+
+	digest := versionOneDigest(t, s, "outbound_group_snapshots", "snapshot", "alert_group_id", agID)
+	if _, err := s.db.Exec(`
+		UPDATE outbound_group_snapshots
+		SET snapshot = jsonb_set(snapshot - 'timeline' - 'timeline_omitted' - 'interactive_providers',
+		                         '{title}', '"somebody else''s alert"'),
+		    snapshot_schema_version = 1, snapshot_digest = $2
+		WHERE alert_group_id = $1`, agID, digest); err != nil {
+		t.Fatalf("alter the row: %v", err)
+	}
+	t.Cleanup(func() { removeOutboundStateOf(t, s, agID) })
+
+	err := s.applyOutboundSchema()
+	if err == nil {
+		t.Fatal("a start rebuilt a snapshot that no longer matches its digest")
+	}
+	if !strings.Contains(err.Error(), agID) || !strings.Contains(err.Error(), "digest") {
+		t.Fatalf("the refusal does not name the group and the digest: %v", err)
+	}
+}
+
+// removeOutboundStateOf is the remedy a refused start names, applied to one
+// group, so the starts after it in this process are not refused for the same
+// reason.
+func removeOutboundStateOf(t *testing.T, s *Store, agID string) {
+	t.Helper()
+	for _, statement := range []string{
+		`DELETE FROM outbound_intent_events e USING outbound_intents i
+		 WHERE e.intent_id = i.id AND i.alert_group_id = $1`,
+		`DELETE FROM outbound_attempts a USING outbound_intents i
+		 WHERE a.intent_id = i.id AND i.alert_group_id = $1`,
+		`UPDATE outbound_intents SET current_attempt_id = NULL WHERE alert_group_id = $1`,
+		`DELETE FROM outbound_intents WHERE alert_group_id = $1`,
+		`DELETE FROM outbound_batches WHERE alert_group_id = $1`,
+		`DELETE FROM outbound_group_snapshots WHERE alert_group_id = $1`,
+	} {
+		if _, err := s.db.Exec(statement, agID); err != nil {
+			t.Fatalf("apply the remedy: %v", err)
+		}
 	}
 }
 
