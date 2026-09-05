@@ -1142,8 +1142,10 @@ func (m *MockStore) RenderInputs(_ context.Context, alertGroupID string) (provid
 	}, nil
 }
 
-// AddAlertGroupNoteAtomic records the note under the caller's name; the mock
-// has no messages to raise.
+// AddAlertGroupNoteAtomic records the note under the caller's name and moves
+// the group's source version, as the real door does: a plan built before the
+// note is refused by the admission here as it is there. The mock has no
+// messages to raise.
 func (m *MockStore) AddAlertGroupNoteAtomic(_ context.Context, alertGroupID, text string,
 	who alertgroup.Actor) (*model.TimelineEvent, error) {
 
@@ -1152,9 +1154,11 @@ func (m *MockStore) AddAlertGroupNoteAtomic(_ context.Context, alertGroupID, tex
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.alertGroups[alertGroupID]; !ok {
+	ag, ok := m.alertGroups[alertGroupID]
+	if !ok {
 		return nil, sql.ErrNoRows
 	}
+	ag.RenderSourceVersion++
 	event := &model.TimelineEvent{
 		ID: uuid.New().String(), AlertGroupID: alertGroupID, Type: model.TimelineEventNote,
 		Message: text, Actor: who.Name, CreatedAt: time.Now(),

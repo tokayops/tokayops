@@ -31,6 +31,8 @@ type admitting interface {
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
 		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
 	SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound.SubmitResult, error)
+	AddAlertGroupNoteAtomic(ctx context.Context, alertGroupID, text string,
+		who alertgroup.Actor) (*model.TimelineEvent, error)
 }
 
 func TestBothStoresAdmitTheSameWay(t *testing.T) {
@@ -62,6 +64,22 @@ func TestBothStoresAdmitTheSameWay(t *testing.T) {
 				repeat := submitTo(t, s, adm)
 				sameClaim(t, first, repeat)
 				return []outbound.SubmitOutcome{first.Outcome, repeat.Outcome}
+			},
+		},
+		{
+			name: "a plan built before a note is refused",
+			run: func(t *testing.T, s admitting, agID string) []outbound.SubmitOutcome {
+				adm := outboundAdmission(t, agID, "first", channelCommitment("C0001", 0))
+				if _, err := s.AddAlertGroupNoteAtomic(context.Background(), agID, "seen it",
+					alertgroup.Actor{ID: "u-nina", Name: "Nina"}); err != nil {
+					t.Fatalf("a note before the admission: %v", err)
+				}
+				stale := submitTo(t, s, adm)
+
+				// The thread renders the note, so the note is a source like
+				// an alert joining: replanned, the plan is admitted.
+				adm = withEscalation(adm, func(about *outbound.EscalationContext) { about.SourceVersion = 1 })
+				return []outbound.SubmitOutcome{stale.Outcome, submitTo(t, s, adm).Outcome}
 			},
 		},
 		{
