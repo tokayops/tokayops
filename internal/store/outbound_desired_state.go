@@ -103,7 +103,7 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 	// this build can express would silently delete the part of the state a
 	// newer renderer needs - and the read side already refuses such a row, so
 	// the card would then be unrenderable by both of us.
-	if schemaVersion != keys.RenderSnapshotSchemaV1 {
+	if schemaVersion != keys.RenderSnapshotSchemaV2 {
 		return outbound.DesiredStateResult{}, outboundContractf(
 			"the state of %s is stored under schema version %d, which this build cannot write",
 			req.AlertGroupID, schemaVersion)
@@ -159,7 +159,7 @@ func setDesiredStateTx(ctx context.Context, tx *sql.Tx, env renderEnvironment,
 		    snapshot_schema_version = $5, final = $6, updated_at = now()
 		WHERE alert_group_id = $1 AND revision = $7 AND final = FALSE`,
 		req.AlertGroupID, next, encoded, stored.Digest(),
-		keys.RenderSnapshotSchemaV1, req.Reason.Final(), revision,
+		stored.SchemaVersion(), req.Reason.Final(), revision,
 	)
 	if err != nil {
 		return outbound.DesiredStateResult{}, fmt.Errorf(

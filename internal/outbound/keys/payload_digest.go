@@ -16,6 +16,12 @@ import (
 //
 // Collapsing them, which is what asking PayloadDigest alone does, makes the
 // first look like the second.
+//
+// "Has a shape for" means can execute, not merely can parse. Version 2 of the
+// escalation payload has its shape below and no executor yet: the channels
+// still draw from version 1, and the planner still writes it. Until they move,
+// a version 2 row can only have come from a build that is ahead, and the
+// answer for it is the answer for any such row - leave it where it is.
 func KnowsPayloadSchema(kind Kind, schemaVersion int) bool {
 	switch kind {
 	case KindEscalation, KindEscalationReplay:
@@ -89,11 +95,26 @@ type Payload interface {
 func decodePayload(kind Kind, schemaVersion int, raw []byte) (Payload, error) {
 	switch kind {
 	case KindEscalation, KindEscalationReplay:
-		decoded, err := DecodeEscalationPayloadV1(schemaVersion, raw)
-		if err != nil {
-			return nil, err
+		// By the row's OWN schema, never the neutral reader: the digest was
+		// taken over the encoder of the version admitted, and a version 1 row
+		// read as version 2 would digest differently and fail every attempt.
+		switch schemaVersion {
+		case EscalationPayloadV1{}.SchemaVersion():
+			decoded, err := DecodeEscalationPayloadV1(schemaVersion, raw)
+			if err != nil {
+				return nil, err
+			}
+			return decoded, nil
+		case EscalationPayloadV2{}.SchemaVersion():
+			decoded, err := DecodeEscalationPayloadV2(schemaVersion, raw)
+			if err != nil {
+				return nil, err
+			}
+			return decoded, nil
+		default:
+			return nil, contractf("payload schema %d is not one this build canonicalises",
+				schemaVersion)
 		}
-		return decoded, nil
 	case KindHandoff:
 		decoded, err := DecodeHandoffPayloadV1(schemaVersion, raw)
 		if err != nil {

@@ -454,10 +454,12 @@ func TestAStartRefusesSnapshotsItCannotRender(t *testing.T) {
 	admitOne(t, s, agID, dmCommitment("U-nina"))
 
 	previousOutboundShape(t, s)
-	// The shape of a snapshot the previous version wrote.
+	// The shape of a snapshot the previous version wrote: version 1, with the
+	// history still under its retired tag. The version is part of it - the
+	// current version carries a history of its own, under a tag of its own.
 	if _, err := s.db.Exec(`
 		UPDATE outbound_group_snapshots
-		SET snapshot = jsonb_set(snapshot, '{timeline}', '[]')
+		SET snapshot = jsonb_set(snapshot, '{timeline}', '[]'), snapshot_schema_version = 1
 		WHERE alert_group_id = $1`, agID); err != nil {
 		t.Fatalf("write the previous snapshot shape: %v", err)
 	}
@@ -1261,4 +1263,77 @@ func TestAStartUpgradesTheDatabaseOfTheLastRelease(t *testing.T) {
 	if got, err := s.GetAlertGroupByID(group); err != nil || got == nil {
 		t.Fatalf("read the alert group after the transition: %v, %v", got, err)
 	}
+}
+
+// TestAnAdmissionFrozenUnderVersionOneStillRenders is the reader the previous
+// snapshot version keeps after the upgrade, and the one place it is allowed.
+//
+// A batch admitted before render_snapshot/v2 froze its state under version 1,
+// and that state is never rewritten: a direct message of that batch, retried
+// after the upgrade, renders exactly what was admitted. The group's own state
+// is the opposite case - the start rebuilds it to the current version, so a
+// version 1 row there is one the rebuild missed, and it is refused like any
+// version this build does not write.
+func TestAnAdmissionFrozenUnderVersionOneStillRenders(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	// asVersionOne rewrites a stored snapshot the way version 1 stored it -
+	// without the three fields version 2 added - and digests it by version 1's
+	// rules, which is what the column beside it said before the upgrade.
+	asVersionOne := func(t *testing.T, table, column, where, id string) []byte {
+		t.Helper()
+		var stripped []byte
+		if err := s.db.QueryRow(`SELECT `+column+` - 'timeline' - 'timeline_omitted' - 'interactive_providers'
+			FROM `+table+` WHERE `+where+` = $1`, id).Scan(&stripped); err != nil {
+			t.Fatalf("read the stored state: %v", err)
+		}
+		older, err := keys.DecodeRenderSnapshotV1(stripped)
+		if err != nil {
+			t.Fatalf("read the state as version 1: %v", err)
+		}
+		return older.Digest()
+	}
+
+	t.Run("a direct message renders what was admitted", func(t *testing.T) {
+		agID := desiredGroup(t, s, "Disk filling up")
+		intentID := admitOne(t, s, agID, dmCommitment("U-nina"))[0]
+
+		digest := asVersionOne(t, "outbound_batches", "admission_snapshot", "alert_group_id", agID)
+		if _, err := s.db.Exec(`
+			UPDATE outbound_batches
+			SET admission_snapshot = admission_snapshot - 'timeline' - 'timeline_omitted' - 'interactive_providers',
+			    admission_schema_version = $2, admission_digest = $3
+			WHERE alert_group_id = $1`, agID, keys.RenderSnapshotSchemaV1, digest); err != nil {
+			t.Fatalf("freeze the admission as version 1: %v", err)
+		}
+
+		token := claimOne(t, s, intentID)
+		if begun := beginOne(t, s, intentID, token); begun.AttemptID == "" {
+			t.Fatal("the attempt was not opened")
+		}
+	})
+
+	t.Run("the group's own state is not read under version 1", func(t *testing.T) {
+		agID := desiredGroup(t, s, "Memory filling up")
+		intentID := admitOne(t, s, agID, channelCommitment("C0001", 0))[0]
+
+		digest := asVersionOne(t, "outbound_group_snapshots", "snapshot", "alert_group_id", agID)
+		if _, err := s.db.Exec(`
+			UPDATE outbound_group_snapshots
+			SET snapshot = snapshot - 'timeline' - 'timeline_omitted' - 'interactive_providers',
+			    snapshot_schema_version = $2, snapshot_digest = $3
+			WHERE alert_group_id = $1`, agID, keys.RenderSnapshotSchemaV1, digest); err != nil {
+			t.Fatalf("write the group's state as version 1: %v", err)
+		}
+
+		token := claimOne(t, s, intentID)
+		_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+			Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
+		})
+		if err == nil || !strings.Contains(err.Error(), "schema version 1") {
+			t.Fatalf("a card was drawn from a version 1 group state: %v", err)
+		}
+	})
 }

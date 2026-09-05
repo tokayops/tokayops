@@ -755,7 +755,10 @@ func TestThisBuildKnowsWhichPayloadSchemasItHas(t *testing.T) {
 		{KindEscalationReplay, 1, true},
 		{KindHandoff, 1, true},
 		{KindHandoff, 2, false},
+		// Version 2 has a shape and, until the channels execute it, no
+		// executor: a row in it is left alone like any row from ahead.
 		{KindEscalation, 2, false},
+		{KindEscalationReplay, 2, false},
 		{Kind("something_newer"), 1, false},
 	} {
 		if got := KnowsPayloadSchema(tc.kind, tc.version); got != tc.known {

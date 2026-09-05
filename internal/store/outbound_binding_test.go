@@ -722,7 +722,7 @@ func TestStateFromANewerBuildWaitsRatherThanEnds(t *testing.T) {
 
 	if _, err := s.db.Exec(`
 		UPDATE outbound_group_snapshots SET snapshot_schema_version = $2
-		WHERE alert_group_id = $1`, agID, keys.RenderSnapshotSchemaV1+1); err != nil {
+		WHERE alert_group_id = $1`, agID, keys.RenderSnapshotSchemaV2+1); err != nil {
 		t.Fatalf("write the state under a later schema: %v", err)
 	}
 

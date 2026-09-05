@@ -693,12 +693,14 @@ const outboundAdmittedStateConstraint = "outbound_batches_admission_snapshot_pre
 // What to do with the claims already there is a different question, and the
 // answer is deliberately narrow.
 //
-// A snapshot written before 2026-08-25 carries the alert's history under tag
-// 14. Copying such a row into the batch would produce a claim that parses as
-// nothing this build can read - the codec refuses fields it does not know - and
-// the commitment under it would end as undeliverable at the moment somebody
-// needed it. Repairing it is not possible either: the digest those commitments
-// were keyed against covered a field this protocol no longer has.
+// A version 1 snapshot written before 2026-08-25 carries the alert's history
+// under tag 14. Copying such a row into the batch would produce a claim that
+// parses as nothing this build can read - the codec refuses fields it does not
+// know - and the commitment under it would end as undeliverable at the moment
+// somebody needed it. Repairing it is not possible either: the digest those
+// commitments were keyed against covered a field this protocol no longer has.
+// (A version 2 snapshot carries the history too, under tag 16, and is nothing
+// of the kind - which is why the version is part of the question.)
 //
 // So the three cases are answered separately, and none of them by guessing:
 //
@@ -724,7 +726,7 @@ BEGIN
 
 		SELECT count(*) INTO stale
 		FROM outbound_group_snapshots
-		WHERE snapshot ? 'timeline';
+		WHERE snapshot_schema_version = 1 AND snapshot ? 'timeline';
 
 		IF stale > 0 THEN
 			RAISE EXCEPTION 'this database holds % render snapshot(s) written before '

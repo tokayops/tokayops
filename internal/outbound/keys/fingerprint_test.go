@@ -60,16 +60,20 @@ func fingerprintOf(t *testing.T, b EscalationBatch) string {
 // found nobody to notify has no commitments to hash, so everything that tells
 // two such proposals apart has to be in the material before the list.
 //
-// Both moved on 2026-08-25, deliberately: the batch's content reference is the
-// render snapshot's digest, and the snapshot lost its timeline (tag 14).
+// Both moved twice, deliberately, and for one reason each time: the batch's
+// content reference is the render snapshot's digest. On 2026-08-25 the
+// snapshot lost its timeline (tag 14); on 2026-09-05 it became version 2. The
+// fingerprint protocol itself did not change on either day - a batch admitted
+// before the upgrade keeps the fingerprint it was admitted with, and nothing
+// compares a new proposal against it (a group's escalation is admitted once).
 func TestBatchFingerprintIsGolden(t *testing.T) {
 	if got, want := fingerprintOf(t, fixtureBatch(t, fixtureCommitment())),
-		"ec2b0714f5f78b7461ed36889c23d7e5ac7dee95c460abfce3153b5caa2cd78d"; got != want {
+		"f8ed7322417f534057921fd0c01384fc7310e88ff759c3eb34fc33e66afa4089"; got != want {
 		t.Errorf("admitted proposal\n got: %s\nwant: %s", got, want)
 	}
 
 	if got, want := fingerprintOf(t, fixtureBatch(t)),
-		"46d2d4d98333a6444760ec0d5a63cd8bb292c56ba4663ad372556bdd7cf17292"; got != want {
+		"52f64d2210a7773a37616f56f5012a2aa346a9b017a213e32325b3298c7f9e17"; got != want {
 		t.Errorf("empty proposal\n got: %s\nwant: %s", got, want)
 	}
 }
@@ -571,6 +575,75 @@ func TestThePayloadIsStoredUnderTheseNames(t *testing.T) {
 	if string(raw) != want {
 		t.Fatalf("a stored payload now reads\n  %s\nand the constraint over it expects\n  %s",
 			raw, want)
+	}
+
+	raw, err = json.Marshal(EscalationPayloadV2{
+		Slot:            Slot{Kind: SlotPolicy, Index: 2},
+		Target:          Target{Kind: TargetChannel, Ref: "C0001"},
+		MessageOverride: &override,
+		StopOnFailure:   true,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	const wantV2 = `{"slot":{"kind":"policy","index":2},` +
+		`"target":{"kind":"channel","ref":"C0001"},` +
+		`"message_override":"call Nina","stop_on_failure":true}`
+	if string(raw) != wantV2 {
+		t.Fatalf("a stored version 2 payload now reads\n  %s\nand the constraint over it expects\n  %s",
+			raw, wantV2)
+	}
+}
+
+// TestAPayloadIsReadWhicheverSchemaItIsIn. One version is written and two are
+// read, for as long as rows of the older one live. A version 1 row never said
+// anything about stopping the escalation, so it does not; what it said about
+// buttons is not read. Each schema is read only as itself - a version 1 body
+// under version 2 carries a field version 2 does not have, and the other way
+// round - and a version this build does not know is refused, not guessed at.
+func TestAPayloadIsReadWhicheverSchemaItIsIn(t *testing.T) {
+	const v1 = `{"slot":{"kind":"policy","index":2},"target":{"kind":"user","ref":"U0001"},` +
+		`"message_override":"call Nina","interactive":true}`
+	const v2 = `{"slot":{"kind":"policy","index":2},"target":{"kind":"user","ref":"U0001"},` +
+		`"message_override":"call Nina","stop_on_failure":true}`
+
+	older, err := DecodeEscalationPayload(1, []byte(v1))
+	if err != nil {
+		t.Fatalf("read a version 1 row: %v", err)
+	}
+	if older.StopOnFailure {
+		t.Fatal("a version 1 row stops the escalation")
+	}
+	if older.Slot.Index != 2 || older.Target.Ref != "U0001" || *older.MessageOverride != "call Nina" {
+		t.Fatalf("a version 1 row was read as %+v", older)
+	}
+
+	newer, err := DecodeEscalationPayload(2, []byte(v2))
+	if err != nil {
+		t.Fatalf("read a version 2 row: %v", err)
+	}
+	if !newer.StopOnFailure || newer.Target.Ref != "U0001" {
+		t.Fatalf("a version 2 row was read as %+v", newer)
+	}
+
+	for name, tc := range map[string]struct {
+		version int
+		raw     string
+	}{
+		"a version this build does not know":  {3, v2},
+		"a version 1 body under version 2":    {2, v1},
+		"a version 2 body under version 1":    {1, v2},
+		"a version 2 body with a stray brace": {2, v2 + "}"},
+		"a version 2 body with a field from later": {2,
+			`{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C1"},"stop_on_failure":false,"louder":true}`},
+		"a version 2 body aimed at a subscriber": {2,
+			`{"slot":{"kind":"firehose"},"target":{"kind":"subscriber","ref":"i-1"},"stop_on_failure":false}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeEscalationPayload(tc.version, []byte(tc.raw)); err == nil {
+				t.Fatalf("%s was read", name)
+			}
+		})
 	}
 }
 

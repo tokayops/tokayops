@@ -108,6 +108,57 @@ func TestTheProcessZoneNeverReachesASnapshot(t *testing.T) {
 	}
 }
 
+// TestTheHistoryAndTheButtonsReachTheFreeze. Both are given to the freeze
+// rather than read by it, and both are carried across faithfully: a line whose
+// type this build cannot name reaches admission and is refused there, exactly
+// like a status.
+func TestTheHistoryAndTheButtonsReachTheFreeze(t *testing.T) {
+	group := liveGroup()
+	view := GroupView{
+		Group: group, Zone: "UTC",
+		Timeline: []*model.TimelineEvent{
+			{ID: "e2", Type: model.TimelineEventAcknowledged, Message: "Acknowledged by nina",
+				Actor: "nina", CreatedAt: time.Unix(1700000120, 0).UTC()},
+			nil,
+			{ID: "e1", Type: model.TimelineEventCreated, Message: "Alert group created",
+				Actor: "system", CreatedAt: time.Unix(1700000000, 0).UTC()},
+		},
+		TimelineOmitted: 4,
+		Interactive:     []string{keys.InteractiveSlack},
+	}
+
+	state := ViewOf(view)
+	if len(state.Timeline) != 2 || state.TimelineOmitted != 4 {
+		t.Fatalf("the history was frozen as %d lines, %d omitted", len(state.Timeline), state.TimelineOmitted)
+	}
+	if state.Timeline[0].Actor == nil || *state.Timeline[0].Actor != "nina" {
+		t.Fatalf("the actor was lost: %v", state.Timeline[0].Actor)
+	}
+	if len(state.InteractiveProviders) != 1 || state.InteractiveProviders[0] != keys.InteractiveSlack {
+		t.Fatalf("the buttons were frozen as %v", state.InteractiveProviders)
+	}
+
+	snapshot, err := SnapshotOf(view)
+	if err != nil {
+		t.Fatalf("the frozen state is not admissible: %v", err)
+	}
+	lines := snapshot.Content().Timeline
+	if lines[0].ID != "e1" || lines[1].ID != "e2" {
+		t.Fatalf("the history was not settled oldest first: %s, %s", lines[0].ID, lines[1].ID)
+	}
+	if lines[0].Actor != nil {
+		t.Fatal("the system was frozen as an actor")
+	}
+
+	view.Timeline[0].Type = model.TimelineEventType("annotated")
+	if _, err := SnapshotOf(view); err == nil {
+		t.Fatal("a producer admitted a line of history this build cannot name")
+	}
+	if got := ViewOf(view).Timeline[0].Type; got != keys.TimelineEventType("annotated") {
+		t.Fatalf("the unknown type became %q before anybody could refuse it", got)
+	}
+}
+
 // TestAVocabularyThisBuildDoesNotShare. A status nobody declared is refused at
 // admission, because a substitution would be recorded as what was accepted - a
 // message about a state the alert was never in, under a digest saying

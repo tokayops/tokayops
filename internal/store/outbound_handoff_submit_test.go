@@ -584,7 +584,7 @@ func TestAHandoverCarriesNoAlertGroupState(t *testing.T) {
 		{
 			name: "a snapshot schema version",
 			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
-				batch.Admission.SnapshotSchemaVersion = keys.RenderSnapshotSchemaV1
+				batch.Admission.SnapshotSchemaVersion = keys.RenderSnapshotSchemaV2
 			},
 		},
 		{
@@ -655,7 +655,7 @@ func TestAnEscalationsFourFieldsDescribeOneState(t *testing.T) {
 		{
 			name: "a schema this build cannot render",
 			spoil: func(t *testing.T, s *Store, batch *outbound.Batch) {
-				batch.Admission.SnapshotSchemaVersion = keys.RenderSnapshotSchemaV1 + 1
+				batch.Admission.SnapshotSchemaVersion = keys.RenderSnapshotSchemaV2 + 1
 			},
 			says: "schema",
 		},

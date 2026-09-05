@@ -223,6 +223,14 @@ func (b EscalationBatch) Admit() (Admission, error) {
 		// here - every other route goes through NewRenderSnapshot.
 		return Admission{}, contractf("an admission with no snapshot to be about")
 	}
+	if b.Snapshot.schema != RenderSnapshotSchemaV2 {
+		// A version 1 snapshot is read for what was admitted once; it is not
+		// something to admit again. New claims are made from the current
+		// shape, which is the only one the group's own state is kept in.
+		return Admission{}, contractf(
+			"an admission from a version %d snapshot; only version %d is admitted",
+			b.Snapshot.schema, RenderSnapshotSchemaV2)
+	}
 
 	identity := BatchIdentity{
 		Kind:            b.Kind,
@@ -340,7 +348,7 @@ func (b EscalationBatch) Admit() (Admission, error) {
 		Fingerprint:           fingerprint,
 		FingerprintVersion:    b.FingerprintVersion,
 		Snapshot:              b.Snapshot,
-		SnapshotSchemaVersion: RenderSnapshotSchemaV1,
+		SnapshotSchemaVersion: b.Snapshot.schema,
 		Commitments:           admitted,
 	}, nil
 }

@@ -27,6 +27,38 @@ func TestThePayloadDigestIsTheseBytes(t *testing.T) {
 	if got := hex.EncodeToString(digest); got != want {
 		t.Fatalf("the payload digest is %s, and the protocol says %s", got, want)
 	}
+
+	// Version 2 of the same commitment, with the flag that replaced the
+	// buttons. A different schema is a different digest by construction: the
+	// version is in the material.
+	digest, err = PayloadDigest(KindEscalation, 2,
+		[]byte(`{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C0001"},"stop_on_failure":true}`))
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	const wantV2 = "df9d99b273d2fe5073e633d7f5f6145cd7cb1857a067e5fa14ce244ba2b5e1b0"
+	if got := hex.EncodeToString(digest); got != wantV2 {
+		t.Fatalf("the version 2 payload digest is %s, and the protocol says %s", got, wantV2)
+	}
+}
+
+// TestADigestIsTakenOverTheRowsOwnSchema. A version 1 row is digested by the
+// version 1 encoder - the one its admission used - never by the neutral
+// reader: read as version 2 it would digest differently and fail every
+// attempt. And each body parses only under its own version.
+func TestADigestIsTakenOverTheRowsOwnSchema(t *testing.T) {
+	const v1 = `{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C0001"},"interactive":true}`
+	const v2 = `{"slot":{"kind":"firehose"},"target":{"kind":"channel","ref":"C0001"},"stop_on_failure":false}`
+
+	if _, err := PayloadDigest(KindEscalation, 2, []byte(v1)); err == nil {
+		t.Fatal("a version 1 body was digested under version 2")
+	}
+	if _, err := PayloadDigest(KindEscalation, 1, []byte(v2)); err == nil {
+		t.Fatal("a version 2 body was digested under version 1")
+	}
+	if _, err := PayloadDigest(KindEscalation, 3, []byte(v2)); err == nil {
+		t.Fatal("a schema this build does not have was digested")
+	}
 }
 
 // TestTwoSpellingsOfOnePayloadAreOneDigest. The digest is of the CANONICAL

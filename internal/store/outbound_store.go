@@ -272,7 +272,7 @@ func admissionCarriesWhatItsKindHas(admission keys.Admission) error {
 		// that one always digests to thirty-two bytes. There is no third case
 		// to defend against, and a guard for it would be a guard nothing can
 		// reach.
-		if admission.SnapshotSchemaVersion != keys.RenderSnapshotSchemaV1 {
+		if admission.SnapshotSchemaVersion != keys.RenderSnapshotSchemaV2 {
 			return outboundContractf(
 				"an escalation admission at snapshot schema %d, which this build cannot render",
 				admission.SnapshotSchemaVersion)
@@ -1600,7 +1600,7 @@ func lockedSnapshotTx(ctx context.Context, tx *sql.Tx, alertGroupID string) (sto
 	if err != nil {
 		return storedSnapshot{}, err
 	}
-	return checkedSnapshot(raw, revision, schemaVersion, digest, final, alertGroupID)
+	return checkedSnapshot(raw, revision, schemaVersion, digest, final, alertGroupID, false)
 }
 
 // admittedSnapshotTx reads the state a batch was admitted from - the one a
@@ -1637,7 +1637,7 @@ func admittedSnapshotTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent)
 			"the admission of %s froze no state, and this commitment renders from one", intent.ID)
 	}
 	return checkedSnapshot(raw, revision.Int64, int(schemaVersion.Int64), digest,
-		false, intent.AlertGroupID)
+		false, intent.AlertGroupID, true)
 }
 
 // attemptContentTx reads what an attempt will be made from, in whichever of the
@@ -1778,21 +1778,35 @@ func contentFormOf(kind keys.Kind) outbound.ContentForm {
 
 // checkedSnapshot proves a stored snapshot is the same thing that went in,
 // whichever row it came out of.
+//
+// Admission state - what a batch was admitted from - is frozen with the claim
+// and never rewritten, so a batch admitted before the current snapshot version
+// still carries the older one, and the one-shot messages of that batch render
+// it. The group's own state is rebuilt to the current version when a build
+// starts, so an older version there is a row the rebuild missed, and it is
+// refused like any other version this build does not write.
 func checkedSnapshot(raw []byte, revision int64, schemaVersion int, digest []byte,
-	final bool, alertGroupID string) (storedSnapshot, error) {
+	final bool, alertGroupID string, admission bool) (storedSnapshot, error) {
 
-	// A version this build does not know is a deployment that is behind, not a
-	// broken alert: the instance that wrote it renders it perfectly well. It
-	// stops here and changes nothing, so the work waits for a build that can
-	// do it instead of being ended by one that cannot.
-	if schemaVersion != keys.RenderSnapshotSchemaV1 {
+	var (
+		snapshot keys.RenderSnapshot
+		err      error
+	)
+	switch {
+	case schemaVersion == keys.RenderSnapshotSchemaV2:
+		err = json.Unmarshal(raw, &snapshot)
+	case schemaVersion == keys.RenderSnapshotSchemaV1 && admission:
+		snapshot, err = keys.DecodeRenderSnapshotV1(raw)
+	default:
+		// A version this build does not know is a deployment that is behind,
+		// not a broken alert: the instance that wrote it renders it perfectly
+		// well. It stops here and changes nothing, so the work waits for a
+		// build that can do it instead of being ended by one that cannot.
 		return storedSnapshot{}, outboundContractf(
 			"the state of %s was written under schema version %d, which this build cannot render",
 			alertGroupID, schemaVersion)
 	}
-
-	var snapshot keys.RenderSnapshot
-	if err := json.Unmarshal(raw, &snapshot); err != nil {
+	if err != nil {
 		// A stored snapshot that no longer canonicalises is refused rather than
 		// rendered: the message it would produce is not the one its key
 		// describes.
