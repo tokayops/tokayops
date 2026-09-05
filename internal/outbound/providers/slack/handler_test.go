@@ -322,8 +322,9 @@ func TestSlackAnswersAreTranslatedNotInterpreted(t *testing.T) {
 		"":                                {"", false},
 	}
 
+	change := outbound.Call{AttemptKind: outbound.AttemptMutation}
 	for status, want := range cases {
-		answer, known := handler.ClassifyResponse(outbound.Result{
+		answer, known := handler.ClassifyResponse(change, outbound.Result{
 			Evidence: outbound.ProviderResponse, Status: status,
 		})
 		if known != want.known {
@@ -342,7 +343,8 @@ func TestSlackAnswersAreTranslatedNotInterpreted(t *testing.T) {
 func TestOnlyAMissingMessageProvesAnythingAboutIt(t *testing.T) {
 	handler := NewHandler(nil, nil)
 
-	gone, known := handler.ClassifyResponse(outbound.Result{
+	change := outbound.Call{AttemptKind: outbound.AttemptMutation}
+	gone, known := handler.ClassifyResponse(change, outbound.Result{
 		Evidence: outbound.ProviderResponse, Status: "message_not_found",
 	})
 	if !known || gone.Detail == nil || *gone.Detail != keys.DetailDefinitelyAbsent {
@@ -350,7 +352,7 @@ func TestOnlyAMissingMessageProvesAnythingAboutIt(t *testing.T) {
 	}
 
 	for _, status := range []string{"cant_update_message", "edit_window_closed"} {
-		stuck, known := handler.ClassifyResponse(outbound.Result{
+		stuck, known := handler.ClassifyResponse(change, outbound.Result{
 			Evidence: outbound.ProviderResponse, Status: status,
 		})
 		if !known {
@@ -359,6 +361,51 @@ func TestOnlyAMissingMessageProvesAnythingAboutIt(t *testing.T) {
 		if stuck.Detail != nil {
 			t.Errorf("%s claimed %v about a message that is still there",
 				status, *stuck.Detail)
+		}
+	}
+}
+
+// TestWhatAnAnswerProvesDependsOnWhatWasAsked. "message_not_found" to a change
+// proves the card is gone; to a create it proves nothing - nothing was made,
+// nothing went away - and chat.postMessage does not document it, so it is
+// doubt under its own name, with no detail and no breach. The three refusals
+// chat.postMessage documents for a reply into a thread are refusals whichever
+// way they are asked.
+func TestWhatAnAnswerProvesDependsOnWhatWasAsked(t *testing.T) {
+	handler := NewHandler(nil, nil)
+	create := outbound.Call{AttemptKind: outbound.AttemptCreate}
+	change := outbound.Call{AttemptKind: outbound.AttemptMutation}
+
+	toCreate, known := handler.ClassifyResponse(create, outbound.Result{
+		Evidence: outbound.ProviderResponse, Status: "message_not_found",
+	})
+	if !known || toCreate.Outcome != outbound.OutcomeAmbiguous || toCreate.Detail != nil ||
+		toCreate.Class != "message_not_found" {
+		t.Fatalf("message_not_found to a create classified %+v", toCreate)
+	}
+	toChange, _ := handler.ClassifyResponse(change, outbound.Result{
+		Evidence: outbound.ProviderResponse, Status: "message_not_found",
+	})
+	if toChange.Outcome != outbound.OutcomePermanentRejection || toChange.Detail == nil {
+		t.Fatalf("message_not_found to a change classified %+v", toChange)
+	}
+
+	// The domain agrees: through Conclude, the create carries no breach.
+	if _, breach := outbound.Conclude(handler, create, outbound.Result{
+		Evidence: outbound.ProviderResponse, Status: "message_not_found",
+	}, errors.New("message_not_found")); breach != outbound.BreachNone {
+		t.Fatalf("a create answered message_not_found was counted as %s", breach)
+	}
+
+	for _, status := range []string{"cannot_reply_to_message",
+		"restricted_action_non_threadable_channel", "restricted_action_thread_locked"} {
+		for name, call := range map[string]outbound.Call{"a create": create, "a change": change} {
+			answer, known := handler.ClassifyResponse(call, outbound.Result{
+				Evidence: outbound.ProviderResponse, Status: status,
+			})
+			if !known || answer.Outcome != outbound.OutcomePermanentRejection || answer.Detail != nil {
+				t.Errorf("%s answered %s classified %+v (known=%v)", name, status, answer, known)
+			}
 		}
 	}
 }

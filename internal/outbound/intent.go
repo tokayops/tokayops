@@ -271,8 +271,35 @@ type Intent struct {
 	// orders by the first and retention measures from the second.
 	CreatedAt time.Time
 	UpdatedAt time.Time
+
+	// ParentID names the card a satellite follows, and is empty for
+	// everything else. Parent is that card as it stood when this commitment
+	// was read - claimed, mostly - and nil when there is none. What the
+	// satellite may do follows from it: nothing until the card has a message,
+	// and a refusal once the card ended without one.
+	ParentID string
+	Parent   *ParentState
 }
+
+// ParentState is what a satellite knows about the card it follows.
+type ParentState struct {
+	ID              string
+	Status          Status
+	ReceiptRecorded bool
+	ReceiptRef      string
+}
+
+// Ended reports whether the card is over - and, if it has no message, that it
+// never will have one unless a person brings it back.
+func (p ParentState) Ended() bool { return p.Status.Terminal() }
 
 // GroupBound reports whether this commitment belongs to an alert group, which
 // is what decides whether a transition has to take the group's lock first.
 func (i Intent) GroupBound() bool { return i.AlertGroupID != "" }
+
+// Satellite reports whether this commitment follows a card rather than
+// reaching a recipient of its own: the thread under a channel card, or the
+// reply that closes it.
+func (i Intent) Satellite() bool {
+	return i.TargetKind == keys.TargetThread || i.TargetKind == keys.TargetThreadReply
+}

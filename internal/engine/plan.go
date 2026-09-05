@@ -398,7 +398,7 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 	)
 
 	if p.firehose != "" {
-		out = append(out, plannedCommitment{
+		card := plannedCommitment{
 			commitment: keys.EscalationCommitment{
 				Slot:            keys.Slot{Kind: keys.SlotFirehose},
 				Provider:        firehoseProvider,
@@ -411,7 +411,9 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 			},
 			targetKind: "channel",
 			firehose:   true,
-		})
+		}
+		out = append(out, card)
+		out = append(out, satellitesOf(card)...)
 	}
 
 	if policy == nil {
@@ -489,7 +491,7 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 				seen[key] = true
 			}
 
-			out = append(out, plannedCommitment{
+			card := plannedCommitment{
 				commitment: keys.EscalationCommitment{
 					Slot:            slot,
 					Provider:        step.Provider,
@@ -504,7 +506,9 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 					AmbiguityPolicy: keys.PolicyRetry,
 				},
 				targetKind: step.TargetKind,
-			})
+			}
+			out = append(out, card)
+			out = append(out, satellitesOf(card)...)
 		}
 	}
 	return out, unpromised, nil
@@ -699,6 +703,11 @@ func policySnapshot(policyID string, policy *model.EscalationPolicy,
 		snapshot.Name = policy.Name
 	}
 	for _, step := range planned {
+		// The satellites of a card are not steps of the policy: they follow a
+		// step's card, and the record of what was decided names the steps.
+		if step.commitment.Target.Satellite() {
+			continue
+		}
 		snapshot.Steps = append(snapshot.Steps, &model.EscalationStepSnapshot{
 			Provider: step.commitment.Provider,
 			// The shape of the message, as the policy words it, and the kind of
@@ -753,4 +762,33 @@ func optionalText(text string) *string {
 		return nil
 	}
 	return &text
+}
+
+// satellitesOf are the two commitments that follow a Slack channel card: the
+// thread under it, edited like the card, and the reply that closes it, said
+// once. The same slot, provider and timing as the card; nothing of their own -
+// no deadline, no words, no buttons. A person's message and a Telegram card
+// have none: Telegram has no threads.
+func satellitesOf(card plannedCommitment) []plannedCommitment {
+	c := card.commitment
+	if c.Provider != firehoseProvider || c.Target.Kind != keys.TargetChannel || !c.Editable {
+		return nil
+	}
+	var out []plannedCommitment
+	for _, kind := range []keys.TargetKind{keys.TargetThread, keys.TargetThreadReply} {
+		out = append(out, plannedCommitment{
+			commitment: keys.EscalationCommitment{
+				Slot:            c.Slot,
+				Provider:        c.Provider,
+				Target:          keys.Target{Kind: kind, Ref: c.Target.Ref},
+				Editable:        kind == keys.TargetThread,
+				Timing:          c.Timing,
+				CompletionMode:  keys.CompletionOnAcceptance,
+				AmbiguityPolicy: keys.PolicyRetry,
+			},
+			targetKind: string(kind),
+			firehose:   card.firehose,
+		})
+	}
+	return out
 }

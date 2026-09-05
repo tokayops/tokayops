@@ -310,7 +310,7 @@ func TestTelegramAnswersAreTranslatedNotInterpreted(t *testing.T) {
 	}
 
 	for status, want := range cases {
-		answer, known := handler.ClassifyResponse(outbound.Result{
+		answer, known := handler.ClassifyResponse(outbound.Call{AttemptKind: outbound.AttemptCreate}, outbound.Result{
 			Evidence: outbound.ProviderResponse, Status: status,
 		})
 		if known != want.known {
@@ -344,7 +344,7 @@ func TestARejectedSendCarriesWhatTelegramSaid(t *testing.T) {
 	if result.Evidence != outbound.ProviderResponse {
 		t.Fatalf("Telegram answered and it was recorded as %q", result.Evidence)
 	}
-	answer, known := handler.ClassifyResponse(result)
+	answer, known := handler.ClassifyResponse(outbound.Call{AttemptKind: outbound.AttemptCreate}, result)
 	if !known || answer.Outcome != outbound.OutcomePermanentRejection {
 		t.Fatalf("a blocked bot classified %q (known=%v)", answer.Outcome, known)
 	}
@@ -383,7 +383,7 @@ func TestWhatTelegramSaysAboutAChange(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			answer, known := handler.ClassifyResponse(outbound.Result{
+			answer, known := handler.ClassifyResponse(outbound.Call{AttemptKind: outbound.AttemptMutation}, outbound.Result{
 				Evidence: outbound.ProviderResponse, Status: tc.status,
 			})
 			if !known {
@@ -602,5 +602,32 @@ func TestACallWithNoStateToRenderIsRefused(t *testing.T) {
 	}
 	if len(api.calls) != 0 {
 		t.Fatal("the channel was called anyway")
+	}
+}
+
+// TestAMissingMessageProvesNothingAboutACreate. "message to edit not found"
+// is about the message a change was aimed at; said to a create it names
+// nothing this commitment made, and is doubt rather than proof of absence.
+func TestAMissingMessageProvesNothingAboutACreate(t *testing.T) {
+	handler := NewHandler(nil, nil)
+	answer, known := handler.ClassifyResponse(outbound.Call{AttemptKind: outbound.AttemptCreate}, outbound.Result{
+		Evidence: outbound.ProviderResponse, Status: "400:Bad Request: message to edit not found",
+	})
+	if !known || answer.Outcome != outbound.OutcomeAmbiguous || answer.Detail != nil {
+		t.Fatalf("a create answered 'message to edit not found' classified %+v (known=%v)", answer, known)
+	}
+}
+
+// TestTelegramHasNoThreads. The messages under a card exist on one provider;
+// a commitment addressing them to Telegram is refused before the network, by
+// name, rather than sent as a card.
+func TestTelegramHasNoThreads(t *testing.T) {
+	handler := NewHandler(&mockTelegramTokenSource{token: "tok"}, nil)
+	for _, kind := range []keys.TargetKind{keys.TargetThread, keys.TargetThreadReply} {
+		prepared := handler.Prepare(context.Background(), intentFor(t, keys.Target{Kind: kind, Ref: "C0001"}))
+		if got := prepared.Request("i", "t", "w").ErrorClass; prepared.Outcome() != outbound.PreparationPermanent ||
+			got != "unsupported_target" {
+			t.Fatalf("a %s was prepared as %s %q", kind, prepared.Outcome(), got)
+		}
 	}
 }

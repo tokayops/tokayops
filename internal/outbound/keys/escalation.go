@@ -105,8 +105,22 @@ func (c EscalationCommitment) validate() error {
 	if c.Provider == "" {
 		return contractf("an escalation commitment with no provider")
 	}
-	if err := c.Target.addressedTo(TargetChannel, TargetUser); err != nil {
+	if err := c.Target.addressedTo(escalationTargets...); err != nil {
 		return err
+	}
+	if c.Target.Satellite() {
+		// A satellite is what its card is - same slot, provider and timing -
+		// with nothing of its own: no deadline, no words, no buttons. The
+		// thread is edited like the card; the reply is said once.
+		if c.Provider != satelliteProvider {
+			return contractf("a %s for %s; only Slack cards have satellites", c.Target.Kind, c.Provider)
+		}
+		if editable := c.Target.Kind == TargetThread; editable != c.Editable {
+			return contractf("a %s that is editable=%v", c.Target.Kind, c.Editable)
+		}
+		if c.Expiry != nil || c.MessageOverride != nil || c.Interactive {
+			return contractf("a %s with a deadline, words or buttons of its own", c.Target.Kind)
+		}
 	}
 	if err := c.Timing.validate(); err != nil {
 		return err
@@ -121,6 +135,11 @@ func (c EscalationCommitment) validate() error {
 	}
 	return c.AmbiguityPolicy.validate()
 }
+
+// satelliteProvider is the one provider whose channel cards have satellites.
+// Telegram has no threads; its handler says so to a satellite it is handed,
+// which the admission never produces.
+const satelliteProvider = "slack"
 
 // EscalationBatch is one admission as a producer proposes it: what content it
 // is about, and every commitment it wants accepted.
@@ -168,6 +187,12 @@ type AdmittedCommitment struct {
 	// guessed at.
 	Payload              Payload
 	PayloadSchemaVersion int
+
+	// ParentKey is the key of the card a satellite follows, and empty for
+	// everything else. Derived, not supplied: the card is the commitment of
+	// the same slot, provider and channel whose target is the channel itself,
+	// and it has to be in the same admission.
+	ParentKey string
 }
 
 // Admission is a proposal reduced to what the database stores: one key for the
@@ -324,6 +349,33 @@ func (b EscalationBatch) Admit() (Admission, error) {
 		encoded = append(encoded, material)
 	}
 
+	// Satellites name their card, and the card has to be here. A second pass,
+	// because the card may come later in the proposal than its satellites.
+	keyed := make(map[string]bool, len(admitted))
+	for _, c := range admitted {
+		keyed[c.IdempotencyKey] = true
+	}
+	for i := range admitted {
+		if !admitted[i].Target.Satellite() {
+			continue
+		}
+		parentKey, err := escalationIntent{
+			AlertGroupID:    snapshot.AlertGroupID,
+			ClientRequestID: b.ClientRequestID,
+			Slot:            admitted[i].Slot,
+			Provider:        admitted[i].Provider,
+			Target:          Target{Kind: TargetChannel, Ref: admitted[i].Target.Ref},
+		}.key(b.Kind, b.GrammarVersion)
+		if err != nil {
+			return Admission{}, err
+		}
+		if !keyed[parentKey] {
+			return Admission{}, contractf("a %s in %s follows a card this admission does not contain",
+				admitted[i].Target.Kind, admitted[i].Target.Ref)
+		}
+		admitted[i].ParentKey = parentKey
+	}
+
 	outcome := OutcomeAdmitted
 	if len(admitted) == 0 {
 		outcome = OutcomeNoTargets
@@ -351,6 +403,60 @@ func (b EscalationBatch) Admit() (Admission, error) {
 		SnapshotSchemaVersion: b.Snapshot.schema,
 		Commitments:           admitted,
 	}, nil
+}
+
+// SatellitesOf derives the two satellites of a Slack channel card that was
+// admitted without them: the thread under it and the reply that closes it,
+// keyed by the same grammar the card was, following the card by its key.
+//
+// For the start-up that gives the cards of a previous version their
+// satellites - the one place a commitment is made outside an admission. The
+// payload is the first schema, like the card's: no buttons, no words.
+func SatellitesOf(kind Kind, grammarVersion int, alertGroupID string, slot Slot,
+	provider, channel string) ([]AdmittedCommitment, error) {
+
+	if kind != KindEscalation {
+		// A re-admission's keys carry the operator's request id, which the
+		// stored claim does not; nothing has produced one yet, and a row that
+		// says otherwise is not this build's to guess about.
+		return nil, contractf("satellites for a %s claim, which nothing has admitted", kind)
+	}
+	card := escalationIntent{
+		AlertGroupID: alertGroupID, Slot: slot, Provider: provider,
+		Target: Target{Kind: TargetChannel, Ref: channel},
+	}
+	parentKey, err := card.key(kind, grammarVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []AdmittedCommitment
+	for _, target := range []Target{
+		{Kind: TargetThread, Ref: channel}, {Kind: TargetThreadReply, Ref: channel},
+	} {
+		intent := card
+		intent.Target = target
+		key, err := intent.key(kind, grammarVersion)
+		if err != nil {
+			return nil, err
+		}
+		payload := EscalationPayloadV1{Slot: slot, Target: target}
+		out = append(out, AdmittedCommitment{
+			IdempotencyKey:       key,
+			Provider:             provider,
+			Target:               target,
+			Slot:                 slot,
+			Editable:             target.Kind == TargetThread,
+			Operation:            OperationSend,
+			CompletionMode:       CompletionOnAcceptance,
+			AmbiguityPolicy:      PolicyRetry,
+			Timing:               TimingSpec{Kind: TimingRelativeToAdmission},
+			Payload:              payload,
+			PayloadSchemaVersion: payload.SchemaVersion(),
+			ParentKey:            parentKey,
+		})
+	}
+	return out, nil
 }
 
 // cloneTiming copies an optional timing spec rather than the pointer to it.

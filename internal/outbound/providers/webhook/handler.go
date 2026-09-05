@@ -267,7 +267,7 @@ func (h *Handler) readPayload(kind keys.Kind, schema int, raw []byte) (keys.Webh
 // says the request itself is wrong and will not be retried; 3xx is a redirect
 // this system does not follow. Everything else - 5xx included - is left to the
 // domain, whose answer is doubt.
-func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification, bool) {
+func (h *Handler) ClassifyResponse(_ outbound.Call, res outbound.Result) (outbound.Classification, bool) {
 	code, err := strconv.Atoi(res.Status)
 	if err != nil {
 		return outbound.Classification{}, false

@@ -55,6 +55,10 @@ type fakeStore struct {
 	expired    []Expired
 	recovered  []Recovered
 	recoverErr error
+
+	// shape, when set, is applied to every commitment the fake leases: the
+	// tests about satellites lease one that follows a card.
+	shape func(*Intent)
 }
 
 // queues is one provider's work, split the way the store splits it.
@@ -139,12 +143,16 @@ func (f *fakeStore) ClaimDueIntents(_ context.Context, req ClaimRequest) ([]Leas
 	leased := make([]Leased, 0, give)
 	for i := 0; i < give; i++ {
 		f.nextID++
+		intent := Intent{
+			KeyKind: keys.KindEscalation,
+			ID:      fmt.Sprintf("intent-%d", f.nextID), Provider: req.Provider,
+			Status: StatusPending, AlertGroupID: "ag-1",
+		}
+		if f.shape != nil {
+			f.shape(&intent)
+		}
 		leased = append(leased, Leased{
-			Intent: Intent{
-				KeyKind: keys.KindEscalation,
-				ID:      fmt.Sprintf("intent-%d", f.nextID), Provider: req.Provider,
-				Status: StatusPending, AlertGroupID: "ag-1",
-			},
+			Intent:      intent,
 			LeaseToken:  fmt.Sprintf("token-%d", f.nextID),
 			LockedUntil: time.Now().Add(req.Lease),
 		})
@@ -248,7 +256,7 @@ func (c *fakeChannel) ExecuteAttempt(ctx context.Context, call Call) (Result, er
 	return result, err
 }
 
-func (c *fakeChannel) ClassifyResponse(Result) (Classification, bool) {
+func (c *fakeChannel) ClassifyResponse(Call, Result) (Classification, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return Classification{Outcome: c.outcome, Class: c.class}, c.known
@@ -879,4 +887,89 @@ func mustSnapshotContent(revision int64) AttemptContent {
 		panic(err)
 	}
 	return content
+}
+
+// TestTheGateAnswersForTheCard. Before a satellite's channel is asked, the
+// domain answers from the card: a card with a message is the channel's to
+// prepare; a card that ended without one is a refusal the worker states; and
+// the two states the claim's predicate keeps out of the queue - a card alive
+// without a message, or no card at all - are contract violations, counted and
+// left for the lease to expire.
+func TestTheGateAnswersForTheCard(t *testing.T) {
+	w := testWorker(newFakeStore(), nil)
+	thread := func(parent *ParentState) Intent {
+		return Intent{ID: "thread-1", TargetKind: keys.TargetThread, ParentID: "card-1", Parent: parent}
+	}
+	for _, tc := range []struct {
+		name      string
+		intent    Intent
+		want      gateDecision
+		class     string
+		violation string
+	}{
+		{name: "a card with a message", want: gateAsk,
+			intent: thread(&ParentState{ID: "card-1", Status: StatusIdle, ReceiptRecorded: true, ReceiptRef: "C0001/1"})},
+		{name: "a card that ended without one", want: gateDecided, class: ParentEndedWithoutMessage,
+			intent: thread(&ParentState{ID: "card-1", Status: StatusPermanentFailed})},
+		{name: "a card still on its way", want: gateSkip, violation: "satellite_before_its_card",
+			intent: thread(&ParentState{ID: "card-1", Status: StatusPending})},
+		{name: "no card at all", want: gateSkip, violation: "satellite_without_parent",
+			intent: thread(nil)},
+		{name: "not a satellite", want: gateAsk,
+			intent: Intent{ID: "card-1", TargetKind: keys.TargetChannel}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := 0.0
+			if tc.violation != "" {
+				before = counterValue(t, metrics.OutboundContractViolationsTotal, "claim", tc.violation)
+			}
+			prepared, got := w.satelliteGate(tc.intent)
+			if got != tc.want {
+				t.Fatalf("the gate said %d, want %d", got, tc.want)
+			}
+			if tc.class != "" {
+				if prepared.Outcome() != PreparationPermanent || prepared.Request("i", "t", "w").ErrorClass != tc.class {
+					t.Fatalf("the gate stated %s %q", prepared.Outcome(), prepared.Request("i", "t", "w").ErrorClass)
+				}
+			}
+			if tc.violation != "" {
+				if got := counterValue(t, metrics.OutboundContractViolationsTotal, "claim", tc.violation); got != before+1 {
+					t.Fatalf("the violation %q was counted %v time(s)", tc.violation, got-before)
+				}
+			}
+		})
+	}
+}
+
+// TestASatelliteIsNotAdmissionLatency. The histogram is how long a page takes
+// to go out from the moment it was admitted. A thread admitted with its card
+// and sent an hour later, when the alert ended, took an hour by that clock
+// and was not late by a second - so a satellite is not observed at all.
+func TestASatelliteIsNotAdmissionLatency(t *testing.T) {
+	latency := 3600.0
+	store := newFakeStore()
+	store.beginOut.FirstAttemptLatency = &latency
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
+	store.available["slack"] = &queues{fresh: 1}
+	store.shape = func(i *Intent) {
+		i.TargetKind = keys.TargetThread
+		i.ParentID = "card-1"
+		i.Parent = &ParentState{ID: "card-1", Status: StatusIdle, ReceiptRecorded: true, ReceiptRef: "C0001/1"}
+	}
+	channel := newFakeChannel()
+
+	before := histogramCount(t, metrics.OutboundAdmissionLatencySeconds, FamilyNotification)
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	w.tick(context.Background())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(channel.made()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the thread was never attempted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := histogramCount(t, metrics.OutboundAdmissionLatencySeconds, FamilyNotification); got != before {
+		t.Fatalf("the histogram holds %d observations, want %d: a thread is not a page", got, before)
+	}
 }

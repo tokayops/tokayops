@@ -30,7 +30,7 @@ func (h *wilfulHandler) ExecuteAttempt(context.Context, Call) (Result, error) {
 	return Result{}, nil
 }
 
-func (h *wilfulHandler) ClassifyResponse(Result) (Classification, bool) {
+func (h *wilfulHandler) ClassifyResponse(Call, Result) (Classification, bool) {
 	h.asked++
 	return Classification{Outcome: h.outcome, Class: h.class, Detail: h.detail}, h.known
 }

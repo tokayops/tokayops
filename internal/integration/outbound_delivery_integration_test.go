@@ -214,10 +214,36 @@ func TestOneRecipientFailingLeavesTheOthersAlone(t *testing.T) {
 
 	startOutboundWorker(t, env.Worker)
 
-	waitForDeliveries(t, env.S, "fan_out_isolation", 2)
+	// The card, the direct message, and the card's thread, which follows the
+	// card into failure: a card that never made a message leaves nothing to
+	// write under. The reply waits for the alert to be over, and fails the
+	// same way then.
+	waitForDeliveries(t, env.S, "fan_out_isolation", 3)
 
-	var failed, delivered int
+	var failed, delivered, followed int
 	for _, intent := range intentsOf(t, env, "fan_out_isolation") {
+		if intent.Satellite() {
+			if intent.TargetKind == "thread_reply" {
+				if intent.Status != outbound.StatusPending {
+					t.Errorf("the reply of an alert that is not over is %s", intent.Status)
+				}
+				continue
+			}
+			if intent.Status != outbound.StatusPermanentFailed {
+				t.Errorf("the %s of the failed card is %s", intent.TargetKind, intent.Status)
+				continue
+			}
+			var class string
+			if err := env.S.GetDB().QueryRow(`SELECT error_class FROM outbound_attempts
+				WHERE intent_id = $1 ORDER BY attempt_no DESC LIMIT 1`, intent.ID).Scan(&class); err != nil {
+				t.Fatalf("read the satellite's refusal: %v", err)
+			}
+			if class != outbound.ParentEndedWithoutMessage {
+				t.Errorf("the %s failed as %q", intent.TargetKind, class)
+			}
+			followed++
+			continue
+		}
 		switch intent.Status {
 		case outbound.StatusPermanentFailed:
 			failed++
@@ -230,8 +256,8 @@ func TestOneRecipientFailingLeavesTheOthersAlone(t *testing.T) {
 			t.Errorf("a commitment to %s is %s", intent.TargetRef, intent.Status)
 		}
 	}
-	if failed != 1 || delivered != 1 {
-		t.Fatalf("%d failed and %d delivered, want one of each", failed, delivered)
+	if failed != 1 || delivered != 1 || followed != 1 {
+		t.Fatalf("%d failed, %d delivered, %d followed; want one of each", failed, delivered, followed)
 	}
 }
 
@@ -276,9 +302,11 @@ func TestWorkOutlivesTheProcessThatTookIt(t *testing.T) {
 	// writing to the database is an instance that has not stopped.
 	stopFirst()
 
+	// The card's satellites wait for the card and are not counted: they
+	// survive with it either way.
 	owed := 0
 	for _, intent := range intentsOf(t, env, "survives_restart") {
-		if !intent.Status.Terminal() {
+		if !intent.Status.Terminal() && !intent.Satellite() {
 			owed++
 		}
 	}

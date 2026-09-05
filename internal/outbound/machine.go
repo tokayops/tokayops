@@ -191,6 +191,22 @@ type Transition struct {
 
 // Decide answers what one commitment does next.
 func Decide(in Input) (Transition, error) {
+	transition, err := decide(in)
+	if err != nil {
+		return transition, err
+	}
+	if in.Intent.Satellite() {
+		// A satellite mirrors the alert's history; it does not write to it.
+		// A line about the mirror would appear in the mirror at the next
+		// door, and the group was moved by the card it follows before the
+		// satellite could be claimed at all. Its fate is in its own journal.
+		transition.Effects.Timeline = TimelineNone
+		transition.Effects.TriggerGroup = false
+	}
+	return transition, nil
+}
+
+func decide(in Input) (Transition, error) {
 	switch in.Trigger {
 	case TriggerPreparation:
 		return decidePreparation(in)

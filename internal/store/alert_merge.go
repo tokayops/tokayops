@@ -46,7 +46,7 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 	// one.
 	group, err := scanAlertGroupRow(tx.QueryRowContext(ctx,
 		`SELECT `+alertGroupColumns+` FROM alert_groups
-		 WHERE alert_key = $1 AND status NOT IN ($2, $3) FOR UPDATE`,
+		 WHERE alert_key = $1 AND status NOT IN ($2, $3) FOR NO KEY UPDATE`,
 		alertKey, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed))
 	if err != nil {
 		return alertgroup.MergeResult{}, fmt.Errorf("read the open incident for %s: %w", alertKey, err)

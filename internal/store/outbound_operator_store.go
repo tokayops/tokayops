@@ -64,6 +64,7 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 		SET status = 'canceled', lease_token = NULL, locked_until = NULL,
 		    worker_id = NULL, updated_at = now()
 		WHERE alert_group_id = $1 AND NOT receipt_recorded AND status = 'pending'
+		`+notFollowingASentCard+`
 		RETURNING id`, alertGroupID)
 	if err != nil {
 		return 0, err
@@ -75,6 +76,7 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 		UPDATE outbound_intents
 		SET cancellation_requested = TRUE, updated_at = now()
 		WHERE alert_group_id = $1 AND NOT receipt_recorded AND status = 'sending'
+		`+notFollowingASentCard+`
 		RETURNING id`, alertGroupID)
 	if err != nil {
 		return 0, err
@@ -86,6 +88,7 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 		UPDATE outbound_intents
 		SET status = 'canceled', updated_at = now()
 		WHERE alert_group_id = $1 AND NOT receipt_recorded AND status = 'manual_review'
+		`+notFollowingASentCard+`
 		RETURNING id`, alertGroupID)
 	if err != nil {
 		return 0, err
@@ -118,8 +121,20 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 
 	// One line in the alert's history, and a line each in the commitments' own:
 	// the group's timeline says what happened to the alert, and the journal says
-	// what happened to every promise it had made.
-	line := fmt.Sprintf("%d pending notification(s) withdrawn: %s", touched, reason)
+	// what happened to every promise it had made. The history counts the
+	// notifications - the satellites of a card are not ones, and they do not
+	// write to the history they mirror.
+	all := append(append(append([]string(nil), notSent...), inFlight...), waiting...)
+	var notifications int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT count(*) FROM outbound_intents
+		WHERE id = ANY($1) AND parent_intent_id IS NULL`, pq.Array(all)).Scan(&notifications); err != nil {
+		return 0, fmt.Errorf("count the withdrawn notifications: %w", err)
+	}
+	if notifications == 0 {
+		return withdrawn, nil
+	}
+	line := fmt.Sprintf("%d pending notification(s) withdrawn: %s", notifications, reason)
 	if at.IsZero() {
 		if err := addTimelineTx(ctx, tx, alertGroupID,
 			model.TimelineEventNotificationFailed, line, timelineActor); err != nil {
@@ -363,6 +378,15 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 	if err := appendIntentEventTx(ctx, tx, req.IntentID, nextEventSeq, "operator_decision",
 		fmt.Sprintf("%s: %s", req.Decision, req.Reason), req.Actor); err != nil {
 		return outbound.ResolveAmbiguityResult{}, err
+	}
+
+	// A card brought back brings back the satellites that were refused
+	// because it had ended: the same transaction, after the group and the
+	// card, before anything else. A card that stays down keeps them down.
+	if transition.To == outbound.StatusPending && !intent.Satellite() {
+		if _, err := reviveSatellitesTx(ctx, tx, req.IntentID, req.Actor); err != nil {
+			return outbound.ResolveAmbiguityResult{}, err
+		}
 	}
 
 	// The commitment as this decision leaves it, read here, under the lock,

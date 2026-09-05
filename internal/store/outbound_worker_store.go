@@ -104,18 +104,20 @@ func (s *Store) ExpireDueIntents(ctx context.Context, family string, limit int) 
 // number would either idle the pool or hide the outage.
 func (s *Store) DueSnapshot(ctx context.Context, family string) ([]outbound.ProviderDue, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT provider,
+		SELECT due.provider,
 		       count(*) FILTER (
-		           WHERE (expires_at IS NULL OR expires_at > now())
-		             AND (locked_until IS NULL OR locked_until <= now())) AS claimable_due,
+		           WHERE (due.expires_at IS NULL OR due.expires_at > now())
+		             AND (due.locked_until IS NULL OR due.locked_until <= now())) AS claimable_due,
 		       count(*) FILTER (
-		           WHERE (expires_at IS NULL OR expires_at > now())
-		             AND (locked_until IS NULL OR locked_until <= now())
-		             AND attempts_in_generation = 0) AS claimable_fresh,
-		       EXTRACT(EPOCH FROM (now() - min(next_attempt_at))) AS lateness_seconds
-		FROM outbound_intents
-		WHERE delivery_family = $1 AND status = 'pending' AND next_attempt_at <= now()
-		GROUP BY provider`, family)
+		           WHERE (due.expires_at IS NULL OR due.expires_at > now())
+		             AND (due.locked_until IS NULL OR due.locked_until <= now())
+		             AND due.attempts_in_generation = 0) AS claimable_fresh,
+		       EXTRACT(EPOCH FROM (now() - min(due.next_attempt_at))) AS lateness_seconds
+		FROM outbound_intents due
+		`+satelliteJoins+`
+		WHERE due.delivery_family = $1 AND due.status = 'pending' AND due.next_attempt_at <= now()
+		  `+satelliteMayGo+`
+		GROUP BY due.provider`, family)
 	if err != nil {
 		return nil, fmt.Errorf("read the queue: %w", err)
 	}
@@ -203,30 +205,32 @@ func (s *Store) ClaimDueIntents(ctx context.Context,
 // quietly treated as the broader of the two: handing out leases for work the
 // caller did not ask for is not a default anybody would choose on purpose.
 func claimStatement(phase outbound.ClaimPhase) (string, error) {
-	const shape = `
+	shape := `
 		UPDATE outbound_intents i
 		SET lease_token = gen_random_uuid()::text,
 		    locked_until = statement_timestamp() + make_interval(secs => $4),
 		    worker_id = $5,
 		    updated_at = now()
 		FROM (
-			SELECT id FROM outbound_intents
-			WHERE delivery_family = $1 AND provider = $2 AND status = 'pending'
-			  AND next_attempt_at <= now()
-			  AND (expires_at IS NULL OR expires_at > now())
-			  AND (locked_until IS NULL OR locked_until <= now())
+			SELECT due.id FROM outbound_intents due
+			` + satelliteJoins + `
+			WHERE due.delivery_family = $1 AND due.provider = $2 AND due.status = 'pending'
+			  AND due.next_attempt_at <= now()
+			  AND (due.expires_at IS NULL OR due.expires_at > now())
+			  AND (due.locked_until IS NULL OR due.locked_until <= now())
+			  ` + satelliteMayGo + `
 			  %s
 			ORDER BY %s
 			LIMIT $3
-			FOR UPDATE SKIP LOCKED
-		) due
-		WHERE i.id = due.id
+			FOR UPDATE OF due SKIP LOCKED
+		) taken
+		WHERE i.id = taken.id
 		RETURNING i.id, i.lease_token, i.locked_until`
 
 	switch phase {
 	case outbound.ClaimFirstAttempts:
 		return fmt.Sprintf(shape,
-			"AND attempts_in_generation = 0", "next_attempt_at, id"), nil
+			"AND due.attempts_in_generation = 0", "due.next_attempt_at, due.id"), nil
 
 	case outbound.ClaimRetriesFirst:
 		// FALSE sorts first, so a commitment that has already been attempted
@@ -235,7 +239,7 @@ func claimStatement(phase outbound.ClaimPhase) (string, error) {
 		// backlog of untried work that is older than the retries takes that
 		// share too, and the oldest retry never goes out at all.
 		return fmt.Sprintf(shape,
-			"", "(attempts_in_generation = 0), next_attempt_at, id"), nil
+			"", "(due.attempts_in_generation = 0), due.next_attempt_at, due.id"), nil
 
 	default:
 		return "", outboundContractf("claim phase %q is not one this build takes", phase)
@@ -438,6 +442,28 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{}, err
 	}
 
+	// A satellite refused because its card ended without a message is checked
+	// against the card again, under the card's shared lock, taken BEFORE the
+	// satellite's own - the order is parent, then satellite, everywhere. The
+	// parent's id is immutable, so reading it without a lock first is fine.
+	refusalStale := false
+	if req.Preparation == outbound.PreparationPermanent &&
+		req.ErrorClass == outbound.ParentEndedWithoutMessage {
+		var parentID sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT parent_intent_id FROM outbound_intents WHERE id = $1`,
+			req.IntentID).Scan(&parentID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return outbound.BeginAttemptResult{}, err
+		}
+		if parentID.Valid {
+			if refusalStale, err = refusalIsStaleTx(ctx, tx, parentID.String); err != nil {
+				return outbound.BeginAttemptResult{}, err
+			}
+			if afterParentCheck != nil {
+				afterParentCheck()
+			}
+		}
+	}
+
 	intent, _, err := lockIntentTx(ctx, tx, req.IntentID)
 	if err != nil {
 		return outbound.BeginAttemptResult{}, err
@@ -490,6 +516,19 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	// that does not depend on any channel is asked here instead, and it decides
 	// whether a refusal may be recorded at all.
 	form, digest, err := executableHere(*intent)
+	if err == nil && refusalStale {
+		// The card is alive again, or has a message after all: the refusal
+		// was true when the worker read the card and is not any more. Nothing
+		// is recorded; the satellite goes back to the queue, and the claim's
+		// own predicate decides again.
+		if err := releaseForRetryTx(ctx, tx, req.IntentID); err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+		return outbound.BeginAttemptResult{Outcome: outbound.BeginPreparedRetry}, nil
+	}
 	if err == nil && req.Preparation != outbound.PreparationReady {
 		// A refusal comes before the STATE is read, because it is true whatever
 		// the state says: nothing was going to be sent either way, and

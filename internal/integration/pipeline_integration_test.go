@@ -523,7 +523,7 @@ func (c *recordingChannel) ExecuteAttempt(_ context.Context,
 	}, nil
 }
 
-func (c *recordingChannel) ClassifyResponse(res outbound.Result) (outbound.Classification, bool) {
+func (c *recordingChannel) ClassifyResponse(_ outbound.Call, res outbound.Result) (outbound.Classification, bool) {
 	switch res.Status {
 	case "ok":
 		return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
@@ -1445,7 +1445,7 @@ func TestPipeline_ChannelUpdate(t *testing.T) {
 		SELECT i.form, COALESCE(i.receipt::text, '')
 		FROM outbound_intents i
 		JOIN alert_groups ag ON ag.id = i.alert_group_id
-		WHERE ag.alert_key = $1 AND i.target_ref = 'C_POLICY_CHAN'`,
+		WHERE ag.alert_key = $1 AND i.target_ref = 'C_POLICY_CHAN' AND i.target_kind = 'channel'`,
 		"test_channel_update_1").Scan(&form, &receipt); err != nil {
 		t.Fatalf("read the channel commitment: %v", err)
 	}
@@ -1647,11 +1647,13 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 	// card goes back into the queue to say so and settles again once the worker
 	// has applied it. Waited for rather than slept through, because how long
 	// that takes is the worker's business and not this test's.
+	// The reply under the firehose card waits for the alert to be over, which
+	// an acknowledgement is not; it is owed by design and not counted.
 	var withdrawn, owing int
 	until(t, "the withdrawal and the acknowledged card to settle", func() bool {
 		if err := env.S.GetDB().QueryRow(`
 			SELECT count(*) FILTER (WHERE i.status = 'canceled'),
-			       count(*) FILTER (WHERE i.status IN ('pending', 'sending'))
+			       count(*) FILTER (WHERE i.status IN ('pending', 'sending') AND i.target_kind <> 'thread_reply')
 			FROM outbound_intents i
 			JOIN alert_groups ag ON ag.id = i.alert_group_id
 			WHERE ag.alert_key = 'test_cancel_exec_1'`).Scan(&withdrawn, &owing); err != nil {
@@ -1669,6 +1671,9 @@ func TestPipeline_CancelDuringExecution(t *testing.T) {
 
 // waitForNothingOwed waits until an alert group has no commitment left in
 // flight: everything it promised has either gone out or been withdrawn.
+//
+// The reply that closes a card's thread is owed only once the alert is over;
+// before that it waits by design, and is not counted.
 func waitForNothingOwed(t *testing.T, s *store.Store, alertKey string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -1677,7 +1682,9 @@ func waitForNothingOwed(t *testing.T, s *store.Store, alertKey string) {
 		err := s.GetDB().QueryRow(`
 			SELECT count(*) FROM outbound_intents i
 			JOIN alert_groups ag ON ag.id = i.alert_group_id
-			WHERE ag.alert_key = $1 AND i.status IN ('pending', 'sending')`,
+			WHERE ag.alert_key = $1 AND i.status IN ('pending', 'sending')
+			  AND NOT (i.target_kind = 'thread_reply' AND NOT EXISTS (
+			      SELECT 1 FROM outbound_group_snapshots g WHERE g.alert_group_id = ag.id AND g.final))`,
 			alertKey).Scan(&owing)
 		if err == nil && owing == 0 {
 			return

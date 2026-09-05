@@ -736,8 +736,10 @@ func TestAStartFillsInThePayloadDigests(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("read the commitments: %v", err)
 	}
-	if filled != 2 {
-		t.Fatalf("the upgrade looked at %d commitment(s), there were 2", filled)
+	// Two admitted, and the two satellites the start gave the channel card:
+	// the start digests those as it writes them.
+	if filled != 4 {
+		t.Fatalf("the upgrade looked at %d commitment(s), there were 2 and the card's two satellites", filled)
 	}
 
 	// The rules, and the fact that each was checked against the rows already in

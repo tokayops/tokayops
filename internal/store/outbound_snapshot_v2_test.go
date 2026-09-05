@@ -573,53 +573,52 @@ func TestANoteAndAnAcknowledgementAgreeOnTheRevision(t *testing.T) {
 	}
 }
 
-// TestASweepTakesTheLeavesBeforeTheParent. A commitment another one names as
-// its parent is not removed while the child stands: with a chunk of one, the
-// child goes first and the parent on the next pass, and no pass fails on the
-// key between them.
+// TestASweepTakesTheLeavesBeforeTheParent. A card is not removed while a
+// satellite that names it stands: with a chunk of one, the two satellites go
+// first and the card on the pass after them, so no pass leaves a satellite
+// pointing at a card that is gone.
 func TestASweepTakesTheLeavesBeforeTheParent(t *testing.T) {
 	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
 	ctx := context.Background()
-	parent := admitOne(t, s, outboundGroup(t, s), channelCommitment("C0001", 0))[0]
-	child := admitOne(t, s, outboundGroup(t, s), channelCommitment("C0002", 0))[0]
-	refusedForGood(t, s, parent)
-	expireLease(t, s, child)
-	refusedForGood(t, s, child)
-
-	// The link, as a satellite will carry it. Its target has to say so too:
-	// the rule that a satellite names a parent reads both.
-	if _, err := s.db.Exec(`
-		UPDATE outbound_intents
-		SET parent_intent_id = $2, target_kind = $3,
-		    payload = jsonb_set(payload, '{target,kind}', to_jsonb($3::text))
-		WHERE id = $1`, child, parent, string(keys.TargetThread)); err != nil {
-		t.Fatalf("link the child to its parent: %v", err)
-	}
-	ageIntent(t, s, parent, 40*day)
-	ageIntent(t, s, child, 35*day)
+	agID := desiredGroup(t, s, "Disk filling up")
+	admitOne(t, s, agID, withSatellites(channelCommitment("C0001", 0))...)
+	card, thread, reply := satellitesOf(t, s, agID)
+	refusedForGood(t, s, card)
+	refusedForItsCard(t, s, thread, claimable(t, s)[thread])
+	endTheAlert(t, s, agID)
+	refusedForItsCard(t, s, reply, claimable(t, s)[reply])
+	ageIntent(t, s, card, 40*day)
+	ageIntent(t, s, thread, 35*day)
+	ageIntent(t, s, reply, 35*day)
 
 	cutoff := time.Now().Add(-30 * day)
 	exists := func(id string) bool {
 		return countWhere(t, s, `SELECT count(*) FROM outbound_intents WHERE id = $1`, id) == 1
 	}
 
-	first, err := s.SweepDeliveryHistory(ctx, cutoff, 1)
+	for pass := 1; pass <= 2; pass++ {
+		result, err := s.SweepDeliveryHistory(ctx, cutoff, 1)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if result.Deleted.Intents != 1 || !exists(card) {
+			t.Fatalf("pass %d removed %d, card present %v; want one satellite and the card standing",
+				pass, result.Deleted.Intents, exists(card))
+		}
+	}
+	if exists(thread) || exists(reply) {
+		t.Fatalf("after two passes the thread is present %v, the reply %v", exists(thread), exists(reply))
+	}
+	third, err := s.SweepDeliveryHistory(ctx, cutoff, 1)
 	if err != nil {
-		t.Fatalf("first pass: %v", err)
+		t.Fatalf("third pass: %v", err)
 	}
-	if first.Deleted.Intents != 1 || exists(child) || !exists(parent) {
-		t.Fatalf("the first pass removed %d, child present %v, parent present %v; want the child alone",
-			first.Deleted.Intents, exists(child), exists(parent))
+	if third.Deleted.Intents != 1 || exists(card) {
+		t.Fatal("the third pass did not remove the card")
 	}
-	second, err := s.SweepDeliveryHistory(ctx, cutoff, 1)
-	if err != nil {
-		t.Fatalf("second pass: %v", err)
-	}
-	if second.Deleted.Intents != 1 || exists(parent) {
-		t.Fatal("the second pass did not remove the parent")
-	}
-	if third, err := s.SweepDeliveryHistory(ctx, cutoff, 1); err != nil || third.Deleted.Intents != 0 {
-		t.Fatalf("the third pass removed %d (%v)", third.Deleted.Intents, err)
+	if fourth, err := s.SweepDeliveryHistory(ctx, cutoff, 1); err != nil || fourth.Deleted.Intents != 0 {
+		t.Fatalf("the fourth pass removed %d (%v)", fourth.Deleted.Intents, err)
 	}
 }
 

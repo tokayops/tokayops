@@ -247,10 +247,10 @@ func DecodeEscalationPayloadV1(schemaVersion int, raw []byte) (EscalationPayload
 	if err := payload.Slot.validate(); err != nil {
 		return payload, err
 	}
-	// A person or a channel. The grammar also knows subscribers, and an
-	// escalation aimed at one would be a message nothing in Slack or Telegram
-	// can be handed.
-	if err := payload.Target.addressedTo(TargetChannel, TargetUser); err != nil {
+	// A person, a channel, or a satellite of a channel card. The grammar also
+	// knows subscribers, and an escalation aimed at one would be a message
+	// nothing in Slack or Telegram can be handed.
+	if err := payload.Target.addressedTo(escalationTargets...); err != nil {
 		return payload, err
 	}
 	return payload, nil
@@ -279,7 +279,7 @@ func decodeStoredPayload(raw []byte, into any) error {
 }
 
 func (p EscalationPayloadV1) encode(buf *bytes.Buffer) error {
-	if err := p.Target.addressedTo(TargetChannel, TargetUser); err != nil {
+	if err := p.Target.addressedTo(escalationTargets...); err != nil {
 		return err
 	}
 	if err := p.Slot.encode(buf); err != nil {
@@ -325,14 +325,14 @@ func DecodeEscalationPayloadV2(schemaVersion int, raw []byte) (EscalationPayload
 	if err := payload.Slot.validate(); err != nil {
 		return payload, err
 	}
-	if err := payload.Target.addressedTo(TargetChannel, TargetUser); err != nil {
+	if err := payload.Target.addressedTo(escalationTargets...); err != nil {
 		return payload, err
 	}
 	return payload, nil
 }
 
 func (p EscalationPayloadV2) encode(buf *bytes.Buffer) error {
-	if err := p.Target.addressedTo(TargetChannel, TargetUser); err != nil {
+	if err := p.Target.addressedTo(escalationTargets...); err != nil {
 		return err
 	}
 	if err := p.Slot.encode(buf); err != nil {

@@ -309,9 +309,9 @@ func TestEngine_StepWithNoTarget_IsRecordedNotFailed(t *testing.T) {
 	if !admitted {
 		t.Fatal("nothing was admitted for a group whose policy step names nobody")
 	}
-	if len(admission.Admission.Commitments) != 1 {
-		t.Fatalf("expected the firehose alone, got %d commitments",
-			len(admission.Admission.Commitments))
+	if cards, satellites := cardsOf(admission.Admission.Commitments); len(cards) != 1 || satellites != 2 {
+		t.Fatalf("expected the firehose alone with its two satellites, got %d card(s) and %d satellite(s)",
+			len(cards), satellites)
 	}
 	if len(escalationOf(t, admission).Unpromised) != 1 {
 		t.Fatalf("the step that named nobody was not recorded: %v", escalationOf(t, admission).Unpromised)
@@ -342,11 +342,13 @@ func TestEngine_FirehoseCreation(t *testing.T) {
 	if !admitted {
 		t.Fatal("nothing was admitted for a group with a firehose channel")
 	}
-	if len(admission.Admission.Commitments) != 1 {
-		t.Fatalf("expected one commitment, got %d", len(admission.Admission.Commitments))
+	cards, satellites := cardsOf(admission.Admission.Commitments)
+	if len(cards) != 1 || satellites != 2 {
+		t.Fatalf("expected one card with its two satellites, got %d card(s) and %d satellite(s)",
+			len(cards), satellites)
 	}
 
-	commitment := admission.Admission.Commitments[0]
+	commitment := cards[0]
 	if commitment.Slot.Kind != keys.SlotFirehose {
 		t.Errorf("the firehose is in slot %q", commitment.Slot.Kind)
 	}
@@ -1183,4 +1185,95 @@ func escalationOf(t *testing.T, batch outbound.Batch) outbound.EscalationContext
 		t.Fatalf("the engine built a %q batch", batch.Context.Form())
 	}
 	return about
+}
+
+// cardsOf splits an admission into the commitments that reach a recipient and
+// the number of satellites that follow a card.
+func cardsOf(commitments []keys.AdmittedCommitment) (cards []keys.AdmittedCommitment, satellites int) {
+	for _, c := range commitments {
+		if c.Target.Satellite() {
+			satellites++
+			continue
+		}
+		cards = append(cards, c)
+	}
+	return cards, satellites
+}
+
+// TestEveryChannelCardHasItsThreadAndItsReply. A Slack channel card - the
+// firehose and every channel step - is admitted with the thread under it and
+// the reply that closes it: same slot, same timing, following the card by its
+// key. A person's message and a Telegram card have neither.
+func TestEveryChannelCardHasItsThreadAndItsReply(t *testing.T) {
+	s := store.NewMockStore()
+	teamID := "team-threads"
+	policyID := "threads_policy"
+	s.CreateTeam(&model.Team{ID: teamID, DefaultPolicyID: policyID})
+	s.CreateUser(&model.User{ID: "U1", Name: "Nina"})
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Threads",
+		Steps: []*model.EscalationStep{
+			{Provider: "slack", TargetKind: "channel", TargetType: "channel", TargetID: "C_OPS", StepIndex: 0, DelaySeconds: 60},
+			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U1", StepIndex: 1},
+			{Provider: "telegram", TargetKind: "channel", TargetType: "channel", TargetID: "-1001", StepIndex: 2},
+		},
+	})
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseCriticalChannel: "C_FIRE"}}
+	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+	s.CreateAlertGroup(&model.AlertGroup{
+		ID: "ag-threads", AlertKey: "dk-threads", Status: model.AlertGroupStatusNew,
+		TeamID: teamID, Severity: "critical",
+	})
+
+	eng.ProcessNewAlertGroups(context.Background())
+
+	admission, admitted := s.AdmissionFor("ag-threads")
+	if !admitted {
+		t.Fatal("nothing was admitted")
+	}
+	byKey := map[string]keys.AdmittedCommitment{}
+	for _, c := range admission.Admission.Commitments {
+		byKey[c.IdempotencyKey] = c
+	}
+	cards, satellites := cardsOf(admission.Admission.Commitments)
+	if len(cards) != 4 || satellites != 4 {
+		t.Fatalf("got %d card(s) and %d satellite(s); want the firehose, three steps and four satellites",
+			len(cards), satellites)
+	}
+	for _, card := range cards {
+		var thread, reply *keys.AdmittedCommitment
+		for i := range admission.Admission.Commitments {
+			c := &admission.Admission.Commitments[i]
+			if c.ParentKey != card.IdempotencyKey {
+				continue
+			}
+			switch c.Target.Kind {
+			case keys.TargetThread:
+				thread = c
+			case keys.TargetThreadReply:
+				reply = c
+			}
+		}
+		slackChannel := card.Provider == "slack" && card.Target.Kind == keys.TargetChannel
+		if slackChannel != (thread != nil && reply != nil) {
+			t.Fatalf("%s %s has thread=%v reply=%v", card.Provider, card.Target.Kind, thread != nil, reply != nil)
+		}
+		if !slackChannel {
+			continue
+		}
+		for name, satellite := range map[string]*keys.AdmittedCommitment{"thread": thread, "reply": reply} {
+			if satellite.Slot != card.Slot || satellite.Timing != card.Timing || satellite.Target.Ref != card.Target.Ref {
+				t.Errorf("the %s of %s does not share its slot, timing and channel", name, card.Target.Ref)
+			}
+			if satellite.Expiry != nil || satellite.Provider != "slack" {
+				t.Errorf("the %s of %s has a deadline or another provider", name, card.Target.Ref)
+			}
+			if _, ok := byKey[satellite.ParentKey]; !ok {
+				t.Errorf("the %s of %s follows a key not in the admission", name, card.Target.Ref)
+			}
+		}
+		if !thread.Editable || reply.Editable {
+			t.Errorf("the thread of %s is editable=%v and the reply editable=%v", card.Target.Ref, thread.Editable, reply.Editable)
+		}
+	}
 }

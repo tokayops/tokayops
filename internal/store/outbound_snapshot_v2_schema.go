@@ -61,10 +61,24 @@ func applySnapshotV2Schema(ctx context.Context, tx *sql.Tx) error {
 				`CHECK (octet_length(card_digest) = 32 AND octet_length(thread_digest) = 32)`),
 		},
 		{
+			// The parent is named by id and NOT by a foreign key, and that is
+			// a finding rather than an omission. A key's check runs again on
+			// the second UPDATE of a satellite's row in one transaction - the
+			// begin binds the generation and then marks the row sending - and
+			// takes a KEY SHARE on the card, which waits behind any update of
+			// the card in flight. A raise updates the card and the thread in
+			// one statement, card first; a begin holds the thread and then
+			// asks for the card: a cycle, seen in the pipeline. The order
+			// leaves-first is a rule of retention, checked by its own test,
+			// and the shape of the link is the rule below.
 			what: "add the generation context and the parent to the commitments",
 			sql: `ALTER TABLE outbound_intents
 				ADD COLUMN IF NOT EXISTS bound_context JSONB,
-				ADD COLUMN IF NOT EXISTS parent_intent_id TEXT REFERENCES outbound_intents(id)`,
+				ADD COLUMN IF NOT EXISTS parent_intent_id TEXT`,
+		},
+		{
+			what: "take the parent's foreign key away where an earlier start added it",
+			sql:  `ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS outbound_intents_parent_intent_id_fkey`,
 		},
 		{
 			what: "add idx_outbound_intents_parent",

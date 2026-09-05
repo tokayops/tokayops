@@ -170,9 +170,9 @@ func TestWhatIsNotThereIsAnAnswer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("a missing policy stopped the escalation: %v", err)
 		}
-		if len(admission.Admission.Commitments) != 1 {
-			t.Fatalf("expected the firehose alone, got %d commitments",
-				len(admission.Admission.Commitments))
+		if cards, satellites := cardsOf(admission.Admission.Commitments); len(cards) != 1 || satellites != 2 {
+			t.Fatalf("expected the firehose alone with its two satellites, got %d card(s) and %d satellite(s)",
+				len(cards), satellites)
 		}
 		if escalationOf(t, admission).PolicyID != "" {
 			t.Errorf("the group records policy %q, which does not exist", escalationOf(t, admission).PolicyID)

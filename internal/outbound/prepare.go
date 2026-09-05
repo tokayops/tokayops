@@ -45,6 +45,13 @@ type Preparer interface {
 // The same mistake had two different fates depending on which layer noticed it
 // first. Now it has one, and it lives in the store where the refusal is
 // already written.
+// ParentEndedWithoutMessage is the refusal of a satellite whose card ended
+// without ever making a message: there is no thread to write under. Stated by
+// the domain rather than by a channel, before the channel is asked, and only
+// recorded once the store has checked the card again under its lock - a
+// person may have brought the card back in the meantime.
+const ParentEndedWithoutMessage = "parent_ended_without_message"
+
 func Ready(endpoint string) Preparation {
 	return Preparation{outcome: PreparationReady, endpoint: endpoint}
 }

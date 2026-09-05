@@ -924,6 +924,9 @@ func (s *Store) applyOutboundSchema() error {
 	if err := applySnapshotV2Schema(context.Background(), tx); err != nil {
 		return err
 	}
+	if err := admitSatellitesTx(context.Background(), tx); err != nil {
+		return fmt.Errorf("failed to give the cards their satellites: %w", err)
+	}
 
 	return tx.Commit()
 }

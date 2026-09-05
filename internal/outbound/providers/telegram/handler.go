@@ -257,7 +257,7 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 // Telegram answers with an HTTP-ish code and a sentence, and only some of those
 // sentences prove the message was not created. Those are named here; everything
 // else is doubt, decided by the domain.
-func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification, bool) {
+func (h *Handler) ClassifyResponse(call outbound.Call, res outbound.Result) (outbound.Classification, bool) {
 	if res.Status == "ok" {
 		return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
 	}
@@ -291,6 +291,13 @@ func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification
 			return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
 		}
 		if strings.Contains(lower, "message to edit not found") {
+			if call.AttemptKind != outbound.AttemptMutation {
+				// Said to a create, it is about nothing this commitment made:
+				// doubt, under its own name.
+				return outbound.Classification{
+					Outcome: outbound.OutcomeAmbiguous, Class: "message_gone",
+				}, true
+			}
 			// The message is gone. The one fact an ordinary answer proves about
 			// the object, and the only ground for making a second one.
 			absent := keys.DetailDefinitelyAbsent

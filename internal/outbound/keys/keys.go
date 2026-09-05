@@ -285,7 +285,19 @@ const (
 // TargetKinds is every kind of recipient this build names, for the doors that
 // take a kind from a caller and have to refuse one this build does not know.
 func TargetKinds() []TargetKind {
-	return []TargetKind{TargetChannel, TargetUser, TargetSubscriber}
+	return []TargetKind{TargetChannel, TargetUser, TargetSubscriber, TargetThread, TargetThreadReply}
+}
+
+// escalationTargets is where an escalation can be aimed: a channel, a person,
+// and the two satellites that follow a channel card - the thread under it and
+// the reply that closes it.
+var escalationTargets = []TargetKind{TargetChannel, TargetUser, TargetThread, TargetThreadReply}
+
+// Satellite reports whether the target is a satellite of a card rather than a
+// recipient: what it names is the card's channel, and what it follows is the
+// card.
+func (t Target) Satellite() bool {
+	return t.Kind == TargetThread || t.Kind == TargetThreadReply
 }
 
 // Target is who a commitment is for, in one place.
@@ -304,7 +316,7 @@ type Target struct {
 
 func (t Target) validate() error {
 	switch t.Kind {
-	case TargetChannel, TargetUser, TargetSubscriber:
+	case TargetChannel, TargetUser, TargetSubscriber, TargetThread, TargetThreadReply:
 	default:
 		return contractf("unknown target kind %q", t.Kind)
 	}
@@ -358,10 +370,10 @@ func (i escalationIntent) key(kind Kind, version int) (string, error) {
 	if i.Provider == "" {
 		return "", contractf("an escalation commitment with no provider")
 	}
-	// A person or a channel. The grammar also knows subscribers, and an
-	// escalation aimed at one would be a message nothing in Slack or Telegram
-	// can be handed.
-	if err := i.Target.addressedTo(TargetChannel, TargetUser); err != nil {
+	// A person, a channel, or a satellite of a channel card. The grammar also
+	// knows subscribers, and an escalation aimed at one would be a message
+	// nothing in Slack or Telegram can be handed.
+	if err := i.Target.addressedTo(escalationTargets...); err != nil {
 		return "", err
 	}
 	if err := requestIDFor(kind, i.ClientRequestID); err != nil {

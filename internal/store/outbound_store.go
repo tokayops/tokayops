@@ -334,7 +334,7 @@ func (s *Store) submitEscalation(ctx context.Context, batch outbound.Batch,
 	var version int64
 	var now time.Time
 	err = tx.QueryRowContext(ctx,
-		`SELECT status, render_source_version, now() FROM alert_groups WHERE id = $1 FOR UPDATE`,
+		`SELECT status, render_source_version, now() FROM alert_groups WHERE id = $1 FOR NO KEY UPDATE`,
 		admission.AlertGroupID).Scan(&status, &version, &now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return outbound.SubmitResult{}, fmt.Errorf("alert group %s not found", admission.AlertGroupID)
@@ -871,76 +871,130 @@ func existingAdmission(ctx context.Context, tx *sql.Tx,
 // The order is not cosmetic: two producers racing on one claim insert the same
 // rows in the same sequence, so a violation of the key grammar surfaces as one
 // deterministic unique-violation instead of as a deadlock nobody can read.
+//
+// Two passes, in the key order the admission settled: every commitment that
+// follows nothing, then every satellite. The satellite names its card by the
+// card's row id, and the key checks the row exists at each INSERT; keys sort
+// by their digest, so a satellite regularly sorts before its card. Each pass
+// keeps the canonical order, which is what turns a clash of keys into one
+// deterministic unique-violation rather than a deadlock. Deferring the key
+// was the other way and was rejected: the order of two passes is an invariant
+// somebody can see.
 func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 	admission keys.Admission, family string, admittedAt time.Time,
 	actor outbound.Actor) ([]string, error) {
 
+	batch := batchRow{
+		ID: batchID, Kind: admission.Kind, GrammarVersion: admission.GrammarVersion,
+		AlertGroupID: admission.AlertGroupID, Revision: admission.Revision,
+		Family: family, AdmittedAt: admittedAt,
+	}
 	ids := make([]string, 0, len(admission.Commitments))
-	for _, c := range admission.Commitments {
-		payload, err := json.Marshal(c.Payload)
-		if err != nil {
-			return nil, fmt.Errorf("encode the payload of %s: %w", c.IdempotencyKey, err)
+	byKey := make(map[string]string, len(admission.Commitments))
+	for pass := 0; pass < 2; pass++ {
+		for _, c := range admission.Commitments {
+			if satellite := c.ParentKey != ""; satellite != (pass == 1) {
+				continue
+			}
+			parentID := ""
+			if c.ParentKey != "" {
+				parentID = byKey[c.ParentKey]
+				if parentID == "" {
+					return nil, outboundContractf("the %s %s follows a card this admission did not write",
+						c.Target.Kind, c.IdempotencyKey)
+				}
+			}
+			id, err := insertCommitmentRowTx(ctx, tx, batch, c, parentID, actor)
+			if err != nil {
+				return nil, err
+			}
+			byKey[c.IdempotencyKey] = id
+			ids = append(ids, id)
 		}
-
-		// What this payload IS, recorded beside it. Every attempt recomputes it
-		// from the row and compares: the payload is not in the business key, so
-		// without this there is nothing a swap could be caught against.
-		//
-		// Taken from the bytes that are about to be stored, not from the value
-		// in hand: if the two ever disagreed, the row would be checked against
-		// a digest of something else.
-		digest, err := keys.PayloadDigest(admission.Kind, c.PayloadSchemaVersion, payload)
-		if err != nil {
-			return nil, fmt.Errorf("digest the payload of %s: %w", c.IdempotencyKey, err)
-		}
-
-		notBefore, err := notBeforeOf(c.Timing, admittedAt)
-		if err != nil {
-			return nil, err
-		}
-		expiresAt, err := expiryOf(c.Expiry, admittedAt)
-		if err != nil {
-			return nil, err
-		}
-
-		form := outbound.FormOneShot
-		if c.Editable {
-			form = outbound.FormEditable
-		}
-
-		id := uuid.New().String()
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO outbound_intents (
-				id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
-				provider, target_kind, target_ref, alert_group_id, form, completion_mode,
-				ambiguity_policy, payload_schema_version, payload, payload_digest,
-				provider_key_codec_version,
-				status, desired_revision, not_before, next_attempt_at, expires_at)
-			VALUES (
-				$1, $2, $3, $19, $4, $5,
-				$6, $7, $8, $9, $10, $11,
-				$12, $13, $14, $20, $15,
-				'pending', $16,
-				$17, GREATEST(now(), $17::timestamptz),
-				$18)`,
-			id, batchID, c.IdempotencyKey,
-			string(admission.Kind), admission.GrammarVersion,
-			c.Provider, string(c.Target.Kind), c.Target.Ref, nilIfEmpty(admission.AlertGroupID),
-			string(form), string(c.CompletionMode),
-			string(c.AmbiguityPolicy), c.PayloadSchemaVersion, payload, keys.ProviderKeyCodecV1,
-			admission.Revision,
-			notBefore,
-			expiresAt, family, digest,
-		); err != nil {
-			return nil, fmt.Errorf("write the commitment %s: %w", c.IdempotencyKey, err)
-		}
-
-		if err := appendIntentEventTx(ctx, tx, id, 1, "created", "", actor); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+// batchRow is what a commitment takes from its claim when it is written.
+type batchRow struct {
+	ID             string
+	Kind           keys.Kind
+	GrammarVersion int
+	AlertGroupID   string
+	Revision       int64
+	Family         string
+	AdmittedAt     time.Time
+}
+
+// insertCommitmentRowTx writes one commitment, and is the only place one is
+// written: the admission's insert and the start-up that gives old cards their
+// satellites both come here.
+func insertCommitmentRowTx(ctx context.Context, tx *sql.Tx, batch batchRow,
+	c keys.AdmittedCommitment, parentID string, actor outbound.Actor) (string, error) {
+
+	payload, err := json.Marshal(c.Payload)
+	if err != nil {
+		return "", fmt.Errorf("encode the payload of %s: %w", c.IdempotencyKey, err)
+	}
+
+	// What this payload IS, recorded beside it. Every attempt recomputes it
+	// from the row and compares: the payload is not in the business key, so
+	// without this there is nothing a swap could be caught against.
+	//
+	// Taken from the bytes that are about to be stored, not from the value
+	// in hand: if the two ever disagreed, the row would be checked against
+	// a digest of something else.
+	digest, err := keys.PayloadDigest(batch.Kind, c.PayloadSchemaVersion, payload)
+	if err != nil {
+		return "", fmt.Errorf("digest the payload of %s: %w", c.IdempotencyKey, err)
+	}
+
+	notBefore, err := notBeforeOf(c.Timing, batch.AdmittedAt)
+	if err != nil {
+		return "", err
+	}
+	expiresAt, err := expiryOf(c.Expiry, batch.AdmittedAt)
+	if err != nil {
+		return "", err
+	}
+
+	form := outbound.FormOneShot
+	if c.Editable {
+		form = outbound.FormEditable
+	}
+
+	id := uuid.New().String()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO outbound_intents (
+			id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
+			provider, target_kind, target_ref, alert_group_id, form, completion_mode,
+			ambiguity_policy, payload_schema_version, payload, payload_digest,
+			provider_key_codec_version,
+			status, desired_revision, not_before, next_attempt_at, expires_at,
+			parent_intent_id)
+		VALUES (
+			$1, $2, $3, $19, $4, $5,
+			$6, $7, $8, $9, $10, $11,
+			$12, $13, $14, $20, $15,
+			'pending', $16,
+			$17, GREATEST(now(), $17::timestamptz),
+			$18, $21)`,
+		id, batch.ID, c.IdempotencyKey,
+		string(batch.Kind), batch.GrammarVersion,
+		c.Provider, string(c.Target.Kind), c.Target.Ref, nilIfEmpty(batch.AlertGroupID),
+		string(form), string(c.CompletionMode),
+		string(c.AmbiguityPolicy), c.PayloadSchemaVersion, payload, keys.ProviderKeyCodecV1,
+		batch.Revision,
+		notBefore,
+		expiresAt, batch.Family, digest, nilIfEmpty(parentID),
+	); err != nil {
+		return "", fmt.Errorf("write the commitment %s: %w", c.IdempotencyKey, err)
+	}
+
+	if err := appendIntentEventTx(ctx, tx, id, 1, "created", "", actor); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // notBeforeOf is the instant a commitment becomes due.
@@ -1172,7 +1226,8 @@ const outboundIntentColumns = `
 	       accepted_duplicate_risk, not_before, next_attempt_at, expires_at,
 	       create_key IS NOT NULL, payload_schema_version,
 	       provider_key_codec_version, payload, payload_digest, receipt, receipt_ref,
-	       COALESCE(expires_at <= now(), FALSE), created_at, updated_at`
+	       COALESCE(expires_at <= now(), FALSE), created_at, updated_at,
+	       COALESCE(parent_intent_id, '')`
 
 // scanIntent turns one row of outboundIntentColumns into a commitment, and is
 // the only place that mapping exists: two readers that disagreed about it would
@@ -1200,7 +1255,7 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		&intent.GenerationBound, &intent.PayloadSchemaVersion,
 		&intent.ProviderKeyCodecVersion, &payload, &intent.PayloadDigest,
 		&coordinates, &name,
-		&deadlinePassed, &intent.CreatedAt, &intent.UpdatedAt); err != nil {
+		&deadlinePassed, &intent.CreatedAt, &intent.UpdatedAt, &intent.ParentID); err != nil {
 		return nil, false, err
 	}
 
@@ -1232,6 +1287,13 @@ func (s *Store) GetIntent(ctx context.Context, id string) (*outbound.Intent, err
 	}
 	if err != nil {
 		return nil, err
+	}
+	// A satellite carries its card as it stands: what the satellite may do
+	// follows from it, and the worker asks before its channel does.
+	if intent.ParentID != "" {
+		if intent.Parent, err = parentStateTx(ctx, s.db, intent.ParentID); err != nil {
+			return nil, err
+		}
 	}
 	return intent, nil
 }
@@ -1502,10 +1564,20 @@ func timelineLine(kind outbound.TimelineKind) (string, model.TimelineEventType, 
 // lockAlertGroupTx takes the group's row, and always before any commitment of
 // it. Every transaction that can write to a group takes them in this order,
 // which is what keeps acknowledgement and delivery from deadlocking.
+//
+// FOR NO KEY UPDATE, not FOR UPDATE, and the difference is load-bearing. The
+// commitments reference the group by key, and a transaction that updates a
+// commitment's row twice - the begin binds the generation, then marks the row
+// sending - has the key checked again on the second update, which takes KEY
+// SHARE on the group's row. KEY SHARE waits behind FOR UPDATE and not behind
+// FOR NO KEY UPDATE. Held FOR UPDATE, a raise that reached the commitment's
+// row first and a begin that held it were a cycle: the raise waiting for the
+// row, the begin waiting for the group. The doors still exclude one another:
+// NO KEY UPDATE conflicts with itself, with FOR UPDATE and with FOR SHARE.
 func lockAlertGroupTx(ctx context.Context, tx *sql.Tx, alertGroupID string) error {
 	var id string
 	err := tx.QueryRowContext(ctx,
-		`SELECT id FROM alert_groups WHERE id = $1 FOR UPDATE`, alertGroupID).Scan(&id)
+		`SELECT id FROM alert_groups WHERE id = $1 FOR NO KEY UPDATE`, alertGroupID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -1668,10 +1740,22 @@ func attemptContentTx(ctx context.Context, tx *sql.Tx,
 	case outbound.ContentSnapshot:
 		var stored storedSnapshot
 		var err error
-		switch intent.Form {
-		case outbound.FormEditable:
+		switch {
+		case intent.Form == outbound.FormEditable:
 			stored, err = lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
-		case outbound.FormOneShot:
+		case intent.Form == outbound.FormOneShot && intent.TargetKind == keys.TargetThreadReply:
+			// The reply that closes a thread is said once, like any one-shot,
+			// but about the END of the alert rather than its admission: it
+			// renders the group's last revision, which does not move once it
+			// is final. The claim opens the reply only once it is, so a
+			// state that is not is a row the claim did not read.
+			stored, err = lockedSnapshotTx(ctx, tx, intent.AlertGroupID)
+			if err == nil && !stored.Final {
+				return outbound.AttemptContent{}, outboundContractf(
+					"the reply %s was claimed before the last revision of %s was out",
+					intent.ID, intent.AlertGroupID)
+			}
+		case intent.Form == outbound.FormOneShot:
 			stored, err = admittedSnapshotTx(ctx, tx, intent)
 		default:
 			return outbound.AttemptContent{}, outboundContractf(

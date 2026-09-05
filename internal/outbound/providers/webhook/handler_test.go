@@ -294,7 +294,7 @@ func TestTheSubscribersAnswerIsClassifiedByRange(t *testing.T) {
 	// both are left to the domain, whose answer is doubt.
 	h := NewHandler(&configs{found: true}, loopback(t))
 	for code := 100; code < 600; code++ {
-		got, known := h.ClassifyResponse(outbound.Result{Status: strconv.Itoa(code)})
+		got, known := h.ClassifyResponse(outbound.Call{}, outbound.Result{Status: strconv.Itoa(code)})
 		switch {
 		case code < 200:
 			if known {
@@ -322,7 +322,7 @@ func TestTheSubscribersAnswerIsClassifiedByRange(t *testing.T) {
 			}
 		}
 	}
-	if _, known := h.ClassifyResponse(outbound.Result{Status: "ok"}); known {
+	if _, known := h.ClassifyResponse(outbound.Call{}, outbound.Result{Status: "ok"}); known {
 		t.Error("a status that is not a number was classified")
 	}
 }

@@ -142,6 +142,21 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	case keys.TargetChannel:
 		return outbound.Ready(intent.TargetRef)
 
+	case keys.TargetThread, keys.TargetThreadReply:
+		// A satellite goes where its card is: the address of the effect is
+		// the card's coordinates, and it is settled once, with the
+		// generation. The domain has already answered for a card that ended
+		// without a message; what is left here is a card that has one.
+		if intent.Parent == nil || !intent.Parent.ReceiptRecorded {
+			return outbound.Impossible("parent_without_message",
+				"the card this satellite follows has no message to write under")
+		}
+		if _, _, ok := coordinates(intent.Parent.ReceiptRef); !ok {
+			return outbound.Impossible("parent_receipt_unreadable",
+				"the coordinates of the card this satellite follows cannot be read")
+		}
+		return outbound.Ready(intent.Parent.ReceiptRef)
+
 	case keys.TargetUser:
 		if h.identity == nil {
 			return outbound.Impossible("identity_lookup_missing",
@@ -203,7 +218,7 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 	}
 	client := h.newClient(token)
 
-	options, refusal, err := h.write(call)
+	options, channel, refusal, err := h.write(call)
 	if err != nil {
 		return refusal, err
 	}
@@ -212,7 +227,7 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 		return updateMessage(ctx, client, call, options)
 	}
 
-	channelID, timestamp, err := client.PostMessageContext(ctx, call.Endpoint, options...)
+	channelID, timestamp, err := client.PostMessageContext(ctx, channel, options...)
 	if err != nil {
 		evidence, status := answerOf(err)
 		return outbound.Result{
@@ -310,7 +325,14 @@ func updateMessage(ctx context.Context, client *slackapi.Client, call outbound.C
 // Everything else - including its own internal errors, about which the
 // documentation says some part of the operation may have succeeded - is doubt,
 // and doubt is the domain's default for anything not named here.
-func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification, bool) {
+//
+// The call is read for one thing: whether the answer is about an object that
+// was there. "message_not_found" to a CHANGE proves the card is gone, and the
+// domain records that as the one ground for making a second one. To a create
+// it proves nothing of the kind - nothing was made, nothing went away - and
+// chat.postMessage does not document it, so it is what any undocumented
+// answer is: doubt, under its own name.
+func (h *Handler) ClassifyResponse(call outbound.Call, res outbound.Result) (outbound.Classification, bool) {
 	switch res.Status {
 	case "ok":
 		return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
@@ -329,6 +351,11 @@ func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification
 		}, true
 
 	case "message_not_found":
+		if call.AttemptKind != outbound.AttemptMutation {
+			return outbound.Classification{
+				Outcome: outbound.OutcomeAmbiguous, Class: res.Status,
+			}, true
+		}
 		// The message this change is for is gone. It is the one thing an
 		// ordinary answer proves about the object, and the only ground on
 		// which an operator may be allowed to make a second one.
@@ -336,6 +363,15 @@ func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification
 		return outbound.Classification{
 			Outcome: outbound.OutcomePermanentRejection, Class: res.Status,
 			Detail: &absent,
+		}, true
+
+	case "cannot_reply_to_message", "restricted_action_non_threadable_channel",
+		"restricted_action_thread_locked":
+		// The reply into a thread was not made, and the documentation of
+		// chat.postMessage says so: the message cannot have replies, the
+		// channel does not thread, or an admin locked the thread.
+		return outbound.Classification{
+			Outcome: outbound.OutcomePermanentRejection, Class: res.Status,
 		}, true
 
 	case "cant_update_message", "edit_window_closed":
@@ -372,24 +408,28 @@ func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification
 // A refusal here is DefinitelyNotSent: nothing has been called yet, and saying
 // so is what keeps a payload nobody can read from being recorded as a call
 // whose fate is unknown and retried on the family's backoff forever.
-func (h *Handler) write(call outbound.Call) ([]slackapi.MsgOption, outbound.Result, error) {
+//
+// It also says WHERE a create is posted: the endpoint, except for a satellite,
+// whose endpoint is the card's coordinates - the channel is the first half of
+// them, and the second half is the thread the message goes under.
+func (h *Handler) write(call outbound.Call) ([]slackapi.MsgOption, string, outbound.Result, error) {
 	switch call.KeyKind {
 	case keys.KindHandoff:
 		payload, err := keys.DecodeHandoffPayloadV1(call.PayloadSchemaVersion, call.Payload)
 		if err != nil {
-			return nil, outbound.Result{
+			return nil, "", outbound.Result{
 				Evidence: outbound.DefinitelyNotSent,
 				Summary:  "the commitment's payload cannot be read: " + err.Error(),
 			}, err
 		}
 		return []slackapi.MsgOption{
 			slackapi.MsgOptionText(announcement(payload), false),
-		}, outbound.Result{}, nil
+		}, call.Endpoint, outbound.Result{}, nil
 
 	case keys.KindEscalation, keys.KindEscalationReplay:
 		payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
 		if err != nil {
-			return nil, outbound.Result{
+			return nil, "", outbound.Result{
 				Evidence: outbound.DefinitelyNotSent,
 				Summary:  "the commitment's payload cannot be read: " + err.Error(),
 			}, err
@@ -399,22 +439,49 @@ func (h *Handler) write(call outbound.Call) ([]slackapi.MsgOption, outbound.Resu
 			// This kind draws an alert card from a frozen state, and this
 			// commitment has none. Not an empty card: a message about nothing
 			// is worse than a message that did not go.
-			return nil, outbound.Result{
+			return nil, "", outbound.Result{
 				Evidence: outbound.DefinitelyNotSent,
 				Summary: fmt.Sprintf(
 					"a %s commitment renders from a state, and this one carries none",
 					call.KeyKind),
 			}, ErrNoContent
 		}
-		return messageFor(snapshot.Content(), payload), outbound.Result{}, nil
+		if payload.Target.Satellite() {
+			return satelliteFor(snapshot.Content(), payload, call)
+		}
+		return messageFor(snapshot.Content(), payload), call.Endpoint, outbound.Result{}, nil
 
 	default:
-		return nil, outbound.Result{
+		return nil, "", outbound.Result{
 			Evidence: outbound.DefinitelyNotSent,
 			Summary: fmt.Sprintf(
 				"Slack has nothing to write for a %q commitment", call.KeyKind),
 		}, ErrNoContent
 	}
+}
+
+// satelliteFor is the thread under the card, or the reply that closes it,
+// posted under the card's timestamp. A change to the thread goes by the
+// thread's own receipt, like every change, and needs no thread_ts.
+func satelliteFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1,
+	call outbound.Call) ([]slackapi.MsgOption, string, outbound.Result, error) {
+
+	channel, ts, ok := coordinates(call.Endpoint)
+	if !ok {
+		return nil, "", outbound.Result{
+			Evidence: outbound.DefinitelyNotSent,
+			Summary:  fmt.Sprintf("a %s bound to %q, which names no card", payload.Target.Kind, call.Endpoint),
+		}, ErrNoContent
+	}
+	text := RenderThread(state)
+	if payload.Target.Kind == keys.TargetThreadReply {
+		text = RenderReply(state)
+	}
+	options := []slackapi.MsgOption{slackapi.MsgOptionText(text, false)}
+	if call.AttemptKind == outbound.AttemptCreate {
+		options = append(options, slackapi.MsgOptionTS(ts))
+	}
+	return options, channel, outbound.Result{}, nil
 }
 
 // messageFor turns the snapshot into the call's content: a card for a channel,
@@ -447,9 +514,9 @@ func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1) s
 	}
 
 	status := providers.ResolveStatus(state)
-	lines := []string{status.Title}
+	lines := []string{mrkdwn(status.Title)}
 	if state.Severity != "" {
-		lines = append(lines, "Severity: "+state.Severity)
+		lines = append(lines, "Severity: "+mrkdwn(state.Severity))
 	}
 	if state.GroupURL != nil && *state.GroupURL != "" {
 		lines = append(lines, fmt.Sprintf("<%s|Open in TokayOps>", *state.GroupURL))
