@@ -174,6 +174,11 @@ type Call struct {
 	Endpoint    string
 	ProviderKey string
 
+	// BoundContext is what the message takes from a neighbouring commitment,
+	// settled with the generation like the endpoint: for a direct message,
+	// the card it points back to. Empty when there is nothing to take.
+	BoundContext json.RawMessage
+
 	// Receipt is where the message this call changes already is - the whole of
 	// what the provider said when it made one. Present for a mutation and empty
 	// for a create, which is the difference between changing something and

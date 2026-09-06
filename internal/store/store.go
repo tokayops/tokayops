@@ -91,6 +91,10 @@ type Store struct {
 	// base URL of this installation and the zone times are printed in. Set once
 	// at wiring - see SetRenderEnvironment.
 	render renderEnvironment
+
+	// dmFallbackToFirehose is the installation's setting for a direct
+	// message whose policy posted no channel card; nil is the default, yes.
+	dmFallbackToFirehose *bool
 }
 
 func (s *Store) Close() error {

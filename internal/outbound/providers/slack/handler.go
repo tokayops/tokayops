@@ -449,6 +449,20 @@ func (h *Handler) write(call outbound.Call) ([]slackapi.MsgOption, string, outbo
 		if payload.Target.Satellite() {
 			return satelliteFor(snapshot.Content(), payload, call)
 		}
+		if payload.Target.Kind == keys.TargetUser {
+			// The card the message points back to was settled with the
+			// generation; a context nobody can read is refused, not sent
+			// without the link.
+			context, err := outbound.DecodeBoundContext(call.BoundContext)
+			if err != nil {
+				return nil, "", outbound.Result{
+					Evidence: outbound.DefinitelyNotSent, Summary: err.Error(),
+				}, err
+			}
+			return []slackapi.MsgOption{
+				slackapi.MsgOptionText(directMessage(snapshot.Content(), payload, context), false),
+			}, call.Endpoint, outbound.Result{}, nil
+		}
 		return messageFor(snapshot.Content(), payload), call.Endpoint, outbound.Result{}, nil
 
 	default:
@@ -484,12 +498,8 @@ func satelliteFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1,
 	return options, channel, outbound.Result{}, nil
 }
 
-// messageFor turns the snapshot into the call's content: a card for a channel,
-// the escalation's own words for a person.
+// messageFor turns the snapshot into a card for a channel.
 func messageFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1) []slackapi.MsgOption {
-	if payload.Target.Kind == keys.TargetUser {
-		return []slackapi.MsgOption{slackapi.MsgOptionText(directMessage(state, payload), false)}
-	}
 	// The buttons come from the snapshot, where the switch can reach them;
 	// what the payload said about them when it was admitted is not read.
 	card := Render(state, state.ButtonsOn(keys.InteractiveSlack))
@@ -500,28 +510,50 @@ func messageFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1) []sl
 	}
 }
 
-// directMessage is what a person is told, and it is built from this commitment
-// alone.
+// directMessage is what a person is told: the escalation's own words when it
+// has any, otherwise what the snapshot says; then the links.
 //
-// The link is the alert group in TokayOps, not the card posted in some channel.
-// A permalink would have to be read from a NEIGHBOURING delivery, which means
-// the first attempt (before that card exists) and a retry (after it does) would
-// carry different bytes under one provider key - a difference the request
-// fingerprint, taken at Begin from the snapshot, cannot even see.
-func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1) string {
-	if payload.MessageOverride != nil && *payload.MessageOverride != "" {
-		return *payload.MessageOverride
-	}
+// The words are the policy's - an operator wrote them, and they go as written.
+// The links are not the words' to replace: the alert in TokayOps is always
+// there, and the card in the channel is there when the generation bound one.
+// The card's coordinates come from the bound context, never from a
+// neighbouring delivery read on the attempt: the first attempt (before the
+// card exists) and a retry (after it does) would otherwise carry different
+// bytes under one provider key - a difference the request fingerprint, taken
+// at Begin from the snapshot, cannot even see.
+func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1,
+	context outbound.BoundContext) string {
 
-	status := providers.ResolveStatus(state)
-	lines := []string{mrkdwn(status.Title)}
-	if state.Severity != "" {
-		lines = append(lines, "Severity: "+mrkdwn(state.Severity))
+	var lines []string
+	if payload.MessageOverride != nil && *payload.MessageOverride != "" {
+		lines = []string{*payload.MessageOverride}
+	} else {
+		status := providers.ResolveStatus(state)
+		lines = []string{mrkdwn(status.Title)}
+		if state.Severity != "" {
+			lines = append(lines, "Severity: "+mrkdwn(state.Severity))
+		}
 	}
 	if state.GroupURL != nil && *state.GroupURL != "" {
 		lines = append(lines, fmt.Sprintf("<%s|Open in TokayOps>", *state.GroupURL))
 	}
+	if link, ok := permalink(context); ok {
+		lines = append(lines, fmt.Sprintf("Primary message: <%s|Open in Slack>", link))
+	}
 	return strings.Join(lines, "\n")
+}
+
+// permalink is the card's address in the workspace, built from its
+// coordinates and the workspace's URL without asking Slack:
+// <team_url>archives/<channel>/p<ts without the dot> is the documented shape.
+// Half of it missing is no link rather than a broken one.
+func permalink(context outbound.BoundContext) (string, bool) {
+	channel, ts, ok := coordinates(context.CardReceiptRef)
+	if !ok || context.TeamURL == "" {
+		return "", false
+	}
+	return strings.TrimSuffix(context.TeamURL, "/") + "/archives/" + channel +
+		"/p" + strings.ReplaceAll(ts, ".", ""), true
 }
 
 // answerOf separates Slack answering from Slack not answering, which is the

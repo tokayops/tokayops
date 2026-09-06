@@ -144,7 +144,7 @@ func TestWhatArrivesFromOutsideCannotSpeakMrkdwn(t *testing.T) {
 		}
 	}
 
-	dm := directMessage(state, keys.EscalationPayloadV1{Target: keys.Target{Kind: keys.TargetUser, Ref: "u-1"}})
+	dm := directMessage(state, keys.EscalationPayloadV1{Target: keys.Target{Kind: keys.TargetUser, Ref: "u-1"}}, outbound.BoundContext{})
 	for _, r := range raw {
 		if strings.Contains(dm, r) {
 			t.Errorf("the direct message carries %q as Slack would read it:\n%s", r, dm)

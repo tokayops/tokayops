@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -425,12 +426,28 @@ func TestARetryOfTheCardAndARefusalOfItsThreadConverge(t *testing.T) {
 		// The begin has checked the card and holds it shared; the operator's
 		// retry arrives now and has to wait for the refusal to be recorded,
 		// so that its revival sees it.
+		// An operator's decision waits a bounded time for the lock and is
+		// answered "try again" when it runs out; the operator does, and so
+		// does the test.
 		retried := make(chan outbound.ResolveAmbiguityResult, 1)
+		failed := make(chan error, 1)
 		afterParentCheck = func() {
 			go func() {
-				retried <- resolve(t, s, outbound.ResolveAmbiguityRequest{
-					IntentID: card, Decision: outbound.DecisionRetryCurrentGeneration, Reason: "again",
-				})
+				for {
+					result, err := s.ResolveAmbiguity(context.Background(), outbound.ResolveAmbiguityRequest{
+						IntentID: card, Decision: outbound.DecisionRetryCurrentGeneration,
+						Actor: byUser("nina"), Reason: "again",
+					})
+					if errors.Is(err, ErrCommitmentBusy) {
+						continue
+					}
+					if err != nil {
+						failed <- err
+						return
+					}
+					retried <- result
+					return
+				}
 			}()
 			time.Sleep(300 * time.Millisecond) // the retry is now waiting on the card
 		}
@@ -440,6 +457,8 @@ func TestARetryOfTheCardAndARefusalOfItsThreadConverge(t *testing.T) {
 			t.Fatalf("the refusal was recorded as %s over a card that had ended", begun.Outcome)
 		}
 		select {
+		case err := <-failed:
+			t.Fatalf("the retry: %v", err)
 		case result := <-retried:
 			if result.Outcome != outbound.ResolveResolved {
 				t.Fatalf("the retry came back %s", result.Outcome)

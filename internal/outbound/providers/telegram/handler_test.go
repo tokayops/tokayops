@@ -532,8 +532,10 @@ func TestADirectMessageIsPlainText(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 
+	// The words are the policy's, as written; the link to the alert is not
+	// theirs to replace.
 	sent := api.calls[0]
-	if got, _ := sent["text"].(string); got != override {
+	if got, _ := sent["text"].(string); got != override+"\nhttps://tokay.example/#/ops/alert-groups/ag-1" {
 		t.Fatalf("the message was rewritten: %q", got)
 	}
 	if mode, marked := sent["parse_mode"]; marked {

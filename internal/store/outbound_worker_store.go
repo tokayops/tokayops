@@ -575,8 +575,14 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{}, err
 	}
 
+	var boundContext json.RawMessage
+	if transition.Effects.OpenGeneration {
+		if boundContext, err = s.dmContextTx(ctx, tx, *intent); err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+	}
 	effect, err := bindGenerationTx(ctx, tx, *intent, req.BoundEndpoint,
-		transition.Effects.OpenGeneration)
+		transition.Effects.OpenGeneration, boundContext)
 	if err != nil {
 		if errors.Is(err, ErrUndeliverable) {
 			return s.refuseAttempt(ctx, tx, req, *intent, plan, "binding_lost", err.Error())
@@ -715,6 +721,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		Operation:                    plan.Operation,
 		BoundEndpoint:                effect.Endpoint,
 		ProviderKey:                  providerKey,
+		BoundContext:                 effect.Context,
 		Receipt:                      receipt,
 		ReceiptRef:                   name.String,
 		Content:                      content,
@@ -827,6 +834,7 @@ func refusalShape(intent outbound.Intent) (plannedAttempt, error) {
 type boundEffect struct {
 	Endpoint    string
 	ProviderKey string
+	Context     json.RawMessage
 }
 
 // bindGenerationTx settles the address and the key of the current external
@@ -839,8 +847,12 @@ type boundEffect struct {
 // deliver twice, to two different people, with nobody able to tell which one
 // got it. So the worker's freshly resolved address is a proposal, and a bound
 // generation ignores it.
+//
+// The context - what the message takes from a neighbouring commitment - is
+// settled here too, for the same reason: read on the attempt, a retry would
+// carry different bytes under the same key.
 func bindGenerationTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
-	proposed string, opening bool) (boundEffect, error) {
+	proposed string, opening bool, context json.RawMessage) (boundEffect, error) {
 
 	if opening {
 		if proposed == "" {
@@ -852,24 +864,28 @@ func bindGenerationTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
 			return boundEffect{}, err
 		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE outbound_intents SET bound_endpoint = $2, create_key = $3
-			WHERE id = $1`, intent.ID, proposed, key); err != nil {
+			UPDATE outbound_intents SET bound_endpoint = $2, create_key = $3, bound_context = $4
+			WHERE id = $1`, intent.ID, proposed, key, nullableJSON(context)); err != nil {
 			return boundEffect{}, fmt.Errorf("bind the effect of %s: %w", intent.ID, err)
 		}
-		return boundEffect{Endpoint: proposed, ProviderKey: key}, nil
+		return boundEffect{Endpoint: proposed, ProviderKey: key, Context: context}, nil
 	}
 
-	var storedEndpoint, storedKey sql.NullString
+	var (
+		storedEndpoint, storedKey sql.NullString
+		storedContext             []byte
+	)
 	if err := tx.QueryRowContext(ctx,
-		`SELECT bound_endpoint, create_key FROM outbound_intents WHERE id = $1`,
-		intent.ID).Scan(&storedEndpoint, &storedKey); err != nil {
+		`SELECT bound_endpoint, create_key, bound_context FROM outbound_intents WHERE id = $1`,
+		intent.ID).Scan(&storedEndpoint, &storedKey, &storedContext); err != nil {
 		return boundEffect{}, err
 	}
 	if !storedEndpoint.Valid || storedEndpoint.String == "" || !storedKey.Valid {
 		return boundEffect{}, undeliverablef(
 			"commitment %s has a bound effect with no address or no key", intent.ID)
 	}
-	return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: storedKey.String}, nil
+	return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: storedKey.String,
+		Context: storedContext}, nil
 }
 
 // refuseAttempt ends a commitment the store itself cannot deliver.

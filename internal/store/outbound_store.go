@@ -1391,6 +1391,7 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 			attempts_in_generation = CASE WHEN $6 THEN 0 ELSE attempts_in_generation END,
 			bound_endpoint = CASE WHEN $6 THEN NULL ELSE bound_endpoint END,
 			create_key     = CASE WHEN $6 THEN NULL ELSE create_key END,
+			bound_context  = CASE WHEN $6 THEN NULL ELSE bound_context END,
 			-- The three receipt states, kept consistent in one statement.
 			--
 			-- The erasure marker is read from the ROW, not from what the caller

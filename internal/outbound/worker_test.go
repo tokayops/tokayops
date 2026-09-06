@@ -973,3 +973,26 @@ func TestASatelliteIsNotAdmissionLatency(t *testing.T) {
 		t.Fatalf("the histogram holds %d observations, want %d: a thread is not a page", got, before)
 	}
 }
+
+// TestTheCallCarriesWhatTheGenerationBound. The context settled at Begin
+// reaches the channel on the call, beside the endpoint and the key.
+func TestTheCallCarriesWhatTheGenerationBound(t *testing.T) {
+	store := newFakeStore()
+	store.beginOut.BoundContext = json.RawMessage(`{"card_receipt_ref":"C0001/1700000000.000100"}`)
+	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
+	store.available["slack"] = &queues{fresh: 1}
+	channel := newFakeChannel()
+
+	w := testWorker(store, map[string]Channel{"slack": channel})
+	w.tick(context.Background())
+	deadline := time.Now().Add(5 * time.Second)
+	for len(channel.made()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("nothing was attempted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := string(channel.made()[0].BoundContext); got != `{"card_receipt_ref":"C0001/1700000000.000100"}` {
+		t.Fatalf("the call carries %q as its context", got)
+	}
+}

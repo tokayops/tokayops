@@ -440,6 +440,7 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 		Operation:            begun.Operation,
 		Endpoint:             begun.BoundEndpoint,
 		ProviderKey:          begun.ProviderKey,
+		BoundContext:         begun.BoundContext,
 		Receipt:              begun.Receipt,
 		ReceiptRef:           begun.ReceiptRef,
 		KeyKind:              leased.Intent.KeyKind,

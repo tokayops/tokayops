@@ -38,6 +38,18 @@ const HTTPTimeout = 30 * time.Second
 // The timeout is a parameter rather than read from the constant here so a test
 // can prove the option reaches the client in milliseconds instead of thirty
 // seconds; opts is what lets that test point the client at a server of its own.
+// WorkspaceURL is the address of the workspace a token belongs to, as
+// auth.test names it. It is asked when an integration is saved or tested and
+// recorded in the integration's configuration, so that a message can link to
+// a card without a call.
+func WorkspaceURL(ctx context.Context, token string) (string, error) {
+	resp, err := NewClient(token, HTTPTimeout).AuthTestContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	return resp.URL, nil
+}
+
 func NewClient(token string, timeout time.Duration, opts ...slackapi.Option) *slackapi.Client {
 	return slackapi.New(token, append(opts,
 		slackapi.OptionHTTPClient(&http.Client{

@@ -437,14 +437,16 @@ func (h *Handler) write(call outbound.Call, body map[string]interface{}) (outbou
 // Nothing here reads a neighbouring delivery - a permalink that exists on the
 // retry and not on the first attempt is two different messages under one key.
 func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1) string {
+	var lines []string
 	if payload.MessageOverride != nil && *payload.MessageOverride != "" {
-		return *payload.MessageOverride
-	}
-
-	status := providers.ResolveStatus(state)
-	lines := []string{status.Title}
-	if state.Severity != "" {
-		lines = append(lines, "Severity: "+state.Severity)
+		// The words are the policy's; the link is not theirs to replace.
+		lines = []string{*payload.MessageOverride}
+	} else {
+		status := providers.ResolveStatus(state)
+		lines = []string{status.Title}
+		if state.Severity != "" {
+			lines = append(lines, "Severity: "+state.Severity)
+		}
 	}
 	if state.GroupURL != nil && *state.GroupURL != "" {
 		lines = append(lines, *state.GroupURL)

@@ -182,6 +182,7 @@ func main() {
 	// every revision of a card the same way the producer of revision 0 freezes
 	// it: two instances, or one instance a month later, render the same bytes.
 	st.SetRenderEnvironment(cfg.Global.SelfURL, providers.ProcessZone())
+	st.SetDMFallbackToFirehose(cfg.Global.DMFallsBackToFirehose())
 
 	// Cards drawn with buttons a switch has since moved. The door that brings
 	// them up to date when the switch moves is best-effort - an instance can
