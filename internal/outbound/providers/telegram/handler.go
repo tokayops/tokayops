@@ -439,8 +439,11 @@ func (h *Handler) write(call outbound.Call, body map[string]interface{}) (outbou
 func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV2) string {
 	var lines []string
 	if payload.MessageOverride != nil && *payload.MessageOverride != "" {
-		// The words are the policy's; the link is not theirs to replace.
-		lines = []string{*payload.MessageOverride}
+		// The words are the policy's; the link is not theirs to replace. A
+		// direct message is plain text here, so the alert's values go in
+		// as they are.
+		lines = []string{providers.RenderMessage(*payload.MessageOverride, state,
+			func(s string) string { return s })}
 	} else {
 		status := providers.ResolveStatus(state)
 		lines = []string{status.Title}

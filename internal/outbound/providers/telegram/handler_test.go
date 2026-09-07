@@ -633,3 +633,30 @@ func TestTelegramHasNoThreads(t *testing.T) {
 		}
 	}
 }
+
+// TestThePolicysWordsAreATemplateInTelegramToo. The same four names, filled
+// in as they are: a direct message here is plain text.
+func TestThePolicysWordsAreATemplateInTelegramToo(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	template := "{{.Title}} ({{.AlertsCount}} alert, {{.Severity}})"
+	payload, err := json.Marshal(keys.EscalationPayloadV2{
+		Slot:            keys.Slot{Kind: keys.SlotPolicy, Index: 1},
+		Target:          keys.Target{Kind: keys.TargetUser, Ref: "user-1"},
+		MessageOverride: &template,
+	})
+	if err != nil {
+		t.Fatalf("build the payload: %v", err)
+	}
+	call := handlerCall(t, keys.TargetUser, true)
+	call.Payload = payload
+	call.PayloadSchemaVersion = 2
+	call.Endpoint = "5551"
+	if _, err := handler.ExecuteAttempt(context.Background(), call); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got, _ := api.calls[0]["text"].(string); got != "Disk filling up (1 alert, critical)\nhttps://tokay.example/#/ops/alert-groups/ag-1" {
+		t.Fatalf("the message reads %q", got)
+	}
+}

@@ -45,6 +45,33 @@ func refusedBeforeTheNetwork(t *testing.T, s *Store, id string) outbound.BeginAt
 	return result
 }
 
+// satellitesOfCard finds the thread and the reply that follow one card, in a
+// group that may hold other cards.
+func satellitesOfCard(t *testing.T, s *Store, card string) (thread, reply string) {
+	t.Helper()
+	rows, err := s.db.Query(`SELECT id, target_kind FROM outbound_intents WHERE parent_intent_id = $1`, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, kind string
+		if err := rows.Scan(&id, &kind); err != nil {
+			t.Fatal(err)
+		}
+		switch keys.TargetKind(kind) {
+		case keys.TargetThread:
+			thread = id
+		case keys.TargetThreadReply:
+			reply = id
+		}
+	}
+	if thread == "" || reply == "" {
+		t.Fatalf("the card %s has thread %q and reply %q", card, thread, reply)
+	}
+	return thread, reply
+}
+
 func stoppedLines(t *testing.T, s *Store, agID string) int {
 	t.Helper()
 	return countWhere(t, s, `SELECT count(*) FROM timeline_events WHERE alert_group_id = $1
@@ -85,7 +112,8 @@ func TestAStepThatFailsForGoodStopsTheStepsAfterIt(t *testing.T) {
 			t.Fatalf("the journal of %s does not say why: %v", ref, lines)
 		}
 	}
-	card, thread, reply := satellitesOf(t, s, agID)
+	card := intentAddressedTo(t, s, agID, "C-2")
+	thread, reply := satellitesOfCard(t, s, card)
 	for _, id := range []string{card, thread, reply} {
 		if got := statusOf(t, s, id); got != outbound.StatusCanceled {
 			t.Fatalf("the later card or its satellite %s is %s", id, got)
@@ -314,7 +342,8 @@ func TestALaterCardThatWentOutKeepsItsSatellites(t *testing.T) {
 	agID := desiredGroup(t, s, "Disk filling up")
 	commitments := []keys.EscalationCommitment{dmStep("u-1", 1, true)}
 	admitOne(t, s, agID, append(commitments, withSatellites(cardStep("C-2", 2, false))...)...)
-	card, thread, reply := satellitesOf(t, s, agID)
+	card := intentAddressedTo(t, s, agID, "C-2")
+	thread, reply := satellitesOfCard(t, s, card)
 	postedAs(t, s, card, "C-2/1700000000.000100")
 
 	refusedBeforeTheNetwork(t, s, intentAddressedTo(t, s, agID, "u-1"))
@@ -340,7 +369,8 @@ func TestTheStopCountsPagesNotMirrors(t *testing.T) {
 	agID := desiredGroup(t, s, "Disk filling up")
 	commitments := []keys.EscalationCommitment{dmStep("u-1", 1, true)}
 	admitOne(t, s, agID, append(commitments, withSatellites(cardStep("C-2", 2, false))...)...)
-	card, thread, reply := satellitesOf(t, s, agID)
+	card := intentAddressedTo(t, s, agID, "C-2")
+	thread, reply := satellitesOfCard(t, s, card)
 	refusedForGood(t, s, card)
 
 	refusedBeforeTheNetwork(t, s, intentAddressedTo(t, s, agID, "u-1"))

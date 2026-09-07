@@ -520,7 +520,7 @@ func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV2,
 
 	var lines []string
 	if payload.MessageOverride != nil && *payload.MessageOverride != "" {
-		lines = []string{*payload.MessageOverride}
+		lines = []string{providers.RenderMessage(*payload.MessageOverride, state, mrkdwn)}
 	} else {
 		status := providers.ResolveStatus(state)
 		lines = []string{mrkdwn(status.Title)}

@@ -39,8 +39,10 @@ type GroupDeliveryDTO struct {
 	Provider     string `json:"provider"`
 	TargetKind   string `json:"target_kind"`
 	TargetRef    string `json:"target_ref"`
-	Form         string `json:"form"`
-	Status       string `json:"status"`
+	// ParentIntentID names the card a thread or a reply follows; empty for anything else.
+	ParentIntentID string `json:"parent_intent_id,omitempty"`
+	Form           string `json:"form"`
+	Status         string `json:"status"`
 
 	GenerationNo         int `json:"generation_no"`
 	AttemptsInGeneration int `json:"attempts_in_generation"`
@@ -191,7 +193,8 @@ func groupDeliveryDTO(i outbound.Intent) GroupDeliveryDTO {
 	return GroupDeliveryDTO{
 		ID: i.ID, BatchID: i.BatchID, AlertGroupID: i.AlertGroupID, Family: i.Family, Kind: string(i.KeyKind),
 		Provider: i.Provider, TargetKind: string(i.TargetKind), TargetRef: i.TargetRef,
-		Form: string(i.Form), Status: string(i.Status),
+		ParentIntentID: i.ParentID,
+		Form:           string(i.Form), Status: string(i.Status),
 		GenerationNo: i.GenerationNo, AttemptsInGeneration: i.AttemptsInGeneration,
 		FailureStreak:   i.FailureStreak,
 		DesiredRevision: i.DesiredRevision, AppliedRevision: i.AppliedRevision,
@@ -362,7 +365,7 @@ func contains(list []string, value string) bool {
 // @Param family query string false "notification | handoff | webhook"
 // @Param provider query string false "slack | telegram | webhook"
 // @Param status query string false "Comma-separated statuses: pending, sending, idle, manual_review, succeeded, permanent_failed, expired, canceled"
-// @Param target_kind query string false "user | channel | subscriber"
+// @Param target_kind query string false "user | channel | thread | thread_reply | subscriber"
 // @Param target_ref query string false "The recipient as this system names it: a user id, a channel id, an integration id"
 // @Param alert_group_id query string false "Commitments owned by this alert group (paging)"
 // @Param event_id query string false "Commitments of every claim on this alert event, replays included"

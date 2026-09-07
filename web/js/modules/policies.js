@@ -552,8 +552,6 @@ function addNewStep() {
         target_type: 'user',
         target_id: '',
         delay_seconds: 0,
-        timeout_seconds: 30,
-        max_attempts: 5,
         message: '',
         continue_on_failure: true
     }, newIndex, State.users || [], State.teams || [], currentTeamId, State.currentScheduleId, State.providers || []);
@@ -655,8 +653,6 @@ function collectStepsData() {
         const targetType = row.querySelector('.target-type-select')?.value || 'user';
         const targetId = row.querySelector('.target-id-input')?.value || '';
         const delaySeconds = parseInt(row.querySelector('.delay-input')?.value || '0', 10);
-        const timeoutSeconds = parseInt(row.querySelector('.timeout-input')?.value || '30', 10);
-        const maxAttempts = parseInt(row.querySelector('.max-attempts-input')?.value || '5', 10);
         const message = row.querySelector('.message-input')?.value || '';
         const continueOnFailure = row.querySelector('.continue-on-failure-input')?.checked ?? true;
 
@@ -666,8 +662,6 @@ function collectStepsData() {
             target_type: targetType,
             target_id: targetId,
             delay_seconds: delaySeconds,
-            timeout_seconds: timeoutSeconds,
-            max_attempts: maxAttempts,
             message,
             continue_on_failure: continueOnFailure
         });
@@ -765,8 +759,6 @@ async function openDuplicateModal(policyId) {
                         target_type: s.target_type,
                         target_id: s.target_id,
                         delay_seconds: s.delay_seconds,
-                        timeout_seconds: s.timeout_seconds,
-                        max_attempts: s.max_attempts,
                         message: s.message,
                         continue_on_failure: s.continue_on_failure ?? true
                     }))

@@ -140,11 +140,40 @@ export function targetLabel(kind, ref) {
             return `<span class="delivery-target" data-user-id="${escapeAttr(ref || '')}"><i data-lucide="user"></i><span class="delivery-target-name">${id}</span></span>`;
         case 'channel':
             return `<span class="delivery-target"><i data-lucide="hash"></i><span>${id}</span></span>`;
+        case 'thread':
+            return `<span class="delivery-target"><i data-lucide="message-square"></i><span>thread in #${id}</span></span>`;
+        case 'thread_reply':
+            return `<span class="delivery-target"><i data-lucide="corner-down-right"></i><span>reply in #${id}</span></span>`;
         case 'subscriber':
             return `<span class="delivery-target"><i data-lucide="webhook"></i><span>subscriber ${id}</span></span>`;
         default:
             return `<span class="delivery-target">${escapeHtml(kind || '')} ${id}</span>`;
     }
+}
+
+/**
+ * What a delivery is, for the Form column: a card, a message, or one of the
+ * two messages that follow a card.
+ */
+function formLabel(d) {
+    if (d.target_kind === 'thread') return 'thread';
+    if (d.target_kind === 'thread_reply') return 'reply';
+    return d.form === 'editable' ? 'card' : 'message';
+}
+
+/**
+ * The paging rows in reading order: each card followed by the thread and the
+ * reply that follow it, so the three read as one delivery to a channel.
+ */
+function besideTheirCards(paging) {
+    const satellites = paging.filter(d => d.parent_intent_id);
+    const ordered = [];
+    paging.filter(d => !d.parent_intent_id).forEach(card => {
+        ordered.push(card);
+        satellites.filter(s => s.parent_intent_id === card.id).forEach(s => ordered.push(s));
+    });
+    satellites.filter(s => !paging.some(d => d.id === s.parent_intent_id)).forEach(s => ordered.push(s));
+    return ordered;
 }
 
 /**
@@ -223,12 +252,12 @@ function pagingTable(paging) {
     if (!paging || paging.length === 0) {
         return '<div class="deliveries-empty">Nobody was paged for this alert.</div>';
     }
-    const rows = paging.map(d => `
-        <tr class="delivery-row" data-delivery-id="${escapeAttr(d.id)}">
+    const rows = besideTheirCards(paging).map(d => `
+        <tr class="delivery-row${d.parent_intent_id ? ' delivery-row-satellite' : ''}" data-delivery-id="${escapeAttr(d.id)}">
             <td>${statusBadge(d.status)}</td>
             <td>${escapeHtml(d.provider)}</td>
             <td>${targetLabel(d.target_kind, d.target_ref)}</td>
-            <td>${escapeHtml(d.form === 'editable' ? 'card' : 'message')}</td>
+            <td>${escapeHtml(formLabel(d))}</td>
             <td>${when(d.created_at)}</td>
             <td class="delivery-row-actions">${journalButton(d.id)}</td>
         </tr>`).join('');

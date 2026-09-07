@@ -7043,3 +7043,8 @@ body::before {
     gap: var(--space-sm, 8px);
     align-items: center;
 }
+
+/* The thread and the reply that follow a card sit under it. */
+.delivery-row-satellite td:nth-child(3) {
+    padding-left: 28px;
+}

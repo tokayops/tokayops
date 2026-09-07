@@ -82,3 +82,24 @@ func TestTheCardComesFromTheGenerationNotFromTheAttempt(t *testing.T) {
 		t.Fatalf("the message does not link to the card it was bound to:\n%s", text)
 	}
 }
+
+// TestThePolicysWordsAreATemplateOverTheAlert. The step's message is
+// rendered from the snapshot, with the alert's values escaped the way every
+// field from outside is; the policy's own words are not touched.
+func TestThePolicysWordsAreATemplateOverTheAlert(t *testing.T) {
+	state := handlerState(t).Content()
+	state.Title = "<!here> Disk filling up"
+	team := "platform"
+	state.TeamLabel = &team
+	template := "*{{.Title}}* is {{.Severity}} for {{.Team}} ({{.AlertsCount}} alert)"
+	payload := keys.EscalationPayloadV2{
+		Slot: keys.Slot{Kind: keys.SlotPolicy, Index: 1}, Target: keys.Target{Kind: keys.TargetUser, Ref: "u-1"},
+		MessageOverride: &template,
+	}
+	got := directMessage(state, payload, outbound.BoundContext{})
+	want := "*&lt;!here&gt; Disk filling up* is critical for platform (1 alert)\n" +
+		"<https://tokay.example/#/ops/alert-groups/ag-1|Open in TokayOps>"
+	if got != want {
+		t.Fatalf("the message reads:\n%s\n\nwant:\n%s", got, want)
+	}
+}

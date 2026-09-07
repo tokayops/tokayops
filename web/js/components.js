@@ -770,6 +770,10 @@ const Components = {
                 return `<span class="delivery-target" data-user-id="${escapeAttr(ref || '')}"><i data-lucide="user"></i><span class="delivery-target-name">${id}</span></span>`;
             case 'channel':
                 return `<span class="delivery-target"><i data-lucide="hash"></i><span>${id}</span></span>`;
+            case 'thread':
+                return `<span class="delivery-target"><i data-lucide="message-square"></i><span>thread in #${id}</span></span>`;
+            case 'thread_reply':
+                return `<span class="delivery-target"><i data-lucide="corner-down-right"></i><span>reply in #${id}</span></span>`;
             case 'subscriber':
                 return `<span class="delivery-target"><i data-lucide="webhook"></i><span>subscriber ${id}</span></span>`;
             default:
@@ -1505,17 +1509,9 @@ const Components = {
                         <label>Delay (s)</label>
                         <input type="number" class="form-input delay-input" value="${step.delay_seconds || 0}" min="0">
                     </div>
-                    <div class="step-field step-field-sm">
-                        <label>Timeout (s)</label>
-                        <input type="number" class="form-input timeout-input" value="${step.timeout_seconds || 30}" min="1">
-                    </div>
-                    <div class="step-field step-field-sm">
-                        <label>Retries</label>
-                        <input type="number" class="form-input max-attempts-input" value="${step.max_attempts || 5}" min="1" max="10">
-                    </div>
                     <div class="step-field step-field-message">
-                        <label>Message <span class="variables-hint" title="{{.Title}}, {{.Severity}}, {{.Team}}, {{.AlertsCount}}">ⓘ</span></label>
-                        <input type="text" class="form-input message-input" placeholder="Custom message (optional)" value="${escapeHtml(step.message || '')}">
+                        <label>Message <span class="variables-hint" title="Text of the direct message. {{.Title}}, {{.Severity}}, {{.Team}} and {{.AlertsCount}} are filled in from the alert. A channel step posts the card, which is not changed.">ⓘ</span></label>
+                        <input type="text" class="form-input message-input" placeholder="Text of the direct message (optional)" value="${escapeHtml(step.message || '')}">
                     </div>
                 </div>
             </div>
@@ -1534,7 +1530,7 @@ const Components = {
         const currentScope = isGlobalPolicy ? 'global' : 'team';
         const isAdmin = Permissions.isAdmin();
         const defaultProvider = (State.providers || [])[0]?.name || '';
-        const steps = policy?.steps || [{ provider: defaultProvider, target_kind: 'dm', target_type: 'user', target_id: '', delay_seconds: 0, timeout_seconds: 30, max_attempts: 5, message: '', continue_on_failure: true }];
+        const steps = policy?.steps || [{ provider: defaultProvider, target_kind: 'dm', target_type: 'user', target_id: '', delay_seconds: 0, message: '', continue_on_failure: true }];
 
         // Build scope selector HTML
         const scopeSelectorHtml = isEdit
