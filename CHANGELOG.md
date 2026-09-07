@@ -245,9 +245,11 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   `auth.test` whenever a Slack integration is saved or tested - an integration
   saved by an earlier version has to be saved or tested once more.
 - **Threads and replies are deliveries of their own.** The delivery journal,
-  the alert's deliveries block and the `target_kind` filter know two more
-  kinds, `thread` and `thread_reply`; each sits beside the card it follows,
-  and an operator's decision applies to it like to a card. A thread that
+  the Activity list and the `target_kind` filter know two more kinds,
+  `thread` and `thread_reply`, and an operator's decision applies to them
+  like to a card. The alert's page no longer lists its deliveries: the
+  timeline says what went out, each of its lines opens the delivery's
+  journal, and the Activity list has the rest. A thread that
   fails because its card never made a message says so
   (`parent_ended_without_message`) and comes back when the card is retried.
   Telegram has neither threads nor links to cards; it is unchanged.

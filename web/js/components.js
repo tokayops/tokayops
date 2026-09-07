@@ -551,13 +551,6 @@ const Components = {
                 </div>
             ` : '')}
 
-            <div class="detail-section deliveries-section">
-                <h3 class="detail-section-title">Deliveries</h3>
-                <div id="alert-group-deliveries" class="deliveries-container">
-                    <div class="loading-spinner">Loading deliveries...</div>
-                </div>
-            </div>
-
             <div class="detail-section timeline-section">
                 <h3 class="detail-section-title">Timeline</h3>
                 <div id="alert-group-timeline" class="timeline-container">

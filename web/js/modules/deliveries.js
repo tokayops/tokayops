@@ -151,30 +151,6 @@ export function targetLabel(kind, ref) {
     }
 }
 
-/**
- * What a delivery is, for the Form column: a card, a message, or one of the
- * two messages that follow a card.
- */
-function formLabel(d) {
-    if (d.target_kind === 'thread') return 'thread';
-    if (d.target_kind === 'thread_reply') return 'reply';
-    return d.form === 'editable' ? 'card' : 'message';
-}
-
-/**
- * The paging rows in reading order: each card followed by the thread and the
- * reply that follow it, so the three read as one delivery to a channel.
- */
-function besideTheirCards(paging) {
-    const satellites = paging.filter(d => d.parent_intent_id);
-    const ordered = [];
-    paging.filter(d => !d.parent_intent_id).forEach(card => {
-        ordered.push(card);
-        satellites.filter(s => s.parent_intent_id === card.id).forEach(s => ordered.push(s));
-    });
-    satellites.filter(s => !paging.some(d => d.id === s.parent_intent_id)).forEach(s => ordered.push(s));
-    return ordered;
-}
 
 /**
  * Who wrote a journal line, by the kind the row carries.
@@ -248,92 +224,6 @@ function journalButton(deliveryId) {
 // The alert group's deliveries
 // ========================================
 
-function pagingTable(paging) {
-    if (!paging || paging.length === 0) {
-        return '<div class="deliveries-empty">Nobody was paged for this alert.</div>';
-    }
-    const rows = besideTheirCards(paging).map(d => `
-        <tr class="delivery-row${d.parent_intent_id ? ' delivery-row-satellite' : ''}" data-delivery-id="${escapeAttr(d.id)}">
-            <td>${statusBadge(d.status)}</td>
-            <td>${escapeHtml(d.provider)}</td>
-            <td>${targetLabel(d.target_kind, d.target_ref)}</td>
-            <td>${escapeHtml(formLabel(d))}</td>
-            <td>${when(d.created_at)}</td>
-            <td class="delivery-row-actions">${journalButton(d.id)}</td>
-        </tr>`).join('');
-    return `
-        <table class="delivery-table deliveries-paging">
-            <thead><tr><th>Status</th><th>Provider</th><th>To</th><th>Form</th><th>Created</th><th></th></tr></thead>
-            <tbody>${rows}</tbody>
-        </table>`;
-}
-
-function batchLabel(batch) {
-    if (batch.outcome === 'no_targets') return 'Nobody subscribed';
-    return batch.kind === 'webhook_replay' ? 'Replay' : 'Fan-out';
-}
-
-function eventsList(events) {
-    if (!events || events.length === 0) {
-        return '<div class="deliveries-empty">No webhook events for this alert.</div>';
-    }
-    return events.map(event => {
-        const batches = (event.batches || []).map(batch => {
-            const deliveries = (batch.deliveries || []).map(d => `
-                <tr class="delivery-row" data-delivery-id="${escapeAttr(d.id)}">
-                    <td>${statusBadge(d.status)}</td>
-                    <td>${targetLabel(d.target_kind, d.target_ref)}</td>
-                    <td>${when(d.created_at)}</td>
-                    <td class="delivery-row-actions">${journalButton(d.id)}</td>
-                </tr>`).join('');
-            return `
-                <div class="delivery-batch" data-batch-kind="${escapeAttr(batch.kind)}" data-batch-outcome="${escapeAttr(batch.outcome)}">
-                    <div class="delivery-batch-header">
-                        <span class="delivery-batch-kind">${escapeHtml(batchLabel(batch))}</span>
-                        <span class="text-muted">${batch.intent_count} ${batch.intent_count === 1 ? 'delivery' : 'deliveries'} · ${when(batch.admitted_at)}</span>
-                    </div>
-                    ${deliveries ? `<table class="delivery-table deliveries-webhook"><tbody>${deliveries}</tbody></table>` : ''}
-                </div>`;
-        }).join('');
-        const pending = !event.batches || event.batches.length === 0;
-        return `
-            <div class="delivery-event" data-event-id="${escapeAttr(event.event_id)}" data-event-status="${escapeAttr(event.status)}">
-                <div class="delivery-event-header">
-                    <span class="delivery-event-type">${escapeHtml(event.event_type)}</span>
-                    <span class="delivery-event-status">${escapeHtml(pending ? 'not fanned out yet' : event.status)}</span>
-                    <span class="text-muted">${when(event.created_at)}</span>
-                </div>
-                ${batches}
-            </div>`;
-    }).join('');
-}
-
-export function groupDeliveriesBlock(data) {
-    return `
-        <div class="deliveries-block">
-            <div class="detail-subtitle">Paging</div>
-            ${pagingTable(data.paging)}
-            <div class="detail-subtitle">Webhooks</div>
-            ${eventsList(data.events)}
-        </div>`;
-}
-
-/**
- * Load the deliveries of an alert group into its details.
- */
-export async function renderGroupDeliveries(alertGroupId) {
-    const container = document.getElementById('alert-group-deliveries');
-    if (!container) return;
-    try {
-        const data = await API.alertGroups.deliveries(alertGroupId);
-        container.innerHTML = groupDeliveriesBlock(data || {});
-        if (window.lucide) lucide.createIcons();
-        bindJournalLinks(container);
-        hydrateUserNames(container);
-    } catch (error) {
-        container.innerHTML = `<div class="deliveries-empty">Failed to load deliveries: ${escapeHtml(error.message)}</div>`;
-    }
-}
 
 /**
  * After a timeline render: the names of the people it names, and the links

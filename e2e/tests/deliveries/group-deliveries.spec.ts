@@ -12,7 +12,7 @@ import {
  * journal of one delivery opens from here for an administrator, and is not
  * offered to anybody else.
  */
-test.describe('Alert group deliveries', () => {
+test.describe('Alert group deliveries in the timeline', () => {
   let alertGroupId = '';
   let webhookIntegrationId = '';
   let team: PagedTeam;
@@ -57,37 +57,14 @@ test.describe('Alert group deliveries', () => {
     await context.close();
   });
 
-  test('the block shows the paging, the webhook claims, and opens the journal for an administrator', async ({ page, dashboardPage }) => {
+  test('the timeline names the page and opens its journal for an administrator', async ({ page, dashboardPage }) => {
     await page.goto(`/#/ops/alert-groups/${alertGroupId}`);
     await dashboardPage.waitForDashboardLoad();
     await dashboardPage.expectAlertModalVisible();
 
-    const block = page.locator('#alert-group-deliveries');
-    await expect(block.locator('.deliveries-paging')).toBeVisible({ timeout: 15000 });
-
-    // The paging: who was paged, through what, and what became of it.
-    const paging = block.locator('.deliveries-paging tbody tr');
-    await expect(paging.first()).toBeVisible();
-    await expect(paging.first().locator('.delivery-status-permanent_failed')).toBeVisible();
-    await expect(paging.first()).toContainText('slack');
-    await expect(paging.first().locator('.delivery-target')).toContainText(team.userName);
-
-    // The webhook half, from the claims: the fan-out's and the replay's, each
-    // with its delivery to the subscriber.
-    const event = block.locator('.delivery-event').first();
-    await expect(event).toBeVisible();
-    await expect(event.locator('.delivery-event-type')).toContainText('alert_group.firing');
-    const fanOut = event.locator('.delivery-batch[data-batch-kind="webhook_event"]');
-    const replay = event.locator('.delivery-batch[data-batch-kind="webhook_replay"]');
-    await expect(fanOut).toHaveCount(1);
-    await expect(replay).toHaveCount(1);
-    await expect(fanOut.locator('.delivery-batch-kind')).toHaveText('Fan-out');
-    await expect(replay.locator('.delivery-batch-kind')).toHaveText('Replay');
-    await expect(fanOut.locator('.delivery-row .delivery-target', { hasText: webhookIntegrationId })).toHaveCount(1);
-    await expect(replay.locator('.delivery-row .delivery-status-permanent_failed')).toBeVisible();
-
-    // The timeline line the delivery wrote names the same addressee and
-    // provider, from the row rather than from the prose.
+    // The timeline line the delivery wrote names the addressee and the
+    // provider, from the row rather than from the prose. The alert's page
+    // lists no deliveries of its own: the timeline is where they are read.
     const timelineLine = page.locator('#alert-group-timeline .timeline-delivery').first();
     await expect(timelineLine).toBeVisible({ timeout: 15000 });
     await expect(timelineLine.locator('.delivery-target')).toContainText(team.userName);
@@ -95,7 +72,7 @@ test.describe('Alert group deliveries', () => {
     await expect(timelineLine.locator('.journal-link')).toBeVisible();
 
     // A click opens the journal of that delivery.
-    await paging.first().locator('.journal-link').click();
+    await timelineLine.locator('.journal-link').click();
     const journal = page.locator('#delivery-modal-overlay');
     await expect(journal).toBeVisible();
     await expect(journal.locator('.journal-attempts tbody tr')).toHaveCount(1);
@@ -107,8 +84,13 @@ test.describe('Alert group deliveries', () => {
 
     // A webhook delivery that failed for good has one door to a new effect,
     // the replay: the dialog offers a withdrawal and nothing the server
-    // would refuse.
-    await fanOut.locator('.delivery-row', { hasText: webhookIntegrationId }).locator('.journal-link').click();
+    // would refuse. Webhook deliveries belong to the event, not to the
+    // alert's page; the Activity list is where they are opened.
+    await page.goto('/#/ops/activity');
+    const failedWebhook = page.locator('.activity-row[data-family="webhook"][data-status="permanent_failed"]',
+      { hasText: webhookIntegrationId }).first();
+    await expect(failedWebhook).toBeVisible({ timeout: 15000 });
+    await failedWebhook.locator('.journal-link').click();
     await expect(journal).toBeVisible();
     await expect(journal.locator('.journal-status .delivery-status-permanent_failed')).toBeVisible();
     await journal.locator('#delivery-decide-btn').click();
@@ -119,16 +101,12 @@ test.describe('Alert group deliveries', () => {
     await expect(journal).toBeHidden();
   });
 
-  test('a user who is not an administrator sees the deliveries and is not offered the journal', async ({ browser }) => {
+  test('a user who is not an administrator sees the timeline and is not offered the journal', async ({ browser }) => {
     const page = await loginAs(browser, 'alice@example.com');
     try {
       await page.goto(`/#/ops/alert-groups/${alertGroupId}`);
-      const block = page.locator('#alert-group-deliveries');
-      await expect(block.locator('.deliveries-paging')).toBeVisible({ timeout: 20000 });
-      await expect(block.locator('.deliveries-paging tbody tr').first().locator('.delivery-target')).toContainText(team.userName);
-      await expect(block.locator('.delivery-event')).toHaveCount(1);
-      await expect(block.locator('.journal-link')).toHaveCount(0);
-      await expect(page.locator('#alert-group-timeline .timeline-delivery').first()).toBeVisible({ timeout: 15000 });
+      await expect(page.locator('#alert-group-timeline .timeline-delivery').first()).toBeVisible({ timeout: 20000 });
+      await expect(page.locator('#alert-group-timeline .timeline-delivery').first().locator('.delivery-target')).toContainText(team.userName);
       await expect(page.locator('#alert-group-timeline .journal-link')).toHaveCount(0);
       await expect(page.locator('#sidebar-nav [data-route="activity"]')).toHaveClass(/disabled/);
     } finally {

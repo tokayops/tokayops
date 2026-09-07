@@ -6863,9 +6863,6 @@ body::before {
     color: var(--text-muted, #6b7280);
 }
 
-.deliveries-block .detail-subtitle {
-    margin-top: var(--space-md, 16px);
-}
 .deliveries-empty {
     color: var(--text-muted, #6b7280);
     font-size: 0.85rem;
@@ -6895,32 +6892,6 @@ body::before {
     height: 12px;
 }
 
-.delivery-event {
-    border: 1px solid var(--border-color, #e5e7eb);
-    border-radius: 6px;
-    padding: var(--space-sm, 8px);
-    margin-bottom: var(--space-sm, 8px);
-}
-.delivery-event-header,
-.delivery-batch-header {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-sm, 8px);
-    align-items: baseline;
-    font-size: 0.85rem;
-}
-.delivery-event-type {
-    font-weight: 600;
-}
-.delivery-event-status {
-    color: var(--text-muted, #6b7280);
-}
-.delivery-batch {
-    margin: var(--space-sm, 8px) 0 0 var(--space-md, 16px);
-}
-.delivery-batch-kind {
-    font-weight: 500;
-}
 
 .timeline-delivery {
     flex-wrap: wrap;
@@ -7044,7 +7015,3 @@ body::before {
     align-items: center;
 }
 
-/* The thread and the reply that follow a card sit under it. */
-.delivery-row-satellite td:nth-child(3) {
-    padding-left: 28px;
-}

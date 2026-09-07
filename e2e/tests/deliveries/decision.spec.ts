@@ -40,7 +40,8 @@ test.describe('Operator decision', () => {
     await page.goto(`/#/ops/alert-groups/${alertGroupId}`);
     await dashboardPage.waitForDashboardLoad();
     await dashboardPage.expectAlertModalVisible();
-    await page.locator('#alert-group-deliveries .deliveries-paging .journal-link').first().click();
+    // The journal opens from the timeline's own line about the failed page.
+    await page.locator('.timeline-delivery .journal-link').first().click();
 
     const modal = page.locator('#delivery-modal-overlay');
     await expect(modal).toBeVisible();
@@ -95,8 +96,9 @@ test.describe('Operator decision', () => {
     await expect(decision.locator('.journal-actor-user .delivery-target-name')).toHaveText(me.name);
     await expect(modal.locator('#delivery-decide-btn')).toHaveCount(0);
 
-    // The group's block reflects the decision.
+    // Opened again from the timeline, the journal shows the decision kept.
     await modal.locator('#delivery-modal-close').click();
-    await expect(page.locator('#alert-group-deliveries .deliveries-paging .delivery-status-canceled')).toBeVisible({ timeout: 15000 });
+    await page.locator('.timeline-delivery .journal-link').first().click();
+    await expect(modal.locator('.journal-status .delivery-status-canceled')).toBeVisible({ timeout: 15000 });
   });
 });
