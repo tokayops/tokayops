@@ -82,7 +82,7 @@ test.describe('Activity log', () => {
     await expect(page.locator('.activity-row').first()).toBeVisible({ timeout: 15000 });
     await page.locator('.activity-row').first().locator('.journal-link').click();
     await expect(page.locator('#delivery-modal-overlay')).toBeVisible();
-    await expect(page.locator('#delivery-modal-overlay .journal-events')).toBeVisible();
+    await expect(page.locator('#delivery-modal-overlay .journal-history')).toBeVisible();
   });
 
   test('is the administrator\'s', async ({ browser }) => {

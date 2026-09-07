@@ -89,8 +89,8 @@ test.describe('Operator decision', () => {
     await modal.locator('#decision-reason').fill('nobody is listening');
     await modal.locator('#decision-submit-btn').click();
     await expect(modal.locator('.journal-status .delivery-status-canceled')).toBeVisible({ timeout: 15000 });
-    await expect(modal.locator('.journal-events [data-kind="canceled"]')).toBeVisible();
-    const decision = modal.locator('.journal-events [data-kind="operator_decision"]');
+    await expect(modal.locator('.journal-history [data-kind="canceled"]')).toBeVisible();
+    const decision = modal.locator('.journal-history [data-kind="operator_decision"]');
     await expect(decision).toBeVisible();
     await expect(decision).toContainText('nobody is listening');
     await expect(decision.locator('.journal-actor-user .delivery-target-name')).toHaveText(me.name);

@@ -75,10 +75,10 @@ test.describe('Alert group deliveries in the timeline', () => {
     await timelineLine.locator('.journal-link').click();
     const journal = page.locator('#delivery-modal-overlay');
     await expect(journal).toBeVisible();
-    await expect(journal.locator('.journal-attempts tbody tr')).toHaveCount(1);
-    await expect(journal.locator('.journal-attempts')).toContainText('preparation');
-    await expect(journal.locator('.journal-events [data-kind="created"]')).toBeVisible();
-    await expect(journal.locator('.journal-events [data-kind="created"] .journal-actor-system')).toHaveText('Escalation engine');
+    await expect(journal.locator('.journal-history .journal-attempt')).toHaveCount(1);
+    await expect(journal.locator('.journal-history .journal-attempt')).toContainText('Not sent');
+    await expect(journal.locator('.journal-history [data-kind="created"]')).toBeVisible();
+    await expect(journal.locator('.journal-history [data-kind="created"] .journal-actor-system')).toHaveText('Escalation engine');
     await journal.locator('#delivery-modal-close').click();
     await expect(journal).toBeHidden();
 
