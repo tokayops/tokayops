@@ -49,23 +49,10 @@ type planStore interface {
 	RenderInputs(ctx context.Context, alertGroupID string) (providers.RenderInputs, error)
 }
 
-// channelSettings is the configuration a MESSAGE depends on, as opposed to the
-// configuration a call depends on.
-//
-// Only the first is frozen. Whether buttons are offered changes the bytes of a
-// card, so it is decided here and travels with the commitment; the token to
-// send it with is read at each attempt, because rotating one has to apply to
-// work that has not gone out yet.
-type channelSettings interface {
-	GetSlackInteractive() bool
-	GetTelegramInteractive() bool
-}
-
 type planner struct {
-	store    planStore
-	oncall   onCallProjection
-	settings channelSettings
-	cfg      *config.Config
+	store  planStore
+	oncall onCallProjection
+	cfg    *config.Config
 
 	// firehose is the channel THIS alert's severity routes to, settled when
 	// the plan starts rather than asked again while it is being built.
@@ -404,7 +391,6 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 				Provider:        firehoseProvider,
 				Target:          keys.Target{Kind: keys.TargetChannel, Ref: p.firehose},
 				Editable:        true,
-				Interactive:     p.interactiveOn(firehoseProvider),
 				Timing:          keys.TimingSpec{Kind: keys.TimingRelativeToAdmission},
 				CompletionMode:  keys.CompletionOnAcceptance,
 				AmbiguityPolicy: keys.PolicyRetry,
@@ -498,7 +484,9 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 					Target:          target,
 					Editable:        step.TargetKind == "channel",
 					MessageOverride: optionalText(step.Message),
-					Interactive:     p.interactiveOn(step.Provider),
+					// The policy's word: a step that does not continue on
+					// failure stops the steps after it when it fails.
+					StopOnFailure: !step.ContinueOnFailure,
 					Timing: keys.TimingSpec{
 						Kind: keys.TimingRelativeToAdmission, Offset: offset,
 					},
@@ -553,28 +541,6 @@ func (p *planner) firehoseChannel(severity string) string {
 		return p.cfg.Global.FirehoseCriticalChannel
 	}
 	return p.cfg.Global.FirehoseWarningChannel
-}
-
-// interactiveOn says whether this provider's messages may carry buttons.
-//
-// Frozen per commitment because it changes the bytes: a card whose buttons come
-// and go between two attempts is two different messages under one key. The cost
-// is named in the plan - interactivity switched on after an alert was admitted
-// does not appear on cards already promised.
-func (p *planner) interactiveOn(provider string) bool {
-	if p.settings == nil {
-		return false
-	}
-	switch provider {
-	case keys.ProviderSlack:
-		return p.settings.GetSlackInteractive()
-	case keys.ProviderTelegram:
-		// Telegram's buttons need somewhere to send people back to, and that
-		// link comes from this instance's own URL.
-		return p.settings.GetTelegramInteractive() && p.cfg != nil && p.cfg.Global.SelfURL != ""
-	default:
-		return false
-	}
 }
 
 // policyFor reads the policy this group escalates by, and distinguishes the two

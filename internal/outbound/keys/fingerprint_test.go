@@ -22,7 +22,6 @@ func fixtureCommitment() EscalationCommitment {
 		Provider:        fixtureProvider,
 		Target:          Target{Kind: TargetChannel, Ref: fixtureChannel},
 		Editable:        true,
-		Interactive:     true,
 		Timing:          TimingSpec{Kind: TimingRelativeToAdmission},
 		CompletionMode:  CompletionOnAcceptance,
 		AmbiguityPolicy: PolicyRetry,
@@ -63,12 +62,16 @@ func fingerprintOf(t *testing.T, b EscalationBatch) string {
 // Both moved twice, deliberately, and for one reason each time: the batch's
 // content reference is the render snapshot's digest. On 2026-08-25 the
 // snapshot lost its timeline (tag 14); on 2026-09-05 it became version 2. The
-// fingerprint protocol itself did not change on either day - a batch admitted
-// before the upgrade keeps the fingerprint it was admitted with, and nothing
-// compares a new proposal against it (a group's escalation is admitted once).
+// admitted proposal moved a third time on 2026-09-07, when the admission
+// began writing escalation_payload/v2: tags 13 and 14 of every commitment
+// carry the payload's version and canonical form. The fingerprint protocol
+// itself did not change on any of those days - a batch admitted before the
+// upgrade keeps the fingerprint it was admitted with, and nothing compares a
+// new proposal against it (a group's escalation is admitted once). The
+// vectors are computed from the written protocol, not from this code.
 func TestBatchFingerprintIsGolden(t *testing.T) {
 	if got, want := fingerprintOf(t, fixtureBatch(t, fixtureCommitment())),
-		"f8ed7322417f534057921fd0c01384fc7310e88ff759c3eb34fc33e66afa4089"; got != want {
+		"9054fc1dc632b79e7e045c2dac752ef4752034ae04f69015aa318d7136ce41e5"; got != want {
 		t.Errorf("admitted proposal\n got: %s\nwant: %s", got, want)
 	}
 
@@ -236,7 +239,7 @@ func TestSubmitIntentFingerprintCoversEveryField(t *testing.T) {
 		{"ambiguity policy", func(c *EscalationCommitment) { c.AmbiguityPolicy = PolicyManualReview }},
 		{"message override appearing", func(c *EscalationCommitment) { c.MessageOverride = &override }},
 		{"message override empty rather than absent", func(c *EscalationCommitment) { c.MessageOverride = &empty }},
-		{"interactive", func(c *EscalationCommitment) { c.Interactive = false }},
+		{"stop on failure", func(c *EscalationCommitment) { c.StopOnFailure = true }},
 	}
 
 	seen := map[string]string{baseline: "baseline"}
@@ -680,9 +683,9 @@ func TestAStoredPayloadHasToEndWhereItsValueDoes(t *testing.T) {
 // escalationPayload reads an admitted payload as the shape an escalation has.
 // The interface is sealed, so this assertion is a check that the admission put
 // the right shape in - not a cast that could go anywhere.
-func escalationPayload(t *testing.T, p Payload) EscalationPayloadV1 {
+func escalationPayload(t *testing.T, p Payload) EscalationPayloadV2 {
 	t.Helper()
-	payload, ok := p.(EscalationPayloadV1)
+	payload, ok := p.(EscalationPayloadV2)
 	if !ok {
 		t.Fatalf("an escalation was admitted carrying a %T", p)
 	}

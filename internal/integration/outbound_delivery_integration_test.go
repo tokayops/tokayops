@@ -366,7 +366,7 @@ func TestWorkFromANewerBuildIsLeftWhereItIs(t *testing.T) {
 	sendWebhook(t, env.Echo, criticalAlert("from_a_newer_build", "DiskFilling"))
 	env.Eng.ProcessNewAlertGroups(context.Background())
 	if _, err := env.S.GetDB().Exec(`
-		UPDATE outbound_intents SET payload_schema_version = 2
+		UPDATE outbound_intents SET payload_schema_version = 3
 		WHERE alert_group_id = (SELECT id FROM alert_groups WHERE alert_key = $1)`,
 		"from_a_newer_build"); err != nil {
 		t.Fatalf("write the commitments as a newer build would: %v", err)

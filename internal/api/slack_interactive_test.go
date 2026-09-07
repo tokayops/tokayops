@@ -101,6 +101,7 @@ func setupTestAPIWithCache(t *testing.T, signingSecret string) (*API, *store.Moc
 	cfg, _ := json.Marshal(model.SlackConfig{
 		Token:         "xoxb-test",
 		SigningSecret: signingSecret,
+		Interactive:   true,
 	})
 	s.CreateIntegration(&model.Integration{
 		ID:      "int-slack-test",
@@ -212,6 +213,7 @@ func TestSlackInteractive(t *testing.T) {
 		cfg, _ := json.Marshal(model.SlackConfig{
 			Token:         "xoxb-test",
 			SigningSecret: secret,
+			Interactive:   true,
 		})
 		s.CreateIntegration(&model.Integration{
 			ID:      "int-slack-test",
@@ -756,7 +758,7 @@ func setupErrorAPI(t *testing.T, es *errorStore) (*API, *echo.Echo, string) {
 	t.Helper()
 	secret := "handler-test-secret"
 
-	cfg, _ := json.Marshal(model.SlackConfig{Token: "xoxb-test", SigningSecret: secret})
+	cfg, _ := json.Marshal(model.SlackConfig{Token: "xoxb-test", SigningSecret: secret, Interactive: true})
 	es.CreateIntegration(&model.Integration{
 		ID: "int-slack-test", Type: model.IntegrationTypeSlack,
 		Name: "test-slack", Enabled: true, Config: cfg,
@@ -1083,6 +1085,7 @@ func TestSlackInteractiveEmailMatch(t *testing.T) {
 		cfg, _ := json.Marshal(model.SlackConfig{
 			Token:         "xoxb-test",
 			SigningSecret: secret,
+			Interactive:   true,
 		})
 		s.CreateIntegration(&model.Integration{
 			ID:      "int-slack-test",

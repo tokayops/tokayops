@@ -87,11 +87,12 @@ type EscalationCommitment struct {
 	// wording. Absent and empty are different: a step that deliberately sends
 	// an empty message is not a step that supplies none.
 	MessageOverride *string
-	// Interactive says whether this message may carry action buttons. Frozen at
-	// admission because it depends on the provider's configuration, and a
-	// message whose buttons come and go between attempts is two different
-	// external effects under one key.
-	Interactive     bool
+	// StopOnFailure is the policy's instruction to stop escalating when this
+	// commitment fails for good: the steps after it that have not gone out
+	// are withdrawn. Best effort by construction - a later step with no
+	// delay may already be out. Never set on the firehose, which is no step,
+	// nor on a satellite, whose failure is not a page that failed.
+	StopOnFailure   bool
 	Timing          TimingSpec
 	Expiry          *TimingSpec
 	CompletionMode  CompletionMode
@@ -101,6 +102,9 @@ type EscalationCommitment struct {
 func (c EscalationCommitment) validate() error {
 	if err := c.Slot.validate(); err != nil {
 		return err
+	}
+	if c.Slot.Kind == SlotFirehose && c.StopOnFailure {
+		return contractf("the firehose is not a step of the policy and cannot stop it")
 	}
 	if c.Provider == "" {
 		return contractf("an escalation commitment with no provider")
@@ -118,7 +122,7 @@ func (c EscalationCommitment) validate() error {
 		if editable := c.Target.Kind == TargetThread; editable != c.Editable {
 			return contractf("a %s that is editable=%v", c.Target.Kind, c.Editable)
 		}
-		if c.Expiry != nil || c.MessageOverride != nil || c.Interactive {
+		if c.Expiry != nil || c.MessageOverride != nil || c.StopOnFailure {
 			return contractf("a %s with a deadline, words or buttons of its own", c.Target.Kind)
 		}
 	}
@@ -306,11 +310,11 @@ func (b EscalationBatch) Admit() (Admission, error) {
 		// still holds a pointer to is a payload that can change after it was
 		// fingerprinted - the executable half moving while the identity half
 		// stands still.
-		payload := EscalationPayloadV1{
+		payload := EscalationPayloadV2{
 			Slot:            c.Slot,
 			Target:          c.Target,
 			MessageOverride: cloneString(c.MessageOverride),
-			Interactive:     c.Interactive,
+			StopOnFailure:   c.StopOnFailure,
 		}
 		expiry := cloneTiming(c.Expiry)
 
@@ -440,7 +444,7 @@ func SatellitesOf(kind Kind, grammarVersion int, alertGroupID string, slot Slot,
 		if err != nil {
 			return nil, err
 		}
-		payload := EscalationPayloadV1{Slot: slot, Target: target}
+		payload := EscalationPayloadV2{Slot: slot, Target: target}
 		out = append(out, AdmittedCommitment{
 			IdempotencyKey:       key,
 			Provider:             provider,

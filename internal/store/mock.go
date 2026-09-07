@@ -1142,6 +1142,33 @@ func (m *MockStore) RenderInputs(_ context.Context, alertGroupID string) (provid
 	}, nil
 }
 
+// ButtonsOn reads the switch from the integrations the mock holds, as the
+// real door reads the table.
+func (m *MockStore) ButtonsOn(_ context.Context, provider string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, i := range m.integrations {
+		if !i.Enabled {
+			continue
+		}
+		switch {
+		case i.Type == model.IntegrationTypeSlack && provider == keys.ProviderSlack:
+			var cfg model.SlackConfig
+			if err := json.Unmarshal(i.Config, &cfg); err != nil {
+				return false, err
+			}
+			return cfg.Interactive, nil
+		case i.Type == model.IntegrationTypeTelegram && provider == keys.ProviderTelegram:
+			var cfg model.TelegramConfig
+			if err := json.Unmarshal(i.Config, &cfg); err != nil {
+				return false, err
+			}
+			return cfg.IsInteractive(), nil
+		}
+	}
+	return false, nil
+}
+
 // AddAlertGroupNoteAtomic records the note under the caller's name and moves
 // the group's source version, as the real door does: a plan built before the
 // note is refused by the admission here as it is there. The mock has no

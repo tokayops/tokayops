@@ -20,6 +20,7 @@ import (
 	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/rbac"
 )
 
@@ -177,6 +178,23 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 	}
 
 	// 4. Resolve TokayOps user from Slack user ID
+	// The switch is read from the database on every press, not from this
+	// instance's cache: a button switched off has to stop working
+	// everywhere at once, and the card that still shows it is redrawn by
+	// the door that switched it, not by the press.
+	on, err := a.store.ButtonsOn(c.Request().Context(), keys.ProviderSlack)
+	if err != nil {
+		metrics.SlackInteractionTotal.WithLabelValues(slackActionLabel(actionID), "error").Inc()
+		c.Logger().Errorf("slack/interactive: read the switch: %v", err)
+		go a.respondEphemeral(responseURL, "Something went wrong. Please try again.")
+		return c.NoContent(http.StatusOK)
+	}
+	if !on {
+		metrics.SlackInteractionTotal.WithLabelValues(slackActionLabel(actionID), "switched_off").Inc()
+		go a.respondEphemeral(responseURL, "Buttons are switched off for this integration.")
+		return c.NoContent(http.StatusOK)
+	}
+
 	user := a.resolveSlackUser(c.Request().Context(), slackUserID)
 	if user == nil {
 		metrics.SlackUnlinkedUserTotal.Inc()

@@ -662,6 +662,12 @@ func TestAStartRebuildsTheSnapshotsOfThePreviousVersion(t *testing.T) {
 	// The row as the previous version left it, and the schema too.
 	digest := versionOneDigest(t, s, "outbound_group_snapshots", "snapshot", "alert_group_id", agID)
 	for _, statement := range []string{
+		// The previous version wrote its payloads in version 1, with the
+		// buttons in them; that is where the rebuild reads them from.
+		`UPDATE outbound_intents
+		 SET payload_schema_version = 1,
+		     payload = (payload - 'stop_on_failure') || '{"interactive": true}'::jsonb
+		 WHERE alert_group_id = '` + agID + `'`,
 		`UPDATE outbound_group_snapshots
 		 SET snapshot = snapshot - 'timeline' - 'timeline_omitted' - 'interactive_providers',
 		     snapshot_schema_version = ` + "1" + `, snapshot_digest = '\x` + hexOf(digest) + `'
@@ -775,6 +781,15 @@ func TestAStartReachesARevivableCardOfThePreviousVersion(t *testing.T) {
 		    snapshot_schema_version = 1, snapshot_digest = $2
 		WHERE alert_group_id = $1`, agID, digest); err != nil {
 		t.Fatalf("build the previous version: %v", err)
+	}
+	// The previous version wrote its payloads in version 1, with the buttons
+	// in them; that is where the rebuild reads them from.
+	if _, err := s.db.Exec(`
+		UPDATE outbound_intents
+		SET payload_schema_version = 1,
+		    payload = (payload - 'stop_on_failure') || '{"interactive": true}'::jsonb
+		WHERE alert_group_id = $1`, agID); err != nil {
+		t.Fatalf("build the previous version's payloads: %v", err)
 	}
 	if err := s.InitDB(); err != nil {
 		t.Fatalf("the start refused: %v", err)

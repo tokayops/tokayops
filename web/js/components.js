@@ -1459,7 +1459,7 @@ const Components = {
                     </div>
                     <span class="step-index-label">Step ${index + 1}</span>
                     <div class="step-header-actions">
-                        <label class="toggle-switch" title="Continue to next step on failure">
+                        <label class="toggle-switch" title="Continue to the next step when this one fails. Off: if this step fails, stop escalating - steps that have not gone out yet are withdrawn">
                             <input type="checkbox" class="continue-on-failure-input" ${step.continue_on_failure !== false ? 'checked' : ''}>
                             <span class="toggle-slider"></span>
                             <span class="toggle-text">Continue on fail</span>

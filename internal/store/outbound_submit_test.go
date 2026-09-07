@@ -49,7 +49,6 @@ func channelCommitment(ref string, offset time.Duration) keys.EscalationCommitme
 		Provider:        "slack",
 		Target:          keys.Target{Kind: keys.TargetChannel, Ref: ref},
 		Editable:        true,
-		Interactive:     true,
 		Timing:          keys.TimingSpec{Kind: keys.TimingRelativeToAdmission, Offset: offset},
 		CompletionMode:  keys.CompletionOnAcceptance,
 		AmbiguityPolicy: keys.PolicyRetry,

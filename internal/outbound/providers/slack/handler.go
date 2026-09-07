@@ -79,7 +79,7 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	mayBeChanged := false
 	switch intent.KeyKind {
 	case keys.KindEscalation, keys.KindEscalationReplay:
-		payload, err := keys.DecodeEscalationPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
+		payload, err := keys.DecodeEscalationPayload(intent.PayloadSchemaVersion, intent.Payload)
 		if err != nil {
 			return outbound.Impossible("payload_unreadable", err.Error())
 		}
@@ -427,7 +427,7 @@ func (h *Handler) write(call outbound.Call) ([]slackapi.MsgOption, string, outbo
 		}, call.Endpoint, outbound.Result{}, nil
 
 	case keys.KindEscalation, keys.KindEscalationReplay:
-		payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
+		payload, err := keys.DecodeEscalationPayload(call.PayloadSchemaVersion, call.Payload)
 		if err != nil {
 			return nil, "", outbound.Result{
 				Evidence: outbound.DefinitelyNotSent,
@@ -471,7 +471,7 @@ func (h *Handler) write(call outbound.Call) ([]slackapi.MsgOption, string, outbo
 // satelliteFor is the thread under the card, or the reply that closes it,
 // posted under the card's timestamp. A change to the thread goes by the
 // thread's own receipt, like every change, and needs no thread_ts.
-func satelliteFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1,
+func satelliteFor(state keys.SnapshotInput, payload keys.EscalationPayloadV2,
 	call outbound.Call) ([]slackapi.MsgOption, string, outbound.Result, error) {
 
 	channel, ts, ok := coordinates(call.Endpoint)
@@ -493,7 +493,7 @@ func satelliteFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1,
 }
 
 // messageFor turns the snapshot into a card for a channel.
-func messageFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1) []slackapi.MsgOption {
+func messageFor(state keys.SnapshotInput, payload keys.EscalationPayloadV2) []slackapi.MsgOption {
 	// The buttons come from the snapshot, where the switch can reach them;
 	// what the payload said about them when it was admitted is not read.
 	card := Render(state, state.ButtonsOn(keys.InteractiveSlack))
@@ -515,7 +515,7 @@ func messageFor(state keys.SnapshotInput, payload keys.EscalationPayloadV1) []sl
 // card exists) and a retry (after it does) would otherwise carry different
 // bytes under one provider key - a difference the request fingerprint, taken
 // at Begin from the snapshot, cannot even see.
-func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1,
+func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV2,
 	context outbound.BoundContext) string {
 
 	var lines []string

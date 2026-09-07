@@ -199,7 +199,7 @@ func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	ing := ingester.NewIngester(s, cfg, &testSecretValidator{})
 	renderer := schedulerender.New(s.ScheduleReadRepository())
 	s.SetRenderEnvironment(cfg.Global.SelfURL, "UTC")
-	eng := engine.NewEngine(s, renderer, &testSettings{}, cfg)
+	eng := engine.NewEngine(s, renderer, cfg)
 	// The engine admits commitments and the outbound workers send them. The
 	// channel below stands in for Slack, and resolves an address by taking the
 	// recipient at its word - what these tests are about is who was promised
@@ -453,7 +453,7 @@ func (c *recordingChannel) Prepare(ctx context.Context, intent outbound.Intent) 
 			return outbound.Impossible("payload_unreadable", err.Error())
 		}
 	default:
-		if _, err := keys.DecodeEscalationPayloadV1(
+		if _, err := keys.DecodeEscalationPayload(
 			intent.PayloadSchemaVersion, intent.Payload); err != nil {
 			return outbound.Impossible("payload_unreadable", err.Error())
 		}
@@ -583,12 +583,6 @@ func storeIdentity(s *store.Store) providers.IdentityLookup {
 		return identity.ExternalID, nil
 	}
 }
-
-// testSettings is the channel configuration a plan freezes.
-type testSettings struct{}
-
-func (testSettings) GetSlackInteractive() bool    { return true }
-func (testSettings) GetTelegramInteractive() bool { return true }
 
 func waitForAlertGroupStatus(t *testing.T, s *store.Store, alertKey string, expectedStatus model.AlertGroupStatus) {
 	deadline := time.Now().Add(5 * time.Second)

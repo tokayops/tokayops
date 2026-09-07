@@ -25,7 +25,10 @@ import (
 func KnowsPayloadSchema(kind Kind, schemaVersion int) bool {
 	switch kind {
 	case KindEscalation, KindEscalationReplay:
-		return schemaVersion == EscalationPayloadV1{}.SchemaVersion()
+		// Both: version 1 rows live as long as their cards do, and this
+		// build writes version 2 and executes its flag.
+		return schemaVersion == EscalationPayloadV1{}.SchemaVersion() ||
+			schemaVersion == EscalationPayloadV2{}.SchemaVersion()
 	case KindHandoff:
 		return schemaVersion == HandoffPayloadV1{}.SchemaVersion()
 	case KindWebhookEvent, KindWebhookReplay:

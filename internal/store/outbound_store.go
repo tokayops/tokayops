@@ -1615,6 +1615,20 @@ func setLockTimeoutTx(ctx context.Context, tx *sql.Tx, wait time.Duration) error
 // lockIntentTx takes one commitment and reads it as the domain sees it,
 // together with whether its own deadline has passed as of this transaction's
 // clock.
+// readIntentTx is the commitment as it stands, unlocked: for what a door has
+// to know before it decides which locks to take.
+func readIntentTx(ctx context.Context, q sqlQueryer, id string) (*outbound.Intent, error) {
+	intent, _, err := scanIntent(q.QueryRowContext(ctx, outboundIntentColumns+
+		` FROM outbound_intents WHERE id = $1`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read commitment %s: %w", id, err)
+	}
+	return intent, nil
+}
+
 func lockIntentTx(ctx context.Context, tx *sql.Tx, id string) (*outbound.Intent, bool, error) {
 	intent, expired, err := scanIntent(tx.QueryRowContext(ctx, outboundIntentColumns+
 		` FROM outbound_intents WHERE id = $1 FOR UPDATE`, id))

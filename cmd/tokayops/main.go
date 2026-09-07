@@ -375,7 +375,7 @@ func main() {
 	// whether a channel's messages carry buttons: that is configuration a
 	// MESSAGE depends on, so it is decided when the escalation is admitted
 	// rather than read again by whoever sends it.
-	eng := engine.NewEngine(st, scheduleRenderer, integrationCache, cfg)
+	eng := engine.NewEngine(st, scheduleRenderer, cfg)
 
 	// What the channels of this build can do. Read by the policy editor, and by
 	// the detector before it promises an announcement.

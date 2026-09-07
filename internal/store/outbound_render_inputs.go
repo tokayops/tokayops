@@ -122,6 +122,23 @@ func interactiveProvidersTx(ctx context.Context, q sqlQueryer, selfURL string) (
 	return providers, nil
 }
 
+// ButtonsOn is the switch as the integrations table stands now, read once
+// per press. Not this instance's cache: the instance that handled the change
+// is the only one whose cache knows about it, and a button switched off has
+// to stop working everywhere at once.
+func (s *Store) ButtonsOn(ctx context.Context, provider string) (bool, error) {
+	on, err := interactiveProvidersTx(ctx, s.db, s.render.selfURL)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range on {
+		if p == provider {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // RenderInputs is the producer's read of the same two things, before it admits.
 //
 // Outside the admission's transaction, and deliberately so: the plan is built

@@ -19,7 +19,7 @@ import (
 func TestTheDirectMessageLinksToTheAlertAndToItsCard(t *testing.T) {
 	state := handlerState(t).Content()
 	title := mrkdwn(providers.ResolveStatus(state).Title)
-	words := keys.EscalationPayloadV1{
+	words := keys.EscalationPayloadV2{
 		Slot: keys.Slot{Kind: keys.SlotPolicy, Index: 1}, Target: keys.Target{Kind: keys.TargetUser, Ref: "u-1"},
 	}
 	override := "disk on db-1 is full, please look"
@@ -31,7 +31,7 @@ func TestTheDirectMessageLinksToTheAlertAndToItsCard(t *testing.T) {
 	const primary = "Primary message: <https://acme.slack.com/archives/C0001/p1700000000000100|Open in Slack>"
 	for _, tc := range []struct {
 		name    string
-		payload keys.EscalationPayloadV1
+		payload keys.EscalationPayloadV2
 		context outbound.BoundContext
 		want    string
 	}{

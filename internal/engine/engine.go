@@ -76,13 +76,11 @@ type escalationStore interface {
 // The producer is built once, here, rather than per alert group. It holds no
 // state between plans - what one plan remembers lives for that plan - so a
 // shared instance is the same object the loop was allocating each time round.
-func NewEngine(s escalationStore, oncall onCallProjection, settings channelSettings,
-	cfg *config.Config) *Engine {
-
+func NewEngine(s escalationStore, oncall onCallProjection, cfg *config.Config) *Engine {
 	return &Engine{
 		store:  s,
 		oncall: oncall,
-		plan:   &planner{store: s, oncall: oncall, settings: settings, cfg: cfg},
+		plan:   &planner{store: s, oncall: oncall, cfg: cfg},
 	}
 }
 

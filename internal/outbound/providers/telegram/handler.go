@@ -81,7 +81,7 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	mayBeChanged := false
 	switch intent.KeyKind {
 	case keys.KindEscalation, keys.KindEscalationReplay:
-		payload, err := keys.DecodeEscalationPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
+		payload, err := keys.DecodeEscalationPayload(intent.PayloadSchemaVersion, intent.Payload)
 		if err != nil {
 			return outbound.Impossible("payload_unreadable", err.Error())
 		}
@@ -380,7 +380,7 @@ func (h *Handler) write(call outbound.Call, body map[string]interface{}) (outbou
 		return outbound.Result{}, nil
 
 	case keys.KindEscalation, keys.KindEscalationReplay:
-		payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
+		payload, err := keys.DecodeEscalationPayload(call.PayloadSchemaVersion, call.Payload)
 		if err != nil {
 			return outbound.Result{
 				Evidence: outbound.DefinitelyNotSent,
@@ -436,7 +436,7 @@ func (h *Handler) write(call outbound.Call, body map[string]interface{}) (outbou
 // and otherwise what the snapshot says, with the link to the alert in TokayOps.
 // Nothing here reads a neighbouring delivery - a permalink that exists on the
 // retry and not on the first attempt is two different messages under one key.
-func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1) string {
+func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV2) string {
 	var lines []string
 	if payload.MessageOverride != nil && *payload.MessageOverride != "" {
 		// The words are the policy's; the link is not theirs to replace.

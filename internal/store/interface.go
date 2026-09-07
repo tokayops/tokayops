@@ -131,6 +131,9 @@ type StoreInterface interface {
 	CreateIntegration(i *model.Integration) error
 	GetIntegrationByID(id string) (*model.Integration, error)
 	GetIntegrationByType(integrationType model.IntegrationType) (*model.Integration, error)
+	// ButtonsOn is whether a provider's cards may be acted on, as the
+	// integrations table stands now - read on every press, never cached.
+	ButtonsOn(ctx context.Context, provider string) (bool, error)
 	GetIntegrationsByType(integrationType model.IntegrationType) ([]*model.Integration, error)
 	GetAllIntegrations() ([]*model.Integration, error)
 	// The lifecycle commands: one transaction each over the row and the

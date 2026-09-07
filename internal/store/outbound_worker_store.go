@@ -446,6 +446,31 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	// against the card again, under the card's shared lock, taken BEFORE the
 	// satellite's own - the order is parent, then satellite, everywhere. The
 	// parent's id is immutable, so reading it without a lock first is fine.
+	// A refusal that may stop the escalation writes into the alert's
+	// history, so the group is taken first - before the commitment, as every
+	// door that reaches the group takes it. The ordinary begin takes no such
+	// lock: every attempt would otherwise wait behind an acknowledgement.
+	// The flag is read from the payload before anything is locked, because
+	// the lock order depends on it, and the payload does not change.
+	var stopping bool
+	var failedStep keys.Slot
+	if req.Preparation == outbound.PreparationPermanent {
+		unlocked, err := readIntentTx(ctx, tx, req.IntentID)
+		if err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+		if unlocked != nil {
+			if failedStep, stopping = stopsEscalation(*unlocked); stopping {
+				if err := lockAlertGroupTx(ctx, tx, unlocked.AlertGroupID); err != nil {
+					return outbound.BeginAttemptResult{}, err
+				}
+				if afterBeginGroupLock != nil {
+					afterBeginGroupLock()
+				}
+			}
+		}
+	}
+
 	refusalStale := false
 	if req.Preparation == outbound.PreparationPermanent &&
 		req.ErrorClass == outbound.ParentEndedWithoutMessage {
@@ -538,7 +563,11 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		if shapeErr != nil {
 			return outbound.BeginAttemptResult{}, shapeErr
 		}
-		return s.recordPreparation(ctx, tx, req, *intent, shape)
+		var stop *keys.Slot
+		if stopping {
+			stop = &failedStep
+		}
+		return s.recordPreparation(ctx, tx, req, *intent, shape, stop)
 	}
 
 	var content outbound.AttemptContent
@@ -921,7 +950,11 @@ func (s *Store) refuseAttempt(ctx context.Context, tx *sql.Tx,
 	req.Preparation = outbound.PreparationPermanent
 	req.ErrorClass = class
 	req.Summary = detail
-	return s.recordPreparation(ctx, tx, req, intent, plan)
+	// Stops no escalation, whatever the step's flag says: the cascade needs
+	// the group taken first, and the damage this refuses is found after the
+	// commitment is locked. The step ends where a person will see it; the
+	// steps after it go on, and the person who repairs the row decides.
+	return s.recordPreparation(ctx, tx, req, intent, plan, nil)
 }
 
 // recordPreparation writes the proof that no call was made.
@@ -929,9 +962,12 @@ func (s *Store) refuseAttempt(ctx context.Context, tx *sql.Tx,
 // It is not an attempt and must never look like one: an attempt row means the
 // network might have been reached, and inventing that doubt would turn a
 // provable refusal into a possible duplicate.
+//
+// stop names the step this refusal stops the escalation at, when the caller
+// took the group for it; nil otherwise.
 func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 	req outbound.BeginAttemptRequest, intent outbound.Intent,
-	plan plannedAttempt) (outbound.BeginAttemptResult, error) {
+	plan plannedAttempt, stop *keys.Slot) (outbound.BeginAttemptResult, error) {
 
 	transition, err := outbound.Decide(outbound.Input{
 		Intent:      intent,
@@ -985,6 +1021,12 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 	}); err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
+	withdrawn := 0
+	if stop != nil && transition.To == outbound.StatusPermanentFailed {
+		if withdrawn, err = stopEscalationTx(ctx, tx, intent, *stop); err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return outbound.BeginAttemptResult{}, err
@@ -995,6 +1037,9 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 	// and the one that was missed when this counter lived in the worker: the
 	// worker returns the moment Begin is not "started".
 	countTerminal(intent.Family, transition.To)
+	if withdrawn > 0 {
+		countWithdrawn(map[string]int{intent.Family: withdrawn})
+	}
 
 	result := outbound.BeginAttemptResult{
 		Outcome: outbound.BeginPreparedRetry, AttemptID: recordID, AttemptNo: attemptNo,
@@ -1016,32 +1061,38 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	req outbound.FinalizeRequest) (outbound.FinalizeResult, error) {
 
-	// Read before the transaction: both are immutable, and the lock order
-	// depends on them.
-	var (
-		intentID    string
-		groupID     string
-		policy      outbound.AmbiguityPolicy
-		attemptFind = `SELECT intent_id, COALESCE(i.alert_group_id, ''), i.ambiguity_policy
-		               FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
-		               WHERE a.id = $1`
-	)
-	err := s.db.QueryRowContext(ctx, attemptFind, req.AttemptID).Scan(&intentID, &groupID, &policy)
+	// Read before the transaction: the group, the policy and the step's flag
+	// are immutable, and the lock order depends on them.
+	var intentID string
+	err := s.db.QueryRowContext(ctx, `SELECT intent_id FROM outbound_attempts WHERE id = $1`,
+		req.AttemptID).Scan(&intentID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return outbound.FinalizeResult{Outcome: outbound.FinalizeNotFound}, nil
 	}
 	if err != nil {
 		return outbound.FinalizeResult{}, err
 	}
+	unlocked, err := readIntentTx(ctx, s.db, intentID)
+	if err != nil {
+		return outbound.FinalizeResult{}, err
+	}
+	if unlocked == nil {
+		return outbound.FinalizeResult{Outcome: outbound.FinalizeNotFound}, nil
+	}
+	groupID, policy := unlocked.AlertGroupID, unlocked.AmbiguityPolicy
 
 	// The group is locked first by anything that could end up writing to it: a
-	// success, or doubt that a policy turns into one.
+	// success, doubt that a policy turns into one, or a failure that stops the
+	// escalation and says so in the alert's history.
 	concluded := req.Conclusion.Completion()
 	receipt := req.Conclusion.Receipt()
 
+	failedStep, stopping := stopsEscalation(*unlocked)
+	stopping = stopping && concluded.Outcome == keys.OutcomePermanentRejection
 	lockGroup := groupID != "" &&
 		(concluded.Outcome == keys.OutcomeAccepted ||
-			(concluded.Outcome == keys.OutcomeAmbiguous && policy == outbound.PolicyAssumeAccepted))
+			(concluded.Outcome == keys.OutcomeAmbiguous && policy == outbound.PolicyAssumeAccepted) ||
+			stopping)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1320,11 +1371,20 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	}); err != nil {
 		return outbound.FinalizeResult{}, err
 	}
+	withdrawn := 0
+	if stopping && transition.To == outbound.StatusPermanentFailed {
+		if withdrawn, err = stopEscalationTx(ctx, tx, *intent, failedStep); err != nil {
+			return outbound.FinalizeResult{}, err
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return outbound.FinalizeResult{}, err
 	}
 	countTerminal(intent.Family, transition.To)
+	if withdrawn > 0 {
+		countWithdrawn(map[string]int{intent.Family: withdrawn})
+	}
 	return outbound.FinalizeResult{
 		Outcome: outbound.FinalizeFinalized, To: transition.To, Row: transition.Row,
 	}, nil

@@ -117,9 +117,8 @@ func (f *failingStore) GetTeamByID(string) (*model.Team, error) {
 
 func planFor(store planStore) *planner {
 	return &planner{
-		store:    store,
-		oncall:   &fakeProjection{},
-		settings: &fakeSettings{},
+		store:  store,
+		oncall: &fakeProjection{},
 		cfg: &config.Config{Global: config.GlobalConfig{
 			FirehoseCriticalChannel: "C_FIRE", SelfURL: "https://tokay.example",
 		}},
