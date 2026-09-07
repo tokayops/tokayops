@@ -1405,7 +1405,7 @@ const docTemplate = `{
         },
         "/api/v1/integrations/{id}/test": {
             "post": {
-                "description": "Send a test message via the integration (admin only)",
+                "description": "Send a test message via the integration; for Slack, also records the workspace URL (team_url) in the integration's configuration (admin only)",
                 "consumes": [
                     "application/json"
                 ],
@@ -3176,11 +3176,11 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "actor": {
-                    "description": "Optional, defaults to \"user\"",
+                    "description": "Ignored since 0.3.0: the authenticated user is the actor",
                     "type": "string"
                 },
                 "message": {
-                    "description": "Required",
+                    "description": "Required, at most 2000 characters",
                     "type": "string"
                 }
             }
