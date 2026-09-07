@@ -6910,141 +6910,66 @@ body::before {
     text-decoration: underline;
 }
 
-/* The journal of one delivery: a sentence, a verdict, the story; the machinery behind Details. */
-.journal {
-    font-size: 0.9rem;
-    line-height: 1.5;
-}
-.journal-head {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    flex-wrap: wrap;
-}
-.journal-status .delivery-status {
-    font-size: 0.75rem;
-}
-.journal-sentence {
-    font-size: 1.0625rem;
+/* The journal of one delivery, drawn with the alert group's own parts. */
+.journal .detail-status-line .journal-sentence {
     font-weight: 600;
     color: var(--text-primary);
     display: inline-flex;
-    align-items: baseline;
-    gap: 6px;
-    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
 }
-.journal-via {
-    font-weight: 400;
-    color: var(--text-secondary, #a1a1aa);
+.journal .detail-status-line .delivery-status {
+    font-size: 0.75rem;
 }
 .journal-verdict {
-    margin: 10px 0 0;
+    margin-top: var(--space-sm);
+    font-size: 0.875rem;
     color: var(--text-primary);
     max-width: 60ch;
 }
-.journal-history {
-    list-style: none;
-    margin: 22px 0 0;
-    padding: 0;
-}
-.journal-history li {
-    display: flex;
-    gap: 14px;
-    padding: 9px 0;
-    border-top: 1px solid var(--border-color);
-}
-.journal-history li:first-child {
-    border-top: none;
-    padding-top: 0;
-}
-.journal-when {
-    flex: 0 0 9em;
-    color: var(--text-muted, #6b7280);
-    font-size: 0.8rem;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-    padding-top: 1px;
-}
-.journal-what {
-    flex: 1 1 auto;
-    min-width: 0;
-    color: var(--text-primary);
+.journal .timeline-container {
+    max-height: none;
+    overflow: visible;
 }
 .journal-tone-ok {
-    color: #059669;
+    color: var(--action-success, #22c55e);
 }
 .journal-tone-retry,
 .journal-tone-doubt {
-    color: #d97706;
+    color: var(--severity-warning, #d4b25a);
 }
 .journal-tone-failed {
-    color: #dc2626;
+    color: var(--severity-critical, #e07a72);
 }
 .journal-tone-open {
-    color: var(--text-muted, #6b7280);
+    color: var(--text-muted);
 }
 .journal-said {
-    margin-top: 2px;
-    color: var(--text-secondary, #a1a1aa);
-    max-width: 60ch;
-}
-.journal-said-inline,
-.journal-by {
-    color: var(--text-secondary, #a1a1aa);
+    color: var(--text-secondary);
 }
 .journal-note {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.75rem;
-    color: var(--text-muted, #6b7280);
+    color: var(--text-muted);
 }
 .journal-none {
-    color: var(--text-muted, #6b7280);
+    color: var(--text-muted);
     font-size: 0.85rem;
-    padding: 6px 0;
+    padding: var(--space-sm) 0;
 }
-.journal-details {
-    margin-top: 22px;
-    border-top: 1px solid var(--border-color);
-    padding-top: 10px;
+.timeline-event.type-journal-decision .timeline-icon {
+    background: var(--accent-primary);
 }
-.journal-details summary {
-    cursor: pointer;
-    color: var(--text-secondary, #a1a1aa);
-    font-size: 0.85rem;
-    user-select: none;
+.timeline-event.type-journal-retry .timeline-icon {
+    background: var(--severity-warning-border, #b38b12);
 }
-.journal-details summary:focus-visible {
-    outline: 2px solid var(--border-focus);
-    outline-offset: 2px;
-    border-radius: 3px;
-}
-.journal-dl {
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    gap: 4px 16px;
-    margin: 12px 0 0;
-    font-size: 0.85rem;
-}
-.journal-dl dt {
-    color: var(--text-muted, #6b7280);
-}
-.journal-dl dd {
-    margin: 0;
-    color: var(--text-secondary, #a1a1aa);
-    font-variant-numeric: tabular-nums;
-    overflow-wrap: anywhere;
+.timeline-event.type-journal-withdrawn .timeline-icon,
+.timeline-event.type-journal-open .timeline-icon,
+.timeline-event.type-journal-machinery .timeline-icon {
+    background: var(--text-muted);
 }
 .journal-machinery {
-    margin-top: 12px;
-    font-size: 0.85rem;
-    color: var(--text-secondary, #a1a1aa);
-}
-.journal-machinery .journal-what {
-    color: var(--text-secondary, #a1a1aa);
-}
-.journal-id {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.75rem;
+    margin-top: var(--space-xs);
 }
 .journal-group-link {
     color: var(--accent-primary);

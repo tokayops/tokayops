@@ -360,30 +360,77 @@ const eventWords = {
     generation_started: 'New generation',
 };
 
+/**
+ * The journal is drawn with the alert group's own parts: the hero line, the
+ * technical details behind a summary, and the timeline - so a person who
+ * reads one reads the other.
+ */
+function relative(ts) {
+    const c = window.Components;
+    return c && typeof c.timeSince === 'function' ? c.timeSince(ts, { withAgo: true }) : '';
+}
+
+function timelineTime(ts) {
+    if (!ts) return '—';
+    const at = new Date(ts);
+    if (Number.isNaN(at.getTime())) return '—';
+    const stamp = at.toLocaleString(undefined, {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short',
+    });
+    const ago = relative(ts);
+    return ago ? `${stamp} · ${ago}` : stamp;
+}
+
+function timelineItem({ classes, icon, at, message, detail, actor, attrs }) {
+    return `
+        <div class="timeline-event ${classes}"${attrs || ''}>
+            <div class="timeline-icon"><i data-lucide="${icon}"></i></div>
+            <div class="timeline-content">
+                <div class="timeline-time">${timelineTime(at)}</div>
+                <div class="timeline-message">${message}</div>
+                ${detail ? `<div class="timeline-actor journal-said">${detail}</div>` : ''}
+                ${actor ? `<div class="timeline-actor">by ${actor}</div>` : ''}
+            </div>
+        </div>`;
+}
+
 function attemptRow(a, d) {
     const w = attemptWords(a, d);
+    const type = { ok: 'type-notification_sent is-key', failed: 'type-notification_failed is-key',
+        retry: 'type-journal-retry is-minor', doubt: 'type-journal-retry is-minor', open: 'type-journal-open is-minor' }[w.tone];
+    const icon = { ok: 'send', failed: 'x-circle', retry: 'refresh-cw', doubt: 'help-circle', open: 'loader' }[w.tone];
     const erased = a.receipt_redacted_at
         ? ' <span class="journal-note" title="The coordinates were removed by an erasure">receipt erased</span>'
         : '';
-    return `
-        <li class="journal-attempt" data-outcome="${escapeAttr(a.outcome || '')}">
-            <span class="journal-when">${when(a.started_at || a.finished_at)}</span>
-            <div class="journal-what">
-                <div>${escapeHtml(w.what)} <span class="journal-tone journal-tone-${escapeAttr(w.tone)}">${escapeHtml(w.outcome)}</span>${erased}</div>
-                ${w.said || a.error_class ? `<div class="journal-said">${escapeHtml(w.said)}${a.error_class ? ` <span class="journal-note">${escapeHtml(a.error_class)}</span>` : ''}</div>` : ''}
-            </div>
-        </li>`;
+    const detail = [w.said ? escapeHtml(w.said) : '', a.error_class ? `<span class="journal-note">${escapeHtml(a.error_class)}</span>` : '']
+        .filter(Boolean).join(' ');
+    return timelineItem({
+        classes: `journal-attempt ${type}`, icon, at: a.started_at || a.finished_at,
+        message: `${escapeHtml(w.what)} <span class="journal-tone journal-tone-${escapeAttr(w.tone)}">${escapeHtml(w.outcome)}</span>${erased}`,
+        detail, attrs: ` data-outcome="${escapeAttr(a.outcome || '')}"`,
+    });
 }
 
+const eventLook = {
+    created: ['type-created is-key', 'bell-ring'],
+    canceled: ['type-journal-withdrawn is-minor', 'ban'],
+    cancellation_requested: ['type-journal-withdrawn is-minor', 'ban'],
+    operator_decision: ['type-journal-decision is-key', 'gavel'],
+    revived: ['type-journal-decision is-key', 'undo-2'],
+    expired: ['type-notification_failed is-key', 'clock'],
+    lease_lost: ['type-journal-retry is-minor', 'alert-triangle'],
+    duplicate_risk_accepted: ['type-journal-decision is-minor', 'copy'],
+};
+
 function eventRow(e) {
-    const reason = e.reason ? `<span class="journal-said-inline">${escapeHtml(e.reason)}</span>` : '';
-    return `
-        <li class="journal-event" data-kind="${escapeAttr(e.kind)}">
-            <span class="journal-when">${when(e.at)}</span>
-            <div class="journal-what">
-                <div>${escapeHtml(eventWords[e.kind] || humanClass(e.kind))} ${reason} <span class="journal-by">${actorLabel(e)}</span></div>
-            </div>
-        </li>`;
+    const [classes, icon] = eventLook[e.kind] || ['type-journal-machinery is-minor', 'settings-2'];
+    return timelineItem({
+        classes: `journal-event ${classes}`, icon, at: e.at,
+        message: escapeHtml(eventWords[e.kind] || humanClass(e.kind)),
+        detail: e.reason ? escapeHtml(e.reason) : '',
+        actor: actorLabel(e),
+        attrs: ` data-kind="${escapeAttr(e.kind)}"`,
+    });
 }
 
 /**
@@ -397,7 +444,15 @@ function history(journal) {
     (journal.events || []).filter(e => !machinery.has(e.kind)).forEach(e => lines.push({ at: e.at, html: eventRow(e) }));
     lines.sort((x, y) => new Date(x.at || 0) - new Date(y.at || 0));
     if (lines.length === 0) return '<div class="journal-none">Nothing has happened yet.</div>';
-    return `<ol class="journal-history">${lines.map(l => l.html).join('')}</ol>`;
+    return `<div class="timeline-container"><div class="timeline journal-history">${lines.map(l => l.html).join('')}</div></div>`;
+}
+
+function detailItem(label, value, mono) {
+    return `
+        <div class="detail-item">
+            <div class="detail-label">${escapeHtml(label)}</div>
+            <div class="detail-value"${mono ? ' style="font-family: monospace; font-size: 0.8rem;"' : ''}>${value}</div>
+        </div>`;
 }
 
 function details(journal) {
@@ -405,28 +460,37 @@ function details(journal) {
     const receipt = d.recipient_erased && d.receipt_recorded
         ? 'recorded, coordinates erased'
         : (d.receipt_recorded ? 'recorded' : 'none');
-    const rows = [
-        ['Generation', `${d.generation_no}, ${d.attempts_in_generation} ${d.attempts_in_generation === 1 ? 'attempt' : 'attempts'}`],
-        ['Revision', `desired ${d.desired_revision}, applied ${d.applied_revision ?? '—'}${d.final_revision_applied ? ', final' : ''}`],
-        ['Receipt', receipt],
-        d.expires_at ? ['Expires', `${when(d.expires_at)}${d.expired ? ', passed' : ''}`] : null,
-        ['Created', when(d.created_at)],
-        ['Last change', when(d.updated_at)],
-        ['Family', `${d.family}, ${d.kind}`],
-        ['Delivery', d.id],
-    ].filter(Boolean);
+    const items = [
+        detailItem('Generation', escapeHtml(`${d.generation_no}, ${d.attempts_in_generation} ${d.attempts_in_generation === 1 ? 'attempt' : 'attempts'}`)),
+        detailItem('Revision', escapeHtml(`desired ${d.desired_revision}, applied ${d.applied_revision ?? '—'}${d.final_revision_applied ? ', final' : ''}`)),
+        detailItem('Receipt', escapeHtml(receipt)),
+        d.expires_at ? detailItem('Expires', escapeHtml(`${when(d.expires_at)}${d.expired ? ', passed' : ''}`)) : '',
+        detailItem('Family', escapeHtml(`${d.family}, ${d.kind}`)),
+        d.alert_group_id ? detailItem('Alert group', `<a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="journal-group-link">${escapeHtml(d.alert_group_id)}</a>`, true) : '',
+        detailItem('Delivery ID', escapeHtml(d.id), true),
+    ].filter(Boolean).join('');
     const machineryLines = (journal.events || []).filter(e => machinery.has(e.kind)).map(eventRow).join('');
     const late = journal.observations && journal.observations.length > 0
         ? `<div class="journal-none">${journal.observations.length === 1 ? 'One result' : `${journal.observations.length} results`} arrived after the attempt was closed and ${journal.observations.length === 1 ? 'is' : 'are'} kept beside it.</div>`
         : '';
     return `
-        <details class="journal-details">
-            <summary>Details</summary>
-            <dl class="journal-dl">
-                ${rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('')}
-                ${d.alert_group_id ? `<dt>Alert</dt><dd><a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="journal-group-link">${escapeHtml(d.alert_group_id)}</a></dd>` : ''}
-            </dl>
-            ${machineryLines ? `<ol class="journal-history journal-machinery">${machineryLines}</ol>` : ''}
+        <details class="detail-section detail-technical journal-details">
+            <summary class="detail-section-title detail-summary">
+                <span class="detail-summary-title">Technical details</span>
+            </summary>
+            <div class="detail-grid">${items}</div>
+            <div class="detail-subsection">
+                <div class="detail-subtitle">Timestamps</div>
+                <div class="detail-grid">
+                    ${detailItem('Created', escapeHtml(when(d.created_at)))}
+                    ${detailItem('Updated', escapeHtml(when(d.updated_at)))}
+                </div>
+            </div>
+            ${machineryLines ? `
+                <div class="detail-subsection">
+                    <div class="detail-subtitle">Internal events</div>
+                    <div class="timeline journal-machinery">${machineryLines}</div>
+                </div>` : ''}
             ${late}
         </details>`;
 }
@@ -434,15 +498,29 @@ function details(journal) {
 export function journalPanel(journal) {
     const d = journal.delivery;
     const said = verdict(journal);
+    const attempts = d.attempts_in_generation;
     return `
         <div class="journal">
-            <div class="journal-head">
-                <div class="journal-status">${statusBadge(d.status)}</div>
-                <div class="journal-sentence">${deliverySentence(d)} <span class="journal-via">via ${escapeHtml(providerName(d.provider))}</span></div>
+            <div class="detail-hero">
+                <div class="detail-status-line">
+                    <span class="journal-status">${statusBadge(d.status)}</span>
+                    <span class="status-sep">·</span>
+                    <span class="journal-sentence">${deliverySentence(d)}</span>
+                    <span class="status-sep">·</span>
+                    <span class="status-time">via ${escapeHtml(providerName(d.provider))}</span>
+                </div>
+                ${said ? `<div class="journal-verdict">${said}</div>` : ''}
+                <div class="detail-meta-row">
+                    <span class="detail-meta-chip">${attempts} ${attempts === 1 ? 'attempt' : 'attempts'}</span>
+                    <span class="detail-meta-chip">Created ${escapeHtml(relative(d.created_at) || when(d.created_at))}</span>
+                    <span class="detail-meta-chip">Last change ${escapeHtml(relative(d.updated_at) || when(d.updated_at))}</span>
+                </div>
             </div>
-            ${said ? `<p class="journal-verdict">${said}</p>` : ''}
-            ${history(journal)}
             ${details(journal)}
+            <div class="detail-section">
+                <h3 class="detail-section-title">History</h3>
+                ${history(journal)}
+            </div>
         </div>`;
 }
 
