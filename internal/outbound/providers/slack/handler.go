@@ -451,16 +451,10 @@ func (h *Handler) write(call outbound.Call) ([]slackapi.MsgOption, string, outbo
 		}
 		if payload.Target.Kind == keys.TargetUser {
 			// The card the message points back to was settled with the
-			// generation; a context nobody can read is refused, not sent
-			// without the link.
-			context, err := outbound.DecodeBoundContext(call.BoundContext)
-			if err != nil {
-				return nil, "", outbound.Result{
-					Evidence: outbound.DefinitelyNotSent, Summary: err.Error(),
-				}, err
-			}
+			// generation and read by the store: what the call carries is
+			// what the message links to.
 			return []slackapi.MsgOption{
-				slackapi.MsgOptionText(directMessage(snapshot.Content(), payload, context), false),
+				slackapi.MsgOptionText(directMessage(snapshot.Content(), payload, call.BoundContext), false),
 			}, call.Endpoint, outbound.Result{}, nil
 		}
 		return messageFor(snapshot.Content(), payload), call.Endpoint, outbound.Result{}, nil

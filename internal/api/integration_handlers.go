@@ -545,7 +545,7 @@ type TestIntegrationResponse struct {
 
 // TestIntegration sends a test message via the integration
 // @Summary Test integration
-// @Description Send a test message via the integration (admin only)
+// @Description Send a test message via the integration; for Slack, also records the workspace URL (team_url) in the integration's configuration (admin only)
 // @Tags integrations
 // @Accept json
 // @Produce json

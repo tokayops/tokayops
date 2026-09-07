@@ -2,7 +2,6 @@ package slack
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -63,30 +62,23 @@ func TestTheDirectMessageLinksToTheAlertAndToItsCard(t *testing.T) {
 }
 
 // TestTheCardComesFromTheGenerationNotFromTheAttempt. What the call carries as
-// its bound context is what the message links to - nothing else is read - and
-// a context this build cannot read stops before the network rather than
-// going out without the link.
+// its bound context is what the message links to; nothing else is read on
+// the attempt. A context this build cannot read never reaches a call: the
+// store refuses it at Begin.
 func TestTheCardComesFromTheGenerationNotFromTheAttempt(t *testing.T) {
 	api := newSlackAPI(t)
 	handler := handlerFor(api)
 
 	call := handlerCall(t, keys.Target{Kind: keys.TargetUser, Ref: "u-1"}, false)
 	call.Endpoint = "D0001"
-	call.BoundContext = json.RawMessage(`{"card_receipt_ref":"C0001/1700000000.000100","team_url":"https://acme.slack.com/"}`)
+	call.BoundContext = outbound.BoundContext{
+		CardReceiptRef: "C0001/1700000000.000100", TeamURL: "https://acme.slack.com/",
+	}
 	if _, err := handler.ExecuteAttempt(context.Background(), call); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	text, _ := api.posts[0]["text"].(string)
 	if !strings.Contains(text, "Primary message: <https://acme.slack.com/archives/C0001/p1700000000000100|Open in Slack>") {
 		t.Fatalf("the message does not link to the card it was bound to:\n%s", text)
-	}
-
-	call.BoundContext = json.RawMessage(`{"card_receipt_ref":"C0001/1700000000.000100","louder":true}`)
-	refusal, err := handler.ExecuteAttempt(context.Background(), call)
-	if err == nil || refusal.Evidence != outbound.DefinitelyNotSent {
-		t.Fatalf("a context this build cannot read was sent: %v, %v", refusal, err)
-	}
-	if len(api.posts) != 1 {
-		t.Fatal("a context this build cannot read reached the network")
 	}
 }

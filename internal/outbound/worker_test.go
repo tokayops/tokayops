@@ -906,12 +906,16 @@ func TestTheGateAnswersForTheCard(t *testing.T) {
 		want      gateDecision
 		class     string
 		violation string
+		quiet     bool
 	}{
 		{name: "a card with a message", want: gateAsk,
 			intent: thread(&ParentState{ID: "card-1", Status: StatusIdle, ReceiptRecorded: true, ReceiptRef: "C0001/1"})},
 		{name: "a card that ended without one", want: gateDecided, class: ParentEndedWithoutMessage,
 			intent: thread(&ParentState{ID: "card-1", Status: StatusPermanentFailed})},
-		{name: "a card still on its way", want: gateSkip, violation: "satellite_before_its_card",
+		// The card was brought back between the claim and this read: a race
+		// the claim settles on its next pass, not a defect anybody is paged
+		// about.
+		{name: "a card brought back after the claim", want: gateSkip, quiet: true,
 			intent: thread(&ParentState{ID: "card-1", Status: StatusPending})},
 		{name: "no card at all", want: gateSkip, violation: "satellite_without_parent",
 			intent: thread(nil)},
@@ -923,7 +927,11 @@ func TestTheGateAnswersForTheCard(t *testing.T) {
 			if tc.violation != "" {
 				before = counterValue(t, metrics.OutboundContractViolationsTotal, "claim", tc.violation)
 			}
+			silence := counterValue(t, metrics.OutboundContractViolationsTotal, "claim", "satellite_before_its_card")
 			prepared, got := w.satelliteGate(tc.intent)
+			if tc.quiet && counterValue(t, metrics.OutboundContractViolationsTotal, "claim", "satellite_before_its_card") != silence {
+				t.Fatal("an ordinary race was counted as a contract violation")
+			}
 			if got != tc.want {
 				t.Fatalf("the gate said %d, want %d", got, tc.want)
 			}
@@ -978,7 +986,7 @@ func TestASatelliteIsNotAdmissionLatency(t *testing.T) {
 // reaches the channel on the call, beside the endpoint and the key.
 func TestTheCallCarriesWhatTheGenerationBound(t *testing.T) {
 	store := newFakeStore()
-	store.beginOut.BoundContext = json.RawMessage(`{"card_receipt_ref":"C0001/1700000000.000100"}`)
+	store.beginOut.BoundContext = BoundContext{CardReceiptRef: "C0001/1700000000.000100"}
 	store.due = []ProviderDue{{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1}}
 	store.available["slack"] = &queues{fresh: 1}
 	channel := newFakeChannel()
@@ -992,7 +1000,7 @@ func TestTheCallCarriesWhatTheGenerationBound(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if got := string(channel.made()[0].BoundContext); got != `{"card_receipt_ref":"C0001/1700000000.000100"}` {
-		t.Fatalf("the call carries %q as its context", got)
+	if got := channel.made()[0].BoundContext; got != (BoundContext{CardReceiptRef: "C0001/1700000000.000100"}) {
+		t.Fatalf("the call carries %+v as its context", got)
 	}
 }

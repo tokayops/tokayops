@@ -73,7 +73,7 @@ type planner struct {
 }
 
 // firehoseProvider: the firehose is Slack-only, deliberately, as it was.
-const firehoseProvider = "slack"
+const firehoseProvider = keys.ProviderSlack
 
 // buildPlan decides what an alert group promises, and to whom.
 //
@@ -566,9 +566,9 @@ func (p *planner) interactiveOn(provider string) bool {
 		return false
 	}
 	switch provider {
-	case "slack":
+	case keys.ProviderSlack:
 		return p.settings.GetSlackInteractive()
-	case "telegram":
+	case keys.ProviderTelegram:
 		// Telegram's buttons need somewhere to send people back to, and that
 		// link comes from this instance's own URL.
 		return p.settings.GetTelegramInteractive() && p.cfg != nil && p.cfg.Global.SelfURL != ""

@@ -328,11 +328,14 @@ const (
 // satelliteGate is the domain's own answer for a satellite, before its
 // channel is asked. A card with a message: the channel prepares, and the
 // endpoint is the card's coordinates. A card that ended without one: a refusal
-// the store records only after checking the card again under its lock. The
-// two other states cannot be claimed - the claim's predicate keeps a satellite
-// whose card is alive without a message out of the queue, and every satellite
-// has a card by the schema - so they are contract violations, counted and left
-// for the lease to expire.
+// the store records only after checking the card again under its lock. No
+// card at all cannot happen - every satellite has one by the schema - and is
+// a contract violation, counted and left for the lease to expire. A card
+// alive without a message is kept out of the queue by the claim's predicate,
+// and reaching here means the card was brought back between the claim and
+// this read of it: the claim is three statements, not one transaction. That
+// is a race, not a defect - the satellite is left alone, and the claim decides
+// again when the lease runs out.
 func (w *Worker) satelliteGate(intent Intent) (Preparation, gateDecision) {
 	if !intent.Satellite() {
 		return Preparation{}, gateAsk
@@ -350,9 +353,8 @@ func (w *Worker) satelliteGate(intent Intent) (Preparation, gateDecision) {
 		return Impossible(ParentEndedWithoutMessage, fmt.Sprintf(
 			"the card %s ended as %s without a message", parent.ID, parent.Status)), gateDecided
 	default:
-		metrics.OutboundContractViolationsTotal.WithLabelValues("claim", "satellite_before_its_card").Inc()
-		log.Printf("outbound worker %s: %s was claimed while its card %s is %s without a message; leaving it",
-			w.workerID, intent.ID, parent.ID, parent.Status)
+		log.Printf("outbound worker %s: the card %s of %s was brought back after the claim; leaving it for the queue",
+			w.workerID, parent.ID, intent.ID)
 		return Preparation{}, gateSkip
 	}
 }

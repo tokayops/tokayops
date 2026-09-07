@@ -480,8 +480,9 @@ type BeginAttemptResult struct {
 	BoundEndpoint string
 	ProviderKey   string
 	// BoundContext is the generation's third field: what the message takes
-	// from a neighbouring commitment, settled when the generation opened.
-	BoundContext json.RawMessage
+	// from a neighbouring commitment, settled when the generation opened and
+	// read here, where a row this build cannot read is a refusal.
+	BoundContext BoundContext
 
 	// Receipt is where the external object is, for the calls that change one.
 	// Empty for a create: there is nothing out there yet.

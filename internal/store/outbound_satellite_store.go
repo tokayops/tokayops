@@ -134,7 +134,8 @@ func releaseForRetryTx(ctx context.Context, tx *sql.Tx, intentID string) error {
 //
 // Only those. A satellite withdrawn with its card stays withdrawn - canceled
 // is the end of a commitment, and the card that was canceled does not come
-// back either.
+// back either. The one withdrawal that is undone is the one a card's own send
+// overtook, and that is the send's doing (reviveWithdrawnSatellitesTx).
 func reviveSatellitesTx(ctx context.Context, tx *sql.Tx, parentID string, by outbound.Actor) (int, error) {
 	rows, err := tx.QueryContext(ctx, `
 		UPDATE outbound_intents i
@@ -169,6 +170,51 @@ func reviveSatellitesTx(ctx context.Context, tx *sql.Tx, parentID string, by out
 	return len(revived), nil
 }
 
+// reviveWithdrawnSatellitesTx brings back the satellites withdrawn with a
+// card that then went out anyway. The withdrawal found the card in flight
+// without a message and took its thread and its reply, as it takes those of
+// any card without one; the card's send then won the race (T16). A card with
+// a message keeps its satellites, so they return: the thread aimed at the
+// revision the withdrawal raised, the reply waiting for the end as before.
+// Only satellites nobody ever attempted: a canceled satellite with an attempt
+// was ended by a person from a failure, and a person's decision is not undone
+// by a race.
+func reviveWithdrawnSatellitesTx(ctx context.Context, tx *sql.Tx, parentID string) (int, error) {
+	rows, err := tx.QueryContext(ctx, `
+		UPDATE outbound_intents i
+		SET status = 'pending', next_attempt_at = now(), cancellation_requested = FALSE,
+		    desired_revision = CASE WHEN i.form = $2 THEN COALESCE(
+		        (SELECT g.revision FROM outbound_group_snapshots g WHERE g.alert_group_id = i.alert_group_id),
+		        i.desired_revision) ELSE i.desired_revision END,
+		    updated_at = now()
+		WHERE i.parent_intent_id = $1 AND i.status = 'canceled'
+		  AND NOT EXISTS (SELECT 1 FROM outbound_attempts a WHERE a.intent_id = i.id)
+		RETURNING i.id`, parentID, string(outbound.FormEditable))
+	if err != nil {
+		return 0, fmt.Errorf("bring back the satellites of %s: %w", parentID, err)
+	}
+	var revived []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		revived = append(revived, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, id := range revived {
+		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "revived",
+			"the card went out alongside the withdrawal", outbound.ActorSystem); err != nil {
+			return 0, err
+		}
+	}
+	return len(revived), nil
+}
+
 // admitSatellitesTx gives the satellites to every Slack channel card admitted
 // by a version that had none: the thread and the reply go into the card's own
 // claim, aimed at the revision the group is at, following the card. Once, at
@@ -196,7 +242,7 @@ func admitSatellitesTx(ctx context.Context, tx *sql.Tx) error {
 		  AND i.status <> 'canceled' AND NOT g.final
 		  AND NOT EXISTS (SELECT 1 FROM outbound_intents c WHERE c.parent_intent_id = i.id)
 		ORDER BY i.created_at, i.id`,
-		keys.InteractiveSlack, string(keys.TargetChannel), string(outbound.FormEditable))
+		keys.ProviderSlack, string(keys.TargetChannel), string(outbound.FormEditable))
 	if err != nil {
 		return fmt.Errorf("find the cards without satellites: %w", err)
 	}

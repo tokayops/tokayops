@@ -115,7 +115,12 @@ func TestWhatArrivesFromOutsideCannotSpeakMrkdwn(t *testing.T) {
 	state.Timeline[2].Actor = ptr("<!channel>")
 	state.AcknowledgedBy = ptr("<!subteam^S1>")
 	state.ResolvedBy = ptr("<!everyone>")
-	raw := []string{"<!channel>", "<@U0001>", "<!here>", "<!subteam^S1>", "<!everyone>", "<critical>"}
+	// The addresses come from outside too - annotations and Alertmanager's
+	// own URL - and a > inside one ends the link it is put in.
+	state.ExternalURL = ptr("https://a|x> <!channel> <@U0001> <https://b")
+	state.Alerts[0].DashboardURL = ptr("javascript:alert(1)")
+	state.Alerts[0].RunbookURL = ptr("https://r.example/runbook|[runbook]><!here>")
+	raw := []string{"<!channel>", "<@U0001>", "<!here>", "<!subteam^S1>", "<!everyone>", "<critical>", "javascript:"}
 
 	thread := RenderThread(state)
 	for _, r := range raw {
@@ -134,12 +139,9 @@ func TestWhatArrivesFromOutsideCannotSpeakMrkdwn(t *testing.T) {
 		t.Errorf("the reply reads %q", reply)
 	}
 
-	card, err := json.Marshal(Render(state, true))
-	if err != nil {
-		t.Fatalf("encode the card: %v", err)
-	}
+	card := mrkdwnOf(t, Render(state, true))
 	for _, r := range raw {
-		if strings.Contains(string(card), r) {
+		if strings.Contains(card, r) {
 			t.Errorf("the card carries %q as Slack would read it:\n%s", r, card)
 		}
 	}
@@ -152,6 +154,51 @@ func TestWhatArrivesFromOutsideCannotSpeakMrkdwn(t *testing.T) {
 	}
 	if !strings.Contains(dm, "<https://tokay.example/#/ops/alert-groups/ag-1|Open in TokayOps>") {
 		t.Errorf("the link this build writes itself was escaped away:\n%s", dm)
+	}
+}
+
+// mrkdwnOf is the card as Slack reads it: JSON spells < > and & as escapes,
+// and a check against the encoded form would find nothing and prove nothing.
+func mrkdwnOf(t *testing.T, card any) string {
+	t.Helper()
+	encoded, err := json.Marshal(card)
+	if err != nil {
+		t.Fatalf("encode the card: %v", err)
+	}
+	return strings.NewReplacer(`\u003c`, "<", `\u003e`, ">", `\u0026`, "&").Replace(string(encoded))
+}
+
+// TestAnAddressFromOutsideIsLinkedOnlyWhenItIsOne. A dashboard, a runbook and
+// Alertmanager's own URL are linked when they are http or https addresses
+// with nothing mrkdwn could read; anything else is left out of the card
+// rather than escaped into a link that goes nowhere.
+func TestAnAddressFromOutsideIsLinkedOnlyWhenItIsOne(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"https://alertmanager.example/#/alerts?receiver=ops":  true,
+		"http://grafana.example/d/abc?var-host=db-1&from=now": true,
+		"https://a|x> <!channel>":                             false,
+		"https://a.example/x|[dash]>":                         false,
+		"javascript:alert(1)":                                 false,
+		"ftp://files.example/runbook":                         false,
+		"https://":                                            false,
+		"https://a b.example":                                 false,
+		"grafana.example/d/abc":                               false,
+		"":                                                    false,
+	} {
+		state := handlerState(t).Content()
+		state.ExternalURL = ptr(raw)
+		state.Alerts[0].DashboardURL = ptr(raw)
+		state.Alerts[0].RunbookURL = ptr(raw)
+		card := mrkdwnOf(t, Render(state, false))
+		linked := strings.Contains(card, "<"+raw+"|")
+		if linked != want {
+			t.Errorf("%q linked: %v, want %v\n%s", raw, linked, want, card)
+		}
+		// A refused address is left out altogether, not printed as text. The
+		// two that are prefixes of the card's own links are not checked.
+		if !want && raw != "" && raw != "https://" && strings.Contains(card, raw) {
+			t.Errorf("%q was put into the card without being linked:\n%s", raw, card)
+		}
 	}
 }
 

@@ -40,7 +40,7 @@ func (s *Store) dmFallsBackToFirehose() bool {
 // payload and the generation. A configuration that cannot be read stops the
 // begin and names the row: the answer decides the bytes of the message.
 func (s *Store) dmContextTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent) (json.RawMessage, error) {
-	if intent.TargetKind != keys.TargetUser || intent.Provider != keys.InteractiveSlack {
+	if intent.TargetKind != keys.TargetUser || intent.Provider != keys.ProviderSlack {
 		return nil, nil
 	}
 	var ref sql.NullString

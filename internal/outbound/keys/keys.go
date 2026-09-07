@@ -44,6 +44,14 @@ const FamilyWebhook Family = "webhook"
 // business key, which names the event and the subscriber and nothing else.
 const ProviderWebhook = "webhook"
 
+// ProviderSlack and ProviderTelegram are the other two provider names, by the
+// same convention. The providers whose cards carry buttons (tag 18) are a
+// different closed set whose entries are these names: see InteractiveSlack.
+const (
+	ProviderSlack    = "slack"
+	ProviderTelegram = "telegram"
+)
+
 // Kind is the identity grammar a key is written in.
 type Kind string
 

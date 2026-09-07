@@ -92,10 +92,11 @@ var timelineEventTypes = map[TimelineEventType]bool{
 
 // The providers whose cards can carry action buttons. A closed set for the
 // same reason as the statuses: tag 18 is a list of these literals, and the
-// card renderer of each provider looks itself up in it.
+// card renderer of each provider looks itself up in it. Each entry is the
+// provider's name - the set is a different one, the spelling is not.
 const (
-	InteractiveSlack    = "slack"
-	InteractiveTelegram = "telegram"
+	InteractiveSlack    = ProviderSlack
+	InteractiveTelegram = ProviderTelegram
 )
 
 var interactiveProviders = map[string]bool{InteractiveSlack: true, InteractiveTelegram: true}

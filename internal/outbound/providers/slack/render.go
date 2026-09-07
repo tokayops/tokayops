@@ -49,8 +49,10 @@ func renderTitleBlocks(state keys.SnapshotInput) []slackapi.Block {
 
 	// The title carries the alert's own words, escaped: a label reading
 	// <!channel> is a label, not a page.
+	// The addresses came from outside too, and an address is linked only
+	// when it is one: a > inside it would end the link and page the channel.
 	titleText := mrkdwn(status.Title)
-	if state.ExternalURL != nil && *state.ExternalURL != "" {
+	if state.ExternalURL != nil && linkable(*state.ExternalURL) {
 		titleText = fmt.Sprintf("<%s|%s>", *state.ExternalURL, mrkdwn(status.Title))
 	}
 	return []slackapi.Block{
@@ -144,7 +146,7 @@ func renderBodyAttachment(state keys.SnapshotInput, interactive bool) slackapi.A
 
 	return slackapi.Attachment{
 		Color:    status.Color,
-		Fallback: status.Title,
+		Fallback: mrkdwn(status.Title),
 		Blocks:   slackapi.Blocks{BlockSet: blocks},
 	}
 }
@@ -204,11 +206,11 @@ func buildAlertList(alerts []keys.AlertSnapshot, zone string) string {
 		rendered++
 
 		dashLink := ""
-		if a.DashboardURL != nil && *a.DashboardURL != "" {
+		if a.DashboardURL != nil && linkable(*a.DashboardURL) {
 			dashLink = fmt.Sprintf(" <%s|[dash]>", *a.DashboardURL)
 		}
 		bookLink := ""
-		if a.RunbookURL != nil && *a.RunbookURL != "" {
+		if a.RunbookURL != nil && linkable(*a.RunbookURL) {
 			bookLink = fmt.Sprintf(" <%s|[runbook]>", *a.RunbookURL)
 		}
 

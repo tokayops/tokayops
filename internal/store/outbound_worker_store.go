@@ -590,6 +590,16 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{}, err
 	}
 
+	// What the message takes from the card is read here and not inside the
+	// call: read there, a row this build cannot read would be an attempt that
+	// never touched the network, retried on the family's backoff forever.
+	// Written by this build's store, such a row is damage, and it ends the
+	// commitment where a person will see it, like a state nobody can read.
+	bound, err := outbound.DecodeBoundContext(effect.Context)
+	if err != nil {
+		return s.refuseAttempt(ctx, tx, req, *intent, plan, "bound_context_unreadable", err.Error())
+	}
+
 	// The key this call is made under. A create carries the generation's own
 	// key, which every retry of it reuses; a change carries one of its own,
 	// keyed by the revision it applies - so applying a revision twice is the
@@ -721,7 +731,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		Operation:                    plan.Operation,
 		BoundEndpoint:                effect.Endpoint,
 		ProviderKey:                  providerKey,
-		BoundContext:                 effect.Context,
+		BoundContext:                 bound,
 		Receipt:                      receipt,
 		ReceiptRef:                   name.String,
 		Content:                      content,

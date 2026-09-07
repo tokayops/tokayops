@@ -340,6 +340,70 @@ func TestTheWithdrawalFollowsTheCard(t *testing.T) {
 	}
 }
 
+// TestACardThatWinsTheRaceAgainstTheWithdrawalBringsItsSatellitesBack. The
+// withdrawal finds the card in flight without a message and takes its thread
+// and its reply, as it takes those of any card without one; the card's send
+// then wins the race and the card lives (T16). A card with a message keeps
+// its satellites, and whether it got its message a moment before the
+// acknowledgement or a moment after must not decide whether the thread
+// exists: the satellites come back in the card's own transaction, the thread
+// aimed at the revision the acknowledgement raised.
+func TestACardThatWinsTheRaceAgainstTheWithdrawalBringsItsSatellitesBack(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+	agID := desiredGroup(t, s, "Disk filling up")
+	admitOne(t, s, agID, withSatellites(channelCommitment("C0001", 0))...)
+	card, thread, reply := satellitesOf(t, s, agID)
+	token := claimOne(t, s, card)
+	begun := beginOne(t, s, card, token) // the card is in flight
+
+	acknowledge(t, s, agID)
+	for _, id := range []string{thread, reply} {
+		if got := statusOf(t, s, id); got != outbound.StatusCanceled {
+			t.Fatalf("%s is %s while its card is in flight without a message", id, got)
+		}
+	}
+	if countWhere(t, s, `SELECT count(*) FROM outbound_intents WHERE id = $1 AND cancellation_requested`, card) != 1 {
+		t.Fatal("the card in flight was not asked to stop")
+	}
+
+	// The send wins: the card has a message - and a revision to apply, since
+	// the acknowledgement raised the group - and its satellites are back.
+	if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token, Conclusion: accepted(),
+	}); err != nil {
+		t.Fatalf("the send that won: %v", err)
+	}
+	if got := statusOf(t, s, card); got != outbound.StatusPending {
+		t.Fatalf("the card that went out is %s", got)
+	}
+	if countWhere(t, s, `SELECT count(*) FROM outbound_intents WHERE id = $1 AND receipt_recorded`, card) != 1 {
+		t.Fatal("the card that went out has no message")
+	}
+	revision, _ := storedRevision(t, s, agID)
+	for _, id := range []string{thread, reply} {
+		if got := statusOf(t, s, id); got != outbound.StatusPending {
+			t.Fatalf("%s is %s after its card went out", id, got)
+		}
+		if lines := journalOf(t, s, id); !hasJournalLine(lines, "revived|the card went out alongside the withdrawal|") {
+			t.Fatalf("the journal of %s does not say why it is back: %v", id, lines)
+		}
+	}
+	if _, aimed := cardAim(t, s, thread); aimed != revision {
+		t.Fatalf("the thread is aimed at revision %d, and the acknowledgement raised the group to %d", aimed, revision)
+	}
+
+	// And the thread goes out under the card, as any thread does.
+	leases := claimable(t, s)
+	if _, ok := leases[thread]; !ok {
+		t.Fatal("the thread that came back was not claimed")
+	}
+	postOne(t, s, thread, leases[thread])
+	if got := statusOf(t, s, thread); got != outbound.StatusIdle {
+		t.Fatalf("the thread is %s after it went out", got)
+	}
+}
+
 // TestARetryOfTheCardAndARefusalOfItsThreadConverge. The refusal a worker
 // states for a thread whose card ended, and an operator's retry of that card,
 // can cross. Whichever goes first, the thread ends up waiting for the card:

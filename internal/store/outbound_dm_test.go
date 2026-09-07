@@ -59,11 +59,7 @@ func postedAs(t *testing.T, s *Store, id, ref string) {
 
 func boundContextOf(t *testing.T, begun outbound.BeginAttemptResult) outbound.BoundContext {
 	t.Helper()
-	context, err := outbound.DecodeBoundContext(begun.BoundContext)
-	if err != nil {
-		t.Fatalf("read the context: %v", err)
-	}
-	return context
+	return begun.BoundContext
 }
 
 func slackWorkspaceIntegration(t *testing.T, s *Store, config string) string {
@@ -97,7 +93,7 @@ func TestADirectMessagePointsBackToTheCardItsGenerationBound(t *testing.T) {
 	token := takeOne(t, s, dm)
 	begun := beginOne(t, s, dm, token)
 	if !boundContextOf(t, begun).Empty() {
-		t.Fatalf("a message sent before any card was bound to %s", begun.BoundContext)
+		t.Fatalf("a message sent before any card was bound to %+v", begun.BoundContext)
 	}
 	if countWhere(t, s, `SELECT count(*) FROM outbound_intents WHERE id = $1 AND bound_context IS NULL`, dm) != 1 {
 		t.Fatal("an empty context was stored as something")
@@ -116,7 +112,7 @@ func TestADirectMessagePointsBackToTheCardItsGenerationBound(t *testing.T) {
 	token = takeOne(t, s, dm)
 	begun = beginOne(t, s, dm, token)
 	if !boundContextOf(t, begun).Empty() {
-		t.Fatalf("a retry inside the generation was bound to %s", begun.BoundContext)
+		t.Fatalf("a retry inside the generation was bound to %+v", begun.BoundContext)
 	}
 	if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
 		AttemptID: begun.AttemptID, LeaseToken: token,
@@ -178,7 +174,7 @@ func TestTheFirehoseIsAFallbackTheInstallationCanRefuse(t *testing.T) {
 	postedAs(t, s, intentAddressedTo(t, s, agID, "C-fire"), "C-fire/1700000000.000100")
 	dm := intentAddressedTo(t, s, agID, "u-1")
 	if begun := beginOne(t, s, dm, takeOne(t, s, dm)); !boundContextOf(t, begun).Empty() {
-		t.Fatalf("with the fallback off the message was bound to %s", begun.BoundContext)
+		t.Fatalf("with the fallback off the message was bound to %+v", begun.BoundContext)
 	}
 
 	s.SetDMFallbackToFirehose(true)
@@ -197,3 +193,48 @@ func TestTheFirehoseIsAFallbackTheInstallationCanRefuse(t *testing.T) {
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+// TestAContextNobodyCanReadIsRefusedBeforeTheNetwork. The bound context is
+// written by this build's store and read back at every begin of the
+// generation; a row this build cannot read is damage, and it ends the
+// commitment where a person will see it - not inside the call, where it
+// would be an attempt that never touched the network, retried forever.
+func TestAContextNobodyCanReadIsRefusedBeforeTheNetwork(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+	agID := desiredGroup(t, s, "Disk filling up")
+	admitOne(t, s, agID, channelCommitment("C-fire", 0), dmCommitment("u-1"))
+	postedAs(t, s, intentAddressedTo(t, s, agID, "C-fire"), "C-fire/1700000000.000100")
+	dm := intentAddressedTo(t, s, agID, "u-1")
+
+	token := takeOne(t, s, dm)
+	begun := beginOne(t, s, dm, token) // the generation is open and bound
+	if _, err := s.FinalizeDeliveryAttempt(context.Background(), outbound.FinalizeRequest{
+		AttemptID: begun.AttemptID, LeaseToken: token,
+		Conclusion: concluded(outbound.OutcomeRetryableRejection, "rate_limited"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE outbound_intents
+		SET bound_context = '{"card_receipt_ref":"C-fire/1700000000.000100","louder":true}' WHERE id = $1`, dm); err != nil {
+		t.Fatal(err)
+	}
+	due(t, s, dm)
+
+	result, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+		IntentID: dm, LeaseToken: takeOne(t, s, dm), WorkerID: "worker-1",
+		Preparation: outbound.PreparationReady, BoundEndpoint: "D0001",
+	})
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if result.Outcome != outbound.BeginPreparedPermanent {
+		t.Fatalf("a context this build cannot read began as %s", result.Outcome)
+	}
+	if got := statusOf(t, s, dm); got != outbound.StatusPermanentFailed {
+		t.Fatalf("the message is %s", got)
+	}
+	if got := lastErrorClass(t, s, dm); got != "bound_context_unreadable" {
+		t.Fatalf("the refusal is classed %q", got)
+	}
+}

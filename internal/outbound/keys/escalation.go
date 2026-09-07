@@ -139,7 +139,7 @@ func (c EscalationCommitment) validate() error {
 // satelliteProvider is the one provider whose channel cards have satellites.
 // Telegram has no threads; its handler says so to a satellite it is handed,
 // which the admission never produces.
-const satelliteProvider = "slack"
+const satelliteProvider = ProviderSlack
 
 // EscalationBatch is one admission as a producer proposes it: what content it
 // is about, and every commitment it wants accepted.

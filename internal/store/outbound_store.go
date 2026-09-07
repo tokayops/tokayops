@@ -1453,6 +1453,17 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 	if err := appendTransitionEventTx(ctx, tx, w); err != nil {
 		return err
 	}
+	// A card that went out while the alert was being withdrawn - the send
+	// won the race against the request to stop, and the request is consumed
+	// here by something other than stopping - is a card with a message: the
+	// withdrawal found it in flight without one and took its thread and its
+	// reply with it, and a card with a message keeps its satellites. They
+	// come back in the card's own transaction, after the group and the card.
+	if e.ConsumeCancellation && w.Transition.To != outbound.StatusCanceled && !w.Intent.Satellite() {
+		if _, err := reviveWithdrawnSatellitesTx(ctx, tx, w.Intent.ID); err != nil {
+			return err
+		}
+	}
 	if !w.Intent.GroupBound() {
 		return nil
 	}

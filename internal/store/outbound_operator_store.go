@@ -380,10 +380,12 @@ func (s *Store) ResolveAmbiguity(ctx context.Context,
 		return outbound.ResolveAmbiguityResult{}, err
 	}
 
-	// A card brought back brings back the satellites that were refused
-	// because it had ended: the same transaction, after the group and the
-	// card, before anything else. A card that stays down keeps them down.
-	if transition.To == outbound.StatusPending && !intent.Satellite() {
+	// A card brought back by a retry brings back the satellites that were
+	// refused because it had ended: the same transaction, after the group and
+	// the card, before anything else. A card that stays down keeps them down,
+	// and a withdrawal or an assumed acceptance is not a retry.
+	if (req.Decision == outbound.DecisionRetryCurrentGeneration ||
+		req.Decision == outbound.DecisionRetryNewGeneration) && !intent.Satellite() {
 		if _, err := reviveSatellitesTx(ctx, tx, req.IntentID, req.Actor); err != nil {
 			return outbound.ResolveAmbiguityResult{}, err
 		}
