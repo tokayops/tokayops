@@ -177,8 +177,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 		return c.NoContent(http.StatusOK)
 	}
 
-	// 4. Resolve TokayOps user from Slack user ID
-	// The switch is read from the database on every press, not from this
+	// 4. The switch, read from the database on every press, not from this
 	// instance's cache: a button switched off has to stop working
 	// everywhere at once, and the card that still shows it is redrawn by
 	// the door that switched it, not by the press.
@@ -195,6 +194,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 		return c.NoContent(http.StatusOK)
 	}
 
+	// 5. Resolve TokayOps user from Slack user ID
 	user := a.resolveSlackUser(c.Request().Context(), slackUserID)
 	if user == nil {
 		metrics.SlackUnlinkedUserTotal.Inc()
@@ -206,7 +206,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 		return c.NoContent(http.StatusOK)
 	}
 
-	// 5. Fetch alert group
+	// 6. Fetch alert group
 	ag, err := a.store.GetAlertGroupByID(alertGroupID)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -219,7 +219,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 		return c.NoContent(http.StatusOK)
 	}
 
-	// 6. RBAC check (best-effort team name for denied message)
+	// 7. RBAC check (best-effort team name for denied message)
 	allowed, err := a.rbac.HasPermission(user.ID, rbacAction, rbac.TeamScope(ag.TeamID))
 	if err != nil {
 		metrics.SlackInteractionTotal.WithLabelValues(slackActionLabel(actionID), "error").Inc()
@@ -242,7 +242,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 		return c.NoContent(http.StatusOK)
 	}
 
-	// 7. Execute transition via service
+	// 8. Execute transition via service
 	actor := alertgroup.Actor{ID: user.ID, Name: actorName(user), Email: user.Email}
 	var result *alertgroup.TransitionResult
 
@@ -279,7 +279,7 @@ func (a *API) HandleSlackInteractive(c echo.Context) error {
 		go a.respondEphemeral(responseURL, fallbackFromAG(result.AlertGroup))
 	}
 
-	// 11. Return 200 empty body: the card is the delivery domain's to update.
+	// 9. Return 200 empty body: the card is the delivery domain's to update.
 	return c.NoContent(http.StatusOK)
 }
 

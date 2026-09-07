@@ -303,3 +303,87 @@ func TestTheStopAndAnAcknowledgementConverge(t *testing.T) {
 		})
 	}
 }
+
+// TestALaterCardThatWentOutKeepsItsSatellites is the named best-effort case
+// through the parent rule: a later step's card that went out before the
+// failure stays out, and its thread and reply stay with it - a card in Slack
+// with its history withdrawn forever would be the worse outcome.
+func TestALaterCardThatWentOutKeepsItsSatellites(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+	agID := desiredGroup(t, s, "Disk filling up")
+	commitments := []keys.EscalationCommitment{dmStep("u-1", 1, true)}
+	admitOne(t, s, agID, append(commitments, withSatellites(cardStep("C-2", 2, false))...)...)
+	card, thread, reply := satellitesOf(t, s, agID)
+	postedAs(t, s, card, "C-2/1700000000.000100")
+
+	refusedBeforeTheNetwork(t, s, intentAddressedTo(t, s, agID, "u-1"))
+	if got := statusOf(t, s, card); got != outbound.StatusIdle {
+		t.Fatalf("the later card that went out is %s", got)
+	}
+	for _, id := range []string{thread, reply} {
+		if got := statusOf(t, s, id); got != outbound.StatusPending {
+			t.Fatalf("a satellite of the card that went out is %s", got)
+		}
+	}
+	if got := stoppedLines(t, s, agID); got != 0 {
+		t.Fatalf("the history says the escalation stopped %d time(s) when nothing was withdrawn", got)
+	}
+}
+
+// TestTheStopCountsPagesNotMirrors. A later card that had already ended
+// without a message leaves its satellites waiting; the stop withdraws them,
+// and the alert's history says nothing - no page was withdrawn.
+func TestTheStopCountsPagesNotMirrors(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+	agID := desiredGroup(t, s, "Disk filling up")
+	commitments := []keys.EscalationCommitment{dmStep("u-1", 1, true)}
+	admitOne(t, s, agID, append(commitments, withSatellites(cardStep("C-2", 2, false))...)...)
+	card, thread, reply := satellitesOf(t, s, agID)
+	refusedForGood(t, s, card)
+
+	refusedBeforeTheNetwork(t, s, intentAddressedTo(t, s, agID, "u-1"))
+	for _, id := range []string{thread, reply} {
+		if got := statusOf(t, s, id); got != outbound.StatusCanceled {
+			t.Fatalf("a satellite of the card that ended is %s", got)
+		}
+	}
+	if got := stoppedLines(t, s, agID); got != 0 {
+		t.Fatalf("the history says the escalation stopped %d time(s) over two mirrors", got)
+	}
+}
+
+// TestTheStopIsWrittenAfterTheFailure. Both lines are written in one
+// transaction, whose instant is one; read newest first, the stop has to come
+// after the failure that caused it, through both doors.
+func TestTheStopIsWrittenAfterTheFailure(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+	order := func(t *testing.T, agID string) {
+		t.Helper()
+		var failedAt, stoppedAt time.Time
+		if err := s.db.QueryRow(`SELECT created_at FROM timeline_events WHERE alert_group_id = $1
+			AND message = 'Notification failed permanently'`, agID).Scan(&failedAt); err != nil {
+			t.Fatalf("the failure's line: %v", err)
+		}
+		if err := s.db.QueryRow(`SELECT created_at FROM timeline_events WHERE alert_group_id = $1
+			AND message LIKE 'Escalation stopped:%'`, agID).Scan(&stoppedAt); err != nil {
+			t.Fatalf("the stop's line: %v", err)
+		}
+		if !stoppedAt.After(failedAt) {
+			t.Fatalf("the stop is dated %v and the failure %v: read newest first, the order is a coin toss",
+				stoppedAt, failedAt)
+		}
+	}
+
+	agID := desiredGroup(t, s, "Disk filling up")
+	admitOne(t, s, agID, dmStep("u-1", 1, true), dmStep("u-2", 2, false))
+	refusedBeforeTheNetwork(t, s, intentAddressedTo(t, s, agID, "u-1"))
+	order(t, agID)
+
+	agID = desiredGroup(t, s, "Disk filling up")
+	admitOne(t, s, agID, cardStep("C-1", 1, true), dmStep("u-2", 2, false))
+	refusedForGood(t, s, intentAddressedTo(t, s, agID, "C-1"))
+	order(t, agID)
+}

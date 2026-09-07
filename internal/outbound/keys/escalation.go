@@ -123,7 +123,7 @@ func (c EscalationCommitment) validate() error {
 			return contractf("a %s that is editable=%v", c.Target.Kind, c.Editable)
 		}
 		if c.Expiry != nil || c.MessageOverride != nil || c.StopOnFailure {
-			return contractf("a %s with a deadline, words or buttons of its own", c.Target.Kind)
+			return contractf("a %s with a deadline, words or a stop of its own", c.Target.Kind)
 		}
 	}
 	if err := c.Timing.validate(); err != nil {

@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -105,16 +108,39 @@ func stopEscalationTx(ctx context.Context, tx *sql.Tx, failed outbound.Intent,
 		}
 	}
 
-	touched := len(notSent) + len(inFlight) + len(waiting)
-	if touched == 0 {
-		return 0, nil
+	// One line in the alert's history, for the pages: the satellites of a
+	// card are not ones, and a stop that found only mirrors to withdraw
+	// writes nothing. The line is dated one microsecond after this
+	// transaction's instant, which is the instant the failure's own line
+	// carries: written at now() it would share it, and the history would
+	// say in half the cases that the escalation stopped before the step
+	// failed.
+	all := append(append(append([]string(nil), notSent...), inFlight...), waiting...)
+	var pages int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT count(*) FROM outbound_intents
+		WHERE id = ANY($1) AND parent_intent_id IS NULL`, pq.Array(all)).Scan(&pages); err != nil {
+		return 0, fmt.Errorf("count the pages the stop withdrew: %w", err)
 	}
-	if err := addTimelineTx(ctx, tx, failed.AlertGroupID, model.TimelineEventNotificationFailed,
-		fmt.Sprintf("Escalation stopped: step %d failed and the policy does not continue", step.Index),
-		"worker"); err != nil {
+	withdrawn := len(notSent) + len(waiting)
+	if pages == 0 {
+		return withdrawn, nil
+	}
+	var now time.Time
+	if err := tx.QueryRowContext(ctx, `SELECT now()`).Scan(&now); err != nil {
 		return 0, err
 	}
-	return len(notSent) + len(waiting), nil
+	if err := addTimelineEventsTx(ctx, tx, []*model.TimelineEvent{{
+		ID:           uuid.New().String(),
+		AlertGroupID: failed.AlertGroupID,
+		Type:         model.TimelineEventNotificationFailed,
+		Message:      fmt.Sprintf("Escalation stopped: step %d failed and the policy does not continue", step.Index),
+		Actor:        "worker",
+		CreatedAt:    now.Add(time.Microsecond),
+	}}); err != nil {
+		return 0, err
+	}
+	return withdrawn, nil
 }
 
 func stopRowsTx(ctx context.Context, tx *sql.Tx, query, batchID string, after int) ([]string, error) {
