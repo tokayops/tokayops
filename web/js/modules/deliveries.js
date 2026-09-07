@@ -74,10 +74,10 @@ const DECISION_LABELS = {
 };
 
 const DECISION_HINTS = {
-    assume_accepted: 'The message reached its recipient even though the provider never confirmed it.',
+    assume_accepted: 'Treat the message as delivered, although the provider did not confirm it.',
     cancel: 'Nothing more is sent. The delivery ends as canceled.',
-    retry_current_generation: 'Send again with the same address and the same key.',
-    retry_new_generation: 'Start over: a new message, which may exist beside the old one.',
+    retry_current_generation: 'Send again to the same address with the same key.',
+    retry_new_generation: 'Send a new message. The old one, if it was sent, stays.',
 };
 
 // The decisions that may create a second message, for which the person can
@@ -99,7 +99,7 @@ const OUTCOME_LABELS = {
     resolved: 'Applied',
     already_resolved: 'Already decided',
     invalid_decision: 'Refused',
-    business_closed: 'The alert is over',
+    business_closed: 'The alert is already resolved',
     recipient_erased: 'The recipient was erased',
     not_found: 'Not found',
 };
@@ -123,9 +123,25 @@ let openJournalId = null;
 // Labels
 // ========================================
 
+// The status in words a person reads without the state machine at hand. The
+// CSS class keeps the status itself, and so do the filters and the API.
+const STATUS_WORDS = {
+    pending: 'waiting',
+    sending: 'sending',
+    idle: 'up to date',
+    manual_review: 'needs decision',
+    succeeded: 'delivered',
+    permanent_failed: 'failed',
+    expired: 'expired',
+    canceled: 'canceled',
+};
+
+export function statusWords(status) {
+    return STATUS_WORDS[status] || String(status || '').replace(/_/g, ' ');
+}
+
 export function statusBadge(status) {
-    const label = String(status || '').replace(/_/g, ' ');
-    return `<span class="delivery-status delivery-status-${escapeHtml(status)}">${escapeHtml(label)}</span>`;
+    return `<span class="delivery-status delivery-status-${escapeHtml(status)}">${escapeHtml(statusWords(status))}</span>`;
 }
 
 /**
@@ -269,8 +285,8 @@ function deliverySentence(d) {
     const to = targetLabel(d.target_kind, d.target_ref);
     const erased = d.recipient_erased ? ' <span class="text-muted">(erased)</span>' : '';
     switch (d.target_kind) {
-        case 'thread': return `Thread under the card in ${to}${erased}`;
-        case 'thread_reply': return `Reply under the card in ${to}${erased}`;
+        case 'thread': return `Thread for the card in ${to}${erased}`;
+        case 'thread_reply': return `Reply for the card in ${to}${erased}`;
         case 'subscriber': return `Event to ${to}${erased}`;
         case 'user': return `Message to ${to}${erased}`;
         default: return `${d.form === 'editable' ? 'Card' : 'Message'} in ${to}${erased}`;
@@ -294,26 +310,26 @@ function verdict(journal) {
     const lastEvent = events[events.length - 1];
     switch (d.status) {
         case 'permanent_failed':
-            return `Failed for good${said ? `: ${escapeHtml(said)}` : '.'}`;
+            return `Failed permanently${said ? `: ${escapeHtml(said)}` : '.'}`;
         case 'manual_review':
-            return `The last attempt ended in doubt and a person decides what it means${said ? `: ${escapeHtml(said)}` : '.'}`;
+            return `The last attempt has no clear result. A person must decide${said ? `: ${escapeHtml(said)}` : '.'}`;
         case 'expired':
-            return `Expired before it could be sent${d.expires_at ? `, at ${when(d.expires_at)}` : ''}.`;
+            return `Not sent before the deadline${d.expires_at ? ` (${when(d.expires_at)})` : ''}.`;
         case 'canceled':
-            return `Withdrawn${lastEvent && lastEvent.reason ? `: ${escapeHtml(lastEvent.reason)}` : '.'}`;
+            return `Canceled${lastEvent && lastEvent.reason ? `: ${escapeHtml(lastEvent.reason)}` : '.'}`;
         case 'sending':
-            return 'An attempt is in flight.';
+            return 'Sending now.';
         case 'pending':
-            if (d.target_kind === 'thread_reply') return 'Waits for the alert to be over and the card to show it.';
-            if (d.target_kind === 'thread') return 'Waits for the card, or for its next revision.';
+            if (d.target_kind === 'thread_reply') return 'Will be sent after the alert is resolved and the card is updated.';
+            if (d.target_kind === 'thread') return 'Will be sent after the card is posted or updated.';
             return d.attempts_in_generation > 0
-                ? `Will be tried again at ${when(d.next_attempt_at)}.`
-                : `Due at ${when(d.next_attempt_at)}.`;
+                ? `Next attempt at ${when(d.next_attempt_at)}.`
+                : `Scheduled for ${when(d.next_attempt_at)}.`;
         case 'idle':
-            return 'Delivered, and kept up to date with the alert.';
+            return 'Delivered. The message is updated when the alert changes.';
         case 'succeeded':
             return d.form === 'editable'
-                ? 'Delivered; the alert is over and the message shows it.'
+                ? 'Delivered. The alert is resolved and the message shows it.'
                 : 'Delivered.';
         default:
             return '';
@@ -321,43 +337,51 @@ function verdict(journal) {
 }
 
 /**
- * What an attempt did, and what came of it, as a person would say it.
+ * What an attempt did, and what came of it, as a person would say it. "Sent"
+ * is only said once the provider accepted; a rejected attempt is named as
+ * the try it was.
  */
 function attemptWords(a, d) {
-    let what = 'Sent';
-    if (a.record_kind !== 'attempt') {
-        what = 'Not sent';
-    } else if (a.attempt_kind === 'mutation') {
-        what = a.operation === 'resolve' ? 'Message updated for the end' : 'Message updated';
-        if (d.form === 'editable' && d.target_kind === 'channel') {
-            what = a.operation === 'resolve' ? 'Card updated for the end' : 'Card updated';
-        }
-    }
-    const outcome = {
-        accepted: ['accepted', 'ok'],
-        retryable_rejection: ['refused, will be retried', 'retry'],
-        permanent_rejection: [a.record_kind === 'attempt' ? 'refused for good' : 'for good', 'failed'],
-        ambiguous: ['no answer', 'doubt'],
-    }[a.outcome] || (a.outcome ? [humanClass(a.outcome), 'doubt'] : ['in flight', 'open']);
     const answer = a.summary || a.result_detail || '';
     const said = answer && answer !== 'ok' && answer !== a.provider_status ? answer : '';
-    return { what, outcome: outcome[0], tone: outcome[1], said };
+    const words = (what, outcome, tone) => ({ what, outcome, tone, said });
+
+    if (a.record_kind !== 'attempt') {
+        // The delivery was not attempted: preparation found it could not be.
+        if (a.outcome === 'permanent_rejection') return words('Not sent', 'no retry', 'failed');
+        if (a.outcome === 'retryable_rejection') return words('Not sent', 'will retry', 'retry');
+        return words('Not sent', humanClass(a.outcome), 'doubt');
+    }
+
+    const thing = d.form === 'editable' && d.target_kind === 'channel' ? 'Card' : 'Message';
+    const mutation = a.attempt_kind === 'mutation';
+    const done = !mutation ? 'Sent'
+        : a.operation === 'resolve' ? `${thing} marked resolved` : `${thing} updated`;
+    const tried = mutation ? `${thing} update` : 'Send';
+
+    switch (a.outcome) {
+        case 'accepted': return words(done, 'accepted', 'ok');
+        case 'retryable_rejection': return words(`${tried} rejected`, 'will retry', 'retry');
+        case 'permanent_rejection': return words(`${tried} rejected`, 'no retry', 'failed');
+        case 'ambiguous': return words(mutation ? `${tried} sent` : 'Sent', 'no response', 'doubt');
+        case undefined: case null: case '': return words(mutation ? `${tried} in progress` : 'Sending', '', 'open');
+        default: return words(tried, humanClass(a.outcome), 'doubt');
+    }
 }
 
 const machinery = new Set(['effect_bound', 'desired_raised', 'generation_started']);
 
 const eventWords = {
-    created: 'Admitted',
-    canceled: 'Withdrawn',
-    cancellation_requested: 'Asked to stop',
-    operator_decision: 'Decision',
-    revived: 'Brought back',
+    created: 'Created',
+    canceled: 'Canceled',
+    cancellation_requested: 'Cancellation requested',
+    operator_decision: 'Operator decision',
+    revived: 'Restored',
     expired: 'Expired',
-    lease_lost: 'Interrupted mid-flight',
     duplicate_risk_accepted: 'Duplicate risk accepted',
-    effect_bound: 'Address settled',
-    desired_raised: 'Aimed at a new revision',
-    generation_started: 'New generation',
+    effect_bound: 'Address assigned',
+    desired_raised: 'New revision requested',
+    generation_started: 'New generation started',
 };
 
 /**
@@ -406,7 +430,7 @@ function attemptRow(a, d) {
         .filter(Boolean).join(' ');
     return timelineItem({
         classes: `journal-attempt ${type}`, icon, at: a.started_at || a.finished_at,
-        message: `${escapeHtml(w.what)} <span class="journal-tone journal-tone-${escapeAttr(w.tone)}">${escapeHtml(w.outcome)}</span>${erased}`,
+        message: `${escapeHtml(w.what)}${w.outcome ? `, <span class="journal-tone journal-tone-${escapeAttr(w.tone)}">${escapeHtml(w.outcome)}</span>` : ''}${erased}`,
         detail, attrs: ` data-outcome="${escapeAttr(a.outcome || '')}"`,
     });
 }
@@ -443,7 +467,7 @@ function history(journal) {
     (journal.attempts || []).forEach(a => lines.push({ at: a.started_at || a.finished_at, html: attemptRow(a, d) }));
     (journal.events || []).filter(e => !machinery.has(e.kind)).forEach(e => lines.push({ at: e.at, html: eventRow(e) }));
     lines.sort((x, y) => new Date(x.at || 0) - new Date(y.at || 0));
-    if (lines.length === 0) return '<div class="journal-none">Nothing has happened yet.</div>';
+    if (lines.length === 0) return '<div class="journal-none">No activity yet.</div>';
     return `<div class="timeline-container"><div class="timeline journal-history">${lines.map(l => l.html).join('')}</div></div>`;
 }
 
@@ -458,7 +482,7 @@ function detailItem(label, value, mono) {
 function details(journal) {
     const d = journal.delivery;
     const receipt = d.recipient_erased && d.receipt_recorded
-        ? 'recorded, coordinates erased'
+        ? 'recorded (coordinates erased)'
         : (d.receipt_recorded ? 'recorded' : 'none');
     const items = [
         detailItem('Generation', escapeHtml(`${d.generation_no}, ${d.attempts_in_generation} ${d.attempts_in_generation === 1 ? 'attempt' : 'attempts'}`)),
@@ -471,7 +495,7 @@ function details(journal) {
     ].filter(Boolean).join('');
     const machineryLines = (journal.events || []).filter(e => machinery.has(e.kind)).map(eventRow).join('');
     const late = journal.observations && journal.observations.length > 0
-        ? `<div class="journal-none">${journal.observations.length === 1 ? 'One result' : `${journal.observations.length} results`} arrived after the attempt was closed and ${journal.observations.length === 1 ? 'is' : 'are'} kept beside it.</div>`
+        ? `<div class="journal-none">${journal.observations.length === 1 ? 'One late response' : `${journal.observations.length} late responses`} arrived after the attempt was closed and ${journal.observations.length === 1 ? 'is' : 'are'} kept with it.</div>`
         : '';
     return `
         <details class="detail-section detail-technical journal-details">
@@ -513,7 +537,7 @@ export function journalPanel(journal) {
                 <div class="detail-meta-row">
                     <span class="detail-meta-chip">${attempts} ${attempts === 1 ? 'attempt' : 'attempts'}</span>
                     <span class="detail-meta-chip">Created ${escapeHtml(relative(d.created_at) || when(d.created_at))}</span>
-                    <span class="detail-meta-chip">Last change ${escapeHtml(relative(d.updated_at) || when(d.updated_at))}</span>
+                    <span class="detail-meta-chip">Updated ${escapeHtml(relative(d.updated_at) || when(d.updated_at))}</span>
                 </div>
             </div>
             ${details(journal)}
@@ -627,7 +651,7 @@ export function decisionForm(delivery) {
                 <div class="form-group">
                     <label for="decision-deadline">New deadline</label>
                     <input type="datetime-local" id="decision-deadline" name="new_expires_at" value="${localDateTimeValue(inAnHour)}" required>
-                    <div class="form-hint">An expired delivery is only retried with a deadline ahead of now.</div>
+                    <div class="form-hint">To retry an expired delivery, set a new deadline in the future.</div>
                 </div>` : ''}
             <div class="form-group">
                 <label for="decision-reason">Reason</label>
@@ -717,7 +741,7 @@ async function submitDecision(delivery) {
     if (form.new_expires_at) {
         const at = new Date(form.new_expires_at.value);
         if (Number.isNaN(at.getTime()) || at.getTime() <= Date.now()) {
-            showRefusal('invalid_decision', 'The new deadline has to be ahead of now.');
+            showRefusal('invalid_decision', 'The new deadline must be in the future.');
             return;
         }
         body.new_expires_at = at.toISOString();
@@ -726,7 +750,7 @@ async function submitDecision(delivery) {
     submit.disabled = true;
     try {
         const result = await API.deliveries.decide(delivery.id, body);
-        showToast(`Decision applied: ${result.status.replace(/_/g, ' ')}`, 'success');
+        showToast(`Decision applied: ${statusWords(result.status)}`, 'success');
         Elements.deliveryModalFooter.classList.remove('split');
         document.dispatchEvent(new CustomEvent('tokay:delivery-decided', {
             detail: { id: delivery.id, alertGroupId: delivery.alert_group_id, status: result.status },
@@ -737,7 +761,7 @@ async function submitDecision(delivery) {
         // of the guard. Anything else is an error.
         const outcome = error.body?.outcome;
         if (outcome) {
-            showRefusal(outcome, error.body.detail || (error.body.status ? `The delivery is ${error.body.status.replace(/_/g, ' ')}.` : ''));
+            showRefusal(outcome, error.body.detail || (error.body.status ? `The delivery is ${statusWords(error.body.status)}.` : ''));
         } else {
             showRefusal('', error.message);
         }
@@ -763,7 +787,7 @@ function activityFilters() {
             <label>Status
                 <select id="activity-status">
                     ${option('', 'All statuses', activity.status === '')}
-                    ${STATUSES.map(s => option(s, s.replace(/_/g, ' '), activity.status === s)).join('')}
+                    ${STATUSES.map(s => option(s, statusWords(s), activity.status === s)).join('')}
                 </select>
             </label>
             <label>From
