@@ -112,6 +112,7 @@ const activity = {
     page: 1,
     family: '',
     status: '',
+    period: '24h',
     from: '',
     to: '',
 };
@@ -229,13 +230,6 @@ function canReadJournal() {
     return Permissions.isAdmin();
 }
 
-function journalButton(deliveryId) {
-    if (!canReadJournal()) return '';
-    return `<button type="button" class="btn btn-sm btn-secondary journal-link" data-delivery-id="${escapeAttr(deliveryId)}" title="Open the journal">
-        <i data-lucide="scroll-text"></i> Journal
-    </button>`;
-}
-
 // ========================================
 // The alert group's deliveries
 // ========================================
@@ -282,7 +276,8 @@ function providerName(provider) {
  * helper, so a person's id becomes a name once the directory answers.
  */
 function deliverySentence(d) {
-    const to = targetLabel(d.target_kind, d.target_ref);
+    const satellite = d.target_kind === 'thread' || d.target_kind === 'thread_reply';
+    const to = targetLabel(satellite ? 'channel' : d.target_kind, d.target_ref);
     const erased = d.recipient_erased ? ' <span class="text-muted">(erased)</span>' : '';
     switch (d.target_kind) {
         case 'thread': return `Thread for the card in ${to}${erased}`;
@@ -774,87 +769,160 @@ async function submitDecision(delivery) {
 // The operational log
 // ========================================
 
+const FAMILY_WORDS = { notification: 'Notifications', handoff: 'Handoffs', webhook: 'Webhooks' };
+const KIND_WORDS = {
+    escalation: 'escalation', escalation_replay: 'escalation replay',
+    handoff: 'on-call handoff', webhook_event: 'webhook event',
+};
+const PERIODS = [['24h', '24h', 1], ['7d', '7d', 7], ['30d', '30d', 30], ['custom', 'Custom', 0]];
+
 function activityFilters() {
     const option = (value, label, selected) => `<option value="${escapeAttr(value)}" ${selected ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    const custom = activity.period === 'custom';
     return `
-        <div class="activity-filters">
-            <label>Family
-                <select id="activity-family">
-                    ${option('', 'All families', activity.family === '')}
-                    ${FAMILIES.map(f => option(f, f, activity.family === f)).join('')}
-                </select>
-            </label>
-            <label>Status
-                <select id="activity-status">
-                    ${option('', 'All statuses', activity.status === '')}
-                    ${STATUSES.map(s => option(s, statusWords(s), activity.status === s)).join('')}
-                </select>
-            </label>
-            <label>From
-                <input type="datetime-local" id="activity-from" value="${escapeAttr(activity.from)}">
-            </label>
-            <label>To
-                <input type="datetime-local" id="activity-to" value="${escapeAttr(activity.to)}">
-            </label>
-            <button type="button" class="btn btn-secondary btn-sm" id="activity-apply">Apply</button>
-            <span class="activity-period text-muted" id="activity-period"></span>
+        <div class="filters-bar activity-filters">
+            <div class="filters-row">
+                <div class="filter-group">
+                    <div class="filter-label">Family</div>
+                    <select id="activity-family" class="form-select" aria-label="Family">
+                        ${option('', 'All families', activity.family === '')}
+                        ${FAMILIES.map(f => option(f, FAMILY_WORDS[f] || f, activity.family === f)).join('')}
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <div class="filter-label">Status</div>
+                    <select id="activity-status" class="form-select" aria-label="Status">
+                        ${option('', 'All statuses', activity.status === '')}
+                        ${STATUSES.map(s => option(s, statusWords(s), activity.status === s)).join('')}
+                    </select>
+                </div>
+                <div class="filters-right">
+                    <div class="filter-group">
+                        <div class="filter-label">Period</div>
+                        <div class="scope-tabs-sm" id="activity-period-tabs" role="tablist" aria-label="Period">
+                            ${PERIODS.map(([key, label]) => `<button type="button" class="scope-tab-sm${activity.period === key ? ' active' : ''}" data-period="${key}" aria-selected="${activity.period === key}">${label}</button>`).join('')}
+                        </div>
+                    </div>
+                    <div class="filter-group activity-custom" ${custom ? '' : 'hidden'}>
+                        <div class="filter-label">From</div>
+                        <input type="datetime-local" id="activity-from" class="form-input" value="${escapeAttr(activity.from)}">
+                    </div>
+                    <div class="filter-group activity-custom" ${custom ? '' : 'hidden'}>
+                        <div class="filter-label">To</div>
+                        <input type="datetime-local" id="activity-to" class="form-input" value="${escapeAttr(activity.to)}">
+                    </div>
+                    <button type="button" class="btn btn-secondary btn-sm activity-custom" id="activity-apply" ${custom ? '' : 'hidden'}>Apply</button>
+                </div>
+            </div>
+        </div>`;
+}
+
+/** The second line of a row: who carries it and what kind of promise it is. */
+function activityKind(d) {
+    const kind = KIND_WORDS[d.kind] || humanClass(d.kind);
+    if (d.family === 'webhook') return kind;
+    return `${providerName(d.provider)} · ${kind}`;
+}
+
+function activityRow(d) {
+    const group = d.alert_group_id
+        ? `<a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="activity-group-link" title="Open the alert group"><i data-lucide="bell"></i> Alert group</a>`
+        : '<span class="text-muted">—</span>';
+    return `
+        <div class="alert-group-card activity-row status-${escapeAttr(d.status)}" data-delivery-id="${escapeAttr(d.id)}" data-family="${escapeAttr(d.family)}" data-status="${escapeAttr(d.status)}">
+            <div class="activity-when">${escapeHtml(window.Components?.formatDateTime?.(d.created_at) || when(d.created_at))}<div class="activity-sub">${escapeHtml(relative(d.created_at))}</div></div>
+            <div class="activity-what"><div class="activity-sentence">${deliverySentence(d)}</div><div class="activity-sub">${escapeHtml(activityKind(d))}</div></div>
+            <div>${statusBadge(d.status)}</div>
+            <div>${group}</div>
+            <span class="journal-link activity-open" data-delivery-id="${escapeAttr(d.id)}" title="Open the journal"><i data-lucide="scroll-text"></i> Journal <i data-lucide="chevron-right"></i></span>
+        </div>`;
+}
+
+function activityFooter(response) {
+    const page = response.page || 1;
+    const totalPages = response.total_pages || 1;
+    const total = response.total || 0;
+    return `
+        <div class="activity-footer">
+            <div class="activity-summary">
+                <span id="activity-total">${total} ${total === 1 ? 'delivery' : 'deliveries'}</span>
+                <span class="activity-dot">·</span>
+                <span id="activity-period">${escapeHtml(periodLabel(response))}</span>
+            </div>
+            <div class="activity-pager">
+                <button type="button" class="btn btn-sm btn-secondary" id="activity-prev" ${page <= 1 ? 'disabled' : ''}><i data-lucide="chevron-left"></i> Previous</button>
+                <span class="page-info" id="activity-page">Page ${page} of ${totalPages}</span>
+                <button type="button" class="btn btn-sm btn-secondary" id="activity-next" ${page >= totalPages ? 'disabled' : ''}>Next <i data-lucide="chevron-right"></i></button>
+            </div>
         </div>`;
 }
 
 function activityTable(response) {
     const deliveries = response.deliveries || [];
     if (deliveries.length === 0) {
-        return '<div class="empty-state" id="activity-empty"><i data-lucide="inbox" class="empty-icon"></i><p>No deliveries in this period.</p></div>';
-    }
-    const rows = deliveries.map(d => `
-        <tr class="delivery-row activity-row" data-delivery-id="${escapeAttr(d.id)}" data-family="${escapeAttr(d.family)}" data-status="${escapeAttr(d.status)}">
-            <td>${when(d.created_at)}</td>
-            <td>${escapeHtml(d.family)}<div class="text-muted">${escapeHtml(d.kind)}</div></td>
-            <td>${escapeHtml(d.provider)}</td>
-            <td>${targetLabel(d.target_kind, d.target_ref)}</td>
-            <td>${statusBadge(d.status)}</td>
-            <td>${d.alert_group_id ? `<a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="activity-group-link" title="${escapeAttr(d.alert_group_id)}">alert</a>` : '<span class="text-muted">—</span>'}</td>
-            <td class="delivery-row-actions">${journalButton(d.id)}</td>
-        </tr>`).join('');
-    const page = response.page || 1;
-    const totalPages = response.total_pages || 1;
-    return `
-        <table class="delivery-table activity-table">
-            <thead><tr><th>Created</th><th>Family</th><th>Provider</th><th>To</th><th>Status</th><th>Alert</th><th></th></tr></thead>
-            <tbody>${rows}</tbody>
-        </table>
-        <div class="activity-pagination">
-            <span id="activity-total">${response.total} deliveries</span>
-            <div>
-                <button type="button" class="btn btn-sm btn-secondary" id="activity-prev" ${page <= 1 ? 'disabled' : ''}>Prev</button>
-                <span id="activity-page">Page ${page} / ${totalPages}</span>
-                <button type="button" class="btn btn-sm btn-secondary" id="activity-next" ${page >= totalPages ? 'disabled' : ''}>Next</button>
+        return `
+            <div class="empty-state" id="activity-empty">
+                <i data-lucide="inbox" class="empty-icon"></i>
+                <p>No deliveries in this period.</p>
+                <p class="text-muted">Widen the period or clear a filter.</p>
             </div>
-        </div>`;
+            ${activityFooter(response)}`;
+    }
+    return `
+        <div class="activity-table">
+            <div class="list-header activity-header">
+                <div class="list-header-col">When</div>
+                <div class="list-header-col">Delivery</div>
+                <div class="list-header-col">Status</div>
+                <div class="list-header-col">Alert group</div>
+                <div class="list-header-col"></div>
+            </div>
+            <div class="activity-rows">${deliveries.map(activityRow).join('')}</div>
+        </div>
+        ${activityFooter(response)}`;
+}
+
+/** The window the log is read over, as the request wants it. */
+function periodRange() {
+    const days = (PERIODS.find(([key]) => key === activity.period) || [])[2];
+    if (days) return activity.period === '24h' ? {} : { from: new Date(Date.now() - days * 86400000).toISOString() };
+    const range = {};
+    if (activity.from) range.from = new Date(activity.from).toISOString();
+    if (activity.to) range.to = new Date(activity.to).toISOString();
+    return range;
 }
 
 function periodLabel(response) {
-    const from = response.from ? new Date(response.from) : null;
-    const to = response.to ? new Date(response.to) : null;
-    if (!activity.from && !activity.to) return 'Last 24 hours';
-    return `${from ? when(from) : '…'} – ${to ? when(to) : 'now'}`;
+    switch (activity.period) {
+        case '24h': return 'Last 24 hours';
+        case '7d': return 'Last 7 days';
+        case '30d': return 'Last 30 days';
+        default: {
+            const from = response.from || activity.from;
+            const to = response.to || activity.to;
+            return `${from ? when(from) : '…'} – ${to ? when(to) : 'now'}`;
+        }
+    }
 }
 
 async function loadActivity() {
     const list = document.getElementById('activity-list');
     if (!list) return;
     list.innerHTML = '<div class="loading-spinner">Loading...</div>';
-    const params = { page: activity.page, limit: 50, family: activity.family, status: activity.status };
-    if (activity.from) params.from = new Date(activity.from).toISOString();
-    if (activity.to) params.to = new Date(activity.to).toISOString();
+    const params = { page: activity.page, limit: 50, family: activity.family, status: activity.status, ...periodRange() };
     try {
         const response = await API.deliveries.list(params);
         list.innerHTML = activityTable(response);
-        const period = document.getElementById('activity-period');
-        if (period) period.textContent = periodLabel(response);
         if (window.lucide) lucide.createIcons();
         bindJournalLinks(list);
         hydrateUserNames(list);
+        // The row itself opens the journal; its links keep their own meaning.
+        list.querySelectorAll('.activity-row').forEach(row => {
+            row.addEventListener('click', (e) => {
+                if (e.target.closest('a, button, .journal-link')) return;
+                openDeliveryJournal(row.dataset.deliveryId);
+            });
+        });
         document.getElementById('activity-prev')?.addEventListener('click', () => { activity.page -= 1; loadActivity(); });
         document.getElementById('activity-next')?.addEventListener('click', () => { activity.page += 1; loadActivity(); });
     } catch (error) {
@@ -871,9 +939,6 @@ export function showActivityView() {
     if (!view) return;
     if (!canReadJournal()) {
         view.innerHTML = `
-            <div class="section-header">
-                <h2 class="section-title"><i data-lucide="activity"></i> Activity</h2>
-            </div>
             <div class="empty-state" id="activity-forbidden">
                 <i data-lucide="lock" class="empty-icon"></i>
                 <p>The delivery journal is available to administrators.</p>
@@ -881,25 +946,30 @@ export function showActivityView() {
         if (window.lucide) lucide.createIcons();
         return;
     }
-    view.innerHTML = `
-        <div class="section-header">
-            <h2 class="section-title"><i data-lucide="activity"></i> Activity</h2>
-        </div>
-        ${activityFilters()}
-        <div id="activity-list"></div>`;
+    view.innerHTML = `${activityFilters()}<div id="activity-list"></div>`;
     if (window.lucide) lucide.createIcons();
+
+    const reload = () => { activity.page = 1; loadActivity(); };
+    document.getElementById('activity-family')?.addEventListener('change', (e) => { activity.family = e.target.value; reload(); });
+    document.getElementById('activity-status')?.addEventListener('change', (e) => { activity.status = e.target.value; reload(); });
     document.getElementById('activity-apply')?.addEventListener('click', () => {
-        activity.family = document.getElementById('activity-family').value;
-        activity.status = document.getElementById('activity-status').value;
         activity.from = document.getElementById('activity-from').value;
         activity.to = document.getElementById('activity-to').value;
-        activity.page = 1;
-        loadActivity();
+        reload();
     });
-    ['activity-family', 'activity-status'].forEach(id => {
-        document.getElementById(id)?.addEventListener('change', () => {
-            document.getElementById('activity-apply')?.click();
+    const tabs = document.getElementById('activity-period-tabs');
+    tabs?.addEventListener('click', (e) => {
+        const tab = e.target.closest('[data-period]');
+        if (!tab) return;
+        activity.period = tab.dataset.period;
+        tabs.querySelectorAll('[data-period]').forEach(t => {
+            const on = t === tab;
+            t.classList.toggle('active', on);
+            t.setAttribute('aria-selected', String(on));
         });
+        const custom = activity.period === 'custom';
+        view.querySelectorAll('.activity-custom').forEach(el => { el.hidden = !custom; });
+        if (!custom) reload();
     });
     loadActivity();
 }

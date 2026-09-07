@@ -253,6 +253,13 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   fails because its card never made a message says so
   (`parent_ended_without_message`) and comes back when the card is retried.
   Telegram has neither threads nor links to cards; it is unchanged.
+- **The delivery journal and the Activity page speak plain words.** A
+  delivery's journal opens as a card in the shape of the alert's: what it is
+  and where it stands in one line, the history as a timeline, the internals
+  folded away. A status is a word (waiting, needs decision, delivered,
+  failed) and an attempt says what happened (sent and accepted, rejected
+  with no retry, not sent). The Activity page lists deliveries the way the
+  alert groups are listed, with a period switch; a row opens the journal.
 - **The alerts inside a message are listed by when they started**, rather than
   in whatever order they arrived from Alertmanager. Two instances rendering the
   same alert now produce the same message.
