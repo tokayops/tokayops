@@ -249,81 +249,183 @@ export function bindJournalLinks(root) {
 // The journal of one delivery
 // ========================================
 
+/**
+ * The journal reads top down: what this delivery is, where it stands and
+ * why, the few numbers that matter, then what happened - the calls to the
+ * provider and the decisions of the machine, each in its own order.
+ */
+const providerNames = { slack: 'Slack', telegram: 'Telegram', webhook: 'Webhook' };
+
+function providerName(provider) {
+    return providerNames[provider] || provider || '';
+}
+
+/**
+ * One sentence for what the delivery is: the form and the place it goes.
+ * The recipient keeps the label helper, so a person's id becomes a name
+ * once the directory answers.
+ */
+function deliverySentence(d) {
+    const to = targetLabel(d.target_kind, d.target_ref);
+    const erased = d.recipient_erased ? ' <span class="text-muted">(erased)</span>' : '';
+    switch (d.target_kind) {
+        case 'thread': return `Thread under the card in ${to}${erased}`;
+        case 'thread_reply': return `Reply under the card in ${to}${erased}`;
+        case 'subscriber': return `Event to ${to}${erased}`;
+        case 'user': return `Message to ${to}${erased}`;
+        default: return `${d.form === 'editable' ? 'Card' : 'Message'} in ${to}${erased}`;
+    }
+}
+
+function humanClass(value) {
+    return String(value || '').replace(/_/g, ' ');
+}
+
+/**
+ * Where the delivery stands, in the interface's words: the status alone is
+ * a label, and the operator needs the reason that goes with it.
+ */
+function verdict(journal) {
+    const d = journal.delivery;
+    const attempts = journal.attempts || [];
+    const last = attempts[attempts.length - 1];
+    const said = last && (last.summary || last.result_detail || humanClass(last.error_class) || last.provider_status);
+    const lastEvent = (journal.events || [])[journal.events.length - 1];
+    switch (d.status) {
+        case 'permanent_failed':
+            return `Failed for good${said ? `: ${escapeHtml(said)}` : '.'}`;
+        case 'manual_review':
+            return `The last attempt ended in doubt and a person decides what it means${said ? `: ${escapeHtml(said)}` : '.'}`;
+        case 'expired':
+            return `Expired before it could be sent${d.expires_at ? `, at ${when(d.expires_at)}` : ''}.`;
+        case 'canceled':
+            return `Withdrawn${lastEvent && lastEvent.reason ? `: ${escapeHtml(lastEvent.reason)}` : '.'}`;
+        case 'sending':
+            return 'An attempt is in flight.';
+        case 'pending':
+            if (d.target_kind === 'thread_reply') return 'Waits for the alert to be over and the card to show it.';
+            if (d.target_kind === 'thread') return 'Waits for the card, or for its next revision.';
+            return d.attempts_in_generation > 0
+                ? `Will be tried again at ${when(d.next_attempt_at)}.`
+                : `Due at ${when(d.next_attempt_at)}.`;
+        case 'idle':
+            return `Delivered, and kept up to date with the alert (revision ${d.applied_revision ?? d.desired_revision}).`;
+        case 'succeeded':
+            return d.form === 'editable'
+                ? 'Delivered; the alert is over and the last revision is applied.'
+                : 'Delivered.';
+        default:
+            return '';
+    }
+}
+
+function facts(d) {
+    const receipt = d.recipient_erased && d.receipt_recorded
+        ? 'recorded, coordinates erased'
+        : (d.receipt_recorded ? 'recorded' : 'none');
+    const cells = [
+        ['Generation', `${d.generation_no} · ${d.attempts_in_generation} ${d.attempts_in_generation === 1 ? 'attempt' : 'attempts'}`],
+        ['Revision', `desired ${d.desired_revision} · applied ${d.applied_revision ?? '—'}${d.final_revision_applied ? ' · final' : ''}`],
+        ['Receipt', receipt],
+    ];
+    if (d.expires_at) cells.push(['Expires', `${when(d.expires_at)}${d.expired ? ' · passed' : ''}`]);
+    return cells.map(([label, value]) => `
+        <div class="journal-fact">
+            <div class="journal-fact-label">${escapeHtml(label)}</div>
+            <div class="journal-fact-value">${escapeHtml(value)}</div>
+        </div>`).join('');
+}
+
 function attemptsTable(attempts) {
     if (!attempts || attempts.length === 0) {
-        return '<div class="deliveries-empty">No attempts yet.</div>';
+        return '<div class="journal-none">Nothing has been tried yet.</div>';
     }
     const rows = attempts.map(a => {
+        // The receipt is a fact of the delivery, said once above; a row says
+        // only when its coordinates were taken away.
         const receipt = a.receipt_redacted_at
-            ? '<span class="text-muted" title="The coordinates were removed by an erasure">redacted</span>'
-            : (a.receipt_recorded ? 'recorded' : '—');
+            ? '<span class="journal-tag" title="The coordinates were removed by an erasure">receipt erased</span>'
+            : '';
+        const what = a.record_kind === 'attempt'
+            ? `${escapeHtml(a.attempt_kind)}${a.operation ? ` · ${escapeHtml(a.operation)}` : ''}`
+            : escapeHtml(a.record_kind);
+        // What the provider said, when it said more than "ok".
+        const answer = a.summary || a.result_detail || '';
+        const said = answer && answer !== 'ok' && answer !== a.provider_status ? answer : '';
         return `
             <tr class="journal-attempt" data-outcome="${escapeAttr(a.outcome || '')}">
-                <td>${a.attempt_no}</td>
-                <td>${escapeHtml(a.record_kind)}${a.record_kind !== 'attempt' ? '' : ` · ${escapeHtml(a.attempt_kind)}`}</td>
-                <td>${escapeHtml(a.outcome || '—')}${a.error_class ? `<div class="text-muted">${escapeHtml(a.error_class)}</div>` : ''}</td>
-                <td>${escapeHtml(a.summary || a.provider_status || '')}</td>
-                <td>${receipt}</td>
-                <td>${when(a.started_at || a.finished_at)}</td>
+                <td class="journal-when">${when(a.started_at || a.finished_at)}</td>
+                <td class="journal-what">
+                    <div class="journal-line">
+                        <span class="journal-no">${a.attempt_no}</span>
+                        <span class="journal-kind">${what}</span>
+                        <span class="journal-outcome journal-outcome-${escapeAttr(a.outcome || 'open')}">${escapeHtml(humanClass(a.outcome) || 'open')}</span>
+                        ${a.error_class ? `<span class="journal-class">${escapeHtml(a.error_class)}</span>` : ''}
+                        ${receipt}
+                    </div>
+                    ${said ? `<div class="journal-said">${escapeHtml(said)}</div>` : ''}
+                </td>
             </tr>`;
     }).join('');
-    return `
-        <table class="delivery-table journal-attempts">
-            <thead><tr><th>#</th><th>Kind</th><th>Outcome</th><th>Summary</th><th>Receipt</th><th>When</th></tr></thead>
-            <tbody>${rows}</tbody>
-        </table>`;
+    return `<table class="journal-list journal-attempts"><tbody>${rows}</tbody></table>`;
 }
 
 function eventsTable(events) {
     if (!events || events.length === 0) {
-        return '<div class="deliveries-empty">No events.</div>';
+        return '<div class="journal-none">Nothing has been recorded.</div>';
     }
-    const rows = events.map(e => `
-        <tr class="journal-event" data-kind="${escapeAttr(e.kind)}">
-            <td>${e.seq}</td>
-            <td><strong>${escapeHtml(e.kind.replace(/_/g, ' '))}</strong>${e.reason ? `<div class="journal-reason">${escapeHtml(e.reason)}</div>` : ''}</td>
-            <td>${actorLabel(e)}</td>
-            <td>${e.from_status || e.to_status ? `${escapeHtml(e.from_status || '·')} → ${escapeHtml(e.to_status || '·')}` : ''}</td>
-            <td>${when(e.at)}</td>
-        </tr>`).join('');
-    return `
-        <table class="delivery-table journal-events">
-            <thead><tr><th>#</th><th>Event</th><th>By</th><th>Status</th><th>When</th></tr></thead>
-            <tbody>${rows}</tbody>
-        </table>`;
+    const rows = events.map(e => {
+        const moved = e.from_status || e.to_status
+            ? `<span class="journal-move">${escapeHtml(humanClass(e.from_status) || '·')} → ${escapeHtml(humanClass(e.to_status) || '·')}</span>`
+            : '';
+        // A short reason - the door's name, an error class - sits on the
+        // line; a sentence gets one of its own.
+        const short = e.reason && e.reason.length <= 40;
+        return `
+            <tr class="journal-event" data-kind="${escapeAttr(e.kind)}">
+                <td class="journal-when">${when(e.at)}</td>
+                <td class="journal-what">
+                    <div class="journal-line">
+                        <span class="journal-no">${e.seq}</span>
+                        <span class="journal-kind">${escapeHtml(humanClass(e.kind))}</span>
+                        ${short ? `<span class="journal-reason">${escapeHtml(e.reason)}</span>` : ''}
+                        ${moved}
+                        <span class="journal-by">${actorLabel(e)}</span>
+                    </div>
+                    ${e.reason && !short ? `<div class="journal-said journal-reason">${escapeHtml(e.reason)}</div>` : ''}
+                </td>
+            </tr>`;
+    }).join('');
+    return `<table class="journal-list journal-events"><tbody>${rows}</tbody></table>`;
 }
 
 export function journalPanel(journal) {
     const d = journal.delivery;
-    const receipt = d.recipient_erased && d.receipt_recorded
-        ? 'recorded, coordinates erased'
-        : (d.receipt_recorded ? 'recorded' : 'none');
+    const said = verdict(journal);
+    const late = journal.observations && journal.observations.length > 0
+        ? `<div class="journal-none">${journal.observations.length === 1 ? 'One result' : `${journal.observations.length} results`} arrived after the attempt was closed and ${journal.observations.length === 1 ? 'is' : 'are'} kept beside it.</div>`
+        : '';
     return `
         <div class="journal">
-            <div class="journal-summary">
+            <div class="journal-head">
                 <div class="journal-status">${statusBadge(d.status)}</div>
-                <dl class="delivery-detail-meta">
-                    <dt>Family</dt><dd>${escapeHtml(d.family)} · ${escapeHtml(d.kind)}</dd>
-                    <dt>Provider</dt><dd>${escapeHtml(d.provider)}</dd>
-                    <dt>To</dt><dd>${targetLabel(d.target_kind, d.target_ref)}${d.recipient_erased ? ' <span class="text-muted">(erased)</span>' : ''}</dd>
-                    <dt>Form</dt><dd>${escapeHtml(d.form === 'editable' ? 'card' : 'message')}</dd>
-                    <dt>Generation</dt><dd>${d.generation_no} · ${d.attempts_in_generation} attempt(s)</dd>
-                    <dt>Revision</dt><dd>desired ${d.desired_revision}, applied ${d.applied_revision ?? '—'}${d.final_revision_applied ? ' (final)' : ''}</dd>
-                    <dt>Receipt</dt><dd>${receipt}</dd>
-                    <dt>Created</dt><dd>${when(d.created_at)}</dd>
-                    <dt>Updated</dt><dd>${when(d.updated_at)}</dd>
-                    ${d.expires_at ? `<dt>Expires</dt><dd>${when(d.expires_at)}${d.expired ? ' (passed)' : ''}</dd>` : ''}
-                    ${d.alert_group_id ? `<dt>Alert group</dt><dd><a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="journal-group-link">${escapeHtml(d.alert_group_id)}</a></dd>` : ''}
-                    <dt>Delivery id</dt><dd class="journal-id">${escapeHtml(d.id)}</dd>
-                </dl>
+                <div class="journal-sentence">${deliverySentence(d)} <span class="journal-via">via ${escapeHtml(providerName(d.provider))}</span></div>
             </div>
-            <div class="detail-subtitle">Attempts</div>
+            ${said ? `<p class="journal-verdict">${said}</p>` : ''}
+            <div class="journal-facts">${facts(d)}</div>
+            <div class="journal-dates">Created ${when(d.created_at)} · last changed ${when(d.updated_at)}</div>
+
+            <h4 class="journal-section">Attempts <span class="journal-section-note">the calls, and the provider's answers</span></h4>
             ${attemptsTable(journal.attempts)}
-            ${journal.observations && journal.observations.length > 0 ? `
-                <div class="detail-subtitle">Late results</div>
-                <div class="deliveries-empty">${journal.observations.length} result(s) arrived after the attempt was closed.</div>` : ''}
-            <div class="detail-subtitle">Events</div>
+            ${late}
+            <h4 class="journal-section">Events <span class="journal-section-note">the delivery's own record</span></h4>
             ${eventsTable(journal.events)}
+
+            <div class="journal-ids">
+                ${d.alert_group_id ? `<span>Alert <a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="journal-group-link">${escapeHtml(d.alert_group_id)}</a></span>` : ''}
+                <span>Delivery <span class="journal-id">${escapeHtml(d.id)}</span></span>
+                <span class="text-muted">${escapeHtml(d.family)} · ${escapeHtml(d.kind)}</span>
+            </div>
         </div>`;
 }
 
@@ -344,7 +446,7 @@ export async function openDeliveryJournal(deliveryId) {
     try {
         const journal = await API.deliveries.get(deliveryId);
         if (openJournalId !== deliveryId) return;
-        Elements.deliveryModalTitle.textContent = `Delivery · ${journal.delivery.status.replace(/_/g, ' ')}`;
+        Elements.deliveryModalTitle.textContent = 'Delivery';
         // A status a person decides about, in a family that offers nothing
         // for it, is told where its door is instead of a button.
         const replayOnly = canReadJournal() && isDecidableStatus(journal.delivery.status) && !canDecide(journal.delivery);

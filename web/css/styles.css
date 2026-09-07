@@ -6910,20 +6910,168 @@ body::before {
     text-decoration: underline;
 }
 
-.journal-summary {
-    margin-bottom: var(--space-md, 16px);
+/* The journal of one delivery: a sentence, a verdict, the facts, the record. */
+.journal {
+    font-size: 0.875rem;
+    line-height: 1.5;
 }
-.journal-status {
-    margin-bottom: var(--space-sm, 8px);
+.journal-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
 }
-.journal-id {
-    font-family: monospace;
+.journal-status .delivery-status {
+    font-size: 0.75rem;
+}
+.journal-sentence {
+    font-size: 1.0625rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.journal-sentence .delivery-target {
+    font-weight: 600;
+}
+.journal-via {
+    font-weight: 400;
+    color: var(--text-secondary, #a1a1aa);
+}
+.journal-verdict {
+    margin: 8px 0 0;
+    color: var(--text-primary);
+    max-width: 60ch;
+}
+.journal-facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px 20px;
+    margin-top: 18px;
+    padding: 12px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+}
+.journal-fact-label {
+    font-size: 0.75rem;
+    color: var(--text-muted, #6b7280);
+}
+.journal-fact-value {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+.journal-dates {
+    margin-top: 8px;
     font-size: 0.8rem;
+    color: var(--text-muted, #6b7280);
 }
-.journal-reason {
+.journal-section {
+    margin: 22px 0 6px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.journal-section-note {
+    font-weight: 400;
+    color: var(--text-muted, #6b7280);
+    margin-left: 6px;
+}
+.journal-list {
+    width: 100%;
+    border-collapse: collapse;
+}
+.journal-list td {
+    padding: 8px 0;
+    border-top: 1px solid var(--border-color);
+    vertical-align: top;
+}
+.journal-list tbody tr:first-child td {
+    border-top: none;
+}
+.journal-when {
+    width: 9.5em;
+    padding-right: 12px !important;
     color: var(--text-muted, #6b7280);
     font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+.journal-line {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.journal-no {
+    color: var(--text-muted, #6b7280);
+    font-size: 0.75rem;
+    min-width: 1.2em;
+}
+.journal-kind {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.journal-outcome,
+.journal-move {
+    color: var(--text-secondary, #a1a1aa);
+}
+.journal-outcome-permanent_rejection {
+    color: #dc2626;
+}
+.journal-outcome-retryable_rejection,
+.journal-outcome-ambiguous {
+    color: #d97706;
+}
+.journal-outcome-accepted {
+    color: #059669;
+}
+.journal-class,
+.journal-tag {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--text-muted, #6b7280);
+}
+.journal-tag {
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    padding: 0 5px;
+}
+.journal-said {
+    margin-top: 2px;
+    color: var(--text-secondary, #a1a1aa);
+    max-width: 60ch;
+}
+.journal-reason {
+    color: var(--text-secondary, #a1a1aa);
+    font-size: 0.85rem;
     font-weight: normal;
+}
+.journal-by {
+    color: var(--text-secondary, #a1a1aa);
+}
+.journal-none {
+    color: var(--text-muted, #6b7280);
+    font-size: 0.85rem;
+    padding: 6px 0;
+}
+.journal-ids {
+    margin-top: 22px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-color);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    font-size: 0.8rem;
+    color: var(--text-secondary, #a1a1aa);
+}
+.journal-id {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+}
+.journal-group-link {
+    color: var(--accent-primary);
 }
 .journal-actor-system {
     color: var(--text-muted, #6b7280);
