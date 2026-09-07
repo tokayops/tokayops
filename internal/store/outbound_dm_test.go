@@ -19,10 +19,14 @@ func stepCard(ref string, index int) keys.EscalationCommitment {
 	return c
 }
 
+// intentAddressedTo is the card or the message sent to a recipient - never
+// the thread or the reply that follow a card, which carry the card's channel
+// as their own recipient and would otherwise be found by scan order.
 func intentAddressedTo(t *testing.T, s *Store, agID, ref string) string {
 	t.Helper()
 	var id string
-	if err := s.db.QueryRow(`SELECT id FROM outbound_intents WHERE alert_group_id = $1 AND target_ref = $2`,
+	if err := s.db.QueryRow(`SELECT id FROM outbound_intents
+		WHERE alert_group_id = $1 AND target_ref = $2 AND parent_intent_id IS NULL`,
 		agID, ref).Scan(&id); err != nil {
 		t.Fatalf("find the commitment to %s: %v", ref, err)
 	}

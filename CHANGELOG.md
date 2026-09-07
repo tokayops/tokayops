@@ -179,8 +179,7 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   filled in from the alert, in Slack and in Telegram alike. The form promised
   this since the first version and no version did it. A message naming
   anything else, or one that does not parse, is refused when the policy is
-  saved, with the reason. A message is at most a thousand characters after
-  filling in.
+  saved, with the reason. A message is at most a thousand characters.
 - **"Continue on failure" on a policy step means something now.** With it
   switched off, a step that fails for good - the provider refused, or the
   recipient has no linked account - stops the escalation: the later steps that
