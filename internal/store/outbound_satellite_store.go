@@ -17,11 +17,17 @@ import (
 
 // The claim's view of a satellite, and the lateness measure's: the card it
 // follows and whether the group's last revision is out, joined to the queue
-// row as `due`. A thread goes once its card has a message or has ended, the
-// reply only once the group's last revision is out as well. A satellite whose
-// card is alive without a message is not late - it is waiting for the card -
-// and a card in manual review must not light the paging alarm through its
-// thread.
+// row as `due`. A thread goes once its card has a message or has ended. The
+// reply goes only once the group's last revision is out AND the card has
+// said its last word - ended, which for a card with a message means the
+// last revision applied. Not merely once the card has a message: a reply
+// posted while the card's last update is in flight makes Slack tell every
+// client about the parent - its reply count changed - with the card as it
+// was, and a client that hears that after the update shows the old card
+// until it is reloaded. The resolution is announced under a card that
+// already shows it. A satellite whose card is alive without a message is not
+// late - it is waiting for the card - and a card in manual review must not
+// light the paging alarm through its thread.
 //
 // Joins, not correlated subqueries: each is one index probe, and a subquery
 // leaves the planner an alternative that walks the table, which the claim's
@@ -34,7 +40,8 @@ const satelliteJoins = `
 var satelliteMayGo = `
 	AND (due.parent_intent_id IS NULL
 	     OR parent.receipt_recorded OR parent.status IN (` + terminalStatusList + `))
-	AND (due.target_kind <> 'thread_reply' OR closing.final)`
+	AND (due.target_kind <> 'thread_reply'
+	     OR (closing.final AND parent.status IN (` + terminalStatusList + `)))`
 
 // notFollowingASentCard is the withdrawal's predicate: a satellite is
 // withdrawn only while its card has no message. A card that went out keeps its

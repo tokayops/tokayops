@@ -158,9 +158,10 @@ func hasJournalLine(lines []string, prefix string) bool {
 }
 
 // TestASatelliteWaitsForItsCard is the claim's predicate. The thread is not
-// claimed until the card has a message, and the reply not until the alert is
-// over as well; while they wait they are not late either, because waiting is
-// what they are for.
+// claimed until the card has a message; the reply not until the alert is over
+// AND the card has applied its last revision - a resolution announced under a
+// card still saying "acknowledged" made Slack clients keep the old card. While
+// they wait they are not late either, because waiting is what they are for.
 func TestASatelliteWaitsForItsCard(t *testing.T) {
 	s := setupTestDB(t)
 	s.SetRenderEnvironment("https://tokay.example", "UTC")
@@ -202,13 +203,27 @@ func TestASatelliteWaitsForItsCard(t *testing.T) {
 		t.Fatalf("the queue is %.0fs late on a reply that is waiting for the end", late)
 	}
 
-	// The alert ends: the reply is claimable, and late from when it was due.
+	// The alert ends: the card and the thread are aimed at the last revision,
+	// and the reply still waits - for the card to show the end first.
 	endTheAlert(t, s, agID)
+	leases = claimable(t, s)
+	if _, ok := leases[reply]; ok {
+		t.Fatal("the reply was claimed before the card applied the last revision")
+	}
+	if _, ok := leases[card]; !ok {
+		t.Fatal("the card was not claimed for its last revision")
+	}
+	postOne(t, s, card, leases[card])
+	if got := statusOf(t, s, card); got != outbound.StatusSucceeded {
+		t.Fatalf("the card is %s after its last revision", got)
+	}
+
+	// The card says the end: the reply goes, late from when it was due.
 	if late, _ := latenessOf(t, s, testFamily); late < 3600 {
 		t.Fatalf("the queue is %.0fs late on a reply that has been due for an hour", late)
 	}
 	if _, ok := claimable(t, s)[reply]; !ok {
-		t.Fatal("the reply was not claimed once the alert was over")
+		t.Fatal("the reply was not claimed once the card had said the end")
 	}
 }
 
@@ -559,8 +574,9 @@ func TestTheReplyIsDrawnFromTheEnd(t *testing.T) {
 	s := setupTestDB(t)
 	s.SetRenderEnvironment("https://tokay.example", "UTC")
 	agID := desiredGroup(t, s, "Disk filling up")
-	_, _, reply := cardWithSatellites(t, s, agID)
+	card, _, reply := cardWithSatellites(t, s, agID)
 	final := endTheAlert(t, s, agID)
+	postOne(t, s, card, claimable(t, s)[card]) // the card shows the end first
 
 	begun := beginOne(t, s, reply, claimable(t, s)[reply])
 	if got := revisionOf(t, begun); got != final {
