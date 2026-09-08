@@ -99,11 +99,12 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	if !ok || teamID == "" {
 		teamID = "triage"
 	}
-	severity, ok := payload.CommonLabels["severity"]
-	if !ok || severity == "" {
-		severity = "info"
-	}
-	severity = strings.ToLower(severity)
+	// Severity is one of three words from here on: routing, the firehose, the
+	// UI and the metrics read it, and none of them has an answer for a fourth.
+	// A missing label is info, and so is any other word - said once, below,
+	// when the incident it opens is created, not on every repeat of the payload.
+	rawSeverity := strings.ToLower(payload.CommonLabels["severity"])
+	severity, knownSeverity := normalSeverity(rawSeverity)
 
 	metrics.AlertsReceivedTotal.WithLabelValues(teamID, severity).Inc()
 	log.Printf("Ingester: Group %s (Team: %s, Sev: %s, Alerts: %d)", alertKey, teamID, severity, len(payload.Alerts))
@@ -242,6 +243,10 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		return c.String(http.StatusInternalServerError, "Failed to persist")
 	}
 	metrics.AlertGroupsCreatedTotal.WithLabelValues(teamID, severity).Inc()
+	if !knownSeverity {
+		log.Printf("Ingester: severity %q of %s is none of critical, warning, info; alert group %s counts as info",
+			rawSeverity, alertKey, ag.ID)
+	}
 	// Deliberately here and not at the lookup above: counting there would also
 	// count Alertmanager retries, the duplicate-key path that merges into an
 	// existing group, and requests that go on to fail.
@@ -251,6 +256,20 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	log.Printf("Ingester: Created alert group %s", ag.ID)
 
 	return c.String(http.StatusOK, "Created")
+}
+
+// normalSeverity folds the label into the three severities the rest of the
+// system knows: an empty label is info, and so is a word that is none of
+// them. The second answer says whether the label was one of the three.
+func normalSeverity(label string) (severity string, known bool) {
+	switch label {
+	case "critical", "warning", "info":
+		return label, true
+	case "":
+		return "info", true
+	default:
+		return "info", false
+	}
 }
 
 func (i *Ingester) generateTitle(p *AMPayload) string {

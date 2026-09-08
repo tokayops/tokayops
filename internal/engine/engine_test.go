@@ -1177,22 +1177,19 @@ func escalationOf(t *testing.T, batch outbound.Batch) outbound.EscalationContext
 }
 
 // TestTheFirehoseChannelFollowsTheSeverity. Each of the three severities has
-// its own firehose channel, and an alert of a severity without one - the key
-// left empty, or a word the configuration has no key for - gets no firehose
-// card at all, rather than the warning channel's.
+// its own firehose channel, and an alert of a severity whose channel is left
+// empty gets no firehose card at all, rather than the warning channel's.
 func TestTheFirehoseChannelFollowsTheSeverity(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		global   config.GlobalConfig
 		severity string
 		channel  string // empty: no firehose card
-		recorded bool   // the history says why there is none
 	}{
-		{"critical", allThree, "critical", "C_CRIT", false},
-		{"warning", allThree, "warning", "C_WARN", false},
-		{"info", allThree, "info", "C_INFO", false},
-		{"a severity the configuration has no key for", allThree, "error", "", true},
-		{"info without a channel", config.GlobalConfig{FirehoseCriticalChannel: "C_CRIT", FirehoseWarningChannel: "C_WARN"}, "info", "", false},
+		{"critical", allThree, "critical", "C_CRIT"},
+		{"warning", allThree, "warning", "C_WARN"},
+		{"info", allThree, "info", "C_INFO"},
+		{"info without a channel", config.GlobalConfig{FirehoseCriticalChannel: "C_CRIT", FirehoseWarningChannel: "C_WARN"}, "info", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := store.NewMockStore()
@@ -1205,16 +1202,8 @@ func TestTheFirehoseChannelFollowsTheSeverity(t *testing.T) {
 				t.Fatal("nothing was admitted")
 			}
 			cards, satellites := cardsOf(admission.Admission.Commitments)
-			// A severity without a key is a card the history accounts for; an
-			// empty channel of a known severity is the operator's choice and
-			// leaves no line.
-			unpromised := escalationOf(t, admission).Unpromised
-			if tc.recorded {
-				if len(unpromised) != 1 || unpromised[0].Reason != outbound.ReasonNoFirehoseChannel ||
-					unpromised[0].Detail != fmt.Sprintf("severity %q", tc.severity) {
-					t.Fatalf("severity %q left %+v in the history, want one no_firehose_channel line naming it", tc.severity, unpromised)
-				}
-			} else if len(unpromised) != 0 {
+			// An empty channel is the operator's choice and leaves no line.
+			if unpromised := escalationOf(t, admission).Unpromised; len(unpromised) != 0 {
 				t.Fatalf("severity %q left %+v in the history, want nothing", tc.severity, unpromised)
 			}
 			if tc.channel == "" {

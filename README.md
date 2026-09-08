@@ -113,11 +113,10 @@ global:
 ```
 
 Firehose sends full messages with timeline, updates and resolve notifications.
-Each severity has its own channel. A severity whose channel is left empty
-gets no firehose messages, and so does an alert whose `severity` label is
-none of `critical`, `warning` and `info`; an alert without the label counts
-as `info`. A severity the configuration has no key for leaves a line in the
-alert's history saying so.
+Each severity has its own channel, and a severity whose channel is left
+empty gets no firehose messages. An alert's severity is one of `critical`,
+`warning` and `info`: an alert whose `severity` label is missing, or is any
+other word, counts as `info`.
 
 A direct message about an alert always links to the alert in TokayOps, and to
 the card in the channel once that card is out. When the policy posted no

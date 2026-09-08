@@ -12,11 +12,25 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 ### Upgrade notes
 
 - **Info alerts leave the warning firehose channel** - including every alert
-  whose `severity` label is missing, which counts as `info`. Set
-  `firehose_info_channel` in `tokay.yaml` to keep a firehose for them; left
-  unset, they get no firehose card from this version on. An alert whose
-  severity is none of `critical`, `warning` and `info` gets none either, and
-  its history says so.
+  whose `severity` label is missing or is none of `critical`, `warning` and
+  `info`, since all of those count as `info` now. Set `firehose_info_channel`
+  in `tokay.yaml` to keep a firehose for them; left unset, they get no
+  firehose card from this version on.
+- **A severity route by any word other than the three stops being taken.**
+  An alert that used to match `severity_routes["error"]` counts as `info`
+  now and escalates by the team's `info` route or its default policy - other
+  steps, other people. Before the upgrade, find the teams that have such a
+  route and move them to one of the three:
+
+  ```sql
+  SELECT id, name, severity_routes FROM teams
+   WHERE EXISTS (SELECT 1 FROM jsonb_object_keys(severity_routes) k
+                 WHERE k NOT IN ('critical', 'warning', 'info'));
+  ```
+
+  The start names them in the log as well. Alert groups still waiting for
+  admission with another word are folded into `info` at start; those past
+  admission keep their word, which nothing reads for a decision any more.
 - **Stop every running instance before starting this version.** An older
   instance left running against the upgraded database fails on any read of an
   alert group - the column carrying an alert's own key is renamed at startup,
@@ -152,10 +166,17 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ### Changed
 
+- **An alert's severity is one of `critical`, `warning` and `info`, decided
+  where the alert comes in.** A missing `severity` label counted as `info`
+  before; now so does any other word, and the ingester logs the word once,
+  when the incident it opens is created. Routing, the firehose, the UI and
+  the metrics read the same three values - `alerts_received_total{severity}`
+  in particular no longer takes its label from whatever an alert rule says.
+  A team's severity route by any other word is refused by the API, in the
+  manual alert's words, and one saved earlier is named in the log at start.
 - **Info alerts no longer go to the warning firehose channel.** They go to
-  `firehose_info_channel`, or nowhere when it is empty; an alert of an unknown
-  severity goes nowhere as well. Before, everything that was not critical
-  went to the warning channel.
+  `firehose_info_channel`, or nowhere when it is empty. Before, everything
+  that was not critical went to the warning channel.
 - **The message about an alert is now kept up to date by the part of TokayOps
   that sent it.** Before, a separate background job edited it, and the two could
   disagree about what it should say. Every change to an alert - an alert
@@ -399,10 +420,7 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 - **`firehose_info_channel`** in `tokay.yaml`: the firehose channel for info
   alerts, beside the critical and warning ones. A severity whose channel is
-  left empty gets no firehose card, and so does an alert whose `severity`
-  label is none of `critical`, `warning` and `info` - that one leaves a line
-  in the alert's history, `No firehose channel for severity "..."`, because
-  it is usually a typo in an alert rule.
+  left empty gets no firehose card.
 - `engine_escalation_build_deferrals_total` counts escalations held back because
   the on-call recipients could not be resolved. Its increase over a window
   should normally be zero; alert on a positive increase rather than on the

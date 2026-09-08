@@ -56,11 +56,8 @@ type planner struct {
 
 	// firehose is the channel THIS alert's severity routes to, settled when
 	// the plan starts rather than asked again while it is being built. Empty
-	// for a severity whose channel is not configured, and for one the
-	// configuration has no key for - firehoseSeverity tells the two apart.
-	firehose         string
-	firehoseSeverity string
-	firehoseKnown    bool
+	// when the severity's channel is not configured: no firehose card then.
+	firehose string
 }
 
 // firehoseProvider: the firehose is Slack-only, deliberately, as it was.
@@ -94,8 +91,7 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup,
 	}
 
 	plan := *p
-	plan.firehoseSeverity = ag.Severity
-	plan.firehose, plan.firehoseKnown = p.firehoseChannel(ag.Severity)
+	plan.firehose = p.firehoseChannel(ag.Severity)
 
 	// Who the people named by this plan actually are, resolved once and shared.
 	// The commitments and the snapshot on the group are the same answer about
@@ -389,17 +385,6 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 		seen       = map[string]bool{}
 	)
 
-	if !p.firehoseKnown {
-		// A severity the configuration has no key for: a card that was never
-		// going to be sent, which is a fact the history states rather than a
-		// silence. An empty channel of a known severity is the operator's
-		// choice and says nothing.
-		unpromised = append(unpromised, outbound.UnpromisedStep{
-			Step:   "firehose",
-			Reason: outbound.ReasonNoFirehoseChannel,
-			Detail: fmt.Sprintf("severity %q", p.firehoseSeverity),
-		})
-	}
 	if p.firehose != "" {
 		card := plannedCommitment{
 			commitment: keys.EscalationCommitment{
@@ -549,24 +534,23 @@ func (p *planner) recipients(ctx context.Context, resolver *scheduleResolver,
 	return []keys.Target{{Kind: kind, Ref: step.TargetID}}, nil
 }
 
-// firehoseChannel is the firehose channel of a severity, and whether the
-// configuration has a key for that severity at all. The channel is empty when
-// it is not configured and when there is no key; the second answer tells a
-// severity nobody set up from one nobody could have. Severity arrives
-// lower-cased from the ingester.
-func (p *planner) firehoseChannel(severity string) (channel string, known bool) {
+// firehoseChannel is the firehose channel of a severity, empty when none is
+// configured. The ingester keeps the severity to the three words, and the
+// start folds the groups still waiting from before it did, so the last case
+// is not reached by a group this build admits.
+func (p *planner) firehoseChannel(severity string) string {
 	if p.cfg == nil {
-		return "", true
+		return ""
 	}
 	switch severity {
 	case "critical":
-		return p.cfg.Global.FirehoseCriticalChannel, true
+		return p.cfg.Global.FirehoseCriticalChannel
 	case "warning":
-		return p.cfg.Global.FirehoseWarningChannel, true
+		return p.cfg.Global.FirehoseWarningChannel
 	case "info":
-		return p.cfg.Global.FirehoseInfoChannel, true
+		return p.cfg.Global.FirehoseInfoChannel
 	default:
-		return "", false
+		return ""
 	}
 }
 

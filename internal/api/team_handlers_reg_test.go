@@ -119,3 +119,43 @@ func TestUpdateTeam_UseDefaultClearsSeverityRoutes(t *testing.T) {
 		t.Errorf("default policy = %q, want policy-default", updated.DefaultPolicyID)
 	}
 }
+
+// TestUpdateTeam_ARouteByAFourthSeverityIsRefused. The ingester folds every
+// alert into critical, warning and info, so a route by any other word would
+// never be taken; it is refused in the manual alert's words.
+func TestUpdateTeam_ARouteByAFourthSeverityIsRefused(t *testing.T) {
+	e := echo.New()
+	s := store.NewMockStore()
+	api := NewAPI(s, nil, nil, nil, "", nil)
+	admin := &model.User{ID: "admin-1", Role: model.UserRoleAdmin}
+	s.CreateUser(admin)
+	team := &model.Team{ID: "team-1", Name: "Team 1", CreatedAt: time.Now()}
+	s.CreateTeam(team)
+	s.CreateEscalationPolicy(&model.EscalationPolicy{ID: "policy-err", Name: "Err Policy", TeamID: &team.ID})
+
+	body, _ := json.Marshal(map[string]any{"name": "Team 1", "severity_routes": map[string]string{"error": "policy-err"}})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/team-1", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues("team-1")
+	c.Set("user_id", admin.ID)
+	if err := api.UpdateTeam(c); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("a route by severity error answered %d, want 400", rec.Code)
+	}
+	var resp ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error != "invalid severity: must be critical, warning, or info" {
+		t.Fatalf("the refusal says %q", resp.Error)
+	}
+	saved, _ := s.GetTeamByID("team-1")
+	if len(saved.SeverityRoutes) != 0 {
+		t.Fatalf("the route was saved anyway: %v", saved.SeverityRoutes)
+	}
+}
