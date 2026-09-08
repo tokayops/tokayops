@@ -19,12 +19,17 @@ import (
 // The Telegram channel as the outbound worker uses it.
 
 func handlerState(t *testing.T) keys.RenderSnapshot {
+	return handlerStateWith(t, nil)
+}
+
+// handlerStateWith is the frozen state with buttons on for the named providers.
+func handlerStateWith(t *testing.T, buttons []string) keys.RenderSnapshot {
 	t.Helper()
 	groupURL := "https://tokay.example/#/ops/alert-groups/ag-1"
 	state, err := keys.NewRenderSnapshot(keys.SnapshotInput{
 		AlertGroupID: "ag-1", Status: keys.GroupTriggered, Title: "Disk filling up",
 		Severity: "critical", TeamOnboarded: true, GroupURL: &groupURL,
-		DisplayTimezone: "UTC",
+		DisplayTimezone: "UTC", InteractiveProviders: buttons,
 		Alerts: []keys.AlertSnapshot{{
 			Fingerprint: "fp-1", Status: keys.AlertFiring,
 			StartsAt:  time.Unix(1700000000, 0).UTC(),
@@ -37,13 +42,24 @@ func handlerState(t *testing.T) keys.RenderSnapshot {
 	return state
 }
 
+// handlerCall is a call whose SNAPSHOT says whether the card has buttons. The
+// payload says the same, as version 1 payloads do, and is not what decides.
 func handlerCall(t *testing.T, kind keys.TargetKind, interactive bool) outbound.Call {
+	t.Helper()
+	var buttons []string
+	if interactive {
+		buttons = []string{keys.InteractiveTelegram}
+	}
+	return handlerCallWith(t, kind, interactive, handlerStateWith(t, buttons))
+}
+
+func handlerCallWith(t *testing.T, kind keys.TargetKind, payloadSays bool, state keys.RenderSnapshot) outbound.Call {
 	t.Helper()
 	payload, err := json.Marshal(keys.EscalationPayloadV1{
 		Slot:   keys.Slot{Kind: keys.SlotFirehose},
 		Target: keys.Target{Kind: kind, Ref: "-1001"},
 		// Direct messages carry the escalation's own words.
-		Interactive: interactive,
+		Interactive: payloadSays,
 	})
 	if err != nil {
 		t.Fatalf("build the payload: %v", err)
@@ -53,7 +69,7 @@ func handlerCall(t *testing.T, kind keys.TargetKind, interactive bool) outbound.
 		AttemptKind: outbound.AttemptCreate, Operation: outbound.OperationSend,
 		Endpoint: "-1001", ProviderKey: "create-key",
 		KeyKind: keys.KindEscalation, Family: outbound.FamilyNotification,
-		Content: snapshotContent(t, handlerState(t)), Payload: payload,
+		Content: snapshotContent(t, state), Payload: payload,
 		PayloadSchemaVersion: (keys.EscalationPayloadV1{}).SchemaVersion(),
 	}
 }
@@ -139,9 +155,23 @@ func TestOneAttemptIsOneCall(t *testing.T) {
 	}
 }
 
-// TestButtonsFollowTheAdmission. An empty keyboard is not the same as no
-// keyboard, and the difference has to survive into the request.
-func TestButtonsFollowTheAdmission(t *testing.T) {
+// TestButtonsFollowTheSnapshot. An empty keyboard is not the same as no
+// keyboard, and the difference has to survive into the request. What decides
+// is the snapshot the revision was frozen with - where the button switch can
+// reach it - and not what the payload said when the commitment was admitted.
+func TestButtonsFollowTheSnapshot(t *testing.T) {
+	// The payload says buttons; the snapshot says none. The snapshot wins.
+	payloadOnly := newBotAPI(t)
+	if _, err := handlerFor(payloadOnly).ExecuteAttempt(context.Background(),
+		handlerCallWith(t, keys.TargetChannel, true, handlerStateWith(t, nil))); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if markup, _ := payloadOnly.calls[0]["reply_markup"].(map[string]any); markup == nil {
+		t.Fatal("expected an empty keyboard from a snapshot without buttons")
+	} else if rows, _ := markup["inline_keyboard"].([]any); len(rows) != 0 {
+		t.Fatalf("the payload's word put %d rows of buttons on a card the snapshot drew without", len(rows))
+	}
+
 	api := newBotAPI(t)
 	handler := handlerFor(api)
 
@@ -280,7 +310,7 @@ func TestTelegramAnswersAreTranslatedNotInterpreted(t *testing.T) {
 	}
 
 	for status, want := range cases {
-		answer, known := handler.ClassifyResponse(outbound.Result{
+		answer, known := handler.ClassifyResponse(outbound.Call{AttemptKind: outbound.AttemptCreate}, outbound.Result{
 			Evidence: outbound.ProviderResponse, Status: status,
 		})
 		if known != want.known {
@@ -314,7 +344,7 @@ func TestARejectedSendCarriesWhatTelegramSaid(t *testing.T) {
 	if result.Evidence != outbound.ProviderResponse {
 		t.Fatalf("Telegram answered and it was recorded as %q", result.Evidence)
 	}
-	answer, known := handler.ClassifyResponse(result)
+	answer, known := handler.ClassifyResponse(outbound.Call{AttemptKind: outbound.AttemptCreate}, result)
 	if !known || answer.Outcome != outbound.OutcomePermanentRejection {
 		t.Fatalf("a blocked bot classified %q (known=%v)", answer.Outcome, known)
 	}
@@ -353,7 +383,7 @@ func TestWhatTelegramSaysAboutAChange(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			answer, known := handler.ClassifyResponse(outbound.Result{
+			answer, known := handler.ClassifyResponse(outbound.Call{AttemptKind: outbound.AttemptMutation}, outbound.Result{
 				Evidence: outbound.ProviderResponse, Status: tc.status,
 			})
 			if !known {
@@ -502,8 +532,10 @@ func TestADirectMessageIsPlainText(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 
+	// The words are the policy's, as written; the link to the alert is not
+	// theirs to replace.
 	sent := api.calls[0]
-	if got, _ := sent["text"].(string); got != override {
+	if got, _ := sent["text"].(string); got != override+"\nhttps://tokay.example/#/ops/alert-groups/ag-1" {
 		t.Fatalf("the message was rewritten: %q", got)
 	}
 	if mode, marked := sent["parse_mode"]; marked {
@@ -572,5 +604,59 @@ func TestACallWithNoStateToRenderIsRefused(t *testing.T) {
 	}
 	if len(api.calls) != 0 {
 		t.Fatal("the channel was called anyway")
+	}
+}
+
+// TestAMissingMessageProvesNothingAboutACreate. "message to edit not found"
+// is about the message a change was aimed at; said to a create it names
+// nothing this commitment made, and is doubt rather than proof of absence.
+func TestAMissingMessageProvesNothingAboutACreate(t *testing.T) {
+	handler := NewHandler(nil, nil)
+	answer, known := handler.ClassifyResponse(outbound.Call{AttemptKind: outbound.AttemptCreate}, outbound.Result{
+		Evidence: outbound.ProviderResponse, Status: "400:Bad Request: message to edit not found",
+	})
+	if !known || answer.Outcome != outbound.OutcomeAmbiguous || answer.Detail != nil {
+		t.Fatalf("a create answered 'message to edit not found' classified %+v (known=%v)", answer, known)
+	}
+}
+
+// TestTelegramHasNoThreads. The messages under a card exist on one provider;
+// a commitment addressing them to Telegram is refused before the network, by
+// name, rather than sent as a card.
+func TestTelegramHasNoThreads(t *testing.T) {
+	handler := NewHandler(&mockTelegramTokenSource{token: "tok"}, nil)
+	for _, kind := range []keys.TargetKind{keys.TargetThread, keys.TargetThreadReply} {
+		prepared := handler.Prepare(context.Background(), intentFor(t, keys.Target{Kind: kind, Ref: "C0001"}))
+		if got := prepared.Request("i", "t", "w").ErrorClass; prepared.Outcome() != outbound.PreparationPermanent ||
+			got != "unsupported_target" {
+			t.Fatalf("a %s was prepared as %s %q", kind, prepared.Outcome(), got)
+		}
+	}
+}
+
+// TestThePolicysWordsAreATemplateInTelegramToo. The same four names, filled
+// in as they are: a direct message here is plain text.
+func TestThePolicysWordsAreATemplateInTelegramToo(t *testing.T) {
+	api := newBotAPI(t)
+	handler := handlerFor(api)
+
+	template := "{{.Title}} ({{.AlertsCount}} alert, {{.Severity}})"
+	payload, err := json.Marshal(keys.EscalationPayloadV2{
+		Slot:            keys.Slot{Kind: keys.SlotPolicy, Index: 1},
+		Target:          keys.Target{Kind: keys.TargetUser, Ref: "user-1"},
+		MessageOverride: &template,
+	})
+	if err != nil {
+		t.Fatalf("build the payload: %v", err)
+	}
+	call := handlerCall(t, keys.TargetUser, true)
+	call.Payload = payload
+	call.PayloadSchemaVersion = 2
+	call.Endpoint = "5551"
+	if _, err := handler.ExecuteAttempt(context.Background(), call); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got, _ := api.calls[0]["text"].(string); got != "Disk filling up (1 alert, critical)\nhttps://tokay.example/#/ops/alert-groups/ag-1" {
+		t.Fatalf("the message reads %q", got)
 	}
 }

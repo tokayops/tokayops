@@ -102,13 +102,6 @@ test.describe('delivery actors', () => {
           type: 'notification_failed', message: 'failed', created_at: at, actor: 'system',
           metadata: { intent_id: hostile, provider: 'slack', target_kind: 'user', target_ref: hostile },
         }),
-        mod.groupDeliveriesBlock({
-          paging: [{ id: hostile, status: 'permanent_failed', provider: 'slack', target_kind: 'user',
-            target_ref: hostile, form: 'oneshot', created_at: at }],
-          events: [{ event_id: hostile, event_type: 'alert_group.firing', status: 'fanned_out', created_at: at,
-            batches: [{ batch_id: hostile, kind: 'webhook_event', outcome: 'admitted', intent_count: 1, admitted_at: at,
-              deliveries: [{ id: hostile, status: 'pending', target_kind: 'subscriber', target_ref: hostile, created_at: at }] }] }],
-        }),
       ].map(html => `<div class="line">${html}</div>`).join('');
       await mod.hydrateUserNames(root);
       const attrs = (selector: string, name: string) =>
@@ -126,13 +119,12 @@ test.describe('delivery actors', () => {
 
     expect(result.title, 'nothing ran').toBe('harness');
     expect(result.handlers, 'no attribute was opened').toBe(0);
-    // Five places name the person: the two labels, the timeline's target twice
-    // (its own helper and the event), the paging row.
-    expect(result.userIds, 'every user id is the id, whole').toEqual(Array(5).fill(HOSTILE));
-    // Six name the delivery: the timeline line and its button, the paging row
-    // and its button, the webhook row and its button.
-    expect(result.deliveryIds).toEqual(Array(6).fill(HOSTILE));
-    expect(result.eventIds).toEqual([HOSTILE]);
+    // Four places name the person: the two labels, the timeline's target
+    // twice (its own helper and the event).
+    expect(result.userIds, 'every user id is the id, whole').toEqual(Array(4).fill(HOSTILE));
+    // Two name the delivery: the timeline line and its button.
+    expect(result.deliveryIds).toEqual(Array(2).fill(HOSTILE));
+    expect(result.eventIds).toEqual([]);
     // And the directory was asked for the id as it is, and answered for it.
     expect(result.asked.flat().every(id => id === HOSTILE)).toBe(true);
     expect(result.names.every(name => name === 'Named ' + HOSTILE.length)).toBe(true);

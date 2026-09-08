@@ -315,6 +315,50 @@ func (w *Worker) claim(ctx context.Context, free int, tick uint64) []Leased {
 	return taken
 }
 
+// gateDecision is what the satellite gate said: ask the channel, use the
+// preparation it stated, or leave the commitment alone.
+type gateDecision int
+
+const (
+	gateAsk gateDecision = iota
+	gateDecided
+	gateSkip
+)
+
+// satelliteGate is the domain's own answer for a satellite, before its
+// channel is asked. A card with a message: the channel prepares, and the
+// endpoint is the card's coordinates. A card that ended without one: a refusal
+// the store records only after checking the card again under its lock. No
+// card at all cannot happen - every satellite has one by the schema - and is
+// a contract violation, counted and left for the lease to expire. A card
+// alive without a message is kept out of the queue by the claim's predicate,
+// and reaching here means the card was brought back between the claim and
+// this read of it: the claim is three statements, not one transaction. That
+// is a race, not a defect - the satellite is left alone, and the claim decides
+// again when the lease runs out.
+func (w *Worker) satelliteGate(intent Intent) (Preparation, gateDecision) {
+	if !intent.Satellite() {
+		return Preparation{}, gateAsk
+	}
+	parent := intent.Parent
+	switch {
+	case parent == nil:
+		metrics.OutboundContractViolationsTotal.WithLabelValues("claim", "satellite_without_parent").Inc()
+		log.Printf("outbound worker %s: %s is a %s with no card to follow; leaving it",
+			w.workerID, intent.ID, intent.TargetKind)
+		return Preparation{}, gateSkip
+	case parent.ReceiptRecorded:
+		return Preparation{}, gateAsk
+	case parent.Ended():
+		return Impossible(ParentEndedWithoutMessage, fmt.Sprintf(
+			"the card %s ended as %s without a message", parent.ID, parent.Status)), gateDecided
+	default:
+		log.Printf("outbound worker %s: the card %s of %s was brought back after the claim; leaving it for the queue",
+			w.workerID, parent.ID, intent.ID)
+		return Preparation{}, gateSkip
+	}
+}
+
 // sortedProviders keeps a pass reproducible. The shares are already decided;
 // what the order settles is who is asked first when the last slots run out
 // mid-pass, and a map's order would make that different every run.
@@ -343,9 +387,17 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 	}
 	detached := context.WithoutCancel(parent)
 
-	prepareCtx, cancelPrepare := context.WithTimeout(detached, w.policy.PrepareDeadline)
-	prepared := channel.Prepare(prepareCtx, leased.Intent)
-	cancelPrepare()
+	// A satellite is answered by the domain first: what it may do follows
+	// from the card, not from anything the channel knows.
+	prepared, decided := w.satelliteGate(leased.Intent)
+	if decided == gateSkip {
+		return
+	}
+	if decided == gateAsk {
+		prepareCtx, cancelPrepare := context.WithTimeout(detached, w.policy.PrepareDeadline)
+		prepared = channel.Prepare(prepareCtx, leased.Intent)
+		cancelPrepare()
+	}
 
 	beginCtx, cancelBegin := w.recording(detached)
 	begun, err := w.store.BeginAttempt(beginCtx,
@@ -372,7 +424,11 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 	// ever contain attempts that came back, so a provider that hangs and a
 	// process that dies would quietly remove exactly the worst measurements
 	// from a metric about how long a page takes to go out.
-	if begun.FirstAttemptLatency != nil {
+	//
+	// Not for a satellite. Its first attempt waits for the card's message,
+	// which is a dependency and not a delay of the page; a thread counted here
+	// would report the card's latency twice and a little worse.
+	if begun.FirstAttemptLatency != nil && !leased.Intent.Satellite() {
 		metrics.OutboundAdmissionLatencySeconds.WithLabelValues(w.family).
 			Observe(*begun.FirstAttemptLatency)
 	}
@@ -386,6 +442,7 @@ func (w *Worker) serve(parent context.Context, leased Leased) {
 		Operation:            begun.Operation,
 		Endpoint:             begun.BoundEndpoint,
 		ProviderKey:          begun.ProviderKey,
+		BoundContext:         begun.BoundContext,
 		Receipt:              begun.Receipt,
 		ReceiptRef:           begun.ReceiptRef,
 		KeyKind:              leased.Intent.KeyKind,

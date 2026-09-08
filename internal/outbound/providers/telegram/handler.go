@@ -81,7 +81,7 @@ func (h *Handler) Prepare(ctx context.Context, intent outbound.Intent) outbound.
 	mayBeChanged := false
 	switch intent.KeyKind {
 	case keys.KindEscalation, keys.KindEscalationReplay:
-		payload, err := keys.DecodeEscalationPayloadV1(intent.PayloadSchemaVersion, intent.Payload)
+		payload, err := keys.DecodeEscalationPayload(intent.PayloadSchemaVersion, intent.Payload)
 		if err != nil {
 			return outbound.Impossible("payload_unreadable", err.Error())
 		}
@@ -257,7 +257,7 @@ func (h *Handler) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbo
 // Telegram answers with an HTTP-ish code and a sentence, and only some of those
 // sentences prove the message was not created. Those are named here; everything
 // else is doubt, decided by the domain.
-func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification, bool) {
+func (h *Handler) ClassifyResponse(call outbound.Call, res outbound.Result) (outbound.Classification, bool) {
 	if res.Status == "ok" {
 		return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
 	}
@@ -291,6 +291,13 @@ func (h *Handler) ClassifyResponse(res outbound.Result) (outbound.Classification
 			return outbound.Classification{Outcome: outbound.OutcomeAccepted}, true
 		}
 		if strings.Contains(lower, "message to edit not found") {
+			if call.AttemptKind != outbound.AttemptMutation {
+				// Said to a create, it is about nothing this commitment made:
+				// doubt, under its own name.
+				return outbound.Classification{
+					Outcome: outbound.OutcomeAmbiguous, Class: "message_gone",
+				}, true
+			}
 			// The message is gone. The one fact an ordinary answer proves about
 			// the object, and the only ground for making a second one.
 			absent := keys.DetailDefinitelyAbsent
@@ -373,7 +380,7 @@ func (h *Handler) write(call outbound.Call, body map[string]interface{}) (outbou
 		return outbound.Result{}, nil
 
 	case keys.KindEscalation, keys.KindEscalationReplay:
-		payload, err := keys.DecodeEscalationPayloadV1(call.PayloadSchemaVersion, call.Payload)
+		payload, err := keys.DecodeEscalationPayload(call.PayloadSchemaVersion, call.Payload)
 		if err != nil {
 			return outbound.Result{
 				Evidence: outbound.DefinitelyNotSent,
@@ -409,7 +416,7 @@ func (h *Handler) write(call outbound.Call, body map[string]interface{}) (outbou
 		}
 		body["text"] = RenderCard(state)
 		body["parse_mode"] = "HTML"
-		if keyboard := KeyboardFor(state, payload.Interactive); keyboard != nil {
+		if keyboard := KeyboardFor(state, state.ButtonsOn(keys.InteractiveTelegram)); keyboard != nil {
 			body["reply_markup"] = keyboard
 		}
 		return outbound.Result{}, nil
@@ -429,15 +436,20 @@ func (h *Handler) write(call outbound.Call, body map[string]interface{}) (outbou
 // and otherwise what the snapshot says, with the link to the alert in TokayOps.
 // Nothing here reads a neighbouring delivery - a permalink that exists on the
 // retry and not on the first attempt is two different messages under one key.
-func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV1) string {
+func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV2) string {
+	var lines []string
 	if payload.MessageOverride != nil && *payload.MessageOverride != "" {
-		return *payload.MessageOverride
-	}
-
-	status := providers.ResolveStatus(state)
-	lines := []string{status.Title}
-	if state.Severity != "" {
-		lines = append(lines, "Severity: "+state.Severity)
+		// The words are the policy's; the link is not theirs to replace. A
+		// direct message is plain text here, so the alert's values go in
+		// as they are.
+		lines = []string{providers.RenderMessage(*payload.MessageOverride, state,
+			func(s string) string { return s })}
+	} else {
+		status := providers.ResolveStatus(state)
+		lines = []string{status.Title}
+		if state.Severity != "" {
+			lines = append(lines, "Severity: "+state.Severity)
+		}
 	}
 	if state.GroupURL != nil && *state.GroupURL != "" {
 		lines = append(lines, *state.GroupURL)

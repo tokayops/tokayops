@@ -64,6 +64,7 @@ type SlackConfig struct {
 	DefaultChannel string `json:"default_channel,omitempty"` // Default channel for notifications
 	SigningSecret  string `json:"signing_secret,omitempty"`  // Signing secret for request verification
 	Interactive    bool   `json:"interactive"`               // Enable Ack/Resolve buttons in Slack messages
+	TeamURL        string `json:"team_url,omitempty"`        // The workspace's URL as auth.test names it; not a secret
 }
 
 // TelegramConfig is the config schema for Telegram integrations.

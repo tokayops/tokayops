@@ -104,18 +104,20 @@ func (s *Store) ExpireDueIntents(ctx context.Context, family string, limit int) 
 // number would either idle the pool or hide the outage.
 func (s *Store) DueSnapshot(ctx context.Context, family string) ([]outbound.ProviderDue, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT provider,
+		SELECT due.provider,
 		       count(*) FILTER (
-		           WHERE (expires_at IS NULL OR expires_at > now())
-		             AND (locked_until IS NULL OR locked_until <= now())) AS claimable_due,
+		           WHERE (due.expires_at IS NULL OR due.expires_at > now())
+		             AND (due.locked_until IS NULL OR due.locked_until <= now())) AS claimable_due,
 		       count(*) FILTER (
-		           WHERE (expires_at IS NULL OR expires_at > now())
-		             AND (locked_until IS NULL OR locked_until <= now())
-		             AND attempts_in_generation = 0) AS claimable_fresh,
-		       EXTRACT(EPOCH FROM (now() - min(next_attempt_at))) AS lateness_seconds
-		FROM outbound_intents
-		WHERE delivery_family = $1 AND status = 'pending' AND next_attempt_at <= now()
-		GROUP BY provider`, family)
+		           WHERE (due.expires_at IS NULL OR due.expires_at > now())
+		             AND (due.locked_until IS NULL OR due.locked_until <= now())
+		             AND due.attempts_in_generation = 0) AS claimable_fresh,
+		       EXTRACT(EPOCH FROM (now() - min(due.next_attempt_at))) AS lateness_seconds
+		FROM outbound_intents due
+		`+satelliteJoins+`
+		WHERE due.delivery_family = $1 AND due.status = 'pending' AND due.next_attempt_at <= now()
+		  `+satelliteMayGo+`
+		GROUP BY due.provider`, family)
 	if err != nil {
 		return nil, fmt.Errorf("read the queue: %w", err)
 	}
@@ -203,30 +205,32 @@ func (s *Store) ClaimDueIntents(ctx context.Context,
 // quietly treated as the broader of the two: handing out leases for work the
 // caller did not ask for is not a default anybody would choose on purpose.
 func claimStatement(phase outbound.ClaimPhase) (string, error) {
-	const shape = `
+	shape := `
 		UPDATE outbound_intents i
 		SET lease_token = gen_random_uuid()::text,
 		    locked_until = statement_timestamp() + make_interval(secs => $4),
 		    worker_id = $5,
 		    updated_at = now()
 		FROM (
-			SELECT id FROM outbound_intents
-			WHERE delivery_family = $1 AND provider = $2 AND status = 'pending'
-			  AND next_attempt_at <= now()
-			  AND (expires_at IS NULL OR expires_at > now())
-			  AND (locked_until IS NULL OR locked_until <= now())
+			SELECT due.id FROM outbound_intents due
+			` + satelliteJoins + `
+			WHERE due.delivery_family = $1 AND due.provider = $2 AND due.status = 'pending'
+			  AND due.next_attempt_at <= now()
+			  AND (due.expires_at IS NULL OR due.expires_at > now())
+			  AND (due.locked_until IS NULL OR due.locked_until <= now())
+			  ` + satelliteMayGo + `
 			  %s
 			ORDER BY %s
 			LIMIT $3
-			FOR UPDATE SKIP LOCKED
-		) due
-		WHERE i.id = due.id
+			FOR UPDATE OF due SKIP LOCKED
+		) taken
+		WHERE i.id = taken.id
 		RETURNING i.id, i.lease_token, i.locked_until`
 
 	switch phase {
 	case outbound.ClaimFirstAttempts:
 		return fmt.Sprintf(shape,
-			"AND attempts_in_generation = 0", "next_attempt_at, id"), nil
+			"AND due.attempts_in_generation = 0", "due.next_attempt_at, due.id"), nil
 
 	case outbound.ClaimRetriesFirst:
 		// FALSE sorts first, so a commitment that has already been attempted
@@ -235,7 +239,7 @@ func claimStatement(phase outbound.ClaimPhase) (string, error) {
 		// backlog of untried work that is older than the retries takes that
 		// share too, and the oldest retry never goes out at all.
 		return fmt.Sprintf(shape,
-			"", "(attempts_in_generation = 0), next_attempt_at, id"), nil
+			"", "(due.attempts_in_generation = 0), due.next_attempt_at, due.id"), nil
 
 	default:
 		return "", outboundContractf("claim phase %q is not one this build takes", phase)
@@ -438,6 +442,53 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{}, err
 	}
 
+	// A satellite refused because its card ended without a message is checked
+	// against the card again, under the card's shared lock, taken BEFORE the
+	// satellite's own - the order is parent, then satellite, everywhere. The
+	// parent's id is immutable, so reading it without a lock first is fine.
+	// A refusal that may stop the escalation writes into the alert's
+	// history, so the group is taken first - before the commitment, as every
+	// door that reaches the group takes it. The ordinary begin takes no such
+	// lock: every attempt would otherwise wait behind an acknowledgement.
+	// The flag is read from the payload before anything is locked, because
+	// the lock order depends on it, and the payload does not change.
+	var stopping bool
+	var failedStep keys.Slot
+	if req.Preparation == outbound.PreparationPermanent {
+		unlocked, err := readIntentTx(ctx, tx, req.IntentID)
+		if err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+		if unlocked != nil {
+			if failedStep, stopping = stopsEscalation(*unlocked); stopping {
+				if err := lockAlertGroupTx(ctx, tx, unlocked.AlertGroupID); err != nil {
+					return outbound.BeginAttemptResult{}, err
+				}
+				if afterBeginGroupLock != nil {
+					afterBeginGroupLock()
+				}
+			}
+		}
+	}
+
+	refusalStale := false
+	if req.Preparation == outbound.PreparationPermanent &&
+		req.ErrorClass == outbound.ParentEndedWithoutMessage {
+		var parentID sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT parent_intent_id FROM outbound_intents WHERE id = $1`,
+			req.IntentID).Scan(&parentID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return outbound.BeginAttemptResult{}, err
+		}
+		if parentID.Valid {
+			if refusalStale, err = refusalIsStaleTx(ctx, tx, parentID.String); err != nil {
+				return outbound.BeginAttemptResult{}, err
+			}
+			if afterParentCheck != nil {
+				afterParentCheck()
+			}
+		}
+	}
+
 	intent, _, err := lockIntentTx(ctx, tx, req.IntentID)
 	if err != nil {
 		return outbound.BeginAttemptResult{}, err
@@ -490,6 +541,19 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	// that does not depend on any channel is asked here instead, and it decides
 	// whether a refusal may be recorded at all.
 	form, digest, err := executableHere(*intent)
+	if err == nil && refusalStale {
+		// The card is alive again, or has a message after all: the refusal
+		// was true when the worker read the card and is not any more. Nothing
+		// is recorded; the satellite goes back to the queue, and the claim's
+		// own predicate decides again.
+		if err := releaseForRetryTx(ctx, tx, req.IntentID); err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+		return outbound.BeginAttemptResult{Outcome: outbound.BeginPreparedRetry}, nil
+	}
 	if err == nil && req.Preparation != outbound.PreparationReady {
 		// A refusal comes before the STATE is read, because it is true whatever
 		// the state says: nothing was going to be sent either way, and
@@ -499,7 +563,11 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		if shapeErr != nil {
 			return outbound.BeginAttemptResult{}, shapeErr
 		}
-		return s.recordPreparation(ctx, tx, req, *intent, shape)
+		var stop *keys.Slot
+		if stopping {
+			stop = &failedStep
+		}
+		return s.recordPreparation(ctx, tx, req, *intent, shape, stop)
 	}
 
 	var content outbound.AttemptContent
@@ -536,13 +604,29 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		return outbound.BeginAttemptResult{}, err
 	}
 
+	var boundContext json.RawMessage
+	if transition.Effects.OpenGeneration {
+		if boundContext, err = s.dmContextTx(ctx, tx, *intent); err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+	}
 	effect, err := bindGenerationTx(ctx, tx, *intent, req.BoundEndpoint,
-		transition.Effects.OpenGeneration)
+		transition.Effects.OpenGeneration, boundContext)
 	if err != nil {
 		if errors.Is(err, ErrUndeliverable) {
 			return s.refuseAttempt(ctx, tx, req, *intent, plan, "binding_lost", err.Error())
 		}
 		return outbound.BeginAttemptResult{}, err
+	}
+
+	// What the message takes from the card is read here and not inside the
+	// call: read there, a row this build cannot read would be an attempt that
+	// never touched the network, retried on the family's backoff forever.
+	// Written by this build's store, such a row is damage, and it ends the
+	// commitment where a person will see it, like a state nobody can read.
+	bound, err := outbound.DecodeBoundContext(effect.Context)
+	if err != nil {
+		return s.refuseAttempt(ctx, tx, req, *intent, plan, "bound_context_unreadable", err.Error())
 	}
 
 	// The key this call is made under. A create carries the generation's own
@@ -676,6 +760,7 @@ func (s *Store) BeginAttempt(ctx context.Context,
 		Operation:                    plan.Operation,
 		BoundEndpoint:                effect.Endpoint,
 		ProviderKey:                  providerKey,
+		BoundContext:                 bound,
 		Receipt:                      receipt,
 		ReceiptRef:                   name.String,
 		Content:                      content,
@@ -788,6 +873,7 @@ func refusalShape(intent outbound.Intent) (plannedAttempt, error) {
 type boundEffect struct {
 	Endpoint    string
 	ProviderKey string
+	Context     json.RawMessage
 }
 
 // bindGenerationTx settles the address and the key of the current external
@@ -800,8 +886,12 @@ type boundEffect struct {
 // deliver twice, to two different people, with nobody able to tell which one
 // got it. So the worker's freshly resolved address is a proposal, and a bound
 // generation ignores it.
+//
+// The context - what the message takes from a neighbouring commitment - is
+// settled here too, for the same reason: read on the attempt, a retry would
+// carry different bytes under the same key.
 func bindGenerationTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
-	proposed string, opening bool) (boundEffect, error) {
+	proposed string, opening bool, context json.RawMessage) (boundEffect, error) {
 
 	if opening {
 		if proposed == "" {
@@ -813,24 +903,28 @@ func bindGenerationTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
 			return boundEffect{}, err
 		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE outbound_intents SET bound_endpoint = $2, create_key = $3
-			WHERE id = $1`, intent.ID, proposed, key); err != nil {
+			UPDATE outbound_intents SET bound_endpoint = $2, create_key = $3, bound_context = $4
+			WHERE id = $1`, intent.ID, proposed, key, nullableJSON(context)); err != nil {
 			return boundEffect{}, fmt.Errorf("bind the effect of %s: %w", intent.ID, err)
 		}
-		return boundEffect{Endpoint: proposed, ProviderKey: key}, nil
+		return boundEffect{Endpoint: proposed, ProviderKey: key, Context: context}, nil
 	}
 
-	var storedEndpoint, storedKey sql.NullString
+	var (
+		storedEndpoint, storedKey sql.NullString
+		storedContext             []byte
+	)
 	if err := tx.QueryRowContext(ctx,
-		`SELECT bound_endpoint, create_key FROM outbound_intents WHERE id = $1`,
-		intent.ID).Scan(&storedEndpoint, &storedKey); err != nil {
+		`SELECT bound_endpoint, create_key, bound_context FROM outbound_intents WHERE id = $1`,
+		intent.ID).Scan(&storedEndpoint, &storedKey, &storedContext); err != nil {
 		return boundEffect{}, err
 	}
 	if !storedEndpoint.Valid || storedEndpoint.String == "" || !storedKey.Valid {
 		return boundEffect{}, undeliverablef(
 			"commitment %s has a bound effect with no address or no key", intent.ID)
 	}
-	return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: storedKey.String}, nil
+	return boundEffect{Endpoint: storedEndpoint.String, ProviderKey: storedKey.String,
+		Context: storedContext}, nil
 }
 
 // refuseAttempt ends a commitment the store itself cannot deliver.
@@ -856,7 +950,11 @@ func (s *Store) refuseAttempt(ctx context.Context, tx *sql.Tx,
 	req.Preparation = outbound.PreparationPermanent
 	req.ErrorClass = class
 	req.Summary = detail
-	return s.recordPreparation(ctx, tx, req, intent, plan)
+	// Stops no escalation, whatever the step's flag says: the cascade needs
+	// the group taken first, and the damage this refuses is found after the
+	// commitment is locked. The step ends where a person will see it; the
+	// steps after it go on, and the person who repairs the row decides.
+	return s.recordPreparation(ctx, tx, req, intent, plan, nil)
 }
 
 // recordPreparation writes the proof that no call was made.
@@ -864,9 +962,12 @@ func (s *Store) refuseAttempt(ctx context.Context, tx *sql.Tx,
 // It is not an attempt and must never look like one: an attempt row means the
 // network might have been reached, and inventing that doubt would turn a
 // provable refusal into a possible duplicate.
+//
+// stop names the step this refusal stops the escalation at, when the caller
+// took the group for it; nil otherwise.
 func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 	req outbound.BeginAttemptRequest, intent outbound.Intent,
-	plan plannedAttempt) (outbound.BeginAttemptResult, error) {
+	plan plannedAttempt, stop *keys.Slot) (outbound.BeginAttemptResult, error) {
 
 	transition, err := outbound.Decide(outbound.Input{
 		Intent:      intent,
@@ -920,6 +1021,12 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 	}); err != nil {
 		return outbound.BeginAttemptResult{}, err
 	}
+	withdrawn := 0
+	if stop != nil && transition.To == outbound.StatusPermanentFailed {
+		if withdrawn, err = stopEscalationTx(ctx, tx, intent, *stop); err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return outbound.BeginAttemptResult{}, err
@@ -930,6 +1037,9 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 	// and the one that was missed when this counter lived in the worker: the
 	// worker returns the moment Begin is not "started".
 	countTerminal(intent.Family, transition.To)
+	if withdrawn > 0 {
+		countWithdrawn(map[string]int{intent.Family: withdrawn})
+	}
 
 	result := outbound.BeginAttemptResult{
 		Outcome: outbound.BeginPreparedRetry, AttemptID: recordID, AttemptNo: attemptNo,
@@ -951,32 +1061,38 @@ func (s *Store) recordPreparation(ctx context.Context, tx *sql.Tx,
 func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	req outbound.FinalizeRequest) (outbound.FinalizeResult, error) {
 
-	// Read before the transaction: both are immutable, and the lock order
-	// depends on them.
-	var (
-		intentID    string
-		groupID     string
-		policy      outbound.AmbiguityPolicy
-		attemptFind = `SELECT intent_id, COALESCE(i.alert_group_id, ''), i.ambiguity_policy
-		               FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
-		               WHERE a.id = $1`
-	)
-	err := s.db.QueryRowContext(ctx, attemptFind, req.AttemptID).Scan(&intentID, &groupID, &policy)
+	// Read before the transaction: the group, the policy and the step's flag
+	// are immutable, and the lock order depends on them.
+	var intentID string
+	err := s.db.QueryRowContext(ctx, `SELECT intent_id FROM outbound_attempts WHERE id = $1`,
+		req.AttemptID).Scan(&intentID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return outbound.FinalizeResult{Outcome: outbound.FinalizeNotFound}, nil
 	}
 	if err != nil {
 		return outbound.FinalizeResult{}, err
 	}
+	unlocked, err := readIntentTx(ctx, s.db, intentID)
+	if err != nil {
+		return outbound.FinalizeResult{}, err
+	}
+	if unlocked == nil {
+		return outbound.FinalizeResult{Outcome: outbound.FinalizeNotFound}, nil
+	}
+	groupID, policy := unlocked.AlertGroupID, unlocked.AmbiguityPolicy
 
 	// The group is locked first by anything that could end up writing to it: a
-	// success, or doubt that a policy turns into one.
+	// success, doubt that a policy turns into one, or a failure that stops the
+	// escalation and says so in the alert's history.
 	concluded := req.Conclusion.Completion()
 	receipt := req.Conclusion.Receipt()
 
+	failedStep, stopping := stopsEscalation(*unlocked)
+	stopping = stopping && concluded.Outcome == keys.OutcomePermanentRejection
 	lockGroup := groupID != "" &&
 		(concluded.Outcome == keys.OutcomeAccepted ||
-			(concluded.Outcome == keys.OutcomeAmbiguous && policy == outbound.PolicyAssumeAccepted))
+			(concluded.Outcome == keys.OutcomeAmbiguous && policy == outbound.PolicyAssumeAccepted) ||
+			stopping)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1255,11 +1371,20 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	}); err != nil {
 		return outbound.FinalizeResult{}, err
 	}
+	withdrawn := 0
+	if stopping && transition.To == outbound.StatusPermanentFailed {
+		if withdrawn, err = stopEscalationTx(ctx, tx, *intent, failedStep); err != nil {
+			return outbound.FinalizeResult{}, err
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return outbound.FinalizeResult{}, err
 	}
 	countTerminal(intent.Family, transition.To)
+	if withdrawn > 0 {
+		countWithdrawn(map[string]int{intent.Family: withdrawn})
+	}
 	return outbound.FinalizeResult{
 		Outcome: outbound.FinalizeFinalized, To: transition.To, Row: transition.Row,
 	}, nil

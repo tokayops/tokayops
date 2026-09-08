@@ -241,14 +241,31 @@ func DecodeEscalationPayloadV1(schemaVersion int, raw []byte) (EscalationPayload
 		return payload, contractf("payload schema %d is not one this build renders",
 			schemaVersion)
 	}
+	if err := decodeStoredPayload(raw, &payload); err != nil {
+		return payload, err
+	}
+	if err := payload.Slot.validate(); err != nil {
+		return payload, err
+	}
+	// A person, a channel, or a satellite of a channel card. The grammar also
+	// knows subscribers, and an escalation aimed at one would be a message
+	// nothing in Slack or Telegram can be handed.
+	if err := payload.Target.addressedTo(escalationTargets...); err != nil {
+		return payload, err
+	}
+	return payload, nil
+}
+
+// decodeStoredPayload is the strict half every payload decoder shares.
+func decodeStoredPayload(raw []byte, into any) error {
 	if len(raw) == 0 {
-		return payload, contractf("a commitment with no payload")
+		return contractf("a commitment with no payload")
 	}
 
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
-		return payload, contractf("the payload cannot be read: %v", err)
+	if err := decoder.Decode(into); err != nil {
+		return contractf("the payload cannot be read: %v", err)
 	}
 	// A second Decode rather than More(): outside an array or an object, More()
 	// answers "is the next token something other than ] or }", so a stray
@@ -256,23 +273,13 @@ func DecodeEscalationPayloadV1(schemaVersion int, raw []byte) (EscalationPayload
 	// What has to be true is that the input ENDED.
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return payload, contractf("the payload does not end where the value does")
+		return contractf("the payload does not end where the value does")
 	}
-
-	if err := payload.Slot.validate(); err != nil {
-		return payload, err
-	}
-	// A person or a channel. The grammar also knows subscribers, and an
-	// escalation aimed at one would be a message nothing in Slack or Telegram
-	// can be handed.
-	if err := payload.Target.addressedTo(TargetChannel, TargetUser); err != nil {
-		return payload, err
-	}
-	return payload, nil
+	return nil
 }
 
 func (p EscalationPayloadV1) encode(buf *bytes.Buffer) error {
-	if err := p.Target.addressedTo(TargetChannel, TargetUser); err != nil {
+	if err := p.Target.addressedTo(escalationTargets...); err != nil {
 		return err
 	}
 	if err := p.Slot.encode(buf); err != nil {
@@ -283,6 +290,86 @@ func (p EscalationPayloadV1) encode(buf *bytes.Buffer) error {
 	encOpt(buf, p.MessageOverride)
 	encBool(buf, p.Interactive)
 	return nil
+}
+
+// EscalationPayloadV2 is the shape since 2026-09-05, and the one this build
+// executes from whichever schema a row is in.
+//
+// Two things changed. StopOnFailure arrived: whether a permanent failure of
+// this step withdraws the steps after it, which the policy step says and the
+// commitment has to carry, since the policy may change after admission.
+// Interactive left: whether a card carries buttons is read from the render
+// snapshot (tag 18 of render_snapshot/v2), where the button switch can reach
+// it, rather than frozen per commitment where it could not.
+type EscalationPayloadV2 struct {
+	Slot            Slot    `json:"slot"`
+	Target          Target  `json:"target"`
+	MessageOverride *string `json:"message_override,omitempty"`
+	StopOnFailure   bool    `json:"stop_on_failure"`
+}
+
+// SchemaVersion is the payload schema this shape belongs to.
+func (p EscalationPayloadV2) SchemaVersion() int { return 2 }
+
+// DecodeEscalationPayloadV2 reads a STORED version 2 payload, as strictly as
+// the version 1 reader reads its own.
+func DecodeEscalationPayloadV2(schemaVersion int, raw []byte) (EscalationPayloadV2, error) {
+	var payload EscalationPayloadV2
+	if schemaVersion != payload.SchemaVersion() {
+		return payload, contractf("payload schema %d is not one this build renders",
+			schemaVersion)
+	}
+	if err := decodeStoredPayload(raw, &payload); err != nil {
+		return payload, err
+	}
+	if err := payload.Slot.validate(); err != nil {
+		return payload, err
+	}
+	if err := payload.Target.addressedTo(escalationTargets...); err != nil {
+		return payload, err
+	}
+	return payload, nil
+}
+
+func (p EscalationPayloadV2) encode(buf *bytes.Buffer) error {
+	if err := p.Target.addressedTo(escalationTargets...); err != nil {
+		return err
+	}
+	if err := p.Slot.encode(buf); err != nil {
+		return err
+	}
+	encStr(buf, string(p.Target.Kind))
+	encStr(buf, p.Target.Ref)
+	encOpt(buf, p.MessageOverride)
+	encBool(buf, p.StopOnFailure)
+	return nil
+}
+
+// DecodeEscalationPayload reads a stored escalation payload of either schema
+// into the shape this build executes from.
+//
+// One version is written; two are read, for as long as rows of the older one
+// live - which is until their cards end and retention takes them. A version 1
+// row has no say about stopping the escalation, so it does not stop it; what
+// it said about buttons is not read, because buttons come from the snapshot
+// now. A version this build does not know is refused, not guessed at.
+func DecodeEscalationPayload(schemaVersion int, raw []byte) (EscalationPayloadV2, error) {
+	switch schemaVersion {
+	case EscalationPayloadV1{}.SchemaVersion():
+		older, err := DecodeEscalationPayloadV1(schemaVersion, raw)
+		if err != nil {
+			return EscalationPayloadV2{}, err
+		}
+		return EscalationPayloadV2{
+			Slot: older.Slot, Target: older.Target,
+			MessageOverride: older.MessageOverride,
+		}, nil
+	case EscalationPayloadV2{}.SchemaVersion():
+		return DecodeEscalationPayloadV2(schemaVersion, raw)
+	default:
+		return EscalationPayloadV2{}, contractf(
+			"payload schema %d is not one this build renders", schemaVersion)
+	}
 }
 
 // submitIntent is one commitment as it is proposed - everything that decides

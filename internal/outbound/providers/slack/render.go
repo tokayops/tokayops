@@ -38,7 +38,7 @@ func Render(state keys.SnapshotInput, interactive bool) slackcard.Card {
 // plainTitle returns the unformatted title for use as the top-level message
 // text (notification preview / accessibility fallback).
 func plainTitle(state keys.SnapshotInput) string {
-	return providers.ResolveStatus(state).Title
+	return mrkdwn(providers.ResolveStatus(state).Title)
 }
 
 // renderTitleBlocks returns the title section as top-level blocks. Used as
@@ -47,9 +47,13 @@ func plainTitle(state keys.SnapshotInput) string {
 func renderTitleBlocks(state keys.SnapshotInput) []slackapi.Block {
 	status := providers.ResolveStatus(state)
 
-	titleText := status.Title
-	if state.ExternalURL != nil && *state.ExternalURL != "" {
-		titleText = fmt.Sprintf("<%s|%s>", *state.ExternalURL, status.Title)
+	// The title carries the alert's own words, escaped: a label reading
+	// <!channel> is a label, not a page.
+	// The addresses came from outside too, and an address is linked only
+	// when it is one: a > inside it would end the link and page the channel.
+	titleText := mrkdwn(status.Title)
+	if state.ExternalURL != nil && linkable(*state.ExternalURL) {
+		titleText = fmt.Sprintf("<%s|%s>", *state.ExternalURL, mrkdwn(status.Title))
 	}
 	return []slackapi.Block{
 		slackapi.NewSectionBlock(
@@ -74,11 +78,11 @@ func renderBodyAttachment(state keys.SnapshotInput, interactive bool) slackapi.A
 	if mentions != "" {
 		bodyText = mentions + "\n\n"
 	}
-	bodyText += fmt.Sprintf("*Severity:* %s\n", state.Severity)
+	bodyText += fmt.Sprintf("*Severity:* %s\n", mrkdwn(state.Severity))
 
 	alertList := buildAlertList(state.Alerts, state.DisplayTimezone)
 	if len(state.Alerts) == 0 {
-		alertList = "• " + state.Title
+		alertList = "• " + mrkdwn(state.Title)
 	}
 	bodyText += "*Alerts:*\n" + alertList
 	bodyText = truncateText(bodyText, 3000)
@@ -142,7 +146,7 @@ func renderBodyAttachment(state keys.SnapshotInput, interactive bool) slackapi.A
 
 	return slackapi.Attachment{
 		Color:    status.Color,
-		Fallback: status.Title,
+		Fallback: mrkdwn(status.Title),
 		Blocks:   slackapi.Blocks{BlockSet: blocks},
 	}
 }
@@ -202,20 +206,20 @@ func buildAlertList(alerts []keys.AlertSnapshot, zone string) string {
 		rendered++
 
 		dashLink := ""
-		if a.DashboardURL != nil && *a.DashboardURL != "" {
+		if a.DashboardURL != nil && linkable(*a.DashboardURL) {
 			dashLink = fmt.Sprintf(" <%s|[dash]>", *a.DashboardURL)
 		}
 		bookLink := ""
-		if a.RunbookURL != nil && *a.RunbookURL != "" {
+		if a.RunbookURL != nil && linkable(*a.RunbookURL) {
 			bookLink = fmt.Sprintf(" <%s|[runbook]>", *a.RunbookURL)
 		}
 
 		if a.Status == keys.AlertFiring {
-			alertList += fmt.Sprintf("• 🔴 %s (Sev: %s)%s%s\n", a.AlertName, a.Severity, dashLink, bookLink)
+			alertList += fmt.Sprintf("• 🔴 %s (Sev: %s)%s%s\n", mrkdwn(a.AlertName), mrkdwn(a.Severity), dashLink, bookLink)
 		} else {
-			alertList += fmt.Sprintf("• 🟢 %s (Resolved)%s%s\n", a.AlertName, dashLink, bookLink)
+			alertList += fmt.Sprintf("• 🟢 %s (Resolved)%s%s\n", mrkdwn(a.AlertName), dashLink, bookLink)
 		}
-		alertList += "   _" + alertDetail(a, zone) + "_\n"
+		alertList += "   _" + mrkdwn(alertDetail(a, zone)) + "_\n"
 	}
 	if remaining := len(alerts) - maxAlerts; remaining > 0 {
 		alertList += fmt.Sprintf("_... and %d more alerts_\n", remaining)

@@ -16,6 +16,7 @@ import (
 	"github.com/tokayops/tokayops/internal/config"
 	"github.com/tokayops/tokayops/internal/integrations"
 	"github.com/tokayops/tokayops/internal/model"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	webhookprovider "github.com/tokayops/tokayops/internal/outbound/providers/webhook"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -186,6 +187,18 @@ func (a *API) CreateIntegration(c echo.Context) error {
 	if err := validateIntegrationConfig(req.Type, req.Config, false); err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 	}
+	if req.Type == model.IntegrationTypeSlack {
+		var cfg model.SlackConfig
+		if err := json.Unmarshal(req.Config, &cfg); err != nil {
+			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid slack config: " + err.Error()})
+		}
+		recordSlackWorkspace(c.Request().Context(), &cfg, cfg.Token, true, "")
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		}
+		req.Config = raw
+	}
 
 	// Default enabled to true if not specified
 	enabled := true
@@ -282,6 +295,28 @@ func (a *API) UpdateIntegration(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 		}
 		patch.Config = req.Config
+		if existing.Type == model.IntegrationTypeSlack {
+			// The workspace is asked again with the token that will be in
+			// force: the one in the request, or the one kept when the
+			// request leaves it masked.
+			var was, cfg model.SlackConfig
+			if err := json.Unmarshal(existing.Config, &was); err != nil {
+				return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			}
+			if err := json.Unmarshal(req.Config, &cfg); err != nil {
+				return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid slack config: " + err.Error()})
+			}
+			token := cfg.Token
+			if token == "" || token == model.MaskedSecret {
+				token = was.Token
+			}
+			recordSlackWorkspace(c.Request().Context(), &cfg, token, token != was.Token, was.TeamURL)
+			raw, err := json.Marshal(cfg)
+			if err != nil {
+				return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			}
+			patch.Config = raw
+		}
 	}
 
 	// For generic_webhook, always validate the effective URL against HTTPS policy.
@@ -510,7 +545,7 @@ type TestIntegrationResponse struct {
 
 // TestIntegration sends a test message via the integration
 // @Summary Test integration
-// @Description Send a test message via the integration (admin only)
+// @Description Send a test message via the integration; for Slack, also records the workspace URL (team_url) in the integration's configuration (admin only)
 // @Tags integrations
 // @Accept json
 // @Produce json
@@ -580,12 +615,59 @@ func (a *API) testSlackIntegration(c echo.Context, integration *model.Integratio
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Slack integration not configured"})
 	}
 
+	// The test is also when the workspace's address is recorded, for an
+	// integration saved before there was one to record.
+	var cfg model.SlackConfig
+	if err := json.Unmarshal(integration.Config, &cfg); err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "invalid slack config: " + err.Error()})
+	}
+	teamURL, err := slackWorkspaceURL(c.Request().Context(), cfg.Token)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: fmt.Sprintf("Slack API error: auth.test: %v", err)})
+	}
+	if teamURL != cfg.TeamURL {
+		cfg.TeamURL = teamURL
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		}
+		if _, err := a.store.UpdateIntegration(c.Request().Context(), integration.ID,
+			store.IntegrationPatch{Config: raw}, userID); err != nil {
+			return a.integrationCommandFailed(c, err)
+		}
+		a.reloadIntegrationCache()
+	}
+
 	message := fmt.Sprintf("TokayOps Test: Slack integration \"%s\" is working", integration.Name)
 	if err := a.slack.SendDM(c.Request().Context(), ident.ExternalID, message); err != nil {
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: fmt.Sprintf("Slack API error: %v", err)})
 	}
 
 	return c.JSON(http.StatusOK, TestIntegrationResponse{OK: true, Message: "Test DM sent"})
+}
+
+// slackWorkspaceURL asks Slack which workspace a token belongs to. A variable
+// so a test can answer for Slack.
+var slackWorkspaceURL = slackprovider.WorkspaceURL
+
+// recordSlackWorkspace writes into a Slack configuration the address of the
+// workspace its token belongs to, as auth.test names it now, so a message can
+// link to a card without a call. A token that cannot be verified records
+// nothing when it is new - a link into a workspace the token cannot reach is
+// worse than none - and keeps the address it had when it is the same token:
+// Slack being unreachable during a save is not evidence about the workspace.
+func recordSlackWorkspace(ctx context.Context, cfg *model.SlackConfig, token string,
+	tokenChanged bool, known string) {
+
+	url, err := slackWorkspaceURL(ctx, token)
+	switch {
+	case err == nil:
+		cfg.TeamURL = url
+	case tokenChanged:
+		cfg.TeamURL = ""
+	default:
+		cfg.TeamURL = known
+	}
 }
 
 func (a *API) testWebhookIntegration(c echo.Context, integration *model.Integration) error {

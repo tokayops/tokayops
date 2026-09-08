@@ -77,9 +77,17 @@ func (s *Store) SweepDeliveryHistory(ctx context.Context, cutoff time.Time, chun
 		return outbound.SweepResult{Busy: true}, nil
 	}
 
+	// A parent goes only once no child names it: the leaves of a card - the
+	// thread and the reply under it - go first, and the card in a later chunk
+	// or a later pass. "The child is doomed too" would not do: it says nothing
+	// about whether the child made it into THIS chunk, and a parent deleted
+	// beside a child left for the next one would fail on the key, stay the
+	// oldest row, and fail every pass after.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id FROM outbound_intents
 		WHERE status IN (`+terminalStatusList+`) AND updated_at < $1
+		  AND NOT EXISTS (SELECT 1 FROM outbound_intents c
+		                  WHERE c.parent_intent_id = outbound_intents.id)
 		ORDER BY updated_at, id
 		LIMIT $2
 		FOR UPDATE SKIP LOCKED`, cutoff, chunk)

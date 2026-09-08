@@ -486,8 +486,8 @@ func TestAStateThisBuildCannotWriteIsLeftAlone(t *testing.T) {
 	moveGroup(t, s, agID, model.AlertGroupStatusAcknowledged)
 
 	if _, err := s.db.Exec(
-		`UPDATE outbound_group_snapshots SET snapshot_schema_version = 2
-		 WHERE alert_group_id = $1`, agID); err != nil {
+		`UPDATE outbound_group_snapshots SET snapshot_schema_version = $2
+		 WHERE alert_group_id = $1`, agID, keys.RenderSnapshotSchemaV2+1); err != nil {
 		t.Fatalf("write the newer state: %v", err)
 	}
 
@@ -503,7 +503,7 @@ func TestAStateThisBuildCannotWriteIsLeftAlone(t *testing.T) {
 		agID).Scan(&version); err != nil {
 		t.Fatalf("read the state back: %v", err)
 	}
-	if version != 2 {
+	if version != keys.RenderSnapshotSchemaV2+1 {
 		t.Fatalf("the stored state came back at version %d", version)
 	}
 }

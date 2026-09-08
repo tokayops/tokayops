@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // ProviderCapabilitiesLookup is the read-only view of the channel catalogue
@@ -53,15 +54,19 @@ type PolicyRequest struct {
 // and must be compatible with target_kind ("dm" → user|schedule,
 // "channel" → channel).
 type PolicyStepRequest struct {
-	Provider          string `json:"provider"`    // "slack", "telegram", ...
-	TargetKind        string `json:"target_kind"` // "dm" | "channel"
-	TargetType        string `json:"target_type"` // user, channel, schedule
-	TargetID          string `json:"target_id"`
-	DelaySeconds      int    `json:"delay_seconds"`
-	TimeoutSeconds    int    `json:"timeout_seconds,omitempty"`
-	MaxAttempts       int    `json:"max_attempts,omitempty"`
-	Message           string `json:"message,omitempty"`
-	ContinueOnFailure *bool  `json:"continue_on_failure,omitempty"` // nil defaults to true
+	Provider     string `json:"provider"`    // "slack", "telegram", ...
+	TargetKind   string `json:"target_kind"` // "dm" | "channel"
+	TargetType   string `json:"target_type"` // user, channel, schedule
+	TargetID     string `json:"target_id"`
+	DelaySeconds int    `json:"delay_seconds"`
+	// Ignored since 0.2.0: a call's deadline is the delivery family's, not the step's.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// Ignored since 0.2.0: retries have no limit; a page is owed until it is delivered or withdrawn.
+	MaxAttempts int `json:"max_attempts,omitempty"`
+	// The words of a direct message; a template over {{.Title}}, {{.Severity}}, {{.Team}} and {{.AlertsCount}}. A channel step posts the card and does not use it.
+	Message string `json:"message,omitempty"`
+	// When false, a step that fails for good stops the escalation: later steps that have not gone out are withdrawn. Defaults to true.
+	ContinueOnFailure *bool `json:"continue_on_failure,omitempty"`
 }
 
 // ListPolicies godoc
@@ -328,13 +333,17 @@ func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup)
 	if step.DelaySeconds < 0 {
 		return fmt.Errorf("delay_seconds must be >= 0")
 	}
-	if step.TimeoutSeconds < 0 {
-		return fmt.Errorf("timeout_seconds must be > 0")
-	}
-	if step.MaxAttempts < 0 || step.MaxAttempts > 100 {
-		return fmt.Errorf("max_attempts must be between 1 and 100")
-	}
+	// timeout_seconds and max_attempts are accepted and ignored: neither
+	// decides anything since 0.2.0, and a saved policy naming them is not
+	// wrong, only old.
 
+	// The message is checked here, once, so an attempt never meets a
+	// template it cannot render.
+	if step.Message != "" {
+		if err := providers.ValidateMessageTemplate(step.Message); err != nil {
+			return fmt.Errorf("message: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -353,14 +362,9 @@ func buildPolicySteps(policyID string, reqSteps []PolicyStepRequest, caps Provid
 			return nil, err
 		}
 
-		timeout := stepReq.TimeoutSeconds
-		if timeout == 0 {
-			timeout = 30
-		}
-		maxAttempts := stepReq.MaxAttempts
-		if maxAttempts == 0 {
-			maxAttempts = 5
-		}
+		// TimeoutSeconds and MaxAttempts are not carried over: nothing reads
+		// them, and the form no longer sends them, so a copy would write a zero
+		// the table refuses. The columns keep their defaults.
 		continueOnFailure := true
 		if stepReq.ContinueOnFailure != nil {
 			continueOnFailure = *stepReq.ContinueOnFailure
@@ -375,8 +379,6 @@ func buildPolicySteps(policyID string, reqSteps []PolicyStepRequest, caps Provid
 			TargetType:        stepReq.TargetType,
 			TargetID:          stepReq.TargetID,
 			DelaySeconds:      stepReq.DelaySeconds,
-			TimeoutSeconds:    timeout,
-			MaxAttempts:       maxAttempts,
 			Message:           stepReq.Message,
 			ContinueOnFailure: continueOnFailure,
 		}

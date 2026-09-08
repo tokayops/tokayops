@@ -663,7 +663,7 @@ func TestARefusalIsNotRecordedAgainstWorkThisBuildCannotRead(t *testing.T) {
 			agID := outboundGroup(t, s)
 			intentID := admitOne(t, s, agID)[0]
 			// The row as a build that renders a later payload shape wrote it.
-			exec(t, s, `UPDATE outbound_intents SET payload_schema_version = 2 WHERE id = $1`,
+			exec(t, s, `UPDATE outbound_intents SET payload_schema_version = 3 WHERE id = $1`,
 				intentID)
 			token := claimOne(t, s, intentID)
 
@@ -1589,10 +1589,10 @@ func TestAPayloadThatIsNotTheOneAdmitted(t *testing.T) {
 				agID := outboundGroup(t, s)
 				intentID := admitOne(t, s, agID)[0]
 				// One flag, and the recipient untouched: what changes is
-				// whether the page that arrives can be acted on.
+				// whether the page's failure stops the escalation.
 				exec(t, s, `
 					UPDATE outbound_intents
-					SET payload = jsonb_set(payload, '{interactive}', 'false')
+					SET payload = jsonb_set(payload, '{stop_on_failure}', 'true')
 					WHERE id = $1`, intentID)
 				return intentID, "C0001"
 			},

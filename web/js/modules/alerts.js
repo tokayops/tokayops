@@ -5,7 +5,7 @@
 
 import { State, STATE_STATUS_MAP } from '/js/core/state.js';
 import { Elements, showToast, escapeHtml } from '/js/core/utils.js';
-import { renderGroupDeliveries, afterTimelineRender } from '/js/modules/deliveries.js';
+import { afterTimelineRender } from '/js/modules/deliveries.js';
 import { ViewManager } from '/js/core/viewManager.js';
 
 const STATUS_STATE_MAP = {
@@ -449,7 +449,6 @@ export async function openAlertGroupModal(alertGroupId) {
         Elements.modalFooter.innerHTML = Components.alertGroupActions(alertGroup);
         bindModalActions();
         loadAlertGroupTimeline(alertGroupId);
-        renderGroupDeliveries(alertGroupId);
     } catch (error) {
         Elements.modalBody.innerHTML = `<div class="empty-state"><p>Failed to load: ${escapeHtml(error.message)}</p></div>`;
     }
@@ -593,12 +592,11 @@ async function loadAlertGroupTimeline(alertGroupId) {
 }
 
 // A decision taken from the journal changes what the group shows: its
-// deliveries and, through the timeline line the decision wrote, its history.
+// its history, through the timeline line the decision wrote.
 document.addEventListener('tokay:delivery-decided', (e) => {
     const groupId = e.detail?.alertGroupId;
     if (!groupId || State.selectedAlertGroup?.id !== groupId) return;
     loadAlertGroupTimeline(groupId);
-    renderGroupDeliveries(groupId);
 });
 
 /**

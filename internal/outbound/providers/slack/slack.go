@@ -32,6 +32,23 @@ var ErrUserNotFound = errors.New("slack user not found")
 // while making three, no longer applies.
 const HTTPTimeout = 30 * time.Second
 
+// authTestTimeout bounds the one call an operator waits on in the browser:
+// auth.test answers in well under a second, and a save should not hang for
+// the thirty seconds a delivery may.
+const authTestTimeout = 10 * time.Second
+
+// WorkspaceURL is the address of the workspace a token belongs to, as
+// auth.test names it. It is asked when an integration is saved or tested and
+// recorded in the integration's configuration, so that a message can link to
+// a card without a call.
+func WorkspaceURL(ctx context.Context, token string) (string, error) {
+	resp, err := NewClient(token, authTestTimeout).AuthTestContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	return resp.URL, nil
+}
+
 // NewClient is the only place a Slack client is built, so the timeout
 // cannot be forgotten by the next caller that needs one.
 //

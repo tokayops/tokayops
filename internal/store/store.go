@@ -91,6 +91,10 @@ type Store struct {
 	// base URL of this installation and the zone times are printed in. Set once
 	// at wiring - see SetRenderEnvironment.
 	render renderEnvironment
+
+	// dmFallbackToFirehose is the installation's setting for a direct
+	// message whose policy posted no channel card; nil is the default, yes.
+	dmFallbackToFirehose *bool
 }
 
 func (s *Store) Close() error {
@@ -2359,9 +2363,11 @@ func (s *Store) CreateEscalationPolicy(p *model.EscalationPolicy) error {
 
 	// Insert steps
 	for _, step := range p.Steps {
-		_, err = tx.Exec(`INSERT INTO escalation_steps (id, policy_id, step_index, provider, target_kind, target_type, target_id, delay_seconds, timeout_seconds, max_attempts, message, continue_on_failure)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			step.ID, p.ID, step.StepIndex, step.Provider, step.TargetKind, step.TargetType, step.TargetID, step.DelaySeconds, step.TimeoutSeconds, step.MaxAttempts, step.Message, step.ContinueOnFailure)
+		// timeout_seconds and max_attempts keep their defaults: nothing reads
+		// them since the delivery families took over deadlines and retries.
+		_, err = tx.Exec(`INSERT INTO escalation_steps (id, policy_id, step_index, provider, target_kind, target_type, target_id, delay_seconds, message, continue_on_failure)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			step.ID, p.ID, step.StepIndex, step.Provider, step.TargetKind, step.TargetType, step.TargetID, step.DelaySeconds, step.Message, step.ContinueOnFailure)
 		if err != nil {
 			return err
 		}
@@ -2479,9 +2485,11 @@ func (s *Store) UpdateEscalationPolicy(p *model.EscalationPolicy) error {
 		if step.ID == "" {
 			step.ID = uuid.New().String()
 		}
-		_, err = tx.Exec(`INSERT INTO escalation_steps (id, policy_id, step_index, provider, target_kind, target_type, target_id, delay_seconds, timeout_seconds, max_attempts, message, continue_on_failure)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			step.ID, p.ID, step.StepIndex, step.Provider, step.TargetKind, step.TargetType, step.TargetID, step.DelaySeconds, step.TimeoutSeconds, step.MaxAttempts, step.Message, step.ContinueOnFailure)
+		// timeout_seconds and max_attempts keep their defaults: nothing reads
+		// them since the delivery families took over deadlines and retries.
+		_, err = tx.Exec(`INSERT INTO escalation_steps (id, policy_id, step_index, provider, target_kind, target_type, target_id, delay_seconds, message, continue_on_failure)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			step.ID, p.ID, step.StepIndex, step.Provider, step.TargetKind, step.TargetType, step.TargetID, step.DelaySeconds, step.Message, step.ContinueOnFailure)
 		if err != nil {
 			return err
 		}
@@ -2752,13 +2760,19 @@ func (s *Store) GetMetricsSnapshot(ctx context.Context) (*model.MetricsSnapshot,
 	// Every family that has rows at all reports a number, zero included, so a
 	// backlog that has been worked off stops ringing instead of leaving its last
 	// value behind forever.
+	//
+	// A satellite waiting for its card, or for the alert to end, is not late:
+	// waiting is what it is for. The predicate is the claim's, so what this
+	// gauge calls late is exactly what a worker could have taken.
 	snapshotStep(8)
 	rows6, err := s.db.QueryContext(ctx, `
-		SELECT delivery_family,
-		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(next_attempt_at)
-		           FILTER (WHERE status = 'pending' AND next_attempt_at <= now()))), 0)::double precision
-		FROM outbound_intents
-		GROUP BY delivery_family`)
+		SELECT due.delivery_family,
+		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(due.next_attempt_at)
+		           FILTER (WHERE due.status = 'pending' AND due.next_attempt_at <= now()
+		                   `+satelliteMayGo+`))), 0)::double precision
+		FROM outbound_intents due
+		`+satelliteJoins+`
+		GROUP BY due.delivery_family`)
 	if err != nil {
 		return nil, fmt.Errorf("outbound queue lateness query: %w", err)
 	}

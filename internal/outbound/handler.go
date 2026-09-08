@@ -117,12 +117,17 @@ type Handler interface {
 	// nothing else: it is never called for a request that failed before an
 	// answer arrived, because what those mean does not vary by provider.
 	//
+	// The call is handed over with the answer, because what an answer proves
+	// depends on what was asked: "the message is not there" is a fact about
+	// the object a CHANGE was aimed at, and about a create it proves nothing
+	// - a create that answered so made nothing, and made nothing go away.
+	//
 	// The bool is the honest half of the contract. A status this build has
 	// never seen is not a failure to be guessed at - returning false hands it
 	// to the rule that knows what to do with an unknown, and a handler that
 	// guessed instead would be declaring an absence its documentation does not
 	// prove.
-	ClassifyResponse(res Result) (Classification, bool)
+	ClassifyResponse(call Call, res Result) (Classification, bool)
 }
 
 // Classification is what a provider's own answer means, in the domain's words.
@@ -168,6 +173,13 @@ type Call struct {
 	// resolve one of its own.
 	Endpoint    string
 	ProviderKey string
+
+	// BoundContext is what the message takes from a neighbouring commitment,
+	// settled with the generation like the endpoint: for a direct message,
+	// the card it points back to. Empty when there is nothing to take. Read
+	// by the store at Begin, so a channel never meets a context it cannot
+	// read.
+	BoundContext BoundContext
 
 	// Receipt is where the message this call changes already is - the whole of
 	// what the provider said when it made one. Present for a mutation and empty
@@ -517,7 +529,7 @@ func classify(h Handler, call Call, res Result) (Outcome, string, *keys.Provider
 		return OutcomeAmbiguous, "no_response", nil, BreachNone
 
 	case ProviderResponse:
-		answer, known := h.ClassifyResponse(res)
+		answer, known := h.ClassifyResponse(call, res)
 		if !known {
 			outcome, class := unknownStatus(res.Status)
 			return outcome, class, nil, BreachNone

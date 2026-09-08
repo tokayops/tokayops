@@ -211,7 +211,7 @@ func TestKeysRefuseWhatTheGrammarCannotSay(t *testing.T) {
 			name: "a target kind from outside the set",
 			call: func() error {
 				i := fixtureIntent()
-				i.Target.Kind = TargetKind("thread")
+				i.Target.Kind = TargetKind("pager")
 				_, err := i.key(KindEscalation, GrammarV1)
 				return err
 			},
@@ -405,6 +405,116 @@ func TestKeysAreStableAcrossCalls(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		if again := mustIntentKey(t, fixtureIntent(), KindEscalation); again != first {
 			t.Fatalf("call %d produced a different key:\n got: %s\nwant: %s", i, again, first)
+		}
+	}
+}
+
+// TestASatelliteIsAimedByAnEscalationAlone. The thread and the reply are
+// targets an escalation may name and a handover or a webhook may not; a
+// satellite is what its card is, and the grammar refuses one with a deadline,
+// words or buttons of its own, or on a provider that has no threads.
+func TestASatelliteIsAimedByAnEscalationAlone(t *testing.T) {
+	for _, kind := range []TargetKind{TargetThread, TargetThreadReply} {
+		target := Target{Kind: kind, Ref: fixtureChannel}
+		if err := target.validate(); err != nil {
+			t.Fatalf("the grammar does not know %s: %v", kind, err)
+		}
+		if err := target.addressedTo(escalationTargets...); err != nil {
+			t.Fatalf("an escalation may not name a %s: %v", kind, err)
+		}
+		if err := target.addressedTo(TargetUser); err == nil {
+			t.Fatalf("a handover may name a %s", kind)
+		}
+		if err := target.addressedTo(TargetSubscriber); err == nil {
+			t.Fatalf("a webhook may name a %s", kind)
+		}
+	}
+
+	sound := func(kind TargetKind) EscalationCommitment {
+		c := fixtureCommitment()
+		c.Target = Target{Kind: kind, Ref: fixtureChannel}
+		c.Editable = kind == TargetThread
+		return c
+	}
+	for _, kind := range []TargetKind{TargetThread, TargetThreadReply} {
+		if err := sound(kind).validate(); err != nil {
+			t.Fatalf("a well-formed %s was refused: %v", kind, err)
+		}
+	}
+	expiry := TimingSpec{Kind: TimingAbsolute, At: fixtureStart}
+	words := "hello"
+	for name, spoil := range map[string]func(*EscalationCommitment){
+		"a thread that is not editable":         func(c *EscalationCommitment) { c.Editable = false },
+		"a satellite with a deadline":           func(c *EscalationCommitment) { c.Expiry = &expiry },
+		"a satellite with words":                func(c *EscalationCommitment) { c.MessageOverride = &words },
+		"a satellite that stops the escalation": func(c *EscalationCommitment) { c.StopOnFailure = true },
+		"a satellite on Telegram":               func(c *EscalationCommitment) { c.Provider = "telegram" },
+	} {
+		c := sound(TargetThread)
+		spoil(&c)
+		if err := c.validate(); err == nil || !errors.Is(err, ErrContract) {
+			t.Errorf("%s was accepted: %v", name, err)
+		}
+	}
+	reply := sound(TargetThreadReply)
+	reply.Editable = true
+	if err := reply.validate(); err == nil {
+		t.Error("an editable reply was accepted")
+	}
+
+	// A satellite follows a card in the same admission; one without is
+	// refused, and one with is keyed apart from its card and from each other.
+	batch := fixtureBatch(t, sound(TargetThread), sound(TargetThreadReply))
+	if _, err := batch.Admit(); err == nil {
+		t.Fatal("satellites were admitted without their card")
+	}
+	admission := mustAdmit(t, fixtureBatch(t, fixtureCommitment(), sound(TargetThread), sound(TargetThreadReply)))
+	seen := map[string]bool{}
+	var cardKey string
+	for _, c := range admission.Commitments {
+		seen[c.IdempotencyKey] = true
+		if !c.Target.Satellite() {
+			cardKey = c.IdempotencyKey
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("three commitments share %d key(s)", len(seen))
+	}
+	for _, c := range admission.Commitments {
+		if c.Target.Satellite() != (c.ParentKey != "") || (c.ParentKey != "" && c.ParentKey != cardKey) {
+			t.Errorf("%s follows %q, the card is %q", c.Target.Kind, c.ParentKey, cardKey)
+		}
+	}
+}
+
+// TestAStepIsAdmittedWithItsFlagInVersionTwo. The admission writes
+// escalation_payload/v2: the policy's word on stopping travels with the
+// commitment, and the buttons do not - they are the snapshot's. The firehose
+// is no step and cannot stop anything; a satellite is not a page and cannot
+// either. This build executes both versions: the rows admitted before it
+// live as long as their cards do.
+func TestAStepIsAdmittedWithItsFlagInVersionTwo(t *testing.T) {
+	stopping := fixtureCommitment()
+	stopping.StopOnFailure = true
+	admitted := mustAdmit(t, fixtureBatch(t, stopping)).Commitments[0]
+	payload, ok := admitted.Payload.(EscalationPayloadV2)
+	if !ok || admitted.PayloadSchemaVersion != 2 {
+		t.Fatalf("the admission wrote %T at version %d", admitted.Payload, admitted.PayloadSchemaVersion)
+	}
+	if !payload.StopOnFailure || payload.Slot != stopping.Slot || payload.Target != stopping.Target {
+		t.Fatalf("the payload reads %+v", payload)
+	}
+
+	firehose := fixtureCommitment()
+	firehose.Slot = Slot{Kind: SlotFirehose}
+	firehose.StopOnFailure = true
+	if err := firehose.validate(); err == nil || !errors.Is(err, ErrContract) {
+		t.Fatalf("the firehose was allowed to stop the escalation: %v", err)
+	}
+
+	for version, want := range map[int]bool{1: true, 2: true, 3: false} {
+		if got := KnowsPayloadSchema(KindEscalation, version); got != want {
+			t.Errorf("version %d known: %v, want %v", version, got, want)
 		}
 	}
 }

@@ -60,7 +60,7 @@ func TestProcessNewAlertGroups(t *testing.T) {
 	// Setup Config (only for firehose channels now)
 	cfg := &config.Config{}
 
-	e := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+	e := NewEngine(s, &fakeProjection{}, cfg)
 
 	// Seed a NEW alert group
 	ag := &model.AlertGroup{
@@ -117,8 +117,7 @@ func TestTheTeamDecidesTheRouting(t *testing.T) {
 		s.CreateEscalationPolicy(&model.EscalationPolicy{ID: id, Name: id})
 	}
 
-	plan := &planner{store: s, oncall: &fakeProjection{}, settings: &fakeSettings{},
-		cfg: &config.Config{}}
+	plan := &planner{store: s, oncall: &fakeProjection{}, cfg: &config.Config{}}
 
 	tests := []struct {
 		name      string
@@ -158,7 +157,7 @@ func TestTheTeamDecidesTheRouting(t *testing.T) {
 
 func TestPolicySnapshot_Versioning(t *testing.T) {
 	s := store.NewMockStore()
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, &config.Config{})
+	eng := NewEngine(s, &fakeProjection{}, &config.Config{})
 
 	// 1. Setup Policy V1
 	policyID := "mutable_policy"
@@ -247,7 +246,7 @@ func TestEngine_PlanFailure_AGStaysNew(t *testing.T) {
 	s := store.NewMockStore()
 
 	cfg := &config.Config{Global: config.GlobalConfig{FirehoseCriticalChannel: "C_FIRE"}}
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	ag := &model.AlertGroup{
 		ID:       "ag-plan-fail",
@@ -295,7 +294,7 @@ func TestEngine_StepWithNoTarget_IsRecordedNotFailed(t *testing.T) {
 	})
 
 	cfg := &config.Config{Global: config.GlobalConfig{FirehoseWarningChannel: "C_FIRE"}}
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	ag := &model.AlertGroup{
 		ID: "ag-no-target", AlertKey: "dedup-no-target",
@@ -309,9 +308,9 @@ func TestEngine_StepWithNoTarget_IsRecordedNotFailed(t *testing.T) {
 	if !admitted {
 		t.Fatal("nothing was admitted for a group whose policy step names nobody")
 	}
-	if len(admission.Admission.Commitments) != 1 {
-		t.Fatalf("expected the firehose alone, got %d commitments",
-			len(admission.Admission.Commitments))
+	if cards, satellites := cardsOf(admission.Admission.Commitments); len(cards) != 1 || satellites != 2 {
+		t.Fatalf("expected the firehose alone with its two satellites, got %d card(s) and %d satellite(s)",
+			len(cards), satellites)
 	}
 	if len(escalationOf(t, admission).Unpromised) != 1 {
 		t.Fatalf("the step that named nobody was not recorded: %v", escalationOf(t, admission).Unpromised)
@@ -330,7 +329,7 @@ func TestEngine_FirehoseCreation(t *testing.T) {
 			FirehoseCriticalChannel: "C_FIRE",
 		},
 	}
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	// Create AG (Critical) - no policy, firehose only
 	ag := &model.AlertGroup{ID: "ag_fire", Severity: "critical", AlertKey: "dk_fire", Status: model.AlertGroupStatusNew}
@@ -342,11 +341,13 @@ func TestEngine_FirehoseCreation(t *testing.T) {
 	if !admitted {
 		t.Fatal("nothing was admitted for a group with a firehose channel")
 	}
-	if len(admission.Admission.Commitments) != 1 {
-		t.Fatalf("expected one commitment, got %d", len(admission.Admission.Commitments))
+	cards, satellites := cardsOf(admission.Admission.Commitments)
+	if len(cards) != 1 || satellites != 2 {
+		t.Fatalf("expected one card with its two satellites, got %d card(s) and %d satellite(s)",
+			len(cards), satellites)
 	}
 
-	commitment := admission.Admission.Commitments[0]
+	commitment := cards[0]
 	if commitment.Slot.Kind != keys.SlotFirehose {
 		t.Errorf("the firehose is in slot %q", commitment.Slot.Kind)
 	}
@@ -393,7 +394,7 @@ func TestEngine_ReconcileStaleProcessing(t *testing.T) {
 		t.Fatalf("Failed to create AG: %v", err)
 	}
 
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, cfg)
 	eng.ProcessNewAlertGroups(context.Background())
 
 	// Verify: AG should still be "processing" (re-processed by engine)
@@ -474,7 +475,7 @@ func TestEngine_ScheduleRecreation_OnCallConsistency(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	cfg := &config.Config{}
-	eng := NewEngine(s, proj, &fakeSettings{}, cfg)
+	eng := NewEngine(s, proj, cfg)
 	eng.ProcessNewAlertGroups(context.Background())
 
 	// 1. Verify on-call snapshot shows user-new (Denis)
@@ -552,7 +553,7 @@ func TestASecondTickDoesNotRestateWhatTheGroupEscalatesBy(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	cfg := &config.Config{}
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	// First call - should create job with V1 snapshot
 	eng.ProcessNewAlertGroups(context.Background())
@@ -623,7 +624,7 @@ func TestAGroupIsAdmittedOnceAndNeverAgain(t *testing.T) {
 	}
 	s.CreateAlertGroup(ag)
 
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	// First run - admits the escalation
 	eng.ProcessNewAlertGroups(context.Background())
@@ -680,7 +681,7 @@ func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 	s.CreateAlertGroup(ag)
 
 	cfg := &config.Config{}
-	eng := NewEngine(s, &fakeProjection{}, &fakeSettings{}, cfg)
+	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	// First tick - should pick up stale AG and touch updated_at
 	eng.ProcessNewAlertGroups(context.Background())
@@ -723,7 +724,7 @@ func TestEngine_OnCallSnapshot_OverrideCarriesSource(t *testing.T) {
 	proj := &fakeProjection{teams: map[string]schedulerender.TeamOnCall{
 		teamID: teamSchedule("sched-1", onDutyByOverride("ovr-1", standIn.ID)),
 	}}
-	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -759,7 +760,7 @@ func TestEngine_OnCallSnapshot_NoSchedule_IsEmptyNotAnError(t *testing.T) {
 	}
 	s.CreateAlertGroup(ag)
 
-	NewEngine(s, &fakeProjection{}, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, &fakeProjection{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -792,7 +793,7 @@ func TestEngine_OnCallSnapshot_DeletedSchedule_IsEmpty(t *testing.T) {
 	proj := &fakeProjection{teams: map[string]schedulerender.TeamOnCall{
 		teamID: {ScheduleID: "sched-1", DeletedAt: &deletedAt, OnCall: schedulerender.OnCall{At: projectionBase}},
 	}}
-	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -825,7 +826,7 @@ func TestEngine_OnCallSnapshot_L2IsRecorded(t *testing.T) {
 	proj := &fakeProjection{teams: map[string]schedulerender.TeamOnCall{
 		teamID: teamSchedule("sched-1", withL2),
 	}}
-	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -877,7 +878,7 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 		first: teamSchedule("sched-1", onDuty("g-outgoing", outgoing.ID)),
 		then:  &after,
 	}
-	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	if proj.calls != 1 {
 		t.Errorf("projection read %d times for one alert group, want 1", proj.calls)
@@ -955,7 +956,7 @@ func TestEngine_OnCallReadFailure_DefersEverything(t *testing.T) {
 		byID: map[string]schedulerender.OnCall{"sched-old": onDuty("g-old", stale.ID)},
 	}
 	deferralsBefore := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
-	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
 	if err != nil {
@@ -1015,7 +1016,7 @@ func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
 		errUntilCall: 1,
 		first:        teamSchedule("sched-current", onDuty("g-a", onDutyUser.ID)),
 	}
-	engine := NewEngine(s, proj, &fakeSettings{}, &config.Config{})
+	engine := NewEngine(s, proj, &config.Config{})
 
 	deferralsBefore := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
 	engine.ProcessNewAlertGroups(context.Background())
@@ -1089,7 +1090,7 @@ func TestEngine_DeferredTick_NamesTheBatchOnceAndNothingPerGroup(t *testing.T) {
 	defer log.SetOutput(restore)
 
 	proj := &countingProjection{err: errors.New("could not begin transaction")}
-	NewEngine(s, proj, &fakeSettings{}, &config.Config{}).ProcessNewAlertGroups(context.Background())
+	NewEngine(s, proj, &config.Config{}).ProcessNewAlertGroups(context.Background())
 
 	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
 	if len(lines) != 2 {
@@ -1154,16 +1155,6 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 	return m.GetCounter().GetValue()
 }
 
-// fakeSettings is the channel configuration a plan freezes: whether messages
-// may carry buttons.
-type fakeSettings struct {
-	slack    bool
-	telegram bool
-}
-
-func (f *fakeSettings) GetSlackInteractive() bool    { return f.slack }
-func (f *fakeSettings) GetTelegramInteractive() bool { return f.telegram }
-
 // promisedUsers is who an admission promises to page, in key order.
 func promisedUsers(admission outbound.Batch) []string {
 	var out []string
@@ -1183,4 +1174,147 @@ func escalationOf(t *testing.T, batch outbound.Batch) outbound.EscalationContext
 		t.Fatalf("the engine built a %q batch", batch.Context.Form())
 	}
 	return about
+}
+
+// cardsOf splits an admission into the commitments that reach a recipient and
+// the number of satellites that follow a card.
+func cardsOf(commitments []keys.AdmittedCommitment) (cards []keys.AdmittedCommitment, satellites int) {
+	for _, c := range commitments {
+		if c.Target.Satellite() {
+			satellites++
+			continue
+		}
+		cards = append(cards, c)
+	}
+	return cards, satellites
+}
+
+// TestEveryChannelCardHasItsThreadAndItsReply. A Slack channel card - the
+// firehose and every channel step - is admitted with the thread under it and
+// the reply that closes it: same slot, same timing, following the card by its
+// key. A person's message and a Telegram card have neither.
+func TestEveryChannelCardHasItsThreadAndItsReply(t *testing.T) {
+	s := store.NewMockStore()
+	teamID := "team-threads"
+	policyID := "threads_policy"
+	s.CreateTeam(&model.Team{ID: teamID, DefaultPolicyID: policyID})
+	s.CreateUser(&model.User{ID: "U1", Name: "Nina"})
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Threads",
+		Steps: []*model.EscalationStep{
+			{Provider: "slack", TargetKind: "channel", TargetType: "channel", TargetID: "C_OPS", StepIndex: 0, DelaySeconds: 60},
+			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U1", StepIndex: 1},
+			{Provider: "telegram", TargetKind: "channel", TargetType: "channel", TargetID: "-1001", StepIndex: 2},
+		},
+	})
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseCriticalChannel: "C_FIRE"}}
+	eng := NewEngine(s, &fakeProjection{}, cfg)
+	s.CreateAlertGroup(&model.AlertGroup{
+		ID: "ag-threads", AlertKey: "dk-threads", Status: model.AlertGroupStatusNew,
+		TeamID: teamID, Severity: "critical",
+	})
+
+	eng.ProcessNewAlertGroups(context.Background())
+
+	admission, admitted := s.AdmissionFor("ag-threads")
+	if !admitted {
+		t.Fatal("nothing was admitted")
+	}
+	byKey := map[string]keys.AdmittedCommitment{}
+	for _, c := range admission.Admission.Commitments {
+		byKey[c.IdempotencyKey] = c
+	}
+	cards, satellites := cardsOf(admission.Admission.Commitments)
+	if len(cards) != 4 || satellites != 4 {
+		t.Fatalf("got %d card(s) and %d satellite(s); want the firehose, three steps and four satellites",
+			len(cards), satellites)
+	}
+	for _, card := range cards {
+		var thread, reply *keys.AdmittedCommitment
+		for i := range admission.Admission.Commitments {
+			c := &admission.Admission.Commitments[i]
+			if c.ParentKey != card.IdempotencyKey {
+				continue
+			}
+			switch c.Target.Kind {
+			case keys.TargetThread:
+				thread = c
+			case keys.TargetThreadReply:
+				reply = c
+			}
+		}
+		slackChannel := card.Provider == "slack" && card.Target.Kind == keys.TargetChannel
+		if slackChannel != (thread != nil && reply != nil) {
+			t.Fatalf("%s %s has thread=%v reply=%v", card.Provider, card.Target.Kind, thread != nil, reply != nil)
+		}
+		if !slackChannel {
+			continue
+		}
+		for name, satellite := range map[string]*keys.AdmittedCommitment{"thread": thread, "reply": reply} {
+			if satellite.Slot != card.Slot || satellite.Timing != card.Timing || satellite.Target.Ref != card.Target.Ref {
+				t.Errorf("the %s of %s does not share its slot, timing and channel", name, card.Target.Ref)
+			}
+			if satellite.Expiry != nil || satellite.Provider != "slack" {
+				t.Errorf("the %s of %s has a deadline or another provider", name, card.Target.Ref)
+			}
+			if _, ok := byKey[satellite.ParentKey]; !ok {
+				t.Errorf("the %s of %s follows a key not in the admission", name, card.Target.Ref)
+			}
+		}
+		if !thread.Editable || reply.Editable {
+			t.Errorf("the thread of %s is editable=%v and the reply editable=%v", card.Target.Ref, thread.Editable, reply.Editable)
+		}
+	}
+}
+
+// TestAStepThatDoesNotContinueStopsOnFailure. The policy's word travels with
+// the commitment as escalation_payload/v2: a step that does not continue on
+// failure is admitted with the flag, the firehose and the satellites without
+// it, whatever the step says.
+func TestAStepThatDoesNotContinueStopsOnFailure(t *testing.T) {
+	s := store.NewMockStore()
+	teamID := "team-stop"
+	policyID := "stop_policy"
+	s.CreateTeam(&model.Team{ID: teamID, DefaultPolicyID: policyID})
+	s.CreateUser(&model.User{ID: "U1", Name: "Nina"})
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Stop",
+		Steps: []*model.EscalationStep{
+			{Provider: "slack", TargetKind: "channel", TargetType: "channel", TargetID: "C_OPS", StepIndex: 0, ContinueOnFailure: false},
+			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U1", StepIndex: 1, ContinueOnFailure: true},
+		},
+	})
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseCriticalChannel: "C_FIRE"}}
+	eng := NewEngine(s, &fakeProjection{}, cfg)
+	s.CreateAlertGroup(&model.AlertGroup{
+		ID: "ag-stop", AlertKey: "dk-stop", Status: model.AlertGroupStatusNew,
+		TeamID: teamID, Severity: "critical",
+	})
+	eng.ProcessNewAlertGroups(context.Background())
+
+	admission, admitted := s.AdmissionFor("ag-stop")
+	if !admitted {
+		t.Fatal("nothing was admitted")
+	}
+	stops := map[string]bool{}
+	for _, c := range admission.Admission.Commitments {
+		if c.PayloadSchemaVersion != 2 {
+			t.Fatalf("%s %s was admitted with payload version %d", c.Target.Kind, c.Target.Ref, c.PayloadSchemaVersion)
+		}
+		payload, ok := c.Payload.(keys.EscalationPayloadV2)
+		if !ok {
+			t.Fatalf("%s %s carries a %T", c.Target.Kind, c.Target.Ref, c.Payload)
+		}
+		stops[string(c.Target.Kind)+" "+c.Target.Ref+" "+string(c.Slot.Kind)] = payload.StopOnFailure
+	}
+	want := map[string]bool{
+		"channel C_OPS policy": true, "thread C_OPS policy": false, "thread_reply C_OPS policy": false,
+		"user U1 policy":          false,
+		"channel C_FIRE firehose": false, "thread C_FIRE firehose": false, "thread_reply C_FIRE firehose": false,
+	}
+	for name, flag := range want {
+		if got, ok := stops[name]; !ok || got != flag {
+			t.Errorf("%s stops on failure: %v (present %v), want %v", name, got, ok, flag)
+		}
+	}
 }

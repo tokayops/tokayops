@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
@@ -708,8 +709,8 @@ type TimelineResponse struct {
 
 // AddNoteRequest represents a request to add a note to an alert group.
 type AddNoteRequest struct {
-	Message string `json:"message"` // Required
-	Actor   string `json:"actor"`   // Optional, defaults to "user"
+	Message string `json:"message"` // Required, at most 2000 characters
+	Actor   string `json:"actor"`   // Ignored since 0.3.0: the authenticated user is the actor
 }
 
 // GetAlertGroupTimeline godoc
@@ -766,39 +767,30 @@ func (a *API) GetAlertGroupTimeline(c echo.Context) error {
 func (a *API) AddAlertGroupNote(c echo.Context) error {
 	id := c.Param("id")
 
-	// Verify alert group exists
-	_, err := a.store.GetAlertGroupByID(id)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "alert group not found"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
 	var req AddNoteRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
 	}
-
 	if req.Message == "" {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "message is required"})
 	}
-
-	actor := req.Actor
-	if actor == "" {
-		actor = "user"
+	if utf8.RuneCountInString(req.Message) > store.NoteLimit {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("message is at most %d characters", store.NoteLimit)})
 	}
 
-	event := &model.TimelineEvent{
-		ID:           uuid.New().String(),
-		AlertGroupID: id,
-		Type:         model.TimelineEventNote,
-		Message:      req.Message,
-		Actor:        actor,
-		CreatedAt:    time.Now(),
-	}
-
-	if err := a.store.AddTimelineEvent(event); err != nil {
+	// The thread under the card renders the note, so it goes through the
+	// domain's door: written and raised under the group's lock, signed by the
+	// person who called - never by a name the body supplied.
+	event, err := a.store.AddAlertGroupNoteAtomic(c.Request().Context(), id, req.Message,
+		a.resolveRESTActor(c))
+	if err != nil {
+		switch {
+		case err == sql.ErrNoRows:
+			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "alert group not found"})
+		case errors.Is(err, store.ErrNoteInvalid):
+			return c.JSON(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		}
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 

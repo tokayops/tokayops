@@ -21,6 +21,7 @@ export const ViewManager = {
         filters: () => Elements.alertGroupsFilters,
         viewToggle: () => Elements.viewToggle,
         configureDashboard: () => document.getElementById('configure-dashboard'), // Tile grid
+        pagination: () => Elements.pagination, // The alert groups' pager
         teamsNav: () => document.getElementById('teams-nav'), // Maybe hide in Cfg? depends on design
     },
 
@@ -63,6 +64,8 @@ export const ViewManager = {
         const viewToggleEl = this.globalElements.viewToggle();
 
         if (filtersEl) filtersEl.style.display = opts.showStats ? 'block' : 'none';
+        const paginationEl = this.globalElements.pagination();
+        if (paginationEl && viewName !== 'alertGroups') paginationEl.style.display = 'none';
         if (viewToggleEl) viewToggleEl.style.display = opts.showViewToggle ? 'flex' : 'none';
 
         this.currentView = viewName;

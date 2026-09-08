@@ -6863,9 +6863,6 @@ body::before {
     color: var(--text-muted, #6b7280);
 }
 
-.deliveries-block .detail-subtitle {
-    margin-top: var(--space-md, 16px);
-}
 .deliveries-empty {
     color: var(--text-muted, #6b7280);
     font-size: 0.85rem;
@@ -6895,32 +6892,6 @@ body::before {
     height: 12px;
 }
 
-.delivery-event {
-    border: 1px solid var(--border-color, #e5e7eb);
-    border-radius: 6px;
-    padding: var(--space-sm, 8px);
-    margin-bottom: var(--space-sm, 8px);
-}
-.delivery-event-header,
-.delivery-batch-header {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-sm, 8px);
-    align-items: baseline;
-    font-size: 0.85rem;
-}
-.delivery-event-type {
-    font-weight: 600;
-}
-.delivery-event-status {
-    color: var(--text-muted, #6b7280);
-}
-.delivery-batch {
-    margin: var(--space-sm, 8px) 0 0 var(--space-md, 16px);
-}
-.delivery-batch-kind {
-    font-weight: 500;
-}
 
 .timeline-delivery {
     flex-wrap: wrap;
@@ -6939,20 +6910,69 @@ body::before {
     text-decoration: underline;
 }
 
-.journal-summary {
-    margin-bottom: var(--space-md, 16px);
+/* The journal of one delivery, drawn with the alert group's own parts. */
+.journal .detail-status-line .journal-sentence {
+    font-weight: 600;
+    color: var(--text-primary);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
 }
-.journal-status {
-    margin-bottom: var(--space-sm, 8px);
+.journal .detail-status-line .delivery-status {
+    font-size: 0.75rem;
 }
-.journal-id {
-    font-family: monospace;
-    font-size: 0.8rem;
+.journal-verdict {
+    margin-top: var(--space-sm);
+    font-size: 0.875rem;
+    color: var(--text-primary);
+    max-width: 60ch;
 }
-.journal-reason {
-    color: var(--text-muted, #6b7280);
-    font-size: 0.8rem;
-    font-weight: normal;
+.journal .timeline-container {
+    max-height: none;
+    overflow: visible;
+}
+.journal-tone-ok {
+    color: var(--action-success, #22c55e);
+}
+.journal-tone-retry,
+.journal-tone-doubt {
+    color: var(--severity-warning, #d4b25a);
+}
+.journal-tone-failed {
+    color: var(--severity-critical, #e07a72);
+}
+.journal-tone-open {
+    color: var(--text-muted);
+}
+.journal-said {
+    color: var(--text-secondary);
+}
+.journal-note {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+.journal-none {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    padding: var(--space-sm) 0;
+}
+.timeline-event.type-journal-decision .timeline-icon {
+    background: var(--accent-primary);
+}
+.timeline-event.type-journal-retry .timeline-icon {
+    background: var(--severity-warning-border, #b38b12);
+}
+.timeline-event.type-journal-withdrawn .timeline-icon,
+.timeline-event.type-journal-open .timeline-icon,
+.timeline-event.type-journal-machinery .timeline-icon {
+    background: var(--text-muted);
+}
+.journal-machinery {
+    margin-top: var(--space-xs);
+}
+.journal-group-link {
+    color: var(--accent-primary);
 }
 .journal-actor-system {
     color: var(--text-muted, #6b7280);
@@ -7017,29 +7037,121 @@ body::before {
     color: #dc2626;
 }
 
-.activity-filters {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-md, 16px);
-    align-items: flex-end;
-    margin-bottom: var(--space-md, 16px);
+/* Activity: the operational log, in the shape of the alert groups' list. */
+.activity-filters .form-select {
+    flex: none;
+    min-width: 180px;
 }
-.activity-filters label {
+.activity-filters .form-input {
+    width: auto;
+    min-width: 200px;
+}
+.activity-filters .filters-right .btn {
+    min-height: 36px;
+}
+/* The custom range shows only under its tab; the groups are flex otherwise. */
+.activity-filters [hidden] {
+    display: none !important;
+}
+.activity-table {
+    --activity-columns: 150px minmax(0, 1fr) 140px 150px;
+}
+.list-header.activity-header {
+    display: grid;
+    grid-template-columns: var(--activity-columns);
+}
+.activity-rows {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    font-size: 0.8rem;
+    gap: var(--space-xs);
 }
-.activity-pagination {
+.activity-row {
+    display: grid;
+    grid-template-columns: var(--activity-columns);
+    align-items: center;
+    gap: var(--space-md);
+    padding: var(--space-sm) var(--space-lg);
+}
+.activity-row::before {
+    background: var(--text-muted);
+}
+.activity-row.status-permanent_failed::before {
+    background: #dc2626;
+}
+.activity-row.status-manual_review::before,
+.activity-row.status-expired::before {
+    background: #d97706;
+}
+.activity-row.status-pending::before,
+.activity-row.status-sending::before {
+    background: var(--accent-primary);
+}
+.activity-row.status-succeeded::before,
+.activity-row.status-idle::before {
+    background: #059669;
+}
+.activity-when {
+    font-size: 0.875rem;
+    white-space: nowrap;
+}
+.activity-sub {
+    margin-top: 2px;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+.activity-what {
+    min-width: 0;
+}
+.activity-sentence {
+    font-weight: 600;
+    font-size: 0.9375rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.activity-sentence .delivery-target {
+    gap: 2px;
+}
+.activity-group-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    text-decoration: none;
+}
+.activity-group-link:hover {
+    color: var(--accent-primary);
+}
+.activity-group-link svg {
+    width: 14px;
+    height: 14px;
+}
+.activity-footer {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: var(--space-md, 16px) 0;
-    font-size: 0.8rem;
-    color: var(--text-muted, #6b7280);
+    padding: var(--space-md) 0;
+    font-size: 0.8125rem;
+    color: var(--text-muted);
 }
-.activity-pagination div {
-    display: flex;
-    gap: var(--space-sm, 8px);
+.activity-summary {
+    display: inline-flex;
     align-items: center;
+    gap: var(--space-xs);
 }
+.activity-pager {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+.activity-pager .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.activity-pager .btn svg {
+    width: 14px;
+    height: 14px;
+}
+

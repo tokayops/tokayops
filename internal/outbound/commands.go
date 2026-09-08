@@ -24,12 +24,23 @@ const (
 	DesiredAck     DesiredReason = "ack"
 	DesiredResolve DesiredReason = "resolve"
 	DesiredMerge   DesiredReason = "merge"
+
+	// DesiredNote: somebody wrote a line into the alert's history, and the
+	// thread under the card shows it. Not final, and allowed in any state the
+	// group is in; on a group whose last revision is out, the line is written
+	// and nothing is raised.
+	DesiredNote DesiredReason = "note"
+
+	// DesiredInteractivity: the button switch of a provider moved, and the
+	// cards show buttons, or stop showing them. Raised from the switch's own
+	// request and from every start, for the groups whose cards are behind it.
+	DesiredInteractivity DesiredReason = "interactivity"
 )
 
 // Known reports whether a reason is one this build states.
 func (r DesiredReason) Known() bool {
 	switch r {
-	case DesiredAck, DesiredResolve, DesiredMerge:
+	case DesiredAck, DesiredResolve, DesiredMerge, DesiredNote, DesiredInteractivity:
 		return true
 	default:
 		return false
@@ -468,6 +479,10 @@ type BeginAttemptResult struct {
 	// key are what they were when it opened. The worker sends to these.
 	BoundEndpoint string
 	ProviderKey   string
+	// BoundContext is the generation's third field: what the message takes
+	// from a neighbouring commitment, settled when the generation opened and
+	// read here, where a row this build cannot read is a refusal.
+	BoundContext BoundContext
 
 	// Receipt is where the external object is, for the calls that change one.
 	// Empty for a create: there is nothing out there yet.

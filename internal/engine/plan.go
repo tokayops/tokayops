@@ -41,25 +41,18 @@ type planStore interface {
 	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
 	GetUsersByIDs(ids []string) ([]*model.User, error)
 	GetTeamByID(id string) (*model.Team, error)
-}
 
-// channelSettings is the configuration a MESSAGE depends on, as opposed to the
-// configuration a call depends on.
-//
-// Only the first is frozen. Whether buttons are offered changes the bytes of a
-// card, so it is decided here and travels with the commitment; the token to
-// send it with is read at each attempt, because rotating one has to apply to
-// work that has not gone out yet.
-type channelSettings interface {
-	GetSlackInteractive() bool
-	GetTelegramInteractive() bool
+	// RenderInputs is what revision 0 freezes besides the group row: the tail
+	// of the history the thread shows and the providers whose cards carry
+	// buttons. From the database, not from a cache - two instances with two
+	// caches would freeze two different revision 0s.
+	RenderInputs(ctx context.Context, alertGroupID string) (providers.RenderInputs, error)
 }
 
 type planner struct {
-	store    planStore
-	oncall   onCallProjection
-	settings channelSettings
-	cfg      *config.Config
+	store  planStore
+	oncall onCallProjection
+	cfg    *config.Config
 
 	// firehose is the channel THIS alert's severity routes to, settled when
 	// the plan starts rather than asked again while it is being built.
@@ -67,7 +60,7 @@ type planner struct {
 }
 
 // firehoseProvider: the firehose is Slack-only, deliberately, as it was.
-const firehoseProvider = "slack"
+const firehoseProvider = keys.ProviderSlack
 
 // buildPlan decides what an alert group promises, and to whom.
 //
@@ -91,7 +84,7 @@ func (p *planner) buildPlan(ctx context.Context, ag *model.AlertGroup,
 		policyID = ""
 	}
 
-	state, err := p.freeze(ag, team)
+	state, err := p.freeze(ctx, ag, team)
 	if err != nil {
 		return outbound.Batch{}, err
 	}
@@ -337,15 +330,26 @@ func (p *planner) teamFor(teamID string) (teamRead, error) {
 // the links whole rather than a base URL, whether the alert's team is set up in
 // TokayOps, and the zone times are printed in. Two instances, or one instance
 // an hour later, then render the same bytes.
-func (p *planner) freeze(ag *model.AlertGroup, team teamRead) (keys.RenderSnapshot, error) {
+func (p *planner) freeze(ctx context.Context, ag *model.AlertGroup, team teamRead) (keys.RenderSnapshot, error) {
 	selfURL := ""
 	if p.cfg != nil {
 		selfURL = p.cfg.Global.SelfURL
 	}
 
+	// The history and the buttons, read now. The window between this read
+	// and the admission's commit is the named best-effort risk of the button
+	// switch, closed by the switch's own door and by every start.
+	inputs, err := p.store.RenderInputs(ctx, ag.ID)
+	if err != nil {
+		return keys.RenderSnapshot{}, fmt.Errorf("read what the state of %s is drawn from: %w", ag.ID, err)
+	}
+
 	in := providers.ViewOf(providers.GroupView{
-		Group:   ag,
-		SelfURL: selfURL,
+		Group:           ag,
+		SelfURL:         selfURL,
+		Timeline:        inputs.Timeline,
+		TimelineOmitted: inputs.TimelineOmitted,
+		Interactive:     inputs.Interactive,
 		// Whether the alert's team is set up here, from the same read the
 		// routing came from. A card says so where its buttons would be, and
 		// asking again at send time would let that answer change between two
@@ -381,20 +385,21 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 	)
 
 	if p.firehose != "" {
-		out = append(out, plannedCommitment{
+		card := plannedCommitment{
 			commitment: keys.EscalationCommitment{
 				Slot:            keys.Slot{Kind: keys.SlotFirehose},
 				Provider:        firehoseProvider,
 				Target:          keys.Target{Kind: keys.TargetChannel, Ref: p.firehose},
 				Editable:        true,
-				Interactive:     p.interactiveOn(firehoseProvider),
 				Timing:          keys.TimingSpec{Kind: keys.TimingRelativeToAdmission},
 				CompletionMode:  keys.CompletionOnAcceptance,
 				AmbiguityPolicy: keys.PolicyRetry,
 			},
 			targetKind: "channel",
 			firehose:   true,
-		})
+		}
+		out = append(out, card)
+		out = append(out, satellitesOf(card)...)
 	}
 
 	if policy == nil {
@@ -472,14 +477,16 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 				seen[key] = true
 			}
 
-			out = append(out, plannedCommitment{
+			card := plannedCommitment{
 				commitment: keys.EscalationCommitment{
 					Slot:            slot,
 					Provider:        step.Provider,
 					Target:          target,
 					Editable:        step.TargetKind == "channel",
 					MessageOverride: optionalText(step.Message),
-					Interactive:     p.interactiveOn(step.Provider),
+					// The policy's word: a step that does not continue on
+					// failure stops the steps after it when it fails.
+					StopOnFailure: !step.ContinueOnFailure,
 					Timing: keys.TimingSpec{
 						Kind: keys.TimingRelativeToAdmission, Offset: offset,
 					},
@@ -487,7 +494,9 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 					AmbiguityPolicy: keys.PolicyRetry,
 				},
 				targetKind: step.TargetKind,
-			})
+			}
+			out = append(out, card)
+			out = append(out, satellitesOf(card)...)
 		}
 	}
 	return out, unpromised, nil
@@ -532,28 +541,6 @@ func (p *planner) firehoseChannel(severity string) string {
 		return p.cfg.Global.FirehoseCriticalChannel
 	}
 	return p.cfg.Global.FirehoseWarningChannel
-}
-
-// interactiveOn says whether this provider's messages may carry buttons.
-//
-// Frozen per commitment because it changes the bytes: a card whose buttons come
-// and go between two attempts is two different messages under one key. The cost
-// is named in the plan - interactivity switched on after an alert was admitted
-// does not appear on cards already promised.
-func (p *planner) interactiveOn(provider string) bool {
-	if p.settings == nil {
-		return false
-	}
-	switch provider {
-	case "slack":
-		return p.settings.GetSlackInteractive()
-	case "telegram":
-		// Telegram's buttons need somewhere to send people back to, and that
-		// link comes from this instance's own URL.
-		return p.settings.GetTelegramInteractive() && p.cfg != nil && p.cfg.Global.SelfURL != ""
-	default:
-		return false
-	}
 }
 
 // policyFor reads the policy this group escalates by, and distinguishes the two
@@ -682,6 +669,11 @@ func policySnapshot(policyID string, policy *model.EscalationPolicy,
 		snapshot.Name = policy.Name
 	}
 	for _, step := range planned {
+		// The satellites of a card are not steps of the policy: they follow a
+		// step's card, and the record of what was decided names the steps.
+		if step.commitment.Target.Satellite() {
+			continue
+		}
 		snapshot.Steps = append(snapshot.Steps, &model.EscalationStepSnapshot{
 			Provider: step.commitment.Provider,
 			// The shape of the message, as the policy words it, and the kind of
@@ -736,4 +728,33 @@ func optionalText(text string) *string {
 		return nil
 	}
 	return &text
+}
+
+// satellitesOf are the two commitments that follow a Slack channel card: the
+// thread under it, edited like the card, and the reply that closes it, said
+// once. The same slot, provider and timing as the card; nothing of their own -
+// no deadline, no words, no buttons. A person's message and a Telegram card
+// have none: Telegram has no threads.
+func satellitesOf(card plannedCommitment) []plannedCommitment {
+	c := card.commitment
+	if c.Provider != firehoseProvider || c.Target.Kind != keys.TargetChannel || !c.Editable {
+		return nil
+	}
+	var out []plannedCommitment
+	for _, kind := range []keys.TargetKind{keys.TargetThread, keys.TargetThreadReply} {
+		out = append(out, plannedCommitment{
+			commitment: keys.EscalationCommitment{
+				Slot:            c.Slot,
+				Provider:        c.Provider,
+				Target:          keys.Target{Kind: kind, Ref: c.Target.Ref},
+				Editable:        kind == keys.TargetThread,
+				Timing:          c.Timing,
+				CompletionMode:  keys.CompletionOnAcceptance,
+				AmbiguityPolicy: keys.PolicyRetry,
+			},
+			targetKind: string(kind),
+			firehose:   card.firehose,
+		})
+	}
+	return out
 }

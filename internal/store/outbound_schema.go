@@ -693,12 +693,14 @@ const outboundAdmittedStateConstraint = "outbound_batches_admission_snapshot_pre
 // What to do with the claims already there is a different question, and the
 // answer is deliberately narrow.
 //
-// A snapshot written before 2026-08-25 carries the alert's history under tag
-// 14. Copying such a row into the batch would produce a claim that parses as
-// nothing this build can read - the codec refuses fields it does not know - and
-// the commitment under it would end as undeliverable at the moment somebody
-// needed it. Repairing it is not possible either: the digest those commitments
-// were keyed against covered a field this protocol no longer has.
+// A version 1 snapshot written before 2026-08-25 carries the alert's history
+// under tag 14. Copying such a row into the batch would produce a claim that
+// parses as nothing this build can read - the codec refuses fields it does not
+// know - and the commitment under it would end as undeliverable at the moment
+// somebody needed it. Repairing it is not possible either: the digest those
+// commitments were keyed against covered a field this protocol no longer has.
+// (A version 2 snapshot carries the history too, under tag 16, and is nothing
+// of the kind - which is why the version is part of the question.)
 //
 // So the three cases are answered separately, and none of them by guessing:
 //
@@ -724,7 +726,7 @@ BEGIN
 
 		SELECT count(*) INTO stale
 		FROM outbound_group_snapshots
-		WHERE snapshot ? 'timeline';
+		WHERE snapshot_schema_version = 1 AND snapshot ? 'timeline';
 
 		IF stale > 0 THEN
 			RAISE EXCEPTION 'this database holds % render snapshot(s) written before '
@@ -798,7 +800,7 @@ BEGIN
 END $$;
 `
 
-const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_the_target"
+const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_the_target_v2"
 
 // outboundTargetAgreementDDL states that a commitment may only name its
 // recipient one way.
@@ -825,6 +827,11 @@ const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_th
 const outboundTargetAgreementDDL = `
 DO $$
 BEGIN
+	-- The rule under its first name knew one payload schema; this one knows
+	-- two. Renamed rather than redefined in place, so a start is a no-op once
+	-- the new one is there.
+	ALTER TABLE outbound_intents
+		DROP CONSTRAINT IF EXISTS outbound_intents_payload_addresses_the_target;
 	IF NOT EXISTS (
 		SELECT 1 FROM pg_constraint
 		WHERE conname = '` + outboundTargetAgreementConstraint + `'
@@ -833,7 +840,7 @@ BEGIN
 		ALTER TABLE outbound_intents
 			ADD CONSTRAINT ` + outboundTargetAgreementConstraint + ` CHECK (
 				key_kind NOT IN ('escalation', 'escalation_replay')
-				OR payload_schema_version <> 1
+				OR payload_schema_version NOT IN (1, 2)
 				-- IS NOT DISTINCT FROM, not =: a payload with no target at all
 				-- yields NULL, and a CHECK that evaluates to NULL is satisfied.
 				-- Written with =, the one row that names its recipient only
@@ -913,6 +920,12 @@ func (s *Store) applyOutboundSchema() error {
 	}
 	if err := applyRetentionSchema(context.Background(), tx); err != nil {
 		return err
+	}
+	if err := applySnapshotV2Schema(context.Background(), tx); err != nil {
+		return err
+	}
+	if err := admitSatellitesTx(context.Background(), tx); err != nil {
+		return fmt.Errorf("failed to give the cards their satellites: %w", err)
 	}
 
 	return tx.Commit()

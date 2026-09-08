@@ -823,7 +823,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "user | channel | subscriber",
+                        "description": "user | channel | thread | thread_reply | subscriber",
                         "name": "target_kind",
                         "in": "query"
                     },
@@ -1405,7 +1405,7 @@ const docTemplate = `{
         },
         "/api/v1/integrations/{id}/test": {
             "post": {
-                "description": "Send a test message via the integration (admin only)",
+                "description": "Send a test message via the integration; for Slack, also records the workspace URL (team_url) in the integration's configuration (admin only)",
                 "consumes": [
                     "application/json"
                 ],
@@ -3176,11 +3176,11 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "actor": {
-                    "description": "Optional, defaults to \"user\"",
+                    "description": "Ignored since 0.3.0: the authenticated user is the actor",
                     "type": "string"
                 },
                 "message": {
-                    "description": "Required",
+                    "description": "Required, at most 2000 characters",
                     "type": "string"
                 }
             }
@@ -3580,6 +3580,10 @@ const docTemplate = `{
                 "not_before": {
                     "type": "string"
                 },
+                "parent_intent_id": {
+                    "description": "ParentIntentID names the card a thread or a reply follows; empty for anything else.",
+                    "type": "string"
+                },
                 "provider": {
                     "type": "string"
                 },
@@ -3845,6 +3849,10 @@ const docTemplate = `{
                 "not_before": {
                     "type": "string"
                 },
+                "parent_intent_id": {
+                    "description": "ParentIntentID names the card a thread or a reply follows; empty for anything else.",
+                    "type": "string"
+                },
                 "provider": {
                     "type": "string"
                 },
@@ -3993,16 +4001,18 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "continue_on_failure": {
-                    "description": "nil defaults to true",
+                    "description": "When false, a step that fails for good stops the escalation: later steps that have not gone out are withdrawn. Defaults to true.",
                     "type": "boolean"
                 },
                 "delay_seconds": {
                     "type": "integer"
                 },
                 "max_attempts": {
+                    "description": "Ignored since 0.2.0: retries have no limit; a page is owed until it is delivered or withdrawn.",
                     "type": "integer"
                 },
                 "message": {
+                    "description": "The words of a direct message; a template over {{.Title}}, {{.Severity}}, {{.Team}} and {{.AlertsCount}}. A channel step posts the card and does not use it.",
                     "type": "string"
                 },
                 "provider": {
@@ -4021,6 +4031,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "timeout_seconds": {
+                    "description": "Ignored since 0.2.0: a call's deadline is the delivery family's, not the step's.",
                     "type": "integer"
                 }
             }

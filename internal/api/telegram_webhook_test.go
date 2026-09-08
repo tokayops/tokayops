@@ -78,7 +78,8 @@ func (f *fakeTelegramAPI) DeleteWebhook(_ context.Context, token string) error {
 func setupTelegramAPI(t *testing.T, secret string) (*API, *store.MockStore, *echo.Echo, *fakeTelegramAPI) {
 	t.Helper()
 	s := store.NewMockStore()
-	cfg, _ := json.Marshal(model.TelegramConfig{BotToken: "123:abc", SecretToken: secret})
+	on := true
+	cfg, _ := json.Marshal(model.TelegramConfig{BotToken: "123:abc", SecretToken: secret, Interactive: &on})
 	s.CreateIntegration(&model.Integration{
 		ID: "int-tg", Type: model.IntegrationTypeTelegram, Name: "tg", Enabled: true, Config: cfg,
 	})

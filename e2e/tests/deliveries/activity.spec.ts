@@ -80,9 +80,10 @@ test.describe('Activity log', () => {
     // Every row offers the journal.
     await page.locator('#activity-status').selectOption('');
     await expect(page.locator('.activity-row').first()).toBeVisible({ timeout: 15000 });
-    await page.locator('.activity-row').first().locator('.journal-link').click();
+    // The row itself opens the journal, as an alert group's row opens the group.
+    await page.locator('.activity-row').first().locator('.activity-what').click();
     await expect(page.locator('#delivery-modal-overlay')).toBeVisible();
-    await expect(page.locator('#delivery-modal-overlay .journal-events')).toBeVisible();
+    await expect(page.locator('#delivery-modal-overlay .journal-history')).toBeVisible();
   });
 
   test('is the administrator\'s', async ({ browser }) => {

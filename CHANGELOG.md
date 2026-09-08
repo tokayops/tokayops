@@ -15,8 +15,18 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   instance left running against the upgraded database fails on any read of an
   alert group - the column carrying an alert's own key is renamed at startup,
   see below - so it stops escalating anything for as long as it is left up.
-  Take a database backup first, as always, and do not start an older image
-  against the upgraded database afterwards: downgrading is not supported.
+  The first start also rewrites what every alert's messages are drawn from
+  (the render snapshot, now carrying the history and the buttons) and gives
+  every open Slack channel card its thread and reply - with a message or
+  without, resolved alerts excluded - so a card sent by the earlier version
+  gets its thread on the first start. Take a database backup first, as
+  always, and do not start an older image against the upgraded database
+  afterwards: downgrading is not supported.
+- **Save or test each Slack integration once after upgrading.** Direct
+  messages link to the card in the channel through the workspace's address,
+  which TokayOps records from `auth.test` on save and on test; an integration
+  saved by an earlier version has none until then, and its direct messages
+  carry the alert link alone.
 - **This version cannot upgrade a database that never went through the schedule
   cutover.** The one-shot `tokayops migrate reset-schedules` command, and the
   startup check that refused to serve until it had run, are both gone: every
@@ -149,12 +159,43 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   payload that arrives afterwards is not merged into it: that alert firing again
   is the next incident, and it starts one. Previously a late payload could still
   change an incident that was over.
-- **There is no thread under a card any more.** The alert's history is not
-  posted as replies, and a resolution is not announced as a second message. Both
-  were extra messages nobody could retry or point at, and the history is on the
-  alert's own page. Cards themselves say more instead: each alert now carries
-  its description and when it started on a second line, the same in Slack and
-  Telegram.
+- **Under every Slack channel card there is one thread and, at the end, one
+  reply.** The thread is a single message that is kept up to date like the
+  card: the alerts in detail and the last twenty lines of the alert's history,
+  each with who did it and when, in the installation's time zone. It changes
+  when the card does - an alert arriving, an acknowledgement, the resolution -
+  and when somebody adds a note, which the card does not show. When the alert
+  is resolved, one reply says so, once: "Resolved by" whoever did it. Both are
+  deliveries of their own in the journal, and neither writes a line into the
+  alert's history. Cards themselves say more too: each alert carries its
+  description and when it started on a second line, the same in Slack and
+  Telegram. Labels and notes are shown as text: an alert named `<!channel>`
+  does not page the channel, and an address that is not one is not linked.
+- **A note is part of the alert's record.** It is written under the name of
+  whoever called the API, not a name given in the request; it is at most two
+  thousand characters; and it appears in the thread under the card.
+- **The words of a direct message can name the alert.** `{{.Title}}`,
+  `{{.Severity}}`, `{{.Team}}` and `{{.AlertsCount}}` in a step's message are
+  filled in from the alert, in Slack and in Telegram alike. The form promised
+  this since the first version and no version did it. A message naming
+  anything else, or one that does not parse, is refused when the policy is
+  saved, with the reason. A message is at most a thousand characters.
+- **"Continue on failure" on a policy step means something now.** With it
+  switched off, a step that fails for good - the provider refused, or the
+  recipient has no linked account - stops the escalation: the later steps that
+  have not gone out yet are withdrawn, and the alert's history says so. A
+  later step with no delay that is already out stays out; the failed step's
+  own other recipients, and the firehose, are not touched. Withdrawn steps
+  cannot be brought back by an operator, which is the price of the flag; the
+  failed step itself can be retried. In the first version a step paging a
+  schedule could not stop anything; now any recipient of a step can.
+- **Switching the Ack and Resolve buttons off takes effect everywhere at
+  once.** A press with the buttons switched off is answered "Buttons are
+  switched off for this integration" on every instance, and the alert is not
+  touched; cards already posted are redrawn without their buttons.
+- **"Retries" and "Timeout" are gone from the step form.** Neither has decided
+  anything since retries lost their limit; the API still accepts both fields
+  and ignores them, and says so.
 - **An escalation step goes out when the policy said it would.** A step's delay
   is now counted from the moment the alert was picked up, not from the moment
   the previous step finished. A policy that says "the channel now, the on-call
@@ -193,11 +234,34 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   failure ended it silently - the page simply never arrived, and nothing said
   so. `max_attempts` on an escalation step no longer ends a page; a provider
   refusing for good still does, immediately.
-- **A direct message about an alert links to the alert in TokayOps.** It used to
-  link to the message in the channel, which meant the link was missing whenever
-  there was no channel message to point at. The `dm_fallback_to_firehose`
-  setting is gone with the path it configured; remove it from `tokay.yaml` if it
-  is there, where it is now ignored.
+- **A direct message about an alert links to the alert in TokayOps, and to the
+  card in the channel once that card is out.** The link to the card is settled
+  when the message is first sent and does not change on a retry: a message
+  sent before the card exists carries the alert link alone. `Message` on the
+  step replaces the words, not the links. When the policy posted no channel
+  card of its own, `dm_fallback_to_firehose` in `tokay.yaml` decides whether
+  the firehose card is linked instead; it is `true` when absent, as before.
+  The link needs the Slack workspace's address, which TokayOps records from
+  `auth.test` whenever a Slack integration is saved or tested - an integration
+  saved by an earlier version has to be saved or tested once more.
+- **Threads and replies are deliveries of their own.** The delivery journal,
+  the Activity list and the `target_kind` filter know two more kinds,
+  `thread` and `thread_reply`, and an operator's decision applies to them
+  like to a card. The alert's page no longer lists its deliveries: the
+  timeline says what went out, each of its lines opens the delivery's
+  journal, and the Activity list has the rest. A thread that
+  fails because its card never made a message says so
+  (`parent_ended_without_message`) and comes back when the card is retried.
+  A thread or a reply withdrawn because the alert ended before its card
+  went out says so in its journal, rather than only "the alert was resolved".
+  Telegram has neither threads nor links to cards; it is unchanged.
+- **The delivery journal and the Activity page speak plain words.** A
+  delivery's journal opens as a card in the shape of the alert's: what it is
+  and where it stands in one line, the history as a timeline, the internals
+  folded away. A status is a word (waiting, needs decision, delivered,
+  failed) and an attempt says what happened (sent and accepted, rejected
+  with no retry, not sent). The Activity page lists deliveries the way the
+  alert groups are listed, with a period switch; a row opens the journal.
 - **The alerts inside a message are listed by when they started**, rather than
   in whatever order they arrived from Alertmanager. Two instances rendering the
   same alert now produce the same message.

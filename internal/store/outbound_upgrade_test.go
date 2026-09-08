@@ -454,10 +454,12 @@ func TestAStartRefusesSnapshotsItCannotRender(t *testing.T) {
 	admitOne(t, s, agID, dmCommitment("U-nina"))
 
 	previousOutboundShape(t, s)
-	// The shape of a snapshot the previous version wrote.
+	// The shape of a snapshot the previous version wrote: version 1, with the
+	// history still under its retired tag. The version is part of it - the
+	// current version carries a history of its own, under a tag of its own.
 	if _, err := s.db.Exec(`
 		UPDATE outbound_group_snapshots
-		SET snapshot = jsonb_set(snapshot, '{timeline}', '[]')
+		SET snapshot = jsonb_set(snapshot, '{timeline}', '[]'), snapshot_schema_version = 1
 		WHERE alert_group_id = $1`, agID); err != nil {
 		t.Fatalf("write the previous snapshot shape: %v", err)
 	}
@@ -734,8 +736,10 @@ func TestAStartFillsInThePayloadDigests(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("read the commitments: %v", err)
 	}
-	if filled != 2 {
-		t.Fatalf("the upgrade looked at %d commitment(s), there were 2", filled)
+	// Two admitted, and the two satellites the start gave the channel card:
+	// the start digests those as it writes them.
+	if filled != 4 {
+		t.Fatalf("the upgrade looked at %d commitment(s), there were 2 and the card's two satellites", filled)
 	}
 
 	// The rules, and the fact that each was checked against the rows already in
@@ -927,6 +931,13 @@ func TestAStartUpgradesADatabaseThatFollowedDevelop(t *testing.T) {
 			idx_outbound_intents_retention, idx_outbound_batches_no_targets`,
 		`DELETE FROM outbound_intent_events`,
 		`ALTER TABLE outbound_intent_events DROP COLUMN IF EXISTS actor_kind`,
+		// And what the render snapshot's second version brought: the form
+		// digests, the parent and the generation context, their rules.
+		`ALTER TABLE outbound_group_snapshots DROP CONSTRAINT IF EXISTS ` + outboundFormDigestLen,
+		`ALTER TABLE outbound_group_snapshots DROP COLUMN IF EXISTS card_digest, DROP COLUMN IF EXISTS thread_digest`,
+		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundSatelliteNamesParent,
+		`DROP INDEX IF EXISTS idx_outbound_intents_parent`,
+		`ALTER TABLE outbound_intents DROP COLUMN IF EXISTS parent_intent_id, DROP COLUMN IF EXISTS bound_context`,
 		// The rows of the previous release in the tables it owned.
 		`INSERT INTO jobs (id, type, status, alert_group_id)
 			VALUES ('job-1', 'escalation', 'completed', '` + group + `')`,
@@ -966,6 +977,18 @@ func TestAStartUpgradesADatabaseThatFollowedDevelop(t *testing.T) {
 
 	if err := s.InitDB(); err != nil {
 		t.Fatalf("the start refused the database of the previous release: %v", err)
+	}
+
+	// The snapshot's second version is back: the form digests were computed
+	// for the rows that had none, and the two commitment columns exist.
+	if n := countWhere(t, s, `SELECT count(*) FROM outbound_group_snapshots
+		WHERE card_digest IS NULL OR thread_digest IS NULL`); n != 0 {
+		t.Errorf("%d snapshot(s) came back without form digests", n)
+	}
+	for _, column := range []string{"parent_intent_id", "bound_context"} {
+		if !hasColumn(t, s, "outbound_intents", column) {
+			t.Errorf("the start did not add %s", column)
+		}
 	}
 
 	// The claims name their event, and every event named exists.
@@ -1261,4 +1284,64 @@ func TestAStartUpgradesTheDatabaseOfTheLastRelease(t *testing.T) {
 	if got, err := s.GetAlertGroupByID(group); err != nil || got == nil {
 		t.Fatalf("read the alert group after the transition: %v, %v", got, err)
 	}
+}
+
+// TestAnAdmissionFrozenUnderVersionOneStillRenders is the reader the previous
+// snapshot version keeps after the upgrade, and the one place it is allowed.
+//
+// A batch admitted before render_snapshot/v2 froze its state under version 1,
+// and that state is never rewritten: a direct message of that batch, retried
+// after the upgrade, renders exactly what was admitted. The group's own state
+// is the opposite case - the start rebuilds it to the current version, so a
+// version 1 row there is one the rebuild missed, and it is refused like any
+// version this build does not write.
+func TestAnAdmissionFrozenUnderVersionOneStillRenders(t *testing.T) {
+	s := setupTestDB(t)
+	s.SetRenderEnvironment("https://tokay.example", "UTC")
+
+	asVersionOne := func(t *testing.T, table, column, where, id string) []byte {
+		return versionOneDigest(t, s, table, column, where, id)
+	}
+
+	t.Run("a direct message renders what was admitted", func(t *testing.T) {
+		agID := desiredGroup(t, s, "Disk filling up")
+		intentID := admitOne(t, s, agID, dmCommitment("U-nina"))[0]
+
+		digest := asVersionOne(t, "outbound_batches", "admission_snapshot", "alert_group_id", agID)
+		if _, err := s.db.Exec(`
+			UPDATE outbound_batches
+			SET admission_snapshot = admission_snapshot - 'timeline' - 'timeline_omitted' - 'interactive_providers',
+			    admission_schema_version = $2, admission_digest = $3
+			WHERE alert_group_id = $1`, agID, keys.RenderSnapshotSchemaV1, digest); err != nil {
+			t.Fatalf("freeze the admission as version 1: %v", err)
+		}
+
+		token := claimOne(t, s, intentID)
+		if begun := beginOne(t, s, intentID, token); begun.AttemptID == "" {
+			t.Fatal("the attempt was not opened")
+		}
+	})
+
+	t.Run("the group's own state is not read under version 1", func(t *testing.T) {
+		agID := desiredGroup(t, s, "Memory filling up")
+		intentID := admitOne(t, s, agID, channelCommitment("C0001", 0))[0]
+
+		digest := asVersionOne(t, "outbound_group_snapshots", "snapshot", "alert_group_id", agID)
+		if _, err := s.db.Exec(`
+			UPDATE outbound_group_snapshots
+			SET snapshot = snapshot - 'timeline' - 'timeline_omitted' - 'interactive_providers',
+			    snapshot_schema_version = $2, snapshot_digest = $3
+			WHERE alert_group_id = $1`, agID, keys.RenderSnapshotSchemaV1, digest); err != nil {
+			t.Fatalf("write the group's state as version 1: %v", err)
+		}
+
+		token := claimOne(t, s, intentID)
+		_, err := s.BeginAttempt(context.Background(), outbound.BeginAttemptRequest{
+			IntentID: intentID, LeaseToken: token, WorkerID: "worker-1",
+			Preparation: outbound.PreparationReady, BoundEndpoint: "C0001",
+		})
+		if err == nil || !strings.Contains(err.Error(), "schema version 1") {
+			t.Fatalf("a card was drawn from a version 1 group state: %v", err)
+		}
+	})
 }

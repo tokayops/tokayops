@@ -17,6 +17,7 @@ import (
 	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/rbac"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -153,6 +154,20 @@ func (a *API) handleTelegramCallback(ctx context.Context, upd *telegramUpdate) {
 		agID = strings.TrimPrefix(cb.Data, model.TelegramCallbackResolvePrefix)
 	default:
 		a.answerTelegram(ctx, cb.ID, "")
+		return
+	}
+
+	// The switch is read from the database on every press, not from this
+	// instance's cache - see the Slack handler.
+	on, err := a.store.ButtonsOn(ctx, keys.ProviderTelegram)
+	if err != nil {
+		metrics.TelegramInteractionTotal.WithLabelValues(label, "error").Inc()
+		a.answerTelegram(ctx, cb.ID, "Something went wrong. Please try again.")
+		return
+	}
+	if !on {
+		metrics.TelegramInteractionTotal.WithLabelValues(label, "switched_off").Inc()
+		a.answerTelegram(ctx, cb.ID, "Buttons are switched off for this integration.")
 		return
 	}
 

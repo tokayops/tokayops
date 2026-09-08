@@ -12,6 +12,7 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -57,6 +58,7 @@ type escalationStore interface {
 	// is escalated by. Listed here because the engine hands its own store to
 	// it: whatever the builder may read, the engine may read.
 	GetEscalationPolicyByID(id string) (*model.EscalationPolicy, error)
+	RenderInputs(ctx context.Context, alertGroupID string) (providers.RenderInputs, error)
 
 	// SubmitBatch admits the whole escalation in one commit: the
 	// claim over the group, its commitments, the state they render from, the
@@ -74,13 +76,11 @@ type escalationStore interface {
 // The producer is built once, here, rather than per alert group. It holds no
 // state between plans - what one plan remembers lives for that plan - so a
 // shared instance is the same object the loop was allocating each time round.
-func NewEngine(s escalationStore, oncall onCallProjection, settings channelSettings,
-	cfg *config.Config) *Engine {
-
+func NewEngine(s escalationStore, oncall onCallProjection, cfg *config.Config) *Engine {
 	return &Engine{
 		store:  s,
 		oncall: oncall,
-		plan:   &planner{store: s, oncall: oncall, settings: settings, cfg: cfg},
+		plan:   &planner{store: s, oncall: oncall, cfg: cfg},
 	}
 }
 

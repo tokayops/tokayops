@@ -14,6 +14,16 @@ type GlobalConfig struct {
 	FirehoseCriticalChannel string `yaml:"firehose_critical_channel"` // Channel for all critical alerts
 	FirehoseWarningChannel  string `yaml:"firehose_warning_channel"`  // Channel for all warning alerts
 	SelfURL                 string `yaml:"self_url"`                  // TokayOps base URL for deep links in Slack messages
+
+	// DMFallbackToFirehose decides whether a direct message points back to
+	// the firehose card when the policy posted no channel card of its own.
+	// Unset means yes, as it always did.
+	DMFallbackToFirehose *bool `yaml:"dm_fallback_to_firehose"`
+}
+
+// DMFallsBackToFirehose is the setting with its default applied.
+func (g GlobalConfig) DMFallsBackToFirehose() bool {
+	return g.DMFallbackToFirehose == nil || *g.DMFallbackToFirehose
 }
 
 // Config is the root configuration structure (v2)

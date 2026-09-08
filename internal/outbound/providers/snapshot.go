@@ -35,6 +35,51 @@ type GroupView struct {
 	// zone: two instances in different zones rendering one snapshot have to
 	// produce the same message.
 	Zone string
+
+	// Timeline is the group's history as the producer read it, and
+	// TimelineOmitted how many earlier lines the producer did not hand over.
+	// Given here rather than read from the group row: the row does not carry
+	// its history, and a freeze that fetched it would read at a second
+	// moment. The snapshot keeps the most recent keys.TimelineLength lines and
+	// counts the rest.
+	Timeline        []*model.TimelineEvent
+	TimelineOmitted int64
+
+	// Interactive names the providers whose action buttons are switched on,
+	// as the producer read them from the database at this moment. The card
+	// draws its buttons from the snapshot this becomes, and from nowhere else.
+	Interactive []string
+}
+
+// RenderInputs is what a revision freezes besides the group row: the tail of
+// the history and which providers have buttons on. Read from the database at
+// the moment of the freeze, by the producer of revision 0 and by every raise
+// alike, and handed to the freeze rather than fetched by it.
+type RenderInputs struct {
+	Timeline        []*model.TimelineEvent
+	TimelineOmitted int64
+	Interactive     []string
+}
+
+// HistoryOf is the render projection of timeline rows. The type is carried
+// across verbatim, like the statuses: one this build cannot name reaches
+// admission and is refused there rather than becoming a line about something
+// else. A nil row is skipped.
+func HistoryOf(events []*model.TimelineEvent) []keys.TimelineEventSnapshot {
+	var lines []keys.TimelineEventSnapshot
+	for _, event := range events {
+		if event == nil {
+			continue
+		}
+		lines = append(lines, keys.TimelineEventSnapshot{
+			ID:        event.ID,
+			Type:      keys.TimelineEventType(event.Type),
+			Message:   event.Message,
+			Actor:     optional(event.Actor),
+			CreatedAt: event.CreatedAt,
+		})
+	}
+	return lines
 }
 
 // SnapshotOf freezes what a card is drawn from, canonical and validated - the
@@ -87,10 +132,10 @@ func ViewOf(view GroupView) keys.SnapshotInput {
 		in.Alerts = append(in.Alerts, alertSnapshot(alert, group.CreatedAt))
 	}
 
-	// The group's history is deliberately not read. It left the snapshot with
-	// tag 14 on 2026-08-25: no message renders it, and a field that reaches the
-	// digest without reaching the message makes the digest answer "the desired
-	// state changed" when nothing visible did.
+	// The history, as handed over.
+	in.Timeline = HistoryOf(view.Timeline)
+	in.TimelineOmitted = view.TimelineOmitted
+	in.InteractiveProviders = append([]string(nil), view.Interactive...)
 	return in
 }
 

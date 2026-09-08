@@ -108,12 +108,15 @@ Enable dual-send to L2 Support channels in `tokay.yaml`:
 global:
   firehose_critical_channel: "C_L2_CRITICAL_CHANNEL_ID"
   firehose_warning_channel: "C_L2_WARNING_CHANNEL_ID"
+  dm_fallback_to_firehose: true
 ```
 
 Firehose sends full messages with timeline, updates and resolve notifications.
 
-A direct message about an alert links to the alert in TokayOps rather than to
-the firehose message, so the link works whether or not a firehose card exists.
+A direct message about an alert always links to the alert in TokayOps, and to
+the card in the channel once that card is out. When the policy posted no
+channel card of its own, `dm_fallback_to_firehose` decides whether the
+firehose card is linked instead; it defaults to `true` when the key is absent.
 
 ### Running Locally
 1. Start the database using Docker Compose:

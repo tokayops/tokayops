@@ -74,10 +74,10 @@ const DECISION_LABELS = {
 };
 
 const DECISION_HINTS = {
-    assume_accepted: 'The message reached its recipient even though the provider never confirmed it.',
+    assume_accepted: 'Treat the message as delivered, although the provider did not confirm it.',
     cancel: 'Nothing more is sent. The delivery ends as canceled.',
-    retry_current_generation: 'Send again with the same address and the same key.',
-    retry_new_generation: 'Start over: a new message, which may exist beside the old one.',
+    retry_current_generation: 'Send again to the same address with the same key.',
+    retry_new_generation: 'Send a new message. The old one, if it was sent, stays.',
 };
 
 // The decisions that may create a second message, for which the person can
@@ -99,7 +99,7 @@ const OUTCOME_LABELS = {
     resolved: 'Applied',
     already_resolved: 'Already decided',
     invalid_decision: 'Refused',
-    business_closed: 'The alert is over',
+    business_closed: 'The alert is already resolved',
     recipient_erased: 'The recipient was erased',
     not_found: 'Not found',
 };
@@ -112,6 +112,7 @@ const activity = {
     page: 1,
     family: '',
     status: '',
+    period: '24h',
     from: '',
     to: '',
 };
@@ -123,9 +124,25 @@ let openJournalId = null;
 // Labels
 // ========================================
 
+// The status in words a person reads without the state machine at hand. The
+// CSS class keeps the status itself, and so do the filters and the API.
+const STATUS_WORDS = {
+    pending: 'waiting',
+    sending: 'sending',
+    idle: 'up to date',
+    manual_review: 'needs decision',
+    succeeded: 'delivered',
+    permanent_failed: 'failed',
+    expired: 'expired',
+    canceled: 'canceled',
+};
+
+export function statusWords(status) {
+    return STATUS_WORDS[status] || String(status || '').replace(/_/g, ' ');
+}
+
 export function statusBadge(status) {
-    const label = String(status || '').replace(/_/g, ' ');
-    return `<span class="delivery-status delivery-status-${escapeHtml(status)}">${escapeHtml(label)}</span>`;
+    return `<span class="delivery-status delivery-status-${escapeHtml(status)}">${escapeHtml(statusWords(status))}</span>`;
 }
 
 /**
@@ -140,12 +157,17 @@ export function targetLabel(kind, ref) {
             return `<span class="delivery-target" data-user-id="${escapeAttr(ref || '')}"><i data-lucide="user"></i><span class="delivery-target-name">${id}</span></span>`;
         case 'channel':
             return `<span class="delivery-target"><i data-lucide="hash"></i><span>${id}</span></span>`;
+        case 'thread':
+            return `<span class="delivery-target"><i data-lucide="message-square"></i><span>thread in #${id}</span></span>`;
+        case 'thread_reply':
+            return `<span class="delivery-target"><i data-lucide="corner-down-right"></i><span>reply in #${id}</span></span>`;
         case 'subscriber':
             return `<span class="delivery-target"><i data-lucide="webhook"></i><span>subscriber ${id}</span></span>`;
         default:
             return `<span class="delivery-target">${escapeHtml(kind || '')} ${id}</span>`;
     }
 }
+
 
 /**
  * Who wrote a journal line, by the kind the row carries.
@@ -208,103 +230,10 @@ function canReadJournal() {
     return Permissions.isAdmin();
 }
 
-function journalButton(deliveryId) {
-    if (!canReadJournal()) return '';
-    return `<button type="button" class="btn btn-sm btn-secondary journal-link" data-delivery-id="${escapeAttr(deliveryId)}" title="Open the journal">
-        <i data-lucide="scroll-text"></i> Journal
-    </button>`;
-}
-
 // ========================================
 // The alert group's deliveries
 // ========================================
 
-function pagingTable(paging) {
-    if (!paging || paging.length === 0) {
-        return '<div class="deliveries-empty">Nobody was paged for this alert.</div>';
-    }
-    const rows = paging.map(d => `
-        <tr class="delivery-row" data-delivery-id="${escapeAttr(d.id)}">
-            <td>${statusBadge(d.status)}</td>
-            <td>${escapeHtml(d.provider)}</td>
-            <td>${targetLabel(d.target_kind, d.target_ref)}</td>
-            <td>${escapeHtml(d.form === 'editable' ? 'card' : 'message')}</td>
-            <td>${when(d.created_at)}</td>
-            <td class="delivery-row-actions">${journalButton(d.id)}</td>
-        </tr>`).join('');
-    return `
-        <table class="delivery-table deliveries-paging">
-            <thead><tr><th>Status</th><th>Provider</th><th>To</th><th>Form</th><th>Created</th><th></th></tr></thead>
-            <tbody>${rows}</tbody>
-        </table>`;
-}
-
-function batchLabel(batch) {
-    if (batch.outcome === 'no_targets') return 'Nobody subscribed';
-    return batch.kind === 'webhook_replay' ? 'Replay' : 'Fan-out';
-}
-
-function eventsList(events) {
-    if (!events || events.length === 0) {
-        return '<div class="deliveries-empty">No webhook events for this alert.</div>';
-    }
-    return events.map(event => {
-        const batches = (event.batches || []).map(batch => {
-            const deliveries = (batch.deliveries || []).map(d => `
-                <tr class="delivery-row" data-delivery-id="${escapeAttr(d.id)}">
-                    <td>${statusBadge(d.status)}</td>
-                    <td>${targetLabel(d.target_kind, d.target_ref)}</td>
-                    <td>${when(d.created_at)}</td>
-                    <td class="delivery-row-actions">${journalButton(d.id)}</td>
-                </tr>`).join('');
-            return `
-                <div class="delivery-batch" data-batch-kind="${escapeAttr(batch.kind)}" data-batch-outcome="${escapeAttr(batch.outcome)}">
-                    <div class="delivery-batch-header">
-                        <span class="delivery-batch-kind">${escapeHtml(batchLabel(batch))}</span>
-                        <span class="text-muted">${batch.intent_count} ${batch.intent_count === 1 ? 'delivery' : 'deliveries'} · ${when(batch.admitted_at)}</span>
-                    </div>
-                    ${deliveries ? `<table class="delivery-table deliveries-webhook"><tbody>${deliveries}</tbody></table>` : ''}
-                </div>`;
-        }).join('');
-        const pending = !event.batches || event.batches.length === 0;
-        return `
-            <div class="delivery-event" data-event-id="${escapeAttr(event.event_id)}" data-event-status="${escapeAttr(event.status)}">
-                <div class="delivery-event-header">
-                    <span class="delivery-event-type">${escapeHtml(event.event_type)}</span>
-                    <span class="delivery-event-status">${escapeHtml(pending ? 'not fanned out yet' : event.status)}</span>
-                    <span class="text-muted">${when(event.created_at)}</span>
-                </div>
-                ${batches}
-            </div>`;
-    }).join('');
-}
-
-export function groupDeliveriesBlock(data) {
-    return `
-        <div class="deliveries-block">
-            <div class="detail-subtitle">Paging</div>
-            ${pagingTable(data.paging)}
-            <div class="detail-subtitle">Webhooks</div>
-            ${eventsList(data.events)}
-        </div>`;
-}
-
-/**
- * Load the deliveries of an alert group into its details.
- */
-export async function renderGroupDeliveries(alertGroupId) {
-    const container = document.getElementById('alert-group-deliveries');
-    if (!container) return;
-    try {
-        const data = await API.alertGroups.deliveries(alertGroupId);
-        container.innerHTML = groupDeliveriesBlock(data || {});
-        if (window.lucide) lucide.createIcons();
-        bindJournalLinks(container);
-        hydrateUserNames(container);
-    } catch (error) {
-        container.innerHTML = `<div class="deliveries-empty">Failed to load deliveries: ${escapeHtml(error.message)}</div>`;
-    }
-}
 
 /**
  * After a timeline render: the names of the people it names, and the links
@@ -330,81 +259,287 @@ export function bindJournalLinks(root) {
 // The journal of one delivery
 // ========================================
 
-function attemptsTable(attempts) {
-    if (!attempts || attempts.length === 0) {
-        return '<div class="deliveries-empty">No attempts yet.</div>';
-    }
-    const rows = attempts.map(a => {
-        const receipt = a.receipt_redacted_at
-            ? '<span class="text-muted" title="The coordinates were removed by an erasure">redacted</span>'
-            : (a.receipt_recorded ? 'recorded' : '—');
-        return `
-            <tr class="journal-attempt" data-outcome="${escapeAttr(a.outcome || '')}">
-                <td>${a.attempt_no}</td>
-                <td>${escapeHtml(a.record_kind)}${a.record_kind !== 'attempt' ? '' : ` · ${escapeHtml(a.attempt_kind)}`}</td>
-                <td>${escapeHtml(a.outcome || '—')}${a.error_class ? `<div class="text-muted">${escapeHtml(a.error_class)}</div>` : ''}</td>
-                <td>${escapeHtml(a.summary || a.provider_status || '')}</td>
-                <td>${receipt}</td>
-                <td>${when(a.started_at || a.finished_at)}</td>
-            </tr>`;
-    }).join('');
-    return `
-        <table class="delivery-table journal-attempts">
-            <thead><tr><th>#</th><th>Kind</th><th>Outcome</th><th>Summary</th><th>Receipt</th><th>When</th></tr></thead>
-            <tbody>${rows}</tbody>
-        </table>`;
+/**
+ * The journal is one story, told top down: what this delivery is, where it
+ * stands and why, then what happened to it in the order it happened. The
+ * machinery - generations, revisions, receipts, the events the machine
+ * writes for itself - stays behind "Details".
+ */
+const providerNames = { slack: 'Slack', telegram: 'Telegram', webhook: 'Webhook' };
+
+function providerName(provider) {
+    return providerNames[provider] || provider || '';
 }
 
-function eventsTable(events) {
-    if (!events || events.length === 0) {
-        return '<div class="deliveries-empty">No events.</div>';
+/**
+ * One sentence for what the delivery is. The recipient keeps the label
+ * helper, so a person's id becomes a name once the directory answers.
+ */
+function deliverySentence(d) {
+    const satellite = d.target_kind === 'thread' || d.target_kind === 'thread_reply';
+    const to = targetLabel(satellite ? 'channel' : d.target_kind, d.target_ref);
+    const erased = d.recipient_erased ? ' <span class="text-muted">(erased)</span>' : '';
+    switch (d.target_kind) {
+        case 'thread': return `Thread for the card in ${to}${erased}`;
+        case 'thread_reply': return `Reply for the card in ${to}${erased}`;
+        case 'subscriber': return `Event to ${to}${erased}`;
+        case 'user': return `Message to ${to}${erased}`;
+        default: return `${d.form === 'editable' ? 'Card' : 'Message'} in ${to}${erased}`;
     }
-    const rows = events.map(e => `
-        <tr class="journal-event" data-kind="${escapeAttr(e.kind)}">
-            <td>${e.seq}</td>
-            <td><strong>${escapeHtml(e.kind.replace(/_/g, ' '))}</strong>${e.reason ? `<div class="journal-reason">${escapeHtml(e.reason)}</div>` : ''}</td>
-            <td>${actorLabel(e)}</td>
-            <td>${e.from_status || e.to_status ? `${escapeHtml(e.from_status || '·')} → ${escapeHtml(e.to_status || '·')}` : ''}</td>
-            <td>${when(e.at)}</td>
-        </tr>`).join('');
+}
+
+function humanClass(value) {
+    return String(value || '').replace(/_/g, ' ');
+}
+
+/**
+ * Where the delivery stands, in the interface's words: the status alone is
+ * a label, and the operator needs the reason that goes with it.
+ */
+function verdict(journal) {
+    const d = journal.delivery;
+    const attempts = journal.attempts || [];
+    const last = attempts[attempts.length - 1];
+    const said = last && (last.summary || last.result_detail || humanClass(last.error_class) || last.provider_status);
+    const events = journal.events || [];
+    const lastEvent = events[events.length - 1];
+    switch (d.status) {
+        case 'permanent_failed':
+            return `Failed permanently${said ? `: ${escapeHtml(said)}` : '.'}`;
+        case 'manual_review':
+            return `The last attempt has no clear result. A person must decide${said ? `: ${escapeHtml(said)}` : '.'}`;
+        case 'expired':
+            return `Not sent before the deadline${d.expires_at ? ` (${when(d.expires_at)})` : ''}.`;
+        case 'canceled':
+            return `Canceled${lastEvent && lastEvent.reason ? `: ${escapeHtml(lastEvent.reason)}` : '.'}`;
+        case 'sending':
+            return 'Sending now.';
+        case 'pending':
+            if (d.target_kind === 'thread_reply') return 'Will be sent after the alert is resolved and the card is updated.';
+            if (d.target_kind === 'thread') return 'Will be sent after the card is posted or updated.';
+            return d.attempts_in_generation > 0
+                ? `Next attempt at ${when(d.next_attempt_at)}.`
+                : `Scheduled for ${when(d.next_attempt_at)}.`;
+        case 'idle':
+            return 'Delivered. The message is updated when the alert changes.';
+        case 'succeeded':
+            return d.form === 'editable'
+                ? 'Delivered. The alert is resolved and the message shows it.'
+                : 'Delivered.';
+        default:
+            return '';
+    }
+}
+
+/**
+ * What an attempt did, and what came of it, as a person would say it. "Sent"
+ * is only said once the provider accepted; a rejected attempt is named as
+ * the try it was.
+ */
+function attemptWords(a, d) {
+    const answer = a.summary || a.result_detail || '';
+    const said = answer && answer !== 'ok' && answer !== a.provider_status ? answer : '';
+    const words = (what, outcome, tone) => ({ what, outcome, tone, said });
+
+    if (a.record_kind !== 'attempt') {
+        // The delivery was not attempted: preparation found it could not be.
+        if (a.outcome === 'permanent_rejection') return words('Not sent', 'no retry', 'failed');
+        if (a.outcome === 'retryable_rejection') return words('Not sent', 'will retry', 'retry');
+        return words('Not sent', humanClass(a.outcome), 'doubt');
+    }
+
+    const thing = d.form === 'editable' && d.target_kind === 'channel' ? 'Card' : 'Message';
+    const mutation = a.attempt_kind === 'mutation';
+    const done = !mutation ? 'Sent'
+        : a.operation === 'resolve' ? `${thing} marked resolved` : `${thing} updated`;
+    const tried = mutation ? `${thing} update` : 'Send';
+
+    switch (a.outcome) {
+        case 'accepted': return words(done, 'accepted', 'ok');
+        case 'retryable_rejection': return words(`${tried} rejected`, 'will retry', 'retry');
+        case 'permanent_rejection': return words(`${tried} rejected`, 'no retry', 'failed');
+        case 'ambiguous': return words(mutation ? `${tried} sent` : 'Sent', 'no response', 'doubt');
+        case undefined: case null: case '': return words(mutation ? `${tried} in progress` : 'Sending', '', 'open');
+        default: return words(tried, humanClass(a.outcome), 'doubt');
+    }
+}
+
+const machinery = new Set(['effect_bound', 'desired_raised', 'generation_started']);
+
+const eventWords = {
+    created: 'Created',
+    canceled: 'Canceled',
+    cancellation_requested: 'Cancellation requested',
+    operator_decision: 'Operator decision',
+    revived: 'Restored',
+    expired: 'Expired',
+    duplicate_risk_accepted: 'Duplicate risk accepted',
+    effect_bound: 'Address assigned',
+    desired_raised: 'New revision requested',
+    generation_started: 'New generation started',
+};
+
+/**
+ * The journal is drawn with the alert group's own parts: the hero line, the
+ * technical details behind a summary, and the timeline - so a person who
+ * reads one reads the other.
+ */
+function relative(ts) {
+    const c = window.Components;
+    return c && typeof c.timeSince === 'function' ? c.timeSince(ts, { withAgo: true }) : '';
+}
+
+function timelineTime(ts) {
+    if (!ts) return '—';
+    const at = new Date(ts);
+    if (Number.isNaN(at.getTime())) return '—';
+    const stamp = at.toLocaleString(undefined, {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short',
+    });
+    const ago = relative(ts);
+    return ago ? `${stamp} · ${ago}` : stamp;
+}
+
+function timelineItem({ classes, icon, at, message, detail, actor, attrs }) {
     return `
-        <table class="delivery-table journal-events">
-            <thead><tr><th>#</th><th>Event</th><th>By</th><th>Status</th><th>When</th></tr></thead>
-            <tbody>${rows}</tbody>
-        </table>`;
+        <div class="timeline-event ${classes}"${attrs || ''}>
+            <div class="timeline-icon"><i data-lucide="${icon}"></i></div>
+            <div class="timeline-content">
+                <div class="timeline-time">${timelineTime(at)}</div>
+                <div class="timeline-message">${message}</div>
+                ${detail ? `<div class="timeline-actor journal-said">${detail}</div>` : ''}
+                ${actor ? `<div class="timeline-actor">by ${actor}</div>` : ''}
+            </div>
+        </div>`;
+}
+
+function attemptRow(a, d) {
+    const w = attemptWords(a, d);
+    const type = { ok: 'type-notification_sent is-key', failed: 'type-notification_failed is-key',
+        retry: 'type-journal-retry is-minor', doubt: 'type-journal-retry is-minor', open: 'type-journal-open is-minor' }[w.tone];
+    const icon = { ok: 'send', failed: 'x-circle', retry: 'refresh-cw', doubt: 'help-circle', open: 'loader' }[w.tone];
+    const erased = a.receipt_redacted_at
+        ? ' <span class="journal-note" title="The coordinates were removed by an erasure">receipt erased</span>'
+        : '';
+    const detail = [w.said ? escapeHtml(w.said) : '', a.error_class ? `<span class="journal-note">${escapeHtml(a.error_class)}</span>` : '']
+        .filter(Boolean).join(' ');
+    return timelineItem({
+        classes: `journal-attempt ${type}`, icon, at: a.started_at || a.finished_at,
+        message: `${escapeHtml(w.what)}${w.outcome ? `, <span class="journal-tone journal-tone-${escapeAttr(w.tone)}">${escapeHtml(w.outcome)}</span>` : ''}${erased}`,
+        detail, attrs: ` data-outcome="${escapeAttr(a.outcome || '')}"`,
+    });
+}
+
+const eventLook = {
+    created: ['type-created is-key', 'bell-ring'],
+    canceled: ['type-journal-withdrawn is-minor', 'ban'],
+    cancellation_requested: ['type-journal-withdrawn is-minor', 'ban'],
+    operator_decision: ['type-journal-decision is-key', 'gavel'],
+    revived: ['type-journal-decision is-key', 'undo-2'],
+    expired: ['type-notification_failed is-key', 'clock'],
+    lease_lost: ['type-journal-retry is-minor', 'alert-triangle'],
+    duplicate_risk_accepted: ['type-journal-decision is-minor', 'copy'],
+};
+
+function eventRow(e) {
+    const [classes, icon] = eventLook[e.kind] || ['type-journal-machinery is-minor', 'settings-2'];
+    return timelineItem({
+        classes: `journal-event ${classes}`, icon, at: e.at,
+        message: escapeHtml(eventWords[e.kind] || humanClass(e.kind)),
+        detail: e.reason ? escapeHtml(e.reason) : '',
+        actor: actorLabel(e),
+        attrs: ` data-kind="${escapeAttr(e.kind)}"`,
+    });
+}
+
+/**
+ * The attempts and the events that mean something to a person, in the order
+ * they happened.
+ */
+function history(journal) {
+    const d = journal.delivery;
+    const lines = [];
+    (journal.attempts || []).forEach(a => lines.push({ at: a.started_at || a.finished_at, html: attemptRow(a, d) }));
+    (journal.events || []).filter(e => !machinery.has(e.kind)).forEach(e => lines.push({ at: e.at, html: eventRow(e) }));
+    lines.sort((x, y) => new Date(x.at || 0) - new Date(y.at || 0));
+    if (lines.length === 0) return '<div class="journal-none">No activity yet.</div>';
+    return `<div class="timeline-container"><div class="timeline journal-history">${lines.map(l => l.html).join('')}</div></div>`;
+}
+
+function detailItem(label, value, mono) {
+    return `
+        <div class="detail-item">
+            <div class="detail-label">${escapeHtml(label)}</div>
+            <div class="detail-value"${mono ? ' style="font-family: monospace; font-size: 0.8rem;"' : ''}>${value}</div>
+        </div>`;
+}
+
+function details(journal) {
+    const d = journal.delivery;
+    const receipt = d.recipient_erased && d.receipt_recorded
+        ? 'recorded (coordinates erased)'
+        : (d.receipt_recorded ? 'recorded' : 'none');
+    const items = [
+        detailItem('Generation', escapeHtml(`${d.generation_no}, ${d.attempts_in_generation} ${d.attempts_in_generation === 1 ? 'attempt' : 'attempts'}`)),
+        detailItem('Revision', escapeHtml(`desired ${d.desired_revision}, applied ${d.applied_revision ?? '—'}${d.final_revision_applied ? ', final' : ''}`)),
+        detailItem('Receipt', escapeHtml(receipt)),
+        d.expires_at ? detailItem('Expires', escapeHtml(`${when(d.expires_at)}${d.expired ? ', passed' : ''}`)) : '',
+        detailItem('Family', escapeHtml(`${d.family}, ${d.kind}`)),
+        d.alert_group_id ? detailItem('Alert group', `<a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="journal-group-link">${escapeHtml(d.alert_group_id)}</a>`, true) : '',
+        detailItem('Delivery ID', escapeHtml(d.id), true),
+    ].filter(Boolean).join('');
+    const machineryLines = (journal.events || []).filter(e => machinery.has(e.kind)).map(eventRow).join('');
+    const late = journal.observations && journal.observations.length > 0
+        ? `<div class="journal-none">${journal.observations.length === 1 ? 'One late response' : `${journal.observations.length} late responses`} arrived after the attempt was closed and ${journal.observations.length === 1 ? 'is' : 'are'} kept with it.</div>`
+        : '';
+    return `
+        <details class="detail-section detail-technical journal-details">
+            <summary class="detail-section-title detail-summary">
+                <span class="detail-summary-title">Technical details</span>
+            </summary>
+            <div class="detail-grid">${items}</div>
+            <div class="detail-subsection">
+                <div class="detail-subtitle">Timestamps</div>
+                <div class="detail-grid">
+                    ${detailItem('Created', escapeHtml(when(d.created_at)))}
+                    ${detailItem('Updated', escapeHtml(when(d.updated_at)))}
+                </div>
+            </div>
+            ${machineryLines ? `
+                <div class="detail-subsection">
+                    <div class="detail-subtitle">Internal events</div>
+                    <div class="timeline journal-machinery">${machineryLines}</div>
+                </div>` : ''}
+            ${late}
+        </details>`;
 }
 
 export function journalPanel(journal) {
     const d = journal.delivery;
-    const receipt = d.recipient_erased && d.receipt_recorded
-        ? 'recorded, coordinates erased'
-        : (d.receipt_recorded ? 'recorded' : 'none');
+    const said = verdict(journal);
+    const attempts = d.attempts_in_generation;
     return `
         <div class="journal">
-            <div class="journal-summary">
-                <div class="journal-status">${statusBadge(d.status)}</div>
-                <dl class="delivery-detail-meta">
-                    <dt>Family</dt><dd>${escapeHtml(d.family)} · ${escapeHtml(d.kind)}</dd>
-                    <dt>Provider</dt><dd>${escapeHtml(d.provider)}</dd>
-                    <dt>To</dt><dd>${targetLabel(d.target_kind, d.target_ref)}${d.recipient_erased ? ' <span class="text-muted">(erased)</span>' : ''}</dd>
-                    <dt>Form</dt><dd>${escapeHtml(d.form === 'editable' ? 'card' : 'message')}</dd>
-                    <dt>Generation</dt><dd>${d.generation_no} · ${d.attempts_in_generation} attempt(s)</dd>
-                    <dt>Revision</dt><dd>desired ${d.desired_revision}, applied ${d.applied_revision ?? '—'}${d.final_revision_applied ? ' (final)' : ''}</dd>
-                    <dt>Receipt</dt><dd>${receipt}</dd>
-                    <dt>Created</dt><dd>${when(d.created_at)}</dd>
-                    <dt>Updated</dt><dd>${when(d.updated_at)}</dd>
-                    ${d.expires_at ? `<dt>Expires</dt><dd>${when(d.expires_at)}${d.expired ? ' (passed)' : ''}</dd>` : ''}
-                    ${d.alert_group_id ? `<dt>Alert group</dt><dd><a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="journal-group-link">${escapeHtml(d.alert_group_id)}</a></dd>` : ''}
-                    <dt>Delivery id</dt><dd class="journal-id">${escapeHtml(d.id)}</dd>
-                </dl>
+            <div class="detail-hero">
+                <div class="detail-status-line">
+                    <span class="journal-status">${statusBadge(d.status)}</span>
+                    <span class="status-sep">·</span>
+                    <span class="journal-sentence">${deliverySentence(d)}</span>
+                    <span class="status-sep">·</span>
+                    <span class="status-time">via ${escapeHtml(providerName(d.provider))}</span>
+                </div>
+                ${said ? `<div class="journal-verdict">${said}</div>` : ''}
+                <div class="detail-meta-row">
+                    <span class="detail-meta-chip">${attempts} ${attempts === 1 ? 'attempt' : 'attempts'}</span>
+                    <span class="detail-meta-chip">Created ${escapeHtml(relative(d.created_at) || when(d.created_at))}</span>
+                    <span class="detail-meta-chip">Updated ${escapeHtml(relative(d.updated_at) || when(d.updated_at))}</span>
+                </div>
             </div>
-            <div class="detail-subtitle">Attempts</div>
-            ${attemptsTable(journal.attempts)}
-            ${journal.observations && journal.observations.length > 0 ? `
-                <div class="detail-subtitle">Late results</div>
-                <div class="deliveries-empty">${journal.observations.length} result(s) arrived after the attempt was closed.</div>` : ''}
-            <div class="detail-subtitle">Events</div>
-            ${eventsTable(journal.events)}
+            ${details(journal)}
+            <div class="detail-section">
+                <h3 class="detail-section-title">History</h3>
+                ${history(journal)}
+            </div>
         </div>`;
 }
 
@@ -425,7 +560,7 @@ export async function openDeliveryJournal(deliveryId) {
     try {
         const journal = await API.deliveries.get(deliveryId);
         if (openJournalId !== deliveryId) return;
-        Elements.deliveryModalTitle.textContent = `Delivery · ${journal.delivery.status.replace(/_/g, ' ')}`;
+        Elements.deliveryModalTitle.textContent = 'Delivery';
         // A status a person decides about, in a family that offers nothing
         // for it, is told where its door is instead of a button.
         const replayOnly = canReadJournal() && isDecidableStatus(journal.delivery.status) && !canDecide(journal.delivery);
@@ -511,7 +646,7 @@ export function decisionForm(delivery) {
                 <div class="form-group">
                     <label for="decision-deadline">New deadline</label>
                     <input type="datetime-local" id="decision-deadline" name="new_expires_at" value="${localDateTimeValue(inAnHour)}" required>
-                    <div class="form-hint">An expired delivery is only retried with a deadline ahead of now.</div>
+                    <div class="form-hint">To retry an expired delivery, set a new deadline in the future.</div>
                 </div>` : ''}
             <div class="form-group">
                 <label for="decision-reason">Reason</label>
@@ -601,7 +736,7 @@ async function submitDecision(delivery) {
     if (form.new_expires_at) {
         const at = new Date(form.new_expires_at.value);
         if (Number.isNaN(at.getTime()) || at.getTime() <= Date.now()) {
-            showRefusal('invalid_decision', 'The new deadline has to be ahead of now.');
+            showRefusal('invalid_decision', 'The new deadline must be in the future.');
             return;
         }
         body.new_expires_at = at.toISOString();
@@ -610,7 +745,7 @@ async function submitDecision(delivery) {
     submit.disabled = true;
     try {
         const result = await API.deliveries.decide(delivery.id, body);
-        showToast(`Decision applied: ${result.status.replace(/_/g, ' ')}`, 'success');
+        showToast(`Decision applied: ${statusWords(result.status)}`, 'success');
         Elements.deliveryModalFooter.classList.remove('split');
         document.dispatchEvent(new CustomEvent('tokay:delivery-decided', {
             detail: { id: delivery.id, alertGroupId: delivery.alert_group_id, status: result.status },
@@ -621,7 +756,7 @@ async function submitDecision(delivery) {
         // of the guard. Anything else is an error.
         const outcome = error.body?.outcome;
         if (outcome) {
-            showRefusal(outcome, error.body.detail || (error.body.status ? `The delivery is ${error.body.status.replace(/_/g, ' ')}.` : ''));
+            showRefusal(outcome, error.body.detail || (error.body.status ? `The delivery is ${statusWords(error.body.status)}.` : ''));
         } else {
             showRefusal('', error.message);
         }
@@ -634,87 +769,158 @@ async function submitDecision(delivery) {
 // The operational log
 // ========================================
 
+const FAMILY_WORDS = { notification: 'Notifications', handoff: 'Handoffs', webhook: 'Webhooks' };
+const KIND_WORDS = {
+    escalation: 'escalation', escalation_replay: 'escalation replay',
+    handoff: 'on-call handoff', webhook_event: 'webhook event',
+};
+const PERIODS = [['24h', '24h', 1], ['7d', '7d', 7], ['30d', '30d', 30], ['custom', 'Custom', 0]];
+
 function activityFilters() {
     const option = (value, label, selected) => `<option value="${escapeAttr(value)}" ${selected ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    const custom = activity.period === 'custom';
     return `
-        <div class="activity-filters">
-            <label>Family
-                <select id="activity-family">
-                    ${option('', 'All families', activity.family === '')}
-                    ${FAMILIES.map(f => option(f, f, activity.family === f)).join('')}
-                </select>
-            </label>
-            <label>Status
-                <select id="activity-status">
-                    ${option('', 'All statuses', activity.status === '')}
-                    ${STATUSES.map(s => option(s, s.replace(/_/g, ' '), activity.status === s)).join('')}
-                </select>
-            </label>
-            <label>From
-                <input type="datetime-local" id="activity-from" value="${escapeAttr(activity.from)}">
-            </label>
-            <label>To
-                <input type="datetime-local" id="activity-to" value="${escapeAttr(activity.to)}">
-            </label>
-            <button type="button" class="btn btn-secondary btn-sm" id="activity-apply">Apply</button>
-            <span class="activity-period text-muted" id="activity-period"></span>
+        <div class="filters-bar activity-filters">
+            <div class="filters-row">
+                <div class="filter-group">
+                    <div class="filter-label">Family</div>
+                    <select id="activity-family" class="form-select" aria-label="Family">
+                        ${option('', 'All families', activity.family === '')}
+                        ${FAMILIES.map(f => option(f, FAMILY_WORDS[f] || f, activity.family === f)).join('')}
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <div class="filter-label">Status</div>
+                    <select id="activity-status" class="form-select" aria-label="Status">
+                        ${option('', 'All statuses', activity.status === '')}
+                        ${STATUSES.map(s => option(s, statusWords(s), activity.status === s)).join('')}
+                    </select>
+                </div>
+                <div class="filters-right">
+                    <div class="filter-group">
+                        <div class="filter-label">Period</div>
+                        <div class="scope-tabs-sm" id="activity-period-tabs" role="tablist" aria-label="Period">
+                            ${PERIODS.map(([key, label]) => `<button type="button" class="scope-tab-sm${activity.period === key ? ' active' : ''}" data-period="${key}" aria-selected="${activity.period === key}">${label}</button>`).join('')}
+                        </div>
+                    </div>
+                    <div class="filter-group activity-custom" ${custom ? '' : 'hidden'}>
+                        <div class="filter-label">From</div>
+                        <input type="datetime-local" id="activity-from" class="form-input" value="${escapeAttr(activity.from)}">
+                    </div>
+                    <div class="filter-group activity-custom" ${custom ? '' : 'hidden'}>
+                        <div class="filter-label">To</div>
+                        <input type="datetime-local" id="activity-to" class="form-input" value="${escapeAttr(activity.to)}">
+                    </div>
+                    <button type="button" class="btn btn-secondary btn-sm activity-custom" id="activity-apply" ${custom ? '' : 'hidden'}>Apply</button>
+                </div>
+            </div>
+        </div>`;
+}
+
+/** The second line of a row: who carries it and what kind of promise it is. */
+function activityKind(d) {
+    const kind = KIND_WORDS[d.kind] || humanClass(d.kind);
+    if (d.family === 'webhook') return kind;
+    return `${providerName(d.provider)} · ${kind}`;
+}
+
+function activityRow(d) {
+    const group = d.alert_group_id
+        ? `<a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="activity-group-link" title="Open the alert group"><i data-lucide="bell"></i> Alert group</a>`
+        : '<span class="text-muted">—</span>';
+    return `
+        <div class="alert-group-card activity-row status-${escapeAttr(d.status)}" title="Open the journal" data-delivery-id="${escapeAttr(d.id)}" data-family="${escapeAttr(d.family)}" data-status="${escapeAttr(d.status)}">
+            <div class="activity-when">${escapeHtml(window.Components?.formatDateTime?.(d.created_at) || when(d.created_at))}<div class="activity-sub">${escapeHtml(relative(d.created_at))}</div></div>
+            <div class="activity-what"><div class="activity-sentence">${deliverySentence(d)}</div><div class="activity-sub">${escapeHtml(activityKind(d))}</div></div>
+            <div>${statusBadge(d.status)}</div>
+            <div>${group}</div>
+        </div>`;
+}
+
+function activityFooter(response) {
+    const page = response.page || 1;
+    const totalPages = response.total_pages || 1;
+    const total = response.total || 0;
+    return `
+        <div class="activity-footer">
+            <div class="activity-summary">
+                <span id="activity-total">${total} ${total === 1 ? 'delivery' : 'deliveries'}</span>
+                <span class="activity-dot">·</span>
+                <span id="activity-period">${escapeHtml(periodLabel(response))}</span>
+            </div>
+            <div class="activity-pager">
+                <button type="button" class="btn btn-sm btn-secondary" id="activity-prev" ${page <= 1 ? 'disabled' : ''}><i data-lucide="chevron-left"></i> Previous</button>
+                <span class="page-info" id="activity-page">Page ${page} of ${totalPages}</span>
+                <button type="button" class="btn btn-sm btn-secondary" id="activity-next" ${page >= totalPages ? 'disabled' : ''}>Next <i data-lucide="chevron-right"></i></button>
+            </div>
         </div>`;
 }
 
 function activityTable(response) {
     const deliveries = response.deliveries || [];
     if (deliveries.length === 0) {
-        return '<div class="empty-state" id="activity-empty"><i data-lucide="inbox" class="empty-icon"></i><p>No deliveries in this period.</p></div>';
-    }
-    const rows = deliveries.map(d => `
-        <tr class="delivery-row activity-row" data-delivery-id="${escapeAttr(d.id)}" data-family="${escapeAttr(d.family)}" data-status="${escapeAttr(d.status)}">
-            <td>${when(d.created_at)}</td>
-            <td>${escapeHtml(d.family)}<div class="text-muted">${escapeHtml(d.kind)}</div></td>
-            <td>${escapeHtml(d.provider)}</td>
-            <td>${targetLabel(d.target_kind, d.target_ref)}</td>
-            <td>${statusBadge(d.status)}</td>
-            <td>${d.alert_group_id ? `<a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="activity-group-link" title="${escapeAttr(d.alert_group_id)}">alert</a>` : '<span class="text-muted">—</span>'}</td>
-            <td class="delivery-row-actions">${journalButton(d.id)}</td>
-        </tr>`).join('');
-    const page = response.page || 1;
-    const totalPages = response.total_pages || 1;
-    return `
-        <table class="delivery-table activity-table">
-            <thead><tr><th>Created</th><th>Family</th><th>Provider</th><th>To</th><th>Status</th><th>Alert</th><th></th></tr></thead>
-            <tbody>${rows}</tbody>
-        </table>
-        <div class="activity-pagination">
-            <span id="activity-total">${response.total} deliveries</span>
-            <div>
-                <button type="button" class="btn btn-sm btn-secondary" id="activity-prev" ${page <= 1 ? 'disabled' : ''}>Prev</button>
-                <span id="activity-page">Page ${page} / ${totalPages}</span>
-                <button type="button" class="btn btn-sm btn-secondary" id="activity-next" ${page >= totalPages ? 'disabled' : ''}>Next</button>
+        return `
+            <div class="empty-state" id="activity-empty">
+                <i data-lucide="inbox" class="empty-icon"></i>
+                <p>No deliveries in this period.</p>
+                <p class="text-muted">Widen the period or clear a filter.</p>
             </div>
-        </div>`;
+            ${activityFooter(response)}`;
+    }
+    return `
+        <div class="activity-table">
+            <div class="list-header activity-header">
+                <div class="list-header-col">When</div>
+                <div class="list-header-col">Delivery</div>
+                <div class="list-header-col">Status</div>
+                <div class="list-header-col">Alert group</div>
+            </div>
+            <div class="activity-rows">${deliveries.map(activityRow).join('')}</div>
+        </div>
+        ${activityFooter(response)}`;
+}
+
+/** The window the log is read over, as the request wants it. */
+function periodRange() {
+    const days = (PERIODS.find(([key]) => key === activity.period) || [])[2];
+    if (days) return activity.period === '24h' ? {} : { from: new Date(Date.now() - days * 86400000).toISOString() };
+    const range = {};
+    if (activity.from) range.from = new Date(activity.from).toISOString();
+    if (activity.to) range.to = new Date(activity.to).toISOString();
+    return range;
 }
 
 function periodLabel(response) {
-    const from = response.from ? new Date(response.from) : null;
-    const to = response.to ? new Date(response.to) : null;
-    if (!activity.from && !activity.to) return 'Last 24 hours';
-    return `${from ? when(from) : '…'} – ${to ? when(to) : 'now'}`;
+    switch (activity.period) {
+        case '24h': return 'Last 24 hours';
+        case '7d': return 'Last 7 days';
+        case '30d': return 'Last 30 days';
+        default: {
+            const from = response.from || activity.from;
+            const to = response.to || activity.to;
+            return `${from ? when(from) : '…'} – ${to ? when(to) : 'now'}`;
+        }
+    }
 }
 
 async function loadActivity() {
     const list = document.getElementById('activity-list');
     if (!list) return;
     list.innerHTML = '<div class="loading-spinner">Loading...</div>';
-    const params = { page: activity.page, limit: 50, family: activity.family, status: activity.status };
-    if (activity.from) params.from = new Date(activity.from).toISOString();
-    if (activity.to) params.to = new Date(activity.to).toISOString();
+    const params = { page: activity.page, limit: 50, family: activity.family, status: activity.status, ...periodRange() };
     try {
         const response = await API.deliveries.list(params);
         list.innerHTML = activityTable(response);
-        const period = document.getElementById('activity-period');
-        if (period) period.textContent = periodLabel(response);
         if (window.lucide) lucide.createIcons();
-        bindJournalLinks(list);
         hydrateUserNames(list);
+        // The row opens the journal, as an alert group's row opens the group;
+        // the link to the group inside it keeps its own meaning.
+        list.querySelectorAll('.activity-row').forEach(row => {
+            row.addEventListener('click', (e) => {
+                if (e.target.closest('a, button')) return;
+                openDeliveryJournal(row.dataset.deliveryId);
+            });
+        });
         document.getElementById('activity-prev')?.addEventListener('click', () => { activity.page -= 1; loadActivity(); });
         document.getElementById('activity-next')?.addEventListener('click', () => { activity.page += 1; loadActivity(); });
     } catch (error) {
@@ -731,9 +937,6 @@ export function showActivityView() {
     if (!view) return;
     if (!canReadJournal()) {
         view.innerHTML = `
-            <div class="section-header">
-                <h2 class="section-title"><i data-lucide="activity"></i> Activity</h2>
-            </div>
             <div class="empty-state" id="activity-forbidden">
                 <i data-lucide="lock" class="empty-icon"></i>
                 <p>The delivery journal is available to administrators.</p>
@@ -741,25 +944,30 @@ export function showActivityView() {
         if (window.lucide) lucide.createIcons();
         return;
     }
-    view.innerHTML = `
-        <div class="section-header">
-            <h2 class="section-title"><i data-lucide="activity"></i> Activity</h2>
-        </div>
-        ${activityFilters()}
-        <div id="activity-list"></div>`;
+    view.innerHTML = `${activityFilters()}<div id="activity-list"></div>`;
     if (window.lucide) lucide.createIcons();
+
+    const reload = () => { activity.page = 1; loadActivity(); };
+    document.getElementById('activity-family')?.addEventListener('change', (e) => { activity.family = e.target.value; reload(); });
+    document.getElementById('activity-status')?.addEventListener('change', (e) => { activity.status = e.target.value; reload(); });
     document.getElementById('activity-apply')?.addEventListener('click', () => {
-        activity.family = document.getElementById('activity-family').value;
-        activity.status = document.getElementById('activity-status').value;
         activity.from = document.getElementById('activity-from').value;
         activity.to = document.getElementById('activity-to').value;
-        activity.page = 1;
-        loadActivity();
+        reload();
     });
-    ['activity-family', 'activity-status'].forEach(id => {
-        document.getElementById(id)?.addEventListener('change', () => {
-            document.getElementById('activity-apply')?.click();
+    const tabs = document.getElementById('activity-period-tabs');
+    tabs?.addEventListener('click', (e) => {
+        const tab = e.target.closest('[data-period]');
+        if (!tab) return;
+        activity.period = tab.dataset.period;
+        tabs.querySelectorAll('[data-period]').forEach(t => {
+            const on = t === tab;
+            t.classList.toggle('active', on);
+            t.setAttribute('aria-selected', String(on));
         });
+        const custom = activity.period === 'custom';
+        view.querySelectorAll('.activity-custom').forEach(el => { el.hidden = !custom; });
+        if (!custom) reload();
     });
     loadActivity();
 }

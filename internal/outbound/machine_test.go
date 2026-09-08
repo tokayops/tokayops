@@ -750,3 +750,47 @@ func TestAWebhookCommitmentHasOneDoorToANewEffect(t *testing.T) {
 		t.Fatalf("an unknown kind was retried: %v", err)
 	}
 }
+
+// TestASatelliteWritesNoHistory. The alert's history says when the card went
+// out and whether it failed; the messages under the card are not events of
+// the alert. Whatever a satellite does, the transition is the card's and the
+// effects on the group are none: no line, and no group moved by a thread.
+func TestASatelliteWritesNoHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   Input
+	}{
+		{name: "accepted", in: Input{Intent: sendingIntent(), Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted}},
+		{name: "refused for good", in: Input{Intent: sendingIntent(), Trigger: TriggerFinishAttempt,
+			Outcome: OutcomePermanentRejection}},
+		{name: "refused before the network", in: Input{Intent: Intent{Status: StatusPending},
+			Trigger: TriggerPreparation, Preparation: PreparationPermanent}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asCard, err := Decide(tc.in)
+			if err != nil {
+				t.Fatalf("the card: %v", err)
+			}
+			if asCard.Effects.Timeline == TimelineNone {
+				t.Fatalf("the card's %s writes no history, so this case proves nothing", tc.name)
+			}
+
+			satellite := tc.in
+			satellite.Intent.TargetKind = keys.TargetThread
+			satellite.Intent.ParentID = "card-1"
+			asThread, err := Decide(satellite)
+			if err != nil {
+				t.Fatalf("the thread: %v", err)
+			}
+			if asThread.To != asCard.To {
+				t.Fatalf("the thread goes to %s and the card to %s", asThread.To, asCard.To)
+			}
+			if asThread.Effects.Timeline != TimelineNone {
+				t.Fatalf("the thread writes %q into the alert's history", asThread.Effects.Timeline)
+			}
+			if asThread.Effects.TriggerGroup {
+				t.Fatal("the thread moves the group")
+			}
+		})
+	}
+}

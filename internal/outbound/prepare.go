@@ -32,6 +32,13 @@ type Preparer interface {
 	Prepare(ctx context.Context, intent Intent) Preparation
 }
 
+// ParentEndedWithoutMessage is the refusal of a satellite whose card ended
+// without ever making a message: there is no thread to write under. Stated by
+// the domain rather than by a channel, before the channel is asked, and only
+// recorded once the store has checked the card again under its lock - a
+// person may have brought the card back in the meantime.
+const ParentEndedWithoutMessage = "parent_ended_without_message"
+
 // Ready is the preparation of a call that may go ahead.
 //
 // An empty address is NOT turned into a refusal here, and the difference

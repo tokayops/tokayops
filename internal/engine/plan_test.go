@@ -15,6 +15,7 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"github.com/tokayops/tokayops/internal/schedulerender"
 )
 
@@ -48,6 +49,11 @@ type failingStore struct {
 	// gone afterwards, which is what an erasure landing mid-plan looks like.
 	forgetful  bool
 	usersReads int
+
+	// inputs is what the freeze reads besides the group: the history and the
+	// buttons, as the database stands.
+	inputs    providers.RenderInputs
+	inputsErr error
 }
 
 func (f *failingStore) GetEscalationPolicyByID(string) (*model.EscalationPolicy, error) {
@@ -62,6 +68,45 @@ func (f *failingStore) GetUsersByIDs([]string) ([]*model.User, error) {
 	return f.users, f.usersErr
 }
 
+func (f *failingStore) RenderInputs(context.Context, string) (providers.RenderInputs, error) {
+	return f.inputs, f.inputsErr
+}
+
+// TestRevisionZeroFreezesTheHistoryAndTheButtons. What the thread shows and
+// whether the card has buttons are read from the database when the plan is
+// built, and frozen into revision 0 with everything else - so the first thread
+// under a card already carries the alert's history, and the buttons of the
+// first card are the switch as it stood. A read that fails admits nothing.
+func TestRevisionZeroFreezesTheHistoryAndTheButtons(t *testing.T) {
+	store := &failingStore{
+		team: routedTeam,
+		inputs: providers.RenderInputs{
+			Timeline: []*model.TimelineEvent{{
+				ID: "e-1", Type: model.TimelineEventCreated, Message: "Alert group created",
+				Actor: "system", CreatedAt: time.Unix(1700000000, 0).UTC(),
+			}},
+			TimelineOmitted: 3,
+			Interactive:     []string{"slack"},
+		},
+	}
+	state, err := planFor(store).freeze(context.Background(), criticalGroup(), teamRead{unnamed: true})
+	if err != nil {
+		t.Fatalf("freeze: %v", err)
+	}
+	content := state.Content()
+	if len(content.Timeline) != 1 || content.Timeline[0].ID != "e-1" || content.TimelineOmitted != 3 {
+		t.Fatalf("the history was frozen as %+v, %d omitted", content.Timeline, content.TimelineOmitted)
+	}
+	if !content.ButtonsOn("slack") || content.ButtonsOn("telegram") {
+		t.Fatalf("the buttons were frozen as %v", content.InteractiveProviders)
+	}
+
+	store.inputsErr = errors.New("connection reset")
+	if _, err := planFor(store).freeze(context.Background(), criticalGroup(), teamRead{unnamed: true}); err == nil {
+		t.Fatal("a freeze whose inputs could not be read admitted a state")
+	}
+}
+
 func (f *failingStore) GetTeamByID(string) (*model.Team, error) {
 	f.teamReads++
 	if f.flaky && f.teamReads == 1 {
@@ -72,9 +117,8 @@ func (f *failingStore) GetTeamByID(string) (*model.Team, error) {
 
 func planFor(store planStore) *planner {
 	return &planner{
-		store:    store,
-		oncall:   &fakeProjection{},
-		settings: &fakeSettings{},
+		store:  store,
+		oncall: &fakeProjection{},
 		cfg: &config.Config{Global: config.GlobalConfig{
 			FirehoseCriticalChannel: "C_FIRE", SelfURL: "https://tokay.example",
 		}},
@@ -125,9 +169,9 @@ func TestWhatIsNotThereIsAnAnswer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("a missing policy stopped the escalation: %v", err)
 		}
-		if len(admission.Admission.Commitments) != 1 {
-			t.Fatalf("expected the firehose alone, got %d commitments",
-				len(admission.Admission.Commitments))
+		if cards, satellites := cardsOf(admission.Admission.Commitments); len(cards) != 1 || satellites != 2 {
+			t.Fatalf("expected the firehose alone with its two satellites, got %d card(s) and %d satellite(s)",
+				len(cards), satellites)
 		}
 		if escalationOf(t, admission).PolicyID != "" {
 			t.Errorf("the group records policy %q, which does not exist", escalationOf(t, admission).PolicyID)

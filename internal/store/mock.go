@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/alertgroup"
@@ -20,6 +21,7 @@ import (
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // MockStore is an in-memory implementation of StoreInterface for testing.
@@ -1122,6 +1124,75 @@ func (m *MockStore) GetTeamMembershipsForUser(userID string) (map[string]model.T
 // ========================================
 // Timeline Events
 // ========================================
+
+// RenderInputs hands the producer the group's history as the mock holds it,
+// the most recent keys.TimelineLength lines, and no buttons: the mock has no
+// integrations to read a switch from.
+func (m *MockStore) RenderInputs(_ context.Context, alertGroupID string) (providers.RenderInputs, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	events := m.timelineEvents[alertGroupID]
+	omitted := 0
+	if len(events) > keys.TimelineLength {
+		omitted = len(events) - keys.TimelineLength
+		events = events[omitted:]
+	}
+	return providers.RenderInputs{
+		Timeline: append([]*model.TimelineEvent(nil), events...), TimelineOmitted: int64(omitted),
+	}, nil
+}
+
+// ButtonsOn reads the switch from the integrations the mock holds, as the
+// real door reads the table.
+func (m *MockStore) ButtonsOn(_ context.Context, provider string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, i := range m.integrations {
+		if !i.Enabled {
+			continue
+		}
+		switch {
+		case i.Type == model.IntegrationTypeSlack && provider == keys.ProviderSlack:
+			var cfg model.SlackConfig
+			if err := json.Unmarshal(i.Config, &cfg); err != nil {
+				return false, err
+			}
+			return cfg.Interactive, nil
+		case i.Type == model.IntegrationTypeTelegram && provider == keys.ProviderTelegram:
+			var cfg model.TelegramConfig
+			if err := json.Unmarshal(i.Config, &cfg); err != nil {
+				return false, err
+			}
+			return cfg.IsInteractive(), nil
+		}
+	}
+	return false, nil
+}
+
+// AddAlertGroupNoteAtomic records the note under the caller's name and moves
+// the group's source version, as the real door does: a plan built before the
+// note is refused by the admission here as it is there. The mock has no
+// messages to raise.
+func (m *MockStore) AddAlertGroupNoteAtomic(_ context.Context, alertGroupID, text string,
+	who alertgroup.Actor) (*model.TimelineEvent, error) {
+
+	if n := utf8.RuneCountInString(text); n == 0 || n > NoteLimit {
+		return nil, ErrNoteInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ag, ok := m.alertGroups[alertGroupID]
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	ag.RenderSourceVersion++
+	event := &model.TimelineEvent{
+		ID: uuid.New().String(), AlertGroupID: alertGroupID, Type: model.TimelineEventNote,
+		Message: text, Actor: who.Name, CreatedAt: time.Now(),
+	}
+	m.timelineEvents[alertGroupID] = append(m.timelineEvents[alertGroupID], event)
+	return event, nil
+}
 
 func (m *MockStore) AddTimelineEvent(e *model.TimelineEvent) error {
 	m.mu.Lock()

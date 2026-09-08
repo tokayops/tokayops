@@ -436,16 +436,12 @@ test.describe('Policies - Step Configuration', () => {
     expect(value).toBe('60');
   });
 
-  test('should configure step timeout', async ({ policiesPage, page }) => {
+  test('a step has no timeout and no retry count to configure', async ({ policiesPage, page }) => {
     await policiesPage.openCreatePolicyModal();
     await policiesPage.addStep();
 
-    const timeoutInput = page.locator('.timeout-input').first();
-    if (await timeoutInput.isVisible()) {
-      await timeoutInput.fill('120');
-      const value = await timeoutInput.inputValue();
-      expect(value).toBe('120');
-    }
+    await expect(page.locator('.timeout-input')).toHaveCount(0);
+    await expect(page.locator('.max-attempts-input')).toHaveCount(0);
   });
 });
 
