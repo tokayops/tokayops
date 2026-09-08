@@ -829,12 +829,11 @@ function activityRow(d) {
         ? `<a href="#/ops/alert-groups/${escapeAttr(d.alert_group_id)}" class="activity-group-link" title="Open the alert group"><i data-lucide="bell"></i> Alert group</a>`
         : '<span class="text-muted">—</span>';
     return `
-        <div class="alert-group-card activity-row status-${escapeAttr(d.status)}" data-delivery-id="${escapeAttr(d.id)}" data-family="${escapeAttr(d.family)}" data-status="${escapeAttr(d.status)}">
+        <div class="alert-group-card activity-row status-${escapeAttr(d.status)}" title="Open the journal" data-delivery-id="${escapeAttr(d.id)}" data-family="${escapeAttr(d.family)}" data-status="${escapeAttr(d.status)}">
             <div class="activity-when">${escapeHtml(window.Components?.formatDateTime?.(d.created_at) || when(d.created_at))}<div class="activity-sub">${escapeHtml(relative(d.created_at))}</div></div>
             <div class="activity-what"><div class="activity-sentence">${deliverySentence(d)}</div><div class="activity-sub">${escapeHtml(activityKind(d))}</div></div>
             <div>${statusBadge(d.status)}</div>
             <div>${group}</div>
-            <span class="journal-link activity-open" data-delivery-id="${escapeAttr(d.id)}" title="Open the journal"><i data-lucide="scroll-text"></i> Journal <i data-lucide="chevron-right"></i></span>
         </div>`;
 }
 
@@ -875,7 +874,6 @@ function activityTable(response) {
                 <div class="list-header-col">Delivery</div>
                 <div class="list-header-col">Status</div>
                 <div class="list-header-col">Alert group</div>
-                <div class="list-header-col"></div>
             </div>
             <div class="activity-rows">${deliveries.map(activityRow).join('')}</div>
         </div>
@@ -914,12 +912,12 @@ async function loadActivity() {
         const response = await API.deliveries.list(params);
         list.innerHTML = activityTable(response);
         if (window.lucide) lucide.createIcons();
-        bindJournalLinks(list);
         hydrateUserNames(list);
-        // The row itself opens the journal; its links keep their own meaning.
+        // The row opens the journal, as an alert group's row opens the group;
+        // the link to the group inside it keeps its own meaning.
         list.querySelectorAll('.activity-row').forEach(row => {
             row.addEventListener('click', (e) => {
-                if (e.target.closest('a, button, .journal-link')) return;
+                if (e.target.closest('a, button')) return;
                 openDeliveryJournal(row.dataset.deliveryId);
             });
         });
