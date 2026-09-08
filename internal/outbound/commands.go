@@ -254,6 +254,12 @@ const (
 	// ReasonNoTarget: the step names no recipient at all.
 	ReasonNoTarget UnpromisedReason = "no_target"
 
+	// ReasonNoFirehoseChannel: the alert's severity is none the configuration
+	// has a firehose key for. A known severity whose channel is left empty is
+	// the operator's choice and is not recorded; a word the configuration has
+	// never heard of is usually a typo in an alert rule, and is.
+	ReasonNoFirehoseChannel UnpromisedReason = "no_firehose_channel"
+
 	// ReasonNoChannel: the step names a provider this build cannot deliver
 	// through. Not a fact about the alert - a fact about what is deployed.
 	ReasonNoChannel UnpromisedReason = "no_channel"

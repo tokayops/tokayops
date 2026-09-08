@@ -1094,6 +1094,8 @@ func unpromisedMessage(step outbound.UnpromisedStep) string {
 		return fmt.Sprintf("Escalation step %s names no recipient", step.Step)
 	case outbound.ReasonNoChannel:
 		return fmt.Sprintf("Escalation step %s could not be delivered: %s", step.Step, step.Detail)
+	case outbound.ReasonNoFirehoseChannel:
+		return fmt.Sprintf("No firehose channel for %s", step.Detail)
 	case outbound.ReasonDuplicate:
 		return fmt.Sprintf("Escalation step %s repeats a notification already promised: %s",
 			step.Step, step.Detail)

@@ -11,9 +11,12 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ### Upgrade notes
 
-- **Info alerts leave the warning firehose channel.** Set
+- **Info alerts leave the warning firehose channel** - including every alert
+  whose `severity` label is missing, which counts as `info`. Set
   `firehose_info_channel` in `tokay.yaml` to keep a firehose for them; left
-  unset, info alerts get no firehose card from this version on.
+  unset, they get no firehose card from this version on. An alert whose
+  severity is none of `critical`, `warning` and `info` gets none either, and
+  its history says so.
 - **Stop every running instance before starting this version.** An older
   instance left running against the upgraded database fails on any read of an
   alert group - the column carrying an alert's own key is renamed at startup,
@@ -397,7 +400,9 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 - **`firehose_info_channel`** in `tokay.yaml`: the firehose channel for info
   alerts, beside the critical and warning ones. A severity whose channel is
   left empty gets no firehose card, and so does an alert whose `severity`
-  label is none of `critical`, `warning` and `info`.
+  label is none of `critical`, `warning` and `info` - that one leaves a line
+  in the alert's history, `No firehose channel for severity "..."`, because
+  it is usually a typo in an alert rule.
 - `engine_escalation_build_deferrals_total` counts escalations held back because
   the on-call recipients could not be resolved. Its increase over a window
   should normally be zero; alert on a positive increase rather than on the
