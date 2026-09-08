@@ -63,6 +63,8 @@ function edgesOf(file: string): Edge[] {
 
 function jsFilesUnder(dir: string): string[] {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+    // The names come from the repository's own tree, not from a request.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) return jsFilesUnder(full);
     return entry.isFile() && entry.name.endsWith('.js') ? [full] : [];

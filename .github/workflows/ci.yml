@@ -20,10 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
-      uses: actions/checkout@v5
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
     - name: Set up Go
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
       with:
         go-version-file: 'go.mod'
 
@@ -50,7 +50,7 @@ jobs:
       run: go tool cover -func=coverage.out | tail -1
 
     - name: Upload coverage artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
       with:
         name: coverage-report
         path: coverage.out
@@ -73,18 +73,18 @@ jobs:
           --health-retries 5
     steps:
     - name: Checkout code
-      uses: actions/checkout@v5
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
     - name: Set up Go
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
       with:
         go-version-file: 'go.mod'
 
     - name: Run integration tests
       env:
         TEST_DB_DSN: postgres://test_user:test_password@localhost:5433/test_tokay?sslmode=disable
-        ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-      run: go test -p 1 -tags=integration -v ./internal/...
+      # The key is any 32 bytes; a fresh one each run, so none is written down.
+      run: ENCRYPTION_KEY="$(openssl rand -hex 32)" go test -p 1 -tags=integration -v ./internal/...
 
   # The Prometheus rules ship with the product and are checked like code:
   # syntax, and the unit tests beside them. The Makefile target is the one
@@ -94,7 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
-      uses: actions/checkout@v5
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
     - name: Check and test the rules
       run: make check-rules
@@ -107,22 +107,22 @@ jobs:
       packages: write   # push images to GHCR via GITHUB_TOKEN
     steps:
     - name: Checkout code
-      uses: actions/checkout@v5
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
     # The runtime stages are alpine + `apk add`, which runs as the target
     # architecture. On an amd64 runner the arm64 leg needs emulation, so QEMU
     # has to be registered before buildx.
     - name: Set up QEMU
-      uses: docker/setup-qemu-action@v3
+      uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       with:
         platforms: arm64
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
     - name: Login to GitHub Container Registry
       if: github.event_name == 'push'
-      uses: docker/login-action@v3
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
@@ -169,7 +169,7 @@ jobs:
         emit_tags receiver_tags webhook-receiver
 
     - name: Build and push Tokay
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
       with:
         context: .
         push: ${{ github.event_name == 'push' }}
@@ -182,7 +182,7 @@ jobs:
         tags: ${{ steps.docker_tag.outputs.app_tags }}
 
     - name: Build and push Webhook Receiver
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
       with:
         context: .
         file: cmd/webhook-receiver/Dockerfile

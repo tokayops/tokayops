@@ -99,6 +99,8 @@ func (f *FanOut) Tick(ctx context.Context) int {
 		if ctx.Err() != nil {
 			return done
 		}
+		// The store answers with both: Refused rides beside the error on purpose.
+		// nosemgrep: trailofbits.go.invalid-usage-of-modified-variable.invalid-usage-of-modified-variable
 		result, err := f.store.FanOutNextEvent(ctx)
 		if err != nil {
 			if result.Refused {

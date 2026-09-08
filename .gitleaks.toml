@@ -6,13 +6,16 @@ useDefault = true
 
 # Global allowlist
 [allowlist]
-description = "Exclude documentation examples, test files, and dummy secrets in CI/e2e configs"
+description = "Exclude documentation examples, test files, and the dummy key of the test stacks"
 paths = [
   '''README\.md$''',
   '''docs/.*\.md$''',
   '''.*_test\.go$''',
   '''testdata/.*''',
-  # Dummy ENCRYPTION_KEY used in CI/e2e - not a real secret
-  '''docker-compose\.e2e\.yml$''',
-  '''\.github/workflows/ci\.yml$''',
+]
+# The dummy ENCRYPTION_KEY of the e2e stack, and of the workflows before they
+# started making one up at run time: the scan reads history, so the value is
+# allowed rather than the files that once held it.
+regexes = [
+  '''0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef''',
 ]
