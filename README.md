@@ -108,10 +108,13 @@ Enable dual-send to L2 Support channels in `tokay.yaml`:
 global:
   firehose_critical_channel: "C_L2_CRITICAL_CHANNEL_ID"
   firehose_warning_channel: "C_L2_WARNING_CHANNEL_ID"
+  firehose_info_channel: "C_L2_INFO_CHANNEL_ID"
   dm_fallback_to_firehose: true
 ```
 
 Firehose sends full messages with timeline, updates and resolve notifications.
+Each severity has its own channel; a severity whose channel is left empty
+gets no firehose messages.
 
 A direct message about an alert always links to the alert in TokayOps, and to
 the card in the channel once that card is out. When the policy posted no

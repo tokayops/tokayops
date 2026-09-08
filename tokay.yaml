@@ -3,10 +3,12 @@ config_version: 3
 
 # Global settings for routing
 global:
-  # Slack channel IDs (format: C + alphanumeric). Leave empty to send no
-  # firehose messages - team channels and DMs still work either way.
+  # Slack channel IDs (format: C + alphanumeric), one per severity. A severity
+  # whose channel is empty gets no firehose messages - team channels and DMs
+  # still work either way.
   firehose_critical_channel: ""  # Global log of critical alerts
   firehose_warning_channel: ""   # Global log of warning alerts
+  firehose_info_channel: ""      # Global log of info alerts
 
 # NOTE: slack_token and providers sections removed in v3.
 # Use the Integrations API instead: POST /api/v1/integrations

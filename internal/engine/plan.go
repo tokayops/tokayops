@@ -533,14 +533,23 @@ func (p *planner) recipients(ctx context.Context, resolver *scheduleResolver,
 	return []keys.Target{{Kind: kind, Ref: step.TargetID}}, nil
 }
 
+// firehoseChannel is the firehose channel of a severity, empty when the
+// severity has none: not configured, or a word the configuration has no key
+// for. Severity arrives lower-cased from the ingester.
 func (p *planner) firehoseChannel(severity string) string {
 	if p.cfg == nil {
 		return ""
 	}
-	if severity == "critical" {
+	switch severity {
+	case "critical":
 		return p.cfg.Global.FirehoseCriticalChannel
+	case "warning":
+		return p.cfg.Global.FirehoseWarningChannel
+	case "info":
+		return p.cfg.Global.FirehoseInfoChannel
+	default:
+		return ""
 	}
-	return p.cfg.Global.FirehoseWarningChannel
 }
 
 // policyFor reads the policy this group escalates by, and distinguishes the two

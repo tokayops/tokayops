@@ -293,7 +293,7 @@ func TestEngine_StepWithNoTarget_IsRecordedNotFailed(t *testing.T) {
 		}},
 	})
 
-	cfg := &config.Config{Global: config.GlobalConfig{FirehoseWarningChannel: "C_FIRE"}}
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseInfoChannel: "C_FIRE"}}
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	ag := &model.AlertGroup{
@@ -1178,6 +1178,52 @@ func escalationOf(t *testing.T, batch outbound.Batch) outbound.EscalationContext
 
 // cardsOf splits an admission into the commitments that reach a recipient and
 // the number of satellites that follow a card.
+// TestTheFirehoseChannelFollowsTheSeverity. Each of the three severities has
+// its own firehose channel, and an alert of a severity without one - the key
+// left empty, or a word the configuration has no key for - gets no firehose
+// card at all, rather than the warning channel's.
+func TestTheFirehoseChannelFollowsTheSeverity(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		global   config.GlobalConfig
+		severity string
+		channel  string // empty: no firehose card
+	}{
+		{"critical", allThree, "critical", "C_CRIT"},
+		{"warning", allThree, "warning", "C_WARN"},
+		{"info", allThree, "info", "C_INFO"},
+		{"a severity the configuration has no key for", allThree, "error", ""},
+		{"info without a channel", config.GlobalConfig{FirehoseCriticalChannel: "C_CRIT", FirehoseWarningChannel: "C_WARN"}, "info", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := store.NewMockStore()
+			eng := NewEngine(s, &fakeProjection{}, &config.Config{Global: tc.global})
+			s.CreateAlertGroup(&model.AlertGroup{ID: "ag", Severity: tc.severity, AlertKey: "dk", Status: model.AlertGroupStatusNew})
+			eng.ProcessNewAlertGroups(context.Background())
+
+			var cards []keys.AdmittedCommitment
+			var satellites int
+			if admission, admitted := s.AdmissionFor("ag"); admitted {
+				cards, satellites = cardsOf(admission.Admission.Commitments)
+			}
+			if tc.channel == "" {
+				if len(cards) != 0 || satellites != 0 {
+					t.Fatalf("severity %q got %d card(s) and %d satellite(s), want no firehose", tc.severity, len(cards), satellites)
+				}
+				return
+			}
+			if len(cards) != 1 || satellites != 2 {
+				t.Fatalf("severity %q got %d card(s) and %d satellite(s), want the firehose card and its two", tc.severity, len(cards), satellites)
+			}
+			if got := cards[0].Target.Ref; got != tc.channel {
+				t.Fatalf("severity %q went to %s, want %s", tc.severity, got, tc.channel)
+			}
+		})
+	}
+}
+
+var allThree = config.GlobalConfig{FirehoseCriticalChannel: "C_CRIT", FirehoseWarningChannel: "C_WARN", FirehoseInfoChannel: "C_INFO"}
+
 func cardsOf(commitments []keys.AdmittedCommitment) (cards []keys.AdmittedCommitment, satellites int) {
 	for _, c := range commitments {
 		if c.Target.Satellite() {

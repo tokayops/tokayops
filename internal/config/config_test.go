@@ -12,6 +12,7 @@ config_version: 3
 global:
   firehose_critical_channel: "C1"
   firehose_warning_channel: "C2"
+  firehose_info_channel: "C3"
 `
 	tmpfile, err := os.CreateTemp("", "config_test_*.yaml")
 	if err != nil {
@@ -38,5 +39,8 @@ global:
 
 	if cfg.Global.FirehoseCriticalChannel != "C1" {
 		t.Errorf("Expected global.firehose_critical_channel = C1, got %s", cfg.Global.FirehoseCriticalChannel)
+	}
+	if cfg.Global.FirehoseInfoChannel != "C3" {
+		t.Errorf("Expected global.firehose_info_channel = C3, got %s", cfg.Global.FirehoseInfoChannel)
 	}
 }
