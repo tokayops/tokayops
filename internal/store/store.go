@@ -2274,7 +2274,6 @@ func (s *Store) CreateAPIToken(token *model.APIToken) error {
 	return requireOneRow(res, ErrUserNotFound)
 }
 
-// GetAPITokenByHash retrieves an API token by its hash
 // GetAPITokenByID retrieves an API token by ID
 func (s *Store) GetAPITokenByID(id string) (*model.APIToken, error) {
 	query := `SELECT id, user_id, name, token_hash, expires_at, last_used_at, created_at 

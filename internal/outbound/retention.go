@@ -11,7 +11,7 @@ import (
 	"github.com/tokayops/tokayops/internal/metrics"
 )
 
-// Retention: the history of finished deliveries has a term.
+// The history of finished deliveries has a term.
 //
 // What goes is a terminal commitment - succeeded, permanent_failed, expired,
 // canceled - older than the window, with its attempts, observations and

@@ -347,7 +347,7 @@ func TestOverlapRefusalIsPermutationInvariant(t *testing.T) {
 	}
 }
 
-// coverage returns the span from the first to the last assignment of a source,
+// sourceSpan returns the span from the first to the last assignment of a source,
 // which is enough to check an override was not truncated.
 func sourceSpan(assignments []Assignment, source string) interval {
 	var out interval

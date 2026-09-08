@@ -382,9 +382,6 @@ type recordingChannel struct {
 	hold chan struct{}
 }
 
-// Hold makes every call block inside the provider until the returned function
-// is called. Without it a "slow provider" is not slow at all: an error returns
-// immediately and the slot is free again before anybody can look at it.
 // AnswerIn makes every call take that long, which is what a slot actually
 // costs.
 func (c *recordingChannel) AnswerIn(d time.Duration) {
@@ -407,6 +404,9 @@ func (c *recordingChannel) HoldKind(kind keys.Kind) func() {
 	}
 }
 
+// Hold makes every call block inside the provider until the returned function
+// is called. Without it a "slow provider" is not slow at all: an error returns
+// immediately and the slot is free again before anybody can look at it.
 func (c *recordingChannel) Hold() func() {
 	c.mu.Lock()
 	c.hold = make(chan struct{})

@@ -465,7 +465,6 @@ BEGIN
 END $$;
 `
 
-// outboundTargetAgreementConstraint is the name of the rule below.
 // The erasure columns, for databases created before they existed, plus the rule
 // that keeps the three receipt states apart.
 //
@@ -800,6 +799,7 @@ BEGIN
 END $$;
 `
 
+// outboundTargetAgreementConstraint is the name of the rule below.
 const outboundTargetAgreementConstraint = "outbound_intents_payload_addresses_the_target_v2"
 
 // outboundTargetAgreementDDL states that a commitment may only name its

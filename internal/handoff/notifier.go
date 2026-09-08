@@ -206,7 +206,6 @@ func (n *Notifier) Tick(ctx context.Context) bool {
 // stands, the next tick tries again, and every transition is still detected -
 // and counting it here would turn a metric that means "this instance is deaf"
 // into one that means "something failed once", which nobody can alert on.
-
 func (n *Notifier) incompleteWarmUp() {
 	n.cacheMu.RLock()
 	warmedUp := n.warmedUp

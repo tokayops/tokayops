@@ -175,7 +175,6 @@ func TestBusinessCollector_OutboxEventsByStatus(t *testing.T) {
 
 // --------------- helpers ---------------
 
-// collectMetrics registers a fresh collector in a temporary registry, gathers, and returns families.
 // snapshotStub is a store that answers with exactly one snapshot.
 //
 // The gauges below are about what the collector EMITS, which the store tests
@@ -222,6 +221,7 @@ func TestBusinessCollector_CardsBehind(t *testing.T) {
 	}
 }
 
+// collectMetrics registers a fresh collector in a temporary registry, gathers, and returns families.
 func collectMetrics(t *testing.T, s store.StoreInterface) []*dto.MetricFamily {
 	t.Helper()
 	reg := prometheus.NewRegistry()

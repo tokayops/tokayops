@@ -90,9 +90,6 @@ func NewAPI(s store.StoreInterface, oidc *auth.OIDCProvider, slack SlackMessenge
 	return api
 }
 
-// SetScheduleConfigService wires the schedule command side: save, delete,
-// override commands and the team-member guard.
-
 // The three severities an alert can have. The ingester folds every other word
 // into info, so a route or a manual alert by a fourth word is refused here.
 const errInvalidSeverity = "invalid severity: must be critical, warning, or info"
@@ -101,6 +98,8 @@ func isSeverity(s string) bool {
 	return s == "critical" || s == "warning" || s == "info"
 }
 
+// SetScheduleConfigService wires the schedule command side: save, delete,
+// override commands and the team-member guard.
 func (a *API) SetScheduleConfigService(svc *scheduleconfig.Service) {
 	a.scheduleConfig = svc
 }

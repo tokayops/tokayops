@@ -16,8 +16,6 @@ import (
 // - and every one of them can be raced by an acknowledgement, by another
 // operator, or by the alert simply being over.
 
-// stuckInReview drives a commitment to the state that waits for a person: a
-// call whose fate is unknown, under a policy that refuses to guess.
 // cardStuckInReview is the same, for the form that has later revisions: a card
 // waiting for a person, with a message already out there.
 func cardStuckInReview(t *testing.T, s *Store, agID string) string {
@@ -42,6 +40,8 @@ func cardStuckInReview(t *testing.T, s *Store, agID string) string {
 	return intentID
 }
 
+// stuckInReview drives a commitment to the state that waits for a person: a
+// call whose fate is unknown, under a policy that refuses to guess.
 func stuckInReview(t *testing.T, s *Store, agID string) string {
 	t.Helper()
 

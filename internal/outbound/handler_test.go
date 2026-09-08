@@ -9,7 +9,7 @@ import (
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
-// Classification is where a wrong answer becomes either a duplicate page or a
+// Classifying an answer is where a wrong one becomes either a duplicate page or a
 // lost one, so the two rules the domain keeps for itself are the two where the
 // cost is asymmetric: what a silent transport means, and what an answer nobody
 // recognises means.
