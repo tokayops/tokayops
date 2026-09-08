@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	// A message is plain text or a provider's markup, escaped by the provider; it is not HTML.
+	// nosemgrep: go.lang.security.audit.xss.import-text-template.import-text-template
 	"text/template"
 	"unicode/utf8"
 

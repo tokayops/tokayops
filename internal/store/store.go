@@ -2765,6 +2765,8 @@ func (s *Store) GetMetricsSnapshot(ctx context.Context) (*model.MetricsSnapshot,
 	// waiting is what it is for. The predicate is the claim's, so what this
 	// gauge calls late is exactly what a worker could have taken.
 	snapshotStep(8)
+	// Constants joined: the claim's predicate and its joins; no value is spliced in.
+	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query
 	rows6, err := s.db.QueryContext(ctx, `
 		SELECT due.delivery_family,
 		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(due.next_attempt_at)

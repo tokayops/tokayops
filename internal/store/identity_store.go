@@ -63,6 +63,8 @@ func (s *Store) BindExternalIdentity(ei *model.ExternalIdentity) error {
 	}
 	ei.UpdatedAt = now
 
+	// Two constants joined; every value is a parameter.
+	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query
 	query := activeUserCTE + `
 		INSERT INTO external_identities (id, user_id, provider, external_id, chat_id, display_name, created_at, updated_at)
 		SELECT $2, active.id, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7, $8 FROM active
@@ -233,6 +235,8 @@ func (s *Store) IssueLinkToken(userID, provider, externalID, token string, expir
 		return errors.New("token is required")
 	}
 	id := uuid.New().String()
+	// Two constants joined; every value is a parameter.
+	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query
 	query := activeUserCTE + `
 		INSERT INTO link_tokens (id, user_id, provider, token_hash, external_id, attempts, expires_at, created_at)
 		SELECT $2, active.id, $3, $4, NULLIF($5, ''), 0, $6, NOW() FROM active
