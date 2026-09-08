@@ -252,6 +252,8 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   journal, and the Activity list has the rest. A thread that
   fails because its card never made a message says so
   (`parent_ended_without_message`) and comes back when the card is retried.
+  A thread or a reply withdrawn because the alert ended before its card
+  went out says so in its journal, rather than only "the alert was resolved".
   Telegram has neither threads nor links to cards; it is unchanged.
 - **The delivery journal and the Activity page speak plain words.** A
   delivery's journal opens as a card in the shape of the alert's: what it is

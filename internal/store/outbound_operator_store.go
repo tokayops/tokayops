@@ -65,7 +65,7 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 		    worker_id = NULL, updated_at = now()
 		WHERE alert_group_id = $1 AND NOT receipt_recorded AND status = 'pending'
 		`+notFollowingASentCard+`
-		RETURNING id`, alertGroupID)
+		RETURNING id, parent_intent_id IS NOT NULL`, alertGroupID)
 	if err != nil {
 		return 0, err
 	}
@@ -77,7 +77,7 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 		SET cancellation_requested = TRUE, updated_at = now()
 		WHERE alert_group_id = $1 AND NOT receipt_recorded AND status = 'sending'
 		`+notFollowingASentCard+`
-		RETURNING id`, alertGroupID)
+		RETURNING id, parent_intent_id IS NOT NULL`, alertGroupID)
 	if err != nil {
 		return 0, err
 	}
@@ -89,26 +89,26 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 		SET status = 'canceled', updated_at = now()
 		WHERE alert_group_id = $1 AND NOT receipt_recorded AND status = 'manual_review'
 		`+notFollowingASentCard+`
-		RETURNING id`, alertGroupID)
+		RETURNING id, parent_intent_id IS NOT NULL`, alertGroupID)
 	if err != nil {
 		return 0, err
 	}
 
-	for _, id := range notSent {
-		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "canceled",
-			reason, actor); err != nil {
+	for _, w := range notSent {
+		if err := appendIntentEventTx(ctx, tx, w.id, nextEventSeq, "canceled",
+			w.reason(reason), actor); err != nil {
 			return 0, err
 		}
 	}
-	for _, id := range inFlight {
-		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "cancellation_requested",
-			reason, actor); err != nil {
+	for _, w := range inFlight {
+		if err := appendIntentEventTx(ctx, tx, w.id, nextEventSeq, "cancellation_requested",
+			w.reason(reason), actor); err != nil {
 			return 0, err
 		}
 	}
-	for _, id := range waiting {
-		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "canceled",
-			reason+"; the outcome of the previous attempt stays unknown", actor); err != nil {
+	for _, w := range waiting {
+		if err := appendIntentEventTx(ctx, tx, w.id, nextEventSeq, "canceled",
+			w.reason(reason)+"; the outcome of the previous attempt stays unknown", actor); err != nil {
 			return 0, err
 		}
 	}
@@ -124,7 +124,12 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 	// what happened to every promise it had made. The history counts the
 	// notifications - the satellites of a card are not ones, and they do not
 	// write to the history they mirror.
-	all := append(append(append([]string(nil), notSent...), inFlight...), waiting...)
+	var all []string
+	for _, group := range [][]withdrawnRow{notSent, inFlight, waiting} {
+		for _, w := range group {
+			all = append(all, w.id)
+		}
+	}
 	var notifications int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT count(*) FROM outbound_intents
@@ -153,22 +158,38 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 	return withdrawn, nil
 }
 
-func cancelRowsTx(ctx context.Context, tx *sql.Tx, query, owner string) ([]string, error) {
+// withdrawnRow is one commitment the withdrawal touched, and whether it is a
+// satellite. A satellite is taken only while its card has no message, and its
+// line says so: "the alert was resolved" alone, on the reply that was to
+// announce the resolution, reads as a contradiction.
+type withdrawnRow struct {
+	id        string
+	satellite bool
+}
+
+func (w withdrawnRow) reason(reason string) string {
+	if w.satellite {
+		return reason + ", and the card it follows was never sent"
+	}
+	return reason
+}
+
+func cancelRowsTx(ctx context.Context, tx *sql.Tx, query, owner string) ([]withdrawnRow, error) {
 	rows, err := tx.QueryContext(ctx, query, owner)
 	if err != nil {
 		return nil, fmt.Errorf("withdraw the commitments of %s: %w", owner, err)
 	}
 	defer rows.Close()
 
-	var ids []string
+	var taken []withdrawnRow
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var w withdrawnRow
+		if err := rows.Scan(&w.id, &w.satellite); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		taken = append(taken, w)
 	}
-	return ids, rows.Err()
+	return taken, rows.Err()
 }
 
 // ErrCommitmentBusy is a commitment held by another transaction for longer

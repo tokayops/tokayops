@@ -336,6 +336,19 @@ func TestTheWithdrawalFollowsTheCard(t *testing.T) {
 			t.Fatalf("%s is %s after the alert was acknowledged with nothing sent", id, got)
 		}
 	}
+	// The card's line names the acknowledgement; a satellite's says why it
+	// went with it, so a reply meant to announce the end does not read as
+	// withdrawn by the end.
+	for id, want := range map[string]string{
+		card:   "canceled|the alert was acknowledged|",
+		thread: "canceled|the alert was acknowledged, and the card it follows was never sent|",
+		reply:  "canceled|the alert was acknowledged, and the card it follows was never sent|",
+	} {
+		lines := journalOf(t, s, id)
+		if last := lines[len(lines)-1]; !strings.HasPrefix(last, want) {
+			t.Fatalf("%s's last line is %q, want one starting %q", id, last, want)
+		}
+	}
 
 	sent := desiredGroup(t, s, "Disk filling up")
 	card, thread, reply = cardWithSatellites(t, s, sent)

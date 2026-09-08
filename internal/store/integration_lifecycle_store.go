@@ -196,7 +196,7 @@ func withdrawSubscriberTx(ctx context.Context, tx *sql.Tx, integrationID, reason
 		SET status = 'canceled', lease_token = NULL, locked_until = NULL,
 		    worker_id = NULL, updated_at = now()
 		WHERE delivery_family = 'webhook' AND target_ref = $1 AND status = 'pending'
-		RETURNING id`, integrationID)
+		RETURNING id, parent_intent_id IS NOT NULL`, integrationID)
 	if err != nil {
 		return 0, err
 	}
@@ -204,7 +204,7 @@ func withdrawSubscriberTx(ctx context.Context, tx *sql.Tx, integrationID, reason
 		UPDATE outbound_intents
 		SET cancellation_requested = TRUE, updated_at = now()
 		WHERE delivery_family = 'webhook' AND target_ref = $1 AND status = 'sending'
-		RETURNING id`, integrationID)
+		RETURNING id, parent_intent_id IS NOT NULL`, integrationID)
 	if err != nil {
 		return 0, err
 	}
@@ -212,24 +212,24 @@ func withdrawSubscriberTx(ctx context.Context, tx *sql.Tx, integrationID, reason
 		UPDATE outbound_intents
 		SET status = 'canceled', updated_at = now()
 		WHERE delivery_family = 'webhook' AND target_ref = $1 AND status = 'manual_review'
-		RETURNING id`, integrationID)
+		RETURNING id, parent_intent_id IS NOT NULL`, integrationID)
 	if err != nil {
 		return 0, err
 	}
 
-	for _, id := range notSent {
-		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "canceled", reason, actor); err != nil {
+	for _, w := range notSent {
+		if err := appendIntentEventTx(ctx, tx, w.id, nextEventSeq, "canceled", reason, actor); err != nil {
 			return 0, err
 		}
 	}
-	for _, id := range inFlight {
-		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "cancellation_requested",
+	for _, w := range inFlight {
+		if err := appendIntentEventTx(ctx, tx, w.id, nextEventSeq, "cancellation_requested",
 			reason, actor); err != nil {
 			return 0, err
 		}
 	}
-	for _, id := range waiting {
-		if err := appendIntentEventTx(ctx, tx, id, nextEventSeq, "canceled",
+	for _, w := range waiting {
+		if err := appendIntentEventTx(ctx, tx, w.id, nextEventSeq, "canceled",
 			reason+"; the outcome of the previous attempt stays unknown", actor); err != nil {
 			return 0, err
 		}
