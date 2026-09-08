@@ -81,6 +81,10 @@ test.describe('Alert group deliveries in the timeline', () => {
     await expect(journal.locator('.journal-history [data-kind="created"] .journal-actor-system')).toHaveText('Escalation engine');
     await journal.locator('#delivery-modal-close').click();
     await expect(journal).toBeHidden();
+    // The group's page stays open over a hash change; a person closes it
+    // before going anywhere, and so does the test.
+    await dashboardPage.closeModalButton.click();
+    await expect(page.locator('#modal-overlay')).not.toHaveClass(/active/);
 
     // A webhook delivery that failed for good has one door to a new effect,
     // the replay: the dialog offers a withdrawal and nothing the server
