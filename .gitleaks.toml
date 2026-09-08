@@ -12,7 +12,6 @@ paths = [
   '''docs/.*\.md$''',
   '''.*_test\.go$''',
   '''testdata/.*''',
-  # Dummy ENCRYPTION_KEY used in CI/e2e - not a real secret
+  # Dummy ENCRYPTION_KEY of the e2e stack - not a real secret; the workflows generate theirs
   '''docker-compose\.e2e\.yml$''',
-  '''\.github/workflows/ci\.yml$''',
 ]

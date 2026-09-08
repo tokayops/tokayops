@@ -135,6 +135,15 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   applies nothing of the delivery domain's block until the row is repaired or
   removed.
 
+### Security
+
+- **Go 1.25.13 and echo 4.15.3**, with `golang.org/x/crypto`, `x/net`, `x/text`
+  and `x/mod` brought up with them, for the vulnerabilities the weekly scan
+  reported (among them echo's URL path decoding discrepancy and the standard
+  library's `net/http`, `net/url`, `crypto/tls` and `html/template` fixes).
+  The workflows pin every action to a commit and make up the test
+  encryption key at run time instead of carrying one.
+
 ### Changed
 
 - **The message about an alert is now kept up to date by the part of TokayOps
