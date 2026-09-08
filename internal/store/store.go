@@ -2363,9 +2363,11 @@ func (s *Store) CreateEscalationPolicy(p *model.EscalationPolicy) error {
 
 	// Insert steps
 	for _, step := range p.Steps {
-		_, err = tx.Exec(`INSERT INTO escalation_steps (id, policy_id, step_index, provider, target_kind, target_type, target_id, delay_seconds, timeout_seconds, max_attempts, message, continue_on_failure)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			step.ID, p.ID, step.StepIndex, step.Provider, step.TargetKind, step.TargetType, step.TargetID, step.DelaySeconds, step.TimeoutSeconds, step.MaxAttempts, step.Message, step.ContinueOnFailure)
+		// timeout_seconds and max_attempts keep their defaults: nothing reads
+		// them since the delivery families took over deadlines and retries.
+		_, err = tx.Exec(`INSERT INTO escalation_steps (id, policy_id, step_index, provider, target_kind, target_type, target_id, delay_seconds, message, continue_on_failure)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			step.ID, p.ID, step.StepIndex, step.Provider, step.TargetKind, step.TargetType, step.TargetID, step.DelaySeconds, step.Message, step.ContinueOnFailure)
 		if err != nil {
 			return err
 		}
@@ -2483,9 +2485,11 @@ func (s *Store) UpdateEscalationPolicy(p *model.EscalationPolicy) error {
 		if step.ID == "" {
 			step.ID = uuid.New().String()
 		}
-		_, err = tx.Exec(`INSERT INTO escalation_steps (id, policy_id, step_index, provider, target_kind, target_type, target_id, delay_seconds, timeout_seconds, max_attempts, message, continue_on_failure)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			step.ID, p.ID, step.StepIndex, step.Provider, step.TargetKind, step.TargetType, step.TargetID, step.DelaySeconds, step.TimeoutSeconds, step.MaxAttempts, step.Message, step.ContinueOnFailure)
+		// timeout_seconds and max_attempts keep their defaults: nothing reads
+		// them since the delivery families took over deadlines and retries.
+		_, err = tx.Exec(`INSERT INTO escalation_steps (id, policy_id, step_index, provider, target_kind, target_type, target_id, delay_seconds, message, continue_on_failure)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			step.ID, p.ID, step.StepIndex, step.Provider, step.TargetKind, step.TargetType, step.TargetID, step.DelaySeconds, step.Message, step.ContinueOnFailure)
 		if err != nil {
 			return err
 		}

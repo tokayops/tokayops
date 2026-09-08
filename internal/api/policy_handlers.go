@@ -362,9 +362,9 @@ func buildPolicySteps(policyID string, reqSteps []PolicyStepRequest, caps Provid
 			return nil, err
 		}
 
-		// Kept as sent, and read by nothing.
-		timeout := stepReq.TimeoutSeconds
-		maxAttempts := stepReq.MaxAttempts
+		// TimeoutSeconds and MaxAttempts are not carried over: nothing reads
+		// them, and the form no longer sends them, so a copy would write a zero
+		// the table refuses. The columns keep their defaults.
 		continueOnFailure := true
 		if stepReq.ContinueOnFailure != nil {
 			continueOnFailure = *stepReq.ContinueOnFailure
@@ -379,8 +379,6 @@ func buildPolicySteps(policyID string, reqSteps []PolicyStepRequest, caps Provid
 			TargetType:        stepReq.TargetType,
 			TargetID:          stepReq.TargetID,
 			DelaySeconds:      stepReq.DelaySeconds,
-			TimeoutSeconds:    timeout,
-			MaxAttempts:       maxAttempts,
 			Message:           stepReq.Message,
 			ContinueOnFailure: continueOnFailure,
 		}

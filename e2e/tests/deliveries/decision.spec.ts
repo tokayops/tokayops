@@ -80,7 +80,7 @@ test.describe('Operator decision', () => {
     await expect(modal.locator('#decision-reason-count')).toHaveText('9');
     await modal.locator('#decision-submit-btn').click();
     await expect(modal.locator('#decision-refusal')).toBeVisible();
-    await expect(modal.locator('.decision-refusal-outcome')).toHaveText('The alert is over');
+    await expect(modal.locator('.decision-refusal-outcome')).toHaveText('The alert is already resolved');
     await expect(modal.locator('.decision-refusal-detail')).toHaveText(expected.detail);
 
     // A withdrawal with a reason applies: the delivery ends as canceled, and

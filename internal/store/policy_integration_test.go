@@ -203,3 +203,40 @@ func TestEscalationPolicy_ContinueOnFailurePersistence(t *testing.T) {
 		t.Errorf("After update: Step 1 ContinueOnFailure mismatch: expected true, got false")
 	}
 }
+
+// TestEscalationPolicy_AStepWithoutTimeoutAndRetriesIsSaved. The form no
+// longer sends a timeout or a retry limit and the handler carries neither, so
+// the step arrives with zeros; the table refuses a zero, and the columns have
+// to keep their defaults instead.
+func TestEscalationPolicy_AStepWithoutTimeoutAndRetriesIsSaved(t *testing.T) {
+	if testStore == nil {
+		t.Skip("Test DB not initialized")
+	}
+	step := func(index int) *model.EscalationStep {
+		return &model.EscalationStep{
+			ID: uuid.New().String(), StepIndex: index, Provider: "slack",
+			TargetKind: "dm", TargetType: "user", TargetID: "user-1", ContinueOnFailure: true,
+		}
+	}
+	p := &model.EscalationPolicy{ID: uuid.New().String(), Name: "Without the ignored fields", Steps: []*model.EscalationStep{step(0)}}
+	if err := testStore.CreateEscalationPolicy(p); err != nil {
+		t.Fatalf("create a policy whose step has no timeout and no retry limit: %v", err)
+	}
+	p.Steps = append(p.Steps, step(1))
+	if err := testStore.UpdateEscalationPolicy(p); err != nil {
+		t.Fatalf("update it with another such step: %v", err)
+	}
+	saved, err := testStore.GetEscalationPolicyByID(p.ID)
+	if err != nil {
+		t.Fatalf("read it back: %v", err)
+	}
+	if len(saved.Steps) != 2 {
+		t.Fatalf("%d steps saved, want 2", len(saved.Steps))
+	}
+	for _, s := range saved.Steps {
+		if s.TimeoutSeconds != 30 || s.MaxAttempts != 5 {
+			t.Fatalf("step %d carries timeout %d and retries %d, want the table's defaults 30 and 5",
+				s.StepIndex, s.TimeoutSeconds, s.MaxAttempts)
+		}
+	}
+}

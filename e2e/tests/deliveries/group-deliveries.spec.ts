@@ -72,7 +72,7 @@ test.describe('Alert group deliveries in the timeline', () => {
     await expect(timelineLine.locator('.journal-link')).toBeVisible();
 
     // A click opens the journal of that delivery.
-    await timelineLine.locator('.journal-link').click();
+    await timelineLine.locator('.activity-what').click();
     const journal = page.locator('#delivery-modal-overlay');
     await expect(journal).toBeVisible();
     await expect(journal.locator('.journal-history .journal-attempt')).toHaveCount(1);
@@ -90,7 +90,7 @@ test.describe('Alert group deliveries in the timeline', () => {
     const failedWebhook = page.locator('.activity-row[data-family="webhook"][data-status="permanent_failed"]',
       { hasText: webhookIntegrationId }).first();
     await expect(failedWebhook).toBeVisible({ timeout: 15000 });
-    await failedWebhook.locator('.journal-link').click();
+    await failedWebhook.locator('.activity-what').click();
     await expect(journal).toBeVisible();
     await expect(journal.locator('.journal-status .delivery-status-permanent_failed')).toBeVisible();
     await journal.locator('#delivery-decide-btn').click();
