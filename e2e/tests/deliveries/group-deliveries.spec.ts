@@ -72,7 +72,7 @@ test.describe('Alert group deliveries in the timeline', () => {
     await expect(timelineLine.locator('.journal-link')).toBeVisible();
 
     // A click opens the journal of that delivery.
-    await timelineLine.locator('.activity-what').click();
+    await timelineLine.locator('.journal-link').click();
     const journal = page.locator('#delivery-modal-overlay');
     await expect(journal).toBeVisible();
     await expect(journal.locator('.journal-history .journal-attempt')).toHaveCount(1);

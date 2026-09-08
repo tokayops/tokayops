@@ -282,24 +282,15 @@ func TestRetentionChunks(t *testing.T) {
 		t.Fatalf("%d canceled commitments, want 2500", n)
 	}
 
-	var removed []int64
-	for i := 0; i < 5; i++ {
-		result, err := s.SweepDeliveryHistory(ctx, time.Now().Add(-30*day), 1000)
-		if err != nil {
-			t.Fatalf("chunk %d: %v", i+1, err)
+	// The plans, read before the sweep on the full table with fresh statistics:
+	// an empty table's estimates let the planner pick any index that fits the
+	// predicate. The sequential scan is disallowed so that a small table cannot
+	// hide a missing index.
+	for _, table := range []string{"outbound_intents", "event_outbox"} {
+		if _, err := s.db.Exec("ANALYZE " + table); err != nil {
+			t.Fatal(err)
 		}
-		removed = append(removed, result.Deleted.Intents)
 	}
-	if want := []int64{1000, 1000, 500, 0, 0}; len(removed) != 5 || removed[0] != want[0] ||
-		removed[1] != want[1] || removed[2] != want[2] || removed[3] != 0 || removed[4] != 0 {
-		t.Fatalf("the chunks removed %v, want %v", removed, want)
-	}
-	if n := countWhere(t, s, `SELECT count(*) FROM outbound_intents`); n != 0 {
-		t.Errorf("%d commitments remain", n)
-	}
-
-	// The plans, with the sequential scan disallowed so that a small table
-	// cannot hide a missing index.
 	plan := func(query string, args ...any) string {
 		t.Helper()
 		tx, err := s.db.Begin()
@@ -338,6 +329,23 @@ func TestRetentionChunks(t *testing.T) {
 	if !strings.Contains(doomed, "idx_event_outbox_retention") {
 		t.Errorf("the events are not read through their index:\n%s", doomed)
 	}
+
+	var removed []int64
+	for i := 0; i < 5; i++ {
+		result, err := s.SweepDeliveryHistory(ctx, time.Now().Add(-30*day), 1000)
+		if err != nil {
+			t.Fatalf("chunk %d: %v", i+1, err)
+		}
+		removed = append(removed, result.Deleted.Intents)
+	}
+	if want := []int64{1000, 1000, 500, 0, 0}; len(removed) != 5 || removed[0] != want[0] ||
+		removed[1] != want[1] || removed[2] != want[2] || removed[3] != 0 || removed[4] != 0 {
+		t.Fatalf("the chunks removed %v, want %v", removed, want)
+	}
+	if n := countWhere(t, s, `SELECT count(*) FROM outbound_intents`); n != 0 {
+		t.Errorf("%d commitments remain", n)
+	}
+
 	if !relationExists(t, s, "idx_event_outbox_retention") || !relationExists(t, s, "idx_outbound_intents_retention") {
 		t.Error("a retention index is missing")
 	}
