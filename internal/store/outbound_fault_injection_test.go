@@ -346,7 +346,7 @@ func TestAnAcknowledgementDuringTheFirstSendEndsAcknowledgedEitherWay(t *testing
 	}
 }
 
-// groupFacts is everything one of these transitions writes, in one read.
+// facts is everything one of these transitions writes, in one read.
 type facts struct {
 	Status   model.AlertGroupStatus
 	Revision int64

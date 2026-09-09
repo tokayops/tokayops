@@ -90,6 +90,14 @@ func NewAPI(s store.StoreInterface, oidc *auth.OIDCProvider, slack SlackMessenge
 	return api
 }
 
+// The three severities an alert can have. The ingester folds every other word
+// into info, so a route or a manual alert by a fourth word is refused here.
+const errInvalidSeverity = "invalid severity: must be critical, warning, or info"
+
+func isSeverity(s string) bool {
+	return s == "critical" || s == "warning" || s == "info"
+}
+
 // SetScheduleConfigService wires the schedule command side: save, delete,
 // override commands and the team-member guard.
 func (a *API) SetScheduleConfigService(svc *scheduleconfig.Service) {
@@ -515,8 +523,8 @@ func (a *API) CreateManualAlertGroup(c echo.Context) error {
 	if severity == "" {
 		severity = "info"
 	}
-	if severity != "critical" && severity != "warning" && severity != "info" {
-		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid severity: must be critical, warning, or info"})
+	if !isSeverity(severity) {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: errInvalidSeverity})
 	}
 
 	title := strings.TrimSpace(req.Title)
@@ -1052,6 +1060,11 @@ func (a *API) UpdateTeam(c echo.Context) error {
 
 	if req.SeverityRoutes != nil {
 		for sev, policyID := range req.SeverityRoutes {
+			// The ingester folds every alert into the three severities, so a
+			// route by a fourth word would never be taken.
+			if !isSeverity(sev) {
+				return c.JSON(http.StatusBadRequest, ErrorResponse{Error: errInvalidSeverity})
+			}
 			if _, err := a.store.GetEscalationPolicyByID(policyID); err != nil {
 				if err == sql.ErrNoRows {
 					return c.JSON(http.StatusBadRequest, ErrorResponse{Error: fmt.Sprintf("policy %s for severity %s not found", policyID, sev)})

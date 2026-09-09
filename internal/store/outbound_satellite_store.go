@@ -98,6 +98,8 @@ func lockParentSharedTx(ctx context.Context, tx *sql.Tx, parentID string) (*outb
 	return &parent, nil
 }
 
+var afterParentCheck func()
+
 // refusalIsStaleTx says whether a satellite's refusal - its card ended without
 // a message - still holds: it does not once a person has brought the card
 // back, or once the card has a message after all.
@@ -110,8 +112,6 @@ func lockParentSharedTx(ctx context.Context, tx *sql.Tx, parentID string) (*outb
 // afterParentCheck is a test hook, called by a begin that holds the card
 // shared and has found its refusal still true, before it takes the satellite.
 // It is how a test puts an operator's retry exactly there.
-var afterParentCheck func()
-
 func refusalIsStaleTx(ctx context.Context, tx *sql.Tx, parentID string) (bool, error) {
 	parent, err := lockParentSharedTx(ctx, tx, parentID)
 	if err != nil {

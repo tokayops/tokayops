@@ -193,6 +193,15 @@ func main() {
 		log.Printf("outbound: %d alert group(s) brought up to date with the button switches", raised)
 	}
 
+	// A route by a severity that is none of the three is never taken: the
+	// ingester folds every alert into them. Said at start, for whoever set it.
+	if teams, err := st.TeamsRoutingUnknownSeverities(context.Background()); err != nil {
+		log.Printf("routing: checking the severity routes: %v", err)
+	} else if len(teams) > 0 {
+		log.Printf("routing: %d team(s) route by a severity that is none of critical, warning, info, and those routes are never taken: %s",
+			len(teams), strings.Join(teams, ", "))
+	}
+
 	// CLI Commands
 	if len(os.Args) > 1 {
 		cmd := os.Args[1]

@@ -781,3 +781,41 @@ func TestResolveFromNewStatus(t *testing.T) {
 
 // Note: concurrent resolve idempotency (changed=false with alerts convergence)
 // is tested in regression_test.go:TestRegression_ConcurrentResolve_AlertsConverge
+
+// TestTheIngesterKeepsSeverityToTheThreeWords. Everything past the ingester -
+// routing, the firehose, the UI, the metrics - knows critical, warning and
+// info; a missing label is info, and so is any other word.
+func TestTheIngesterKeepsSeverityToTheThreeWords(t *testing.T) {
+	s := store.NewMockStore()
+	seedDefaultTeams(s)
+	ing := NewIngester(s, &config.Config{}, &mockSecretValidator{secrets: map[string]bool{"secret123": true}})
+	e := echo.New()
+	ing.RegisterRoutes(e)
+
+	for i, tc := range []struct{ label, want string }{
+		{"critical", "critical"}, {"Warning", "warning"}, {"info", "info"},
+		{"", "info"}, {"error", "info"}, {"SEV1", "info"},
+	} {
+		key := fmt.Sprintf("sev-%d", i)
+		labels := fmt.Sprintf(`"alertname":"Test","team":"devops","severity":%q`, tc.label)
+		if tc.label == "" {
+			labels = `"alertname":"Test","team":"devops"`
+		}
+		payload := fmt.Sprintf(`{"status":"firing","groupKey":%q,"commonLabels":{%s},"alerts":[{"status":"firing","labels":{%s},"fingerprint":"f%d"}]}`,
+			key, labels, labels, i)
+		req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret123", strings.NewReader(payload))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("label %q: %d %s", tc.label, rec.Code, rec.Body.String())
+		}
+		ag, err := s.GetActiveAlertGroupByAlertKey(key)
+		if err != nil || ag == nil {
+			t.Fatalf("label %q: the alert group was not created", tc.label)
+		}
+		if ag.Severity != tc.want {
+			t.Fatalf("label %q became severity %q, want %q", tc.label, ag.Severity, tc.want)
+		}
+	}
+}

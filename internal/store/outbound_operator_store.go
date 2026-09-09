@@ -518,6 +518,28 @@ type attemptFacts struct {
 	ResourceLost bool
 }
 
+func resourceLostTx(ctx context.Context, tx *sql.Tx, intentID string,
+	generation int) (bool, error) {
+
+	var lost bool
+	err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM outbound_attempts a
+			WHERE a.intent_id = $1 AND a.generation_no = $2
+			  AND a.outcome = $3 AND a.provider_result_detail = $4
+			UNION ALL
+			SELECT 1 FROM outbound_attempt_observations o
+			JOIN outbound_attempts a ON a.id = o.attempt_id
+			WHERE a.intent_id = $1 AND a.generation_no = $2
+			  AND o.outcome = $3 AND o.provider_result_detail = $4
+		)`, intentID, generation, string(outbound.OutcomePermanentRejection),
+		string(keys.DetailDefinitelyAbsent)).Scan(&lost)
+	if err != nil {
+		return false, fmt.Errorf("read what became of the message of %s: %w", intentID, err)
+	}
+	return lost, nil
+}
+
 // lastAttemptFactsTx reads them, for the CURRENT generation only.
 //
 // Every one of these facts is about the effect being decided on now. An
@@ -547,28 +569,6 @@ type attemptFacts struct {
 // is refused where it is written, in one place, for both tables. So the read
 // asks what the attempt ended as and not what it was: re-deriving the rule here
 // would defend a row that no writer in this build can produce.
-func resourceLostTx(ctx context.Context, tx *sql.Tx, intentID string,
-	generation int) (bool, error) {
-
-	var lost bool
-	err := tx.QueryRowContext(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM outbound_attempts a
-			WHERE a.intent_id = $1 AND a.generation_no = $2
-			  AND a.outcome = $3 AND a.provider_result_detail = $4
-			UNION ALL
-			SELECT 1 FROM outbound_attempt_observations o
-			JOIN outbound_attempts a ON a.id = o.attempt_id
-			WHERE a.intent_id = $1 AND a.generation_no = $2
-			  AND o.outcome = $3 AND o.provider_result_detail = $4
-		)`, intentID, generation, string(outbound.OutcomePermanentRejection),
-		string(keys.DetailDefinitelyAbsent)).Scan(&lost)
-	if err != nil {
-		return false, fmt.Errorf("read what became of the message of %s: %w", intentID, err)
-	}
-	return lost, nil
-}
-
 func lastAttemptFactsTx(ctx context.Context, tx *sql.Tx, intentID string,
 	generation int) (attemptFacts, error) {
 

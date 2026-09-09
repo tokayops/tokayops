@@ -368,13 +368,6 @@ func webhookCommitments(t *testing.T, env *IntegrationTestEnv) int {
 	return n
 }
 
-// webhookWatch samples the webhook family once a second while a test runs:
-// the lateness gauge an alert reads and the number of commitments in flight,
-// which is the pool's occupancy as the database sees it. Every sample carries
-// the moment it was taken, because what the tests ask is about TIME - how
-// long the gauge stayed over a threshold, how much of a window the slots were
-// held for - and a ticker promises neither a sample every second nor one at
-// all when a scrape runs long.
 type webhookSample struct {
 	at       time.Time
 	late     float64
@@ -382,6 +375,13 @@ type webhookSample struct {
 	inFlight int
 }
 
+// webhookWatch samples the webhook family once a second while a test runs:
+// the lateness gauge an alert reads and the number of commitments in flight,
+// which is the pool's occupancy as the database sees it. Every sample carries
+// the moment it was taken, because what the tests ask is about TIME - how
+// long the gauge stayed over a threshold, how much of a window the slots were
+// held for - and a ticker promises neither a sample every second nor one at
+// all when a scrape runs long.
 type webhookWatch struct {
 	mu      sync.Mutex
 	samples []webhookSample

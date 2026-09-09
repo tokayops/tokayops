@@ -56,8 +56,11 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
+      # Pinned: v1.8.0 wants Go 1.26, and the scan runs on the toolchain the
+      # module builds with. The vulnerability database is fetched live either
+      # way; move the pin with the Go version in go.mod.
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
 
       - name: Run govulncheck
         run: govulncheck ./...

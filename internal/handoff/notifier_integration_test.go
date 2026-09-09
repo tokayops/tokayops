@@ -887,6 +887,8 @@ func (r *recorder) occurrences() []string {
 	return keys
 }
 
+const claimBarrierKey = 7710041
+
 // claimBarrier is the door, and it is inside the database.
 //
 // A trigger makes every transaction inserting a claim wait for one advisory
@@ -899,8 +901,6 @@ func (r *recorder) occurrences() []string {
 // The alternative, letting the two goroutines run and hoping, tests a
 // sequential repeat most of the time: the second transaction commits before the
 // first one has begun, and the first then reads a claim that is already there.
-const claimBarrierKey = 7710041
-
 type claimBarrier struct {
 	t      *testing.T
 	db     *sql.DB

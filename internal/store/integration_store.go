@@ -311,7 +311,6 @@ func mergeSecrets(integrationType model.IntegrationType, existingConfig, newConf
 	return newConfig
 }
 
-// isUniqueViolation checks if error is a unique constraint violation
 // isIntegrationTeamFKViolation recognises the integrations -> teams foreign
 // key, and only it. Matching on the constraint name rather than on the error
 // class is deliberate: every other foreign key reachable from this table means
@@ -324,6 +323,7 @@ func isIntegrationTeamFKViolation(err error) bool {
 		pqErr.Constraint == integrationTeamFKConstraint
 }
 
+// isUniqueViolation checks if error is a unique constraint violation
 func isUniqueViolation(err error) bool {
 	// PostgreSQL error code for unique violation is 23505
 	return err != nil && (err.Error() == "pq: duplicate key value violates unique constraint \"idx_integrations_type_outbound\"" ||

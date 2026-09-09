@@ -326,6 +326,14 @@ func (s *Store) buildSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_alert_groups_status ON alert_groups(status);
 	CREATE INDEX IF NOT EXISTS idx_alert_groups_team_id ON alert_groups(team_id);
 
+	-- The ingester keeps severity to critical, warning and info. A group that
+	-- was still waiting for admission when this build started may carry a word
+	-- an earlier version let through, and would get no firehose card: folded
+	-- into info here, as the ingester would have. A group past admission keeps
+	-- its word - nothing reads it for a decision any more.
+	UPDATE alert_groups SET severity = 'info'
+	WHERE status = 'new' AND severity NOT IN ('critical', 'warning', 'info');
+
 	-- Teams table
 	CREATE TABLE IF NOT EXISTS teams (
 		id TEXT PRIMARY KEY,
@@ -1733,6 +1741,31 @@ func (s *Store) GetAllIncidents() ([]*model.Incident, error) {
 // Team CRUD
 // ========================================
 
+// TeamsRoutingUnknownSeverities names the teams whose severity routes carry a
+// word that is none of critical, warning and info. Such a route is never
+// taken: the ingester folds every alert into the three. Reported at start for
+// the operator; not refused, because it breaks nothing.
+func (s *Store) TeamsRoutingUnknownSeverities(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM teams
+		WHERE EXISTS (SELECT 1 FROM jsonb_object_keys(severity_routes) k
+		              WHERE k NOT IN ('critical', 'warning', 'info'))
+		ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("teams routing unknown severities: %w", err)
+	}
+	defer rows.Close()
+	var teams []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		teams = append(teams, id)
+	}
+	return teams, rows.Err()
+}
+
 func (s *Store) CreateTeam(t *model.Team) error {
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()
@@ -2241,7 +2274,6 @@ func (s *Store) CreateAPIToken(token *model.APIToken) error {
 	return requireOneRow(res, ErrUserNotFound)
 }
 
-// GetAPITokenByHash retrieves an API token by its hash
 // GetAPITokenByID retrieves an API token by ID
 func (s *Store) GetAPITokenByID(id string) (*model.APIToken, error) {
 	query := `SELECT id, user_id, name, token_hash, expires_at, last_used_at, created_at 

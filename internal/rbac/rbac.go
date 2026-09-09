@@ -98,7 +98,6 @@ type Checker struct {
 	store directory
 }
 
-// NewChecker creates a new RBAC Checker.
 // directory is the store as an access check needs it: who the user is, and what
 // role they hold in a team. Two methods, and a check that needed a third would
 // be a different kind of check.
@@ -109,6 +108,7 @@ type directory interface {
 	GetUserTeamRole(userID, teamID string) (model.TeamMemberRole, error)
 }
 
+// NewChecker creates a new RBAC Checker.
 func NewChecker(s directory) *Checker {
 	return &Checker{store: s}
 }

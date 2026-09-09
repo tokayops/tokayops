@@ -198,7 +198,7 @@ func TestAnAnnouncementTouchesNothingInTheAlertDomain(t *testing.T) {
 	}
 }
 
-// alertDomainState is everything an escalation admission writes outside the
+// domainState is everything an escalation admission writes outside the
 // outbound tables, counted.
 type domainState struct {
 	Snapshots  int
