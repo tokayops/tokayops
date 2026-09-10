@@ -1178,17 +1178,20 @@ func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
 			provider, target_kind, target_ref, alert_group_id, form, completion_mode,
 			ambiguity_policy, payload_schema_version, payload, payload_digest,
 			provider_key_codec_version,
-			status, desired_revision, attempts_in_generation, not_before, next_attempt_at)
+			status, desired_revision, attempts_in_generation, not_before, next_attempt_at,
+			awaits_intent_ids)
 		SELECT gen_random_uuid()::text, $1, 'backlog-' || g, $2, 'escalation', 1,
-		       'slack', 'channel', 'C' || g, $3, 'editable', 'on_acceptance',
+		       'slack', CASE WHEN g % 100 = 0 THEN 'user' ELSE 'channel' END, 'C' || g, $3, 'editable', 'on_acceptance',
 		       'retry', 1,
 		       jsonb_build_object(
-			       'slot', jsonb_build_object('kind', 'firehose', 'index', 0),
-			       'target', jsonb_build_object('kind', 'channel', 'ref', 'C' || g),
+			       'slot', CASE WHEN g % 100 = 0 THEN jsonb_build_object('kind', 'policy', 'index', 1)
+			                    ELSE jsonb_build_object('kind', 'firehose', 'index', 0) END,
+			       'target', jsonb_build_object('kind', CASE WHEN g % 100 = 0 THEN 'user' ELSE 'channel' END, 'ref', 'C' || g),
 			       'interactive', true), decode(repeat('ab', 32), 'hex'), 1,
 		       'pending', 0, CASE WHEN g % 10 = 0 THEN 1 ELSE 0 END,
-		       now() - interval '3 hours', now() - make_interval(secs => g)
-		FROM generate_series(1, 5000) g`, batchID, testFamily, agID); err != nil {
+		       now() - interval '3 hours', now() - make_interval(secs => g),
+		       CASE WHEN g % 100 = 0 THEN ARRAY[$4::text] END
+		FROM generate_series(1, 5000) g`, batchID, testFamily, agID, seed); err != nil {
 		t.Fatalf("build the backlog: %v", err)
 	}
 	if _, err := s.db.Exec(`ANALYZE outbound_intents`); err != nil {

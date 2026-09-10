@@ -114,9 +114,9 @@ func (s *Store) DueSnapshot(ctx context.Context, family string) ([]outbound.Prov
 		             AND due.attempts_in_generation = 0) AS claimable_fresh,
 		       EXTRACT(EPOCH FROM (now() - min(due.next_attempt_at))) AS lateness_seconds
 		FROM outbound_intents due
-		`+satelliteJoins+`
+		`+satelliteJoins+dmJoins+`
 		WHERE due.delivery_family = $1 AND due.status = 'pending' AND due.next_attempt_at <= now()
-		  `+satelliteMayGo+`
+		  `+satelliteMayGo+dmMayGo+`
 		GROUP BY due.provider`, family)
 	if err != nil {
 		return nil, fmt.Errorf("read the queue: %w", err)
@@ -213,12 +213,12 @@ func claimStatement(phase outbound.ClaimPhase) (string, error) {
 		    updated_at = now()
 		FROM (
 			SELECT due.id FROM outbound_intents due
-			` + satelliteJoins + `
+			` + satelliteJoins + dmJoins + `
 			WHERE due.delivery_family = $1 AND due.provider = $2 AND due.status = 'pending'
 			  AND due.next_attempt_at <= now()
 			  AND (due.expires_at IS NULL OR due.expires_at > now())
 			  AND (due.locked_until IS NULL OR due.locked_until <= now())
-			  ` + satelliteMayGo + `
+			  ` + satelliteMayGo + dmMayGo + `
 			  %s
 			ORDER BY %s
 			LIMIT $3

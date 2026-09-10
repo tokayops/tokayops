@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/outbound"
@@ -294,7 +295,7 @@ func admitSatellitesTx(ctx context.Context, tx *sql.Tx) error {
 				ID: c.batchID, Kind: keys.Kind(c.kind), GrammarVersion: c.grammar,
 				AlertGroupID: c.groupID, Revision: c.snapshotRevision,
 				Family: outbound.FamilyNotification, AdmittedAt: c.admittedAt,
-			}, satellite, c.id, outbound.ActorSystem); err != nil {
+			}, satellite, uuid.New().String(), c.id, nil, outbound.ActorSystem); err != nil {
 				return err
 			}
 		}

@@ -279,6 +279,14 @@ type Intent struct {
 	// and a refusal once the card ended without one.
 	ParentID string
 	Parent   *ParentState
+
+	// AwaitsIntentIDs names the cards a direct message could link to, as the
+	// admission saw them: the channel cards of its batch due no later than
+	// it - the policy's, and the firehose's when the fallback is on. The
+	// claim holds the message until every one of them has had its first
+	// attempt, and the binding chooses among them. Empty for everything
+	// else, and for rows an earlier build admitted.
+	AwaitsIntentIDs []string
 }
 
 // ParentState is what a satellite knows about the card it follows.

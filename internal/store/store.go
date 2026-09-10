@@ -2794,7 +2794,8 @@ func (s *Store) GetMetricsSnapshot(ctx context.Context) (*model.MetricsSnapshot,
 	// value behind forever.
 	//
 	// A satellite waiting for its card, or for the alert to end, is not late:
-	// waiting is what it is for. The predicate is the claim's, so what this
+	// waiting is what it is for; nor is a direct message waiting for the
+	// cards it could link to. The predicate is the claim's, so what this
 	// gauge calls late is exactly what a worker could have taken.
 	snapshotStep(8)
 	// Constants joined: the claim's predicate and its joins; no value is spliced in.
@@ -2803,9 +2804,9 @@ func (s *Store) GetMetricsSnapshot(ctx context.Context) (*model.MetricsSnapshot,
 		SELECT due.delivery_family,
 		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(due.next_attempt_at)
 		           FILTER (WHERE due.status = 'pending' AND due.next_attempt_at <= now()
-		                   `+satelliteMayGo+`))), 0)::double precision
+		                   `+satelliteMayGo+dmMayGo+`))), 0)::double precision
 		FROM outbound_intents due
-		`+satelliteJoins+`
+		`+satelliteJoins+dmJoins+`
 		GROUP BY due.delivery_family`)
 	if err != nil {
 		return nil, fmt.Errorf("outbound queue lateness query: %w", err)

@@ -71,10 +71,14 @@ func applySnapshotV2Schema(ctx context.Context, tx *sql.Tx) error {
 			// asks for the card: a cycle, seen in the pipeline. The order
 			// leaves-first is a rule of retention, checked by its own test,
 			// and the shape of the link is the rule below.
-			what: "add the generation context and the parent to the commitments",
+			// awaits_intent_ids names the cards a direct message could link
+			// to, by id and without a key for the same reason as the parent:
+			// a card the retention sweep has removed reads as settled.
+			what: "add the generation context, the parent and the awaited cards to the commitments",
 			sql: `ALTER TABLE outbound_intents
 				ADD COLUMN IF NOT EXISTS bound_context JSONB,
-				ADD COLUMN IF NOT EXISTS parent_intent_id TEXT`,
+				ADD COLUMN IF NOT EXISTS parent_intent_id TEXT,
+				ADD COLUMN IF NOT EXISTS awaits_intent_ids TEXT[]`,
 		},
 		{
 			what: "take the parent's foreign key away where an earlier start added it",

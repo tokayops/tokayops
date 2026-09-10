@@ -11,6 +11,10 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ### Upgrade notes
 
+- **A direct message now goes out after the card it links to.** The start
+  adds `awaits_intent_ids` to the commitments; messages admitted by this
+  version name their cards there. A message still pending from before the
+  upgrade has no such list and goes as before, without waiting.
 - **Info alerts leave the warning firehose channel** - including every alert
   whose `severity` label is missing or is none of `critical`, `warning` and
   `info`, since all of those count as `info` now. Set `firehose_info_channel`
@@ -276,11 +280,15 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   refusing for good still does, immediately.
 - **A direct message about an alert reads as it did in 0.1.0** - `You have a
   new alert: <title> (Severity: <severity>)` - **and links to the alert in
-  TokayOps, and to the card in the channel once that card is out.** The link
-  to the card is settled
-  when the message is first sent and does not change on a retry: a message
-  sent before the card exists carries the alert link alone. `Message` on the
-  step replaces the words, not the links. When the policy posted no channel
+  TokayOps, and to the card in the channel.** The message names, when the
+  escalation is admitted, the cards it could link to - the policy's channel
+  cards due no later than it, and the firehose card when the fallback is on -
+  and is not sent until every one of them has had its first attempt: the link
+  is part of its words, and the words are fixed when it is first sent. A card
+  that went out is linked; a card whose first attempt was refused, that failed
+  for good, was withdrawn or waits for a person releases the message without
+  the link, at once - a page waits for one attempt of a card and never for its
+  retries. `Message` on the step replaces the words, not the links. When the policy posted no channel
   card of its own, `dm_fallback_to_firehose` in `tokay.yaml` decides whether
   the firehose card is linked instead; it is `true` when absent, as before.
   The link needs the Slack workspace's address, which TokayOps records from
