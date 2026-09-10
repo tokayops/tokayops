@@ -7,7 +7,6 @@ import (
 
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
-	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // TestTheDirectMessageLinksToTheAlertAndToItsCard. The words are the policy's
@@ -18,7 +17,8 @@ import (
 // slash the workspace's address ends in.
 func TestTheDirectMessageLinksToTheAlertAndToItsCard(t *testing.T) {
 	state := handlerState(t).Content()
-	title := mrkdwn(providers.ResolveStatus(state).Title)
+	// The words of the first release, which people had learned to read.
+	sentence := "You have a new alert: " + mrkdwn(state.Title) + " (Severity: critical)"
 	words := keys.EscalationPayloadV2{
 		Slot: keys.Slot{Kind: keys.SlotPolicy, Index: 1}, Target: keys.Target{Kind: keys.TargetUser, Ref: "u-1"},
 	}
@@ -36,22 +36,22 @@ func TestTheDirectMessageLinksToTheAlertAndToItsCard(t *testing.T) {
 		want    string
 	}{
 		{name: "the snapshot's words, no card", payload: words,
-			want: title + "\nSeverity: critical\n" + alert},
+			want: sentence + "\n" + alert},
 		{name: "the snapshot's words, a card", payload: words, context: card,
-			want: title + "\nSeverity: critical\n" + alert + "\n" + primary},
+			want: sentence + "\n" + alert + "\n" + primary},
 		{name: "the policy's words, no card", payload: own,
 			want: override + "\n" + alert},
 		{name: "the policy's words, a card", payload: own, context: card,
 			want: override + "\n" + alert + "\n" + primary},
 		{name: "a card in no known workspace", payload: words,
 			context: outbound.BoundContext{CardReceiptRef: "C0001/1700000000.000100"},
-			want:    title + "\nSeverity: critical\n" + alert},
+			want:    sentence + "\n" + alert},
 		{name: "a workspace with no card", payload: words,
 			context: outbound.BoundContext{TeamURL: "https://acme.slack.com/"},
-			want:    title + "\nSeverity: critical\n" + alert},
+			want:    sentence + "\n" + alert},
 		{name: "a workspace without the slash", payload: words,
 			context: outbound.BoundContext{CardReceiptRef: "C0001/1700000000.000100", TeamURL: "https://acme.slack.com"},
-			want:    title + "\nSeverity: critical\n" + alert + "\n" + primary},
+			want:    sentence + "\n" + alert + "\n" + primary},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := directMessage(state, tc.payload, tc.context); got != tc.want {

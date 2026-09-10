@@ -11,6 +11,10 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ### Upgrade notes
 
+- **A direct message now goes out after the card it links to.** The start
+  adds `awaits_intent_ids` to the commitments; messages admitted by this
+  version name their cards there. A message still pending from before the
+  upgrade has no such list and goes as before, without waiting.
 - **Info alerts leave the warning firehose channel** - including every alert
   whose `severity` label is missing or is none of `critical`, `warning` and
   `info`, since all of those count as `info` now. Set `firehose_info_channel`
@@ -274,11 +278,17 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   failure ended it silently - the page simply never arrived, and nothing said
   so. `max_attempts` on an escalation step no longer ends a page; a provider
   refusing for good still does, immediately.
-- **A direct message about an alert links to the alert in TokayOps, and to the
-  card in the channel once that card is out.** The link to the card is settled
-  when the message is first sent and does not change on a retry: a message
-  sent before the card exists carries the alert link alone. `Message` on the
-  step replaces the words, not the links. When the policy posted no channel
+- **A direct message about an alert reads as it did in 0.1.0** - `You have a
+  new alert: <title> (Severity: <severity>)` - **and links to the alert in
+  TokayOps, and to the card in the channel.** The message names, when the
+  escalation is admitted, the cards it could link to - the policy's channel
+  cards due no later than it, and the firehose card when the fallback is on -
+  and is not sent until every one of them has had its first attempt: the link
+  is part of its words, and the words are fixed when it is first sent. A card
+  that went out is linked; a card whose first attempt was refused, that failed
+  for good, was withdrawn or waits for a person releases the message without
+  the link, at once - a page waits for one attempt of a card and never for its
+  retries. `Message` on the step replaces the words, not the links. When the policy posted no channel
   card of its own, `dm_fallback_to_firehose` in `tokay.yaml` decides whether
   the firehose card is linked instead; it is `true` when absent, as before.
   The link needs the Slack workspace's address, which TokayOps records from
@@ -302,9 +312,16 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   failed) and an attempt says what happened (sent and accepted, rejected
   with no retry, not sent). The Activity page lists deliveries the way the
   alert groups are listed, with a period switch; a row opens the journal.
-- **The alerts inside a message are listed by when they started**, rather than
-  in whatever order they arrived from Alertmanager. Two instances rendering the
-  same alert now produce the same message.
+- **The alerts inside a message are listed firing first, then resolved, each
+  by when they started**, rather than in whatever order they arrived from
+  Alertmanager. A card lists ten of many, and after a partial recovery the ten
+  that started first are the resolved ones; the firing alerts come first now.
+  Two instances rendering the same alert produce the same message.
+- **The card names the alerts; the thread says what is wrong.** The line
+  under each alert in the card - its description and the moment it started -
+  is gone from the card, and the thread's `Alert Details` reads
+  `*name*: description`, as both did in 0.1.0. Telegram, which has no
+  thread, keeps the line in its card.
 - **Erasing a user also removes the addresses their notifications were sent to**,
   and withdraws anything still owed to them. What was already delivered is kept
   as a record that it happened, without the coordinates of the message; nothing

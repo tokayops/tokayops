@@ -434,7 +434,8 @@ func (s *Store) submitEscalation(ctx context.Context, batch outbound.Batch,
 		return result, nil
 	}
 
-	intentIDs, err := insertCommitmentsTx(ctx, tx, batchID, admission, family, admittedAt, batch.Actor)
+	intentIDs, err := insertCommitmentsTx(ctx, tx, batchID, admission, family, admittedAt, batch.Actor,
+		s.dmFallsBackToFirehose())
 	if err != nil {
 		return outbound.SubmitResult{}, err
 	}
@@ -560,7 +561,8 @@ func (s *Store) submitHandoff(ctx context.Context, batch outbound.Batch,
 		return result, nil
 	}
 
-	intentIDs, err := insertCommitmentsTx(ctx, tx, batchID, admission, family, admittedAt, batch.Actor)
+	intentIDs, err := insertCommitmentsTx(ctx, tx, batchID, admission, family, admittedAt, batch.Actor,
+		s.dmFallsBackToFirehose())
 	if err != nil {
 		return outbound.SubmitResult{}, err
 	}
@@ -882,17 +884,24 @@ func existingAdmission(ctx context.Context, tx *sql.Tx,
 // somebody can see.
 func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 	admission keys.Admission, family string, admittedAt time.Time,
-	actor outbound.Actor) ([]string, error) {
+	actor outbound.Actor, dmFallsBackToFirehose bool) ([]string, error) {
 
 	batch := batchRow{
 		ID: batchID, Kind: admission.Kind, GrammarVersion: admission.GrammarVersion,
 		AlertGroupID: admission.AlertGroupID, Revision: admission.Revision,
 		Family: family, AdmittedAt: admittedAt,
 	}
+	// The ids are minted before anything is written: a direct message names
+	// the cards it could link to by id, in its own INSERT, and the admission
+	// is the one moment every commitment of the batch is in hand.
+	minted := make([]string, len(admission.Commitments))
+	for i := range admission.Commitments {
+		minted[i] = uuid.New().String()
+	}
 	ids := make([]string, 0, len(admission.Commitments))
 	byKey := make(map[string]string, len(admission.Commitments))
 	for pass := 0; pass < 2; pass++ {
-		for _, c := range admission.Commitments {
+		for i, c := range admission.Commitments {
 			if satellite := c.ParentKey != ""; satellite != (pass == 1) {
 				continue
 			}
@@ -904,15 +913,57 @@ func insertCommitmentsTx(ctx context.Context, tx *sql.Tx, batchID string,
 						c.Target.Kind, c.IdempotencyKey)
 				}
 			}
-			id, err := insertCommitmentRowTx(ctx, tx, batch, c, parentID, actor)
+			awaits, err := cardsAMessageCouldLinkTo(admission.Commitments, minted, i, admittedAt, dmFallsBackToFirehose)
 			if err != nil {
 				return nil, err
 			}
-			byKey[c.IdempotencyKey] = id
-			ids = append(ids, id)
+			if _, err := insertCommitmentRowTx(ctx, tx, batch, c, minted[i], parentID, awaits, actor); err != nil {
+				return nil, err
+			}
+			byKey[c.IdempotencyKey] = minted[i]
+			ids = append(ids, minted[i])
 		}
 	}
 	return ids, nil
+}
+
+// cardsAMessageCouldLinkTo is what a Slack direct message waits for and links
+// to: the channel cards of its own admission due no later than it - the
+// policy's, and the firehose's when the installation lets a message fall
+// back to it. A card due later is not named: the message goes without the
+// link rather than wait for a step that has not come. Nothing for any other
+// commitment. The switch is read here, once; the array is the answer from
+// then on. Sorted, so the row is the same whatever the plan's order.
+func cardsAMessageCouldLinkTo(commitments []keys.AdmittedCommitment, minted []string, i int,
+	admittedAt time.Time, dmFallsBackToFirehose bool) ([]string, error) {
+
+	dm := commitments[i]
+	if dm.Provider != keys.ProviderSlack || dm.Target.Kind != keys.TargetUser || dm.ParentKey != "" {
+		return nil, nil
+	}
+	dmDue, err := notBeforeOf(dm.Timing, admittedAt)
+	if err != nil {
+		return nil, err
+	}
+	var awaits []string
+	for j, card := range commitments {
+		if card.Provider != dm.Provider || card.Target.Kind != keys.TargetChannel || card.ParentKey != "" {
+			continue
+		}
+		if card.Slot.Kind != keys.SlotPolicy && !dmFallsBackToFirehose {
+			continue
+		}
+		cardDue, err := notBeforeOf(card.Timing, admittedAt)
+		if err != nil {
+			return nil, err
+		}
+		if cardDue.After(dmDue) {
+			continue
+		}
+		awaits = append(awaits, minted[j])
+	}
+	sort.Strings(awaits)
+	return awaits, nil
 }
 
 // batchRow is what a commitment takes from its claim when it is written.
@@ -930,7 +981,7 @@ type batchRow struct {
 // written: the admission's insert and the start-up that gives old cards their
 // satellites both come here.
 func insertCommitmentRowTx(ctx context.Context, tx *sql.Tx, batch batchRow,
-	c keys.AdmittedCommitment, parentID string, actor outbound.Actor) (string, error) {
+	c keys.AdmittedCommitment, id, parentID string, awaits []string, actor outbound.Actor) (string, error) {
 
 	payload, err := json.Marshal(c.Payload)
 	if err != nil {
@@ -963,7 +1014,6 @@ func insertCommitmentRowTx(ctx context.Context, tx *sql.Tx, batch batchRow,
 		form = outbound.FormEditable
 	}
 
-	id := uuid.New().String()
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO outbound_intents (
 			id, batch_id, idempotency_key, delivery_family, key_kind, grammar_version,
@@ -971,14 +1021,14 @@ func insertCommitmentRowTx(ctx context.Context, tx *sql.Tx, batch batchRow,
 			ambiguity_policy, payload_schema_version, payload, payload_digest,
 			provider_key_codec_version,
 			status, desired_revision, not_before, next_attempt_at, expires_at,
-			parent_intent_id)
+			parent_intent_id, awaits_intent_ids)
 		VALUES (
 			$1, $2, $3, $19, $4, $5,
 			$6, $7, $8, $9, $10, $11,
 			$12, $13, $14, $20, $15,
 			'pending', $16,
 			$17, GREATEST(now(), $17::timestamptz),
-			$18, $21)`,
+			$18, $21, $22)`,
 		id, batch.ID, c.IdempotencyKey,
 		string(batch.Kind), batch.GrammarVersion,
 		c.Provider, string(c.Target.Kind), c.Target.Ref, nilIfEmpty(batch.AlertGroupID),
@@ -986,7 +1036,7 @@ func insertCommitmentRowTx(ctx context.Context, tx *sql.Tx, batch batchRow,
 		string(c.AmbiguityPolicy), c.PayloadSchemaVersion, payload, keys.ProviderKeyCodecV1,
 		batch.Revision,
 		notBefore,
-		expiresAt, batch.Family, digest, nilIfEmpty(parentID),
+		expiresAt, batch.Family, digest, nilIfEmpty(parentID), nullableTextArray(awaits),
 	); err != nil {
 		return "", fmt.Errorf("write the commitment %s: %w", c.IdempotencyKey, err)
 	}
@@ -995,6 +1045,15 @@ func insertCommitmentRowTx(ctx context.Context, tx *sql.Tx, batch batchRow,
 		return "", err
 	}
 	return id, nil
+}
+
+// nullableTextArray is NULL for an empty list: a message with no card to wait
+// for carries no array at all, as a row of an earlier build does.
+func nullableTextArray(values []string) any {
+	if len(values) == 0 {
+		return nil
+	}
+	return pq.Array(values)
 }
 
 // notBeforeOf is the instant a commitment becomes due.
@@ -1227,7 +1286,7 @@ const outboundIntentColumns = `
 	       create_key IS NOT NULL, payload_schema_version,
 	       provider_key_codec_version, payload, payload_digest, receipt, receipt_ref,
 	       COALESCE(expires_at <= now(), FALSE), created_at, updated_at,
-	       COALESCE(parent_intent_id, '')`
+	       COALESCE(parent_intent_id, ''), awaits_intent_ids`
 
 // scanIntent turns one row of outboundIntentColumns into a commitment, and is
 // the only place that mapping exists: two readers that disagreed about it would
@@ -1255,7 +1314,8 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		&intent.GenerationBound, &intent.PayloadSchemaVersion,
 		&intent.ProviderKeyCodecVersion, &payload, &intent.PayloadDigest,
 		&coordinates, &name,
-		&deadlinePassed, &intent.CreatedAt, &intent.UpdatedAt, &intent.ParentID); err != nil {
+		&deadlinePassed, &intent.CreatedAt, &intent.UpdatedAt, &intent.ParentID,
+		pq.Array(&intent.AwaitsIntentIDs)); err != nil {
 		return nil, false, err
 	}
 

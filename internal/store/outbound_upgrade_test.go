@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"github.com/lib/pq"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -429,6 +431,24 @@ func TestAStartUpgradesADatabaseFromThePreviousVersion(t *testing.T) {
 		if form == string(outbound.FormOneShot) {
 			dm = id
 		}
+	}
+	// The message waits for the cards it could link to; they go out first.
+	cards, err := s.db.Query(`SELECT id FROM outbound_intents
+		WHERE id = ANY($1) AND target_kind = 'channel' AND parent_intent_id IS NULL`, pq.Array(intentIDs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cardIDs []string
+	for cards.Next() {
+		var id string
+		if err := cards.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		cardIDs = append(cardIDs, id)
+	}
+	cards.Close()
+	for i, card := range cardIDs {
+		postedAs(t, s, card, fmt.Sprintf("C/1700000000.%06d", i))
 	}
 	token := claimOne(t, s, dm)
 	begun := beginOne(t, s, dm, token)
@@ -937,7 +957,8 @@ func TestAStartUpgradesADatabaseThatFollowedDevelop(t *testing.T) {
 		`ALTER TABLE outbound_group_snapshots DROP COLUMN IF EXISTS card_digest, DROP COLUMN IF EXISTS thread_digest`,
 		`ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundSatelliteNamesParent,
 		`DROP INDEX IF EXISTS idx_outbound_intents_parent`,
-		`ALTER TABLE outbound_intents DROP COLUMN IF EXISTS parent_intent_id, DROP COLUMN IF EXISTS bound_context`,
+		`ALTER TABLE outbound_intents DROP COLUMN IF EXISTS parent_intent_id, DROP COLUMN IF EXISTS bound_context,
+			DROP COLUMN IF EXISTS awaits_intent_ids`,
 		// The rows of the previous release in the tables it owned.
 		`INSERT INTO jobs (id, type, status, alert_group_id)
 			VALUES ('job-1', 'escalation', 'completed', '` + group + `')`,
@@ -985,7 +1006,7 @@ func TestAStartUpgradesADatabaseThatFollowedDevelop(t *testing.T) {
 		WHERE card_digest IS NULL OR thread_digest IS NULL`); n != 0 {
 		t.Errorf("%d snapshot(s) came back without form digests", n)
 	}
-	for _, column := range []string{"parent_intent_id", "bound_context"} {
+	for _, column := range []string{"parent_intent_id", "bound_context", "awaits_intent_ids"} {
 		if !hasColumn(t, s, "outbound_intents", column) {
 			t.Errorf("the start did not add %s", column)
 		}

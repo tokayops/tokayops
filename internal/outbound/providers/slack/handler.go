@@ -522,11 +522,7 @@ func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV2,
 	if payload.MessageOverride != nil && *payload.MessageOverride != "" {
 		lines = []string{providers.RenderMessage(*payload.MessageOverride, state, mrkdwn)}
 	} else {
-		status := providers.ResolveStatus(state)
-		lines = []string{mrkdwn(status.Title)}
-		if state.Severity != "" {
-			lines = append(lines, "Severity: "+mrkdwn(state.Severity))
-		}
+		lines = []string{providers.PageWords(state, mrkdwn)}
 	}
 	if state.GroupURL != nil && *state.GroupURL != "" {
 		lines = append(lines, fmt.Sprintf("<%s|Open in TokayOps>", *state.GroupURL))

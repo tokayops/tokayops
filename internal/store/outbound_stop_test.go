@@ -84,7 +84,11 @@ func stopped(agID string) []keys.EscalationCommitment {
 		dmStep("u-1", 1, true), dmStep("u-1b", 1, false),
 		dmStep("u-2", 2, false),
 	}
-	out = append(out, withSatellites(cardStep("C-2", 2, false))...)
+	// The card of step 2 comes a minute later, as a later step does: the
+	// messages due at once do not wait for it.
+	later := cardStep("C-2", 2, false)
+	later.Timing = keys.TimingSpec{Kind: keys.TimingRelativeToAdmission, Offset: time.Minute}
+	out = append(out, withSatellites(later)...)
 	return append(out, dmStep("u-3", 3, false))
 }
 
@@ -98,6 +102,9 @@ func TestAStepThatFailsForGoodStopsTheStepsAfterIt(t *testing.T) {
 	agID := desiredGroup(t, s, "Disk filling up")
 	admitOne(t, s, agID, stopped(agID)...)
 	u1 := intentAddressedTo(t, s, agID, "u-1")
+	// The firehose has had its attempt, and the messages wait for no more
+	// than that; it is still pending, on its backoff.
+	rejectedOnce(t, s, intentAddressedTo(t, s, agID, "C-fire"))
 
 	refusedBeforeTheNetwork(t, s, u1)
 	if got := statusOf(t, s, u1); got != outbound.StatusPermanentFailed {

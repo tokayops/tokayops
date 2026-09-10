@@ -55,7 +55,10 @@ func TestErasureWithdrawsWhatIsOwedAndForgetsTheAddress(t *testing.T) {
 		dmForUser("bob", 1), // never tried
 		dmForUser("bob", 2), // in flight
 		dmForUser("bob", 3), // already delivered
-		channelCommitment("C0001", 0),
+		// Due later than the messages, so that none of them waits for it:
+		// a message waits for the cards it could link to, and a card that
+		// comes five minutes after it is not one.
+		channelCommitment("C0001", 5*time.Minute),
 	)
 	// Which of the four is which. The ids come back in key order, so they are
 	// told apart by what they are aimed at rather than by position.

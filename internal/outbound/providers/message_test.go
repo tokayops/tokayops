@@ -82,3 +82,17 @@ func TestAPolicyIsSavedOnlyWithATemplateThatRenders(t *testing.T) {
 		}
 	}
 }
+
+// TestThePageWordsAreTheFirstReleases. A step without words of its own says
+// what the first release said, with the title and the severity escaped for
+// the provider, and without the severity when the alert has none.
+func TestThePageWordsAreTheFirstReleases(t *testing.T) {
+	upper := func(s string) string { return strings.ToUpper(s) }
+	state := keys.SnapshotInput{Title: "disk full", Severity: "critical"}
+	if got, want := PageWords(state, upper), "You have a new alert: DISK FULL (Severity: CRITICAL)"; got != want {
+		t.Fatalf("the words read %q, want %q", got, want)
+	}
+	if got, want := PageWords(keys.SnapshotInput{Title: "disk full"}, upper), "You have a new alert: DISK FULL"; got != want {
+		t.Fatalf("without a severity the words read %q, want %q", got, want)
+	}
+}

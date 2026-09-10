@@ -60,7 +60,8 @@ func admitWebhookTx(ctx context.Context, tx *sql.Tx, batch keys.WebhookBatch,
 	}
 
 	intentIDs, err := insertCommitmentsTx(ctx, tx, batchID, admission, string(family),
-		admittedAt, actor)
+		admittedAt, actor,
+		false) // a webhook batch carries no direct message to a person
 	if err != nil {
 		return outbound.SubmitResult{}, err
 	}
