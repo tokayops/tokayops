@@ -445,11 +445,7 @@ func directMessage(state keys.SnapshotInput, payload keys.EscalationPayloadV2) s
 		lines = []string{providers.RenderMessage(*payload.MessageOverride, state,
 			func(s string) string { return s })}
 	} else {
-		status := providers.ResolveStatus(state)
-		lines = []string{status.Title}
-		if state.Severity != "" {
-			lines = append(lines, "Severity: "+state.Severity)
-		}
+		lines = []string{providers.PageWords(state, func(s string) string { return s })}
 	}
 	if state.GroupURL != nil && *state.GroupURL != "" {
 		lines = append(lines, *state.GroupURL)

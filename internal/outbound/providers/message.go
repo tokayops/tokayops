@@ -45,6 +45,18 @@ func ValidateMessageTemplate(text string) error {
 	return nil
 }
 
+// PageWords is what a person is told when a step has no words of its own:
+// the sentence the first release used, which people had learned to read.
+// A direct message goes out once, when the alert fires, so it does not follow
+// the alert's state the way a card does. The severity is left out when the
+// alert has none.
+func PageWords(state keys.SnapshotInput, escape func(string) string) string {
+	if state.Severity == "" {
+		return "You have a new alert: " + escape(state.Title)
+	}
+	return fmt.Sprintf("You have a new alert: %s (Severity: %s)", escape(state.Title), escape(state.Severity))
+}
+
 // RenderMessage is the step's words for one alert. The values are the
 // snapshot's, passed through the channel's escaping - they came from outside
 // and the channel reads markup in them - while the template's own text is

@@ -274,8 +274,10 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   failure ended it silently - the page simply never arrived, and nothing said
   so. `max_attempts` on an escalation step no longer ends a page; a provider
   refusing for good still does, immediately.
-- **A direct message about an alert links to the alert in TokayOps, and to the
-  card in the channel once that card is out.** The link to the card is settled
+- **A direct message about an alert reads as it did in 0.1.0** - `You have a
+  new alert: <title> (Severity: <severity>)` - **and links to the alert in
+  TokayOps, and to the card in the channel once that card is out.** The link
+  to the card is settled
   when the message is first sent and does not change on a retry: a message
   sent before the card exists carries the alert link alone. `Message` on the
   step replaces the words, not the links. When the policy posted no channel
