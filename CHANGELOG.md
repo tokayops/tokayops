@@ -372,6 +372,12 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ### Fixed
 
+- **The ingester says in the log why it did nothing with a payload.** A
+  resolved-only payload with no open incident, a payload the open incident
+  already says, and a payload with nothing that belongs to the open incident
+  each leave a line now; the line for every payload says how many alerts
+  are firing and how many resolved, and the payload's own status.
+
 - An Alertmanager payload and somebody pressing Acknowledge can no longer
   produce two different answers about the same incident. Whether a payload adds
   alerts to the open incident or ends it is now decided while holding that

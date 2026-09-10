@@ -107,7 +107,14 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	severity, knownSeverity := normalSeverity(rawSeverity)
 
 	metrics.AlertsReceivedTotal.WithLabelValues(teamID, severity).Inc()
-	log.Printf("Ingester: Group %s (Team: %s, Sev: %s, Alerts: %d)", alertKey, teamID, severity, len(payload.Alerts))
+	firingInPayload := 0
+	for _, a := range payload.Alerts {
+		if a.Status == model.AlertStatusFiring {
+			firingInPayload++
+		}
+	}
+	log.Printf("Ingester: Group %s (Team: %s, Sev: %s, Alerts: %d firing, %d resolved, payload %s)",
+		alertKey, teamID, severity, firingInPayload, len(payload.Alerts)-firingInPayload, payload.Status)
 
 	// 3. Apply it to the incident that is open, if there is one. What that
 	// means - a merge, the end of the incident, or nothing at all - is decided
@@ -118,10 +125,16 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		log.Printf("Ingester: Failed to apply the payload for %s: %v", alertKey, err)
 		return c.String(http.StatusInternalServerError, "Failed to persist")
 	}
+	// Every outcome leaves a line, the quiet ones included: a payload that
+	// changed nothing is the one a person asks about afterwards.
 	switch result.Outcome {
 	case alertgroup.MergeIgnored:
+		log.Printf("Ingester: %s: nothing in the payload belongs to the open incident %s, ignored",
+			alertKey, result.AlertGroupID)
 		return c.String(http.StatusOK, "Ignored Resolved")
 	case alertgroup.MergeUnchanged:
+		log.Printf("Ingester: %s: the open incident %s already says this, unchanged",
+			alertKey, result.AlertGroupID)
 		return c.String(http.StatusOK, "Unchanged")
 	case alertgroup.MergeMerged:
 		log.Printf("Ingester: Updated alert group %s", result.AlertGroupID)
@@ -140,6 +153,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		}
 	}
 	if len(firingAlerts) == 0 {
+		log.Printf("Ingester: %s: no open incident and nothing firing in the payload, ignored", alertKey)
 		return c.String(http.StatusOK, "Ignored Resolved")
 	}
 
