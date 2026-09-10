@@ -48,15 +48,15 @@ func threadState() keys.SnapshotInput {
 	}
 }
 
-// TestTheThreadIsTheseWords is the golden text: ten alerts - what is wrong
-// and since when, in the snapshot's zone, the firing ones first so the one
-// that resolved (the second) falls behind the count of the rest - the
-// history oldest first in the snapshot's zone with a count of what the
-// window left out, and the icons per type.
+// TestTheThreadIsTheseWords is the golden text: ten alerts - what is wrong,
+// as the first release wrote them, the firing ones first so the one that
+// resolved (the second) falls behind the count of the rest - the history
+// oldest first in the snapshot's zone with a count of what the window left
+// out, and the icons per type.
 func TestTheThreadIsTheseWords(t *testing.T) {
 	lines := []string{"📋 *Alert Details*"}
 	for _, i := range []int{1, 3, 4, 5, 6, 7, 8, 9, 10, 11} {
-		lines = append(lines, fmt.Sprintf("🔴 *DiskWillFill%d*: disk %d nearly full · since 2023-11-14 23:13 GMT+01:00", i, i))
+		lines = append(lines, fmt.Sprintf("🔴 *DiskWillFill%d*: disk %d nearly full", i, i))
 	}
 	lines = append(lines,
 		"_... and 2 more alert details_",

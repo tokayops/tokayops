@@ -62,8 +62,10 @@ func linkable(raw string) bool {
 const maxThreadAlerts = 10
 
 // RenderThread is the message under the card: the alerts in detail - what is
-// wrong and since when, firing first - and the history of the group as the
-// snapshot holds it.
+// wrong, firing first, as the first release wrote them - and the history of
+// the group as the snapshot holds it. The moment an alert started is not
+// printed here: the block is due for a rework, and until then it reads as
+// it did.
 func RenderThread(state keys.SnapshotInput) string {
 	var b strings.Builder
 	b.WriteString("📋 *Alert Details*\n")
@@ -79,7 +81,11 @@ func RenderThread(state keys.SnapshotInput) string {
 		if a.Status == keys.AlertResolved {
 			icon = "🟢"
 		}
-		b.WriteString(icon + " *" + mrkdwn(a.AlertName) + "*: " + mrkdwn(providers.AlertDetail(a, state.DisplayTimezone)) + "\n")
+		line := icon + " *" + mrkdwn(a.AlertName) + "*"
+		if description := providers.AlertDescription(a); description != "" {
+			line += ": " + mrkdwn(description)
+		}
+		b.WriteString(line + "\n")
 	}
 
 	b.WriteString("\n📋 *Timeline*\n```\n")

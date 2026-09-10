@@ -82,17 +82,20 @@ func TestACardIsAFunctionOfItsSnapshot(t *testing.T) {
 			first, second)
 	}
 
-	// The card names the alerts; what is wrong and since when is the thread's
-	// to say, and the zone it says it in is the snapshot's, not the machine's.
-	// Europe/Berlin was at +01:00 on the fixture's instant.
+	// The card names the alerts; what is wrong is the thread's to say, and
+	// neither says since when: the first release did not, and the block is
+	// due for a rework rather than an investment now.
 	for _, detail := range []string{"the disk will be full in two hours", "since "} {
 		if strings.Contains(first, detail) {
 			t.Fatalf("the card says %q, which is the thread's to say: %s", detail, first)
 		}
 	}
 	thread := RenderThread(state)
-	if !strings.Contains(thread, "the disk will be full in two hours · since 2023-11-14 23:13 GMT+01:00") {
-		t.Fatalf("the thread does not say what is wrong and since when, in the snapshot's zone: %s", thread)
+	if !strings.Contains(thread, "*DiskWillFill*: the disk will be full in two hours") {
+		t.Fatalf("the thread does not say what is wrong: %s", thread)
+	}
+	if strings.Contains(thread, "since ") {
+		t.Fatalf("the thread says since when, which the first release did not: %s", thread)
 	}
 }
 

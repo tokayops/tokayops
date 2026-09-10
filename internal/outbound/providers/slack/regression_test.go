@@ -237,7 +237,7 @@ func TestRegression_AlertList_Truncation(t *testing.T) {
 	if strings.Contains(result, "Description for alert 1") {
 		t.Error("the alert's description is in the card, which the thread says")
 	}
-	if !strings.Contains(RenderThread(state), "*Alert1*: Description for alert 1 · since ") {
+	if !strings.Contains(RenderThread(state), "*Alert1*: Description for alert 1") {
 		t.Error("the alert's description did not reach the thread")
 	}
 }

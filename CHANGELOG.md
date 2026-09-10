@@ -317,11 +317,11 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   Alertmanager. A card lists ten of many, and after a partial recovery the ten
   that started first are the resolved ones; the firing alerts come first now.
   Two instances rendering the same alert produce the same message.
-- **The card names the alerts; the thread says what is wrong and since when.**
-  The line under each alert in the card - its description and the moment it
-  started - moved into the thread's `Alert Details`, where each alert now
-  reads `*name*: description · since <time>`. The card reads as it did in
-  0.1.0. Telegram, which has no thread, keeps the line in its card.
+- **The card names the alerts; the thread says what is wrong.** The line
+  under each alert in the card - its description and the moment it started -
+  is gone from the card, and the thread's `Alert Details` reads
+  `*name*: description`, as both did in 0.1.0. Telegram, which has no
+  thread, keeps the line in its card.
 - **Erasing a user also removes the addresses their notifications were sent to**,
   and withdraws anything still owed to them. What was already delivered is kept
   as a record that it happened, without the coordinates of the message; nothing
