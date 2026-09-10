@@ -186,20 +186,17 @@ func collectMentions(alerts []keys.AlertSnapshot) string {
 	return strings.Join(parts, " ")
 }
 
-// buildAlertList returns a mrkdwn bullet list of alerts (max 10), each with a
-// second line saying what is wrong and since when.
-//
-// That second line is where the alert's description lives now. It used to be in
-// the card's thread, in a message of its own, and the thread went away with the
-// rule that one attempt performs one external effect. Nothing carried the
-// content over, which left the one field that says what actually broke reaching
-// no message at all.
+// buildAlertList returns a mrkdwn bullet list of alerts (max 10), firing
+// first: the card names them, and the thread under it says what is wrong and
+// since when. The description lived here while the thread was gone (from
+// 2026-08-25, when one attempt came to perform one effect); with the thread
+// back it returns there, and the card reads as it did in the first release.
 func buildAlertList(alerts []keys.AlertSnapshot, zone string) string {
 	const maxAlerts = 10
 	alertList := ""
 	rendered := 0
 
-	for _, a := range alerts {
+	for _, a := range providers.FiringFirst(alerts) {
 		if rendered >= maxAlerts {
 			break
 		}
@@ -219,22 +216,11 @@ func buildAlertList(alerts []keys.AlertSnapshot, zone string) string {
 		} else {
 			alertList += fmt.Sprintf("• 🟢 %s (Resolved)%s%s\n", mrkdwn(a.AlertName), dashLink, bookLink)
 		}
-		alertList += "   _" + mrkdwn(alertDetail(a, zone)) + "_\n"
 	}
 	if remaining := len(alerts) - maxAlerts; remaining > 0 {
 		alertList += fmt.Sprintf("_... and %d more alerts_\n", remaining)
 	}
 	return alertList
-}
-
-// alertDetail is the second line: the description when there is one, and the
-// moment the alert started, which there always is.
-func alertDetail(a keys.AlertSnapshot, zone string) string {
-	since := "since " + providers.AlertStartedAt(a, zone)
-	if description := providers.AlertDescription(a); description != "" {
-		return description + " · " + since
-	}
-	return since
 }
 
 // truncateText truncates s to fit within maxLen bytes (including suffix),

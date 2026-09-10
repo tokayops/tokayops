@@ -61,15 +61,16 @@ func linkable(raw string) bool {
 // maxThreadAlerts bounds the details section, as the card bounds its list.
 const maxThreadAlerts = 10
 
-// RenderThread is the message under the card: the alerts in detail, and the
-// history of the group as the snapshot holds it.
+// RenderThread is the message under the card: the alerts in detail - what is
+// wrong and since when, firing first - and the history of the group as the
+// snapshot holds it.
 func RenderThread(state keys.SnapshotInput) string {
 	var b strings.Builder
 	b.WriteString("📋 *Alert Details*\n")
 	if len(state.Alerts) == 0 {
 		b.WriteString("• " + mrkdwn(state.Title) + "\n")
 	}
-	for i, a := range state.Alerts {
+	for i, a := range providers.FiringFirst(state.Alerts) {
 		if i == maxThreadAlerts {
 			fmt.Fprintf(&b, "_... and %d more alert details_\n", len(state.Alerts)-maxThreadAlerts)
 			break
@@ -78,11 +79,7 @@ func RenderThread(state keys.SnapshotInput) string {
 		if a.Status == keys.AlertResolved {
 			icon = "🟢"
 		}
-		line := icon + " *" + mrkdwn(a.AlertName) + "*"
-		if description := providers.AlertDescription(a); description != "" {
-			line += ": " + mrkdwn(description)
-		}
-		b.WriteString(line + "\n")
+		b.WriteString(icon + " *" + mrkdwn(a.AlertName) + "*: " + mrkdwn(providers.AlertDetail(a, state.DisplayTimezone)) + "\n")
 	}
 
 	b.WriteString("\n📋 *Timeline*\n```\n")

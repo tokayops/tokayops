@@ -67,6 +67,39 @@ func CountFiring(alerts []keys.AlertSnapshot) int {
 	return n
 }
 
+// FiringFirst is the order a person reads alerts in: the ones still firing,
+// then the ones that resolved, each group as the snapshot holds it - by when
+// they started. A message that lists ten of many would otherwise show the
+// ten that started first, which after a partial recovery are the resolved
+// ones, with every firing alert behind "and N more". The snapshot's own
+// order is not touched: it is canonical and digested; this is the reading
+// order, decided when the message is drawn.
+func FiringFirst(alerts []keys.AlertSnapshot) []keys.AlertSnapshot {
+	ordered := make([]keys.AlertSnapshot, 0, len(alerts))
+	for _, a := range alerts {
+		if a.Status == keys.AlertFiring {
+			ordered = append(ordered, a)
+		}
+	}
+	for _, a := range alerts {
+		if a.Status != keys.AlertFiring {
+			ordered = append(ordered, a)
+		}
+	}
+	return ordered
+}
+
+// AlertDetail is what is wrong and since when: the description when the
+// alert carries one, and the moment it started, which it always has. Drawn
+// in the thread, under the card that names the alerts.
+func AlertDetail(a keys.AlertSnapshot, zone string) string {
+	since := "since " + AlertStartedAt(a, zone)
+	if description := AlertDescription(a); description != "" {
+		return description + " · " + since
+	}
+	return since
+}
+
 // AlertDescription is what an alert says is wrong. Empty when the alert carries
 // nothing to say.
 //

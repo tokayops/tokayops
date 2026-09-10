@@ -233,15 +233,18 @@ func TestRegression_AlertList_Truncation(t *testing.T) {
 	if !strings.Contains(result, "more alerts") {
 		t.Error("Expected a notice for the alerts that did not fit")
 	}
-	// Every listed alert says what is wrong, not just what it is called.
-	if !strings.Contains(result, "Description for alert 1") {
-		t.Error("the alert's description did not reach the card")
+	// The card names the alerts; what is wrong is the thread's to say.
+	if strings.Contains(result, "Description for alert 1") {
+		t.Error("the alert's description is in the card, which the thread says")
+	}
+	if !strings.Contains(RenderThread(state), "*Alert1*: Description for alert 1 · since ") {
+		t.Error("the alert's description did not reach the thread")
 	}
 }
 
 // TestRegression_AlertList_LongDescription verifies that a very long alert
 // description is shortened rather than pushing the alerts below it out of the
-// card: the body is capped, and what is cut is cut here on purpose.
+// thread: the field is capped, and what is cut is cut before the digest.
 func TestRegression_AlertList_LongDescription(t *testing.T) {
 
 	longDesc := strings.Repeat("x", 500) // 500 chars
@@ -261,7 +264,7 @@ func TestRegression_AlertList_LongDescription(t *testing.T) {
 	}
 
 	state := frozen(t, ag)
-	result := buildAlertList(state.Alerts, state.DisplayTimezone)
+	result := RenderThread(state)
 
 	if strings.Contains(result, longDesc) {
 		t.Error("Long description should be truncated, but full text was found")
@@ -273,15 +276,12 @@ func TestRegression_AlertList_LongDescription(t *testing.T) {
 	other := ag.Alerts[0].Annotations["description"] + "-and-a-different-tail"
 	ag.Alerts[0].Annotations["description"] = other
 	twin := frozen(t, ag)
-	if got := buildAlertList(twin.Alerts, twin.DisplayTimezone); got != result {
+	if got := RenderThread(twin); got != result {
 		t.Errorf("two descriptions cut to the same value rendered differently:\n%s\n%s",
 			result, got)
 	}
-	if !strings.Contains(result, "...") {
+	if !strings.Contains(result, "xxx...") {
 		t.Error("Expected '...' suffix for truncated description")
-	}
-	if len(result) > 300 {
-		t.Errorf("Result too long (%d chars), expected the description to be cut", len(result))
 	}
 }
 

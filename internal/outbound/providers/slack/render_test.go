@@ -2,6 +2,7 @@ package slack
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -81,13 +82,52 @@ func TestACardIsAFunctionOfItsSnapshot(t *testing.T) {
 			first, second)
 	}
 
-	// And the zone it DOES print in is the snapshot's, not the machine's.
+	// The card names the alerts; what is wrong and since when is the thread's
+	// to say, and the zone it says it in is the snapshot's, not the machine's.
 	// Europe/Berlin was at +01:00 on the fixture's instant.
-	if !strings.Contains(first, "GMT+01:00") {
-		t.Fatalf("the alert's start is not in the snapshot's zone: %s", first)
+	for _, detail := range []string{"the disk will be full in two hours", "since "} {
+		if strings.Contains(first, detail) {
+			t.Fatalf("the card says %q, which is the thread's to say: %s", detail, first)
+		}
 	}
-	if !strings.Contains(first, "the disk will be full in two hours") {
-		t.Fatalf("the alert's description did not reach the card: %s", first)
+	thread := RenderThread(state)
+	if !strings.Contains(thread, "the disk will be full in two hours · since 2023-11-14 23:13 GMT+01:00") {
+		t.Fatalf("the thread does not say what is wrong and since when, in the snapshot's zone: %s", thread)
+	}
+}
+
+// TestTheCardListsFiringAlertsFirst. Of many alerts the card lists ten, and
+// after a partial recovery the ten that started first are the resolved ones:
+// the firing alerts, the ones a person is paged about, would all be behind
+// "and N more". Firing first, then resolved, each by when they started.
+func TestTheCardListsFiringAlertsFirst(t *testing.T) {
+	var alerts []keys.AlertSnapshot
+	for i := 0; i < 12; i++ {
+		status := keys.AlertFiring
+		if i < 3 {
+			status = keys.AlertResolved // the three that started first have resolved
+		}
+		alerts = append(alerts, keys.AlertSnapshot{
+			Fingerprint: fmt.Sprintf("fp-%d", i), Status: status,
+			StartsAt: time.Unix(1700000000+int64(i)*60, 0).UTC(), AlertName: fmt.Sprintf("Alert%d", i),
+			Severity: "critical",
+		})
+	}
+	list := buildAlertList(alerts, "UTC")
+	lines := strings.Split(strings.TrimSpace(list), "\n")
+	if len(lines) != 11 {
+		t.Fatalf("the list has %d lines, want ten alerts and the count of the rest:\n%s", len(lines), list)
+	}
+	for i, line := range lines[:9] {
+		if !strings.HasPrefix(line, fmt.Sprintf("• 🔴 Alert%d ", i+3)) {
+			t.Fatalf("line %d reads %q, want the firing alerts first, by when they started", i, line)
+		}
+	}
+	if lines[9] != "• 🟢 Alert0 (Resolved)" {
+		t.Fatalf("the tenth line reads %q, want the first of the resolved", lines[9])
+	}
+	if lines[10] != "_... and 2 more alerts_" {
+		t.Fatalf("the count reads %q", lines[10])
 	}
 }
 
