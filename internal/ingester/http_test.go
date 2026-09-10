@@ -1,8 +1,10 @@
 package ingester
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -817,5 +819,54 @@ func TestTheIngesterKeepsSeverityToTheThreeWords(t *testing.T) {
 		if ag.Severity != tc.want {
 			t.Fatalf("label %q became severity %q, want %q", tc.label, ag.Severity, tc.want)
 		}
+	}
+}
+
+// TestTheIngesterSaysWhyItDidNothing. A payload that changed nothing is the
+// one a person asks about afterwards - "the alert came and nothing
+// happened" - so each quiet outcome leaves a line: nothing firing and no
+// open incident, the open incident already saying this, and a payload
+// with nothing that belongs to the open incident.
+func TestTheIngesterSaysWhyItDidNothing(t *testing.T) {
+	s := store.NewMockStore()
+	seedDefaultTeams(s)
+	ing := NewIngester(s, &config.Config{}, &mockSecretValidator{secrets: map[string]bool{"secret123": true}})
+	e := echo.New()
+	ing.RegisterRoutes(e)
+
+	var logged bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	post := func(payload string) string {
+		t.Helper()
+		logged.Reset()
+		req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret123", strings.NewReader(payload))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%d %s", rec.Code, rec.Body.String())
+		}
+		return logged.String()
+	}
+	labels := `"alertname":"Test","team":"devops","severity":"critical"`
+	firing := fmt.Sprintf(`{"status":"firing","groupKey":"quiet","commonLabels":{%s},"alerts":[{"status":"firing","labels":{%s},"fingerprint":"f1"}]}`, labels, labels)
+	resolvedOnly := fmt.Sprintf(`{"status":"resolved","groupKey":"quiet","commonLabels":{%s},"alerts":[{"status":"resolved","labels":{%s},"fingerprint":"f1"}]}`, labels, labels)
+	strangers := fmt.Sprintf(`{"status":"resolved","groupKey":"quiet","commonLabels":{%s},"alerts":[{"status":"resolved","labels":{%s},"fingerprint":"f9"}]}`, labels, labels)
+
+	if got := post(resolvedOnly); !strings.Contains(got, "no open incident and nothing firing in the payload, ignored") {
+		t.Fatalf("a resolved payload with no incident left:\n%s", got)
+	}
+	if got := post(firing); !strings.Contains(got, "Alerts: 1 firing, 0 resolved, payload firing") ||
+		!strings.Contains(got, "Created alert group") {
+		t.Fatalf("the payload that opened the incident left:\n%s", got)
+	}
+	if got := post(firing); !strings.Contains(got, "already says this, unchanged") {
+		t.Fatalf("the repeated payload left:\n%s", got)
+	}
+	if got := post(strangers); !strings.Contains(got, "nothing in the payload belongs to the open incident") {
+		t.Fatalf("a payload of strangers left:\n%s", got)
 	}
 }
