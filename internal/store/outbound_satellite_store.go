@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
