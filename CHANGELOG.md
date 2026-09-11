@@ -9,6 +9,10 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-11
+
+Converts to Apache-2.0 on 2028-09-11.
+
 ### Upgrade notes
 
 - **A direct message now goes out after the card it links to.** The start
@@ -609,5 +613,6 @@ what the first supported version contains rather than what changed in it.
   move under you on the next release, or pin the image digest listed with this
   release for a reference that cannot move at all.
 
-[Unreleased]: https://github.com/tokayops/tokayops/compare/v0.1.0...develop
+[Unreleased]: https://github.com/tokayops/tokayops/compare/v0.2.0...develop
+[0.2.0]: https://github.com/tokayops/tokayops/releases/tag/v0.2.0
 [0.1.0]: https://github.com/tokayops/tokayops/releases/tag/v0.1.0
