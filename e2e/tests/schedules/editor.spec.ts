@@ -84,7 +84,7 @@ test.describe('Schedule editor', () => {
   test.describe.configure({ timeout: 60_000 });
 
   /**
-   * The scenario the epic was opened for.
+   * The scenario this editor was built for.
    *
    * Groups [A], [B], [C] with B on duty. Adding D to B must leave B and D on
    * duty and C next - not restart the cycle at A, and not move the handoff.

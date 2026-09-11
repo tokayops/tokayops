@@ -1,0 +1,175 @@
+package outbound
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/tokayops/tokayops/internal/outbound/keys"
+)
+
+// ErrNotAdmissible is what an admission is refused with.
+//
+// It is not retryable and it is not a race: it means the producer asked for a
+// delivery this build cannot perform. Storing it anyway would create a
+// commitment whose first attempt is guaranteed to fail, which is a promise the
+// domain would have to break by design.
+var ErrNotAdmissible = errors.New("outbound: not admissible")
+
+func notAdmissiblef(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrNotAdmissible, fmt.Sprintf(format, args...))
+}
+
+// notificationProviders is what the notification family can actually deliver
+// through today.
+//
+// The list lives here rather than in the store because it is a property of the
+// family, not of the schema, and it moves into the family policy when that
+// arrives. What matters now is that it exists somewhere: without it a typo in a
+// provider name becomes a durable commitment that fails on every attempt until
+// somebody notices.
+var notificationProviders = map[string]bool{
+	"slack":    true,
+	"telegram": true,
+}
+
+// DeliversThrough reports whether this build has a channel for a provider.
+//
+// Exported because the producer has to ask BEFORE it promises: a step naming a
+// provider nothing delivers through is refused here, and refusing it refuses
+// the whole admission - the alert would lose its firehose over one misspelled
+// step, and retry that forever. Asked in advance, the step is dropped, the
+// history says why, and the rest of the escalation goes out.
+func DeliversThrough(provider string) bool { return notificationProviders[provider] }
+
+// ValidateHandoffAdmission is the gate a shift-change announcement has to pass
+// to become durable.
+//
+// The shared half is shared, and the differences are named rather than
+// inherited: a handover is one-shot by definition, so nothing here asks about
+// editability; and its deadline is allowed to be in the past, because a shift
+// that began and ended while the system was stopped is a fact, and an
+// announcement about it should be admitted and expire at once rather than be
+// refused at the door - refusing it would lose the record that it was owed.
+func ValidateHandoffAdmission(adm keys.Admission, now time.Time) error {
+	if adm.BatchKey == "" {
+		return notAdmissiblef("an admission with no claim")
+	}
+	if len(adm.Fingerprint) == 0 {
+		return notAdmissiblef("an admission with no fingerprint")
+	}
+	for _, c := range adm.Commitments {
+		if !notificationProviders[c.Provider] {
+			return notAdmissiblef("provider %q is not one this build delivers through", c.Provider)
+		}
+		if c.CompletionMode != keys.CompletionOnAcceptance {
+			return notAdmissiblef(
+				"completion mode %q needs provider receipts, which this build cannot receive",
+				c.CompletionMode)
+		}
+		switch c.AmbiguityPolicy {
+		case keys.PolicyRetry, keys.PolicyManualReview:
+		default:
+			return notAdmissiblef(
+				"ambiguity policy %q is not one a handover announcement may carry",
+				c.AmbiguityPolicy)
+		}
+		if c.Editable {
+			return notAdmissiblef("a handover announcement that claims to be editable")
+		}
+		if c.Expiry == nil {
+			return notAdmissiblef("a handover announcement with no deadline")
+		}
+		if c.Expiry.Kind != keys.TimingBounded {
+			// The form matters, not only that there is one. The grammar
+			// fingerprints a bounded deadline's two atoms; a spec swapped to
+			// absolute or relative after the admission was built would still
+			// match that fingerprint while the stored expires_at came out of
+			// entirely different arithmetic.
+			return notAdmissiblef(
+				"a handover deadline is bounded, and this one is %q", c.Expiry.Kind)
+		}
+		if err := c.Expiry.Validate(); err != nil {
+			return notAdmissiblef("expiry: %v", err)
+		}
+	}
+	return nil
+}
+
+// ValidateEscalationAdmission is the gate an escalation's commitments have to
+// pass to become durable.
+//
+// Each rule here corresponds to a capability this build does not have. They are
+// checked at admission rather than at delivery because that is the last moment
+// a refusal costs nothing: afterwards the promise exists, and the only ways out
+// of it are a failed delivery and an operator.
+func ValidateEscalationAdmission(adm keys.Admission, now time.Time) error {
+	if adm.BatchKey == "" {
+		return notAdmissiblef("an admission with no claim")
+	}
+	if len(adm.Fingerprint) == 0 {
+		return notAdmissiblef("an admission with no fingerprint")
+	}
+
+	for _, c := range adm.Commitments {
+		if !notificationProviders[c.Provider] {
+			return notAdmissiblef("provider %q is not one this build delivers through", c.Provider)
+		}
+
+		if c.CompletionMode != keys.CompletionOnAcceptance {
+			// A channel whose acceptance only means "queued" needs somewhere to
+			// wait for the provider's own confirmation, and there is nowhere to
+			// wait yet. Admitting one would leave a commitment that can never
+			// be completed.
+			return notAdmissiblef(
+				"completion mode %q needs provider receipts, which this build cannot receive",
+				c.CompletionMode)
+		}
+
+		switch c.AmbiguityPolicy {
+		case keys.PolicyRetry, keys.PolicyManualReview:
+		case keys.PolicyReconcileThenRetry:
+			// The policy promises a reconciliation before the retry, and no
+			// provider here can be asked what happened. Admitting it would
+			// promise a check that never runs.
+			return notAdmissiblef(
+				"reconcile_then_retry needs a provider that can be asked what happened")
+		case keys.PolicyAssumeAccepted:
+			if c.Editable {
+				// Assuming delivery of a card leaves nothing to update
+				// afterwards: it would be frozen at whatever it said when the
+				// doubt began, with the domain claiming it is fine.
+				return notAdmissiblef(
+					"assume_accepted cannot be automatic for an editable commitment")
+			}
+		default:
+			return notAdmissiblef("unknown ambiguity policy %q", c.AmbiguityPolicy)
+		}
+
+		if c.Expiry != nil {
+			if err := c.Expiry.Validate(); err != nil {
+				return notAdmissiblef("expiry: %v", err)
+			}
+			if c.Expiry.Kind == keys.TimingBounded {
+				// A bounded deadline is the handover form: the earlier of a
+				// domain instant and an age from admission, for work nobody can
+				// acknowledge. An escalation IS acknowledged, so it does not
+				// need one - and it would arrive with the handover's rule
+				// attached, which allows an instant already past. That would
+				// admit an escalation, move the group to processing and leave a
+				// commitment the sweep ends before any provider is called: a
+				// page that never happens, from an alert that looks handled.
+				return notAdmissiblef(
+					"a bounded deadline is a handover's; an escalation ends by acknowledgement")
+			}
+			if c.Expiry.Kind == keys.TimingAbsolute && !c.Expiry.At.After(now) {
+				// A deadline already in the past would make the commitment
+				// expire on its first claim, which is a delivery that never
+				// happens and a terminal state nobody asked for.
+				return notAdmissiblef("a deadline in the past: %s", c.Expiry.At)
+			}
+		}
+	}
+
+	return nil
+}

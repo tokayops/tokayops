@@ -40,7 +40,7 @@ var (
 	registry = map[model.IntegrationType]Descriptor{}
 )
 
-// Register adds a descriptor. Panics on duplicate Type — descriptors are
+// Register adds a descriptor. Panics on duplicate Type - descriptors are
 // declared at package init() time, and a duplicate registration is a
 // programming error, not a runtime condition.
 func Register(d Descriptor) {
@@ -88,7 +88,7 @@ func IsValidType(t model.IntegrationType) bool {
 }
 
 // DirectionFor returns the registered Direction for t. Unknown types return
-// (_, false) — the legacy GetDirectionForType silently defaulted to outbound,
+// (_, false) - the legacy GetDirectionForType silently defaulted to outbound,
 // which masked typos; callers now have to handle the missing case explicitly.
 func DirectionFor(t model.IntegrationType) (model.IntegrationDirection, bool) {
 	mu.RLock()

@@ -13,8 +13,6 @@ import (
 	"github.com/tokayops/tokayops/internal/scheduleconfig/fakes"
 )
 
-// bulkRepo builds a repository holding several schedules, which the single-
-// schedule seed() helper cannot: it owns testScheduleID.
 type bulkSchedule struct {
 	id     string
 	teamID string
@@ -27,6 +25,8 @@ type bulkSchedule struct {
 	deletedAt *time.Time
 }
 
+// bulkRepo builds a repository holding several schedules, which the single-
+// schedule seed() helper cannot: it owns testScheduleID.
 func bulkRepo(t testing.TB, schedules ...bulkSchedule) *fakes.ScheduleConfigRepo {
 	t.Helper()
 	repo := fakes.NewScheduleConfigRepo()

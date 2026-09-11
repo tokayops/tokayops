@@ -1,0 +1,1 @@
+{"deliveries":[{"id":"<uuid>","event_id":"<uuid>","integration_id":"<uuid>","status":"sent","attempts":1,"last_http_status":200,"request_payload":"{\"event\": \"alert_group.firing\", \"alert_group\": {\"id\": \"<uuid>\"}}","response_body_trunc":"HTTP 200: ","created_at":"<time>","sent_at":"<time>"}],"total":1,"page":1,"total_pages":1,"has_next":false,"has_prev":false}

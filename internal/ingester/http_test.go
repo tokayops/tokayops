@@ -1,8 +1,10 @@
 package ingester
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -141,7 +143,7 @@ func TestHandleWebhook(t *testing.T) {
 		}
 
 		// Verify DB
-		ag, err := s.GetActiveAlertGroup("g1")
+		ag, err := s.GetActiveAlertGroupByAlertKey("g1")
 		if err != nil || ag == nil {
 			t.Fatal("Alert group not created in store")
 		}
@@ -167,16 +169,20 @@ func TestHandleWebhook(t *testing.T) {
 		}
 
 		// Verify Resolution in Store
-		resolved, _ := s.GetResolvedAlertGroups()
+		resolvedStatus := model.AlertGroupStatusResolved
+		resolved, _, err := s.GetAllAlertGroups(&resolvedStatus, 100, 0)
+		if err != nil {
+			t.Fatalf("read the resolved groups: %v", err)
+		}
 		found := false
 		for _, r := range resolved {
-			if r.DedupKey == "g1" {
+			if r.AlertKey == "g1" {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Error("Alert group 'g1' not found in Resolved list")
+			t.Error("Alert group 'g1' is not resolved")
 		}
 	})
 }
@@ -215,7 +221,7 @@ func TestSeverityNormalization(t *testing.T) {
 				t.Fatalf("Expected 200, got %d. Body: %s", rec.Code, rec.Body.String())
 			}
 
-			ag, err := s.GetActiveAlertGroup(groupKey)
+			ag, err := s.GetActiveAlertGroupByAlertKey(groupKey)
 			if err != nil || ag == nil {
 				t.Fatalf("Alert group not found for key %s", groupKey)
 			}
@@ -234,7 +240,7 @@ func TestEmptyDedupKeyRejected(t *testing.T) {
 	e := echo.New()
 	ing.RegisterRoutes(e)
 
-	// groupKey empty, fingerprint empty → dedupKey empty → should be rejected
+	// groupKey empty, fingerprint empty → alertKey empty → should be rejected
 	payload := `{"status":"firing","groupKey":"","alerts":[{"status":"firing","labels":{"alertname":"Test"},"fingerprint":""}],"commonLabels":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret123", strings.NewReader(payload))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
@@ -242,7 +248,7 @@ func TestEmptyDedupKeyRejected(t *testing.T) {
 	e.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
-		t.Errorf("Expected 400 for empty dedupKey, got %d. Body: %s", rec.Code, rec.Body.String())
+		t.Errorf("Expected 400 for empty alertKey, got %d. Body: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -265,13 +271,20 @@ func TestMergeIntoGroup_PreservesAcknowledgedStatus(t *testing.T) {
 		t.Fatalf("Step 1 failed: %d %s", rec1.Code, rec1.Body.String())
 	}
 
-	ag, _ := s.GetActiveAlertGroup("ack-test")
+	ag, _ := s.GetActiveAlertGroupByAlertKey("ack-test")
 	if ag == nil {
 		t.Fatal("Alert group not created")
 	}
 
-	// Step 2: Simulate ack → set status to acknowledged
-	s.UpdateAlertGroupAcknowledged(ag.ID, "user1")
+	// Step 2: Simulate ack → set status to acknowledged, the way an ack
+	// actually happens: the engine admits the group, then the transition
+	// applies. Acking straight from "new" is refused, as it is in production.
+	if err := s.SetAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing); err != nil {
+		t.Fatalf("UpdateAlertGroupStatus: %v", err)
+	}
+	if changed, err := s.AckAlertGroupAtomic(ag.ID, actorNamed("user1"), nil, nil); err != nil || !changed {
+		t.Fatalf("AckAlertGroupAtomic: changed=%v err=%v", changed, err)
+	}
 	ag, _ = s.GetAlertGroupByID(ag.ID)
 	if ag.Status != model.AlertGroupStatusAcknowledged {
 		t.Fatalf("Expected acknowledged, got %s", ag.Status)
@@ -294,7 +307,7 @@ func TestMergeIntoGroup_PreservesAcknowledgedStatus(t *testing.T) {
 	}
 }
 
-func TestMergeIntoGroup_SetsSlackUpdatePending(t *testing.T) {
+func TestAMergedAlertMovesTheVersionAProducerReads(t *testing.T) {
 	s := store.NewMockStore()
 	seedDefaultTeams(s)
 	cfg := &config.Config{}
@@ -313,19 +326,16 @@ func TestMergeIntoGroup_SetsSlackUpdatePending(t *testing.T) {
 		t.Fatalf("Step 1 failed: %d %s", rec1.Code, rec1.Body.String())
 	}
 
-	ag, _ := s.GetActiveAlertGroup("update-test")
+	ag, _ := s.GetActiveAlertGroupByAlertKey("update-test")
 	if ag == nil {
 		t.Fatal("Alert group not created")
 	}
 
 	// Simulate engine processing → status = processing
-	s.UpdateAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing)
+	s.SetAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing)
 
-	// Verify flag is NOT set before merge
 	ag, _ = s.GetAlertGroupByID(ag.ID)
-	if ag.SlackUpdatePending {
-		t.Fatal("SlackUpdatePending should be false before merge")
-	}
+	before := ag.RenderSourceVersion
 
 	// Step 2: New webhook → partial merge (not all resolved)
 	payload2 := `{"status":"firing","groupKey":"update-test","alerts":[{"status":"firing","labels":{"alertname":"A2","team":"devops"},"fingerprint":"fp2"}]}`
@@ -337,10 +347,15 @@ func TestMergeIntoGroup_SetsSlackUpdatePending(t *testing.T) {
 		t.Fatalf("Step 2 failed: %d %s", rec2.Code, rec2.Body.String())
 	}
 
-	// Verify: slack_update_pending should be true
+	// The version has to move, so a plan built from the state before this alert
+	// is refused rather than admitted stale. What the group's messages have to
+	// show is raised in the same commit, by the delivery domain.
 	ag, _ = s.GetAlertGroupByID(ag.ID)
-	if !ag.SlackUpdatePending {
-		t.Error("Expected SlackUpdatePending to be true after partial merge")
+	if ag.RenderSourceVersion <= before {
+		t.Errorf("the version stayed at %d after an alert joined", ag.RenderSourceVersion)
+	}
+	if len(ag.Alerts) != 2 {
+		t.Errorf("the incident holds %d alerts, want both", len(ag.Alerts))
 	}
 }
 
@@ -366,7 +381,7 @@ func TestAlertRefire(t *testing.T) {
 		t.Fatalf("Step 1 failed: expected 200/Created, got %d/%s", rec1.Code, rec1.Body.String())
 	}
 
-	ag, _ := s.GetActiveAlertGroup("refire-test")
+	ag, _ := s.GetActiveAlertGroupByAlertKey("refire-test")
 	if ag == nil {
 		t.Fatal("Alert group not created")
 	}
@@ -397,7 +412,7 @@ func TestAlertRefire(t *testing.T) {
 	// Step 3: Re-fire the same alert
 	// First we need to re-activate the alert group (since it was resolved)
 	ag.Status = model.AlertGroupStatusProcessing
-	s.UpdateAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing)
+	s.SetAlertGroupStatus(ag.ID, model.AlertGroupStatusProcessing)
 
 	payload3 := `{"status":"firing","groupKey":"refire-test","alerts":[{"status":"firing","labels":{"alertname":"HighCPU","team":"devops"},"fingerprint":"fp1"}]}`
 	req3 := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=test-secret", strings.NewReader(payload3))
@@ -520,7 +535,7 @@ func TestNewGroup_ExcludesResolvedAlerts(t *testing.T) {
 		t.Fatalf("Expected 'Created', got %q", rec.Body.String())
 	}
 
-	ag, err := s.GetActiveAlertGroup("filter-test")
+	ag, err := s.GetActiveAlertGroupByAlertKey("filter-test")
 	if err != nil || ag == nil {
 		t.Fatal("Alert group not found")
 	}
@@ -572,7 +587,7 @@ func TestCreatePath_AtomicTimelineAndOutbox(t *testing.T) {
 	}
 
 	// Find the created AG
-	ag, err := s.GetActiveAlertGroup("atomic-test-group")
+	ag, err := s.GetActiveAlertGroupByAlertKey("atomic-test-group")
 	if err != nil || ag == nil {
 		t.Fatal("Alert group not created in store")
 	}
@@ -687,7 +702,7 @@ func TestResolveCreatesOutboxEvent(t *testing.T) {
 
 	// Create a firing AG
 	ag := &model.AlertGroup{
-		ID: "ag-outbox-resolve", DedupKey: "outbox-resolve-group",
+		ID: "ag-outbox-resolve", AlertKey: "outbox-resolve-group",
 		Status: model.AlertGroupStatusTriggered, TeamID: "devops", TeamNameSnapshot: "DevOps",
 		Severity:  "critical",
 		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
@@ -733,7 +748,7 @@ func TestResolveFromNewStatus(t *testing.T) {
 	seedDefaultTeams(s)
 
 	ag := &model.AlertGroup{
-		ID: "ag-new-resolve", DedupKey: "new-resolve-group",
+		ID: "ag-new-resolve", AlertKey: "new-resolve-group",
 		Status: model.AlertGroupStatusNew, TeamID: "devops", TeamNameSnapshot: "DevOps",
 		Severity:  "warning",
 		Alerts:    []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring, Labels: map[string]string{"alertname": "Test"}}},
@@ -769,70 +784,89 @@ func TestResolveFromNewStatus(t *testing.T) {
 // Note: concurrent resolve idempotency (changed=false with alerts convergence)
 // is tested in regression_test.go:TestRegression_ConcurrentResolve_AlertsConverge
 
-func TestFilterMergeableAlerts(t *testing.T) {
-	existing := map[string]model.AlertStatus{
-		"known-firing":   model.AlertStatusFiring,
-		"known-resolved": model.AlertStatusResolved,
-	}
+// TestTheIngesterKeepsSeverityToTheThreeWords. Everything past the ingester -
+// routing, the firehose, the UI, the metrics - knows critical, warning and
+// info; a missing label is info, and so is any other word.
+func TestTheIngesterKeepsSeverityToTheThreeWords(t *testing.T) {
+	s := store.NewMockStore()
+	seedDefaultTeams(s)
+	ing := NewIngester(s, &config.Config{}, &mockSecretValidator{secrets: map[string]bool{"secret123": true}})
+	e := echo.New()
+	ing.RegisterRoutes(e)
 
-	tests := []struct {
-		name     string
-		incoming []model.Alert
-		expected []string
-	}{
-		{
-			name:     "unknown resolved alert is dropped",
-			incoming: []model.Alert{{Fingerprint: "stranger", Status: model.AlertStatusResolved}},
-			expected: nil,
-		},
-		{
-			name:     "unknown firing alert joins the group",
-			incoming: []model.Alert{{Fingerprint: "newcomer", Status: model.AlertStatusFiring}},
-			expected: []string{"newcomer"},
-		},
-		{
-			name:     "known alert resolving is kept",
-			incoming: []model.Alert{{Fingerprint: "known-firing", Status: model.AlertStatusResolved}},
-			expected: []string{"known-firing"},
-		},
-		{
-			name:     "known alert re-firing is kept",
-			incoming: []model.Alert{{Fingerprint: "known-resolved", Status: model.AlertStatusFiring}},
-			expected: []string{"known-resolved"},
-		},
-		{
-			name:     "known alert with unchanged status is kept",
-			incoming: []model.Alert{{Fingerprint: "known-firing", Status: model.AlertStatusFiring}},
-			expected: []string{"known-firing"},
-		},
-		{
-			name: "mixed payload keeps everything but the unknown resolved alert",
-			incoming: []model.Alert{
-				{Fingerprint: "known-firing", Status: model.AlertStatusResolved},
-				{Fingerprint: "stranger", Status: model.AlertStatusResolved},
-				{Fingerprint: "newcomer", Status: model.AlertStatusFiring},
-			},
-			expected: []string{"known-firing", "newcomer"},
-		},
-		{
-			name:     "empty payload stays empty",
-			incoming: nil,
-			expected: nil,
-		},
+	for i, tc := range []struct{ label, want string }{
+		{"critical", "critical"}, {"Warning", "warning"}, {"info", "info"},
+		{"", "info"}, {"error", "info"}, {"SEV1", "info"},
+	} {
+		key := fmt.Sprintf("sev-%d", i)
+		labels := fmt.Sprintf(`"alertname":"Test","team":"devops","severity":%q`, tc.label)
+		if tc.label == "" {
+			labels = `"alertname":"Test","team":"devops"`
+		}
+		payload := fmt.Sprintf(`{"status":"firing","groupKey":%q,"commonLabels":{%s},"alerts":[{"status":"firing","labels":{%s},"fingerprint":"f%d"}]}`,
+			key, labels, labels, i)
+		req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret123", strings.NewReader(payload))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("label %q: %d %s", tc.label, rec.Code, rec.Body.String())
+		}
+		ag, err := s.GetActiveAlertGroupByAlertKey(key)
+		if err != nil || ag == nil {
+			t.Fatalf("label %q: the alert group was not created", tc.label)
+		}
+		if ag.Severity != tc.want {
+			t.Fatalf("label %q became severity %q, want %q", tc.label, ag.Severity, tc.want)
+		}
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := filterMergeableAlerts(tt.incoming, existing)
-			if len(got) != len(tt.expected) {
-				t.Fatalf("got %d alerts, want %d (%v)", len(got), len(tt.expected), got)
-			}
-			// Order is preserved, so index comparison is safe.
-			for i, fp := range tt.expected {
-				if got[i].Fingerprint != fp {
-					t.Errorf("alert %d = %q, want %q", i, got[i].Fingerprint, fp)
-				}
-			}
-		})
+// TestTheIngesterSaysWhyItDidNothing. A payload that changed nothing is the
+// one a person asks about afterwards - "the alert came and nothing
+// happened" - so each quiet outcome leaves a line: nothing firing and no
+// open incident, the open incident already saying this, and a payload
+// with nothing that belongs to the open incident.
+func TestTheIngesterSaysWhyItDidNothing(t *testing.T) {
+	s := store.NewMockStore()
+	seedDefaultTeams(s)
+	ing := NewIngester(s, &config.Config{}, &mockSecretValidator{secrets: map[string]bool{"secret123": true}})
+	e := echo.New()
+	ing.RegisterRoutes(e)
+
+	var logged bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	post := func(payload string) string {
+		t.Helper()
+		logged.Reset()
+		req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret123", strings.NewReader(payload))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%d %s", rec.Code, rec.Body.String())
+		}
+		return logged.String()
+	}
+	labels := `"alertname":"Test","team":"devops","severity":"critical"`
+	firing := fmt.Sprintf(`{"status":"firing","groupKey":"quiet","commonLabels":{%s},"alerts":[{"status":"firing","labels":{%s},"fingerprint":"f1"}]}`, labels, labels)
+	resolvedOnly := fmt.Sprintf(`{"status":"resolved","groupKey":"quiet","commonLabels":{%s},"alerts":[{"status":"resolved","labels":{%s},"fingerprint":"f1"}]}`, labels, labels)
+	strangers := fmt.Sprintf(`{"status":"resolved","groupKey":"quiet","commonLabels":{%s},"alerts":[{"status":"resolved","labels":{%s},"fingerprint":"f9"}]}`, labels, labels)
+
+	if got := post(resolvedOnly); !strings.Contains(got, "no open incident and nothing firing in the payload, ignored") {
+		t.Fatalf("a resolved payload with no incident left:\n%s", got)
+	}
+	if got := post(firing); !strings.Contains(got, "Alerts: 1 firing, 0 resolved, payload firing") ||
+		!strings.Contains(got, "Created alert group") {
+		t.Fatalf("the payload that opened the incident left:\n%s", got)
+	}
+	if got := post(firing); !strings.Contains(got, "already says this, unchanged") {
+		t.Fatalf("the repeated payload left:\n%s", got)
+	}
+	if got := post(strangers); !strings.Contains(got, "nothing in the payload belongs to the open incident") {
+		t.Fatalf("a payload of strangers left:\n%s", got)
 	}
 }

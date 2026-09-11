@@ -25,7 +25,7 @@ func setupIntegrationTestAPI(t *testing.T) (*API, *store.MockStore, *echo.Echo) 
 }
 
 // failingIdentityStore wraps MockStore but makes GetExternalIdentity fail with a
-// caller-supplied non-sql.ErrNoRows error — used to exercise the "DB error → 500"
+// caller-supplied non-sql.ErrNoRows error - used to exercise the "DB error → 500"
 // branch of testSlackIntegration.
 type failingIdentityStore struct {
 	store.StoreInterface
@@ -499,7 +499,7 @@ func TestUpdateIntegration(t *testing.T) {
 		json.Unmarshal(createRec.Body.Bytes(), &created)
 		_ = scope // used in create body
 
-		// Disable override, then try to rename — should be rejected
+		// Disable override, then try to rename - should be rejected
 		os.Unsetenv(config.WebhookAllowHTTPEnv)
 		updateBody := `{"name":"Renamed"}`
 		updateReq := httptest.NewRequest(http.MethodPut, "/api/v1/integrations/"+created.ID, strings.NewReader(updateBody))
@@ -600,7 +600,7 @@ func TestTestIntegration(t *testing.T) {
 		}
 		s.CreateIntegration(integration)
 
-		// denis has no Slack identity bound — test-DM should respond 412.
+		// denis has no Slack identity bound - test-DM should respond 412.
 		_ = s.UnbindExternalIdentity("denis", "slack")
 
 		body := `{"mode":"dm"}`

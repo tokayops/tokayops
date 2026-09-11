@@ -6,7 +6,6 @@ import (
 
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
-	"github.com/tokayops/tokayops/internal/store"
 )
 
 type TransitionOutcome string
@@ -18,6 +17,10 @@ const (
 )
 
 type Actor struct {
+	// ID is the user, for the journal of the commitments the transition
+	// withdraws. Name and Email are the audit labels the alert's own timeline
+	// keeps.
+	ID    string
 	Name  string
 	Email string
 }
@@ -28,10 +31,23 @@ type TransitionResult struct {
 }
 
 type Service struct {
-	store store.StoreInterface
+	store transitions
 }
 
-func NewService(s store.StoreInterface) *Service {
+// transitions is the store as this service needs it: read the group, and apply
+// one of the two single-winner transitions.
+//
+// The atomic calls are what this service exists for. Each of them carries the
+// status change, the timeline entry, the outbox event and the cancellation of
+// the escalation in one commit, so "acknowledged" and "nobody is being paged
+// any more" are one fact rather than two writes that can be interrupted.
+type transitions interface {
+	GetAlertGroupByID(id string) (*model.AlertGroup, error)
+	AckAlertGroupAtomic(id string, actor Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+	ResolveAlertGroupAtomic(id string, actor Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (changed bool, err error)
+}
+
+func NewService(s transitions) *Service {
 	return &Service{store: s}
 }
 
@@ -63,7 +79,7 @@ func (s *Service) Ack(alertGroupID string, actor Actor, meta map[string]string) 
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.store.AckAlertGroupAtomic(alertGroupID, actor.Name, meta, outboxEvent, ag.DedupKey)
+	changed, err := s.store.AckAlertGroupAtomic(alertGroupID, actor, meta, outboxEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +128,7 @@ func (s *Service) Resolve(alertGroupID string, actor Actor, meta map[string]stri
 		Payload:      eventPayload,
 	}
 
-	changed, err := s.store.ResolveAlertGroupAtomic(alertGroupID, actor.Name, meta, outboxEvent, ag.DedupKey)
+	changed, err := s.store.ResolveAlertGroupAtomic(alertGroupID, actor, meta, outboxEvent)
 	if err != nil {
 		return nil, err
 	}

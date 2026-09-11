@@ -2,7 +2,7 @@ import { test, expect } from '../../fixtures/auth.fixture';
 
 // The policy step editor builds its (provider:kind) dropdown from GET /api/v1/providers.
 // The telegram capability is registered at app startup, so it must appear with zero
-// frontend changes — this asserts that contract end-to-end against the running app.
+// frontend changes - this asserts that contract end-to-end against the running app.
 test.describe('Telegram in policy editor', () => {
   test('step type dropdown offers Telegram', async ({ policiesPage, page }) => {
     await policiesPage.goto();

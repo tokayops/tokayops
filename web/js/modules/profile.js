@@ -388,7 +388,7 @@ const ProfileModule = {
         try {
             await API.auth.slack.unbind();
 
-            // Manually clear local state — drop the slack identity from the array.
+            // Manually clear local state - drop the slack identity from the array.
             if (Array.isArray(this.currentUser.identities)) {
                 this.currentUser.identities = this.currentUser.identities.filter(i => i.provider !== 'slack');
             }
@@ -413,7 +413,7 @@ const ProfileModule = {
      * Render the Telegram section. Unlike Slack (OTP), linking is a deep link:
      * the user opens t.me/<bot>?start=<token> and presses Start. That completes
      * server-side asynchronously, so after issuing the link we render an explicit
-     * anchor (a real user-gesture click — never window.open, which gets blocked)
+     * anchor (a real user-gesture click - never window.open, which gets blocked)
      * plus a Refresh action to re-fetch /me.
      */
     renderTelegramSection() {
@@ -436,7 +436,7 @@ const ProfileModule = {
             `;
         }
 
-        // 2. Link issued — show the deep link + refresh affordance (buttons right-aligned, like Slack)
+        // 2. Link issued - show the deep link + refresh affordance (buttons right-aligned, like Slack)
         if (this._tgLink) {
             return `
                 <div class="slack-otp-state">
@@ -454,7 +454,7 @@ const ProfileModule = {
             `;
         }
 
-        // 3. Initial disconnected — mirror Slack's [input][Connect] row exactly so the
+        // 3. Initial disconnected - mirror Slack's [input][Connect] row exactly so the
         // two integration cards line up pixel-for-pixel. There's no real input to type
         // into (linking is a deep link, not an ID), so the left field is a disabled,
         // read-only placeholder; the hint below carries the actual description.
@@ -472,7 +472,7 @@ const ProfileModule = {
     },
 
     /**
-     * Handle Connect Telegram — issue a deep link and re-render to show it.
+     * Handle Connect Telegram - issue a deep link and re-render to show it.
      */
     async handleRequestTelegramLink() {
         const btn = document.getElementById('telegram-connect-btn');
@@ -491,7 +491,7 @@ const ProfileModule = {
     },
 
     /**
-     * Handle Refresh — re-fetch /me to pick up the (async) Telegram link.
+     * Handle Refresh - re-fetch /me to pick up the (async) Telegram link.
      */
     async handleRefreshTelegram() {
         try {
@@ -501,7 +501,7 @@ const ProfileModule = {
             if (this.telegramIdentity()) {
                 window.showToast && window.showToast('Telegram account connected!', 'success');
             } else {
-                window.showToast && window.showToast('Not linked yet — open the link and press Start.', 'info');
+                window.showToast && window.showToast('Not linked yet - open the link and press Start.', 'info');
             }
         } catch (error) {
             window.showToast && window.showToast(error.message, 'error');
@@ -539,7 +539,7 @@ const ProfileModule = {
             <div class="token-created-alert">
                 <div class="alert-header">
                     <i data-lucide="alert-triangle" class="alert-icon"></i>
-                    <strong>Token created! Copy it now — it won't be shown again.</strong>
+                    <strong>Token created! Copy it now - it won't be shown again.</strong>
                 </div>
                 <div class="token-value">
                     <code id="new-token-value">${this.newlyCreatedToken}</code>

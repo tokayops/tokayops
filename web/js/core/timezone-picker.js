@@ -48,7 +48,7 @@ const allTimezones = (Intl.supportedValuesOf ? Intl.supportedValuesOf('timeZone'
     return { name: tz, offset: formatOffset(mins) };
 });
 
-// Module-level registry keyed by container ID — survives innerHTML replacement
+// Module-level registry keyed by container ID - survives innerHTML replacement
 const pickerRegistry = new Map();
 
 export function initTimezonePicker(containerId, options = {}) {

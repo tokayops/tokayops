@@ -10,7 +10,7 @@ Dockerfile
 docker-compose.yml
 docker-compose.test.yml
 
-# Webhook receiver dev tool — no user input, static embedded HTML, no TLS (reverse proxy)
+# Webhook receiver dev tool - no user input, static embedded HTML, no TLS (reverse proxy)
 cmd/webhook-receiver/
 
 # Test files - cookie security flags not relevant for test harnesses

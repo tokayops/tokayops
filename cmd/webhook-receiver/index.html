@@ -123,7 +123,7 @@ let webhooks = [];
 
 function setConnected(connected) {
   statusDot.className = 'status-dot ' + (connected ? 'connected' : 'disconnected');
-  statusText.textContent = connected ? 'SSE: Connected' : 'SSE: Disconnected — reconnecting...';
+  statusText.textContent = connected ? 'SSE: Connected' : 'SSE: Disconnected - reconnecting...';
 }
 
 function formatTime(iso) {

@@ -103,6 +103,11 @@ export function initElements() {
     Elements.modalBody = document.getElementById('modal-body');
     Elements.modalFooter = document.getElementById('modal-footer');
     Elements.modalClose = document.getElementById('modal-close');
+    Elements.deliveryModalOverlay = document.getElementById('delivery-modal-overlay');
+    Elements.deliveryModalTitle = document.getElementById('delivery-modal-title');
+    Elements.deliveryModalBody = document.getElementById('delivery-modal-body');
+    Elements.deliveryModalFooter = document.getElementById('delivery-modal-footer');
+    Elements.deliveryModalClose = document.getElementById('delivery-modal-close');
     Elements.pagination = document.getElementById('pagination');
     Elements.prevPage = document.getElementById('prev-page');
     Elements.nextPage = document.getElementById('next-page');

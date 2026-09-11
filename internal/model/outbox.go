@@ -14,6 +14,11 @@ const (
 	OutboxEventStatusProcessing OutboxEventStatus = "processing"
 	OutboxEventStatusCompleted  OutboxEventStatus = "completed"
 	OutboxEventStatusFailed     OutboxEventStatus = "failed"
+	// OutboxEventStatusFannedOut: the event has been turned into delivery
+	// commitments, one per subscriber that was enabled and in scope, and nothing
+	// reads it as work any more. The statuses above it are the old delivery
+	// worker's and remain on rows written before the cutover.
+	OutboxEventStatusFannedOut OutboxEventStatus = "fanned_out"
 )
 
 // OutboxEventType represents a lifecycle event type.

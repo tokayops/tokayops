@@ -2,7 +2,7 @@
 # Pinned to the build host's own architecture: the binary is pure Go with CGO
 # off, so we cross-compile for the target below instead of emulating the
 # builder under QEMU.
-FROM --platform=$BUILDPLATFORM golang:1.25.8-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25.13-alpine AS builder
 
 WORKDIR /app
 

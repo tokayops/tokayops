@@ -71,9 +71,9 @@ var (
 // ScheduleRoot is the aggregate identity and concurrency root of a schedule.
 // It carries no configuration: configuration lives only in revisions.
 //
-// HistoryCompleteFrom is a value, not a pointer, because the column is NOT NULL
-// after the cutover. A root without a horizon was a row from before the
-// revision model, and the physical cutover removed the last way to have one.
+// HistoryCompleteFrom is a value, not a pointer, because the column is NOT
+// NULL. A root without a horizon could only be a row from before the revision
+// model, and no database that this binary can serve still has one.
 type ScheduleRoot struct {
 	ID                  string
 	TeamID              string

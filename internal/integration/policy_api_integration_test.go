@@ -10,8 +10,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/api"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 	"github.com/tokayops/tokayops/internal/store"
 	"github.com/tokayops/tokayops/internal/testutil"
 )
@@ -23,13 +23,13 @@ import (
 func setupPolicyAPITest(t *testing.T) *APIIntegrationEnv {
 	s := testutil.SetupDB(t)
 
-	reg := dispatcher.NewProviderRegistry(s)
-	reg.RegisterCapabilities(dispatcher.ProviderCapabilities{
+	reg := providers.NewCatalog()
+	reg.Register(providers.Capability{
 		Name:                 "slack",
 		IntegrationType:      model.IntegrationTypeSlack,
 		SupportedTargetKinds: []string{"dm", "channel"},
 	})
-	reg.RegisterCapabilities(dispatcher.ProviderCapabilities{
+	reg.Register(providers.Capability{
 		Name:                 "telegram",
 		IntegrationType:      model.IntegrationTypeTelegram,
 		SupportedTargetKinds: []string{"dm", "channel"},
@@ -97,7 +97,7 @@ func assertPolicyStep(t *testing.T, s *model.EscalationStep, provider, kind, tty
 }
 
 // TestPolicyAPI_ListProviders verifies GET /api/v1/providers reflects the real
-// dispatcher registry: slack and telegram, each supporting dm + channel.
+// channel catalogue: slack and telegram, each supporting dm + channel.
 func TestPolicyAPI_ListProviders(t *testing.T) {
 	env := setupPolicyAPITest(t)
 	admin := seedGlobalAdmin(t, env.S, "admin@providers.test")
@@ -167,8 +167,8 @@ func TestPolicyAPI_CreateValid_RoundTrips(t *testing.T) {
 }
 
 // TestPolicyAPI_CreateValid_TelegramSteps verifies telegram dm + channel steps
-// pass the capability gate and round-trip through Store -> DB -> GET — the Epic 8
-// Sprint 2 proof that registering the telegram capability is sufficient.
+// pass the capability gate and round-trip through Store -> DB -> GET: the proof
+// that registering the telegram capability is sufficient.
 func TestPolicyAPI_CreateValid_TelegramSteps(t *testing.T) {
 	env := setupPolicyAPITest(t)
 	admin := seedGlobalAdmin(t, env.S, "admin@poltelegram.test")

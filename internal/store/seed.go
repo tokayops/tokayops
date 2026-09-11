@@ -271,17 +271,17 @@ func (s *Store) seedAlertGroups() error {
 
 	now := time.Now()
 	for i, ag := range alertGroups {
-		dedupKey := fmt.Sprintf("seed-%s-%d", ag.Title, i)
+		alertKey := fmt.Sprintf("seed-%s-%d", ag.Title, i)
 
 		// Check if already exists
-		existing, _ := s.GetActiveAlertGroup(dedupKey)
+		existing, _ := s.GetActiveAlertGroupByAlertKey(alertKey)
 		if existing != nil {
 			continue
 		}
 
 		alerts := generateSeedAlerts(ag.Title, ag.Alerts, ag.Severity)
 
-		// Resolve team name for snapshot — teams are seeded before alert groups
+		// Resolve team name for snapshot - teams are seeded before alert groups
 		teamName := ag.TeamID
 		if team, err := s.GetTeamByID(ag.TeamID); err == nil {
 			teamName = team.Name
@@ -291,7 +291,7 @@ func (s *Store) seedAlertGroups() error {
 
 		alertGroup := &model.AlertGroup{
 			ID:               uuid.New().String(),
-			DedupKey:         dedupKey,
+			AlertKey:         alertKey,
 			Status:           ag.Status,
 			Title:            ag.Title,
 			TeamID:           ag.TeamID,
@@ -369,7 +369,7 @@ func (s *Store) addSeedTimelineEvents(alertGroupID, title string, createdAt time
 			AlertGroupID: alertGroupID,
 			Type:         model.TimelineEventNotificationSent,
 			Message:      "Step 1 completed via slack_channel to #alerts-critical",
-			Actor:        "dispatcher",
+			Actor:        "outbound",
 			Metadata: map[string]string{
 				"step_type":    "slack_channel",
 				"channel_id":   "C0123456789",
@@ -382,7 +382,7 @@ func (s *Store) addSeedTimelineEvents(alertGroupID, title string, createdAt time
 			AlertGroupID: alertGroupID,
 			Type:         model.TimelineEventNotificationSent,
 			Message:      "Step 2 completed via slack_dm to John Doe",
-			Actor:        "dispatcher",
+			Actor:        "outbound",
 			Metadata: map[string]string{
 				"step_type":     "slack_dm",
 				"slack_user_id": "U0123456789",

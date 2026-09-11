@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,18 @@ type fakeTelegramAPI struct {
 	setSecrets []string
 	delTokens  []string
 	username   string
+	// registered is the Bot API's side: which tokens have a webhook right now.
+	registered map[string]string
+}
+
+// registeredTokens is every token with a webhook registered, sorted.
+func (f *fakeTelegramAPI) registeredTokens() []string {
+	tokens := make([]string, 0, len(f.registered))
+	for token := range f.registered {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	return tokens
 }
 
 func (f *fakeTelegramAPI) AnswerCallback(_ context.Context, _, text string) error {
@@ -49,18 +62,24 @@ func (f *fakeTelegramAPI) SetWebhook(_ context.Context, token, url, secret strin
 	f.setTokens = append(f.setTokens, token)
 	f.setURLs = append(f.setURLs, url)
 	f.setSecrets = append(f.setSecrets, secret)
+	if f.registered == nil {
+		f.registered = map[string]string{}
+	}
+	f.registered[token] = url
 	return nil
 }
 func (f *fakeTelegramAPI) DeleteWebhook(_ context.Context, token string) error {
 	f.delCalls++
 	f.delTokens = append(f.delTokens, token)
+	delete(f.registered, token)
 	return nil
 }
 
 func setupTelegramAPI(t *testing.T, secret string) (*API, *store.MockStore, *echo.Echo, *fakeTelegramAPI) {
 	t.Helper()
 	s := store.NewMockStore()
-	cfg, _ := json.Marshal(model.TelegramConfig{BotToken: "123:abc", SecretToken: secret})
+	on := true
+	cfg, _ := json.Marshal(model.TelegramConfig{BotToken: "123:abc", SecretToken: secret, Interactive: &on})
 	s.CreateIntegration(&model.Integration{
 		ID: "int-tg", Type: model.IntegrationTypeTelegram, Name: "tg", Enabled: true, Config: cfg,
 	})
@@ -164,7 +183,7 @@ func TestTelegramWebhook_CallbackAcks(t *testing.T) {
 	}
 	agID := "ag-tg-" + fmt.Sprintf("%d", time.Now().UnixNano())
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: agID, DedupKey: "dk-" + agID, Status: model.AlertGroupStatusTriggered,
+		ID: agID, AlertKey: "dk-" + agID, Status: model.AlertGroupStatusTriggered,
 		Title: "Test Alert", TeamID: "devops", TeamNameSnapshot: "DevOps", Severity: "critical",
 		CreatedAt: time.Now().Add(-time.Minute), UpdatedAt: time.Now(),
 	})
@@ -191,7 +210,7 @@ func TestTelegramWebhook_CallbackUnlinked(t *testing.T) {
 
 	agID := "ag-unlinked"
 	s.CreateAlertGroup(&model.AlertGroup{
-		ID: agID, DedupKey: "dk-" + agID, Status: model.AlertGroupStatusTriggered,
+		ID: agID, AlertKey: "dk-" + agID, Status: model.AlertGroupStatusTriggered,
 		Title: "T", TeamID: "devops", Severity: "critical", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	})
 

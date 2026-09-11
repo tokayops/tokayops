@@ -176,7 +176,7 @@ func TestLockTeamBlocksConcurrentScheduleInsert(t *testing.T) {
 	}
 }
 
-// The half of S6-D10 that the lock alone does not give: after waiting for the
+// The half that the lock alone does not give: after waiting for the
 // lock, the delete has to SEE the schedule that committed while it waited.
 //
 // That is READ COMMITTED, and it is the reason the root is read AFTER the
@@ -185,7 +185,7 @@ func TestLockTeamBlocksConcurrentScheduleInsert(t *testing.T) {
 //   - WithinTx on sql.LevelRepeatableRead: "could not serialize access due to
 //     concurrent update" - the snapshot predates the create;
 //   - reading the root before LockTeam: the raw schedule_revisions_schedule_id
-//     _fkey violation, which is the exact 500 this sprint exists to remove.
+//     _fkey violation, which is the exact 500 this locking order removes.
 //
 // Deterministic by construction, not by repetition: the create holds its
 // transaction open until the delete is provably blocked on the lock.
@@ -323,25 +323,8 @@ func TestIntegrationWriteForADeletedTeamIsTyped(t *testing.T) {
 		t.Fatalf("a raw SQL error leaked through the contract: %v", pqErr)
 	}
 
-	// Update reaches the same foreign key, because moving an integration onto
-	// a team scope writes team_id too.
-	seedTeam(t, s, "devops")
-	live := "devops"
-	if err := s.CreateIntegration(&model.Integration{
-		ID: "int-live", Type: model.IntegrationTypeGenericWebhook,
-		Name: "live hook", Enabled: true, Scope: &scope, TeamID: &live,
-		Config: json.RawMessage(`{"url":"https://example.test/hook"}`),
-	}); err != nil {
-		t.Fatalf("CreateIntegration: %v", err)
-	}
-	moved, err := s.GetIntegrationByID("int-live")
-	if err != nil {
-		t.Fatalf("GetIntegrationByID: %v", err)
-	}
-	moved.TeamID = &ghost
-	if err := s.UpdateIntegration(moved); !errors.Is(err, ErrIntegrationTeamNotFound) {
-		t.Fatalf("update error = %v, want ErrIntegrationTeamNotFound", err)
-	}
+	// Update cannot reach this key: an edit patches name, enabled and
+	// configuration, and an integration is not moved between teams.
 }
 
 // The merge DoD asks that the audit trail answer this in one query: a save

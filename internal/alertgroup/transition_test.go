@@ -1,10 +1,11 @@
-package alertgroup
+package alertgroup_test
 
 import (
 	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
 )
@@ -13,7 +14,7 @@ func createAG(t *testing.T, s *store.MockStore, id string, status model.AlertGro
 	t.Helper()
 	ag := &model.AlertGroup{
 		ID:               id,
-		DedupKey:         "dedup-" + id,
+		AlertKey:         "dedup-" + id,
 		Status:           status,
 		Title:            "Test Alert",
 		TeamID:           "devops",
@@ -30,14 +31,14 @@ func createAG(t *testing.T, s *store.MockStore, id string, status model.AlertGro
 
 func TestAck_Applied(t *testing.T) {
 	s := store.NewMockStore()
-	svc := NewService(s)
+	svc := alertgroup.NewService(s)
 	createAG(t, s, "ag-1", model.AlertGroupStatusTriggered)
 
-	result, err := svc.Ack("ag-1", Actor{Name: "Denis", Email: "denis@example.com"}, nil)
+	result, err := svc.Ack("ag-1", alertgroup.Actor{Name: "Denis", Email: "denis@example.com"}, nil)
 	if err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
-	if result.Outcome != OutcomeApplied {
+	if result.Outcome != alertgroup.OutcomeApplied {
 		t.Errorf("Expected applied, got %s", result.Outcome)
 	}
 	if result.AlertGroup.Status != model.AlertGroupStatusAcknowledged {
@@ -74,14 +75,14 @@ func TestAck_Applied(t *testing.T) {
 
 func TestAck_AlreadyDone(t *testing.T) {
 	s := store.NewMockStore()
-	svc := NewService(s)
+	svc := alertgroup.NewService(s)
 	createAG(t, s, "ag-2", model.AlertGroupStatusAcknowledged)
 
-	result, err := svc.Ack("ag-2", Actor{Name: "Denis"}, nil)
+	result, err := svc.Ack("ag-2", alertgroup.Actor{Name: "Denis"}, nil)
 	if err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
-	if result.Outcome != OutcomeAlreadyDone {
+	if result.Outcome != alertgroup.OutcomeAlreadyDone {
 		t.Errorf("Expected already_done, got %s", result.Outcome)
 	}
 	if result.AlertGroup == nil {
@@ -99,13 +100,13 @@ func TestAck_AlreadyDone(t *testing.T) {
 
 func TestAck_NotFound(t *testing.T) {
 	s := store.NewMockStore()
-	svc := NewService(s)
+	svc := alertgroup.NewService(s)
 
-	result, err := svc.Ack("nonexistent", Actor{Name: "Denis"}, nil)
+	result, err := svc.Ack("nonexistent", alertgroup.Actor{Name: "Denis"}, nil)
 	if err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
-	if result.Outcome != OutcomeNotFound {
+	if result.Outcome != alertgroup.OutcomeNotFound {
 		t.Errorf("Expected not_found, got %s", result.Outcome)
 	}
 	if result.AlertGroup != nil {
@@ -115,35 +116,35 @@ func TestAck_NotFound(t *testing.T) {
 
 func TestAck_CASRaceLoser(t *testing.T) {
 	s := store.NewMockStore()
-	svc := NewService(s)
+	svc := alertgroup.NewService(s)
 	createAG(t, s, "ag-race", model.AlertGroupStatusTriggered)
 
 	// First ack wins
-	result1, _ := svc.Ack("ag-race", Actor{Name: "Alice"}, nil)
-	if result1.Outcome != OutcomeApplied {
+	result1, _ := svc.Ack("ag-race", alertgroup.Actor{Name: "Alice"}, nil)
+	if result1.Outcome != alertgroup.OutcomeApplied {
 		t.Fatalf("First ack should apply, got %s", result1.Outcome)
 	}
 
 	// Second ack is a race loser
-	result2, err := svc.Ack("ag-race", Actor{Name: "Bob"}, nil)
+	result2, err := svc.Ack("ag-race", alertgroup.Actor{Name: "Bob"}, nil)
 	if err != nil {
 		t.Fatalf("Second ack: %v", err)
 	}
-	if result2.Outcome != OutcomeAlreadyDone {
+	if result2.Outcome != alertgroup.OutcomeAlreadyDone {
 		t.Errorf("Expected already_done for race loser, got %s", result2.Outcome)
 	}
 }
 
 func TestAck_UsesTeamNameSnapshot(t *testing.T) {
 	s := store.NewMockStore()
-	svc := NewService(s)
+	svc := alertgroup.NewService(s)
 	createAG(t, s, "ag-snap", model.AlertGroupStatusTriggered)
 
-	result, err := svc.Ack("ag-snap", Actor{Name: "Denis", Email: "denis@example.com"}, nil)
+	result, err := svc.Ack("ag-snap", alertgroup.Actor{Name: "Denis", Email: "denis@example.com"}, nil)
 	if err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
-	if result.Outcome != OutcomeApplied {
+	if result.Outcome != alertgroup.OutcomeApplied {
 		t.Fatalf("Expected applied, got %s", result.Outcome)
 	}
 
@@ -164,45 +165,16 @@ func TestAck_UsesTeamNameSnapshot(t *testing.T) {
 	t.Fatal("Outbox event not found")
 }
 
-func TestAck_CancelsEscalation(t *testing.T) {
-	s := store.NewMockStore()
-	svc := NewService(s)
-	createAG(t, s, "ag-cancel", model.AlertGroupStatusTriggered)
-
-	// Create a pending escalation job with matching dedupKey
-	dedupKey := "dedup-ag-cancel"
-	s.CreateJobWithDedup(&model.Job{
-		Type:     "escalation",
-		Status:   model.JobStatusPending,
-		Payload:  json.RawMessage("{}"),
-		DedupKey: &dedupKey,
-	}, nil, nil)
-
-	result, err := svc.Ack("ag-cancel", Actor{Name: "Denis"}, nil)
-	if err != nil {
-		t.Fatalf("Ack: %v", err)
-	}
-	if result.Outcome != OutcomeApplied {
-		t.Fatalf("Expected applied, got %s", result.Outcome)
-	}
-
-	// Verify job was cancelled
-	job, _ := s.GetJobByDedupKey(dedupKey)
-	if job != nil && job.Status != model.JobStatusCanceled {
-		t.Errorf("Expected job to be canceled, got %s", job.Status)
-	}
-}
-
 func TestResolve_Applied(t *testing.T) {
 	s := store.NewMockStore()
-	svc := NewService(s)
+	svc := alertgroup.NewService(s)
 	createAG(t, s, "ag-res", model.AlertGroupStatusTriggered)
 
-	result, err := svc.Resolve("ag-res", Actor{Name: "Denis", Email: "denis@example.com"}, nil)
+	result, err := svc.Resolve("ag-res", alertgroup.Actor{Name: "Denis", Email: "denis@example.com"}, nil)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if result.Outcome != OutcomeApplied {
+	if result.Outcome != alertgroup.OutcomeApplied {
 		t.Errorf("Expected applied, got %s", result.Outcome)
 	}
 	if result.AlertGroup.Status != model.AlertGroupStatusResolved {
@@ -230,14 +202,14 @@ func TestResolve_Applied(t *testing.T) {
 
 func TestResolve_FromAcknowledged(t *testing.T) {
 	s := store.NewMockStore()
-	svc := NewService(s)
+	svc := alertgroup.NewService(s)
 	createAG(t, s, "ag-res-ack", model.AlertGroupStatusAcknowledged)
 
-	result, err := svc.Resolve("ag-res-ack", Actor{Name: "Denis"}, nil)
+	result, err := svc.Resolve("ag-res-ack", alertgroup.Actor{Name: "Denis"}, nil)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if result.Outcome != OutcomeApplied {
+	if result.Outcome != alertgroup.OutcomeApplied {
 		t.Errorf("Expected applied, got %s", result.Outcome)
 	}
 	if result.AlertGroup.Status != model.AlertGroupStatusResolved {
@@ -247,27 +219,27 @@ func TestResolve_FromAcknowledged(t *testing.T) {
 
 func TestResolve_AlreadyDone(t *testing.T) {
 	s := store.NewMockStore()
-	svc := NewService(s)
+	svc := alertgroup.NewService(s)
 	createAG(t, s, "ag-res-done", model.AlertGroupStatusResolved)
 
-	result, err := svc.Resolve("ag-res-done", Actor{Name: "Denis"}, nil)
+	result, err := svc.Resolve("ag-res-done", alertgroup.Actor{Name: "Denis"}, nil)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if result.Outcome != OutcomeAlreadyDone {
+	if result.Outcome != alertgroup.OutcomeAlreadyDone {
 		t.Errorf("Expected already_done, got %s", result.Outcome)
 	}
 }
 
 func TestResolve_NotFound(t *testing.T) {
 	s := store.NewMockStore()
-	svc := NewService(s)
+	svc := alertgroup.NewService(s)
 
-	result, err := svc.Resolve("nonexistent", Actor{Name: "Denis"}, nil)
+	result, err := svc.Resolve("nonexistent", alertgroup.Actor{Name: "Denis"}, nil)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if result.Outcome != OutcomeNotFound {
+	if result.Outcome != alertgroup.OutcomeNotFound {
 		t.Errorf("Expected not_found, got %s", result.Outcome)
 	}
 }

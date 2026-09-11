@@ -97,7 +97,17 @@ func (s *Service) Erase(ctx context.Context, userID string) error {
 		if err := tx.DeleteUserAPITokens(ctx, userID); err != nil {
 			return err
 		}
+		// Before the address goes: what is still owed to this person is
+		// withdrawn, so the delivery domain never tries to reach an identity
+		// this transaction is about to remove.
+		if err := tx.CancelLiveOutboundIntentsForUser(ctx, userID); err != nil {
+			return err
+		}
 		if err := tx.DeleteUserExternalIdentities(ctx, userID); err != nil {
+			return err
+		}
+		// And the copies of that address the delivery domain kept.
+		if err := tx.ScrubOutboundEndpointsForUser(ctx, userID); err != nil {
 			return err
 		}
 		if err := tx.DeleteUserLinkTokens(ctx, userID); err != nil {

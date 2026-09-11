@@ -9,22 +9,22 @@ import (
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
-// ProviderCapabilitiesLookup is the read-only view of the dispatcher's
-// capability registry that the API layer needs. Capability lookup is
-// compile-time data (which provider class supports which target kinds) —
-// it never touches the DB and never fails because an integration is
-// disabled. The dispatcher's *ProviderRegistry implements this.
+// ProviderCapabilitiesLookup is the read-only view of the channel catalogue
+// that the API layer needs. What it answers is declared at start-up - which
+// provider class carries which target kinds - so it never touches the database
+// and never fails because an integration is disabled.
 type ProviderCapabilitiesLookup interface {
 	Capabilities(name string) (capabilities ProviderCapability, ok bool)
 	AllCapabilities() []ProviderCapability
 }
 
-// ProviderCapability mirrors dispatcher.ProviderCapabilities at the API
-// boundary so the api package doesn't import dispatcher just for the type.
-// (api already imports dispatcher elsewhere, but the read-only contract is
-// nicer to keep narrow.)
+// ProviderCapability mirrors providers.Capability at the API boundary. The
+// duplication is deliberate: this is what the HTTP response is shaped like, and
+// a response shaped by another package's struct changes whenever that struct
+// does.
 type ProviderCapability struct {
 	Name                 string                `json:"name"`
 	IntegrationType      model.IntegrationType `json:"integration_type"`
@@ -45,7 +45,7 @@ type PolicyRequest struct {
 
 // PolicyStepRequest represents a step in a policy request.
 //
-// Sprint 4: provider + target_kind replace the flat step_type.
+// provider + target_kind, which replaced a flat step_type.
 //   - provider: e.g. "slack", validated against the capability registry.
 //   - target_kind: "dm" | "channel"; validated against the provider's
 //     SupportedTargetKinds.
@@ -54,15 +54,19 @@ type PolicyRequest struct {
 // and must be compatible with target_kind ("dm" → user|schedule,
 // "channel" → channel).
 type PolicyStepRequest struct {
-	Provider          string `json:"provider"`    // "slack", "telegram", ...
-	TargetKind        string `json:"target_kind"` // "dm" | "channel"
-	TargetType        string `json:"target_type"` // user, channel, schedule
-	TargetID          string `json:"target_id"`
-	DelaySeconds      int    `json:"delay_seconds"`
-	TimeoutSeconds    int    `json:"timeout_seconds,omitempty"`
-	MaxAttempts       int    `json:"max_attempts,omitempty"`
-	Message           string `json:"message,omitempty"`
-	ContinueOnFailure *bool  `json:"continue_on_failure,omitempty"` // nil defaults to true
+	Provider     string `json:"provider"`    // "slack", "telegram", ...
+	TargetKind   string `json:"target_kind"` // "dm" | "channel"
+	TargetType   string `json:"target_type"` // user, channel, schedule
+	TargetID     string `json:"target_id"`
+	DelaySeconds int    `json:"delay_seconds"`
+	// Ignored since 0.2.0: a call's deadline is the delivery family's, not the step's.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// Ignored since 0.2.0: retries have no limit; a page is owed until it is delivered or withdrawn.
+	MaxAttempts int `json:"max_attempts,omitempty"`
+	// The words of a direct message; a template over {{.Title}}, {{.Severity}}, {{.Team}} and {{.AlertsCount}}. A channel step posts the card and does not use it.
+	Message string `json:"message,omitempty"`
+	// When false, a step that fails for good stops the escalation: later steps that have not gone out are withdrawn. Defaults to true.
+	ContinueOnFailure *bool `json:"continue_on_failure,omitempty"`
 }
 
 // ListPolicies godoc
@@ -281,7 +285,7 @@ var targetKindForTargetType = map[string]map[string]bool{
 // validatePolicyStep checks the (provider, target_kind, target_type) triple
 // is consistent and that the provider supports target_kind. caps is the
 // capability registry view (nil during tests that don't exercise the
-// registry — guarded below).
+// registry - guarded below).
 func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup) error {
 	if step.Provider == "" {
 		return fmt.Errorf("provider is required")
@@ -291,7 +295,7 @@ func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup)
 	}
 
 	// Capability check: provider registered, and target_kind supported.
-	// caps == nil means this binary has no dispatcher wired in (test setup);
+	// caps == nil means this binary has no channel catalogue wired in (test setup);
 	// fall back to validating the legacy {dm,channel} pair without provider
 	// existence checks so unit tests that don't supply a registry still pass.
 	if caps != nil {
@@ -320,22 +324,26 @@ func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup)
 		return fmt.Errorf("%s step requires one of %v target types, got %s", step.TargetKind, keysOf(allowedTargetTypes), step.TargetType)
 	}
 
-	// target_id is required for concrete targets — schedules resolve at dispatch.
+	// target_id is required for concrete targets - schedules resolve at dispatch.
 	if (step.TargetType == "user" || step.TargetType == "channel") && step.TargetID == "" {
 		return fmt.Errorf("target_id is required for %s target type", step.TargetType)
 	}
 
-	// Timing field guards (unchanged from before Sprint 4).
+	// Timing field guards, which the step shape never touched.
 	if step.DelaySeconds < 0 {
 		return fmt.Errorf("delay_seconds must be >= 0")
 	}
-	if step.TimeoutSeconds < 0 {
-		return fmt.Errorf("timeout_seconds must be > 0")
-	}
-	if step.MaxAttempts < 0 || step.MaxAttempts > 100 {
-		return fmt.Errorf("max_attempts must be between 1 and 100")
-	}
+	// timeout_seconds and max_attempts are accepted and ignored: neither
+	// decides anything since 0.2.0, and a saved policy naming them is not
+	// wrong, only old.
 
+	// The message is checked here, once, so an attempt never meets a
+	// template it cannot render.
+	if step.Message != "" {
+		if err := providers.ValidateMessageTemplate(step.Message); err != nil {
+			return fmt.Errorf("message: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -354,14 +362,9 @@ func buildPolicySteps(policyID string, reqSteps []PolicyStepRequest, caps Provid
 			return nil, err
 		}
 
-		timeout := stepReq.TimeoutSeconds
-		if timeout == 0 {
-			timeout = 30
-		}
-		maxAttempts := stepReq.MaxAttempts
-		if maxAttempts == 0 {
-			maxAttempts = 5
-		}
+		// TimeoutSeconds and MaxAttempts are not carried over: nothing reads
+		// them, and the form no longer sends them, so a copy would write a zero
+		// the table refuses. The columns keep their defaults.
 		continueOnFailure := true
 		if stepReq.ContinueOnFailure != nil {
 			continueOnFailure = *stepReq.ContinueOnFailure
@@ -376,8 +379,6 @@ func buildPolicySteps(policyID string, reqSteps []PolicyStepRequest, caps Provid
 			TargetType:        stepReq.TargetType,
 			TargetID:          stepReq.TargetID,
 			DelaySeconds:      stepReq.DelaySeconds,
-			TimeoutSeconds:    timeout,
-			MaxAttempts:       maxAttempts,
 			Message:           stepReq.Message,
 			ContinueOnFailure: continueOnFailure,
 		}

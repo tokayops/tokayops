@@ -3,9 +3,10 @@ package engine
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"log"
 	"strings"
 	"testing"
@@ -14,7 +15,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/tokayops/tokayops/internal/config"
-	"github.com/tokayops/tokayops/internal/dispatcher/builders"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -65,7 +65,7 @@ func TestProcessNewAlertGroups(t *testing.T) {
 	// Seed a NEW alert group
 	ag := &model.AlertGroup{
 		ID:        "ag-1",
-		DedupKey:  "dedup-1",
+		AlertKey:  "dedup-1",
 		Status:    model.AlertGroupStatusNew,
 		TeamID:    "devops",
 		Severity:  "critical",
@@ -80,7 +80,7 @@ func TestProcessNewAlertGroups(t *testing.T) {
 	e.ProcessNewAlertGroups(context.Background())
 
 	// Verify State
-	updated, err := s.GetActiveAlertGroup("dedup-1")
+	updated, err := s.GetActiveAlertGroupByAlertKey("dedup-1")
 	if err != nil {
 		t.Errorf("Failed to fetch updated alert group: %v", err)
 	}
@@ -93,10 +93,13 @@ func TestProcessNewAlertGroups(t *testing.T) {
 	}
 }
 
-func TestResolvePolicy(t *testing.T) {
+// TestTheTeamDecidesTheRouting drives the routing through the path production
+// uses - the plan - rather than through a helper beside it. The routing and
+// whether the team is set up here come out of ONE read of the team, and a test
+// that called the helper directly would not notice if they stopped doing so.
+func TestTheTeamDecidesTheRouting(t *testing.T) {
 	s := store.NewMockStore()
 
-	// Create teams in Store
 	s.CreateTeam(&model.Team{
 		ID:              "devops",
 		Name:            "DevOps",
@@ -110,49 +113,46 @@ func TestResolvePolicy(t *testing.T) {
 		Name:            "Triage",
 		DefaultPolicyID: "triage_policy",
 	})
+	for _, id := range []string{"critical_policy", "default_policy", "triage_policy"} {
+		s.CreateEscalationPolicy(&model.EscalationPolicy{ID: id, Name: id})
+	}
 
-	e := &Engine{store: s}
+	plan := &planner{store: s, oncall: &fakeProjection{}, cfg: &config.Config{}}
 
 	tests := []struct {
-		name     string
-		team     string
-		severity string
-		want     string
+		name      string
+		team      string
+		severity  string
+		want      string
+		onboarded bool
 	}{
-		{
-			name:     "Direct Match",
-			team:     "devops",
-			severity: "critical",
-			want:     "critical_policy",
-		},
-		{
-			name:     "Fallback to Default Route",
-			team:     "devops",
-			severity: "unknown",
-			want:     "default_policy",
-		},
-		{
-			name:     "Triage Default",
-			team:     "triage",
-			severity: "info",
-			want:     "triage_policy",
-		},
-		{
-			name:     "Team Not Found",
-			team:     "missing_team",
-			severity: "critical",
-			want:     "", // No team = no policy
-		},
+		{"the severity has its own route", "devops", "critical", "critical_policy", true},
+		{"the severity falls back to the default", "devops", "unknown", "default_policy", true},
+		{"a team with no routes uses its default", "triage", "info", "triage_policy", true},
+		{"a team nobody set up escalates by nothing", "missing_team", "critical", "", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := e.resolvePolicy(tt.team, tt.severity); got != tt.want {
-				t.Errorf("resolvePolicy() = %v, want %v", got, tt.want)
+			admission, err := plan.buildPlan(context.Background(), &model.AlertGroup{
+				ID: "ag-" + tt.team, AlertKey: "dk-" + tt.team,
+				Status: model.AlertGroupStatusNew, TeamID: tt.team,
+				Severity: tt.severity, Title: "Disk filling up",
+			}, schedulerender.TeamOnCallResult{})
+			if err != nil {
+				t.Fatalf("build the plan: %v", err)
+			}
+
+			if escalationOf(t, admission).PolicyID != tt.want {
+				t.Errorf("the alert escalates by %q, want %q", escalationOf(t, admission).PolicyID, tt.want)
+			}
+			// From the same read: a team that answered the routing also answers
+			// whether its people can act on the card.
+			if got := admission.Admission.Snapshot.Content().TeamOnboarded; got != tt.onboarded {
+				t.Errorf("the card says team_onboarded=%v", got)
 			}
 		})
 	}
-
 }
 
 func TestPolicySnapshot_Versioning(t *testing.T) {
@@ -180,7 +180,7 @@ func TestPolicySnapshot_Versioning(t *testing.T) {
 	// 3. Process AG 1 (should get V1)
 	ag1 := &model.AlertGroup{
 		ID:       "ag1",
-		DedupKey: "dk-ag1",
+		AlertKey: "dk-ag1",
 		Status:   model.AlertGroupStatusNew,
 		TeamID:   teamID,
 		Severity: "info",
@@ -211,7 +211,7 @@ func TestPolicySnapshot_Versioning(t *testing.T) {
 	// 5. Process AG 2 (should get V2)
 	ag2 := &model.AlertGroup{
 		ID:       "ag2",
-		DedupKey: "dk-ag2",
+		AlertKey: "dk-ag2",
 		Status:   model.AlertGroupStatusNew,
 		TeamID:   teamID,
 		Severity: "info",
@@ -235,52 +235,90 @@ func TestPolicySnapshot_Versioning(t *testing.T) {
 	}
 }
 
-func TestEngine_BuildFailure_AGStaysNew(t *testing.T) {
+// TestEngine_PlanFailure_AGStaysNew: a plan that cannot be built at all admits
+// nothing, and the group stays new for the next tick.
+//
+// The state here cannot be frozen - two alerts carrying the same fingerprint
+// cannot be told apart, so a digest over them would not say what was rendered.
+// Admitting anyway would spend this alert's one chance to page on an escalation
+// whose messages nothing can identify.
+func TestEngine_PlanFailure_AGStaysNew(t *testing.T) {
 	s := store.NewMockStore()
 
-	// Create team that routes to a policy with an invalid step (empty TargetID)
-	teamID := "team_bad_policy"
-	policyID := "bad_policy"
-	s.CreateTeam(&model.Team{
-		ID:              teamID,
-		DefaultPolicyID: policyID,
-	})
-	s.CreateEscalationPolicy(&model.EscalationPolicy{
-		ID:   policyID,
-		Name: "Bad Policy",
-		Steps: []*model.EscalationStep{
-			{
-				Provider:    "slack",
-				TargetKind:  "dm",
-				TargetType:  "user",
-				TargetID:    "", // Empty target → Build() returns error
-				StepIndex:   0,
-				MaxAttempts: 3,
-			},
-		},
-	})
-
-	cfg := &config.Config{}
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseCriticalChannel: "C_FIRE"}}
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	ag := &model.AlertGroup{
-		ID:       "ag-build-fail",
-		DedupKey: "dedup-build-fail",
+		ID:       "ag-plan-fail",
+		AlertKey: "dedup-plan-fail",
 		Status:   model.AlertGroupStatusNew,
-		TeamID:   teamID,
-		Severity: "info",
+		Severity: "critical",
+		Alerts: []model.Alert{
+			{Fingerprint: "same", Status: model.AlertStatusFiring, StartsAt: time.Now()},
+			{Fingerprint: "same", Status: model.AlertStatusFiring, StartsAt: time.Now()},
+		},
 	}
 	s.CreateAlertGroup(ag)
 
 	eng.ProcessNewAlertGroups(context.Background())
 
-	// AG should stay "new" because Build() failed — not marked as "processing"
-	updated, err := s.GetAlertGroupByID("ag-build-fail")
+	updated, err := s.GetAlertGroupByID("ag-plan-fail")
 	if err != nil {
 		t.Fatalf("Failed to fetch alert group: %v", err)
 	}
 	if updated.Status != model.AlertGroupStatusNew {
-		t.Errorf("Expected AG status to stay 'new' after Build failure, got '%s'", updated.Status)
+		t.Errorf("Expected AG status to stay 'new' after a plan failure, got '%s'", updated.Status)
+	}
+	if _, admitted := s.AdmissionFor("ag-plan-fail"); admitted {
+		t.Error("an escalation was admitted for a group whose state cannot be frozen")
+	}
+}
+
+// TestEngine_StepWithNoTarget_IsRecordedNotFailed. A step nobody can be found
+// for is not a reason to hold the whole escalation: the rest of the plan is
+// admitted, and the step that resolved to nobody is named in the group's
+// history instead of becoming a commitment that is certain to fail.
+func TestEngine_StepWithNoTarget_IsRecordedNotFailed(t *testing.T) {
+	s := store.NewMockStore()
+
+	teamID := "team_bad_policy"
+	policyID := "bad_policy"
+	s.CreateTeam(&model.Team{ID: teamID, DefaultPolicyID: policyID})
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID:   policyID,
+		Name: "Bad Policy",
+		Steps: []*model.EscalationStep{{
+			Provider: "slack", TargetKind: "dm", TargetType: "user",
+			TargetID: "", StepIndex: 0, MaxAttempts: 3,
+		}},
+	})
+
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseInfoChannel: "C_FIRE"}}
+	eng := NewEngine(s, &fakeProjection{}, cfg)
+
+	ag := &model.AlertGroup{
+		ID: "ag-no-target", AlertKey: "dedup-no-target",
+		Status: model.AlertGroupStatusNew, TeamID: teamID, Severity: "info",
+	}
+	s.CreateAlertGroup(ag)
+
+	eng.ProcessNewAlertGroups(context.Background())
+
+	admission, admitted := s.AdmissionFor("ag-no-target")
+	if !admitted {
+		t.Fatal("nothing was admitted for a group whose policy step names nobody")
+	}
+	if cards, satellites := cardsOf(admission.Admission.Commitments); len(cards) != 1 || satellites != 2 {
+		t.Fatalf("expected the firehose alone with its two satellites, got %d card(s) and %d satellite(s)",
+			len(cards), satellites)
+	}
+	if len(escalationOf(t, admission).Unpromised) != 1 {
+		t.Fatalf("the step that named nobody was not recorded: %v", escalationOf(t, admission).Unpromised)
+	}
+	// The reason matters: a step with no recipient sends a reader to the
+	// policy, and "nobody on call" sends them to the schedule.
+	if got := escalationOf(t, admission).Unpromised[0].Reason; got != outbound.ReasonNoTarget {
+		t.Errorf("the step was recorded as %q", got)
 	}
 }
 
@@ -294,39 +332,32 @@ func TestEngine_FirehoseCreation(t *testing.T) {
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 
 	// Create AG (Critical) - no policy, firehose only
-	ag := &model.AlertGroup{ID: "ag_fire", Severity: "critical", DedupKey: "dk_fire", Status: model.AlertGroupStatusNew}
+	ag := &model.AlertGroup{ID: "ag_fire", Severity: "critical", AlertKey: "dk_fire", Status: model.AlertGroupStatusNew}
 	s.CreateAlertGroup(ag)
 
 	eng.ProcessNewAlertGroups(context.Background())
 
-	// Firehose is now step 0 in the unified escalation job (dedup key = ag.DedupKey)
-	job, err := s.GetJobByDedupKey("dk_fire")
-	if err != nil {
-		t.Fatalf("Escalation job not found: %v", err)
+	admission, admitted := s.AdmissionFor("ag_fire")
+	if !admitted {
+		t.Fatal("nothing was admitted for a group with a firehose channel")
 	}
-	if job == nil {
-		t.Fatal("Escalation job is nil")
-	}
-	if job.Type != "escalation" {
-		t.Errorf("Expected job type escalation, got %s", job.Type)
+	cards, satellites := cardsOf(admission.Admission.Commitments)
+	if len(cards) != 1 || satellites != 2 {
+		t.Fatalf("expected one card with its two satellites, got %d card(s) and %d satellite(s)",
+			len(cards), satellites)
 	}
 
-	// Step 0 should be firehose
-	fetchedSteps := s.GetJobStepsByJobID(job.ID)
-	step := fetchedSteps[0]
-	if step.StepType != "firehose" {
-		t.Errorf("Expected step type firehose, got %s", step.StepType)
+	commitment := cards[0]
+	if commitment.Slot.Kind != keys.SlotFirehose {
+		t.Errorf("the firehose is in slot %q", commitment.Slot.Kind)
 	}
-
-	var data model.EscalationStepData
-	if err := json.Unmarshal(step.Data, &data); err != nil {
-		t.Fatalf("Unmarshal failed: %v", err)
+	if commitment.Target.Kind != keys.TargetChannel || commitment.Target.Ref != "C_FIRE" {
+		t.Errorf("the firehose promises %s %q", commitment.Target.Kind, commitment.Target.Ref)
 	}
-	if data.TargetID != "C_FIRE" {
-		t.Errorf("Expected target C_FIRE, got %s", data.TargetID)
-	}
-	if !data.IsFirehose {
-		t.Error("IsFirehose should be true")
+	// It goes out immediately: everything else in a plan is measured from the
+	// admission, and the firehose is the zero of that measurement.
+	if commitment.Timing.Offset != 0 {
+		t.Errorf("the firehose waits %s", commitment.Timing.Offset)
 	}
 }
 
@@ -352,7 +383,7 @@ func TestEngine_ReconcileStaleProcessing(t *testing.T) {
 	// Simulate crash scenario: AG is in "processing" with stale updated_at, no job exists
 	ag := &model.AlertGroup{
 		ID:        "ag-orphan",
-		DedupKey:  "dk-orphan",
+		AlertKey:  "dk-orphan",
 		Status:    model.AlertGroupStatusProcessing,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -375,16 +406,18 @@ func TestEngine_ReconcileStaleProcessing(t *testing.T) {
 		t.Errorf("Expected status processing, got %s", updated.Status)
 	}
 
-	// Verify: a job should now exist for this AG
-	job, err := s.GetJobByDedupKey("dk-orphan")
-	if err != nil {
-		t.Fatalf("Job lookup failed: %v", err)
+	// Verify: the orphan is escalated now - it was picked up precisely because
+	// nothing had been admitted for it.
+	admission, admitted := s.AdmissionFor("ag-orphan")
+	if !admitted {
+		t.Fatal("nothing was admitted for a group that has been processing with no escalation")
 	}
-	if job == nil {
-		t.Fatal("Expected job to be created for orphaned AG, got nil")
+	if len(admission.Admission.Commitments) != 1 {
+		t.Fatalf("expected the policy's one step, got %d commitments",
+			len(admission.Admission.Commitments))
 	}
-	if job.Type != "escalation" {
-		t.Errorf("Expected job type escalation, got %s", job.Type)
+	if got := admission.Admission.Commitments[0].Target.Ref; got != "U999" {
+		t.Errorf("the escalation promises %q", got)
 	}
 }
 
@@ -432,7 +465,7 @@ func TestEngine_ScheduleRecreation_OnCallConsistency(t *testing.T) {
 	// Create alert group
 	ag := &model.AlertGroup{
 		ID:        "ag-stale-engine",
-		DedupKey:  "dk-stale-engine",
+		AlertKey:  "dk-stale-engine",
 		Status:    model.AlertGroupStatusNew,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -458,146 +491,39 @@ func TestEngine_ScheduleRecreation_OnCallConsistency(t *testing.T) {
 		t.Errorf("OnCallSnapshot should show '%s' (Denis), got '%s'", userNew.ID, snapshotUserID)
 	}
 
-	// 2. Verify job step targets the same user
-	job, err := s.GetJobByDedupKey("dk-stale-engine")
-	if err != nil || job == nil {
-		t.Fatalf("Job not found: %v", err)
+	// 2. Verify the escalation promises the same person
+	admission, admitted := s.AdmissionFor("ag-stale-engine")
+	if !admitted {
+		t.Fatal("nothing was admitted")
 	}
-	fetchedSteps := s.GetJobStepsByJobID(job.ID)
-	var dmStep *model.JobStep
-	for _, step := range fetchedSteps {
-		if step.StepType == "dm" {
-			dmStep = step
+	var promised string
+	for _, commitment := range admission.Admission.Commitments {
+		if commitment.Target.Kind == keys.TargetUser {
+			promised = commitment.Target.Ref
 			break
 		}
 	}
-	if dmStep == nil {
-		t.Fatal("Expected a dm step in the job")
+	if promised == "" {
+		t.Fatal("the escalation promises nobody")
 	}
 
-	var stepData model.EscalationStepData
-	json.Unmarshal(dmStep.Data, &stepData)
-
-	// Critical consistency check: snapshot and job step must agree
-	if stepData.TargetID != snapshotUserID {
-		t.Errorf("REGRESSION: Job step targets '%s' but OnCallSnapshot shows '%s' — stale schedule bug!",
-			stepData.TargetID, snapshotUserID)
+	// The consistency that matters: what was recorded on the group and what
+	// was promised are one answer, read once, from the schedule the team has
+	// NOW rather than the one a policy step still names.
+	if promised != snapshotUserID {
+		t.Errorf("REGRESSION: the escalation promises '%s' while the on-call snapshot shows '%s' - stale schedule bug!",
+			promised, snapshotUserID)
 	}
-	if stepData.TargetID != userNew.ID {
-		t.Errorf("REGRESSION: Job step should target '%s' (Denis), got '%s'", userNew.ID, stepData.TargetID)
-	}
-}
-
-func TestEngine_StaleProcessing_WithSucceededJob_NotReconciled(t *testing.T) {
-	s := store.NewMockStore()
-	cfg := &config.Config{}
-
-	teamID := "team-succeeded-noop"
-	policyID := "policy-succeeded"
-	s.CreateTeam(&model.Team{
-		ID:              teamID,
-		DefaultPolicyID: policyID,
-	})
-	s.CreateEscalationPolicy(&model.EscalationPolicy{
-		ID:   policyID,
-		Name: "Succeeded Policy",
-		Steps: []*model.EscalationStep{
-			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U111", StepIndex: 0, MaxAttempts: 3},
-		},
-	})
-
-	// AG in processing with stale updated_at
-	ag := &model.AlertGroup{
-		ID:        "ag-succeeded-noop",
-		DedupKey:  "dk-succeeded-noop",
-		Status:    model.AlertGroupStatusProcessing,
-		TeamID:    teamID,
-		Severity:  "info",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now().Add(-60 * time.Second),
-	}
-	s.CreateAlertGroup(ag)
-
-	// Simulate: escalation job already ran and succeeded
-	eng := NewEngine(s, &fakeProjection{}, cfg)
-	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
-	job, stages, steps, snapshot, _ := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
-	// Create job directly (bypassing engine) and mark as succeeded
-	s.CreateJobWithDedup(job, stages, steps)
-	s.MarkJobSucceeded(ag.DedupKey)
-	// Save snapshot so we can verify it's not overwritten
-	s.UpdateAlertGroupPolicy(ag.ID, snapshot.PolicyID, snapshot)
-
-	beforeRun := time.Now()
-	eng.ProcessNewAlertGroups(context.Background())
-
-	// AG should NOT be picked up — job exists (succeeded), not a true orphan
-	updated, _ := s.GetAlertGroupByID("ag-succeeded-noop")
-	if updated.UpdatedAt.After(beforeRun) {
-		t.Error("Stale processing AG with succeeded job should NOT be re-processed by engine")
+	if promised != userNew.ID {
+		t.Errorf("REGRESSION: the escalation should promise '%s' (Denis), got '%s'", userNew.ID, promised)
 	}
 }
 
-func TestEnsureEscalationJob_SkipsAckedAG(t *testing.T) {
-	s := store.NewMockStore()
-
-	// Create team + policy
-	teamID := "team-ack-skip"
-	policyID := "policy-ack-skip"
-	s.CreateTeam(&model.Team{
-		ID:              teamID,
-		DefaultPolicyID: policyID,
-	})
-	s.CreateEscalationPolicy(&model.EscalationPolicy{
-		ID:   policyID,
-		Name: "Ack Skip Policy",
-		Steps: []*model.EscalationStep{
-			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U111", StepIndex: 0, MaxAttempts: 3},
-		},
-	})
-
-	// Create AG already acknowledged
-	ag := &model.AlertGroup{
-		ID:        "ag-acked",
-		DedupKey:  "dk-acked",
-		Status:    model.AlertGroupStatusAcknowledged,
-		TeamID:    teamID,
-		Severity:  "info",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	s.CreateAlertGroup(ag)
-
-	// Build job for this AG (as engine would)
-	cfg := &config.Config{}
-	eng := NewEngine(s, &fakeProjection{}, cfg)
-	escBuilder := builders.NewEscalationJobBuilder(s, &fakeProjection{}, cfg)
-	job, stages, steps, snapshot, err := escBuilder.Build(context.Background(), ag, policyID, schedulerender.TeamOnCallRead(schedulerender.TeamOnCall{}, nil))
-	if err != nil {
-		t.Fatalf("Build failed: %v", err)
-	}
-	if job == nil {
-		t.Fatal("Expected job to be built")
-	}
-	_ = eng // engine not used directly here
-
-	// Call EnsureEscalationJob — should return (false, nil)
-	created, err := s.EnsureEscalationJob(ag.ID, job, stages, steps, snapshot)
-	if err != nil {
-		t.Fatalf("EnsureEscalationJob error: %v", err)
-	}
-	if created {
-		t.Error("Expected created=false for acknowledged AG")
-	}
-
-	// Verify AG status unchanged
-	updated, _ := s.GetAlertGroupByID("ag-acked")
-	if updated.Status != model.AlertGroupStatusAcknowledged {
-		t.Errorf("Expected status to stay 'acknowledged', got '%s'", updated.Status)
-	}
-}
-
-func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
+// TestASecondTickDoesNotRestateWhatTheGroupEscalatesBy. The policy is edited
+// after the escalation was admitted, and the group keeps saying what it was
+// admitted under: the winner of the claim said what this group escalates by,
+// and a later producer does not get to restate it.
+func TestASecondTickDoesNotRestateWhatTheGroupEscalatesBy(t *testing.T) {
 	s := store.NewMockStore()
 
 	teamID := "team-dedup-snap"
@@ -617,7 +543,7 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	// Create AG
 	ag := &model.AlertGroup{
 		ID:        "ag-dedup",
-		DedupKey:  "dk-dedup",
+		AlertKey:  "dk-dedup",
 		Status:    model.AlertGroupStatusNew,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -629,7 +555,7 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	cfg := &config.Config{}
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 
-	// First call — should create job with V1 snapshot
+	// First call - should create job with V1 snapshot
 	eng.ProcessNewAlertGroups(context.Background())
 
 	updatedAG, _ := s.GetAlertGroupByID("ag-dedup")
@@ -650,9 +576,9 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	})
 
 	// Force AG back to "new" to re-trigger processing
-	s.UpdateAlertGroupStatus("ag-dedup", model.AlertGroupStatusNew)
+	s.SetAlertGroupStatus("ag-dedup", model.AlertGroupStatusNew)
 
-	// Second call — job already exists (dedup), snapshot should NOT be overwritten
+	// Second call - job already exists (dedup), snapshot should NOT be overwritten
 	eng.ProcessNewAlertGroups(context.Background())
 
 	updatedAG2, _ := s.GetAlertGroupByID("ag-dedup")
@@ -664,7 +590,11 @@ func TestEnsureEscalationJob_DedupSkipsSnapshotOverwrite(t *testing.T) {
 	}
 }
 
-func TestEnsureEscalationJob_SkipsSucceededJob(t *testing.T) {
+// TestAGroupIsAdmittedOnceAndNeverAgain. The claim over a group's escalation is
+// held forever, whatever became of the deliveries under it. A group that comes
+// back round - a status change, a stale reconcile, anything - does not get a
+// second escalation, and a tick that finds the claim held touches nothing.
+func TestAGroupIsAdmittedOnceAndNeverAgain(t *testing.T) {
 	s := store.NewMockStore()
 	cfg := &config.Config{}
 
@@ -685,7 +615,7 @@ func TestEnsureEscalationJob_SkipsSucceededJob(t *testing.T) {
 	// Create AG in "new"
 	ag := &model.AlertGroup{
 		ID:        "ag-succeeded-skip",
-		DedupKey:  "dk-succeeded-skip",
+		AlertKey:  "dk-succeeded-skip",
 		Status:    model.AlertGroupStatusNew,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -696,39 +626,41 @@ func TestEnsureEscalationJob_SkipsSucceededJob(t *testing.T) {
 
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 
-	// First run — creates escalation job
+	// First run - admits the escalation
 	eng.ProcessNewAlertGroups(context.Background())
 
-	// Verify job was created
-	job, err := s.GetJobByDedupKey("dk-succeeded-skip")
-	if err != nil {
-		t.Fatalf("Job not found: %v", err)
-	}
-	if job == nil {
-		t.Fatal("Expected job to be created")
+	first, admitted := s.AdmissionFor("ag-succeeded-skip")
+	if !admitted {
+		t.Fatal("nothing was admitted on the first tick")
 	}
 
-	// Mark job as succeeded
-	s.MarkJobSucceeded("dk-succeeded-skip")
-
-	// Force AG back to new to re-trigger processing
-	s.UpdateAlertGroupStatus("ag-succeeded-skip", model.AlertGroupStatusNew)
-
-	// Second run — should NOT create a new job (DB invariant: 1 escalation per AG)
+	// Whatever happens to the deliveries afterwards, the claim over this group
+	// is held forever: an escalation is admitted once, and a group that comes
+	// back round - by a status change, a stale reconcile, anything - does not
+	// get a second one.
+	s.SetAlertGroupStatus("ag-succeeded-skip", model.AlertGroupStatusNew)
 	eng.ProcessNewAlertGroups(context.Background())
 
-	// Verify AG was picked up but dedup prevented a new job
-	updated, _ := s.GetAlertGroupByID("ag-succeeded-skip")
-	// AG transitions to processing because EnsureEscalationJob updates status before dedup check
-	if updated.Status != model.AlertGroupStatusProcessing {
-		t.Errorf("Expected AG status 'processing' (transitioned before dedup), got '%s'", updated.Status)
+	if batches := s.AdmittedBatches(); len(batches) != 1 {
+		t.Fatalf("the group was admitted %d times", len(batches))
 	}
+	again, _ := s.AdmissionFor("ag-succeeded-skip")
+	if again.Admission.BatchKey != first.Admission.BatchKey {
+		t.Errorf("the second tick replaced the claim: %q then %q",
+			first.Admission.BatchKey, again.Admission.BatchKey)
+	}
+
+	// The group's status is not asserted here on purpose. A tick that finds the
+	// claim already held touches nothing about the group - the producer that
+	// won said what this group escalates by, and a later one does not get to
+	// restate it - so what the status says afterwards is whatever the test set
+	// it to. What matters is above: one claim, unchanged.
 }
 
 func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 	s := store.NewMockStore()
 
-	// Team with no policy — will produce job == nil
+	// Team with no policy - will produce job == nil
 	teamID := "team-no-policy"
 	s.CreateTeam(&model.Team{
 		ID:   teamID,
@@ -739,7 +671,7 @@ func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 	staleTime := time.Now().Add(-60 * time.Second)
 	ag := &model.AlertGroup{
 		ID:        "ag-stale-touch",
-		DedupKey:  "dk-stale-touch",
+		AlertKey:  "dk-stale-touch",
 		Status:    model.AlertGroupStatusProcessing,
 		TeamID:    teamID,
 		Severity:  "info",
@@ -751,7 +683,7 @@ func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 	cfg := &config.Config{}
 	eng := NewEngine(s, &fakeProjection{}, cfg)
 
-	// First tick — should pick up stale AG and touch updated_at
+	// First tick - should pick up stale AG and touch updated_at
 	eng.ProcessNewAlertGroups(context.Background())
 
 	updated, _ := s.GetAlertGroupByID("ag-stale-touch")
@@ -762,7 +694,7 @@ func TestEngine_JobNil_StaleProcessing_TouchesUpdatedAt(t *testing.T) {
 		t.Error("Expected updated_at to be refreshed (touched)")
 	}
 
-	// Second tick — AG should NOT be picked up again (updated_at is fresh)
+	// Second tick - AG should NOT be picked up again (updated_at is fresh)
 	beforeSecondTick := time.Now()
 	time.Sleep(10 * time.Millisecond) // ensure time difference
 	eng.ProcessNewAlertGroups(context.Background())
@@ -784,7 +716,7 @@ func TestEngine_OnCallSnapshot_OverrideCarriesSource(t *testing.T) {
 	teamID := "team-override"
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Override Team"})
 	ag := &model.AlertGroup{
-		ID: "ag-override", DedupKey: "dk-override", TeamID: teamID, Severity: "info",
+		ID: "ag-override", AlertKey: "dk-override", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -823,7 +755,7 @@ func TestEngine_OnCallSnapshot_NoSchedule_IsEmptyNotAnError(t *testing.T) {
 	teamID := "team-scheduleless"
 	s.CreateTeam(&model.Team{ID: teamID, Name: "No Schedule"})
 	ag := &model.AlertGroup{
-		ID: "ag-no-sched", DedupKey: "dk-no-sched", TeamID: teamID, Severity: "info",
+		ID: "ag-no-sched", AlertKey: "dk-no-sched", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -852,7 +784,7 @@ func TestEngine_OnCallSnapshot_DeletedSchedule_IsEmpty(t *testing.T) {
 	teamID := "team-deleted-sched"
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Deleted Schedule"})
 	ag := &model.AlertGroup{
-		ID: "ag-deleted-sched", DedupKey: "dk-deleted-sched", TeamID: teamID, Severity: "info",
+		ID: "ag-deleted-sched", AlertKey: "dk-deleted-sched", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -884,7 +816,7 @@ func TestEngine_OnCallSnapshot_L2IsRecorded(t *testing.T) {
 	teamID := "team-l2"
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Two Layers"})
 	ag := &model.AlertGroup{
-		ID: "ag-l2", DedupKey: "dk-l2", TeamID: teamID, Severity: "info",
+		ID: "ag-l2", AlertKey: "dk-l2", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -924,16 +856,18 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 	s.CreateEscalationPolicy(&model.EscalationPolicy{
 		ID: policyID, Name: "Schedule Policy",
 		Steps: []*model.EscalationStep{
-			{ID: "s1", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
-			// A second step naming the SAME schedule: two steps of one job are
+			{ID: "s1", StepIndex: 0, Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
+			// A second step naming the SAME schedule: two steps of one plan are
 			// one question, and they must not be answered differently either.
-			{ID: "s2", Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
+			// Its own index, because that index is part of what tells the two
+			// promises apart.
+			{ID: "s2", StepIndex: 1, Provider: "slack", TargetKind: "dm", TargetType: "schedule", TargetID: "sched-1", MaxAttempts: 3},
 		},
 	})
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Handoff Race", DefaultPolicyID: policyID})
 
 	ag := &model.AlertGroup{
-		ID: "ag-handoff-race", DedupKey: "dk-handoff-race", TeamID: teamID, Severity: "info",
+		ID: "ag-handoff-race", AlertKey: "dk-handoff-race", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -959,27 +893,24 @@ func TestEngine_OnCallReadOncePerAlertGroup(t *testing.T) {
 	}
 	snapshotUser := updated.OnCallSnapshot.L1Users[0].ID
 
-	job, err := s.GetJobByDedupKey(ag.DedupKey)
-	if err != nil || job == nil {
-		t.Fatalf("job not found: %v", err)
+	admission, admitted := s.AdmissionFor(ag.ID)
+	if !admitted {
+		t.Fatal("nothing was admitted")
 	}
 	var targets []string
-	for _, step := range s.GetJobStepsByJobID(job.ID) {
-		if step.StepType != "dm" {
-			continue
+	for _, commitment := range admission.Admission.Commitments {
+		if commitment.Target.Kind == keys.TargetUser {
+			targets = append(targets, commitment.Target.Ref)
 		}
-		var data model.EscalationStepData
-		if err := json.Unmarshal(step.Data, &data); err != nil {
-			t.Fatalf("unmarshal step data: %v", err)
-		}
-		targets = append(targets, data.TargetID)
 	}
 	if len(targets) != 2 {
-		t.Fatalf("job has %d dm steps, want one per policy step: %v", len(targets), targets)
+		t.Fatalf("the escalation promises %d people, want one per policy step: %v",
+			len(targets), targets)
 	}
 	for _, target := range targets {
 		if target != snapshotUser {
-			t.Errorf("job step pages %q while the snapshot records %q", target, snapshotUser)
+			t.Errorf("the escalation promises %q while the snapshot records %q",
+				target, snapshotUser)
 		}
 	}
 }
@@ -1014,7 +945,7 @@ func TestEngine_OnCallReadFailure_DefersEverything(t *testing.T) {
 	})
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Unreadable", DefaultPolicyID: policyID})
 	ag := &model.AlertGroup{
-		ID: "ag-unreadable", DedupKey: "dk-unreadable", TeamID: teamID, Severity: "info",
+		ID: "ag-unreadable", AlertKey: "dk-unreadable", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -1042,9 +973,9 @@ func TestEngine_OnCallReadFailure_DefersEverything(t *testing.T) {
 		t.Errorf("the fallback schedule was read %d times after a failed team read, want 0", proj.scheduleCalls)
 	}
 
-	job, err := s.GetJobByDedupKey(ag.DedupKey)
-	if err == nil && job != nil {
-		t.Errorf("job %s was committed on an unknown roster - nothing would ever rebuild it", job.ID)
+	if admission, admitted := s.AdmissionFor(ag.ID); admitted {
+		t.Errorf("the escalation was admitted on an unknown roster (%s) - an admission is "+
+			"held forever, so nothing would ever rebuild it", admission.Admission.BatchKey)
 	}
 
 	if got := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal) - deferralsBefore; got != 1 {
@@ -1074,7 +1005,7 @@ func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
 	})
 	s.CreateTeam(&model.Team{ID: teamID, Name: "Recovers", DefaultPolicyID: policyID})
 	ag := &model.AlertGroup{
-		ID: "ag-recovers", DedupKey: "dk-recovers", TeamID: teamID, Severity: "info",
+		ID: "ag-recovers", AlertKey: "dk-recovers", TeamID: teamID, Severity: "info",
 		Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.CreateAlertGroup(ag)
@@ -1090,8 +1021,8 @@ func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
 	deferralsBefore := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
 	engine.ProcessNewAlertGroups(context.Background())
 
-	if job, _ := s.GetJobByDedupKey(ag.DedupKey); job != nil {
-		t.Fatalf("first tick committed job %s although the roster was unknown", job.ID)
+	if _, admitted := s.AdmissionFor(ag.ID); admitted {
+		t.Fatal("the first tick admitted an escalation although the roster was unknown")
 	}
 	deferralsAfterFirst := counterValue(t, metrics.EngineEscalationBuildDeferralsTotal)
 	if got := deferralsAfterFirst - deferralsBefore; got != 1 {
@@ -1100,13 +1031,13 @@ func TestEngine_OnCallReadRecovers_PagesOnCall(t *testing.T) {
 
 	engine.ProcessNewAlertGroups(context.Background())
 
-	job, err := s.GetJobByDedupKey(ag.DedupKey)
-	if err != nil || job == nil {
-		t.Fatalf("second tick built no job although the projection answered: %v", err)
+	admission, admitted := s.AdmissionFor(ag.ID)
+	if !admitted {
+		t.Fatal("the second tick admitted nothing although the projection answered")
 	}
-	targets := dmTargetsOf(t, s.GetJobStepsByJobID(job.ID))
+	targets := promisedUsers(admission)
 	if len(targets) != 1 || targets[0] != onDutyUser.ID {
-		t.Errorf("second tick pages %v, want the on-call user %q", targets, onDutyUser.ID)
+		t.Errorf("the second tick promises %v, want the on-call user %q", targets, onDutyUser.ID)
 	}
 
 	updated, err := s.GetAlertGroupByID(ag.ID)
@@ -1148,7 +1079,7 @@ func TestEngine_DeferredTick_NamesTheBatchOnceAndNothingPerGroup(t *testing.T) {
 	s.CreateTeam(&model.Team{ID: "team-batch", Name: "Batch", DefaultPolicyID: policyID})
 	for _, id := range []string{"ag-first", "ag-second"} {
 		s.CreateAlertGroup(&model.AlertGroup{
-			ID: id, DedupKey: "dk-" + id, TeamID: "team-batch", Severity: "info",
+			ID: id, AlertKey: "dk-" + id, TeamID: "team-batch", Severity: "info",
 			Status: model.AlertGroupStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		})
 	}
@@ -1212,23 +1143,6 @@ func TestAlertGroupIDs_CapsTheList(t *testing.T) {
 	}
 }
 
-// dmTargetsOf lists what the dm steps of a built job would page.
-func dmTargetsOf(t *testing.T, steps []*model.JobStep) []string {
-	t.Helper()
-	var out []string
-	for _, step := range steps {
-		if step.StepType != "dm" {
-			continue
-		}
-		var data model.EscalationStepData
-		if err := json.Unmarshal(step.Data, &data); err != nil {
-			t.Fatalf("unmarshal step data: %v", err)
-		}
-		out = append(out, data.TargetID)
-	}
-	return out
-}
-
 // counterValue reads a counter without prometheus/testutil, which would promote
 // prometheus/common from an indirect dependency for one assertion. Counters are
 // process-wide, so callers compare a delta rather than an absolute.
@@ -1239,4 +1153,216 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 		t.Fatalf("read counter: %v", err)
 	}
 	return m.GetCounter().GetValue()
+}
+
+// promisedUsers is who an admission promises to page, in key order.
+func promisedUsers(admission outbound.Batch) []string {
+	var out []string
+	for _, commitment := range admission.Admission.Commitments {
+		if commitment.Target.Kind == keys.TargetUser {
+			out = append(out, commitment.Target.Ref)
+		}
+	}
+	return out
+}
+
+// escalationOf reads the alert-group half of a batch the engine built.
+func escalationOf(t *testing.T, batch outbound.Batch) outbound.EscalationContext {
+	t.Helper()
+	about, ok := batch.Context.Escalation()
+	if !ok {
+		t.Fatalf("the engine built a %q batch", batch.Context.Form())
+	}
+	return about
+}
+
+// TestTheFirehoseChannelFollowsTheSeverity. Each of the three severities has
+// its own firehose channel, and an alert of a severity whose channel is left
+// empty gets no firehose card at all, rather than the warning channel's.
+func TestTheFirehoseChannelFollowsTheSeverity(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		global   config.GlobalConfig
+		severity string
+		channel  string // empty: no firehose card
+	}{
+		{"critical", allThree, "critical", "C_CRIT"},
+		{"warning", allThree, "warning", "C_WARN"},
+		{"info", allThree, "info", "C_INFO"},
+		{"info without a channel", config.GlobalConfig{FirehoseCriticalChannel: "C_CRIT", FirehoseWarningChannel: "C_WARN"}, "info", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := store.NewMockStore()
+			eng := NewEngine(s, &fakeProjection{}, &config.Config{Global: tc.global})
+			s.CreateAlertGroup(&model.AlertGroup{ID: "ag", Severity: tc.severity, AlertKey: "dk", Status: model.AlertGroupStatusNew})
+			eng.ProcessNewAlertGroups(context.Background())
+
+			admission, admitted := s.AdmissionFor("ag")
+			if !admitted {
+				t.Fatal("nothing was admitted")
+			}
+			cards, satellites := cardsOf(admission.Admission.Commitments)
+			// An empty channel is the operator's choice and leaves no line.
+			if unpromised := escalationOf(t, admission).Unpromised; len(unpromised) != 0 {
+				t.Fatalf("severity %q left %+v in the history, want nothing", tc.severity, unpromised)
+			}
+			if tc.channel == "" {
+				if len(cards) != 0 || satellites != 0 {
+					t.Fatalf("severity %q got %d card(s) and %d satellite(s), want no firehose", tc.severity, len(cards), satellites)
+				}
+				return
+			}
+			if len(cards) != 1 || satellites != 2 {
+				t.Fatalf("severity %q got %d card(s) and %d satellite(s), want the firehose card and its two", tc.severity, len(cards), satellites)
+			}
+			if got := cards[0].Target.Ref; got != tc.channel {
+				t.Fatalf("severity %q went to %s, want %s", tc.severity, got, tc.channel)
+			}
+		})
+	}
+}
+
+var allThree = config.GlobalConfig{FirehoseCriticalChannel: "C_CRIT", FirehoseWarningChannel: "C_WARN", FirehoseInfoChannel: "C_INFO"}
+
+// cardsOf splits an admission into the commitments that reach a recipient and
+// the number of satellites that follow a card.
+func cardsOf(commitments []keys.AdmittedCommitment) (cards []keys.AdmittedCommitment, satellites int) {
+	for _, c := range commitments {
+		if c.Target.Satellite() {
+			satellites++
+			continue
+		}
+		cards = append(cards, c)
+	}
+	return cards, satellites
+}
+
+// TestEveryChannelCardHasItsThreadAndItsReply. A Slack channel card - the
+// firehose and every channel step - is admitted with the thread under it and
+// the reply that closes it: same slot, same timing, following the card by its
+// key. A person's message and a Telegram card have neither.
+func TestEveryChannelCardHasItsThreadAndItsReply(t *testing.T) {
+	s := store.NewMockStore()
+	teamID := "team-threads"
+	policyID := "threads_policy"
+	s.CreateTeam(&model.Team{ID: teamID, DefaultPolicyID: policyID})
+	s.CreateUser(&model.User{ID: "U1", Name: "Nina"})
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Threads",
+		Steps: []*model.EscalationStep{
+			{Provider: "slack", TargetKind: "channel", TargetType: "channel", TargetID: "C_OPS", StepIndex: 0, DelaySeconds: 60},
+			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U1", StepIndex: 1},
+			{Provider: "telegram", TargetKind: "channel", TargetType: "channel", TargetID: "-1001", StepIndex: 2},
+		},
+	})
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseCriticalChannel: "C_FIRE"}}
+	eng := NewEngine(s, &fakeProjection{}, cfg)
+	s.CreateAlertGroup(&model.AlertGroup{
+		ID: "ag-threads", AlertKey: "dk-threads", Status: model.AlertGroupStatusNew,
+		TeamID: teamID, Severity: "critical",
+	})
+
+	eng.ProcessNewAlertGroups(context.Background())
+
+	admission, admitted := s.AdmissionFor("ag-threads")
+	if !admitted {
+		t.Fatal("nothing was admitted")
+	}
+	byKey := map[string]keys.AdmittedCommitment{}
+	for _, c := range admission.Admission.Commitments {
+		byKey[c.IdempotencyKey] = c
+	}
+	cards, satellites := cardsOf(admission.Admission.Commitments)
+	if len(cards) != 4 || satellites != 4 {
+		t.Fatalf("got %d card(s) and %d satellite(s); want the firehose, three steps and four satellites",
+			len(cards), satellites)
+	}
+	for _, card := range cards {
+		var thread, reply *keys.AdmittedCommitment
+		for i := range admission.Admission.Commitments {
+			c := &admission.Admission.Commitments[i]
+			if c.ParentKey != card.IdempotencyKey {
+				continue
+			}
+			switch c.Target.Kind {
+			case keys.TargetThread:
+				thread = c
+			case keys.TargetThreadReply:
+				reply = c
+			}
+		}
+		slackChannel := card.Provider == "slack" && card.Target.Kind == keys.TargetChannel
+		if slackChannel != (thread != nil && reply != nil) {
+			t.Fatalf("%s %s has thread=%v reply=%v", card.Provider, card.Target.Kind, thread != nil, reply != nil)
+		}
+		if !slackChannel {
+			continue
+		}
+		for name, satellite := range map[string]*keys.AdmittedCommitment{"thread": thread, "reply": reply} {
+			if satellite.Slot != card.Slot || satellite.Timing != card.Timing || satellite.Target.Ref != card.Target.Ref {
+				t.Errorf("the %s of %s does not share its slot, timing and channel", name, card.Target.Ref)
+			}
+			if satellite.Expiry != nil || satellite.Provider != "slack" {
+				t.Errorf("the %s of %s has a deadline or another provider", name, card.Target.Ref)
+			}
+			if _, ok := byKey[satellite.ParentKey]; !ok {
+				t.Errorf("the %s of %s follows a key not in the admission", name, card.Target.Ref)
+			}
+		}
+		if !thread.Editable || reply.Editable {
+			t.Errorf("the thread of %s is editable=%v and the reply editable=%v", card.Target.Ref, thread.Editable, reply.Editable)
+		}
+	}
+}
+
+// TestAStepThatDoesNotContinueStopsOnFailure. The policy's word travels with
+// the commitment as escalation_payload/v2: a step that does not continue on
+// failure is admitted with the flag, the firehose and the satellites without
+// it, whatever the step says.
+func TestAStepThatDoesNotContinueStopsOnFailure(t *testing.T) {
+	s := store.NewMockStore()
+	teamID := "team-stop"
+	policyID := "stop_policy"
+	s.CreateTeam(&model.Team{ID: teamID, DefaultPolicyID: policyID})
+	s.CreateUser(&model.User{ID: "U1", Name: "Nina"})
+	s.CreateEscalationPolicy(&model.EscalationPolicy{
+		ID: policyID, Name: "Stop",
+		Steps: []*model.EscalationStep{
+			{Provider: "slack", TargetKind: "channel", TargetType: "channel", TargetID: "C_OPS", StepIndex: 0, ContinueOnFailure: false},
+			{Provider: "slack", TargetKind: "dm", TargetType: "user", TargetID: "U1", StepIndex: 1, ContinueOnFailure: true},
+		},
+	})
+	cfg := &config.Config{Global: config.GlobalConfig{FirehoseCriticalChannel: "C_FIRE"}}
+	eng := NewEngine(s, &fakeProjection{}, cfg)
+	s.CreateAlertGroup(&model.AlertGroup{
+		ID: "ag-stop", AlertKey: "dk-stop", Status: model.AlertGroupStatusNew,
+		TeamID: teamID, Severity: "critical",
+	})
+	eng.ProcessNewAlertGroups(context.Background())
+
+	admission, admitted := s.AdmissionFor("ag-stop")
+	if !admitted {
+		t.Fatal("nothing was admitted")
+	}
+	stops := map[string]bool{}
+	for _, c := range admission.Admission.Commitments {
+		if c.PayloadSchemaVersion != 2 {
+			t.Fatalf("%s %s was admitted with payload version %d", c.Target.Kind, c.Target.Ref, c.PayloadSchemaVersion)
+		}
+		payload, ok := c.Payload.(keys.EscalationPayloadV2)
+		if !ok {
+			t.Fatalf("%s %s carries a %T", c.Target.Kind, c.Target.Ref, c.Payload)
+		}
+		stops[string(c.Target.Kind)+" "+c.Target.Ref+" "+string(c.Slot.Kind)] = payload.StopOnFailure
+	}
+	want := map[string]bool{
+		"channel C_OPS policy": true, "thread C_OPS policy": false, "thread_reply C_OPS policy": false,
+		"user U1 policy":          false,
+		"channel C_FIRE firehose": false, "thread C_FIRE firehose": false, "thread_reply C_FIRE firehose": false,
+	}
+	for name, flag := range want {
+		if got, ok := stops[name]; !ok || got != flag {
+			t.Errorf("%s stops on failure: %v (present %v), want %v", name, got, ok, flag)
+		}
+	}
 }

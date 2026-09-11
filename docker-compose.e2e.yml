@@ -59,11 +59,9 @@ services:
 
   # The maintenance CLI, run one command at a time with `docker compose run`.
   #
-  # It exists so the destructive schedule reset can run with the application
-  # stopped, which is what the upgrade checklist requires of an operator. The
-  # reset drops the pre-revision tables and tightens a column; doing that
-  # against a live application would be rehearsing a procedure nobody is
-  # supposed to follow.
+  # It builds the data the suite logs into and works against - the admin user,
+  # the seeded teams, policies and integrations - from the same image the
+  # application runs, so the commands under test are the shipped ones.
   #
   # Behind a profile so it never starts with `up`: it is a command, not a
   # service, and a container that exits immediately would look like a crash.

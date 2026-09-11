@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"time"
 
 	"github.com/tokayops/tokayops/internal/erasure"
@@ -51,18 +52,34 @@ func (r *erasureRepo) WithinTx(ctx context.Context, fn func(erasure.Tx) error) e
 		}
 	}()
 
-	if err := fn(&erasureTx{tx: tx}); err != nil {
+	unit := &erasureTx{tx: tx}
+	if err := fn(unit); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	committed = true
+
+	// After the commit, never inside it: an erasure that rolled back would
+	// otherwise report deliveries as withdrawn while they are still going out,
+	// and this counter is the one an operator watches for pages that did not
+	// happen.
+	countWithdrawn(unit.withdrawn)
 	return nil
 }
 
 type erasureTx struct {
 	tx *sql.Tx
+
+	// withdrawn is the commitments this erasure ended, by the family each ran
+	// in, held until the transaction commits. See WithinTx.
+	//
+	// By family and not as one number: the counter is watched per partition,
+	// and an announcement withdrawn from the handover queue counted against
+	// paging reads as an escalation that did not go out - which is what
+	// somebody is woken up for.
+	withdrawn map[string]int
 }
 
 // adminLifecycleLockKey is an arbitrary but fixed advisory-lock key. Every
@@ -230,6 +247,182 @@ func (t *erasureTx) DeleteUserExternalIdentities(ctx context.Context, userID str
 func (t *erasureTx) DeleteUserLinkTokens(ctx context.Context, userID string) error {
 	_, err := t.tx.ExecContext(ctx, `DELETE FROM link_tokens WHERE user_id = $1`, userID)
 	return err
+}
+
+// CancelLiveOutboundIntentsForUser marks this person's commitments as erased
+// and withdraws what is still owed to them.
+//
+// The MARKER comes first, and it is the point of the whole operation: erasure
+// is not a sweep that cleans up once, it is a durable prohibition every later
+// writer has to honour. A result already in flight, a late observation from a
+// worker whose lease was reclaimed, an operator reviving a failed commitment -
+// each of those would otherwise put the address back minutes after the person
+// was erased.
+//
+// Then the withdrawal, and three states get three answers - the same split the
+// acknowledgement path makes:
+//
+//   - pending and manual_review: nothing has gone out and nothing will.
+//     Withdrawn outright, and the lease goes with them so a worker holding one
+//     finds out at its next compare-and-set.
+//   - sending: a call is in flight and may already have landed. FLAGGED, not
+//     withdrawn - and the journal says cancellation_requested, because
+//     "canceled" would be a claim about an external effect nobody knows the
+//     fate of yet.
+//   - anything with a receipt: left alone. Something exists out there, and
+//     erasure removes the ability to CONTACT a person rather than unsending
+//     what was sent. Its coordinates are redacted below.
+//
+// The rows are taken in one statement per state, ordered by id, and the
+// commitments are locked before the attempts under them - the same order
+// Finalize takes, because the opposite order is a deadlock waiting for a busy
+// afternoon.
+func (t *erasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID string) error {
+	if _, err := t.tx.ExecContext(ctx, `
+		UPDATE outbound_intents SET recipient_erased_at = now(), updated_at = now()
+		WHERE target_kind = 'user' AND target_ref = $1 AND recipient_erased_at IS NULL`,
+		userID); err != nil {
+		return fmt.Errorf("mark the commitments of an erased user: %w", err)
+	}
+
+	withdrawn, err := t.withdrawOutbound(ctx, `
+		UPDATE outbound_intents
+		SET status = 'canceled', lease_token = NULL, locked_until = NULL,
+		    worker_id = NULL, updated_at = now()
+		WHERE target_kind = 'user' AND target_ref = $1
+		  AND NOT receipt_recorded AND status IN ('pending', 'manual_review')
+		RETURNING id, delivery_family`, userID, "canceled",
+		"the recipient was erased")
+	if err != nil {
+		return err
+	}
+
+	if _, err := t.withdrawOutbound(ctx, `
+		UPDATE outbound_intents
+		SET cancellation_requested = TRUE, updated_at = now()
+		WHERE target_kind = 'user' AND target_ref = $1
+		  AND NOT receipt_recorded AND status = 'sending'
+		RETURNING id, delivery_family`, userID, "cancellation_requested",
+		"the recipient was erased; this send was already in flight"); err != nil {
+		return err
+	}
+
+	// Counted, not returned: the caller is the erasure service, which has no
+	// business knowing how many messages somebody was owed.
+	if t.withdrawn == nil {
+		t.withdrawn = map[string]int{}
+	}
+	for family, n := range withdrawn {
+		t.withdrawn[family] += n
+	}
+	return nil
+}
+
+// withdrawOutbound runs one withdrawal and writes a line in each commitment's
+// own journal, saying what actually happened to it. The reason names nobody: it
+// is written into a row that survives the person it is about.
+func (t *erasureTx) withdrawOutbound(ctx context.Context, query, userID, kind, reason string) (map[string]int, error) {
+	rows, err := t.tx.QueryContext(ctx, query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("withdraw the notifications of an erased user: %w", err)
+	}
+	type withdrawal struct{ id, family string }
+	var withdrawn []withdrawal
+	for rows.Next() {
+		var w withdrawal
+		if err := rows.Scan(&w.id, &w.family); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		withdrawn = append(withdrawn, w)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	byFamily := map[string]int{}
+	for _, w := range withdrawn {
+		if err := appendIntentEventTx(ctx, t.tx, w.id, nextEventSeq, kind,
+			reason, outbound.ActorErasure); err != nil {
+			return nil, err
+		}
+		byFamily[w.family]++
+	}
+	return byFamily, nil
+}
+
+// ScrubOutboundEndpointsForUser removes every personal coordinate the delivery
+// domain holds for this person, in all three tables that can hold one.
+//
+// What goes: the address a message was sent to (bound_endpoint), the receipt
+// that says where the message ended up, and the response summary - which reads
+// "accepted with channel=D0123" and is therefore an address in prose.
+//
+// What stays, deliberately: the outcome, the applied revision and the completion
+// fingerprint. The first two name nobody. The fingerprint is a SHA-256 whose
+// inputs include the receipt reference, which makes it pseudonymous rather than
+// irreversible - channel ids are enumerable, so the hash confirms a guess for
+// anybody who already holds both this database and a candidate list. It is kept
+// with that risk named, because it is what tells an idempotent repeat from a
+// conflict: without it one delivery could be finalised twice with two different
+// answers and nothing would notice.
+//
+// And the FACT of a receipt stays: receipt_recorded remains true with
+// receipt_redacted_at set, so the state machine still knows a message exists out
+// there rather than deciding it never happened.
+//
+// The commitments are updated before the attempts under them. That is the order
+// Finalize takes - the commitment, then its attempt - and taking it the other
+// way round here is what turns a busy afternoon into a deadlock.
+func (t *erasureTx) ScrubOutboundEndpointsForUser(ctx context.Context, userID string) error {
+	if _, err := t.tx.ExecContext(ctx, `
+		UPDATE outbound_intents
+		SET bound_endpoint = NULL,
+		    receipt = NULL,
+		    -- The name goes with the coordinates: it is a channel and a
+		    -- timestamp, or a chat and a message, which is an address by
+		    -- another spelling.
+		    receipt_ref = NULL,
+		    receipt_redacted_at = CASE
+		        WHEN receipt_recorded THEN COALESCE(receipt_redacted_at, now())
+		        ELSE NULL END,
+		    updated_at = now()
+		WHERE target_kind = 'user' AND target_ref = $1
+		  AND (bound_endpoint IS NOT NULL OR receipt IS NOT NULL
+		       OR receipt_ref IS NOT NULL)`, userID); err != nil {
+		return fmt.Errorf("scrub the commitment endpoints of an erased user: %w", err)
+	}
+
+	if _, err := t.tx.ExecContext(ctx, `
+		UPDATE outbound_attempts a
+		SET bound_endpoint = NULL,
+		    receipt = NULL,
+		    receipt_redacted_at = CASE
+		        WHEN a.receipt_recorded THEN COALESCE(a.receipt_redacted_at, now())
+		        ELSE NULL END,
+		    response_summary = NULL
+		FROM outbound_intents i
+		WHERE i.id = a.intent_id AND i.target_kind = 'user' AND i.target_ref = $1
+		  AND (a.bound_endpoint IS NOT NULL OR a.receipt IS NOT NULL
+		       OR a.response_summary IS NOT NULL)`, userID); err != nil {
+		return fmt.Errorf("scrub the attempt endpoints of an erased user: %w", err)
+	}
+
+	if _, err := t.tx.ExecContext(ctx, `
+		UPDATE outbound_attempt_observations o
+		SET receipt = NULL,
+		    receipt_redacted_at = CASE
+		        WHEN o.receipt_recorded THEN COALESCE(o.receipt_redacted_at, now())
+		        ELSE NULL END,
+		    response_summary = NULL
+		FROM outbound_attempts a JOIN outbound_intents i ON i.id = a.intent_id
+		WHERE a.id = o.attempt_id AND i.target_kind = 'user' AND i.target_ref = $1
+		  AND (o.receipt IS NOT NULL OR o.response_summary IS NOT NULL)`,
+		userID); err != nil {
+		return fmt.Errorf("scrub the observed endpoints of an erased user: %w", err)
+	}
+	return nil
 }
 
 // NullifyOverrideRevisionReasons clears free text on override revisions where

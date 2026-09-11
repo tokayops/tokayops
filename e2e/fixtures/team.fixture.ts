@@ -100,7 +100,7 @@ export async function deleteTeam(page: Page, teamId: string): Promise<DeleteOutc
   // that merely mentioned the name while meaning something else.
   //
   // The refusal used to arrive as a 500 carrying a constraint name, and this
-  // helper accepted that shape too while Sprint 6C was pending. It no longer
+  // helper accepted that shape too while the fix was pending. It no longer
   // does: a 500 here is now a defect, and accepting one would hide exactly the
   // regression this branch was written for.
   //

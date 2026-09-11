@@ -163,7 +163,10 @@ const Components = {
                     <i data-lucide="calendar" class="nav-icon"></i>
                     <span class="nav-text">On-Call</span>
                 </a>
-                <a href="#/ops/activity" class="nav-item disabled" title="Coming soon">
+                <a href="${Permissions.isAdmin() ? '#/ops/activity' : 'javascript:void(0)'}"
+                   class="nav-item ${Permissions.isAdmin() ? '' : 'disabled'}"
+                   data-route="activity"
+                   ${Permissions.isAdmin() ? '' : 'title="The delivery journal is available to administrators"'}>
                     <i data-lucide="activity" class="nav-icon"></i>
                     <span class="nav-text">Activity</span>
                 </a>
@@ -698,12 +701,26 @@ const Components = {
         const keyTypes = new Set(['created', 'acknowledged', 'resolved']);
         const emphasisClass = keyTypes.has(event.type) ? ' is-key' : ' is-minor';
 
-        // Build notification details from metadata. Sprint 4 renamed
+        // Build notification details from metadata. A rename moved
         // step_type values (slack_dm → dm, slack_channel → channel) and
         // introduced recipient_id in place of slack_user_id; firehose stays.
         let notificationDetails = '';
-        if (event.type === 'notification_sent' && event.metadata) {
-            const meta = event.metadata;
+        const meta = event.metadata || {};
+        if (meta.intent_id) {
+            // A line the delivery domain wrote: who it went to and through
+            // what, from the row rather than from the prose. The journal of
+            // the delivery is the administrator's, and offered only to them.
+            const target = Components.deliveryTarget(meta.target_kind, meta.target_ref);
+            const journal = window.Permissions && Permissions.isAdmin()
+                ? `<button type="button" class="btn-link journal-link" data-delivery-id="${escapeAttr(meta.intent_id)}">journal</button>`
+                : '';
+            notificationDetails = `
+                <div class="timeline-notification-details timeline-delivery" data-delivery-id="${escapeAttr(meta.intent_id)}">
+                    ${target}
+                    <span class="timeline-delivery-provider">via ${escapeHtml(meta.provider || '')}</span>
+                    ${journal}
+                </div>`;
+        } else if (event.type === 'notification_sent' && event.metadata) {
             if (meta.step_type === 'dm' && (meta.user_name || meta.recipient_id)) {
                 const userName = meta.user_name || meta.recipient_id;
                 notificationDetails = `
@@ -733,6 +750,28 @@ const Components = {
                 </div>
             </div>
         `;
+    },
+
+    /**
+     * Where a delivery went, as the deliveries module labels it: a person by
+     * id until the directory answers with a name, a channel, a subscriber.
+     */
+    deliveryTarget: (kind, ref) => {
+        const id = escapeHtml(ref || '');
+        switch (kind) {
+            case 'user':
+                return `<span class="delivery-target" data-user-id="${escapeAttr(ref || '')}"><i data-lucide="user"></i><span class="delivery-target-name">${id}</span></span>`;
+            case 'channel':
+                return `<span class="delivery-target"><i data-lucide="hash"></i><span>${id}</span></span>`;
+            case 'thread':
+                return `<span class="delivery-target"><i data-lucide="message-square"></i><span>thread in #${id}</span></span>`;
+            case 'thread_reply':
+                return `<span class="delivery-target"><i data-lucide="corner-down-right"></i><span>reply in #${id}</span></span>`;
+            case 'subscriber':
+                return `<span class="delivery-target"><i data-lucide="webhook"></i><span>subscriber ${id}</span></span>`;
+            default:
+                return `<span class="delivery-target">${escapeHtml(kind || '')} ${id}</span>`;
+        }
     },
 
     /**
@@ -1347,7 +1386,7 @@ const Components = {
                 chips.push(`<span class="step-delay">(${delayStr})</span>`);
             }
 
-            // Sprint 4: chips read step.target_kind ("dm" / "channel").
+            // Chips read step.target_kind ("dm" / "channel").
             const isChannel = step.target_kind === 'channel';
             const icon = isChannel ? 'hash' : 'user';
             const label = isChannel ? 'Channel' : 'DM';
@@ -1366,7 +1405,7 @@ const Components = {
      * @param {string} policyTeamId - Current policy's team ID
      */
     policyStepRow: (step, index, users = [], teams = [], policyTeamId = '', scheduleId = '', providers = []) => {
-        // Sprint 4: build the type dropdown from provider capabilities. Each
+        // The type dropdown is built from provider capabilities. Each
         // <option> value is "<provider>:<target_kind>", and the human label
         // capitalizes both pieces. If the registry is empty (offline / bad
         // wiring) fall back to a single Slack DM option so the editor stays
@@ -1417,7 +1456,7 @@ const Components = {
                     </div>
                     <span class="step-index-label">Step ${index + 1}</span>
                     <div class="step-header-actions">
-                        <label class="toggle-switch" title="Continue to next step on failure">
+                        <label class="toggle-switch" title="Continue to the next step when this one fails. Off: if this step fails, stop escalating - steps that have not gone out yet are withdrawn">
                             <input type="checkbox" class="continue-on-failure-input" ${step.continue_on_failure !== false ? 'checked' : ''}>
                             <span class="toggle-slider"></span>
                             <span class="toggle-text">Continue on fail</span>
@@ -1463,17 +1502,9 @@ const Components = {
                         <label>Delay (s)</label>
                         <input type="number" class="form-input delay-input" value="${step.delay_seconds || 0}" min="0">
                     </div>
-                    <div class="step-field step-field-sm">
-                        <label>Timeout (s)</label>
-                        <input type="number" class="form-input timeout-input" value="${step.timeout_seconds || 30}" min="1">
-                    </div>
-                    <div class="step-field step-field-sm">
-                        <label>Retries</label>
-                        <input type="number" class="form-input max-attempts-input" value="${step.max_attempts || 5}" min="1" max="10">
-                    </div>
                     <div class="step-field step-field-message">
-                        <label>Message <span class="variables-hint" title="{{.Title}}, {{.Severity}}, {{.Team}}, {{.AlertsCount}}">ⓘ</span></label>
-                        <input type="text" class="form-input message-input" placeholder="Custom message (optional)" value="${escapeHtml(step.message || '')}">
+                        <label>Message <span class="variables-hint" title="Text of the direct message. {{.Title}}, {{.Severity}}, {{.Team}} and {{.AlertsCount}} are filled in from the alert. A channel step posts the card, which is not changed.">ⓘ</span></label>
+                        <input type="text" class="form-input message-input" placeholder="Text of the direct message (optional)" value="${escapeHtml(step.message || '')}">
                     </div>
                 </div>
             </div>
@@ -1492,7 +1523,7 @@ const Components = {
         const currentScope = isGlobalPolicy ? 'global' : 'team';
         const isAdmin = Permissions.isAdmin();
         const defaultProvider = (State.providers || [])[0]?.name || '';
-        const steps = policy?.steps || [{ provider: defaultProvider, target_kind: 'dm', target_type: 'user', target_id: '', delay_seconds: 0, timeout_seconds: 30, max_attempts: 5, message: '', continue_on_failure: true }];
+        const steps = policy?.steps || [{ provider: defaultProvider, target_kind: 'dm', target_type: 'user', target_id: '', delay_seconds: 0, message: '', continue_on_failure: true }];
 
         // Build scope selector HTML
         const scopeSelectorHtml = isEdit

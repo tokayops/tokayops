@@ -66,7 +66,7 @@ func TestTelegramLink_RequestUnbindRoundTrip(t *testing.T) {
 }
 
 // TestTelegramLink_RequiresSelfURL: without TOKAY_SELF_URL the /start webhook can't be
-// registered, so linking can never complete — the endpoint fails fast (503) instead
+// registered, so linking can never complete - the endpoint fails fast (503) instead
 // of issuing a dead deep link.
 func TestTelegramLink_RequiresSelfURL(t *testing.T) {
 	s := store.NewMockStore()

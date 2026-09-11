@@ -13,11 +13,12 @@ import (
 	"github.com/tokayops/tokayops/internal/store"
 )
 
-// slackOTPTTL is how long an issued Slack OTP code stays valid (mirrors the pre-Sprint-3 5-min window).
+// slackOTPTTL is how long an issued Slack OTP code stays valid (the 5-minute
+// window this has always had).
 const slackOTPTTL = 5 * time.Minute
 
 // otpIssueRetries bounds the retry loop on the rare (provider, token_hash) collision in IssueLinkToken
-// — for a 6-digit code there are 1M values, so a fresh draw resolves it.
+// - for a 6-digit code there are 1M values, so a fresh draw resolves it.
 const otpIssueRetries = 5
 
 // generateSlackOTP returns a fresh 6-digit code.

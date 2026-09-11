@@ -61,7 +61,7 @@ export const Permissions = {
 
     /**
      * Get team IDs where the user has team_admin role.
-     * Always returns an array (empty for admin — caller should check isAdmin() separately).
+     * Always returns an array (empty for admin - caller should check isAdmin() separately).
      */
     getAdminTeamIds() {
         if (!this.user) return [];

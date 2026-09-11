@@ -35,7 +35,7 @@ type TransitionInput struct {
 //
 // It used to carry ExpectedActiveGroupID and PreservesActiveGroup as well, for
 // a commit-time guard to check the planner against itself. The guard is gone
-// (Sprint 6D), and with it the only reader outside tests: both fields were
+// now, and with it the only reader outside tests: both fields were
 // still being computed on every save and looked at by nobody. What remains is
 // what the audit trail records - the phase action and the group selection go
 // into change_summary, where a person can ask later what a save decided.

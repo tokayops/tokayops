@@ -271,11 +271,6 @@ func (t *scheduleConfigTx) ActiveUserIDs(ctx context.Context, userIDs []string) 
 	return out, rows.Err()
 }
 
-// DeleteTeamMembership removes one membership.
-//
-// A membership that is not there is not an error: the caller asked for the
-// person to end up outside the team, and they are. The guard that decides
-// whether the removal is allowed at all lives in the service, above this.
 // LockTeam takes the row lock that serializes team deletion against anything
 // that would give the team a new child row.
 //
@@ -316,6 +311,11 @@ func (t *scheduleConfigTx) DeleteTeam(ctx context.Context, teamID string) error 
 	return nil
 }
 
+// DeleteTeamMembership removes one membership.
+//
+// A membership that is not there is not an error: the caller asked for the
+// person to end up outside the team, and they are. The guard that decides
+// whether the removal is allowed at all lives in the service, above this.
 func (t *scheduleConfigTx) DeleteTeamMembership(ctx context.Context, teamID, userID string) error {
 	_, err := t.tx.ExecContext(ctx,
 		`DELETE FROM team_members WHERE team_id = $1 AND user_id = $2`, teamID, userID)

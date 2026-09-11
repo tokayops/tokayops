@@ -11,17 +11,24 @@ const CurrentConfigVersion = 3 // v3: Removed providers, webhook_secret (use Int
 
 // GlobalConfig contains system-wide settings for routing and logging.
 type GlobalConfig struct {
-	FirehoseCriticalChannel string `yaml:"firehose_critical_channel"` // Channel for all critical alerts
-	FirehoseWarningChannel  string `yaml:"firehose_warning_channel"`  // Channel for all warning alerts
-	SelfURL                 string `yaml:"self_url"`                  // TokayOps base URL for deep links in Slack messages
-	DMFallbackToFirehose    *bool  `yaml:"dm_fallback_to_firehose"`   // If no primary delivery, use firehose permalink in DMs
+	// The firehose: one Slack channel per severity that gets a card for every
+	// alert of that severity, whatever the policy does. A severity whose
+	// channel is empty gets no firehose card, and so does a severity that is
+	// none of the three.
+	FirehoseCriticalChannel string `yaml:"firehose_critical_channel"`
+	FirehoseWarningChannel  string `yaml:"firehose_warning_channel"`
+	FirehoseInfoChannel     string `yaml:"firehose_info_channel"`
+	SelfURL                 string `yaml:"self_url"` // TokayOps base URL for deep links in Slack messages
+
+	// DMFallbackToFirehose decides whether a direct message points back to
+	// the firehose card when the policy posted no channel card of its own.
+	// Unset means yes, as it always did.
+	DMFallbackToFirehose *bool `yaml:"dm_fallback_to_firehose"`
 }
 
-func (g GlobalConfig) DmFallbackToFirehose() bool {
-	if g.DMFallbackToFirehose == nil {
-		return true
-	}
-	return *g.DMFallbackToFirehose
+// DMFallsBackToFirehose is the setting with its default applied.
+func (g GlobalConfig) DMFallsBackToFirehose() bool {
+	return g.DMFallbackToFirehose == nil || *g.DMFallbackToFirehose
 }
 
 // Config is the root configuration structure (v2)

@@ -142,7 +142,8 @@ func (b *SSEBroker) Broadcast(msg SSEMessage) {
 }
 
 // --- HMAC Verification ---
-// Mirrors internal/outbox/sender.go:signPayload (line 161-167).
+// Mirrors internal/outbound/providers/webhook/transport.go (Sign): the hex
+// HMAC-SHA256 over "<timestamp>.<body>" with the shared secret.
 
 func verifySignature(timestamp string, body []byte, secret, providedSig string) bool {
 	prefix := "sha256="

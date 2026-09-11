@@ -258,6 +258,16 @@ func (t *testErasureTx) DeleteUserLinkTokens(ctx context.Context, userID string)
 	return nil
 }
 
+func (t *testErasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID string) error {
+	t.record("CancelLiveOutboundIntentsForUser")
+	return nil
+}
+
+func (t *testErasureTx) ScrubOutboundEndpointsForUser(ctx context.Context, userID string) error {
+	t.record("ScrubOutboundEndpointsForUser")
+	return nil
+}
+
 func (t *testErasureTx) DeleteUserTeamMemberships(ctx context.Context, userID string) error {
 	t.record("DeleteUserTeamMemberships")
 	teams, err := t.repo.store.GetTeamMembershipsForUser(userID)

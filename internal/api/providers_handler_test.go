@@ -12,7 +12,7 @@ import (
 )
 
 // fixedCaps is a tiny ProviderCapabilitiesLookup for handler tests so we
-// don't have to spin up a full dispatcher.
+// don't have to build a catalogue.
 type fixedCaps []ProviderCapability
 
 func (f fixedCaps) Capabilities(name string) (ProviderCapability, bool) {

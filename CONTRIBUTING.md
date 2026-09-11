@@ -96,7 +96,8 @@ them, so a PR cannot affect anyone's deployment.
 - **Delivery is at-least-once.** Do not build on an exactly-once assumption.
 - **Integration secrets** are encrypted with `ENCRYPTION_KEY`, which cannot be
   rotated.
-- **Notification channels** go through the provider abstraction in
-  `internal/dispatcher`. Read `internal/dispatcher/registry.go` and an existing
-  provider (`slack.go`, `telegram.go`) before adding one; ask in an issue if the
-  intended shape is not obvious from those.
+- **Notification channels** implement the `Channel` interface in
+  `internal/outbound`: prepare an address, execute one attempt, classify what
+  the provider answered. Read `internal/outbound/handler.go` and an existing
+  channel (`internal/outbound/providers/slack`, `.../telegram`) before adding
+  one; ask in an issue if the intended shape is not obvious from those.

@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -12,7 +14,7 @@ import (
 	"github.com/tokayops/tokayops/internal/store"
 )
 
-// Locks the Sprint-3-review webhook lifecycle contract: setWebhook on enable,
+// Locks the webhook lifecycle contract: setWebhook on enable,
 // no delete on a same-token edit, delete-old + set-new on rotation, delete on
 // disable/delete. Drives the integration handlers directly over a MockStore +
 // a recording fake TelegramAPI (no DB, no real Bot API).
@@ -148,6 +150,90 @@ func TestTelegramWebhookLifecycle(t *testing.T) {
 
 		if len(ft.delTokens) == 0 || ft.delTokens[len(ft.delTokens)-1] != "TOK1" {
 			t.Errorf("delete should DeleteWebhook(TOK1), got delTokens=%v", ft.delTokens)
+		}
+	})
+}
+
+// The effects of lifecycle commands run in the reverse order of their commits.
+//
+// Transactions are serialised by the row lock; the Telegram calls after them
+// are not, and two instances can run them in either order. The reconcile
+// decides by the row as it stands, so the order of the effects does not
+// decide what ends up registered. The barrier is the test itself: the commands
+// are run through the store, and their effects are then run backwards.
+func TestTelegramEffectsInReverseOrderRegisterOnlyTheCurrentToken(t *testing.T) {
+	ctx := context.Background()
+	rotate := func(t *testing.T, a *API, id, token string) store.IntegrationChange {
+		t.Helper()
+		cfg := fmt.Sprintf(`{"bot_token":%q,"secret_token":"SEK"}`, token)
+		change, err := a.store.UpdateIntegration(ctx, id, store.IntegrationPatch{Config: []byte(cfg)}, "nina")
+		if err != nil {
+			t.Fatalf("rotate to %s: %v", token, err)
+		}
+		return change
+	}
+
+	t.Run("two rotations, effects backwards", func(t *testing.T) {
+		a, ft := newLifecycleAPI(t)
+		id := lcCreateEnabled(t, a, "T1", "SEK")
+		first := rotate(t, a, id, "T2")  // T1 -> T2, committed
+		second := rotate(t, a, id, "T3") // T2 -> T3, committed
+
+		a.reconcileTelegramWebhook(ctx, id, second.Before, second.After)
+		a.reconcileTelegramWebhook(ctx, id, first.Before, first.After)
+
+		if got := ft.registeredTokens(); !reflect.DeepEqual(got, []string{"T3"}) {
+			t.Fatalf("registered %v, want only the current token T3", got)
+		}
+	})
+
+	t.Run("an edit and a deletion, effects backwards", func(t *testing.T) {
+		a, ft := newLifecycleAPI(t)
+		id := lcCreateEnabled(t, a, "T1", "SEK")
+		edit := rotate(t, a, id, "T2")
+		deletion, err := a.store.DeleteIntegration(ctx, id, "nina")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		a.reconcileTelegramWebhook(ctx, id, deletion.Before)
+		a.reconcileTelegramWebhook(ctx, id, edit.Before, edit.After)
+
+		if got := ft.registeredTokens(); len(got) != 0 {
+			t.Fatalf("a deleted integration has a webhook registered: %v", got)
+		}
+	})
+
+	t.Run("rotating back never removes the live token", func(t *testing.T) {
+		a, ft := newLifecycleAPI(t)
+		id := lcCreateEnabled(t, a, "T1", "SEK")
+		away := rotate(t, a, id, "T2")
+		a.reconcileTelegramWebhook(ctx, id, away.Before, away.After)
+		back := rotate(t, a, id, "T1")
+		deletesBefore := len(ft.delTokens)
+		a.reconcileTelegramWebhook(ctx, id, back.Before, back.After)
+
+		if got := ft.registeredTokens(); !reflect.DeepEqual(got, []string{"T1"}) {
+			t.Fatalf("registered %v, want T1", got)
+		}
+		for _, token := range ft.delTokens[deletesBefore:] {
+			if token == "T1" {
+				t.Fatalf("rotating back to T1 removed T1 on the way: %v", ft.delTokens[deletesBefore:])
+			}
+		}
+	})
+
+	t.Run("switching off with the same token removes it", func(t *testing.T) {
+		a, ft := newLifecycleAPI(t)
+		id := lcCreateEnabled(t, a, "T1", "SEK")
+		off := false
+		change, err := a.store.UpdateIntegration(ctx, id, store.IntegrationPatch{Enabled: &off}, "nina")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.reconcileTelegramWebhook(ctx, id, change.Before, change.After)
+		if got := ft.registeredTokens(); len(got) != 0 {
+			t.Fatalf("a switched-off bot has a webhook registered: %v", got)
 		}
 	})
 }

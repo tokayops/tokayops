@@ -14,6 +14,22 @@ let deliveries = [];
 let deliveryPagination = null;
 let currentDeliveryIntegrationId = null;
 
+// One idempotency key per unfinished replay, by delivery. The key is made when
+// the button is pressed and lives until the answer proves something: a 2xx or a
+// 4xx ends it (done, or refused outright), while a 5xx or no answer at all
+// keeps it - the server may have committed and lost the response, and the next
+// press must find the same new delivery rather than make a second one. A press
+// after an answer is a second decision and gets a new key. The page's memory is
+// the boundary: a reload starts over, deliberately.
+const replayKeys = new Map();
+
+function newIdempotencyKey() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+    }
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
 /**
  * Parse custom headers text into an object.
  * Returns { ok: true, headers: {} } or { ok: false, error: string }.
@@ -706,26 +722,40 @@ async function openDeliveriesViewFromDetail(integrationId) {
 }
 
 /**
- * Handle replay delivery
+ * Handle replay delivery: one request per press, the button held while it is
+ * in flight, and the NEW delivery opened when it succeeds - the original stays
+ * exactly as it was, so reopening it would show a screen that never changes.
  */
 async function handleReplayDelivery(integrationId, deliveryId) {
+    const slot = `${integrationId}/${deliveryId}`;
+    if (!replayKeys.has(slot)) replayKeys.set(slot, newIdempotencyKey());
+    const key = replayKeys.get(slot);
+
+    const buttons = Array.from(document.querySelectorAll('.replay-btn, #delivery-detail-replay-btn'))
+        .filter(btn => btn.dataset.deliveryId === deliveryId);
+    buttons.forEach(btn => { btn.disabled = true; });
     try {
-        await API.integrations.replayDelivery(integrationId, deliveryId);
+        const result = await API.integrations.replayDelivery(integrationId, deliveryId, key);
+        replayKeys.delete(slot);
         showToast('Delivery queued for replay', 'success');
 
-        // Refresh current view immediately, then again after worker processes
-        const refresh = async () => {
-            if (modalMode === 'delivery-detail') {
-                await openDeliveryDetail(integrationId, deliveryId);
-            } else if (modalMode === 'deliveries') {
-                const page = deliveryPagination?.page || 1;
-                await loadDeliveryPage(integrationId, page);
+        const newDeliveryId = result?.delivery_id || deliveryId;
+        await openDeliveryDetail(integrationId, newDeliveryId);
+        // Once more after the worker has had its turn, if the screen is still
+        // on this delivery.
+        setTimeout(async () => {
+            if (modalMode === 'delivery-detail' && currentDeliveryIntegrationId === integrationId) {
+                await openDeliveryDetail(integrationId, newDeliveryId);
             }
-        };
-        await refresh();
-        setTimeout(refresh, 3000);
+        }, 3000);
     } catch (error) {
+        // A 4xx is the server refusing the request itself: nothing was made,
+        // and the same key would fail the same way. Anything else leaves the
+        // key for the next press.
+        if (error.status >= 400 && error.status < 500) replayKeys.delete(slot);
         showToast('Replay failed: ' + error.message, 'error');
+    } finally {
+        buttons.forEach(btn => { btn.disabled = false; });
     }
 }
 

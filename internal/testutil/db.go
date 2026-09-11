@@ -12,7 +12,7 @@ import (
 )
 
 // BindIdentity binds an external identity (provider + external ID) to a user via
-// the Epic 7 external_identities table. Fails the test on error. Use this so
+// the external_identities table. Fails the test on error. Use this so
 // escalation/handoff/syncer recipients resolve to a provider-specific ID.
 func BindIdentity(t *testing.T, s *store.Store, userID, provider, externalID string) {
 	t.Helper()
@@ -65,8 +65,12 @@ func TruncateTables(t testing.TB, s *store.Store) {
 	t.Helper()
 
 	tables := []string{
-		"event_outbox_delivery_attempts",
-		"event_outbox_deliveries",
+		"outbound_intent_events",
+		"outbound_attempt_observations",
+		"outbound_attempts",
+		"outbound_intents",
+		"outbound_group_snapshots",
+		"outbound_batches",
 		"event_outbox",
 		"integrations",
 		"schedule_revisions",
@@ -77,9 +81,6 @@ func TruncateTables(t testing.TB, s *store.Store) {
 		"schedules",
 		"timeline_events",
 		"team_members",
-		"job_steps",
-		"job_stages",
-		"jobs",
 		"alert_groups",
 		"users",
 		"teams",

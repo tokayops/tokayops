@@ -21,8 +21,9 @@ set -e
 # Defaults
 AUTO_DB=true
 RUN_PATTERN=""
-# ./cmd/... too: the schedule cutover startup gate can only be tested by
-# running the binary, so its test lives beside main.
+# ./cmd/... too: the command dispatch refuses an unknown first argument before
+# it touches the database, and proving that means running the binary, so its
+# test lives beside main.
 PACKAGE="./internal/... ./cmd/..."
 OUTPUT_MODE="full"  # full, summary, failures
 VERBOSE="-v"
@@ -41,6 +42,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pkg)
             PACKAGE="$2"
+            shift 2
+            ;;
+        # The SLO profiles run for minutes each, past go test's default ten
+        # per package; the profile target passes the budget they need.
+        --timeout)
+            TIMEOUT="$2"
             shift 2
             ;;
         --summary)
@@ -94,14 +101,21 @@ else
     fi
 fi
 
-# Build test command
-TEST_CMD="go test -p 1 -tags=integration $VERBOSE"
+# Build test command.
+#
+# -count=1 always, not only when shuffling. Go caches a test result by the
+# source and the environment, and neither of those mentions the database - so a
+# freshly created, empty instance answers with the results of the last one, and
+# the gate reports "(cached)" for tests that never ran against it.
+TEST_CMD="go test -p 1 -count=1 -tags=integration $VERBOSE"
 if $SHUFFLE; then
-    # -count=1 with it: a cached result was produced in some other order.
-    TEST_CMD="$TEST_CMD -shuffle=on -count=1"
+    TEST_CMD="$TEST_CMD -shuffle=on"
 fi
 if [ -n "$RUN_PATTERN" ]; then
     TEST_CMD="$TEST_CMD -run $RUN_PATTERN"
+fi
+if [ -n "${TIMEOUT:-}" ]; then
+    TEST_CMD="$TEST_CMD -timeout $TIMEOUT"
 fi
 TEST_CMD="$TEST_CMD $PACKAGE"
 

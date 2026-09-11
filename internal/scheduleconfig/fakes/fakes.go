@@ -997,6 +997,14 @@ func (t *erasureTx) DeleteUserLinkTokens(ctx context.Context, userID string) err
 	return t.wipe("DeleteUserLinkTokens", userID)
 }
 
+func (t *erasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID string) error {
+	return t.wipe("CancelLiveOutboundIntentsForUser", userID)
+}
+
+func (t *erasureTx) ScrubOutboundEndpointsForUser(ctx context.Context, userID string) error {
+	return t.wipe("ScrubOutboundEndpointsForUser", userID)
+}
+
 func (t *erasureTx) NullifyOverrideRevisionReasons(ctx context.Context, userID string) error {
 	return t.wipe("NullifyOverrideRevisionReasons", userID)
 }

@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"net/http"
 	"strconv"
 
@@ -26,13 +27,33 @@ type DeliveryDetailResponse struct {
 	Attempts []*model.DeliveryAttempt `json:"attempts"`
 }
 
-// ReplayDeliveryResponse represents the result of a replay request.
+// ReplayDeliveryResponse represents the result of a replay request. DeliveryID
+// is the commitment the replay stands for - the same one on a repeat with the
+// same Idempotency-Key, so the answer to a repeated request is indistinguishable
+// from the first.
 type ReplayDeliveryResponse struct {
-	OK      bool   `json:"ok"`
-	Message string `json:"message"`
+	OK         bool   `json:"ok"`
+	Message    string `json:"message"`
+	DeliveryID string `json:"delivery_id,omitempty"`
 }
 
+// idempotencyKeyLimit bounds the Idempotency-Key header: one to this many bytes.
+const idempotencyKeyLimit = 128
+
 // ListIntegrationDeliveries returns paginated deliveries for an integration.
+//
+// ListIntegrationDeliveries godoc
+// @Summary List the deliveries of a webhook integration
+// @Description The deliveries made to one generic webhook subscriber, newest first, in the subscriber's own vocabulary (pending, retry, sent, failed). History before the cutover to the delivery domain is not carried. Readable after the integration is deleted.
+// @Tags integrations
+// @Produce json
+// @Param id path string true "Integration ID"
+// @Param page query int false "Page (default 1)"
+// @Param limit query int false "Page size (default 50, at most 200)"
+// @Success 200 {object} DeliveryListResponse
+// @Failure 403 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Router /api/v1/integrations/{id}/deliveries [get]
 func (a *API) ListIntegrationDeliveries(c echo.Context) error {
 	integrationID := c.Param("id")
 
@@ -49,7 +70,7 @@ func (a *API) ListIntegrationDeliveries(c echo.Context) error {
 	}
 
 	offset := (page - 1) * limit
-	deliveries, total, err := a.store.GetDeliveriesByIntegrationID(integrationID, limit, offset)
+	deliveries, total, err := a.store.ListWebhookDeliveries(c.Request().Context(), integrationID, limit, offset)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
@@ -70,26 +91,29 @@ func (a *API) ListIntegrationDeliveries(c echo.Context) error {
 	})
 }
 
-// GetDeliveryDetail returns a delivery with its attempt history.
+// GetDeliveryDetail returns a delivery with its attempt history. A delivery
+// that is not this integration's is not found, whoever asks.
+//
+// GetDeliveryDetail godoc
+// @Summary One delivery of a webhook integration, with its attempts
+// @Description The delivery and every attempt made for it. The delivery id is the same id the journal under /deliveries answers about.
+// @Tags integrations
+// @Produce json
+// @Param id path string true "Integration ID"
+// @Param deliveryId path string true "Delivery ID"
+// @Success 200 {object} DeliveryDetailResponse
+// @Failure 403 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Router /api/v1/integrations/{id}/deliveries/{deliveryId} [get]
 func (a *API) GetDeliveryDetail(c echo.Context) error {
 	integrationID := c.Param("id")
 	deliveryID := c.Param("deliveryId")
 
-	delivery, err := a.store.GetOutboxDeliveryByID(deliveryID)
+	delivery, attempts, err := a.store.WebhookDelivery(c.Request().Context(), integrationID, deliveryID)
 	if err != nil {
-		if errors.Is(err, store.ErrOutboxDeliveryNotFound) {
+		if errors.Is(err, store.ErrWebhookDeliveryNotFound) {
 			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "delivery not found"})
 		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-	}
-
-	// IDOR check: delivery must belong to this integration
-	if delivery.IntegrationID != integrationID {
-		return c.JSON(http.StatusNotFound, ErrorResponse{Error: "delivery not found"})
-	}
-
-	attempts, err := a.store.GetDeliveryAttempts(deliveryID)
-	if err != nil {
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 	if attempts == nil {
@@ -102,34 +126,66 @@ func (a *API) GetDeliveryDetail(c echo.Context) error {
 	})
 }
 
-// ReplayDelivery resets a terminal delivery back to pending for the worker to re-deliver.
+// ReplayDelivery delivers the event of a finished delivery to the same
+// subscriber again, as a NEW delivery with the subscriber's current address and
+// configuration. The Idempotency-Key names the operator's decision: a repeat of
+// the request with the same key finds the same new delivery and gets the same
+// answer. A delivery still in progress is not replayed - a second live one
+// beside it would reach the subscriber twice for certain - and neither is
+// anything to a subscriber that is switched off: the switch withdrew its work,
+// and a replay would give it back.
+//
+// ReplayDelivery godoc
+// @Summary Deliver a finished delivery's event to the subscriber again
+// @Description Creates a NEW delivery of the same event to the same subscriber, at its current address. The Idempotency-Key header is required and names the decision: a repeat with the same key answers with the same delivery. A delivery still in progress is not replayed (409), and neither is one of a disabled integration (409).
+// @Tags integrations
+// @Produce json
+// @Param id path string true "Integration ID"
+// @Param deliveryId path string true "Delivery ID"
+// @Param Idempotency-Key header string true "1 to 128 bytes"
+// @Success 200 {object} ReplayDeliveryResponse
+// @Failure 400 {object} ErrorResponse
+// @Failure 403 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse
+// @Failure 410 {object} ErrorResponse
+// @Router /api/v1/integrations/{id}/deliveries/{deliveryId}/replay [post]
 func (a *API) ReplayDelivery(c echo.Context) error {
 	integrationID := c.Param("id")
 	deliveryID := c.Param("deliveryId")
 
-	delivery, err := a.store.GetOutboxDeliveryByID(deliveryID)
+	key := c.Request().Header.Get("Idempotency-Key")
+	if key == "" || len(key) > idempotencyKeyLimit {
+		return c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: "Idempotency-Key header is required and must be 1 to 128 bytes"})
+	}
+	userID, _ := c.Get("user_id").(string)
+	actor, err := outbound.UserActor(userID)
 	if err != nil {
-		if errors.Is(err, store.ErrOutboxDeliveryNotFound) {
-			return c.JSON(http.StatusNotFound, ErrorResponse{Error: "delivery not found"})
-		}
-		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		return c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "no user in the session"})
 	}
 
-	// IDOR check
-	if delivery.IntegrationID != integrationID {
+	result, err := a.store.ReplayWebhookDelivery(c.Request().Context(), store.WebhookReplayRequest{
+		IntegrationID: integrationID, DeliveryID: deliveryID, ClientRequestID: key, Actor: actor,
+	})
+	switch {
+	case errors.Is(err, store.ErrWebhookDeliveryNotFound):
 		return c.JSON(http.StatusNotFound, ErrorResponse{Error: "delivery not found"})
-	}
-
-	// Atomic: reset delivery + re-open parent event (CAS: only terminal deliveries)
-	if err := a.store.ReplayOutboxDelivery(deliveryID); err != nil {
-		if errors.Is(err, store.ErrOutboxDeliveryNotTerminal) {
-			return c.JSON(http.StatusConflict, ErrorResponse{Error: "delivery is already in progress"})
-		}
+	case errors.Is(err, store.ErrWebhookDeliveryNotTerminal):
+		return c.JSON(http.StatusConflict, ErrorResponse{Error: "delivery is already in progress"})
+	case errors.Is(err, store.ErrWebhookSubscriberDisabled):
+		return c.JSON(http.StatusConflict, ErrorResponse{Error: "integration is disabled; enable it to replay"})
+	case errors.Is(err, store.ErrWebhookReplayRetired):
+		return c.JSON(http.StatusGone, ErrorResponse{Error: err.Error()})
+	case errors.Is(err, store.ErrIntegrationBusy):
+		return c.JSON(http.StatusConflict, ErrorResponse{Error: "the delivery or its integration is being changed by another request, try again"})
+	case err != nil:
 		return c.JSON(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 	}
 
 	return c.JSON(http.StatusOK, ReplayDeliveryResponse{
-		OK:      true,
-		Message: "delivery queued for replay",
+		OK:         true,
+		Message:    "delivery queued for replay",
+		DeliveryID: result.DeliveryID,
 	})
 }

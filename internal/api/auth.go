@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	"log"
 	"net/http"
 	"os"
@@ -16,7 +17,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/tokayops/tokayops/internal/auth"
-	"github.com/tokayops/tokayops/internal/dispatcher"
 	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/store"
@@ -455,8 +455,9 @@ func (a *API) OIDCCallback(c echo.Context) error {
 // their email in the Slack workspace. Runs in a background goroutine during SSO login.
 //
 // Cheap pre-check first: skip the Slack API call entirely for already-linked users.
-// (Sprint 3 dropped the in-process user.SlackUserID guard; without this we'd hit
-// users.lookupByEmail on every OIDC login — rate limit / perf regression.)
+// (There is no in-process user.SlackUserID guard any more; without this we'd
+// hit users.lookupByEmail on every OIDC login - a rate limit and a perf
+// regression.)
 func (a *API) tryLinkSlackUser(userID, email string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -470,7 +471,7 @@ func (a *API) tryLinkSlackUser(userID, email string) {
 
 	slackUserID, err := a.slack.GetSlackUserIDByEmail(ctx, email)
 	if err != nil {
-		if !errors.Is(err, dispatcher.ErrSlackUserNotFound) {
+		if !errors.Is(err, slackprovider.ErrUserNotFound) {
 			log.Printf("tryLinkSlackUser: slack lookup failed for user %s: %v", userID, err)
 		}
 		return
@@ -479,7 +480,7 @@ func (a *API) tryLinkSlackUser(userID, email string) {
 	changed, err := a.store.BindExternalIdentityIfAbsent(userID, "slack", slackUserID, "")
 	if err != nil {
 		// ErrExternalIdentityAlreadyLinked means a *different* user owns that Slack id;
-		// fall through without surfacing — user can still link manually via OTP.
+		// fall through without surfacing - user can still link manually via OTP.
 		if !errors.Is(err, store.ErrExternalIdentityAlreadyLinked) {
 			log.Printf("tryLinkSlackUser: failed to save slack link for user %s: %v", userID, err)
 		}

@@ -2,7 +2,7 @@
        test-db-start test-db-stop test-db-status \
        test-integration test-integration-quick test-integration-run \
        test-integration-shuffle \
-       test-pipeline test-dispatcher \
+       test-pipeline test-delivery \
        e2e-install e2e-test e2e-test-ui e2e-test-headed e2e-up e2e-down \
        e2e-wait e2e-seed \
        webhook-receiver webhook-receiver-build
@@ -44,6 +44,21 @@ build: swagger
 test:
 	go test ./...
 
+# The Prometheus rules ship with the product and are checked like code: the
+# syntax, then the unit tests beside them. promtool comes from the
+# prom/prometheus image, pinned by digest (v3.5.0) because a tag can be moved
+# and a digest cannot: a new promtool cannot change what passes without a
+# change here. CI runs this same target.
+PROMETHEUS_IMAGE = prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+
+check-rules:
+	docker run --rm --entrypoint promtool \
+		-v "$(CURDIR)/deploy/prometheus:/rules:ro" $(PROMETHEUS_IMAGE) \
+		check rules /rules/tokayops.rules.yml
+	docker run --rm --entrypoint promtool \
+		-v "$(CURDIR)/deploy/prometheus:/rules:ro" -w /rules $(PROMETHEUS_IMAGE) \
+		test rules /rules/tokayops.rules.test.yml
+
 clean:
 	rm -f tokayops
 	rm -f docs/docs.go docs/swagger.json docs/swagger.yaml
@@ -68,15 +83,15 @@ test-db-status:
 test-integration:
 	@./scripts/run_integration_tests.sh --failures
 
-# Order independence of the store package, which is where the schema-mutating
-# cutover tests live. Inside the runner so the database it starts is still up:
+# Order independence of the store package, which is where the tests that reshape
+# the schema live. Inside the runner so the database it starts is still up:
 # see the --shuffle comment in the script.
 #
 # Scoped to ./internal/store/... deliberately. The tree as a whole has never
-# been order-independent - `-shuffle=on` over ./internal/... fails on `epic10`
-# too, in api, dispatcher and integration - and fixing that is a separate piece
-# of work, recorded in tokay-docs. Widening this target before then would give
-# it a red baseline and make it useless for the thing it was added to check.
+# been order-independent - `-shuffle=on` over ./internal/... fails in api and
+# integration too - and fixing that is a separate piece of work. Widening this
+# target before then would give it a red baseline and make it useless for the
+# thing it was added to check.
 test-integration-shuffle:
 	@./scripts/run_integration_tests.sh --shuffle --pkg ./internal/store/... --failures
 
@@ -93,9 +108,24 @@ test-integration-run:
 test-pipeline:
 	@./scripts/run_integration_tests.sh --run TestPipeline
 
-# Run dispatcher tests only
-test-dispatcher:
-	@./scripts/run_integration_tests.sh --pkg ./internal/dispatcher/... --failures
+# Run delivery tests only. One invocation with both patterns in a single --pkg:
+# the script keeps one package string and expands it unquoted, so a second
+# --pkg would silently replace the first, and a second invocation would collide
+# on the ephemeral database container.
+test-delivery:
+	@./scripts/run_integration_tests.sh --failures \
+		--pkg "./internal/outbound/... ./internal/handoff/..."
+
+# The SLO profiles, measured rather than reasoned about: paging on a quiet
+# instance, paging under the webhook steady state, the webhook burst on a free
+# pool, and the handover burst. Minutes each, on purpose, and not in the
+# ordinary run - the flag is what lets them run at all, and the numbers they
+# print are what the sprint plan records.
+test-profile:
+	@TOKAY_PROFILE_SLO=1 ./scripts/run_integration_tests.sh \
+		--pkg ./internal/integration/... \
+		--run 'Profile|WebhookBacklog|WebhookBurst' \
+		--timeout 45m
 
 # =============================================================================
 # E2E Testing
@@ -103,19 +133,14 @@ test-dispatcher:
 e2e-install:
 	cd e2e && npm install && npx playwright install chromium firefox
 
-# Always from a fresh volume. The environment is built by seeding and then
-# resetting, and the reset records a marker that makes it a no-op afterwards -
-# so running this twice against a surviving database would re-seed the legacy
-# schedules and have nothing left to remove them. Starting clean is also what
-# e2e-test already assumed: it tears the stack down after every run.
+# Always from a fresh volume: e2e-test tears the stack down after every run, and
+# the seed below is written for an empty database rather than for whatever the
+# last run left behind.
 #
-# The database comes up alone, the CLI runs against it, and only then does the
-# application start. That order is the production cutover procedure, and the
-# reason to reproduce it is that `migrate reset-schedules` is no longer only
-# DML: it drops the pre-revision tables and tightens a column, taking ACCESS
-# EXCLUSIVE locks. The upgrade checklist requires every instance to be stopped
-# for exactly that reason, and the only automated rehearsal of the cutover we
-# have should not be rehearsing something the checklist forbids.
+# The database comes up alone, the CLI containers run against it, and only then
+# does the application start. Seeding before the first request is what makes the
+# state deterministic when Playwright connects; schedules are not seeded at all -
+# the setup project creates them through the API.
 e2e-up: e2e-down
 	docker compose -f docker-compose.e2e.yml up -d --wait e2e_db
 	$(MAKE) e2e-seed
@@ -140,21 +165,14 @@ e2e-wait:
 	docker compose -f docker-compose.e2e.yml logs tokay_app; \
 	exit 1
 
-# e2e-seed is the data half of the environment: the admin the suite logs in as,
-# the seeded teams, and the destructive reset.
+# e2e-seed is the data half of the environment: the admin the suite logs in as
+# and the seeded teams, policies and integrations.
 #
 # It is a target of its own so that CI calls it instead of keeping a copy of
-# these three commands. It used to keep one, and when Epic 10 Sprint 5.5 added
-# the reset below, the workflow's copy never got it - so `env.spec.ts` failed on
-# every branch in CI while every local run was green. One definition of the
-# environment, called from both places, is the only thing that stops that
-# happening again.
-#
-# The reset no longer has anything to delete - `seed` stopped writing schedules
-# when the legacy write path was removed - and it stays anyway, without `|| true`,
-# so a failure fails the environment. On every run it puts the real CLI against
-# the real schema and leaves the marker a database has after an upgrade, which is
-# the state the suite is supposed to run against.
+# these commands. It used to keep one, and when a step was added here the
+# workflow's copy never got it - so `env.spec.ts` failed on every branch in CI
+# while every local run was green. One definition of the environment, called
+# from both places, is the only thing that stops that happening again.
 #
 # These run as one-shot containers rather than `exec` into a running app,
 # because the application is deliberately not running yet - see e2e-up. Each
@@ -165,7 +183,6 @@ e2e-wait:
 e2e-seed:
 	docker compose -f docker-compose.e2e.yml run --rm --build tokay_cli user create admin@example.com 'Admin123!' 'Test Admin' || true
 	docker compose -f docker-compose.e2e.yml run --rm tokay_cli seed || true
-	docker compose -f docker-compose.e2e.yml run --rm tokay_cli migrate reset-schedules
 
 e2e-down:
 	docker compose -f docker-compose.e2e.yml down -v --remove-orphans

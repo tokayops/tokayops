@@ -1,6 +1,6 @@
 # Build
 # Native builder, cross-compiled output - see the note in the root Dockerfile.
-FROM --platform=$BUILDPLATFORM golang:1.25.8-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25.13-alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache git
 COPY go.mod go.sum ./

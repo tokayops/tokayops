@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -11,45 +13,44 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/integrations"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
+	"github.com/tokayops/tokayops/internal/outbound/providers"
 )
 
 // MockStore is an in-memory implementation of StoreInterface for testing.
 type MockStore struct {
+	// admissions is what SubmitBatch accepted, by batch key.
+	admissions map[string]*admittedBatch
+
 	mu sync.RWMutex
 
-	alertGroups            map[string]*model.AlertGroup
-	incidents              map[int]*model.Incident
-	incidentSeq            int
-	teams                  map[string]*model.Team
-	users                  map[string]*model.User
-	erasedUsers            map[string]bool
-	teamMembers            map[string]map[string]model.TeamMemberRole // teamID -> userID -> role
-	timelineEvents         map[string][]*model.TimelineEvent          // alertGroupID -> events
-	apiTokens              map[string]*model.APIToken                 // tokenID -> token
-	externalIdentities     map[string]*model.ExternalIdentity         // "userID|provider" -> identity
-	linkTokens             map[string]mockLinkToken                   // "userID|provider" -> link token
-	jobs                   map[string]*model.Job                      // jobID -> job
-	jobStages              map[string]*model.JobStage                 // stageID -> stage
-	jobSteps               map[string]*model.JobStep                  // stepID -> step
-	escalationPolicies     map[string]*model.EscalationPolicy         // policyID -> policy
-	integrations           map[string]*model.Integration              // integrationID -> integration
-	notificationDeliveries map[string]*model.NotificationDelivery     // deliveryID -> delivery
-	outboxEvents           map[string]*model.OutboxEvent              // eventID -> event
-	outboxDeliveries       map[string]*model.OutboxDelivery           // deliveryID -> delivery
-	deliveryAttempts       map[string][]*model.DeliveryAttempt        // deliveryID -> attempts
+	alertGroups        map[string]*model.AlertGroup
+	incidents          map[int]*model.Incident
+	incidentSeq        int
+	teams              map[string]*model.Team
+	users              map[string]*model.User
+	erasedUsers        map[string]bool
+	teamMembers        map[string]map[string]model.TeamMemberRole // teamID -> userID -> role
+	timelineEvents     map[string][]*model.TimelineEvent          // alertGroupID -> events
+	apiTokens          map[string]*model.APIToken                 // tokenID -> token
+	externalIdentities map[string]*model.ExternalIdentity         // "userID|provider" -> identity
+	linkTokens         map[string]mockLinkToken                   // "userID|provider" -> link token
+	escalationPolicies map[string]*model.EscalationPolicy         // policyID -> policy
+	integrations       map[string]*model.Integration              // integrationID -> integration
+	tombstones         map[string]model.IntegrationTombstone      // integrationID -> what its deletion left
+	effectsMu          sync.Mutex                                 // the double's stand-in for the advisory lock
+	outboxEvents       map[string]*model.OutboxEvent              // eventID -> event
 
 	// Error injection for testing. When set, the corresponding method returns this error.
-	GetIntegrationByIDError       error
-	GetUserByIDError              error
-	CreateOutboxDeliveryError     error // returned by CreateOutboxDelivery (non-duplicate calls)
-	ExtendOutboxEventLeaseError   error // returned by ExtendOutboxEventLease
-	ExtendOutboxEventLeaseResult  *bool // if non-nil, overrides the ownership check result
-	UpdateOutboxEventIfOwnedError error // returned by UpdateOutboxEventIfOwned
-	ReplayOutboxDeliveryError     error // returned by ReplayOutboxDelivery
+	GetIntegrationByIDError error
+	GetUserByIDError        error
 }
 
 // NewMockStore creates a new MockStore with seed data.
@@ -64,17 +65,12 @@ func NewMockStore() *MockStore {
 		timelineEvents: make(map[string][]*model.TimelineEvent),
 		apiTokens:      make(map[string]*model.APIToken),
 
-		externalIdentities:     make(map[string]*model.ExternalIdentity),
-		linkTokens:             make(map[string]mockLinkToken),
-		jobs:                   make(map[string]*model.Job),
-		jobStages:              make(map[string]*model.JobStage),
-		jobSteps:               make(map[string]*model.JobStep),
-		escalationPolicies:     make(map[string]*model.EscalationPolicy),
-		integrations:           make(map[string]*model.Integration),
-		notificationDeliveries: make(map[string]*model.NotificationDelivery),
-		outboxEvents:           make(map[string]*model.OutboxEvent),
-		outboxDeliveries:       make(map[string]*model.OutboxDelivery),
-		deliveryAttempts:       make(map[string][]*model.DeliveryAttempt),
+		externalIdentities: make(map[string]*model.ExternalIdentity),
+		linkTokens:         make(map[string]mockLinkToken),
+		escalationPolicies: make(map[string]*model.EscalationPolicy),
+		integrations:       make(map[string]*model.Integration),
+		tombstones:         make(map[string]model.IntegrationTombstone),
+		outboxEvents:       make(map[string]*model.OutboxEvent),
 	}
 
 	// Seed data matching what InitDB would create
@@ -130,12 +126,12 @@ func (m *MockStore) Close() error {
 // Alert Groups (renamed from Incidents)
 // ========================================
 
-func (m *MockStore) GetActiveAlertGroup(dedupKey string) (*model.AlertGroup, error) {
+func (m *MockStore) GetActiveAlertGroupByAlertKey(alertKey string) (*model.AlertGroup, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	for _, ag := range m.alertGroups {
-		if ag.DedupKey == dedupKey &&
+		if ag.AlertKey == alertKey &&
 			ag.Status != model.AlertGroupStatusResolved &&
 			ag.Status != model.AlertGroupStatusClosed {
 			return m.copyAlertGroup(ag), nil
@@ -192,7 +188,15 @@ func (m *MockStore) insertOutboxEvent(event *model.OutboxEvent) {
 	m.outboxEvents[event.ID] = event
 }
 
-func (m *MockStore) UpdateAlertGroupStatus(id string, status model.AlertGroupStatus) error {
+// SetAlertGroupStatus puts a group into a status whatever it is in now.
+//
+// A test fixture, deliberately absent from StoreInterface: production moves a
+// group through the door that owns the move - AckAlertGroupAtomic,
+// ResolveAlertGroupAtomic - each of which states what it expected to find and
+// carries everything that goes with the change. Tests that rewind a group to
+// set up the next assertion have no such expectation to state, and saying so
+// here is better than keeping an unconditional setter in the contract.
+func (m *MockStore) SetAlertGroupStatus(id string, status model.AlertGroupStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -203,20 +207,6 @@ func (m *MockStore) UpdateAlertGroupStatus(id string, status model.AlertGroupSta
 			now := time.Now()
 			ag.ResolvedAt = &now
 		}
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
-func (m *MockStore) UpdateAlertGroupAcknowledged(id string, acknowledgedBy string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if ag, ok := m.alertGroups[id]; ok {
-		ag.Status = model.AlertGroupStatusAcknowledged
-		ag.AcknowledgedBy = acknowledgedBy
-		ag.AckProcessedAt = nil // Clear to allow re-processing on re-ack
-		ag.UpdatedAt = time.Now()
 		return nil
 	}
 	return sql.ErrNoRows
@@ -264,45 +254,137 @@ func (m *MockStore) UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResu
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) UpdateAlertGroupAlerts(id string, alerts []model.Alert) error {
+// ApplyAlertmanagerUpdateAtomic mirrors the store: the incident that is open
+// decides what the payload means, and it decides while holding it.
+//
+// One lock over the whole call, which is the guarantee the row lock gives - a
+// second payload for the same alert cannot read the set this one is about to
+// change and then act on what it read.
+//
+// What it does NOT model, and what therefore may not be asserted through it:
+// the withdrawal of what an incident still owes when it ends, and the revision
+// its messages are brought to. There are no commitments in here to withdraw and
+// no snapshot to raise. The outcomes ARE the same as the database's, and a test
+// proves that - see TestTheMockAndTheDatabaseAnswerAPayloadAlike; anything
+// beyond the outcome has to be asserted against a real one.
+func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
+	incoming []model.Alert, actor string) (alertgroup.MergeResult, error) {
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ag, ok := m.alertGroups[id]; ok {
-		ag.Alerts = make([]model.Alert, len(alerts))
-		copy(ag.Alerts, alerts)
-		ag.UpdatedAt = time.Now()
-		return nil
+	var group *model.AlertGroup
+	for _, ag := range m.alertGroups {
+		if ag.AlertKey == alertKey &&
+			ag.Status != model.AlertGroupStatusResolved &&
+			ag.Status != model.AlertGroupStatusClosed {
+			group = ag
+			break
+		}
 	}
-	return sql.ErrNoRows
+	if group == nil {
+		return alertgroup.MergeResult{Outcome: alertgroup.MergeNoActive}, nil
+	}
+
+	held := alertgroup.FingerprintsOf(group.Alerts)
+	relevant := alertgroup.FilterMergeable(incoming, held)
+	if len(relevant) == 0 {
+		return alertgroup.MergeResult{
+			Outcome: alertgroup.MergeIgnored, AlertGroupID: group.ID,
+		}, nil
+	}
+
+	merged := alertgroup.MergeAlerts(group.Alerts, relevant)
+	resolving := alertgroup.AllResolved(merged)
+	if !resolving && alertgroup.SameAlerts(group.Alerts, merged) {
+		return alertgroup.MergeResult{
+			Outcome: alertgroup.MergeUnchanged, AlertGroupID: group.ID,
+		}, nil
+	}
+
+	now := time.Now()
+	events := alertgroup.MergeTimelineEvents(group.ID, relevant, held, now)
+	group.Alerts = merged
+	group.UpdatedAt = now
+	group.RenderSourceVersion++
+
+	outcome := alertgroup.MergeMerged
+	if resolving {
+		events = append(events, &model.TimelineEvent{
+			ID:           uuid.New().String(),
+			AlertGroupID: group.ID,
+			Type:         model.TimelineEventResolved,
+			Message:      "Alert group resolved: all alerts cleared",
+			Actor:        actor,
+			CreatedAt:    now.Add(time.Duration(len(events)+1) * time.Microsecond),
+		})
+		group.Status = model.AlertGroupStatusResolved
+		group.ResolvedBy = actor
+		group.ResolvedAt = &now
+
+		payload, err := model.BuildWebhookEventPayload(
+			model.OutboxEventResolved, group, group.TeamNameSnapshot, actor, "", now)
+		if err != nil {
+			return alertgroup.MergeResult{}, err
+		}
+		m.insertOutboxEvent(&model.OutboxEvent{
+			EventType:    model.OutboxEventResolved,
+			AlertGroupID: group.ID,
+			TeamID:       group.TeamID,
+			Actor:        actor,
+			Payload:      payload,
+		})
+		outcome = alertgroup.MergeResolved
+	}
+	m.timelineEvents[group.ID] = append(m.timelineEvents[group.ID], events...)
+
+	return alertgroup.MergeResult{Outcome: outcome, AlertGroupID: group.ID}, nil
 }
 
-func (m *MockStore) GetNewAlertGroups() ([]*model.AlertGroup, error) {
+func (m *MockStore) GetEscalationSources(ctx context.Context) ([]*model.AlertGroup, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	staleThreshold := time.Now().Add(-30 * time.Second)
 	var result []*model.AlertGroup
 	for _, ag := range m.alertGroups {
-		if ag.Status == model.AlertGroupStatusNew {
-			result = append(result, m.copyAlertGroup(ag))
-		} else if ag.Status == model.AlertGroupStatusProcessing && ag.UpdatedAt.Before(staleThreshold) {
-			// Only include stale processing AGs that have NO escalation job at all (true orphan).
-			// If any escalation job exists (succeeded, failed, canceled, etc.), the AG was already
-			// processed and should not spawn a duplicate job.
-			hasAnyJob := false
-			for _, j := range m.jobs {
-				if j.AlertGroupID != nil && *j.AlertGroupID == ag.ID && j.Type == "escalation" {
-					hasAnyJob = true
-					break
-				}
-			}
-			if !hasAnyJob {
-				result = append(result, m.copyAlertGroup(ag))
-			}
+		switch {
+		case ag.Status == model.AlertGroupStatusNew:
+		case ag.Status == model.AlertGroupStatusProcessing &&
+			ag.UpdatedAt.Before(staleThreshold) && !m.admittedLocked(ag.ID):
+			// A true orphan: the status changed and the crash came before the
+			// admission. A group that HAS one has been escalated, whatever
+			// became of the deliveries under it, and never comes back.
+		default:
+			continue
 		}
+
+		source := m.copyAlertGroup(ag)
+		for _, e := range m.timelineEvents[ag.ID] {
+			event := *e
+			source.TimelineEvents = append(source.TimelineEvents, &event)
+		}
+		sort.SliceStable(source.TimelineEvents, func(i, j int) bool {
+			a, b := source.TimelineEvents[i], source.TimelineEvents[j]
+			if !a.CreatedAt.Equal(b.CreatedAt) {
+				return a.CreatedAt.Before(b.CreatedAt)
+			}
+			return a.ID < b.ID
+		})
+		result = append(result, source)
 	}
 	return result, nil
+}
+
+// admittedLocked says whether this group's escalation was already claimed. The
+// caller holds the lock.
+func (m *MockStore) admittedLocked(agID string) bool {
+	for _, batch := range m.admissions {
+		if batch.Admission.Admission.AlertGroupID == agID {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *MockStore) GetProcessingAlertGroups() ([]*model.AlertGroup, error) {
@@ -317,38 +399,6 @@ func (m *MockStore) GetProcessingAlertGroups() ([]*model.AlertGroup, error) {
 		}
 	}
 
-	// Populate timeline
-	for _, ag := range alertGroups {
-		events, _ := m.GetTimelineEvents(ag.ID)
-		ag.TimelineEvents = events
-	}
-	return alertGroups, nil
-}
-
-func (m *MockStore) GetAcknowledgedAlertGroups() ([]*model.AlertGroup, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	// Only return acknowledged alert groups that haven't been processed yet
-	var alertGroups []*model.AlertGroup
-	for _, ag := range m.alertGroups {
-		if ag.Status == model.AlertGroupStatusAcknowledged && ag.AckProcessedAt == nil {
-			alertGroups = append(alertGroups, m.copyAlertGroup(ag))
-		}
-	}
-
-	for _, ag := range alertGroups {
-		events, _ := m.GetTimelineEvents(ag.ID)
-		ag.TimelineEvents = events
-	}
-	return alertGroups, nil
-}
-
-func (m *MockStore) GetResolvedAlertGroups() ([]*model.AlertGroup, error) {
-	alertGroups, err := m.getAlertGroupsByStatus(model.AlertGroupStatusResolved)
-	if err != nil {
-		return nil, err
-	}
 	// Populate timeline
 	for _, ag := range alertGroups {
 		events, _ := m.GetTimelineEvents(ag.ID)
@@ -521,7 +571,7 @@ func compareSummaryField(a, b *model.AlertGroupSummary, field string) int {
 		if b.ResolvedAt != nil {
 			tb = *b.ResolvedAt
 		}
-		// NULLs (zero time) sort last in DESC, first in ASC — handled by caller via direction
+		// NULLs (zero time) sort last in DESC, first in ASC - handled by caller via direction
 		return timeCmp(ta, tb)
 	default: // "created_at" or empty
 		return timeCmp(a.CreatedAt, b.CreatedAt)
@@ -588,7 +638,7 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 			}
 		}
 		filtered = append(filtered, &model.AlertGroupSummary{
-			ID: ag.ID, DedupKey: ag.DedupKey, Status: ag.Status, Title: ag.Title,
+			ID: ag.ID, AlertKey: ag.AlertKey, Status: ag.Status, Title: ag.Title,
 			TeamID: ag.TeamID, Severity: ag.Severity, CurrentStep: ag.CurrentStep,
 			OnCallSnapshot: ag.OnCallSnapshot, ExternalURL: ag.ExternalURL,
 			AcknowledgedBy: ag.AcknowledgedBy, ResolvedBy: ag.ResolvedBy,
@@ -656,7 +706,8 @@ func (m *MockStore) TouchAlertGroup(id string) error {
 	return sql.ErrNoRows
 }
 
-func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (m *MockStore) AckAlertGroupAtomic(id string, who alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	actor := who.Name
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -672,8 +723,8 @@ func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string
 	now := time.Now()
 	ag.Status = model.AlertGroupStatusAcknowledged
 	ag.AcknowledgedBy = actor
-	ag.AckProcessedAt = nil
 	ag.UpdatedAt = now
+	ag.RenderSourceVersion++
 
 	// Add timeline event atomically (under same lock)
 	event := &model.TimelineEvent{
@@ -689,12 +740,11 @@ func (m *MockStore) AckAlertGroupAtomic(id, actor string, meta map[string]string
 
 	m.insertOutboxEvent(outboxEvent)
 
-	m.cancelJobByDedupKeyLocked(dedupKey)
-
 	return true, nil
 }
 
-func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]string, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
+func (m *MockStore) ResolveAlertGroupAtomic(id string, who alertgroup.Actor, meta map[string]string, outboxEvent *model.OutboxEvent) (bool, error) {
+	actor := who.Name
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -712,6 +762,7 @@ func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]st
 	ag.ResolvedBy = actor
 	ag.ResolvedAt = &now
 	ag.UpdatedAt = now
+	ag.RenderSourceVersion++
 
 	// Add timeline event atomically (under same lock)
 	event := &model.TimelineEvent{
@@ -727,300 +778,7 @@ func (m *MockStore) ResolveAlertGroupAtomic(id, actor string, meta map[string]st
 
 	m.insertOutboxEvent(outboxEvent)
 
-	m.cancelJobByDedupKeyLocked(dedupKey)
-
 	return true, nil
-}
-
-func (m *MockStore) ResolveAlertGroupWithAlertsAtomic(id string, alerts []model.Alert, timelineEvents []*model.TimelineEvent, outboxEvent *model.OutboxEvent, dedupKey string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ag, ok := m.alertGroups[id]
-	if !ok {
-		return false, nil
-	}
-	if ag.Status != model.AlertGroupStatusNew &&
-		ag.Status != model.AlertGroupStatusProcessing &&
-		ag.Status != model.AlertGroupStatusTriggered &&
-		ag.Status != model.AlertGroupStatusAcknowledged {
-		return false, nil
-	}
-
-	now := time.Now()
-	ag.Alerts = make([]model.Alert, len(alerts))
-	copy(ag.Alerts, alerts)
-	ag.Status = model.AlertGroupStatusResolved
-	ag.ResolvedBy = "system"
-	ag.ResolvedAt = &now
-	ag.UpdatedAt = now
-
-	for _, e := range timelineEvents {
-		eventCopy := *e
-		if eventCopy.CreatedAt.IsZero() {
-			eventCopy.CreatedAt = now
-		}
-		m.timelineEvents[id] = append(m.timelineEvents[id], &eventCopy)
-	}
-
-	m.insertOutboxEvent(outboxEvent)
-	m.cancelJobByDedupKeyLocked(dedupKey)
-
-	return true, nil
-}
-
-// cancelJobByDedupKeyLocked cancels jobs matching dedupKey. Caller must hold m.mu.
-func (m *MockStore) cancelJobByDedupKeyLocked(dedupKey string) {
-	if dedupKey == "" {
-		return
-	}
-	for _, job := range m.jobs {
-		if job.DedupKey != nil && *job.DedupKey == dedupKey {
-			if job.Status == model.JobStatusPending || job.Status == model.JobStatusRunning {
-				job.Status = model.JobStatusCanceled
-			}
-		}
-	}
-}
-
-func (m *MockStore) TransitionAlertGroupStatus(id string, fromStatus, toStatus model.AlertGroupStatus) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ag, ok := m.alertGroups[id]
-	if !ok {
-		return false, nil
-	}
-	if ag.Status != fromStatus {
-		return false, nil
-	}
-
-	ag.Status = toStatus
-	ag.UpdatedAt = time.Now()
-	return true, nil
-}
-
-func (m *MockStore) MarkAckProcessed(agID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if ag, ok := m.alertGroups[agID]; ok {
-		now := time.Now()
-		ag.AckProcessedAt = &now
-		ag.UpdatedAt = now
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
-func (m *MockStore) SetSlackUpdatePending(id string, pending bool) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if ag, ok := m.alertGroups[id]; ok {
-		ag.SlackUpdatePending = pending
-		ag.UpdatedAt = time.Now()
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
-func (m *MockStore) GetAlertGroupsPendingSlackUpdate() ([]*model.AlertGroup, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var alertGroups []*model.AlertGroup
-	for _, ag := range m.alertGroups {
-		if ag.SlackUpdatePending &&
-			(ag.Status == model.AlertGroupStatusProcessing ||
-				ag.Status == model.AlertGroupStatusAcknowledged ||
-				ag.Status == model.AlertGroupStatusTriggered) {
-			alertGroups = append(alertGroups, m.copyAlertGroup(ag))
-		}
-	}
-	return alertGroups, nil
-}
-
-// ========================================
-// Notification Deliveries
-// ========================================
-
-func (m *MockStore) UpsertNotificationDelivery(d *model.NotificationDelivery) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if d == nil {
-		return fmt.Errorf("delivery is nil")
-	}
-
-	now := time.Now()
-	if d.ID == "" {
-		d.ID = uuid.New().String()
-	}
-	if d.CreatedAt.IsZero() {
-		d.CreatedAt = now
-	}
-	d.UpdatedAt = now
-
-	if d.JobStepID != nil && *d.JobStepID != "" {
-		for _, existing := range m.notificationDeliveries {
-			if existing.JobStepID != nil && *existing.JobStepID == *d.JobStepID {
-				existing.AlertGroupID = d.AlertGroupID
-				existing.Provider = d.Provider
-				existing.Kind = d.Kind
-				existing.TargetType = d.TargetType
-				existing.TargetID = d.TargetID
-				existing.ProviderPayload = d.ProviderPayload
-				existing.SupportsUpdate = d.SupportsUpdate
-				existing.IsFirehose = d.IsFirehose
-				// Intentionally keep existing.IsPrimary to avoid clobbering primary on retries.
-				existing.Attempt = d.Attempt
-				existing.UpdatedAt = d.UpdatedAt
-				return nil
-			}
-		}
-	}
-
-	copy := *d
-	if d.JobStepID != nil {
-		jobStepID := *d.JobStepID
-		copy.JobStepID = &jobStepID
-	}
-	m.notificationDeliveries[copy.ID] = &copy
-	return nil
-}
-
-func (m *MockStore) SetPrimaryDeliveryIfNone(alertGroupID, deliveryID string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID == alertGroupID && d.IsPrimary {
-			return false, nil
-		}
-	}
-
-	if d, ok := m.notificationDeliveries[deliveryID]; ok {
-		d.IsPrimary = true
-		d.UpdatedAt = time.Now()
-		return true, nil
-	}
-
-	return false, sql.ErrNoRows
-}
-
-func (m *MockStore) GetPrimaryDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var selected *model.NotificationDelivery
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID != alertGroupID || d.Provider != provider || !d.IsPrimary {
-			continue
-		}
-		if selected == nil || d.CreatedAt.After(selected.CreatedAt) {
-			selected = d
-		}
-	}
-	if selected == nil {
-		return nil, nil
-	}
-	copy := *selected
-	if selected.JobStepID != nil {
-		jobStepID := *selected.JobStepID
-		copy.JobStepID = &jobStepID
-	}
-	return &copy, nil
-}
-
-func (m *MockStore) GetFirehoseDelivery(alertGroupID, provider string) (*model.NotificationDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var selected *model.NotificationDelivery
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID != alertGroupID || d.Provider != provider || !d.IsFirehose || !d.SupportsUpdate {
-			continue
-		}
-		if selected == nil || d.CreatedAt.After(selected.CreatedAt) {
-			selected = d
-		}
-	}
-	if selected == nil {
-		return nil, nil
-	}
-	copy := *selected
-	if selected.JobStepID != nil {
-		jobStepID := *selected.JobStepID
-		copy.JobStepID = &jobStepID
-	}
-	return &copy, nil
-}
-
-func (m *MockStore) GetDeliveryByID(id string) (*model.NotificationDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, d := range m.notificationDeliveries {
-		if d.ID == id {
-			copy := *d
-			if d.JobStepID != nil {
-				jobStepID := *d.JobStepID
-				copy.JobStepID = &jobStepID
-			}
-			return &copy, nil
-		}
-	}
-	return nil, nil
-}
-
-func (m *MockStore) ListDeliveries(alertGroupID string) ([]*model.NotificationDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var deliveries []*model.NotificationDelivery
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID != alertGroupID {
-			continue
-		}
-		copy := *d
-		if d.JobStepID != nil {
-			jobStepID := *d.JobStepID
-			copy.JobStepID = &jobStepID
-		}
-		deliveries = append(deliveries, &copy)
-	}
-
-	sort.Slice(deliveries, func(i, j int) bool {
-		return deliveries[i].CreatedAt.Before(deliveries[j].CreatedAt)
-	})
-
-	return deliveries, nil
-}
-
-func (m *MockStore) HasPrimaryDelivery(alertGroupID, provider string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, d := range m.notificationDeliveries {
-		if d.AlertGroupID == alertGroupID && d.Provider == provider && d.IsPrimary {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (m *MockStore) UpdateDeliveryPayload(deliveryID, payload string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, d := range m.notificationDeliveries {
-		if d.ID == deliveryID {
-			d.ProviderPayload = payload
-			return nil
-		}
-	}
-	return nil
 }
 
 // ========================================
@@ -1367,6 +1125,75 @@ func (m *MockStore) GetTeamMembershipsForUser(userID string) (map[string]model.T
 // Timeline Events
 // ========================================
 
+// RenderInputs hands the producer the group's history as the mock holds it,
+// the most recent keys.TimelineLength lines, and no buttons: the mock has no
+// integrations to read a switch from.
+func (m *MockStore) RenderInputs(_ context.Context, alertGroupID string) (providers.RenderInputs, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	events := m.timelineEvents[alertGroupID]
+	omitted := 0
+	if len(events) > keys.TimelineLength {
+		omitted = len(events) - keys.TimelineLength
+		events = events[omitted:]
+	}
+	return providers.RenderInputs{
+		Timeline: append([]*model.TimelineEvent(nil), events...), TimelineOmitted: int64(omitted),
+	}, nil
+}
+
+// ButtonsOn reads the switch from the integrations the mock holds, as the
+// real door reads the table.
+func (m *MockStore) ButtonsOn(_ context.Context, provider string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, i := range m.integrations {
+		if !i.Enabled {
+			continue
+		}
+		switch {
+		case i.Type == model.IntegrationTypeSlack && provider == keys.ProviderSlack:
+			var cfg model.SlackConfig
+			if err := json.Unmarshal(i.Config, &cfg); err != nil {
+				return false, err
+			}
+			return cfg.Interactive, nil
+		case i.Type == model.IntegrationTypeTelegram && provider == keys.ProviderTelegram:
+			var cfg model.TelegramConfig
+			if err := json.Unmarshal(i.Config, &cfg); err != nil {
+				return false, err
+			}
+			return cfg.IsInteractive(), nil
+		}
+	}
+	return false, nil
+}
+
+// AddAlertGroupNoteAtomic records the note under the caller's name and moves
+// the group's source version, as the real door does: a plan built before the
+// note is refused by the admission here as it is there. The mock has no
+// messages to raise.
+func (m *MockStore) AddAlertGroupNoteAtomic(_ context.Context, alertGroupID, text string,
+	who alertgroup.Actor) (*model.TimelineEvent, error) {
+
+	if n := utf8.RuneCountInString(text); n == 0 || n > NoteLimit {
+		return nil, ErrNoteInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ag, ok := m.alertGroups[alertGroupID]
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	ag.RenderSourceVersion++
+	event := &model.TimelineEvent{
+		ID: uuid.New().String(), AlertGroupID: alertGroupID, Type: model.TimelineEventNote,
+		Message: text, Actor: who.Name, CreatedAt: time.Now(),
+	}
+	m.timelineEvents[alertGroupID] = append(m.timelineEvents[alertGroupID], event)
+	return event, nil
+}
+
 func (m *MockStore) AddTimelineEvent(e *model.TimelineEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1499,7 +1326,7 @@ func (m *MockStore) DeleteAPIToken(id string) error {
 }
 
 // ========================================
-// External Identities + Link Tokens (Epic 7 Sprint 3)
+// External Identities + Link Tokens
 // ========================================
 
 type mockIdentity = model.ExternalIdentity
@@ -1636,7 +1463,7 @@ func (m *MockStore) IssueLinkToken(userID, provider, externalID, token string, e
 		return ErrUserNotFound
 	}
 	hash := mockHashToken(token)
-	// (provider, token_hash) global uniqueness — collisions retry at the caller.
+	// (provider, token_hash) global uniqueness - collisions retry at the caller.
 	for k, lt := range m.linkTokens {
 		if lt.Provider == provider && lt.TokenHash == hash && k != userID+"|"+provider {
 			return errors.New("link token collision")
@@ -1800,389 +1627,6 @@ func (m *MockStore) CountAdmins() (int, error) {
 	return count, nil
 }
 
-// Jobs Mocks (Phase 2)
-// NOTE: We add a map to store jobs for testing
-func (m *MockStore) CreateJobWithDedup(job *model.Job, stages []*model.JobStage, steps []*model.JobStep) (string, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// Initialize maps if needed (hack for existing tests)
-	if m.jobs == nil {
-		m.jobs = make(map[string]*model.Job)
-	}
-	if m.jobStages == nil {
-		m.jobStages = make(map[string]*model.JobStage)
-	}
-	if m.jobSteps == nil {
-		m.jobSteps = make(map[string]*model.JobStep)
-	}
-
-	// Implement dedup: check if job with same dedup_key exists and is pending/running
-	if job.DedupKey != nil {
-		for _, existing := range m.jobs {
-			if existing.DedupKey != nil && *existing.DedupKey == *job.DedupKey {
-				if existing.Status == model.JobStatusPending || existing.Status == model.JobStatusRunning {
-					// Dedup: return existing job ID, nothing was created
-					return existing.ID, false, nil
-				}
-			}
-		}
-	}
-
-	jobCopy := *job
-	m.jobs[job.ID] = &jobCopy
-
-	for _, stage := range stages {
-		stageCopy := *stage
-		m.jobStages[stage.ID] = &stageCopy
-	}
-	for _, step := range steps {
-		stepCopy := *step
-		m.jobSteps[step.ID] = &stepCopy
-	}
-	return job.ID, true, nil
-}
-
-// EnsureEscalationJob atomically transitions an AG from new/processing → processing
-// and creates the escalation job + snapshot.
-func (m *MockStore) EnsureEscalationJob(agID string, job *model.Job, stages []*model.JobStage, steps []*model.JobStep, snapshot *model.EscalationPolicySnapshot) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.jobs == nil {
-		m.jobs = make(map[string]*model.Job)
-	}
-	if m.jobStages == nil {
-		m.jobStages = make(map[string]*model.JobStage)
-	}
-	if m.jobSteps == nil {
-		m.jobSteps = make(map[string]*model.JobStep)
-	}
-
-	ag, ok := m.alertGroups[agID]
-	if !ok {
-		return false, fmt.Errorf("alert group %s not found", agID)
-	}
-
-	// Only new or processing are eligible
-	if ag.Status != model.AlertGroupStatusNew && ag.Status != model.AlertGroupStatusProcessing {
-		return false, nil
-	}
-
-	// Transition to processing + touch updated_at
-	ag.Status = model.AlertGroupStatusProcessing
-	ag.UpdatedAt = time.Now()
-
-	// Dedup: check if ANY escalation job exists for this AG (any status)
-	for _, existing := range m.jobs {
-		if existing.AlertGroupID != nil && *existing.AlertGroupID == agID && existing.Type == "escalation" {
-			// Escalation already exists (any status) — don't create duplicate
-			return false, nil
-		}
-	}
-
-	// Create job + stages + steps
-	jobCopy := *job
-	m.jobs[job.ID] = &jobCopy
-	for _, stage := range stages {
-		stageCopy := *stage
-		m.jobStages[stage.ID] = &stageCopy
-	}
-	for _, step := range steps {
-		stepCopy := *step
-		m.jobSteps[step.ID] = &stepCopy
-	}
-
-	// Save snapshot
-	if snapshot != nil {
-		ag.PolicyID = snapshot.PolicyID
-		snapCopy := *snapshot
-		snapCopy.Steps = make([]*model.EscalationStepSnapshot, len(snapshot.Steps))
-		for i, s := range snapshot.Steps {
-			sc := *s
-			snapCopy.Steps[i] = &sc
-		}
-		ag.PolicySnapshot = &snapCopy
-	}
-
-	return true, nil
-}
-
-func (m *MockStore) GetJobByID(id string) (*model.Job, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.jobs == nil {
-		return nil, sql.ErrNoRows
-	}
-	if job, ok := m.jobs[id]; ok {
-		jobCopy := *job
-		return &jobCopy, nil
-	}
-	return nil, sql.ErrNoRows
-}
-
-func (m *MockStore) GetJobByDedupKey(dedupKey string) (*model.Job, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var latest *model.Job
-	for _, j := range m.jobs {
-		if j.DedupKey != nil && *j.DedupKey == dedupKey {
-			if latest == nil || j.CreatedAt.After(latest.CreatedAt) {
-				latest = j
-			}
-		}
-	}
-	if latest != nil {
-		jobCopy := *latest
-		return &jobCopy, nil
-	}
-	return nil, sql.ErrNoRows
-}
-
-// MarkJobSucceeded is a test helper to mark a job as succeeded by dedup key
-func (m *MockStore) MarkJobSucceeded(dedupKey string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, j := range m.jobs {
-		if j.DedupKey != nil && *j.DedupKey == dedupKey {
-			j.Status = model.JobStatusSucceeded
-			return
-		}
-	}
-}
-
-func (m *MockStore) GetJobStepByID(stepID string) (*model.JobStep, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if step, ok := m.jobSteps[stepID]; ok {
-		stepCopy := *step
-		return &stepCopy, nil
-	}
-	return nil, sql.ErrNoRows
-}
-
-// GetJobStepsByJobID returns all steps for a job sorted by StepIndex (test helper, not on interface)
-func (m *MockStore) GetJobStepsByJobID(jobID string) []*model.JobStep {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []*model.JobStep
-	for _, step := range m.jobSteps {
-		if step.JobID == jobID {
-			stepCopy := *step
-			result = append(result, &stepCopy)
-		}
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].StepIndex < result[j].StepIndex })
-	return result
-}
-func (m *MockStore) ClaimNextJobSteps(limit int, duration time.Duration) ([]*model.JobStep, error) {
-	return []*model.JobStep{}, nil // TODO: Implement if needed for loop testing
-}
-func (m *MockStore) UpdateJobStepIfOwned(step *model.JobStep, leaseToken string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	existing, ok := m.jobSteps[step.ID]
-	if !ok {
-		return false, nil
-	}
-	if existing.LockedBy == nil || *existing.LockedBy != leaseToken {
-		return false, nil
-	}
-	stepCopy := *step
-	stepCopy.UpdatedAt = time.Now()
-	m.jobSteps[step.ID] = &stepCopy
-	return true, nil
-}
-
-func (m *MockStore) FinishStepAndAdvance(stepID string, leaseToken string, outcome model.JobStepStatus, result string, stepError string) (model.AdvanceResult, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	step, ok := m.jobSteps[stepID]
-	if !ok {
-		return 0, fmt.Errorf("step %s not found", stepID)
-	}
-
-	// Find stage and job
-	stage, ok := m.jobStages[step.StageID]
-	if !ok {
-		return 0, fmt.Errorf("stage %s not found", step.StageID)
-	}
-	job, ok := m.jobs[step.JobID]
-	if !ok {
-		return 0, fmt.Errorf("job %s not found", step.JobID)
-	}
-
-	// 1. Terminal guard
-	if job.Status != model.JobStatusPending && job.Status != model.JobStatusRunning {
-		if step.LockedBy != nil && *step.LockedBy == leaseToken {
-			step.Status = model.JobStepStatusCanceled
-			step.LockedUntil = nil
-		}
-		return model.AdvanceJobAlreadyTerminal, nil
-	}
-
-	// 2. Already-advanced guard
-	if stage.Status == model.JobStageStatusSucceeded || stage.Status == model.JobStageStatusFailed || stage.Status == model.JobStageStatusCanceled {
-		return model.AdvanceAlreadyAdvanced, nil
-	}
-
-	// 3. Lease check
-	if step.LockedBy == nil || *step.LockedBy != leaseToken || step.Status != model.JobStepStatusRunning {
-		return model.AdvanceLeaseLost, nil
-	}
-
-	// Finalize step
-	now := time.Now()
-	step.Status = outcome
-	if result != "" {
-		step.Result = json.RawMessage(fmt.Sprintf("%q", result))
-	}
-	if stepError != "" {
-		step.Error = &stepError
-	}
-	step.LockedUntil = nil
-	step.UpdatedAt = now
-
-	// 4. Hard-fail
-	if outcome == model.JobStepStatusFailed && !step.ContinueOnFailure {
-		stage.Status = model.JobStageStatusFailed
-		stage.UpdatedAt = now
-		job.Status = model.JobStatusFailed
-		if stepError != "" {
-			job.Error = &stepError
-		}
-		job.FinishedAt = &now
-		job.UpdatedAt = now
-		return model.AdvanceJobFinished, nil
-	}
-
-	// 5. Pending siblings
-	pendingCount := 0
-	for _, s := range m.jobSteps {
-		if s.StageID == step.StageID && s.Status != model.JobStepStatusSucceeded && s.Status != model.JobStepStatusFailed && s.Status != model.JobStepStatusCanceled {
-			pendingCount++
-		}
-	}
-	if pendingCount > 0 {
-		return model.AdvanceWaitingSiblings, nil
-	}
-
-	// 6. Hard-fail siblings
-	for _, s := range m.jobSteps {
-		if s.StageID == step.StageID && s.Status == model.JobStepStatusFailed && !s.ContinueOnFailure {
-			stage.Status = model.JobStageStatusFailed
-			stage.UpdatedAt = now
-			job.Status = model.JobStatusFailed
-			errMsg := "step failed"
-			job.Error = &errMsg
-			job.FinishedAt = &now
-			job.UpdatedAt = now
-			return model.AdvanceJobFinished, nil
-		}
-	}
-
-	// 7. Stage completed — determine status
-	hasAnyFailed := false
-	for _, s := range m.jobSteps {
-		if s.StageID == step.StageID && s.Status == model.JobStepStatusFailed {
-			hasAnyFailed = true
-			break
-		}
-	}
-	if hasAnyFailed {
-		stage.Status = model.JobStageStatusFailed
-	} else {
-		stage.Status = model.JobStageStatusSucceeded
-	}
-	stage.UpdatedAt = now
-
-	// 8. Find next blocked stage
-	var nextStage *model.JobStage
-	for _, st := range m.jobStages {
-		if st.JobID == job.ID && st.StageIndex == stage.StageIndex+1 && st.Status == model.JobStageStatusBlocked {
-			nextStage = st
-			break
-		}
-	}
-
-	if nextStage == nil {
-		// Last stage — finish job
-		jobHasFailed := false
-		for _, s := range m.jobSteps {
-			if s.JobID == job.ID && s.Status == model.JobStepStatusFailed {
-				jobHasFailed = true
-				break
-			}
-		}
-		if jobHasFailed {
-			job.Status = model.JobStatusFailed
-		} else {
-			job.Status = model.JobStatusSucceeded
-		}
-		job.FinishedAt = &now
-		job.UpdatedAt = now
-		return model.AdvanceJobFinished, nil
-	}
-
-	// 9. Unlock next stage + steps
-	nextStage.Status = model.JobStageStatusActive
-	nextStage.UpdatedAt = now
-	for _, s := range m.jobSteps {
-		if s.StageID == nextStage.ID && s.Status == model.JobStepStatusBlocked {
-			s.Status = model.JobStepStatusPending
-			s.NextRunAt = &now
-			s.UpdatedAt = now
-		}
-	}
-	job.CurrentStage = stage.StageIndex + 1
-	job.UpdatedAt = now
-
-	return model.AdvanceUnlockedNextStage, nil
-}
-func (m *MockStore) CancelJobByDedupKey(dedupKey string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, job := range m.jobs {
-		if job.DedupKey != nil && *job.DedupKey == dedupKey {
-			if job.Status == model.JobStatusPending || job.Status == model.JobStatusRunning {
-				job.Status = model.JobStatusCanceled
-				// Cancel active/blocked stages
-				for _, stage := range m.jobStages {
-					if stage.JobID == job.ID {
-						if stage.Status == model.JobStageStatusActive || stage.Status == model.JobStageStatusBlocked {
-							stage.Status = model.JobStageStatusCanceled
-						}
-					}
-				}
-			}
-		}
-	}
-	return nil
-}
-func (m *MockStore) ExtendStepLease(stepID string, leaseToken string, duration time.Duration) error {
-	return nil
-}
-func (m *MockStore) GetJobsByIDs(ids []string) (map[string]*model.Job, error) {
-	return make(map[string]*model.Job), nil
-}
-
-func (m *MockStore) FailJob(jobID, reason string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if job, ok := m.jobs[jobID]; ok {
-		job.Status = model.JobStatusFailed
-		job.Error = &reason
-		now := time.Now()
-		job.FinishedAt = &now
-		job.UpdatedAt = now
-		return nil
-	}
-	return sql.ErrNoRows
-}
-
 // ========================================
 // Escalation Policies (Phase 4)
 // ========================================
@@ -2299,14 +1743,16 @@ func (m *MockStore) CreateIntegration(i *model.Integration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Set direction and ID. Same invariant as Store.CreateIntegration —
+	// Set direction and ID. Same invariant as Store.CreateIntegration -
 	// type is validated upstream; an unknown one here is a programming error.
 	dir, ok := integrations.DirectionFor(i.Type)
 	if !ok {
 		return fmt.Errorf("unknown integration type %s", i.Type)
 	}
 	i.Direction = dir
-	i.ID = fmt.Sprintf("int-%d", len(m.integrations)+1)
+	if i.ID == "" {
+		i.ID = fmt.Sprintf("int-%d", len(m.integrations)+1)
+	}
 	i.CreatedAt = time.Now()
 	i.UpdatedAt = time.Now()
 
@@ -2378,29 +1824,73 @@ func (m *MockStore) GetAllIntegrations() ([]*model.Integration, error) {
 	return result, nil
 }
 
-func (m *MockStore) UpdateIntegration(i *model.Integration) error {
+// UpdateIntegration applies the patch to the stored row, the way the store
+// applies it to the row re-read under its lock. The double has no
+// commitments, so nothing is ever withdrawn here.
+func (m *MockStore) UpdateIntegration(_ context.Context, id string, patch IntegrationPatch,
+	_ string) (IntegrationChange, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.integrations[i.ID]; !ok {
-		return ErrIntegrationNotFound
+	current, ok := m.integrations[id]
+	if !ok {
+		return IntegrationChange{}, ErrIntegrationNotFound
 	}
-
-	i.UpdatedAt = time.Now()
-	copy := *i
-	m.integrations[i.ID] = &copy
-	return nil
+	before := *current
+	after := before
+	if patch.Name != nil {
+		after.Name = *patch.Name
+	}
+	if patch.Enabled != nil {
+		after.Enabled = *patch.Enabled
+	}
+	if patch.Config != nil {
+		after.Config = mergeSecrets(before.Type, before.Config, patch.Config)
+	}
+	after.UpdatedAt = time.Now()
+	stored := after
+	m.integrations[id] = &stored
+	return IntegrationChange{Before: &before, After: &after}, nil
 }
 
-func (m *MockStore) DeleteIntegration(id string) error {
+func (m *MockStore) DeleteIntegration(_ context.Context, id, _ string) (IntegrationChange, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.integrations[id]; !ok {
-		return ErrIntegrationNotFound
+	current, ok := m.integrations[id]
+	if !ok {
+		return IntegrationChange{}, ErrIntegrationNotFound
 	}
+	before := *current
 	delete(m.integrations, id)
-	return nil
+	m.tombstones[id] = model.IntegrationTombstone{
+		ID: id, Type: before.Type, Scope: before.Scope, TeamID: before.TeamID, DeletedAt: time.Now(),
+	}
+	return IntegrationChange{Before: &before}, nil
+}
+
+// WithIntegrationLocked serialises fn across callers the way the advisory lock
+// does, and hands it the row as it stands now.
+func (m *MockStore) WithIntegrationLocked(_ context.Context, id string,
+	fn func(current *model.Integration) error) error {
+	m.effectsMu.Lock()
+	defer m.effectsMu.Unlock()
+
+	current, err := m.GetIntegrationByID(id)
+	if errors.Is(err, ErrIntegrationNotFound) {
+		current = nil
+	} else if err != nil {
+		return err
+	}
+	return fn(current)
+}
+
+func (m *MockStore) IntegrationTombstone(_ context.Context, id string) (model.IntegrationTombstone, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	tombstone, ok := m.tombstones[id]
+	return tombstone, ok, nil
 }
 
 // GetAPITokenByID retrieves an API token by ID from MockStore
@@ -2417,11 +1907,11 @@ func (m *MockStore) GetAPITokenByID(id string) (*model.APIToken, error) {
 }
 
 // GetMetricsSnapshot returns mock metrics data.
-func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
+func (m *MockStore) GetMetricsSnapshot(context.Context) (*model.MetricsSnapshot, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	snap := &MetricsSnapshot{}
+	snap := &model.MetricsSnapshot{}
 
 	// Active alert groups
 	counts := make(map[string]map[string]int) // team -> severity -> count
@@ -2436,7 +1926,7 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	}
 	for team, sevMap := range counts {
 		for sev, count := range sevMap {
-			snap.ActiveAlertGroups = append(snap.ActiveAlertGroups, AlertGroupCount{
+			snap.ActiveAlertGroups = append(snap.ActiveAlertGroups, model.AlertGroupCount{
 				TeamID: team, Severity: sev, Count: count,
 			})
 		}
@@ -2456,7 +1946,7 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 	for team, sevMap := range statusCounts {
 		for sev, statMap := range sevMap {
 			for status, count := range statMap {
-				snap.AlertGroupsByStatus = append(snap.AlertGroupsByStatus, AlertGroupStatusCount{
+				snap.AlertGroupsByStatus = append(snap.AlertGroupsByStatus, model.AlertGroupStatusCount{
 					TeamID: team, Severity: sev, Status: status, Count: count,
 				})
 			}
@@ -2484,16 +1974,7 @@ func (m *MockStore) GetMetricsSnapshot() (*MetricsSnapshot, error) {
 		evtCounts[string(e.Status)]++
 	}
 	for status, count := range evtCounts {
-		snap.OutboxEventsByStatus = append(snap.OutboxEventsByStatus, StatusCount{Status: status, Count: count})
-	}
-
-	// Outbox deliveries by status
-	delCounts := make(map[string]int)
-	for _, d := range m.outboxDeliveries {
-		delCounts[string(d.Status)]++
-	}
-	for status, count := range delCounts {
-		snap.OutboxDeliveriesByStatus = append(snap.OutboxDeliveriesByStatus, StatusCount{Status: status, Count: count})
+		snap.OutboxEventsByStatus = append(snap.OutboxEventsByStatus, model.StatusCount{Status: status, Count: count})
 	}
 
 	return snap, nil
@@ -2571,277 +2052,186 @@ func (m *MockStore) GetPendingOutboxEvents(limit int) ([]*model.OutboxEvent, err
 	return result, nil
 }
 
-func (m *MockStore) UpdateOutboxEvent(event *model.OutboxEvent) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, ok := m.outboxEvents[event.ID]; !ok {
-		return ErrOutboxEventNotFound
-	}
-	// Store a copy (mirrors real DB: in-memory mutations don't affect stored rows).
-	cp := *event
-	if event.LockedBy != nil {
-		v := *event.LockedBy
-		cp.LockedBy = &v
-	}
-	if event.LockedUntil != nil {
-		v := *event.LockedUntil
-		cp.LockedUntil = &v
-	}
-	m.outboxEvents[event.ID] = &cp
-	return nil
+// The double has no commitments and so no webhook deliveries: the list is
+// empty and nothing is found. A test that needs deliveries wraps the double
+// with what it wants answered.
+func (m *MockStore) ListWebhookDeliveries(_ context.Context, _ string, _, _ int) ([]*model.OutboxDelivery, int, error) {
+	return []*model.OutboxDelivery{}, 0, nil
 }
 
-func (m *MockStore) UpdateOutboxEventIfOwned(event *model.OutboxEvent, workerID string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.UpdateOutboxEventIfOwnedError != nil {
-		return false, m.UpdateOutboxEventIfOwnedError
-	}
-
-	existing, ok := m.outboxEvents[event.ID]
-	if !ok {
-		return false, nil
-	}
-	if existing.LockedBy == nil || *existing.LockedBy != workerID {
-		return false, nil
-	}
-	// Store a copy (mirrors real DB: in-memory mutations don't affect stored rows).
-	cp := *event
-	if event.LockedBy != nil {
-		v := *event.LockedBy
-		cp.LockedBy = &v
-	}
-	if event.LockedUntil != nil {
-		v := *event.LockedUntil
-		cp.LockedUntil = &v
-	}
-	m.outboxEvents[event.ID] = &cp
-	return true, nil
+func (m *MockStore) WebhookDelivery(_ context.Context, _, _ string) (*model.OutboxDelivery, []*model.DeliveryAttempt, error) {
+	return nil, nil, ErrWebhookDeliveryNotFound
 }
 
-func (m *MockStore) CreateOutboxDelivery(delivery *model.OutboxDelivery) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if delivery.ID == "" {
-		delivery.ID = uuid.New().String()
-	}
-	if delivery.Status == "" {
-		delivery.Status = model.OutboxDeliveryPending
-	}
-	delivery.CreatedAt = time.Now()
-
-	// Check unique(event_id, integration_id)
-	for _, d := range m.outboxDeliveries {
-		if d.EventID == delivery.EventID && d.IntegrationID == delivery.IntegrationID {
-			return fmt.Errorf("duplicate delivery for event %s and integration %s", delivery.EventID, delivery.IntegrationID)
-		}
-	}
-
-	if m.CreateOutboxDeliveryError != nil {
-		return m.CreateOutboxDeliveryError
-	}
-
-	m.outboxDeliveries[delivery.ID] = delivery
-	return nil
+func (m *MockStore) ReplayWebhookDelivery(_ context.Context, _ WebhookReplayRequest) (WebhookReplayResult, error) {
+	return WebhookReplayResult{}, ErrWebhookDeliveryNotFound
 }
 
-func (m *MockStore) GetOutboxDeliveryByID(id string) (*model.OutboxDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	d, ok := m.outboxDeliveries[id]
-	if !ok {
-		return nil, ErrOutboxDeliveryNotFound
-	}
-	return d, nil
+// The delivery journal is not mirrored here: it is a read over the outbound
+// tables, which the mock does not have. The routes are tested over a fake that
+// answers what it is told, and the reads against Postgres.
+func (m *MockStore) ListIntents(_ context.Context, _ IntentFilter, _, _ int) ([]outbound.Intent, int, error) {
+	return []outbound.Intent{}, 0, nil
 }
 
-func (m *MockStore) GetOutboxDelivery(eventID, integrationID string) (*model.OutboxDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, d := range m.outboxDeliveries {
-		if d.EventID == eventID && d.IntegrationID == integrationID {
-			return d, nil
-		}
-	}
-	return nil, ErrOutboxDeliveryNotFound
+func (m *MockStore) IntentJournal(_ context.Context, _ string) (*outbound.Journal, error) {
+	return nil, nil
 }
 
-func (m *MockStore) GetDeliveriesByEventID(eventID string) ([]*model.OutboxDelivery, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var result []*model.OutboxDelivery
-	for _, d := range m.outboxDeliveries {
-		if d.EventID == eventID {
-			result = append(result, d)
-		}
-	}
-	slices.SortFunc(result, func(a, b *model.OutboxDelivery) int {
-		return a.CreatedAt.Compare(b.CreatedAt)
-	})
-	return result, nil
+// ResolveAmbiguity: the mock holds no commitments, so there is nothing to decide.
+func (m *MockStore) ResolveAmbiguity(_ context.Context, _ outbound.ResolveAmbiguityRequest) (outbound.ResolveAmbiguityResult, error) {
+	return outbound.ResolveAmbiguityResult{Outcome: outbound.ResolveNotFound}, nil
 }
 
-func (m *MockStore) GetDeliveriesByIntegrationID(integrationID string, limit, offset int) ([]*model.OutboxDelivery, int, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var all []*model.OutboxDelivery
-	for _, d := range m.outboxDeliveries {
-		if d.IntegrationID == integrationID {
-			all = append(all, d)
-		}
-	}
-	slices.SortFunc(all, func(a, b *model.OutboxDelivery) int {
-		return b.CreatedAt.Compare(a.CreatedAt) // DESC
-	})
-
-	total := len(all)
-	if offset >= total {
-		return nil, total, nil
-	}
-	end := offset + limit
-	if end > total {
-		end = total
-	}
-	return all[offset:end], total, nil
-}
-
-func (m *MockStore) UpdateOutboxDelivery(delivery *model.OutboxDelivery) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, ok := m.outboxDeliveries[delivery.ID]; !ok {
-		return ErrOutboxDeliveryNotFound
-	}
-	m.outboxDeliveries[delivery.ID] = delivery
-	return nil
-}
-
-func (m *MockStore) ReplayOutboxDelivery(deliveryID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.ReplayOutboxDeliveryError != nil {
-		return m.ReplayOutboxDeliveryError
-	}
-
-	d, ok := m.outboxDeliveries[deliveryID]
-	if !ok {
-		return ErrOutboxDeliveryNotFound
-	}
-
-	// CAS: only terminal deliveries can be replayed
-	if d.Status != model.OutboxDeliverySent && d.Status != model.OutboxDeliveryFailed {
-		return ErrOutboxDeliveryNotTerminal
-	}
-
-	// Reset delivery
-	d.Status = model.OutboxDeliveryPending
-	d.Attempts = 0
-	d.NextAttemptAt = nil
-	d.LastHTTPStatus = nil
-	d.LastError = nil
-	d.ResponseBodyTrunc = nil
-	d.SentAt = nil
-
-	// Re-open parent event if terminal
-	if evt, ok := m.outboxEvents[d.EventID]; ok {
-		if evt.Status == model.OutboxEventStatusCompleted || evt.Status == model.OutboxEventStatusFailed {
-			evt.Status = model.OutboxEventStatusProcessing
-			evt.NextAttemptAt = nil
-			evt.LockedUntil = nil
-			evt.LockedBy = nil
-			evt.LastError = nil
-			evt.SentAt = nil
-		}
-	}
-	return nil
-}
-
-func (m *MockStore) ClaimOutboxEvents(workerID string, limit int, leaseDuration time.Duration) ([]*model.OutboxEvent, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	now := time.Now()
-	var result []*model.OutboxEvent
-	for _, e := range m.outboxEvents {
-		if e.Status != model.OutboxEventStatusPending && e.Status != model.OutboxEventStatusProcessing {
-			continue
-		}
-		if e.LockedUntil != nil && e.LockedUntil.After(now) {
-			continue
-		}
-		if e.NextAttemptAt != nil && e.NextAttemptAt.After(now) {
-			continue
-		}
-		result = append(result, e)
-	}
-	slices.SortFunc(result, func(a, b *model.OutboxEvent) int {
-		return cmpTimePtr(a.NextAttemptAt, b.NextAttemptAt)
-	})
-	if len(result) > limit {
-		result = result[:limit]
-	}
-	// Apply lock
-	lockedUntil := now.Add(leaseDuration)
-	for _, e := range result {
-		e.Status = model.OutboxEventStatusProcessing
-		e.LockedBy = &workerID
-		e.LockedUntil = &lockedUntil
-	}
-	return result, nil
-}
-
-func (m *MockStore) ExtendOutboxEventLease(eventID, workerID string, until time.Time) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.ExtendOutboxEventLeaseError != nil {
-		return false, m.ExtendOutboxEventLeaseError
-	}
-	if m.ExtendOutboxEventLeaseResult != nil {
-		return *m.ExtendOutboxEventLeaseResult, nil
-	}
-
-	e, ok := m.outboxEvents[eventID]
-	if !ok {
-		return false, nil
-	}
-	if e.Status != model.OutboxEventStatusProcessing || e.LockedBy == nil || *e.LockedBy != workerID {
-		return false, nil
-	}
-	e.LockedUntil = &until
-	return true, nil
-}
-
-func (m *MockStore) CreateDeliveryAttempt(attempt *model.DeliveryAttempt) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if attempt.ID == "" {
-		attempt.ID = uuid.New().String()
-	}
-	attempt.CreatedAt = time.Now()
-	m.deliveryAttempts[attempt.DeliveryID] = append(m.deliveryAttempts[attempt.DeliveryID], attempt)
-	return nil
-}
-
-func (m *MockStore) GetDeliveryAttempts(deliveryID string) ([]*model.DeliveryAttempt, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	attempts := m.deliveryAttempts[deliveryID]
-	result := make([]*model.DeliveryAttempt, len(attempts))
-	copy(result, attempts)
-	return result, nil
+func (m *MockStore) AlertGroupDeliveries(_ context.Context, _ string) (*outbound.GroupDeliveries, error) {
+	return &outbound.GroupDeliveries{}, nil
 }
 
 // Ensure Store implements StoreInterface
 var _ StoreInterface = (*Store)(nil)
 var _ StoreInterface = (*MockStore)(nil)
+
+// admittedBatch is what the double remembers about one admission, so a test can
+// ask what an escalation promised instead of what it happened to write.
+type admittedBatch struct {
+	Admission outbound.Batch
+	IntentIDs []string
+}
+
+// SubmitBatch admits an escalation the way the store does: the group
+// is claimed, its commitments are recorded, and a second producer for the same
+// group is told which of the two answers it got.
+//
+// It keeps the parts of the real one that a caller can observe - the group must
+// be new or processing, the claim is once and forever, and the same batch
+// submitted twice is the same batch - and none of the parts that are about
+// storage.
+func (m *MockStore) SubmitBatch(ctx context.Context,
+	adm outbound.Batch) (outbound.SubmitResult, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	about, isEscalation := adm.Context.Escalation()
+	if !isEscalation {
+		// The double models the alert-group half only. A handover admission has
+		// no group to claim, and answering it here with something plausible
+		// would let a test pass against a path this double does not have.
+		return outbound.SubmitResult{}, fmt.Errorf(
+			"this double admits escalations; %q belongs to the real store", adm.Context.Form())
+	}
+
+	admission := adm.Admission
+	ag, ok := m.alertGroups[admission.AlertGroupID]
+	if !ok {
+		return outbound.SubmitResult{}, fmt.Errorf("alert group %s not found", admission.AlertGroupID)
+	}
+
+	if m.admissions == nil {
+		m.admissions = map[string]*admittedBatch{}
+	}
+
+	// The order below is the contract, not an implementation detail, so it is
+	// the same order the real store uses.
+	//
+	// What is already claimed answers first. A producer retrying after a lost
+	// reply is asking whether its work was accepted, and that answer was
+	// written before any of the guards below became true - asked in the wrong
+	// order, an acknowledged group or an alert that has since moved turns a
+	// repeat into a refusal over commitments that exist.
+	if held, ok := m.admissions[admission.BatchKey]; ok {
+		// The same claim, held by somebody. Whether it is the same work is what
+		// the fingerprint says, and the answer differs: one is "already done",
+		// the other is "somebody promised something else for this group".
+		if !bytes.Equal(held.Admission.Admission.Fingerprint, admission.Fingerprint) {
+			return outbound.SubmitResult{
+				Outcome: outbound.SubmitConflict, BatchID: held.Admission.Admission.BatchKey,
+				IntentIDs: held.IntentIDs,
+			}, nil
+		}
+		return outbound.SubmitResult{
+			Outcome: outbound.SubmitExisting, BatchID: held.Admission.Admission.BatchKey,
+			IntentIDs: held.IntentIDs,
+		}, nil
+	}
+
+	// Nobody is promised a message who is not there to receive one. After the
+	// claim, like the real store: a repeat of an admission accepted before the
+	// erasure is still that admission.
+	for _, c := range admission.Commitments {
+		if c.Target.Kind == keys.TargetUser && m.erasedUsers[c.Target.Ref] {
+			return outbound.SubmitResult{Outcome: outbound.SubmitRecipientErased}, nil
+		}
+	}
+
+	// The user is ahead of us: they acknowledged or resolved before this
+	// escalation was admitted.
+	if ag.Status != model.AlertGroupStatusNew && ag.Status != model.AlertGroupStatusProcessing {
+		return outbound.SubmitResult{Outcome: outbound.SubmitGroupNotAdmitted}, nil
+	}
+
+	// The alert moved after the producer read it, so the snapshot describes a
+	// state it is no longer in. Nothing is claimed and the next tick plans it
+	// again.
+	if about.SourceVersion != ag.RenderSourceVersion {
+		return outbound.SubmitResult{Outcome: outbound.SubmitSourceChanged}, nil
+	}
+
+	batch := &admittedBatch{Admission: adm}
+	for range admission.Commitments {
+		batch.IntentIDs = append(batch.IntentIDs, uuid.New().String())
+	}
+	m.admissions[admission.BatchKey] = batch
+
+	// The group is escalating by this policy from now on, and it is out of the
+	// engine's loop whether or not anybody was found to notify.
+	ag.Status = model.AlertGroupStatusProcessing
+	ag.UpdatedAt = time.Now()
+	ag.PolicyID = about.PolicyID
+	if len(about.PolicySnapshot) > 0 {
+		var snapshot model.EscalationPolicySnapshot
+		if err := json.Unmarshal(about.PolicySnapshot, &snapshot); err == nil {
+			ag.PolicySnapshot = &snapshot
+		}
+	}
+	// Who was on duty, from the same admission. Nothing recorded leaves what is
+	// already there: the producer could not read the people, which is not a
+	// claim that there were none.
+	if len(about.OnCallSnapshot) > 0 {
+		var snapshot model.OnCallResult
+		if err := json.Unmarshal(about.OnCallSnapshot, &snapshot); err == nil {
+			ag.OnCallSnapshot = &snapshot
+		}
+	}
+
+	return outbound.SubmitResult{
+		Outcome: outbound.SubmitCreated, BatchID: admission.BatchKey,
+		IntentIDs: batch.IntentIDs,
+	}, nil
+}
+
+// AdmittedBatches is every admission this double accepted, for a test to read.
+func (m *MockStore) AdmittedBatches() []outbound.Batch {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]outbound.Batch, 0, len(m.admissions))
+	for _, batch := range m.admissions {
+		out = append(out, batch.Admission)
+	}
+	return out
+}
+
+// AdmissionFor is the admission held for one alert group, or false if nothing
+// was admitted for it.
+func (m *MockStore) AdmissionFor(agID string) (outbound.Batch, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, batch := range m.admissions {
+		if batch.Admission.Admission.AlertGroupID == agID {
+			return batch.Admission, true
+		}
+	}
+	return outbound.Batch{}, false
+}

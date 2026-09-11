@@ -81,10 +81,10 @@ func setupScheduleAPI(t *testing.T) (*API, *store.MockStore, *echo.Echo, *schedu
 	return api, s, e, env
 }
 
-func createTestAlertGroup(t *testing.T, s store.StoreInterface, id, dedupKey string, status model.AlertGroupStatus) *model.AlertGroup {
+func createTestAlertGroup(t *testing.T, s store.StoreInterface, id, alertKey string, status model.AlertGroupStatus) *model.AlertGroup {
 	ag := &model.AlertGroup{
 		ID:               id,
-		DedupKey:         dedupKey,
+		AlertKey:         alertKey,
 		Status:           status,
 		Title:            "Test Alert Group",
 		TeamID:           "devops",
@@ -548,7 +548,7 @@ func TestAckAlertGroup_IdempotentNoOutbox(t *testing.T) {
 		t.Fatalf("Second ack: expected 200, got %d", rec.Code)
 	}
 
-	// Count again — should be same
+	// Count again - should be same
 	events2, _ := s.GetPendingOutboxEvents(100)
 	ackCount2 := 0
 	for _, ev := range events2 {
@@ -614,9 +614,9 @@ func TestAckAlertGroup_AlreadyAcked_NoTeamLookup(t *testing.T) {
 	_, s, e := setupTestAPI(t)
 	defer s.Close()
 
-	// AG already acknowledged — service short-circuits, no team lookup needed
+	// AG already acknowledged - service short-circuits, no team lookup needed
 	ag := &model.AlertGroup{
-		ID: "ag-ack-noop", DedupKey: "dedup-ack-noop",
+		ID: "ag-ack-noop", AlertKey: "dedup-ack-noop",
 		Status: model.AlertGroupStatusAcknowledged, Title: "Test",
 		TeamID: "nonexistent-team", TeamNameSnapshot: "Ghost Team", Severity: "critical",
 	}
@@ -636,9 +636,9 @@ func TestResolveAlertGroup_AlreadyClosed_NoTeamLookup(t *testing.T) {
 	_, s, e := setupTestAPI(t)
 	defer s.Close()
 
-	// AG already closed — service short-circuits, no team lookup needed
+	// AG already closed - service short-circuits, no team lookup needed
 	ag := &model.AlertGroup{
-		ID: "ag-res-noop", DedupKey: "dedup-res-noop",
+		ID: "ag-res-noop", AlertKey: "dedup-res-noop",
 		Status: model.AlertGroupStatusClosed, Title: "Test",
 		TeamID: "nonexistent-team", TeamNameSnapshot: "Ghost Team", Severity: "critical",
 	}
@@ -736,7 +736,7 @@ func TestUsersAPI(t *testing.T) {
 	})
 
 	t.Run("UpdateUser ignores slack_user_id (linking is via /me/slack)", func(t *testing.T) {
-		// Sprint 3: admin user CRUD no longer accepts slack_user_id; it's silently dropped
+		// Admin user CRUD does not accept slack_user_id; it is silently dropped
 		// and the user response carries identities populated from external_identities (empty here).
 		body := `{"name": "Renamed", "slack_user_id": "U999999"}`
 		req := httptest.NewRequest(http.MethodPut, "/api/v1/users/new", strings.NewReader(body))
@@ -1023,7 +1023,7 @@ func TestPaginationMeta(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		ag := &model.AlertGroup{
 			ID:       fmt.Sprintf("pg-%d", i),
-			DedupKey: fmt.Sprintf("dedup-pg-%d", i),
+			AlertKey: fmt.Sprintf("dedup-pg-%d", i),
 			Status:   model.AlertGroupStatusNew,
 			Title:    fmt.Sprintf("Alert %d", i),
 			TeamID:   "devops",
