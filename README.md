@@ -341,6 +341,30 @@ Two things that are easy to miss:
   but Slack/Telegram Ack/Resolve buttons are hidden and Telegram linking cannot
   complete.
 
+### Alertmanager receiver
+
+Point an Alertmanager `webhook_configs` receiver at
+`https://<your-host>/webhook/alertmanager?token=<secret>`. Three settings of
+that receiver are part of the webhook contract:
+
+```yaml
+receivers:
+  - name: tokayops
+    webhook_configs:
+      - url: 'https://<your-host>/webhook/alertmanager?token=<secret>'
+        send_resolved: true
+        max_alerts: 0
+```
+
+- `send_resolved: true`. Without it Alertmanager never says an alert cleared,
+  and alert groups do not resolve by themselves.
+- `max_alerts: 0` (the default). A notification cut short says how many alerts
+  it dropped, not which, so an alert group can resolve while a dropped alert
+  still fires. TokayOps counts such notifications in
+  `alertmanager_truncated_notifications_total`, and the shipped rules warn on
+  it.
+- No custom `payload`. It replaces the message TokayOps reads.
+
 **Full installation guide, including Slack, Telegram and Alertmanager wiring:
 https://tokayops.com/install**
 

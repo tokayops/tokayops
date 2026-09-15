@@ -123,6 +123,16 @@ type AlertGroup struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
 	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
+
+	// LastNotifiedAt is when Alertmanager last sent anything about this group
+	// while it was open, repeats that changed nothing included. UpdatedAt is
+	// when the group last changed. A group that fires steadily does not
+	// change, so this is what tells it apart from a group Alertmanager has
+	// gone quiet about.
+	//
+	// Empty for a group Alertmanager never sent, such as one opened by hand,
+	// and for a group that has heard nothing since the version that records it.
+	LastNotifiedAt *time.Time `json:"last_notified_at,omitempty"`
 }
 
 // AlertGroupSummary is a lightweight projection of AlertGroup for list views.

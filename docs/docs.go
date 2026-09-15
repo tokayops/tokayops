@@ -4766,6 +4766,10 @@ const docTemplate = `{
                     "description": "Link to future Incident (NULL in most cases for Phase 2)",
                     "type": "integer"
                 },
+                "last_notified_at": {
+                    "description": "LastNotifiedAt is when Alertmanager last sent anything about this group\nwhile it was open, repeats that changed nothing included. UpdatedAt is\nwhen the group last changed. A group that fires steadily does not\nchange, so this is what tells it apart from a group Alertmanager has\ngone quiet about.\n\nEmpty for a group Alertmanager never sent, such as one opened by hand,\nand for a group that has heard nothing since the version that records it.",
+                    "type": "string"
+                },
                 "oncall_snapshot": {
                     "description": "OnCall Snapshot (stores the on-call state at the time of alert group creation)",
                     "allOf": [

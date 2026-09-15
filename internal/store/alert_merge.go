@@ -55,9 +55,19 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 		return alertgroup.MergeResult{Outcome: alertgroup.MergeNoActive}, nil
 	}
 
+	// Alertmanager has been heard from about this incident, whatever the
+	// payload turns out to mean - a repeat that changes nothing is the one
+	// that says Alertmanager is still sending.
+	if err := recordNotifiedTx(ctx, tx, group.ID); err != nil {
+		return alertgroup.MergeResult{}, err
+	}
+
 	held := alertgroup.FingerprintsOf(group.Alerts)
 	relevant := alertgroup.FilterMergeable(incoming, held)
 	if len(relevant) == 0 {
+		if err := tx.Commit(); err != nil {
+			return alertgroup.MergeResult{}, err
+		}
 		return alertgroup.MergeResult{
 			Outcome: alertgroup.MergeIgnored, AlertGroupID: group.ID,
 		}, nil
@@ -67,10 +77,14 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 	resolving := alertgroup.AllResolved(merged)
 
 	// A repeat that says exactly what the incident already says is not news:
-	// no write, no revision, no edit of a message into what it already showed.
+	// the alerts are not written, no revision, no edit of a message into what
+	// it already showed. Only the fact that Alertmanager sent it is kept.
 	// The end of an incident is the exception - a group whose alerts have all
 	// cleared has to end even if this payload told us nothing new.
 	if !resolving && alertgroup.SameAlerts(group.Alerts, merged) {
+		if err := tx.Commit(); err != nil {
+			return alertgroup.MergeResult{}, err
+		}
 		return alertgroup.MergeResult{
 			Outcome: alertgroup.MergeUnchanged, AlertGroupID: group.ID,
 		}, nil
@@ -89,6 +103,31 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 		return s.resolveByAlertmanagerTx(ctx, tx, group, events, now, actor)
 	}
 	return s.mergeAlertsTx(ctx, tx, group, events, actor)
+}
+
+// recordNotifiedTx records that Alertmanager sent something about the group.
+//
+// The instant is the clock read AFTER the row lock, not now(). now() is when
+// the transaction began, and a payload that waited for the lock behind another
+// would write an instant earlier than the one already committed. Serialised by
+// the lock, the clock moves in the order the writers do. GREATEST keeps the
+// column from going back when the clock itself steps back; it ignores the
+// NULL of a group that has not heard from Alertmanager yet.
+//
+// Only this column: not updated_at, which is when the group last changed, and
+// not the render source version - a repeat is not news about the alert.
+func recordNotifiedTx(ctx context.Context, tx *sql.Tx, groupID string) error {
+	var observedAt time.Time
+	if err := tx.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&observedAt); err != nil {
+		return fmt.Errorf("read the clock for %s: %w", groupID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE alert_groups
+		SET last_notified_at = GREATEST(last_notified_at, $2::timestamptz)
+		WHERE id = $1`, groupID, observedAt); err != nil {
+		return fmt.Errorf("record that %s was notified: %w", groupID, err)
+	}
+	return nil
 }
 
 // mergeAlertsTx records a changed alert set and tells the incident's messages

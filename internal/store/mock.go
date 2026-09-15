@@ -152,7 +152,10 @@ func (m *MockStore) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.alertGroups[ag.ID] = m.copyAlertGroup(ag)
+	stored := m.copyAlertGroup(ag)
+	notifiedAt := time.Now()
+	stored.LastNotifiedAt = &notifiedAt
+	m.alertGroups[ag.ID] = stored
 
 	for _, e := range timelineEvents {
 		eventCopy := *e
@@ -286,6 +289,12 @@ func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey 
 		return alertgroup.MergeResult{Outcome: alertgroup.MergeNoActive}, nil
 	}
 
+	now := time.Now()
+	if group.LastNotifiedAt == nil || now.After(*group.LastNotifiedAt) {
+		notifiedAt := now
+		group.LastNotifiedAt = &notifiedAt
+	}
+
 	held := alertgroup.FingerprintsOf(group.Alerts)
 	relevant := alertgroup.FilterMergeable(incoming, held)
 	if len(relevant) == 0 {
@@ -302,7 +311,6 @@ func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey 
 		}, nil
 	}
 
-	now := time.Now()
 	events := alertgroup.MergeTimelineEvents(group.ID, relevant, held, now)
 	group.Alerts = merged
 	group.UpdatedAt = now

@@ -24,6 +24,9 @@ type AMPayload struct {
 	ExternalURL  string            `json:"externalURL"`
 	CommonLabels map[string]string `json:"commonLabels"`
 	Alerts       []model.Alert     `json:"alerts"`
+	// TruncatedAlerts is how many alerts Alertmanager cut off the notification
+	// (max_alerts). It does not say which.
+	TruncatedAlerts uint64 `json:"truncatedAlerts"`
 }
 
 // WebhookSecretValidator interface for validating webhook secrets
@@ -115,6 +118,15 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	}
 	log.Printf("Ingester: Group %s (Team: %s, Sev: %s, Alerts: %d firing, %d resolved, payload %s)",
 		alertKey, teamID, severity, firingInPayload, len(payload.Alerts)-firingInPayload, payload.Status)
+	if payload.TruncatedAlerts > 0 {
+		// Outside the contract: the receiver has max_alerts set. What the
+		// group still holds cannot be read from a list with an unknown part
+		// missing, so this is said every time rather than once.
+		log.Printf("Ingester: %s: Alertmanager cut %d alerts off the notification (max_alerts); "+
+			"the alert group can resolve while one of them still fires - set max_alerts to 0",
+			alertKey, payload.TruncatedAlerts)
+		metrics.AlertmanagerTruncatedNotificationsTotal.Inc()
+	}
 
 	// 3. Apply it to the incident that is open, if there is one. What that
 	// means - a merge, the end of the incident, or nothing at all - is decided

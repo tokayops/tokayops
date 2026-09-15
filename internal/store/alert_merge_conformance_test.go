@@ -18,12 +18,14 @@ import (
 // which is worse than not testing it, because it reads as coverage.
 //
 // What is compared here is the OUTCOME, because that is what the ingester
-// branches on. What the mock deliberately does not model - the withdrawal of
+// branches on, and whether the incident now says Alertmanager sent something,
+// because the view reads that off whichever store it is given. What the mock deliberately does not model - the withdrawal of
 // what an incident still owes, and the revision its messages are brought to -
 // is stated on the mock itself: no test may assert those against it.
 
 type applying interface {
 	CreateAlertGroup(ag *model.AlertGroup) error
+	GetAlertGroupByID(id string) (*model.AlertGroup, error)
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
 		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
 }
@@ -100,7 +102,7 @@ func TestTheMockAndTheDatabaseAnswerAPayloadAlike(t *testing.T) {
 		},
 	}
 
-	run := func(t *testing.T, s applying, tc int) alertgroup.MergeOutcome {
+	run := func(t *testing.T, s applying, tc int) (alertgroup.MergeOutcome, bool) {
 		t.Helper()
 		c := cases[tc]
 		id := uuid.New().String()
@@ -118,7 +120,11 @@ func TestTheMockAndTheDatabaseAnswerAPayloadAlike(t *testing.T) {
 		if err != nil {
 			t.Fatalf("apply the payload: %v", err)
 		}
-		return result.Outcome
+		group, err := s.GetAlertGroupByID(id)
+		if err != nil || group == nil {
+			t.Fatalf("read the incident: %v", err)
+		}
+		return result.Outcome, group.LastNotifiedAt != nil
 	}
 
 	for i, c := range cases {
@@ -126,14 +132,22 @@ func TestTheMockAndTheDatabaseAnswerAPayloadAlike(t *testing.T) {
 			store := setupTestDB(t)
 			store.SetRenderEnvironment("https://tokay.example", "UTC")
 
-			fromStore := run(t, store, i)
-			fromMock := run(t, NewMockStore(), i)
+			fromStore, storeNotified := run(t, store, i)
+			fromMock, mockNotified := run(t, NewMockStore(), i)
 
 			if fromStore != c.want {
 				t.Errorf("the database answered %s, want %s", fromStore, c.want)
 			}
 			if fromMock != fromStore {
 				t.Errorf("the mock answered %s and the database %s", fromMock, fromStore)
+			}
+			// Every payload that reaches an open incident is recorded; one for
+			// an incident that is over reaches nothing.
+			if wantNotified := c.want != alertgroup.MergeNoActive; storeNotified != wantNotified {
+				t.Errorf("the database recorded the notification: %v, want %v", storeNotified, wantNotified)
+			}
+			if mockNotified != storeNotified {
+				t.Errorf("the mock recorded the notification: %v, the database: %v", mockNotified, storeNotified)
 			}
 		})
 	}

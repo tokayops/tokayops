@@ -447,6 +447,14 @@ func (s *Store) buildSchema() error {
 		return err
 	}
 
+	// When Alertmanager last sent anything about a group. Nothing to fill in:
+	// a group has not heard from Alertmanager under this version yet, and
+	// updated_at is a different instant - when the group last changed.
+	if _, err := s.db.Exec(
+		`ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS last_notified_at TIMESTAMPTZ`); err != nil {
+		return fmt.Errorf("add last_notified_at to alert_groups: %w", err)
+	}
+
 	// Schedule revision history: the aggregate root, its append-only
 	// configuration snapshots, and the override history beside them.
 	//
@@ -896,7 +904,8 @@ func (s *Store) buildSchema() error {
 // All query functions should use this to ensure consistent column ordering.
 const alertGroupColumns = `id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step,
 	external_url, alerts_data, policy_snapshot, oncall_snapshot,
-	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, render_source_version`
+	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, render_source_version,
+	last_notified_at`
 
 // alertGroupScanner is an interface for scanning rows (works with *sql.Row and *sql.Rows).
 type alertGroupScanner interface {
@@ -907,7 +916,7 @@ type alertGroupScanner interface {
 // The row must contain columns in the order defined by alertGroupColumns.
 func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	var ag model.AlertGroup
-	var resolvedAt sql.NullTime
+	var resolvedAt, lastNotifiedAt sql.NullTime
 	var teamID, teamNameSnapshot, severity, policyID, externalURL sql.NullString
 	var alertsData, policySnapshot, oncallSnapshot, acknowledgedBy, resolvedBy sql.NullString
 
@@ -917,7 +926,7 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 		&externalURL, &alertsData,
 		&policySnapshot, &oncallSnapshot,
 		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt, &acknowledgedBy, &resolvedBy,
-		&ag.RenderSourceVersion,
+		&ag.RenderSourceVersion, &lastNotifiedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -937,6 +946,9 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 
 	if resolvedAt.Valid {
 		ag.ResolvedAt = &resolvedAt.Time
+	}
+	if lastNotifiedAt.Valid {
+		ag.LastNotifiedAt = &lastNotifiedAt.Time
 	}
 
 	// The alerts ARE the alert group: they are what a message about it says,
@@ -1025,9 +1037,12 @@ func (s *Store) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*m
 	if len(snapshotJson) > 0 {
 		snapshotVal = sql.NullString{String: string(snapshotJson), Valid: true}
 	}
+	// The ingester is the only caller, so the payload that opens the group is
+	// the first thing Alertmanager said about it. A group opened by hand goes
+	// through CreateAlertGroup and has heard from nobody.
 	_, err = tx.Exec(
-		`INSERT INTO alert_groups (id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+		`INSERT INTO alert_groups (id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at, last_notified_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())`,
 		ag.ID, ag.AlertKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep,
 		ag.ExternalURL, string(alertsJson), snapshotVal,
 		ag.AcknowledgedBy, ag.ResolvedBy, ag.CreatedAt, ag.UpdatedAt,

@@ -47,6 +47,17 @@ var (
 		Name: "unknown_team_alert_groups_total",
 		Help: "Alert groups created with a team label that matches no team in TokayOps.",
 	}, []string{"team"})
+
+	// A notification Alertmanager cut short with max_alerts. It says how many
+	// alerts it dropped and not which, so what the group still holds cannot
+	// be read from it - an alert group can resolve while an alert that was cut
+	// off still fires. No label: the group key is unbounded, and the log line
+	// names it. Counted on receipt, so a retry of the same notification counts
+	// again; the rule on it only asks whether it happened.
+	AlertmanagerTruncatedNotificationsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_truncated_notifications_total",
+		Help: "Alertmanager notifications received with alerts cut off by max_alerts.",
+	})
 )
 
 // Tier 4 - Engine
@@ -415,6 +426,7 @@ func init() {
 	register(AlertGroupsCreatedTotal)
 	register(UnknownTeamAlertGroupsTotal)
 	register(AlertGroupsResolvedTotal)
+	register(AlertmanagerTruncatedNotificationsTotal)
 
 	// Tier 4
 	register(EngineRunsTotal)

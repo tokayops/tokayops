@@ -9,6 +9,26 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **The Alertmanager receiver has a stated contract:** `send_resolved: true`,
+  `max_alerts: 0` and no custom `payload` (see the README). Nothing checks
+  the first and the last; a notification cut by `max_alerts` is now counted and
+  warned about.
+- The start adds `alert_groups.last_notified_at`. It stays empty for an
+  existing alert group until Alertmanager next sends about it.
+
+### Added
+
+- An alert group records when Alertmanager last sent anything about it,
+  repeats that change nothing included (`last_notified_at` in the API). The
+  alert group view shows it next to the last update, which is when the group
+  last changed. A group that fires steadily does not change; the new time is
+  what tells it apart from one Alertmanager has gone quiet about - everything in
+  it silenced, for example.
+- `alertmanager_truncated_notifications_total` and the warning rule
+  `AlertmanagerNotificationsTruncated`.
+
 ## [0.2.0] - 2026-09-11
 
 Converts to Apache-2.0 on 2028-09-11.

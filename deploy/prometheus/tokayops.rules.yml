@@ -264,6 +264,19 @@ groups:
         annotations:
           summary: "An escalation build was deferred in the last 5 minutes - an alert group may not have paged its on-call"
 
+      # Alertmanager cut alerts off a notification: the receiver has max_alerts
+      # set, which the webhook contract does not allow. The notification says
+      # how many alerts it dropped and not which, so an alert group can resolve
+      # while a dropped alert still fires. A process counter, so a warning; the
+      # ingester's log names the group. Like the deferral above, it says it
+      # happened in the window, and has no `for`.
+      - alert: AlertmanagerNotificationsTruncated
+        expr: sum(increase(alertmanager_truncated_notifications_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Alertmanager cut alerts off a notification in the last hour - set max_alerts to 0 on the TokayOps receiver"
+
       - alert: HighMTTR
         expr: |
           (rate(alert_group_resolution_duration_seconds_sum{severity="critical"}[7d])

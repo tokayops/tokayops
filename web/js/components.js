@@ -457,6 +457,12 @@ const Components = {
         const activeDuration = Components.formatDuration(Math.max(0, endedAt - startedAt));
         const statusTime = activeDuration;
         const updatedRelative = Components.timeSince(alertGroup.updated_at, { withAgo: true });
+        // Not the same instant as the update: a group that fires steadily does
+        // not change, and Alertmanager's repeats of it are what this one counts.
+        // Absent for a group Alertmanager never sent.
+        const notifiedRelative = alertGroup.last_notified_at
+            ? Components.timeSince(alertGroup.last_notified_at, { withAgo: true })
+            : '';
         const ackName = alertGroup.acknowledged_by || '';
         const ackDisplay = ackName ? truncateText(ackName, 28) : '';
         const ackTitle = ackName ? ` title="${escapeHtml(ackName)}"` : '';
@@ -481,7 +487,8 @@ const Components = {
                 <div class="detail-meta-row">
                     <span class="detail-meta-chip">${escapeHtml(teamLabel)}</span>
                     <span class="detail-meta-chip"${onCallTitle}>On-call ${escapeHtml(onCallDisplay)}</span>
-                    <span class="detail-meta-chip">Last update ${updatedRelative}</span>
+                    <span class="detail-meta-chip" title="When the alert group last changed">Last update ${updatedRelative}</span>
+                    ${notifiedRelative ? `<span class="detail-meta-chip" title="When Alertmanager last sent anything about this alert group, repeats included">Last notification ${notifiedRelative}</span>` : ''}
                     ${ackName ? `<span class="detail-meta-chip"${ackTitle}>Ack by ${escapeHtml(ackDisplay)}</span>` : ''}
                 </div>
             </div>
@@ -527,6 +534,12 @@ const Components = {
                             <div class="detail-label">Updated</div>
                             <div class="detail-value">${Components.formatTime(alertGroup.updated_at)}</div>
                         </div>
+                        ${alertGroup.last_notified_at ? `
+                            <div class="detail-item">
+                                <div class="detail-label">Last notification</div>
+                                <div class="detail-value">${Components.formatTime(alertGroup.last_notified_at)}</div>
+                            </div>
+                        ` : ''}
                         ${alertGroup.resolved_at ? `
                             <div class="detail-item">
                                 <div class="detail-label">Resolved</div>
