@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -382,4 +383,51 @@ func (s *Store) SubscriberConfig(ctx context.Context, integrationID string) (mod
 		return model.GenericWebhookConfig{}, false, fmt.Errorf("subscriber %s: configuration does not read: %w", integrationID, err)
 	}
 	return cfg, true, nil
+}
+
+// VerifyIntake settles what an Alertmanager payload is allowed to do, and what
+// the integration that sent it says about silence.
+//
+// From the database rather than from the cache, for the reason SubscriberConfig
+// gives: the cache is refreshed by whichever instance handled a change and by
+// no other, so an integration disabled or rotated on one instance goes on being
+// accepted by the rest until they restart. The cache says which integration a
+// secret belongs to; this says whether that integration still exists, is still
+// enabled, and still carries that secret.
+//
+// The bool is whether the payload is from who it claims to be. An error is the
+// database failing, which is a different answer: nothing can be stored either
+// way, so the caller asks Alertmanager to come back rather than turning it
+// away.
+//
+// The seconds are what the integration declares about silence, 0 for nothing
+// declared. They never decide whether a payload is taken.
+func (s *Store) VerifyIntake(ctx context.Context, integrationID, secret string) (int, bool, error) {
+	var kind model.IntegrationType
+	var enabled bool
+	var encrypted string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT type, enabled, config FROM integrations WHERE id = $1`, integrationID).
+		Scan(&kind, &enabled, &encrypted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if kind != model.IntegrationTypeAlertmanagerWebhook || !enabled {
+		return 0, false, nil
+	}
+	raw, err := decryptConfig(encrypted)
+	if err != nil {
+		return 0, false, err
+	}
+	var cfg model.WebhookConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return 0, false, fmt.Errorf("intake %s: configuration does not read: %w", integrationID, err)
+	}
+	if cfg.Secret == "" || subtle.ConstantTimeCompare([]byte(cfg.Secret), []byte(secret)) != 1 {
+		return 0, false, nil
+	}
+	return cfg.QuietAfterSeconds, true, nil
 }

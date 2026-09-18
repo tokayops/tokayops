@@ -93,7 +93,30 @@ func (c TelegramConfig) IsInteractive() bool {
 // WebhookConfig is the config schema for Alertmanager webhook integrations
 type WebhookConfig struct {
 	Secret string `json:"secret"`
+
+	// QuietAfterSeconds is how long a silence about an alert group is normal
+	// for the Alertmanager sending through this integration: after it, the
+	// view says the group has gone quiet.
+	//
+	// It is the operator's number, not one this system works out. What is
+	// normal is the route's repeat_interval plus its group_interval, and
+	// neither is in anything Alertmanager sends. Zero or absent means nothing
+	// is claimed, and nothing is shown.
+	//
+	// Whole minutes, because that is what the form takes and shows: a value of
+	// 90 would come back as 2 minutes and be saved as 120 the next time
+	// somebody opened the form, which is a setting that changes by being
+	// looked at.
+	QuietAfterSeconds int `json:"quiet_after_seconds,omitempty"`
 }
+
+// QuietAfterBounds are the seconds a declared silence may be. A minute is the
+// shortest interval Alertmanager is ever configured to repeat at; a week is
+// past the point where a group that quiet is news.
+const (
+	QuietAfterMin = 60
+	QuietAfterMax = 604800
+)
 
 // GenericWebhookConfig is the config schema for generic outbound webhook integrations
 type GenericWebhookConfig struct {

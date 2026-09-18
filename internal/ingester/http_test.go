@@ -23,17 +23,19 @@ func seedDefaultTeams(s *store.MockStore) {
 	s.CreateTeam(&model.Team{ID: "triage", Name: "Triage", CreatedAt: time.Now()})
 }
 
-// mockSecretValidator implements WebhookSecretValidator for testing
+// mockSecretValidator implements WebhookSource for testing: a secret belongs
+// to an integration named after it, which is all the ingester asks of the
+// cache.
 type mockSecretValidator struct {
 	secrets map[string]bool
 }
 
-func (m *mockSecretValidator) ValidateWebhookSecret(secret string) bool {
+func (m *mockSecretValidator) WebhookIntegrationID(secret string) (string, bool) {
 	// If no secrets configured, reject all (matches IntegrationCache behavior)
-	if len(m.secrets) == 0 {
-		return false
+	if len(m.secrets) == 0 || !m.secrets[secret] {
+		return "", false
 	}
-	return m.secrets[secret]
+	return "integration-for-" + secret, true
 }
 
 func TestGenerateTitle(t *testing.T) {

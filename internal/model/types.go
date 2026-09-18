@@ -174,6 +174,20 @@ type AlertGroup struct {
 	// Empty for a group Alertmanager never sent, such as one opened by hand,
 	// and for a group that has heard nothing since the version that records it.
 	LastNotifiedAt *time.Time `json:"last_notified_at,omitempty"`
+
+	// QuietAfterSeconds is what the integration that last sent about this
+	// group declared: how long silence is normal for it. A snapshot, like the
+	// team name - the integration can be changed or deleted, and what was true
+	// when the payload arrived stays.
+	//
+	// Empty when nothing is declared, and then nothing is said about silence.
+	QuietAfterSeconds *int `json:"quiet_after_seconds,omitempty"`
+
+	// IntakeIntegrationID names the integration that last sent about this
+	// group. Internal: it is how a change to that integration reaches the
+	// groups it feeds, and a reader outside this repository can do nothing
+	// with it.
+	IntakeIntegrationID string `json:"-"`
 }
 
 // AlertGroupSummary is a lightweight projection of AlertGroup for list views.
@@ -200,6 +214,12 @@ type AlertGroupSummary struct {
 	// of AlertsCount is resolved.
 	FiringCount     int `json:"firing_count"`
 	UnreportedCount int `json:"unreported_count"`
+
+	// The list draws the card without the alerts, so what it needs to say
+	// "this group has gone quiet" has to be here: when Alertmanager last sent,
+	// and after how long silence is unusual for whoever sent it.
+	LastNotifiedAt    *time.Time `json:"last_notified_at,omitempty"`
+	QuietAfterSeconds *int       `json:"quiet_after_seconds,omitempty"`
 }
 
 // IncidentStatus represents the lifecycle state of a business incident.

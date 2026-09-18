@@ -42,6 +42,11 @@ type StoreInterface interface {
 	// Atomic resolve with alerts update (ingester auto-resolve: alerts + status + timeline + outbox in one transaction)
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string, notification alertgroup.Notification, actor string) (alertgroup.MergeResult, error)
 
+	// VerifyIntake settles whether an Alertmanager payload may be taken: the
+	// integration the secret belongs to still exists, is enabled and still
+	// carries it. The seconds are what it declares about silence.
+	VerifyIntake(ctx context.Context, integrationID, secret string) (int, bool, error)
+
 	// notification_deliveries has no methods anywhere any more. It had one
 	// reader and one writer, both in the job path that kept an alert group's
 	// messages current, and what was delivered and where it landed is an

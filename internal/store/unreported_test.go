@@ -239,10 +239,12 @@ func TestTheListCountsTheThreeStates(t *testing.T) {
 	}
 
 	// fp-1 clears, fp-2 stops being reported, fp-0 keeps firing.
-	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key, amSnapshot(
+	snapshot := amSnapshot(
 		notifiedAlert("fp-0", model.AlertStatusFiring),
 		notifiedAlert("fp-1", model.AlertStatusResolved),
-	), "system"); err != nil {
+	)
+	snapshot.QuietAfterSeconds = 900
+	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key, snapshot, "system"); err != nil {
 		t.Fatalf("apply the snapshot: %v", err)
 	}
 
@@ -280,6 +282,14 @@ func TestTheListCountsTheThreeStates(t *testing.T) {
 	}
 	if resolved := summary.AlertsCount - summary.FiringCount - summary.UnreportedCount; resolved != 1 {
 		t.Errorf("what is left over is %d alerts, want the one that resolved", resolved)
+	}
+	// The card is drawn from this row alone, so it also carries what says
+	// whether Alertmanager has gone quiet about the group.
+	if summary.LastNotifiedAt == nil {
+		t.Error("the list does not say when Alertmanager last sent")
+	}
+	if summary.QuietAfterSeconds == nil || *summary.QuietAfterSeconds != 900 {
+		t.Errorf("the list says quiet after %v, want the declared 900", summary.QuietAfterSeconds)
 	}
 }
 

@@ -31,6 +31,12 @@ type MockStore struct {
 
 	mu sync.RWMutex
 
+	// What VerifyIntake answers: by default a payload is taken and nothing is
+	// declared about silence.
+	intakeQuietAfter int
+	intakeRefused    bool
+	intakeErr        error
+
 	alertGroups        map[string]*model.AlertGroup
 	incidents          map[int]*model.Incident
 	incidentSeq        int
@@ -299,6 +305,13 @@ func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey 
 	if group.LastNotifiedAt == nil || now.After(*group.LastNotifiedAt) {
 		notifiedAt := now
 		group.LastNotifiedAt = &notifiedAt
+	}
+	// What the sender declares about silence, as it came: cleared when the
+	// operator clears it.
+	group.QuietAfterSeconds = nil
+	if notification.QuietAfterSeconds > 0 {
+		seconds := notification.QuietAfterSeconds
+		group.QuietAfterSeconds = &seconds
 	}
 
 	held := alertgroup.FingerprintsOf(group.Alerts)
@@ -657,6 +670,7 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 			CreatedAt: ag.CreatedAt, UpdatedAt: ag.UpdatedAt, ResolvedAt: ag.ResolvedAt,
 			AlertsCount: len(ag.Alerts), FiringCount: firingCount,
 			UnreportedCount: unreportedCount,
+			LastNotifiedAt:  ag.LastNotifiedAt, QuietAfterSeconds: ag.QuietAfterSeconds,
 		})
 	}
 	return filtered
@@ -847,6 +861,43 @@ func (m *MockStore) CreateTeam(t *model.Team) error {
 	m.teams[t.ID] = &teamCopy
 	m.teamMembers[t.ID] = make(map[string]model.TeamMemberRole)
 	return nil
+}
+
+// VerifyIntake mirrors the store: an integration the mock knows about, is
+// enabled, and whose secret matches may send, and it declares what
+// SetIntakeQuietAfter was told. The default is the one every ingester test
+// wants - the payload is taken, nothing is declared about silence.
+func (m *MockStore) VerifyIntake(ctx context.Context, integrationID, secret string) (int, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.intakeErr != nil {
+		return 0, false, m.intakeErr
+	}
+	if m.intakeRefused {
+		return 0, false, nil
+	}
+	return m.intakeQuietAfter, true, nil
+}
+
+// SetIntakeQuietAfter is what integrations say about silence in a test.
+func (m *MockStore) SetIntakeQuietAfter(seconds int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.intakeQuietAfter = seconds
+}
+
+// RefuseIntake makes every payload look like one from an integration that was
+// disabled or had its secret rotated; FailIntake makes the check itself fail.
+func (m *MockStore) RefuseIntake(refused bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.intakeRefused = refused
+}
+
+func (m *MockStore) FailIntake(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.intakeErr = err
 }
 
 func (m *MockStore) GetTeamByID(id string) (*model.Team, error) {

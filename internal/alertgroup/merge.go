@@ -33,6 +33,19 @@ import (
 type Notification struct {
 	Alerts   []model.Alert
 	Snapshot bool
+
+	// IntegrationID names the integration this payload came through, so that a
+	// change to what that integration declares can reach the groups it feeds -
+	// including a group that has gone quiet and will never send again.
+	IntegrationID string
+
+	// QuietAfterSeconds is what the integration this payload came through says
+	// about silence: how long a group may say nothing before the view calls it
+	// quiet. It is about the sender rather than about the alerts, and it rides
+	// with the payload because that is when it is read - fresh, per payload,
+	// so an operator's change reaches every instance at once. Zero is nothing
+	// declared.
+	QuietAfterSeconds int
 }
 
 // MergeOutcome is what an Alertmanager payload did to the incident it named.

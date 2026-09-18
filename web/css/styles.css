@@ -1051,6 +1051,14 @@ body::before {
 
 /* An alert Alertmanager has stopped reporting: neither firing nor resolved,
    and deliberately quieter than both. */
+/* An alert group Alertmanager has gone quiet about: the same restraint as the
+   alert badge, and deliberately not the colour of a severity. */
+.badge-quiet {
+    border: 1px solid var(--text-muted);
+    color: var(--text-muted);
+    background: transparent;
+}
+
 .alert-status-tag.status-unreported {
     border-color: var(--text-muted);
     color: var(--text-muted);

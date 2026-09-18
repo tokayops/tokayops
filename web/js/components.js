@@ -230,6 +230,44 @@ const Components = {
     },
 
     /**
+     * Has Alertmanager gone quiet about this alert group?
+     *
+     * Only when the integration that sent it says how long silence is normal:
+     * the number is the operator's, and without it nothing is claimed. Only
+     * while the group is open - a group that ended is not waiting for news -
+     * and only when we know when Alertmanager last sent, which we do not for
+     * groups opened by hand or opened before this was recorded.
+     *
+     * @param {Object} alertGroup - Alert group or summary
+     * @returns {{silentFor: number, quietAfter: number}|null} milliseconds of
+     * silence and the declared allowance, or null when nothing is claimed.
+     */
+    quietSilence: (alertGroup) => {
+        const quietAfter = alertGroup?.quiet_after_seconds;
+        if (!quietAfter || !alertGroup?.last_notified_at) return null;
+        if (getDisplayStatus(alertGroup.status) === 'resolved') return null;
+
+        const silentFor = Date.now() - new Date(alertGroup.last_notified_at).getTime();
+        if (!(silentFor > quietAfter * 1000)) return null;
+        return { silentFor, quietAfter };
+    },
+
+    /**
+     * Render the badge for an alert group Alertmanager has gone quiet about.
+     * Says the fact and not a cause: silence looks the same whether everything
+     * in the group was silenced, the route changed, or Alertmanager is down.
+     * @param {Object} alertGroup - Alert group or summary
+     */
+    quietBadge: (alertGroup) => {
+        const quiet = Components.quietSilence(alertGroup);
+        if (!quiet) return '';
+        const title = `Alertmanager last sent at ${Components.formatTime(alertGroup.last_notified_at)}; `
+            + `this integration says silence over ${Components.formatDuration(quiet.quietAfter * 1000)} is unusual`;
+        return `<span class="badge badge-quiet" title="${escapeHtml(title)}">`
+            + `No notification for ${Components.formatDuration(quiet.silentFor)}</span>`;
+    },
+
+    /**
      * Counts of an alert group by state. The API answers them for a list,
      * where the alerts themselves are not sent; with the alerts at hand they
      * are counted here, by the same three states.
@@ -444,6 +482,7 @@ const Components = {
                     <div class="alert-group-status-badge">
                         ${Components.statusBadge(alertGroup.status)}
                     </div>
+                    ${Components.quietBadge(alertGroup)}
                 </div>
                 <div class="alert-group-meta">
                     <div class="alert-group-meta-item">
@@ -526,6 +565,7 @@ const Components = {
                     <span class="detail-meta-chip"${onCallTitle}>On-call ${escapeHtml(onCallDisplay)}</span>
                     <span class="detail-meta-chip" title="When the alert group last changed">Last update ${updatedRelative}</span>
                     ${notifiedRelative ? `<span class="detail-meta-chip" title="When Alertmanager last sent anything about this alert group, repeats included">Last notification ${notifiedRelative}</span>` : ''}
+                    ${Components.quietBadge(alertGroup)}
                     ${ackName ? `<span class="detail-meta-chip"${ackTitle}>Ack by ${escapeHtml(ackDisplay)}</span>` : ''}
                 </div>
             </div>
@@ -1898,6 +1938,13 @@ const Components = {
             const isMasked = secret === '****';
             const baseUrl = window.location.origin + '/webhook/alertmanager';
             const displayUrl = isMasked ? baseUrl + '?token=****' : baseUrl + '?token=YOUR_TOKEN';
+            // Declared in seconds and edited in minutes: an operator reads
+            // repeat_interval in minutes and hours, not in seconds. Whole
+            // minutes only, which the API enforces, so nothing is lost on the
+            // way back into the form.
+            const quietAfterMinutes = config?.quiet_after_seconds
+                ? config.quiet_after_seconds / 60
+                : '';
 
             return `
                 <div class="form-group">
@@ -1916,6 +1963,17 @@ const Components = {
                         </button>
                     </div>
                     <small class="form-hint">Use this URL in your Alertmanager configuration. Replace YOUR_TOKEN with your actual token.</small>
+                </div>
+                <div class="form-group">
+                    <label for="config-quiet-after">Consider quiet after (minutes)</label>
+                    <input type="number" id="config-quiet-after" class="form-input" min="1" max="10080"
+                           placeholder="leave empty to say nothing about silence"
+                           value="${quietAfterMinutes}">
+                    <small class="form-hint">How long this Alertmanager may say nothing about an alert group before
+                        the alert group is shown as quiet. A route repeats between its repeat_interval and
+                        repeat_interval + group_interval, so take the upper bound and add your own margin; one receiver
+                        often serves several routes, and then the longest one is the number to use. Empty means nothing
+                        is claimed and no alert group is marked.</small>
                 </div>
             `;
         } else if (type === 'generic_webhook') {

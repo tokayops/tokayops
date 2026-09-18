@@ -61,7 +61,7 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 	// that says Alertmanager is still sending. The instant it answers with is
 	// this payload's: the marks below and the silences they end are measured
 	// from the same clock, read after the lock.
-	observedAt, err := recordNotifiedTx(ctx, tx, group.ID)
+	observedAt, err := recordNotifiedTx(ctx, tx, group.ID, notification)
 	if err != nil {
 		return alertgroup.MergeResult{}, err
 	}
@@ -141,17 +141,37 @@ func countUnreported(applied alertgroup.Applied) {
 // column from going back when the clock itself steps back; it ignores the
 // NULL of a group that has not heard from Alertmanager yet.
 //
-// Only this column: not updated_at, which is when the group last changed, and
-// not the render source version - a repeat is not news about the alert.
-func recordNotifiedTx(ctx context.Context, tx *sql.Tx, groupID string) (time.Time, error) {
+// It also records what the integration that sent it declares about silence,
+// which is read per payload and therefore may change - including back to
+// nothing, when an operator clears the field. That one is written as it comes
+// rather than under GREATEST: it is a statement about the sender, not a clock.
+//
+// Only these two columns: not updated_at, which is when the group last
+// changed, and not the render source version - a repeat is not news about the
+// alert.
+func recordNotifiedTx(ctx context.Context, tx *sql.Tx, groupID string,
+	notification alertgroup.Notification) (time.Time, error) {
+
 	var observedAt time.Time
 	if err := tx.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&observedAt); err != nil {
 		return time.Time{}, fmt.Errorf("read the clock for %s: %w", groupID, err)
 	}
+	var quiet *int
+	if notification.QuietAfterSeconds > 0 {
+		seconds := notification.QuietAfterSeconds
+		quiet = &seconds
+	}
+	var sender *string
+	if notification.IntegrationID != "" {
+		id := notification.IntegrationID
+		sender = &id
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE alert_groups
-		SET last_notified_at = GREATEST(last_notified_at, $2::timestamptz)
-		WHERE id = $1`, groupID, observedAt); err != nil {
+		SET last_notified_at = GREATEST(last_notified_at, $2::timestamptz),
+		    quiet_after_seconds = $3,
+		    intake_integration_id = $4
+		WHERE id = $1`, groupID, observedAt, quiet, sender); err != nil {
 		return time.Time{}, fmt.Errorf("record that %s was notified: %w", groupID, err)
 	}
 	return observedAt, nil

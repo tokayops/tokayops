@@ -1169,6 +1169,15 @@ definitions:
         allOf:
         - $ref: '#/definitions/model.EscalationPolicySnapshot'
         description: Policy Snapshot (stores the policy state at the time of creation/assignment)
+      quiet_after_seconds:
+        description: |-
+          QuietAfterSeconds is what the integration that last sent about this
+          group declared: how long silence is normal for it. A snapshot, like the
+          team name - the integration can be changed or deleted, and what was true
+          when the payload arrived stays.
+
+          Empty when nothing is declared, and then nothing is said about silence.
+        type: integer
       resolved_at:
         type: string
       resolved_by:

@@ -4794,6 +4794,10 @@ const docTemplate = `{
                         }
                     ]
                 },
+                "quiet_after_seconds": {
+                    "description": "QuietAfterSeconds is what the integration that last sent about this\ngroup declared: how long silence is normal for it. A snapshot, like the\nteam name - the integration can be changed or deleted, and what was true\nwhen the payload arrived stays.\n\nEmpty when nothing is declared, and then nothing is said about silence.",
+                    "type": "integer"
+                },
                 "resolved_at": {
                     "type": "string"
                 },

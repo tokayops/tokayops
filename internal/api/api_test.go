@@ -1149,10 +1149,12 @@ func TestTheSummaryListCountsTheThreeStates(t *testing.T) {
 			Labels: map[string]string{"alertname": fingerprint},
 		}
 	}
+	notifiedAt := time.Now().Add(-2 * time.Hour)
+	quietAfter := 14700
 	if err := s.CreateAlertGroup(&model.AlertGroup{
 		ID: "ag-counted", AlertKey: "dedup-counted", Status: model.AlertGroupStatusProcessing,
 		Title: "Test Alert Group", TeamID: "devops", TeamNameSnapshot: "DevOps",
-		Severity: "critical",
+		Severity: "critical", LastNotifiedAt: &notifiedAt, QuietAfterSeconds: &quietAfter,
 		Alerts: []model.Alert{
 			alert("fp-0", model.AlertStatusFiring, nil),
 			alert("fp-1", model.AlertStatusFiring, &silentSince),
@@ -1172,10 +1174,12 @@ func TestTheSummaryListCountsTheThreeStates(t *testing.T) {
 
 	var resp struct {
 		AlertGroups []struct {
-			ID              string `json:"id"`
-			AlertsCount     int    `json:"alerts_count"`
-			FiringCount     int    `json:"firing_count"`
-			UnreportedCount int    `json:"unreported_count"`
+			ID                string     `json:"id"`
+			AlertsCount       int        `json:"alerts_count"`
+			FiringCount       int        `json:"firing_count"`
+			UnreportedCount   int        `json:"unreported_count"`
+			LastNotifiedAt    *time.Time `json:"last_notified_at"`
+			QuietAfterSeconds *int       `json:"quiet_after_seconds"`
 		} `json:"alert_groups"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
@@ -1193,6 +1197,13 @@ func TestTheSummaryListCountsTheThreeStates(t *testing.T) {
 		}
 		if resolved := summary.AlertsCount - summary.FiringCount - summary.UnreportedCount; resolved != 1 {
 			t.Errorf("what is left over is %d, want the one alert that resolved", resolved)
+		}
+		// The card is drawn from the list alone, so what it needs to say an
+		// alert group has gone quiet has to be in the list too.
+		if summary.LastNotifiedAt == nil || summary.QuietAfterSeconds == nil ||
+			*summary.QuietAfterSeconds != 14700 {
+			t.Errorf("the list says notified %v and quiet after %v; the card cannot tell",
+				summary.LastNotifiedAt, summary.QuietAfterSeconds)
 		}
 	}
 	if !found {
