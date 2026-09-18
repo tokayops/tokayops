@@ -111,6 +111,7 @@ func setupTelegramPipeline(t *testing.T) *tgPipelineEnv {
 	t.Setenv(config.EncryptionKeyEnv, hex.EncodeToString(key))
 
 	s := testutil.SetupDB(t)
+	seedIntakeIntegration(t, s)
 	bot := newFakeBot()
 	server := bot.start(t)
 	t.Cleanup(server.Close)

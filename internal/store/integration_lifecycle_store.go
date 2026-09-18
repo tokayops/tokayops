@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -106,6 +107,9 @@ func (s *Store) UpdateIntegration(ctx context.Context, id string, patch Integrat
 		RETURNING updated_at`, after.Name, after.Enabled, encrypted, id).Scan(&after.UpdatedAt); err != nil {
 		return IntegrationChange{}, busyOr(err)
 	}
+	if err := declareSilenceTx(ctx, tx, &after); err != nil {
+		return IntegrationChange{}, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return IntegrationChange{}, err
@@ -161,6 +165,10 @@ func (s *Store) DeleteIntegration(ctx context.Context, id, actor string) (Integr
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM integrations WHERE id = $1`, id); err != nil {
 		return IntegrationChange{}, busyOr(err)
+	}
+	// An integration that is gone declares nothing.
+	if _, err := clearSilenceTx(ctx, tx, id); err != nil {
+		return IntegrationChange{}, err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -311,4 +319,51 @@ func (s *Store) IntegrationTombstone(ctx context.Context, id string) (model.Inte
 		tombstone.TeamID = &teamID.String
 	}
 	return tombstone, true, nil
+}
+
+// declareSilenceTx brings the open alert groups an Alertmanager integration
+// feeds up to what it now says about silence.
+//
+// A group takes the number from the payload that reached it, which is enough
+// while payloads keep arriving - and useless for the group this is for. A group
+// everything in which was silenced hears nothing more, so an operator who
+// clears the field would otherwise leave its badge standing for good. The
+// integration's own row is where the answer changed, so this is where the
+// groups are brought to it.
+//
+// A disabled integration declares nothing: it is not sending, and what it used
+// to allow is not a statement about a group nobody is feeding.
+func declareSilenceTx(ctx context.Context, tx *sql.Tx, integration *model.Integration) error {
+	if integration.Type != model.IntegrationTypeAlertmanagerWebhook {
+		return nil
+	}
+	var cfg model.WebhookConfig
+	if err := json.Unmarshal(integration.Config, &cfg); err != nil {
+		return fmt.Errorf("read the configuration of %s: %w", integration.ID, err)
+	}
+	var quiet *int
+	if integration.Enabled && cfg.QuietAfterSeconds > 0 {
+		seconds := cfg.QuietAfterSeconds
+		quiet = &seconds
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE alert_groups SET quiet_after_seconds = $2
+		WHERE intake_integration_id = $1 AND status NOT IN ($3, $4)`,
+		integration.ID, quiet, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed,
+	); err != nil {
+		return fmt.Errorf("bring the alert groups of %s to what it declares: %w", integration.ID, err)
+	}
+	return nil
+}
+
+// clearSilenceTx is declareSilenceTx for an integration that no longer exists.
+func clearSilenceTx(ctx context.Context, tx *sql.Tx, integrationID string) (int64, error) {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE alert_groups SET quiet_after_seconds = NULL
+		WHERE intake_integration_id = $1 AND status NOT IN ($2, $3)`,
+		integrationID, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed)
+	if err != nil {
+		return 0, fmt.Errorf("clear what %s declared: %w", integrationID, err)
+	}
+	return result.RowsAffected()
 }

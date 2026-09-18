@@ -31,6 +31,12 @@ type MockStore struct {
 
 	mu sync.RWMutex
 
+	// What VerifyIntake answers: by default a payload is taken and nothing is
+	// declared about silence.
+	intakeQuietAfter int
+	intakeRefused    bool
+	intakeErr        error
+
 	alertGroups        map[string]*model.AlertGroup
 	incidents          map[int]*model.Incident
 	incidentSeq        int
@@ -152,7 +158,10 @@ func (m *MockStore) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.alertGroups[ag.ID] = m.copyAlertGroup(ag)
+	stored := m.copyAlertGroup(ag)
+	notifiedAt := time.Now()
+	stored.LastNotifiedAt = &notifiedAt
+	m.alertGroups[ag.ID] = stored
 
 	for _, e := range timelineEvents {
 		eventCopy := *e
@@ -267,8 +276,14 @@ func (m *MockStore) UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResu
 // no snapshot to raise. The outcomes ARE the same as the database's, and a test
 // proves that - see TestTheMockAndTheDatabaseAnswerAPayloadAlike; anything
 // beyond the outcome has to be asserted against a real one.
+//
+// The one place the outcomes part company follows from the same omission: a
+// payload whose only news is that Alertmanager has stopped reporting an alert
+// is "merged" here and "unchanged" against the database, because no message
+// shows the mark and the database answers with what the messages did. The
+// alerts it leaves behind are the same either way.
 func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
-	incoming []model.Alert, actor string) (alertgroup.MergeResult, error) {
+	notification alertgroup.Notification, actor string) (alertgroup.MergeResult, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -286,23 +301,30 @@ func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey 
 		return alertgroup.MergeResult{Outcome: alertgroup.MergeNoActive}, nil
 	}
 
-	held := alertgroup.FingerprintsOf(group.Alerts)
-	relevant := alertgroup.FilterMergeable(incoming, held)
-	if len(relevant) == 0 {
-		return alertgroup.MergeResult{
-			Outcome: alertgroup.MergeIgnored, AlertGroupID: group.ID,
-		}, nil
-	}
-
-	merged := alertgroup.MergeAlerts(group.Alerts, relevant)
-	resolving := alertgroup.AllResolved(merged)
-	if !resolving && alertgroup.SameAlerts(group.Alerts, merged) {
-		return alertgroup.MergeResult{
-			Outcome: alertgroup.MergeUnchanged, AlertGroupID: group.ID,
-		}, nil
-	}
-
 	now := time.Now()
+	if group.LastNotifiedAt == nil || now.After(*group.LastNotifiedAt) {
+		notifiedAt := now
+		group.LastNotifiedAt = &notifiedAt
+	}
+	// What the sender declares about silence, as it came: cleared when the
+	// operator clears it.
+	group.QuietAfterSeconds = nil
+	if notification.QuietAfterSeconds > 0 {
+		seconds := notification.QuietAfterSeconds
+		group.QuietAfterSeconds = &seconds
+	}
+
+	held := alertgroup.FingerprintsOf(group.Alerts)
+	applied := alertgroup.Apply(group.Alerts, notification, now)
+	merged, relevant, resolving := applied.Alerts, applied.Relevant, applied.Resolving
+	if !resolving && alertgroup.SameAlerts(group.Alerts, merged) {
+		outcome := alertgroup.MergeUnchanged
+		if len(relevant) == 0 {
+			outcome = alertgroup.MergeIgnored
+		}
+		return alertgroup.MergeResult{Outcome: outcome, AlertGroupID: group.ID}, nil
+	}
+
 	events := alertgroup.MergeTimelineEvents(group.ID, relevant, held, now)
 	group.Alerts = merged
 	group.UpdatedAt = now
@@ -631,10 +653,13 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 		if days > 0 && ag.UpdatedAt.Before(cutoff) && ag.CreatedAt.Before(cutoff) {
 			continue
 		}
-		firingCount := 0
+		firingCount, unreportedCount := 0, 0
 		for _, a := range ag.Alerts {
-			if a.Status == "firing" {
+			switch a.State() {
+			case model.AlertStateFiring:
 				firingCount++
+			case model.AlertStateUnreported:
+				unreportedCount++
 			}
 		}
 		filtered = append(filtered, &model.AlertGroupSummary{
@@ -644,6 +669,8 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 			AcknowledgedBy: ag.AcknowledgedBy, ResolvedBy: ag.ResolvedBy,
 			CreatedAt: ag.CreatedAt, UpdatedAt: ag.UpdatedAt, ResolvedAt: ag.ResolvedAt,
 			AlertsCount: len(ag.Alerts), FiringCount: firingCount,
+			UnreportedCount: unreportedCount,
+			LastNotifiedAt:  ag.LastNotifiedAt, QuietAfterSeconds: ag.QuietAfterSeconds,
 		})
 	}
 	return filtered
@@ -834,6 +861,43 @@ func (m *MockStore) CreateTeam(t *model.Team) error {
 	m.teams[t.ID] = &teamCopy
 	m.teamMembers[t.ID] = make(map[string]model.TeamMemberRole)
 	return nil
+}
+
+// VerifyIntake mirrors the store: an integration the mock knows about, is
+// enabled, and whose secret matches may send, and it declares what
+// SetIntakeQuietAfter was told. The default is the one every ingester test
+// wants - the payload is taken, nothing is declared about silence.
+func (m *MockStore) VerifyIntake(ctx context.Context, integrationID, secret string) (int, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.intakeErr != nil {
+		return 0, false, m.intakeErr
+	}
+	if m.intakeRefused {
+		return 0, false, nil
+	}
+	return m.intakeQuietAfter, true, nil
+}
+
+// SetIntakeQuietAfter is what integrations say about silence in a test.
+func (m *MockStore) SetIntakeQuietAfter(seconds int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.intakeQuietAfter = seconds
+}
+
+// RefuseIntake makes every payload look like one from an integration that was
+// disabled or had its secret rotated; FailIntake makes the check itself fail.
+func (m *MockStore) RefuseIntake(refused bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.intakeRefused = refused
+}
+
+func (m *MockStore) FailIntake(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.intakeErr = err
 }
 
 func (m *MockStore) GetTeamByID(id string) (*model.Team, error) {

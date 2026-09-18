@@ -230,14 +230,88 @@ const Components = {
     },
 
     /**
-     * Render alert status badge (for alert-level statuses: firing/resolved)
-     * @param {string} status - Alert status (firing or resolved)
+     * Has Alertmanager gone quiet about this alert group?
+     *
+     * Only when the integration that sent it says how long silence is normal:
+     * the number is the operator's, and without it nothing is claimed. Only
+     * while the group is open - a group that ended is not waiting for news -
+     * and only when we know when Alertmanager last sent, which we do not for
+     * groups opened by hand or opened before this was recorded.
+     *
+     * @param {Object} alertGroup - Alert group or summary
+     * @returns {{silentFor: number, quietAfter: number}|null} milliseconds of
+     * silence and the declared allowance, or null when nothing is claimed.
      */
-    alertStatusBadge: (status) => {
-        const normalized = status?.toLowerCase() || 'firing';
-        const label = normalized === 'resolved' ? 'Resolved' : 'Firing';
-        const cssClass = normalized === 'resolved' ? 'resolved' : 'firing';
-        return `<span class="alert-status-tag status-${cssClass}">${label}</span>`;
+    quietSilence: (alertGroup) => {
+        const quietAfter = alertGroup?.quiet_after_seconds;
+        if (!quietAfter || !alertGroup?.last_notified_at) return null;
+        if (getDisplayStatus(alertGroup.status) === 'resolved') return null;
+
+        const silentFor = Date.now() - new Date(alertGroup.last_notified_at).getTime();
+        if (!(silentFor > quietAfter * 1000)) return null;
+        return { silentFor, quietAfter };
+    },
+
+    /**
+     * Render the badge for an alert group Alertmanager has gone quiet about.
+     * Says the fact and not a cause: silence looks the same whether everything
+     * in the group was silenced, the route changed, or Alertmanager is down.
+     * @param {Object} alertGroup - Alert group or summary
+     */
+    quietBadge: (alertGroup) => {
+        const quiet = Components.quietSilence(alertGroup);
+        if (!quiet) return '';
+        const title = `Alertmanager last sent at ${Components.formatTime(alertGroup.last_notified_at)}; `
+            + `this integration says silence over ${Components.formatDuration(quiet.quietAfter * 1000)} is unusual`;
+        return `<span class="badge badge-quiet" title="${escapeHtml(title)}">`
+            + `No notification for ${Components.formatDuration(quiet.silentFor)}</span>`;
+    },
+
+    /**
+     * Counts of an alert group by state. The API answers them for a list,
+     * where the alerts themselves are not sent; with the alerts at hand they
+     * are counted here, by the same three states.
+     * @param {Object} alertGroup - Alert group or summary
+     */
+    alertCounts: (alertGroup) => {
+        const alerts = alertGroup.alerts;
+        const total = alertGroup.alerts_count ?? alerts?.length ?? 0;
+        const counted = (state) => alerts?.filter(a => Components.alertState(a) === state).length ?? 0;
+        const firing = alertGroup.firing_count ?? counted('firing');
+        const unreported = alertGroup.unreported_count ?? counted('unreported');
+        return { total, firing, unreported, resolved: Math.max(0, total - firing - unreported) };
+    },
+
+    /**
+     * State of one alert: what Alertmanager last said, and whether it still
+     * says it. The same three states the API counts by, worked out in one
+     * place so the badge, the border and the counts cannot disagree.
+     * @param {Object} alert - Alert data
+     * @returns {'firing'|'unreported'|'resolved'}
+     */
+    alertState: (alert) => {
+        // Anything that is not firing is resolved, including a status this
+        // build does not know - the same answer model.Alert.State gives in Go
+        // and the same one the list counts by in SQL.
+        if (alert?.status?.toLowerCase() !== 'firing') return 'resolved';
+        return alert?.unreportedSince ? 'unreported' : 'firing';
+    },
+
+    /**
+     * Render alert status badge (for alert-level states: firing/unreported/resolved)
+     * @param {Object} alert - Alert data
+     */
+    alertStatusBadge: (alert) => {
+        const state = Components.alertState(alert);
+        if (state === 'unreported') {
+            const since = Components.formatTime(alert.unreportedSince);
+            const title = 'Absent from the latest Alertmanager notification for this group: '
+                + 'silenced, inhibited, or cleared while silenced';
+            return `<span class="alert-status-tag status-unreported" title="${escapeHtml(title)}">`
+                + `Not reported since ${escapeHtml(since)}</span>`;
+        }
+        const label = state === 'resolved' ? 'Resolved' : 'Firing';
+        return `<span class="alert-status-tag status-${state}">${label}</span>`;
     },
 
     /**
@@ -365,9 +439,8 @@ const Components = {
      * @param {Object} alertGroup - AlertGroup data
      */
     alertGroupCard: (alertGroup, options = {}) => {
-        const alertCount = alertGroup.alerts_count ?? alertGroup.alerts?.length ?? 0;
-        const firingCount = alertGroup.firing_count ?? alertGroup.alerts?.filter(a => a.status === 'firing').length ?? 0;
-        const resolvedCount = alertCount - firingCount;
+        const { total: alertCount, firing: firingCount, unreported: unreportedCount,
+            resolved: resolvedCount } = Components.alertCounts(alertGroup);
 
         const displayStatus = getDisplayStatus(alertGroup.status);
         const ackName = displayStatus === 'acknowledged' ? (alertGroup.acknowledged_by || '-') : '-';
@@ -391,6 +464,7 @@ const Components = {
         const duration = Components.formatDuration(endTime - startTime);
         const alertsParts = [];
         if (firingCount > 0) alertsParts.push(`${firingCount} firing`);
+        if (unreportedCount > 0) alertsParts.push(`${unreportedCount} not reported`);
         if (resolvedCount > 0) alertsParts.push(`${resolvedCount} resolved`);
         const alertsSummary = alertsParts.length > 0
             ? `<span class="alerts-count-main">${alertsParts.join(' · ')}</span><span class="alerts-duration">for ${duration}</span>`
@@ -408,6 +482,7 @@ const Components = {
                     <div class="alert-group-status-badge">
                         ${Components.statusBadge(alertGroup.status)}
                     </div>
+                    ${Components.quietBadge(alertGroup)}
                 </div>
                 <div class="alert-group-meta">
                     <div class="alert-group-meta-item">
@@ -457,16 +532,23 @@ const Components = {
         const activeDuration = Components.formatDuration(Math.max(0, endedAt - startedAt));
         const statusTime = activeDuration;
         const updatedRelative = Components.timeSince(alertGroup.updated_at, { withAgo: true });
+        // Not the same instant as the update: a group that fires steadily does
+        // not change, and Alertmanager's repeats of it are what this one counts.
+        // Absent for a group Alertmanager never sent.
+        const notifiedRelative = alertGroup.last_notified_at
+            ? Components.timeSince(alertGroup.last_notified_at, { withAgo: true })
+            : '';
         const ackName = alertGroup.acknowledged_by || '';
         const ackDisplay = ackName ? truncateText(ackName, 28) : '';
         const ackTitle = ackName ? ` title="${escapeHtml(ackName)}"` : '';
         const onCallName = (alertGroup.onCall?.l1_users || []).map(u => u.name).join(', ');
         const onCallDisplay = onCallName ? truncateText(onCallName, 28) : (alertGroup.onCall ? 'Not configured' : '—');
         const onCallTitle = onCallName ? ` title="${escapeHtml(onCallName)}"` : '';
-        const firingCount = alertGroup.firing_count ?? alertGroup.alerts?.filter(a => a.status === 'firing').length ?? 0;
-        const totalCount = alertGroup.alerts_count ?? alertGroup.alerts?.length ?? 0;
-        const resolvedCount = totalCount - firingCount;
-        const alertsSummary = `Alerts: ${firingCount} firing${resolvedCount > 0 ? ` · ${resolvedCount} resolved` : ''}`;
+        const { total: totalCount, firing: firingCount, unreported: unreportedCount,
+            resolved: resolvedCount } = Components.alertCounts(alertGroup);
+        const alertsSummary = `Alerts: ${firingCount} firing`
+            + (unreportedCount > 0 ? ` · ${unreportedCount} not reported` : '')
+            + (resolvedCount > 0 ? ` · ${resolvedCount} resolved` : '');
         const teamLabel = alertGroup.team_id ? `Team ${alertGroup.team_id}` : 'Team N/A';
 
         return `
@@ -481,7 +563,9 @@ const Components = {
                 <div class="detail-meta-row">
                     <span class="detail-meta-chip">${escapeHtml(teamLabel)}</span>
                     <span class="detail-meta-chip"${onCallTitle}>On-call ${escapeHtml(onCallDisplay)}</span>
-                    <span class="detail-meta-chip">Last update ${updatedRelative}</span>
+                    <span class="detail-meta-chip" title="When the alert group last changed">Last update ${updatedRelative}</span>
+                    ${notifiedRelative ? `<span class="detail-meta-chip" title="When Alertmanager last sent anything about this alert group, repeats included">Last notification ${notifiedRelative}</span>` : ''}
+                    ${Components.quietBadge(alertGroup)}
                     ${ackName ? `<span class="detail-meta-chip"${ackTitle}>Ack by ${escapeHtml(ackDisplay)}</span>` : ''}
                 </div>
             </div>
@@ -527,6 +611,12 @@ const Components = {
                             <div class="detail-label">Updated</div>
                             <div class="detail-value">${Components.formatTime(alertGroup.updated_at)}</div>
                         </div>
+                        ${alertGroup.last_notified_at ? `
+                            <div class="detail-item">
+                                <div class="detail-label">Last notification</div>
+                                <div class="detail-value">${Components.formatTime(alertGroup.last_notified_at)}</div>
+                            </div>
+                        ` : ''}
                         ${alertGroup.resolved_at ? `
                             <div class="detail-item">
                                 <div class="detail-label">Resolved</div>
@@ -591,10 +681,10 @@ const Components = {
         const hiddenHtml = hiddenLabels.map(labelSpan).join(' · ');
 
         return `
-            <div class="alert-item status-${alert.status}">
+            <div class="alert-item status-${Components.alertState(alert)}">
                 <div class="alert-header">
                     <span class="alert-name">${escapeHtml(headerTitle)}</span>
-                    ${Components.alertStatusBadge(alert.status)}
+                    ${Components.alertStatusBadge(alert)}
                 </div>
                 ${summary ? `
                     <div class="alert-annotation">${escapeHtml(summary)}</div>
@@ -1848,6 +1938,13 @@ const Components = {
             const isMasked = secret === '****';
             const baseUrl = window.location.origin + '/webhook/alertmanager';
             const displayUrl = isMasked ? baseUrl + '?token=****' : baseUrl + '?token=YOUR_TOKEN';
+            // Declared in seconds and edited in minutes: an operator reads
+            // repeat_interval in minutes and hours, not in seconds. Whole
+            // minutes only, which the API enforces, so nothing is lost on the
+            // way back into the form.
+            const quietAfterMinutes = config?.quiet_after_seconds
+                ? config.quiet_after_seconds / 60
+                : '';
 
             return `
                 <div class="form-group">
@@ -1866,6 +1963,17 @@ const Components = {
                         </button>
                     </div>
                     <small class="form-hint">Use this URL in your Alertmanager configuration. Replace YOUR_TOKEN with your actual token.</small>
+                </div>
+                <div class="form-group">
+                    <label for="config-quiet-after">Consider quiet after (minutes)</label>
+                    <input type="number" id="config-quiet-after" class="form-input" min="1" max="10080"
+                           placeholder="leave empty to say nothing about silence"
+                           value="${quietAfterMinutes}">
+                    <small class="form-hint">How long this Alertmanager may say nothing about an alert group before
+                        the alert group is shown as quiet. A route repeats between its repeat_interval and
+                        repeat_interval + group_interval, so take the upper bound and add your own margin; one receiver
+                        often serves several routes, and then the longest one is the number to use. Empty means nothing
+                        is claimed and no alert group is marked.</small>
                 </div>
             `;
         } else if (type === 'generic_webhook') {

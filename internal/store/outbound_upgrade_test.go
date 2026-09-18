@@ -913,9 +913,8 @@ func TestAStartRefusesAPayloadItCannotDigest(t *testing.T) {
 // events and the subscribers. Each thing the start fills in is read back
 // against what it was filled in from.
 //
-// This is not the upgrade from the last release: that database has no
-// delivery domain at all, and TestAStartUpgradesTheDatabaseOfTheLastRelease
-// starts from its exact schema.
+// This is not the upgrade from v0.1.0: that database has no delivery domain
+// at all, and TestAStartUpgradesTheDatabaseOfV010 starts from its exact schema.
 func TestAStartUpgradesADatabaseThatFollowedDevelop(t *testing.T) {
 	s := setupTestDB(t)
 	teamOne(t, s)
@@ -1137,9 +1136,9 @@ func throwawayDatabase(t *testing.T, schemaFile string) *Store {
 	return s
 }
 
-// TestAStartUpgradesTheDatabaseOfTheLastRelease is the upgrade every
-// installation on the last release makes: the schema exactly as v0.1.0's own
-// start built it (testdata/schema-v0.1.0.sql, dumped from it), holding the
+// TestAStartUpgradesTheDatabaseOfV010 is the upgrade every installation still
+// on v0.1.0 makes: the schema exactly as v0.1.0's own start built it
+// (testdata/schema-v0.1.0.sql, dumped from it), holding the
 // rows that release wrote - a team, an alert group under the old name of its
 // key column, a finished escalation job and the message it delivered, a
 // webhook subscriber, an event the old worker sent with the delivery row and
@@ -1147,7 +1146,7 @@ func throwawayDatabase(t *testing.T, schemaFile string) *Store {
 // and no delivery domain at all. One start of this version brings it up, and
 // what the start fills in is read back against the rows it was filled in
 // from.
-func TestAStartUpgradesTheDatabaseOfTheLastRelease(t *testing.T) {
+func TestAStartUpgradesTheDatabaseOfV010(t *testing.T) {
 	s := throwawayDatabase(t, "schema-v0.1.0.sql")
 	if relationExists(t, s, "outbound_intents") || !hasColumn(t, s, "alert_groups", "dedup_key") {
 		t.Fatal("the schema file is not the last release's")

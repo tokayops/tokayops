@@ -29,7 +29,7 @@ type admitting interface {
 	AckAlertGroupAtomic(id string, actor alertgroup.Actor, meta map[string]string,
 		outboxEvent *model.OutboxEvent) (bool, error)
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
-		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
+		notification alertgroup.Notification, actor string) (alertgroup.MergeResult, error)
 	SubmitBatch(ctx context.Context, batch outbound.Batch) (outbound.SubmitResult, error)
 	AddAlertGroupNoteAtomic(ctx context.Context, alertGroupID, text string,
 		who alertgroup.Actor) (*model.TimelineEvent, error)
@@ -186,10 +186,10 @@ func conformanceGroup(t *testing.T, s admitting) string {
 // conformance meaningful.
 func alertJoins(s admitting, agID string) error {
 	_, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), "conformance-"+agID,
-		[]model.Alert{{
+		alertgroup.Notification{Alerts: []model.Alert{{
 			Fingerprint: "fp-late", Status: model.AlertStatusFiring,
 			StartsAt: time.Now(), Labels: map[string]string{"alertname": "Late"},
-		}}, "system")
+		}}}, "system")
 	return err
 }
 

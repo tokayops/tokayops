@@ -79,7 +79,7 @@ func TestTwoFiringPayloadsAtOnceKeepBothAlerts(t *testing.T) {
 			go func(fingerprint string) {
 				defer wg.Done()
 				_, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-					[]model.Alert{firingAlert(fingerprint, time.Unix(1700000100, 0))}, "system")
+					alertgroup.Notification{Alerts: []model.Alert{firingAlert(fingerprint, time.Unix(1700000100, 0))}}, "system")
 				errs <- err
 			}(fingerprint)
 		}
@@ -125,7 +125,7 @@ func TestAFiringPayloadAgainstAResolutionLosesNothing(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			applied, applyErr = s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-				[]model.Alert{firingAlert("fp-a", time.Unix(1700000100, 0))}, "system")
+				alertgroup.Notification{Alerts: []model.Alert{firingAlert("fp-a", time.Unix(1700000100, 0))}}, "system")
 		}()
 		go func() {
 			defer wg.Done()
@@ -190,11 +190,11 @@ func TestAResolvingPayloadAgainstAnAcknowledgementEndsTheIncidentOnce(t *testing
 		go func() {
 			defer wg.Done()
 			applied, applyErr = s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-				[]model.Alert{{
+				alertgroup.Notification{Alerts: []model.Alert{{
 					Fingerprint: "fp-0", Status: model.AlertStatusResolved,
 					StartsAt: time.Unix(1700000000, 0),
 					Labels:   map[string]string{"alertname": "DiskWillFill"},
-				}}, "system")
+				}}}, "system")
 		}()
 		go func() {
 			defer wg.Done()
@@ -247,7 +247,7 @@ func TestAMergeThatCommitsFirstIsInTheIncidentThatEnds(t *testing.T) {
 	agID, key := mergeRaceGroup(t, s)
 
 	applied, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-		[]model.Alert{firingAlert("fp-a", time.Unix(1700000100, 0))}, "system")
+		alertgroup.Notification{Alerts: []model.Alert{firingAlert("fp-a", time.Unix(1700000100, 0))}}, "system")
 	if err != nil || applied.Outcome != alertgroup.MergeMerged {
 		t.Fatalf("the merge came back %s (%v)", applied.Outcome, err)
 	}
@@ -289,7 +289,7 @@ func TestAResolutionThatCommitsFirstSendsTheAlertToTheNextIncident(t *testing.T)
 	}
 
 	applied, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-		[]model.Alert{firingAlert("fp-a", time.Unix(1700000100, 0))}, "system")
+		alertgroup.Notification{Alerts: []model.Alert{firingAlert("fp-a", time.Unix(1700000100, 0))}}, "system")
 	if err != nil {
 		t.Fatalf("apply the payload: %v", err)
 	}

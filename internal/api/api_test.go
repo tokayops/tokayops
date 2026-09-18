@@ -1133,3 +1133,80 @@ func TestPaginationMeta(t *testing.T) {
 		}
 	})
 }
+
+// TestTheSummaryListCountsTheThreeStates. The list is answered without the
+// alerts themselves, so these three numbers are all a client has: what is
+// firing, what Alertmanager has stopped reporting, and - by subtraction - what
+// resolved.
+func TestTheSummaryListCountsTheThreeStates(t *testing.T) {
+	_, s, e := setupTestAPI(t)
+	defer s.Close()
+
+	silentSince := time.Now().Add(-time.Hour)
+	alert := func(fingerprint string, status model.AlertStatus, since *time.Time) model.Alert {
+		return model.Alert{
+			Fingerprint: fingerprint, Status: status, UnreportedSince: since,
+			Labels: map[string]string{"alertname": fingerprint},
+		}
+	}
+	notifiedAt := time.Now().Add(-2 * time.Hour)
+	quietAfter := 14700
+	if err := s.CreateAlertGroup(&model.AlertGroup{
+		ID: "ag-counted", AlertKey: "dedup-counted", Status: model.AlertGroupStatusProcessing,
+		Title: "Test Alert Group", TeamID: "devops", TeamNameSnapshot: "DevOps",
+		Severity: "critical", LastNotifiedAt: &notifiedAt, QuietAfterSeconds: &quietAfter,
+		Alerts: []model.Alert{
+			alert("fp-0", model.AlertStatusFiring, nil),
+			alert("fp-1", model.AlertStatusFiring, &silentSince),
+			alert("fp-2", model.AlertStatusResolved, nil),
+		},
+	}); err != nil {
+		t.Fatalf("create the alert group: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/alert-groups?view=summary", nil)
+	addAuth(req, "denis")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the list answered %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		AlertGroups []struct {
+			ID                string     `json:"id"`
+			AlertsCount       int        `json:"alerts_count"`
+			FiringCount       int        `json:"firing_count"`
+			UnreportedCount   int        `json:"unreported_count"`
+			LastNotifiedAt    *time.Time `json:"last_notified_at"`
+			QuietAfterSeconds *int       `json:"quiet_after_seconds"`
+		} `json:"alert_groups"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("read the list: %v", err)
+	}
+	var found bool
+	for _, summary := range resp.AlertGroups {
+		if summary.ID != "ag-counted" {
+			continue
+		}
+		found = true
+		if summary.AlertsCount != 3 || summary.FiringCount != 1 || summary.UnreportedCount != 1 {
+			t.Errorf("the list says %d alerts, %d firing, %d unreported; want 3, 1 and 1",
+				summary.AlertsCount, summary.FiringCount, summary.UnreportedCount)
+		}
+		if resolved := summary.AlertsCount - summary.FiringCount - summary.UnreportedCount; resolved != 1 {
+			t.Errorf("what is left over is %d, want the one alert that resolved", resolved)
+		}
+		// The card is drawn from the list alone, so what it needs to say an
+		// alert group has gone quiet has to be in the list too.
+		if summary.LastNotifiedAt == nil || summary.QuietAfterSeconds == nil ||
+			*summary.QuietAfterSeconds != 14700 {
+			t.Errorf("the list says notified %v and quiet after %v; the card cannot tell",
+				summary.LastNotifiedAt, summary.QuietAfterSeconds)
+		}
+	}
+	if !found {
+		t.Fatal("the alert group is not in the list")
+	}
+}

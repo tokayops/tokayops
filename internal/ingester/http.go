@@ -23,18 +23,78 @@ type AMPayload struct {
 	GroupKey     string            `json:"groupKey"`
 	ExternalURL  string            `json:"externalURL"`
 	CommonLabels map[string]string `json:"commonLabels"`
-	Alerts       []model.Alert     `json:"alerts"`
+	Alerts       []AMAlert         `json:"alerts"`
+	// TruncatedAlerts is how many alerts Alertmanager cut off the notification
+	// (max_alerts). It does not say which.
+	TruncatedAlerts uint64 `json:"truncatedAlerts"`
 }
 
-// WebhookSecretValidator interface for validating webhook secrets
-type WebhookSecretValidator interface {
-	ValidateWebhookSecret(secret string) bool
+// AMAlert is an alert as Alertmanager sends it, and only that.
+//
+// It is not model.Alert, which also carries what this system observed about
+// the alert - since when Alertmanager stopped reporting it. Reading a payload
+// into the stored type would let whoever holds the webhook secret set that
+// observation, and an alert would claim to have been silent since a moment
+// nobody watched.
+type AMAlert struct {
+	Fingerprint  string            `json:"fingerprint"`
+	Status       model.AlertStatus `json:"status"`
+	Labels       map[string]string `json:"labels"`
+	Annotations  map[string]string `json:"annotations"`
+	StartsAt     time.Time         `json:"startsAt"`
+	EndsAt       time.Time         `json:"endsAt"`
+	GeneratorURL string            `json:"generatorURL"`
+}
+
+func (a AMAlert) alert() model.Alert {
+	return model.Alert{
+		Fingerprint:  a.Fingerprint,
+		Status:       a.Status,
+		Labels:       a.Labels,
+		Annotations:  a.Annotations,
+		StartsAt:     a.StartsAt,
+		EndsAt:       a.EndsAt,
+		GeneratorURL: a.GeneratorURL,
+	}
+}
+
+// alerts is the payload as the rest of the system holds alerts.
+func (p AMPayload) alerts() []model.Alert {
+	out := make([]model.Alert, 0, len(p.Alerts))
+	for _, a := range p.Alerts {
+		out = append(out, a.alert())
+	}
+	return out
+}
+
+// notification says what the payload is worth as a statement about the group.
+//
+// It is a snapshot - the whole set of alerts Alertmanager still reports - only
+// if it named the group, carried alerts, and had nothing cut off by
+// max_alerts. Without a group key the alert key is one alert's fingerprint and
+// the payload was never about a group; with alerts cut off, what is missing is
+// missing for a reason nobody can read.
+func (p AMPayload) notification(integrationID string, quietAfterSeconds int) alertgroup.Notification {
+	return alertgroup.Notification{
+		Alerts:            p.alerts(),
+		Snapshot:          p.GroupKey != "" && p.TruncatedAlerts == 0 && len(p.Alerts) > 0,
+		IntegrationID:     integrationID,
+		QuietAfterSeconds: quietAfterSeconds,
+	}
+}
+
+// WebhookSource names the integration a secret belongs to. It is the fast
+// filter and the way to learn an id; whether the payload is taken is settled
+// against the database, because this answer comes from a cache only the
+// instance that handled a change has reloaded.
+type WebhookSource interface {
+	WebhookIntegrationID(secret string) (string, bool)
 }
 
 type Ingester struct {
-	store           alertIntake
-	cfg             *config.Config
-	secretValidator WebhookSecretValidator
+	store  alertIntake
+	cfg    *config.Config
+	source WebhookSource
 }
 
 // alertIntake is the store as the ingester needs it: find the incident an alert
@@ -53,13 +113,19 @@ type alertIntake interface {
 	// before anything is held, and two webhooks for one alert would then act on
 	// the same starting point and disagree.
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
-		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
+		notification alertgroup.Notification, actor string) (alertgroup.MergeResult, error)
+
+	// VerifyIntake says whether the integration the secret belongs to still
+	// exists, is enabled and still carries that secret, and what it declares
+	// about silence. The cache cannot answer the first three: it is reloaded
+	// by one instance at a time.
+	VerifyIntake(ctx context.Context, integrationID, secret string) (int, bool, error)
 
 	GetTeamByID(id string) (*model.Team, error)
 }
 
-func NewIngester(s alertIntake, cfg *config.Config, secretValidator WebhookSecretValidator) *Ingester {
-	return &Ingester{store: s, cfg: cfg, secretValidator: secretValidator}
+func NewIngester(s alertIntake, cfg *config.Config, source WebhookSource) *Ingester {
+	return &Ingester{store: s, cfg: cfg, source: source}
 }
 
 func (i *Ingester) RegisterRoutes(e *echo.Echo) {
@@ -67,11 +133,28 @@ func (i *Ingester) RegisterRoutes(e *echo.Echo) {
 }
 
 func (i *Ingester) handleWebhook(c echo.Context) error {
-	// Authentication: validate webhook secret (rejects if no integrations configured)
+	// Authentication, in two steps. The cache says which integration the token
+	// belongs to, and the database says whether that integration may still
+	// send: an instance that has not reloaded the cache since the integration
+	// was disabled or its secret rotated would otherwise go on taking its
+	// payloads.
 	token := c.QueryParam("token")
 
-	if !i.secretValidator.ValidateWebhookSecret(token) {
+	integrationID, known := i.source.WebhookIntegrationID(token)
+	if !known {
 		log.Printf("Ingester: Unauthorized webhook request")
+		return c.String(http.StatusUnauthorized, "Unauthorized")
+	}
+	quietAfterSeconds, allowed, err := i.store.VerifyIntake(c.Request().Context(), integrationID, token)
+	if err != nil {
+		// The database is the same database the payload would be stored in, so
+		// there is nothing to be gained by turning Alertmanager away: it is
+		// asked to come back.
+		log.Printf("Ingester: Failed to verify integration %s: %v", integrationID, err)
+		return c.String(http.StatusInternalServerError, "Failed to persist")
+	}
+	if !allowed {
+		log.Printf("Ingester: Integration %s no longer accepts this token", integrationID)
 		return c.String(http.StatusUnauthorized, "Unauthorized")
 	}
 
@@ -115,12 +198,21 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	}
 	log.Printf("Ingester: Group %s (Team: %s, Sev: %s, Alerts: %d firing, %d resolved, payload %s)",
 		alertKey, teamID, severity, firingInPayload, len(payload.Alerts)-firingInPayload, payload.Status)
+	if payload.TruncatedAlerts > 0 {
+		// Outside the contract: the receiver has max_alerts set. What the
+		// group still holds cannot be read from a list with an unknown part
+		// missing, so this is said every time rather than once.
+		log.Printf("Ingester: %s: Alertmanager cut %d alerts off the notification (max_alerts); "+
+			"the alert group can resolve while one of them still fires - set max_alerts to 0",
+			alertKey, payload.TruncatedAlerts)
+		metrics.AlertmanagerTruncatedNotificationsTotal.Inc()
+	}
 
 	// 3. Apply it to the incident that is open, if there is one. What that
 	// means - a merge, the end of the incident, or nothing at all - is decided
 	// under the lock on the row, not here.
 	result, err := i.store.ApplyAlertmanagerUpdateAtomic(
-		c.Request().Context(), alertKey, payload.Alerts, "system")
+		c.Request().Context(), alertKey, payload.notification(integrationID, quietAfterSeconds), "system")
 	if err != nil {
 		log.Printf("Ingester: Failed to apply the payload for %s: %v", alertKey, err)
 		return c.String(http.StatusInternalServerError, "Failed to persist")
@@ -147,7 +239,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	// 4. Create New Alert Group
 	// Filter to firing alerts only - resolved alerts shouldn't appear in a new group.
 	var firingAlerts []model.Alert
-	for _, a := range payload.Alerts {
+	for _, a := range payload.alerts() {
 		if a.Status == model.AlertStatusFiring {
 			firingAlerts = append(firingAlerts, a)
 		}
@@ -168,6 +260,11 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		Alerts:      firingAlerts,        // Only firing alerts
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
+	}
+	ag.IntakeIntegrationID = integrationID
+	if quietAfterSeconds > 0 {
+		seconds := quietAfterSeconds
+		ag.QuietAfterSeconds = &seconds
 	}
 
 	// Build timeline events for atomic insert - µs offsets ensure deterministic ordering
@@ -240,7 +337,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 			// and the payload now belongs to their incident.
 			log.Printf("Ingester: Duplicate key for %s, applying to the incident that won", alertKey)
 			retry, retryErr := i.store.ApplyAlertmanagerUpdateAtomic(
-				c.Request().Context(), alertKey, payload.Alerts, "system")
+				c.Request().Context(), alertKey, payload.notification(integrationID, quietAfterSeconds), "system")
 			if retryErr != nil {
 				log.Printf("Ingester: Retry failed for %s: %v", alertKey, retryErr)
 				return c.String(http.StatusInternalServerError, "Failed to persist")

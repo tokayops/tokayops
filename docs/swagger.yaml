@@ -1097,6 +1097,17 @@ definitions:
         type: string
       status:
         $ref: '#/definitions/model.AlertStatus'
+      unreportedSince:
+        description: |-
+          UnreportedSince is when this alert stopped appearing in what
+          Alertmanager sends about its group, while the group was still being
+          sent. It is an observation and not a cause: an alert goes missing
+          because it was silenced, because an inhibition covers it, or because it
+          cleared while silenced, and the notification does not say which.
+
+          Set only for an alert that was firing, and cleared the moment
+          Alertmanager reports it again.
+        type: string
     type: object
   model.AlertGroup:
     properties:
@@ -1135,6 +1146,17 @@ definitions:
       incident_id:
         description: Link to future Incident (NULL in most cases for Phase 2)
         type: integer
+      last_notified_at:
+        description: |-
+          LastNotifiedAt is when Alertmanager last sent anything about this group
+          while it was open, repeats that changed nothing included. UpdatedAt is
+          when the group last changed. A group that fires steadily does not
+          change, so this is what tells it apart from a group Alertmanager has
+          gone quiet about.
+
+          Empty for a group Alertmanager never sent, such as one opened by hand,
+          and for a group that has heard nothing since the version that records it.
+        type: string
       oncall_snapshot:
         allOf:
         - $ref: '#/definitions/model.OnCallResult'
@@ -1147,6 +1169,15 @@ definitions:
         allOf:
         - $ref: '#/definitions/model.EscalationPolicySnapshot'
         description: Policy Snapshot (stores the policy state at the time of creation/assignment)
+      quiet_after_seconds:
+        description: |-
+          QuietAfterSeconds is what the integration that last sent about this
+          group declared: how long silence is normal for it. A snapshot, like the
+          team name - the integration can be changed or deleted, and what was true
+          when the payload arrived stays.
+
+          Empty when nothing is declared, and then nothing is said about silence.
+        type: integer
       resolved_at:
         type: string
       resolved_by:

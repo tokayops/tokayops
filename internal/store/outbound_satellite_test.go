@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -764,12 +765,12 @@ func TestARaiseAndASatellitesBeginDoNotDeadlock(t *testing.T) {
 		// An alert joins the group: the merge takes the group, raises the
 		// revision and aims the card and the thread - and waits for the
 		// thread the begin holds.
-		_, err := s.ApplyAlertmanagerUpdateAtomic(ctx, group.AlertKey, []model.Alert{
+		_, err := s.ApplyAlertmanagerUpdateAtomic(ctx, group.AlertKey, alertgroup.Notification{Alerts: []model.Alert{
 			{Fingerprint: "fp-1", Status: model.AlertStatusFiring, StartsAt: time.Unix(1700000000, 0),
 				Labels: map[string]string{"alertname": "DiskWillFill"}},
 			{Fingerprint: "fp-2", Status: model.AlertStatusFiring, StartsAt: time.Unix(1700000600, 0),
 				Labels: map[string]string{"alertname": "DiskSlow"}},
-		}, "alertmanager")
+		}}, "alertmanager")
 		raised <- err
 	}()
 	time.Sleep(300 * time.Millisecond) // the merge is now waiting on the thread
