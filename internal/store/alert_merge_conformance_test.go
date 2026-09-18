@@ -27,7 +27,7 @@ type applying interface {
 	CreateAlertGroup(ag *model.AlertGroup) error
 	GetAlertGroupByID(id string) (*model.AlertGroup, error)
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
-		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
+		notification alertgroup.Notification, actor string) (alertgroup.MergeResult, error)
 }
 
 func TestTheMockAndTheDatabaseAnswerAPayloadAlike(t *testing.T) {
@@ -116,7 +116,7 @@ func TestTheMockAndTheDatabaseAnswerAPayloadAlike(t *testing.T) {
 			t.Fatalf("create the incident: %v", err)
 		}
 		result, err := s.ApplyAlertmanagerUpdateAtomic(
-			context.Background(), key, c.incoming, "system")
+			context.Background(), key, alertgroup.Notification{Alerts: c.incoming}, "system")
 		if err != nil {
 			t.Fatalf("apply the payload: %v", err)
 		}

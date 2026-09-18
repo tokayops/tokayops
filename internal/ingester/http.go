@@ -23,10 +23,62 @@ type AMPayload struct {
 	GroupKey     string            `json:"groupKey"`
 	ExternalURL  string            `json:"externalURL"`
 	CommonLabels map[string]string `json:"commonLabels"`
-	Alerts       []model.Alert     `json:"alerts"`
+	Alerts       []AMAlert         `json:"alerts"`
 	// TruncatedAlerts is how many alerts Alertmanager cut off the notification
 	// (max_alerts). It does not say which.
 	TruncatedAlerts uint64 `json:"truncatedAlerts"`
+}
+
+// AMAlert is an alert as Alertmanager sends it, and only that.
+//
+// It is not model.Alert, which also carries what this system observed about
+// the alert - since when Alertmanager stopped reporting it. Reading a payload
+// into the stored type would let whoever holds the webhook secret set that
+// observation, and an alert would claim to have been silent since a moment
+// nobody watched.
+type AMAlert struct {
+	Fingerprint  string            `json:"fingerprint"`
+	Status       model.AlertStatus `json:"status"`
+	Labels       map[string]string `json:"labels"`
+	Annotations  map[string]string `json:"annotations"`
+	StartsAt     time.Time         `json:"startsAt"`
+	EndsAt       time.Time         `json:"endsAt"`
+	GeneratorURL string            `json:"generatorURL"`
+}
+
+func (a AMAlert) alert() model.Alert {
+	return model.Alert{
+		Fingerprint:  a.Fingerprint,
+		Status:       a.Status,
+		Labels:       a.Labels,
+		Annotations:  a.Annotations,
+		StartsAt:     a.StartsAt,
+		EndsAt:       a.EndsAt,
+		GeneratorURL: a.GeneratorURL,
+	}
+}
+
+// alerts is the payload as the rest of the system holds alerts.
+func (p AMPayload) alerts() []model.Alert {
+	out := make([]model.Alert, 0, len(p.Alerts))
+	for _, a := range p.Alerts {
+		out = append(out, a.alert())
+	}
+	return out
+}
+
+// notification says what the payload is worth as a statement about the group.
+//
+// It is a snapshot - the whole set of alerts Alertmanager still reports - only
+// if it named the group, carried alerts, and had nothing cut off by
+// max_alerts. Without a group key the alert key is one alert's fingerprint and
+// the payload was never about a group; with alerts cut off, what is missing is
+// missing for a reason nobody can read.
+func (p AMPayload) notification() alertgroup.Notification {
+	return alertgroup.Notification{
+		Alerts:   p.alerts(),
+		Snapshot: p.GroupKey != "" && p.TruncatedAlerts == 0 && len(p.Alerts) > 0,
+	}
 }
 
 // WebhookSecretValidator interface for validating webhook secrets
@@ -56,7 +108,7 @@ type alertIntake interface {
 	// before anything is held, and two webhooks for one alert would then act on
 	// the same starting point and disagree.
 	ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
-		incoming []model.Alert, actor string) (alertgroup.MergeResult, error)
+		notification alertgroup.Notification, actor string) (alertgroup.MergeResult, error)
 
 	GetTeamByID(id string) (*model.Team, error)
 }
@@ -132,7 +184,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	// means - a merge, the end of the incident, or nothing at all - is decided
 	// under the lock on the row, not here.
 	result, err := i.store.ApplyAlertmanagerUpdateAtomic(
-		c.Request().Context(), alertKey, payload.Alerts, "system")
+		c.Request().Context(), alertKey, payload.notification(), "system")
 	if err != nil {
 		log.Printf("Ingester: Failed to apply the payload for %s: %v", alertKey, err)
 		return c.String(http.StatusInternalServerError, "Failed to persist")
@@ -159,7 +211,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	// 4. Create New Alert Group
 	// Filter to firing alerts only - resolved alerts shouldn't appear in a new group.
 	var firingAlerts []model.Alert
-	for _, a := range payload.Alerts {
+	for _, a := range payload.alerts() {
 		if a.Status == model.AlertStatusFiring {
 			firingAlerts = append(firingAlerts, a)
 		}
@@ -252,7 +304,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 			// and the payload now belongs to their incident.
 			log.Printf("Ingester: Duplicate key for %s, applying to the incident that won", alertKey)
 			retry, retryErr := i.store.ApplyAlertmanagerUpdateAtomic(
-				c.Request().Context(), alertKey, payload.Alerts, "system")
+				c.Request().Context(), alertKey, payload.notification(), "system")
 			if retryErr != nil {
 				log.Printf("Ingester: Retry failed for %s: %v", alertKey, retryErr)
 				return c.String(http.StatusInternalServerError, "Failed to persist")

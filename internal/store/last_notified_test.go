@@ -79,7 +79,7 @@ func TestEveryPayloadForAnOpenIncidentRecordsTheNotification(t *testing.T) {
 			id := notifiedFixture(t, s, key, model.AlertGroupStatusProcessing)
 
 			result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-				[]model.Alert{c.incoming}, "system")
+				alertgroup.Notification{Alerts: []model.Alert{c.incoming}}, "system")
 			if err != nil {
 				t.Fatalf("apply the payload: %v", err)
 			}
@@ -111,7 +111,7 @@ func TestARepeatRecordsTheNotificationAndNothingElse(t *testing.T) {
 	versionBefore := renderSourceVersion(t, s, id)
 
 	result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-		[]model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)}, "system")
+		alertgroup.Notification{Alerts: []model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)}}, "system")
 	if err != nil || result.Outcome != alertgroup.MergeUnchanged {
 		t.Fatalf("the repeat came back %s (%v)", result.Outcome, err)
 	}
@@ -143,7 +143,7 @@ func TestAPayloadLeavesAFinishedIncidentAlone(t *testing.T) {
 	open := notifiedFixture(t, s, key, model.AlertGroupStatusProcessing)
 
 	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-		[]model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)}, "system"); err != nil {
+		alertgroup.Notification{Alerts: []model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)}}, "system"); err != nil {
 		t.Fatalf("apply the payload: %v", err)
 	}
 
@@ -180,7 +180,7 @@ func TestAPayloadThatWaitedForTheLockRecordsWhenItGotIt(t *testing.T) {
 	applied := make(chan error, 1)
 	go func() {
 		_, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-			[]model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)}, "system")
+			alertgroup.Notification{Alerts: []model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)}}, "system")
 		applied <- err
 	}()
 	waitForLockWaiter(t, s, "the payload never queued behind the held incident")
@@ -221,7 +221,7 @@ func TestTheNotificationTimeNeverGoesBack(t *testing.T) {
 	}
 
 	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
-		[]model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)}, "system"); err != nil {
+		alertgroup.Notification{Alerts: []model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)}}, "system"); err != nil {
 		t.Fatalf("apply the payload: %v", err)
 	}
 

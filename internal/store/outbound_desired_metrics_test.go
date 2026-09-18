@@ -75,7 +75,7 @@ func TestWhatCameOfARevisionIsCounted(t *testing.T) {
 			Labels:   map[string]string{"alertname": "DiskSlow"},
 		}}
 		if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
-			"desired-"+agID, arrived, "ingester"); err != nil {
+			"desired-"+agID, alertgroup.Notification{Alerts: arrived}, "ingester"); err != nil {
 			t.Fatalf("the first payload: %v", err)
 		}
 
@@ -87,7 +87,7 @@ func TestWhatCameOfARevisionIsCounted(t *testing.T) {
 		}}
 		before := count(outbound.DesiredMerge, outbound.DesiredUnchanged)
 		result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
-			"desired-"+agID, invisible, "ingester")
+			"desired-"+agID, alertgroup.Notification{Alerts: invisible}, "ingester")
 		if err != nil {
 			t.Fatalf("the payload: %v", err)
 		}
@@ -131,7 +131,7 @@ func TestWhatCameOfARevisionIsCounted(t *testing.T) {
 		}}
 		before := count(outbound.DesiredResolve, outbound.DesiredApplied)
 		result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
-			"desired-"+agID, cleared, "ingester")
+			"desired-"+agID, alertgroup.Notification{Alerts: cleared}, "ingester")
 		if err != nil {
 			t.Fatalf("the resolving payload: %v", err)
 		}

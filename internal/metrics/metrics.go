@@ -58,6 +58,33 @@ var (
 		Name: "alertmanager_truncated_notifications_total",
 		Help: "Alertmanager notifications received with alerts cut off by max_alerts.",
 	})
+
+	// The three below are what a decision about resolving an alert group
+	// without the alerts Alertmanager has stopped reporting would be made
+	// from. They are process counters - best effort - and no rule stands on
+	// them; they are read when the question is asked.
+	AlertsUnreportedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alerts_unreported_total",
+		Help: "Firing alerts that stopped appearing in what Alertmanager sends about their group.",
+	})
+
+	// Observed when the alert comes back, from the mark in the row rather than
+	// from anything this process remembers, and labelled with what it came
+	// back as: an alert that returns firing is one an automatic resolution
+	// would have been wrong about.
+	AlertUnreportedDurationSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "alert_unreported_duration_seconds",
+		Help: "How long an alert went unreported by Alertmanager, measured when it was reported again.",
+		Buckets: []float64{60, 300, 900, 1800, 3600, 7200, 14400, 28800,
+			86400, 259200, 604800},
+	}, []string{"status"})
+
+	// Counted on the transition into the state, not on every payload that
+	// finds the group in it.
+	AlertGroupsHeldByUnreportedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alert_groups_held_by_unreported_total",
+		Help: "Alert groups that came to be open only because of alerts Alertmanager no longer reports.",
+	})
 )
 
 // Tier 4 - Engine
@@ -427,6 +454,9 @@ func init() {
 	register(UnknownTeamAlertGroupsTotal)
 	register(AlertGroupsResolvedTotal)
 	register(AlertmanagerTruncatedNotificationsTotal)
+	register(AlertsUnreportedTotal)
+	register(AlertUnreportedDurationSeconds)
+	register(AlertGroupsHeldByUnreportedTotal)
 
 	// Tier 4
 	register(EngineRunsTotal)

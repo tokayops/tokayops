@@ -20,6 +20,17 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ### Added
 
+- **Alerts Alertmanager has stopped reporting are shown as such.** When a
+  notification carries the whole group and an alert that was firing is not in
+  it - silenced, inhibited, or cleared while silenced - the alert is marked
+  "not reported" from that moment, and the mark goes the moment Alertmanager
+  reports it again. The alert group view shows the state and counts it apart
+  (`unreportedSince` on the alert, `unreported_count` on the list).
+  Such an alert still holds the alert group open: absence is not a resolution,
+  and nothing about paging or escalation changes.
+- Three metrics for how often this happens: `alerts_unreported_total`,
+  `alert_unreported_duration_seconds` (labelled with what the alert came back
+  as) and `alert_groups_held_by_unreported_total`.
 - An alert group records when Alertmanager last sent anything about it,
   repeats that change nothing included (`last_notified_at` in the API). The
   alert group view shows it next to the last update, which is when the group

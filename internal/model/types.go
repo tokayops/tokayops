@@ -13,6 +13,10 @@ const (
 )
 
 // Alert represents a single alert received from Alertmanager.
+//
+// Everything but the last field is what Alertmanager said about the alert.
+// UnreportedSince is what this system observed about it, and no sender can
+// set it: the ingester reads a payload into its own type.
 type Alert struct {
 	Fingerprint  string            `json:"fingerprint"`
 	Status       AlertStatus       `json:"status"`
@@ -21,6 +25,43 @@ type Alert struct {
 	StartsAt     time.Time         `json:"startsAt"`
 	EndsAt       time.Time         `json:"endsAt"`
 	GeneratorURL string            `json:"generatorURL"`
+
+	// UnreportedSince is when this alert stopped appearing in what
+	// Alertmanager sends about its group, while the group was still being
+	// sent. It is an observation and not a cause: an alert goes missing
+	// because it was silenced, because an inhibition covers it, or because it
+	// cleared while silenced, and the notification does not say which.
+	//
+	// Set only for an alert that was firing, and cleared the moment
+	// Alertmanager reports it again.
+	UnreportedSince *time.Time `json:"unreportedSince,omitempty"`
+}
+
+// AlertState is what an alert is doing as far as this system knows: what
+// Alertmanager last said, and whether it still says it.
+//
+// One definition, because three readers count by it - the list summary in
+// SQL, the mock, and the view - and three definitions would eventually
+// disagree about the same alert.
+type AlertState string
+
+const (
+	AlertStateFiring     AlertState = "firing"
+	AlertStateUnreported AlertState = "unreported"
+	AlertStateResolved   AlertState = "resolved"
+)
+
+// State answers with one of the three. Anything that is not firing is
+// resolved, which is what the counts have always done with a status this
+// build does not know.
+func (a Alert) State() AlertState {
+	if a.Status != AlertStatusFiring {
+		return AlertStateResolved
+	}
+	if a.UnreportedSince != nil {
+		return AlertStateUnreported
+	}
+	return AlertStateFiring
 }
 
 // AlertGroupStatus represents the state of an alert group in our system.
@@ -154,7 +195,11 @@ type AlertGroupSummary struct {
 	UpdatedAt      time.Time        `json:"updated_at"`
 	ResolvedAt     *time.Time       `json:"resolved_at,omitempty"`
 	AlertsCount    int              `json:"alerts_count"`
-	FiringCount    int              `json:"firing_count"`
+	// FiringCount counts the alerts Alertmanager still reports as firing;
+	// UnreportedCount the firing ones it has stopped reporting. What is left
+	// of AlertsCount is resolved.
+	FiringCount     int `json:"firing_count"`
+	UnreportedCount int `json:"unreported_count"`
 }
 
 // IncidentStatus represents the lifecycle state of a business incident.

@@ -4727,6 +4727,10 @@ const docTemplate = `{
                 },
                 "status": {
                     "$ref": "#/definitions/model.AlertStatus"
+                },
+                "unreportedSince": {
+                    "description": "UnreportedSince is when this alert stopped appearing in what\nAlertmanager sends about its group, while the group was still being\nsent. It is an observation and not a cause: an alert goes missing\nbecause it was silenced, because an inhibition covers it, or because it\ncleared while silenced, and the notification does not say which.\n\nSet only for an alert that was firing, and cleared the moment\nAlertmanager reports it again.",
+                    "type": "string"
                 }
             }
         },

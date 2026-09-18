@@ -57,10 +57,10 @@ func TestAStartUpgradesTheDatabaseOfV020(t *testing.T) {
 	}
 
 	s.SetRenderEnvironment("https://tokay.example", "UTC")
-	result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key, []model.Alert{{
+	result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key, alertgroup.Notification{Alerts: []model.Alert{{
 		Fingerprint: "fp-0", Status: model.AlertStatusFiring, StartsAt: time.Unix(1700000000, 0),
 		Labels: map[string]string{"alertname": "DiskWillFill"},
-	}}, "system")
+	}}}, "system")
 	if err != nil || result.Outcome != alertgroup.MergeUnchanged || result.AlertGroupID != open {
 		t.Fatalf("the repeat came back %s for %s (%v), want unchanged for %s",
 			result.Outcome, result.AlertGroupID, err, open)

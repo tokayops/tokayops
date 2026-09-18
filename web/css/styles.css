@@ -1049,6 +1049,13 @@ body::before {
     color: var(--action-success);
 }
 
+/* An alert Alertmanager has stopped reporting: neither firing nor resolved,
+   and deliberately quieter than both. */
+.alert-status-tag.status-unreported {
+    border-color: var(--text-muted);
+    color: var(--text-muted);
+}
+
 .badge-severity {
     border: 1px solid;
     background: transparent;
@@ -1726,6 +1733,10 @@ body::before {
 
 .alert-item.status-resolved {
     border-left-color: var(--status-resolved);
+}
+
+.alert-item.status-unreported {
+    border-left-color: var(--text-muted);
 }
 
 .alert-header {

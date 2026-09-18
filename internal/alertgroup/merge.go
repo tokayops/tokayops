@@ -22,6 +22,19 @@ import (
 // second decided, and a firing alert was either lost or written into an
 // incident that was already over.
 
+// Notification is one thing Alertmanager sent about a group.
+//
+// Snapshot says the payload is the WHOLE set of alerts Alertmanager still
+// reports for this group: it named the group, nothing was cut off by
+// max_alerts, and it carried at least one alert. Only then does the absence of
+// an alert from it mean anything - in a payload that is not a snapshot, an
+// alert can be missing because a list was cut short or because the payload was
+// never about a group at all.
+type Notification struct {
+	Alerts   []model.Alert
+	Snapshot bool
+}
+
 // MergeOutcome is what an Alertmanager payload did to the incident it named.
 type MergeOutcome string
 
@@ -140,11 +153,21 @@ func SameAlerts(a, b []model.Alert) bool {
 func sameAlert(x, y model.Alert) bool {
 	return x.Fingerprint == y.Fingerprint &&
 		x.Status == y.Status &&
+		sameInstant(x.UnreportedSince, y.UnreportedSince) &&
 		x.GeneratorURL == y.GeneratorURL &&
 		x.StartsAt.Equal(y.StartsAt) &&
 		x.EndsAt.Equal(y.EndsAt) &&
 		sameStrings(x.Labels, y.Labels) &&
 		sameStrings(x.Annotations, y.Annotations)
+}
+
+// sameInstant compares two optional instants: absent is not zero, and two
+// present ones are compared as times rather than as pointers.
+func sameInstant(x, y *time.Time) bool {
+	if x == nil || y == nil {
+		return x == nil && y == nil
+	}
+	return x.Equal(*y)
 }
 
 func sameStrings(x, y map[string]string) bool {
@@ -159,7 +182,163 @@ func sameStrings(x, y map[string]string) bool {
 	return true
 }
 
+// Applied is what a notification does to the alerts an incident holds.
+//
+// The arithmetic is here, once, because the two stores that apply a payload -
+// the database and the mock the ingester's tests run against - have to answer
+// the same way, and because the answer has to be reachable from inside the
+// transaction that holds the incident.
+type Applied struct {
+	// Alerts is what the incident holds afterwards, and Relevant what of the
+	// payload merged into it - the lines the history gains are about those.
+	Alerts   []model.Alert
+	Relevant []model.Alert
+
+	// Resolving says nothing in the incident is firing any more.
+	Resolving bool
+
+	// Marked is how many alerts this payload marked as no longer reported,
+	// Back the ones it brought back, and HeldOnlyByUnreported says the
+	// incident has just come to be open only because of alerts nobody reports.
+	Marked               int
+	Back                 []Reported
+	HeldOnlyByUnreported bool
+}
+
+// Apply works out what a notification means for an incident: what it holds
+// afterwards, and what changed about who is still reported.
+//
+// Pure, and it does not touch what it is given. `at` is the instant the
+// payload was taken at, read from the database after the incident was locked.
+func Apply(held []model.Alert, notification Notification, at time.Time) Applied {
+	relevant := FilterMergeable(notification.Alerts, FingerprintsOf(held))
+	alerts := MergeAlerts(held, relevant)
+
+	// Read before the marks: the merge above is what clears one, so the
+	// alerts the incident held a moment ago are the only place a silence that
+	// has just ended is still written down.
+	back := ReportedAgain(held, notification.Alerts, at)
+	heldBefore := HeldOnlyByUnreported(held)
+
+	marked := 0
+	if notification.Snapshot {
+		alerts, marked = MarkUnreported(alerts, ReportedIn(notification.Alerts), at)
+	}
+
+	return Applied{
+		Alerts:               alerts,
+		Relevant:             relevant,
+		Resolving:            AllResolved(alerts),
+		Marked:               marked,
+		Back:                 back,
+		HeldOnlyByUnreported: !heldBefore && HeldOnlyByUnreported(alerts),
+	}
+}
+
+// ReportedIn is every alert a payload carried, by identity. A payload that is
+// a snapshot says the incident's other alerts are no longer reported, so this
+// is read against the WHOLE payload and not against the part that merges: an
+// alert Alertmanager sent is reported whether or not this incident can take
+// it.
+func ReportedIn(payload []model.Alert) map[string]bool {
+	reported := make(map[string]bool, len(payload))
+	for _, a := range payload {
+		reported[a.Fingerprint] = true
+	}
+	return reported
+}
+
+// MarkUnreported is the incident's alerts with the ones Alertmanager has
+// stopped reporting marked, and how many marks it added.
+//
+// Only a FIRING alert can be marked. A resolved one is missing from every
+// later notification by design - Alertmanager drops it once it has been sent -
+// so its absence says nothing. A mark already standing is not rewritten: it
+// says when the silence STARTED, and a repeat of the same snapshot is not a
+// second silence.
+//
+// The result is a new slice; the argument is not touched.
+func MarkUnreported(alerts []model.Alert, reported map[string]bool, at time.Time) ([]model.Alert, int) {
+	out := make([]model.Alert, len(alerts))
+	copy(out, alerts)
+
+	marked := 0
+	for i := range out {
+		if out[i].Status != model.AlertStatusFiring || reported[out[i].Fingerprint] {
+			continue
+		}
+		if out[i].UnreportedSince != nil {
+			continue
+		}
+		since := at
+		out[i].UnreportedSince = &since
+		marked++
+	}
+	return out, marked
+}
+
+// Reported is an alert Alertmanager started reporting again: how long it was
+// missing, and what it came back as.
+type Reported struct {
+	Status model.AlertStatus
+	Silent time.Duration
+}
+
+// ReportedAgain is what a payload says about the alerts this incident had
+// stopped hearing about. It is read before the merge, from the alerts the
+// incident holds now, because the merge is what clears the mark.
+//
+// A silence measured as negative is reported as none: the mark and this
+// instant are both the database's clock, and a clock that stepped back is not
+// a negative silence.
+func ReportedAgain(held, payload []model.Alert, at time.Time) []Reported {
+	silent := make(map[string]time.Time, len(held))
+	for _, a := range held {
+		if a.UnreportedSince != nil {
+			silent[a.Fingerprint] = *a.UnreportedSince
+		}
+	}
+
+	var back []Reported
+	for _, a := range payload {
+		since, ok := silent[a.Fingerprint]
+		if !ok {
+			continue
+		}
+		gap := at.Sub(since)
+		if gap < 0 {
+			gap = 0
+		}
+		back = append(back, Reported{Status: a.Status, Silent: gap})
+	}
+	return back
+}
+
+// HeldOnlyByUnreported says the incident has nothing firing that Alertmanager
+// still reports, and is open only because of alerts it has stopped reporting.
+//
+// This is the state a resolution that went by the alert set alone would have
+// ended, which is what counting it is for. It is an upper bound on that and
+// not a count of resolutions a policy would actually make: a policy would ask
+// more of the payload than its alerts.
+func HeldOnlyByUnreported(alerts []model.Alert) bool {
+	unreported := false
+	for _, a := range alerts {
+		switch a.State() {
+		case model.AlertStateFiring:
+			return false
+		case model.AlertStateUnreported:
+			unreported = true
+		}
+	}
+	return unreported
+}
+
 // AllResolved says the incident is over: nothing it holds is firing.
+//
+// An alert Alertmanager has stopped reporting is still firing here. Absence is
+// not a resolution: it is what a silence looks like, and an incident that
+// ended because somebody silenced an alert would take the paging with it.
 func AllResolved(alerts []model.Alert) bool {
 	for _, a := range alerts {
 		if a.Status == model.AlertStatusFiring {

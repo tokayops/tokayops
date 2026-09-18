@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tokayops/tokayops/internal/alertgroup"
+	"github.com/tokayops/tokayops/internal/metrics"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 )
@@ -26,7 +27,7 @@ import (
 // So the decision moved to where the row is held. What the caller supplies is
 // the payload; what it gets back is what happened.
 func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
-	incoming []model.Alert, actor string) (alertgroup.MergeResult, error) {
+	notification alertgroup.Notification, actor string) (alertgroup.MergeResult, error) {
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -57,37 +58,38 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 
 	// Alertmanager has been heard from about this incident, whatever the
 	// payload turns out to mean - a repeat that changes nothing is the one
-	// that says Alertmanager is still sending.
-	if err := recordNotifiedTx(ctx, tx, group.ID); err != nil {
+	// that says Alertmanager is still sending. The instant it answers with is
+	// this payload's: the marks below and the silences they end are measured
+	// from the same clock, read after the lock.
+	observedAt, err := recordNotifiedTx(ctx, tx, group.ID)
+	if err != nil {
 		return alertgroup.MergeResult{}, err
 	}
 
 	held := alertgroup.FingerprintsOf(group.Alerts)
-	relevant := alertgroup.FilterMergeable(incoming, held)
-	if len(relevant) == 0 {
-		if err := tx.Commit(); err != nil {
-			return alertgroup.MergeResult{}, err
-		}
-		return alertgroup.MergeResult{
-			Outcome: alertgroup.MergeIgnored, AlertGroupID: group.ID,
-		}, nil
-	}
+	applied := alertgroup.Apply(group.Alerts, notification, observedAt)
+	merged, relevant, resolving := applied.Alerts, applied.Relevant, applied.Resolving
 
-	merged := alertgroup.MergeAlerts(group.Alerts, relevant)
-	resolving := alertgroup.AllResolved(merged)
-
-	// A repeat that says exactly what the incident already says is not news:
+	// A payload that says exactly what the incident already says is not news:
 	// the alerts are not written, no revision, no edit of a message into what
 	// it already showed. Only the fact that Alertmanager sent it is kept.
 	// The end of an incident is the exception - a group whose alerts have all
 	// cleared has to end even if this payload told us nothing new.
+	//
+	// "Nothing in it belongs here" is said apart from "this is a repeat",
+	// because they are different things to read in a log - and a snapshot of
+	// alerts this incident cannot take still marks the ones it no longer
+	// reports, which is news.
 	if !resolving && alertgroup.SameAlerts(group.Alerts, merged) {
+		outcome := alertgroup.MergeUnchanged
+		if len(relevant) == 0 {
+			outcome = alertgroup.MergeIgnored
+		}
 		if err := tx.Commit(); err != nil {
 			return alertgroup.MergeResult{}, err
 		}
-		return alertgroup.MergeResult{
-			Outcome: alertgroup.MergeUnchanged, AlertGroupID: group.ID,
-		}, nil
+		countUnreported(applied)
+		return alertgroup.MergeResult{Outcome: outcome, AlertGroupID: group.ID}, nil
 	}
 
 	// Time comes from the database, like every other instant this system
@@ -100,12 +102,37 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 
 	group.Alerts = merged
 	if resolving {
-		return s.resolveByAlertmanagerTx(ctx, tx, group, events, now, actor)
+		result, err := s.resolveByAlertmanagerTx(ctx, tx, group, events, now, actor)
+		if err == nil {
+			countUnreported(applied)
+		}
+		return result, err
 	}
-	return s.mergeAlertsTx(ctx, tx, group, events, actor)
+	result, err := s.mergeAlertsTx(ctx, tx, group, events, actor)
+	if err == nil {
+		countUnreported(applied)
+	}
+	return result, err
 }
 
-// recordNotifiedTx records that Alertmanager sent something about the group.
+// countUnreported records what a payload did to the alerts Alertmanager still
+// reports, after the commit like every other count here: an observation about
+// a transaction that was rolled back is an observation about nothing.
+func countUnreported(applied alertgroup.Applied) {
+	for i := 0; i < applied.Marked; i++ {
+		metrics.AlertsUnreportedTotal.Inc()
+	}
+	for _, r := range applied.Back {
+		metrics.AlertUnreportedDurationSeconds.
+			WithLabelValues(string(r.Status)).Observe(r.Silent.Seconds())
+	}
+	if applied.HeldOnlyByUnreported {
+		metrics.AlertGroupsHeldByUnreportedTotal.Inc()
+	}
+}
+
+// recordNotifiedTx records that Alertmanager sent something about the group,
+// and answers with the instant it recorded.
 //
 // The instant is the clock read AFTER the row lock, not now(). now() is when
 // the transaction began, and a payload that waited for the lock behind another
@@ -116,18 +143,18 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 //
 // Only this column: not updated_at, which is when the group last changed, and
 // not the render source version - a repeat is not news about the alert.
-func recordNotifiedTx(ctx context.Context, tx *sql.Tx, groupID string) error {
+func recordNotifiedTx(ctx context.Context, tx *sql.Tx, groupID string) (time.Time, error) {
 	var observedAt time.Time
 	if err := tx.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&observedAt); err != nil {
-		return fmt.Errorf("read the clock for %s: %w", groupID, err)
+		return time.Time{}, fmt.Errorf("read the clock for %s: %w", groupID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE alert_groups
 		SET last_notified_at = GREATEST(last_notified_at, $2::timestamptz)
 		WHERE id = $1`, groupID, observedAt); err != nil {
-		return fmt.Errorf("record that %s was notified: %w", groupID, err)
+		return time.Time{}, fmt.Errorf("record that %s was notified: %w", groupID, err)
 	}
-	return nil
+	return observedAt, nil
 }
 
 // mergeAlertsTx records a changed alert set and tells the incident's messages

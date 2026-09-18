@@ -58,7 +58,7 @@ func TestGenerateTitle(t *testing.T) {
 			name: "Alert Label Alertname Present",
 			payload: AMPayload{
 				Status: "firing",
-				Alerts: []model.Alert{
+				Alerts: []AMAlert{
 					{
 						Labels: map[string]string{
 							"alertname": "FallbackAlert",
@@ -827,6 +827,10 @@ func TestTheIngesterKeepsSeverityToTheThreeWords(t *testing.T) {
 // happened" - so each quiet outcome leaves a line: nothing firing and no
 // open incident, the open incident already saying this, and a payload
 // with nothing that belongs to the open incident.
+//
+// The last one is quiet only when the payload is not a snapshot. A snapshot
+// of alerts this incident cannot take still says the ones it holds are no
+// longer reported, and that is news.
 func TestTheIngesterSaysWhyItDidNothing(t *testing.T) {
 	s := store.NewMockStore()
 	seedDefaultTeams(s)
@@ -855,6 +859,7 @@ func TestTheIngesterSaysWhyItDidNothing(t *testing.T) {
 	firing := fmt.Sprintf(`{"status":"firing","groupKey":"quiet","commonLabels":{%s},"alerts":[{"status":"firing","labels":{%s},"fingerprint":"f1"}]}`, labels, labels)
 	resolvedOnly := fmt.Sprintf(`{"status":"resolved","groupKey":"quiet","commonLabels":{%s},"alerts":[{"status":"resolved","labels":{%s},"fingerprint":"f1"}]}`, labels, labels)
 	strangers := fmt.Sprintf(`{"status":"resolved","groupKey":"quiet","commonLabels":{%s},"alerts":[{"status":"resolved","labels":{%s},"fingerprint":"f9"}]}`, labels, labels)
+	strangersCutShort := fmt.Sprintf(`{"status":"resolved","groupKey":"quiet","truncatedAlerts":1,"commonLabels":{%s},"alerts":[{"status":"resolved","labels":{%s},"fingerprint":"f9"}]}`, labels, labels)
 
 	if got := post(resolvedOnly); !strings.Contains(got, "no open incident and nothing firing in the payload, ignored") {
 		t.Fatalf("a resolved payload with no incident left:\n%s", got)
@@ -866,7 +871,16 @@ func TestTheIngesterSaysWhyItDidNothing(t *testing.T) {
 	if got := post(firing); !strings.Contains(got, "already says this, unchanged") {
 		t.Fatalf("the repeated payload left:\n%s", got)
 	}
-	if got := post(strangers); !strings.Contains(got, "nothing in the payload belongs to the open incident") {
-		t.Fatalf("a payload of strangers left:\n%s", got)
+	if got := post(strangersCutShort); !strings.Contains(got, "nothing in the payload belongs to the open incident") {
+		t.Fatalf("a payload of strangers that was cut short left:\n%s", got)
+	}
+	// The same payload whole is not quiet: it is a snapshot, so it says
+	// Alertmanager no longer reports f1, and the incident is written. Which
+	// line that leaves depends on whether a message shows the mark, which the
+	// mock does not model - so it is asserted where the incident is, in
+	// TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp, and not
+	// here.
+	if got := post(strangers); strings.Contains(got, "nothing in the payload belongs to the open incident") {
+		t.Fatalf("a whole snapshot without the incident's alert was called quiet:\n%s", got)
 	}
 }

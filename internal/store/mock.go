@@ -270,8 +270,14 @@ func (m *MockStore) UpdateAlertGroupOnCall(id string, snapshot *model.OnCallResu
 // no snapshot to raise. The outcomes ARE the same as the database's, and a test
 // proves that - see TestTheMockAndTheDatabaseAnswerAPayloadAlike; anything
 // beyond the outcome has to be asserted against a real one.
+//
+// The one place the outcomes part company follows from the same omission: a
+// payload whose only news is that Alertmanager has stopped reporting an alert
+// is "merged" here and "unchanged" against the database, because no message
+// shows the mark and the database answers with what the messages did. The
+// alerts it leaves behind are the same either way.
 func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
-	incoming []model.Alert, actor string) (alertgroup.MergeResult, error) {
+	notification alertgroup.Notification, actor string) (alertgroup.MergeResult, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -296,19 +302,14 @@ func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey 
 	}
 
 	held := alertgroup.FingerprintsOf(group.Alerts)
-	relevant := alertgroup.FilterMergeable(incoming, held)
-	if len(relevant) == 0 {
-		return alertgroup.MergeResult{
-			Outcome: alertgroup.MergeIgnored, AlertGroupID: group.ID,
-		}, nil
-	}
-
-	merged := alertgroup.MergeAlerts(group.Alerts, relevant)
-	resolving := alertgroup.AllResolved(merged)
+	applied := alertgroup.Apply(group.Alerts, notification, now)
+	merged, relevant, resolving := applied.Alerts, applied.Relevant, applied.Resolving
 	if !resolving && alertgroup.SameAlerts(group.Alerts, merged) {
-		return alertgroup.MergeResult{
-			Outcome: alertgroup.MergeUnchanged, AlertGroupID: group.ID,
-		}, nil
+		outcome := alertgroup.MergeUnchanged
+		if len(relevant) == 0 {
+			outcome = alertgroup.MergeIgnored
+		}
+		return alertgroup.MergeResult{Outcome: outcome, AlertGroupID: group.ID}, nil
 	}
 
 	events := alertgroup.MergeTimelineEvents(group.ID, relevant, held, now)
@@ -639,10 +640,13 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 		if days > 0 && ag.UpdatedAt.Before(cutoff) && ag.CreatedAt.Before(cutoff) {
 			continue
 		}
-		firingCount := 0
+		firingCount, unreportedCount := 0, 0
 		for _, a := range ag.Alerts {
-			if a.Status == "firing" {
+			switch a.State() {
+			case model.AlertStateFiring:
 				firingCount++
+			case model.AlertStateUnreported:
+				unreportedCount++
 			}
 		}
 		filtered = append(filtered, &model.AlertGroupSummary{
@@ -652,6 +656,7 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 			AcknowledgedBy: ag.AcknowledgedBy, ResolvedBy: ag.ResolvedBy,
 			CreatedAt: ag.CreatedAt, UpdatedAt: ag.UpdatedAt, ResolvedAt: ag.ResolvedAt,
 			AlertsCount: len(ag.Alerts), FiringCount: firingCount,
+			UnreportedCount: unreportedCount,
 		})
 	}
 	return filtered

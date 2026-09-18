@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tokayops/tokayops/internal/alertgroup"
 	"github.com/tokayops/tokayops/internal/model"
 	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/outbound/keys"
@@ -67,11 +68,11 @@ func TestADoorThatCannotRaiseItsRevisionDoesNotOpen(t *testing.T) {
 			name: "an alert that arrived",
 			open: func(t *testing.T, s *Store, agID string) error {
 				_, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
-					"desired-"+agID, []model.Alert{{
+					"desired-"+agID, alertgroup.Notification{Alerts: []model.Alert{{
 						Fingerprint: "fp-9", Status: model.AlertStatusFiring,
 						StartsAt: time.Unix(1700000600, 0),
 						Labels:   map[string]string{"alertname": "DiskSlow"},
-					}}, "ingester")
+					}}}, "ingester")
 				return err
 			},
 		},
@@ -220,11 +221,11 @@ func TestADoorWhoseCommitFailsReportsIt(t *testing.T) {
 			name: "an alert that arrived",
 			open: func(t *testing.T, s *Store, agID string) error {
 				_, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
-					"desired-"+agID, []model.Alert{{
+					"desired-"+agID, alertgroup.Notification{Alerts: []model.Alert{{
 						Fingerprint: "fp-9", Status: model.AlertStatusFiring,
 						StartsAt: time.Unix(1700000600, 0),
 						Labels:   map[string]string{"alertname": "DiskSlow"},
-					}}, "ingester")
+					}}}, "ingester")
 				return err
 			},
 		},

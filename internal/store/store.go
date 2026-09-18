@@ -1476,11 +1476,21 @@ func (s *Store) GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset 
 // alertGroupSummaryColumns selects lightweight fields for list views,
 // skipping heavy JSONB columns (alerts_data, policy_snapshot)
 // and computing alert counts from alerts_data inline.
+//
+// The two counts are model.Alert.State in SQL: an alert is firing while
+// Alertmanager still reports it, unreported once it has stopped, and what is
+// left of the total is resolved. The definition lives in the model and is
+// written twice on purpose - once here, because counting in SQL is what keeps
+// the list off the alerts themselves - and a test holds the two to the same
+// answer.
 const alertGroupSummaryColumns = `id, alert_key, status, title, team_id, severity, current_step,
 	oncall_snapshot, external_url, acknowledged_by, resolved_by,
 	created_at, updated_at, resolved_at,
 	jsonb_array_length(COALESCE(alerts_data::jsonb, '[]'::jsonb)),
-	(SELECT count(*)::int FROM jsonb_array_elements(COALESCE(alerts_data::jsonb, '[]'::jsonb)) elem WHERE elem->>'status' = 'firing')`
+	(SELECT count(*)::int FROM jsonb_array_elements(COALESCE(alerts_data::jsonb, '[]'::jsonb)) elem
+	  WHERE elem->>'status' = 'firing' AND elem->>'unreportedSince' IS NULL),
+	(SELECT count(*)::int FROM jsonb_array_elements(COALESCE(alerts_data::jsonb, '[]'::jsonb)) elem
+	  WHERE elem->>'status' = 'firing' AND elem->>'unreportedSince' IS NOT NULL)`
 
 func scanAlertGroupSummaryRow(scanner alertGroupScanner) (*model.AlertGroupSummary, error) {
 	var ag model.AlertGroupSummary
@@ -1492,7 +1502,7 @@ func scanAlertGroupSummaryRow(scanner alertGroupScanner) (*model.AlertGroupSumma
 		&teamID, &severity, &ag.CurrentStep,
 		&oncallSnapshot, &externalURL, &acknowledgedBy, &resolvedBy,
 		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt,
-		&ag.AlertsCount, &ag.FiringCount,
+		&ag.AlertsCount, &ag.FiringCount, &ag.UnreportedCount,
 	)
 	if err != nil {
 		return nil, err

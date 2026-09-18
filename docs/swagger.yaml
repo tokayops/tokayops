@@ -1097,6 +1097,17 @@ definitions:
         type: string
       status:
         $ref: '#/definitions/model.AlertStatus'
+      unreportedSince:
+        description: |-
+          UnreportedSince is when this alert stopped appearing in what
+          Alertmanager sends about its group, while the group was still being
+          sent. It is an observation and not a cause: an alert goes missing
+          because it was silenced, because an inhibition covers it, or because it
+          cleared while silenced, and the notification does not say which.
+
+          Set only for an alert that was firing, and cleared the moment
+          Alertmanager reports it again.
+        type: string
     type: object
   model.AlertGroup:
     properties:

@@ -230,14 +230,50 @@ const Components = {
     },
 
     /**
-     * Render alert status badge (for alert-level statuses: firing/resolved)
-     * @param {string} status - Alert status (firing or resolved)
+     * Counts of an alert group by state. The API answers them for a list,
+     * where the alerts themselves are not sent; with the alerts at hand they
+     * are counted here, by the same three states.
+     * @param {Object} alertGroup - Alert group or summary
      */
-    alertStatusBadge: (status) => {
-        const normalized = status?.toLowerCase() || 'firing';
-        const label = normalized === 'resolved' ? 'Resolved' : 'Firing';
-        const cssClass = normalized === 'resolved' ? 'resolved' : 'firing';
-        return `<span class="alert-status-tag status-${cssClass}">${label}</span>`;
+    alertCounts: (alertGroup) => {
+        const alerts = alertGroup.alerts;
+        const total = alertGroup.alerts_count ?? alerts?.length ?? 0;
+        const counted = (state) => alerts?.filter(a => Components.alertState(a) === state).length ?? 0;
+        const firing = alertGroup.firing_count ?? counted('firing');
+        const unreported = alertGroup.unreported_count ?? counted('unreported');
+        return { total, firing, unreported, resolved: Math.max(0, total - firing - unreported) };
+    },
+
+    /**
+     * State of one alert: what Alertmanager last said, and whether it still
+     * says it. The same three states the API counts by, worked out in one
+     * place so the badge, the border and the counts cannot disagree.
+     * @param {Object} alert - Alert data
+     * @returns {'firing'|'unreported'|'resolved'}
+     */
+    alertState: (alert) => {
+        // Anything that is not firing is resolved, including a status this
+        // build does not know - the same answer model.Alert.State gives in Go
+        // and the same one the list counts by in SQL.
+        if (alert?.status?.toLowerCase() !== 'firing') return 'resolved';
+        return alert?.unreportedSince ? 'unreported' : 'firing';
+    },
+
+    /**
+     * Render alert status badge (for alert-level states: firing/unreported/resolved)
+     * @param {Object} alert - Alert data
+     */
+    alertStatusBadge: (alert) => {
+        const state = Components.alertState(alert);
+        if (state === 'unreported') {
+            const since = Components.formatTime(alert.unreportedSince);
+            const title = 'Absent from the latest Alertmanager notification for this group: '
+                + 'silenced, inhibited, or cleared while silenced';
+            return `<span class="alert-status-tag status-unreported" title="${escapeHtml(title)}">`
+                + `Not reported since ${escapeHtml(since)}</span>`;
+        }
+        const label = state === 'resolved' ? 'Resolved' : 'Firing';
+        return `<span class="alert-status-tag status-${state}">${label}</span>`;
     },
 
     /**
@@ -365,9 +401,8 @@ const Components = {
      * @param {Object} alertGroup - AlertGroup data
      */
     alertGroupCard: (alertGroup, options = {}) => {
-        const alertCount = alertGroup.alerts_count ?? alertGroup.alerts?.length ?? 0;
-        const firingCount = alertGroup.firing_count ?? alertGroup.alerts?.filter(a => a.status === 'firing').length ?? 0;
-        const resolvedCount = alertCount - firingCount;
+        const { total: alertCount, firing: firingCount, unreported: unreportedCount,
+            resolved: resolvedCount } = Components.alertCounts(alertGroup);
 
         const displayStatus = getDisplayStatus(alertGroup.status);
         const ackName = displayStatus === 'acknowledged' ? (alertGroup.acknowledged_by || '-') : '-';
@@ -391,6 +426,7 @@ const Components = {
         const duration = Components.formatDuration(endTime - startTime);
         const alertsParts = [];
         if (firingCount > 0) alertsParts.push(`${firingCount} firing`);
+        if (unreportedCount > 0) alertsParts.push(`${unreportedCount} not reported`);
         if (resolvedCount > 0) alertsParts.push(`${resolvedCount} resolved`);
         const alertsSummary = alertsParts.length > 0
             ? `<span class="alerts-count-main">${alertsParts.join(' · ')}</span><span class="alerts-duration">for ${duration}</span>`
@@ -469,10 +505,11 @@ const Components = {
         const onCallName = (alertGroup.onCall?.l1_users || []).map(u => u.name).join(', ');
         const onCallDisplay = onCallName ? truncateText(onCallName, 28) : (alertGroup.onCall ? 'Not configured' : '—');
         const onCallTitle = onCallName ? ` title="${escapeHtml(onCallName)}"` : '';
-        const firingCount = alertGroup.firing_count ?? alertGroup.alerts?.filter(a => a.status === 'firing').length ?? 0;
-        const totalCount = alertGroup.alerts_count ?? alertGroup.alerts?.length ?? 0;
-        const resolvedCount = totalCount - firingCount;
-        const alertsSummary = `Alerts: ${firingCount} firing${resolvedCount > 0 ? ` · ${resolvedCount} resolved` : ''}`;
+        const { total: totalCount, firing: firingCount, unreported: unreportedCount,
+            resolved: resolvedCount } = Components.alertCounts(alertGroup);
+        const alertsSummary = `Alerts: ${firingCount} firing`
+            + (unreportedCount > 0 ? ` · ${unreportedCount} not reported` : '')
+            + (resolvedCount > 0 ? ` · ${resolvedCount} resolved` : '');
         const teamLabel = alertGroup.team_id ? `Team ${alertGroup.team_id}` : 'Team N/A';
 
         return `
@@ -604,10 +641,10 @@ const Components = {
         const hiddenHtml = hiddenLabels.map(labelSpan).join(' · ');
 
         return `
-            <div class="alert-item status-${alert.status}">
+            <div class="alert-item status-${Components.alertState(alert)}">
                 <div class="alert-header">
                     <span class="alert-name">${escapeHtml(headerTitle)}</span>
-                    ${Components.alertStatusBadge(alert.status)}
+                    ${Components.alertStatusBadge(alert)}
                 </div>
                 ${summary ? `
                     <div class="alert-annotation">${escapeHtml(summary)}</div>

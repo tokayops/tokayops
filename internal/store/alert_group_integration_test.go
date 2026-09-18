@@ -1090,10 +1090,10 @@ func TestAPayloadThatClearsEverythingEndsTheIncident(t *testing.T) {
 	}
 
 	result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
-		[]model.Alert{{
+		alertgroup.Notification{Alerts: []model.Alert{{
 			Fingerprint: "fp1", Status: model.AlertStatusResolved,
 			StartsAt: time.Unix(1700000000, 0), Labels: map[string]string{"alertname": "CPU"},
-		}}, "system")
+		}}}, "system")
 	if err != nil {
 		t.Fatalf("apply the payload: %v", err)
 	}
@@ -1156,7 +1156,7 @@ func TestAPayloadForAnIncidentThatIsOverBelongsToTheNextOne(t *testing.T) {
 	}
 
 	result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
-		[]model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}}, "system")
+		alertgroup.Notification{Alerts: []model.Alert{{Fingerprint: "fp1", Status: model.AlertStatusFiring}}}, "system")
 	if err != nil {
 		t.Fatalf("apply the payload: %v", err)
 	}
@@ -1292,11 +1292,11 @@ func TestTheDoorsThatStopADeliveryStopAllOfIt(t *testing.T) {
 				t.Fatalf("read the alert key: %v", err)
 			}
 			result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
-				[]model.Alert{{
+				alertgroup.Notification{Alerts: []model.Alert{{
 					Fingerprint: "fp-1", Status: model.AlertStatusResolved,
 					StartsAt: time.Unix(1700000000, 0),
 					Labels:   map[string]string{"alertname": "DiskWillFill"},
-				}}, "system")
+				}}}, "system")
 			if err != nil || result.Outcome != alertgroup.MergeResolved {
 				t.Fatalf("the payload came back %s (%v)", result.Outcome, err)
 			}
