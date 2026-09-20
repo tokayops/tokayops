@@ -29,21 +29,21 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ### Added
 
-- **An alert group Alertmanager has gone quiet about can be marked.** The
-  Alertmanager integration takes an optional "Consider quiet after": how long
-  silence about an alert group is normal for that Alertmanager, in whole
+- **An alert group Alertmanager has stopped sending about is marked stale.**
+  The Alertmanager integration takes an optional "Consider stale after": how
+  long silence about an alert group is normal for that Alertmanager, in whole
   minutes. Editing it, clearing it, disabling the integration or deleting it
   reaches the alert groups it feeds that are still open - including the ones
-  that have gone quiet and will never send again. An open alert
-  group that has said nothing for longer is badged in the list and in the alert
-  group view. Nothing is claimed unless the number is set, and nothing is
+  that will never be sent about again. An open alert group that has said
+  nothing for longer is badged "Stale" with how long, in the list and in the
+  alert group view. Nothing is claimed unless the number is set, and nothing is
   inferred from Alertmanager's own configuration - it cannot be read from what
   it sends.
 - **Alerts Alertmanager has stopped reporting are shown as such.** When a
   notification carries the whole group and an alert that was firing is not in
   it - silenced, inhibited, or cleared while silenced - the alert is marked
-  "not reported" from that moment, and the mark goes the moment Alertmanager
-  reports it again. The alert group view shows the state and counts it apart
+  stale from that moment, and the mark goes the moment Alertmanager reports it
+  again. The alert group view shows the state and counts it apart
   (`unreportedSince` on the alert, `unreported_count` on the list).
   Such an alert still holds the alert group open: absence is not a resolution,
   and nothing about paging or escalation changes.
@@ -54,8 +54,8 @@ Each release converts to the Apache License 2.0 two years after it ships, per
   repeats that change nothing included (`last_notified_at` in the API). The
   alert group view shows it next to the last update, which is when the group
   last changed. A group that fires steadily does not change; the new time is
-  what tells it apart from one Alertmanager has gone quiet about - everything in
-  it silenced, for example.
+  what tells it apart from one that has gone stale - everything in it
+  silenced, for example.
 - `alertmanager_truncated_notifications_total` and the warning rule
   `AlertmanagerNotificationsTruncated`.
 

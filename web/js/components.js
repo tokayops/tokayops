@@ -230,7 +230,7 @@ const Components = {
     },
 
     /**
-     * Has Alertmanager gone quiet about this alert group?
+     * Has Alertmanager gone stale about this alert group?
      *
      * Only when the integration that sent it says how long silence is normal:
      * the number is the operator's, and without it nothing is claimed. Only
@@ -239,32 +239,32 @@ const Components = {
      * groups opened by hand or opened before this was recorded.
      *
      * @param {Object} alertGroup - Alert group or summary
-     * @returns {{silentFor: number, quietAfter: number}|null} milliseconds of
+     * @returns {{silentFor: number, staleAfter: number}|null} milliseconds of
      * silence and the declared allowance, or null when nothing is claimed.
      */
-    quietSilence: (alertGroup) => {
-        const quietAfter = alertGroup?.quiet_after_seconds;
-        if (!quietAfter || !alertGroup?.last_notified_at) return null;
+    staleSilence: (alertGroup) => {
+        const staleAfter = alertGroup?.quiet_after_seconds;
+        if (!staleAfter || !alertGroup?.last_notified_at) return null;
         if (getDisplayStatus(alertGroup.status) === 'resolved') return null;
 
         const silentFor = Date.now() - new Date(alertGroup.last_notified_at).getTime();
-        if (!(silentFor > quietAfter * 1000)) return null;
-        return { silentFor, quietAfter };
+        if (!(silentFor > staleAfter * 1000)) return null;
+        return { silentFor, staleAfter };
     },
 
     /**
-     * Render the badge for an alert group Alertmanager has gone quiet about.
+     * Render the badge for an alert group Alertmanager has gone stale about.
      * Says the fact and not a cause: silence looks the same whether everything
      * in the group was silenced, the route changed, or Alertmanager is down.
      * @param {Object} alertGroup - Alert group or summary
      */
-    quietBadge: (alertGroup) => {
-        const quiet = Components.quietSilence(alertGroup);
-        if (!quiet) return '';
+    staleMark: (alertGroup) => {
+        const stale = Components.staleSilence(alertGroup);
+        if (!stale) return '';
         const title = `Alertmanager last sent at ${Components.formatTime(alertGroup.last_notified_at)}; `
-            + `this integration says silence over ${Components.formatDuration(quiet.quietAfter * 1000)} is unusual`;
-        return `<span class="badge badge-quiet" title="${escapeHtml(title)}">`
-            + `No notification for ${Components.formatDuration(quiet.silentFor)}</span>`;
+            + `this integration says silence over ${Components.formatDuration(stale.staleAfter * 1000)} is unusual`;
+        return `<span class="stale-mark" title="${escapeHtml(title)}">`
+            + `Stale ${Components.formatDuration(stale.silentFor)}</span>`;
     },
 
     /**
@@ -304,11 +304,12 @@ const Components = {
     alertStatusBadge: (alert) => {
         const state = Components.alertState(alert);
         if (state === 'unreported') {
-            const since = Components.formatTime(alert.unreportedSince);
-            const title = 'Absent from the latest Alertmanager notification for this group: '
-                + 'silenced, inhibited, or cleared while silenced';
+            const since = new Date(alert.unreportedSince).getTime();
+            const title = `Absent from every Alertmanager notification for this group since `
+                + `${Components.formatTime(alert.unreportedSince)}: silenced, inhibited, or `
+                + 'cleared while silenced';
             return `<span class="alert-status-tag status-unreported" title="${escapeHtml(title)}">`
-                + `Not reported since ${escapeHtml(since)}</span>`;
+                + `Stale ${Components.formatDuration(Date.now() - since)}</span>`;
         }
         const label = state === 'resolved' ? 'Resolved' : 'Firing';
         return `<span class="alert-status-tag status-${state}">${label}</span>`;
@@ -455,25 +456,34 @@ const Components = {
         const onCallName = (onCallData?.l1_users || []).map(u => u.name).join(', ');
         const onCallDisplay = onCallName
             ? truncateText(onCallName, 24)
-            : (onCallData ? 'Not configured' : '—');
+            : (onCallData ? 'Not configured' : '-');
         const onCallTitle = onCallName ? ` title="${escapeHtml(onCallName)}"` : '';
 
         const showAlertsCount = alertCount > 0 || options.forceAlertsCount;
         const startTime = alertGroup.created_at ? new Date(alertGroup.created_at).getTime() : 0;
         const endTime = alertGroup.resolved_at ? new Date(alertGroup.resolved_at).getTime() : Date.now();
         const duration = Components.formatDuration(endTime - startTime);
+        // Each count is its own element, and carries its separator: the list
+        // has one line to say this in, and drops the part it can do without
+        // rather than wrapping the row onto a second line.
         const alertsParts = [];
-        if (firingCount > 0) alertsParts.push(`${firingCount} firing`);
-        if (unreportedCount > 0) alertsParts.push(`${unreportedCount} not reported`);
-        if (resolvedCount > 0) alertsParts.push(`${resolvedCount} resolved`);
+        if (firingCount > 0) alertsParts.push(['count-firing', `${firingCount} firing`]);
+        if (unreportedCount > 0) alertsParts.push(['count-unreported', `${unreportedCount} stale`]);
+        if (resolvedCount > 0) alertsParts.push(['count-resolved', `${resolvedCount} resolved`]);
+        const alertsTitle = alertsParts.map(([, text]) => text).join(' · ');
         const alertsSummary = alertsParts.length > 0
-            ? `<span class="alerts-count-main">${alertsParts.join(' · ')}</span><span class="alerts-duration">for ${duration}</span>`
+            ? `<span class="alerts-count-main">${alertsParts
+                .map(([cls, text], i) => `<span class="${cls}">${i > 0 ? ' · ' : ''}${text}</span>`)
+                .join('')}</span><span class="alerts-duration">for ${duration}</span>`
             : '0';
 
         return `
             <div class="alert-group-card status-${displayStatus} severity-${severityClass}${highlightClass}" data-alert-group-id="${alertGroup.id}">
                 <div class="alert-group-card-header">
-                    <h3 class="alert-group-title">${escapeHtml(alertGroup.title || 'Untitled Alert')}</h3>
+                    <h3 class="alert-group-title">
+                        <span class="alert-group-title-text">${escapeHtml(alertGroup.title || 'Untitled Alert')}</span>
+                        ${Components.staleMark(alertGroup)}
+                    </h3>
                 </div>
                 <div class="alert-group-badges">
                     <div class="alert-group-severity-badge">
@@ -482,7 +492,6 @@ const Components = {
                     <div class="alert-group-status-badge">
                         ${Components.statusBadge(alertGroup.status)}
                     </div>
-                    ${Components.quietBadge(alertGroup)}
                 </div>
                 <div class="alert-group-meta">
                     <div class="alert-group-meta-item">
@@ -507,7 +516,7 @@ const Components = {
                     </div>
                 </div>
                 ${showAlertsCount ? `
-                    <div class="alert-group-alerts-count">
+                    <div class="alert-group-alerts-count" title="${escapeAttr(alertsTitle)}">
                         ${alertsSummary}
                     </div>
                 ` : ''}
@@ -532,22 +541,16 @@ const Components = {
         const activeDuration = Components.formatDuration(Math.max(0, endedAt - startedAt));
         const statusTime = activeDuration;
         const updatedRelative = Components.timeSince(alertGroup.updated_at, { withAgo: true });
-        // Not the same instant as the update: a group that fires steadily does
-        // not change, and Alertmanager's repeats of it are what this one counts.
-        // Absent for a group Alertmanager never sent.
-        const notifiedRelative = alertGroup.last_notified_at
-            ? Components.timeSince(alertGroup.last_notified_at, { withAgo: true })
-            : '';
         const ackName = alertGroup.acknowledged_by || '';
         const ackDisplay = ackName ? truncateText(ackName, 28) : '';
         const ackTitle = ackName ? ` title="${escapeHtml(ackName)}"` : '';
         const onCallName = (alertGroup.onCall?.l1_users || []).map(u => u.name).join(', ');
-        const onCallDisplay = onCallName ? truncateText(onCallName, 28) : (alertGroup.onCall ? 'Not configured' : '—');
+        const onCallDisplay = onCallName ? truncateText(onCallName, 28) : (alertGroup.onCall ? 'Not configured' : '-');
         const onCallTitle = onCallName ? ` title="${escapeHtml(onCallName)}"` : '';
         const { total: totalCount, firing: firingCount, unreported: unreportedCount,
             resolved: resolvedCount } = Components.alertCounts(alertGroup);
         const alertsSummary = `Alerts: ${firingCount} firing`
-            + (unreportedCount > 0 ? ` · ${unreportedCount} not reported` : '')
+            + (unreportedCount > 0 ? ` · ${unreportedCount} stale` : '')
             + (resolvedCount > 0 ? ` · ${resolvedCount} resolved` : '');
         const teamLabel = alertGroup.team_id ? `Team ${alertGroup.team_id}` : 'Team N/A';
 
@@ -564,8 +567,7 @@ const Components = {
                     <span class="detail-meta-chip">${escapeHtml(teamLabel)}</span>
                     <span class="detail-meta-chip"${onCallTitle}>On-call ${escapeHtml(onCallDisplay)}</span>
                     <span class="detail-meta-chip" title="When the alert group last changed">Last update ${updatedRelative}</span>
-                    ${notifiedRelative ? `<span class="detail-meta-chip" title="When Alertmanager last sent anything about this alert group, repeats included">Last notification ${notifiedRelative}</span>` : ''}
-                    ${Components.quietBadge(alertGroup)}
+                    ${Components.staleMark(alertGroup)}
                     ${ackName ? `<span class="detail-meta-chip"${ackTitle}>Ack by ${escapeHtml(ackDisplay)}</span>` : ''}
                 </div>
             </div>
@@ -1942,7 +1944,7 @@ const Components = {
             // repeat_interval in minutes and hours, not in seconds. Whole
             // minutes only, which the API enforces, so nothing is lost on the
             // way back into the form.
-            const quietAfterMinutes = config?.quiet_after_seconds
+            const staleAfterMinutes = config?.quiet_after_seconds
                 ? config.quiet_after_seconds / 60
                 : '';
 
@@ -1965,15 +1967,9 @@ const Components = {
                     <small class="form-hint">Use this URL in your Alertmanager configuration. Replace YOUR_TOKEN with your actual token.</small>
                 </div>
                 <div class="form-group">
-                    <label for="config-quiet-after">Consider quiet after (minutes)</label>
-                    <input type="number" id="config-quiet-after" class="form-input" min="1" max="10080"
-                           placeholder="leave empty to say nothing about silence"
-                           value="${quietAfterMinutes}">
-                    <small class="form-hint">How long this Alertmanager may say nothing about an alert group before
-                        the alert group is shown as quiet. A route repeats between its repeat_interval and
-                        repeat_interval + group_interval, so take the upper bound and add your own margin; one receiver
-                        often serves several routes, and then the longest one is the number to use. Empty means nothing
-                        is claimed and no alert group is marked.</small>
+                    <label for="config-stale-after">Consider stale after (minutes) <span class="optional">(optional)</span> <span class="tooltip-icon" data-tooltip="Minutes of silence about an alert group that are normal here: the route's repeat_interval plus group_interval, or the longest of them if this receiver serves several. Empty: no alert group is marked."><i data-lucide="help-circle" style="width:14px;height:14px;color:var(--text-muted);"></i></span></label>
+                    <input type="number" id="config-stale-after" class="form-input" min="1" max="10080"
+                           placeholder="minutes" value="${staleAfterMinutes}">
                 </div>
             `;
         } else if (type === 'generic_webhook') {

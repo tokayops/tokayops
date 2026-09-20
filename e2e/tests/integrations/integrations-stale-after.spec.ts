@@ -11,8 +11,8 @@ import { test, expect } from '../../fixtures/auth.fixture';
  */
 test.describe('Integrations: how long silence is normal', () => {
   test('is saved in minutes, shown again, and cleared when emptied', async ({ integrationsPage, page }) => {
-    const name = `E2E Quiet ${Date.now()}`;
-    const secret = `quiet-secret-${Date.now()}`;
+    const name = `E2E Stale ${Date.now()}`;
+    const secret = `stale-secret-${Date.now()}`;
 
     await integrationsPage.goto();
     await integrationsPage.openCreateIntegrationModal();
@@ -20,7 +20,7 @@ test.describe('Integrations: how long silence is normal', () => {
     await page.waitForTimeout(100);
     await integrationsPage.integrationNameInput.fill(name);
     await integrationsPage.configSecret.fill(secret);
-    await page.locator('#config-quiet-after').fill('245');
+    await page.locator('#config-stale-after').fill('245');
     await integrationsPage.integrationFormSubmit.click();
 
     const card = page.locator('.integration-card', { hasText: name });
@@ -30,15 +30,15 @@ test.describe('Integrations: how long silence is normal', () => {
     // typed in, not the seconds it is stored as.
     await card.locator('.edit-integration-btn').click();
     await expect(integrationsPage.integrationModal).toHaveClass(/active/, { timeout: 10000 });
-    await expect(page.locator('#config-quiet-after')).toHaveValue('245');
+    await expect(page.locator('#config-stale-after')).toHaveValue('245');
 
     // Emptied, it goes: nothing is claimed about silence any more.
-    await page.locator('#config-quiet-after').fill('');
+    await page.locator('#config-stale-after').fill('');
     await integrationsPage.integrationFormSubmit.click();
     await expect(integrationsPage.integrationModal).not.toHaveClass(/active/, { timeout: 10000 });
 
     await card.locator('.edit-integration-btn').click();
     await expect(integrationsPage.integrationModal).toHaveClass(/active/, { timeout: 10000 });
-    await expect(page.locator('#config-quiet-after')).toHaveValue('');
+    await expect(page.locator('#config-stale-after')).toHaveValue('');
   });
 });
