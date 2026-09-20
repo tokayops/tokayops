@@ -1151,6 +1151,35 @@ func TestBackoffGrowsWithTheStreak(t *testing.T) {
 	}
 }
 
+// planNode is as much of EXPLAIN (FORMAT JSON) as the rule below reads.
+type planNode struct {
+	NodeType     string     `json:"Node Type"`
+	RelationName string     `json:"Relation Name"`
+	Alias        string     `json:"Alias"`
+	IndexName    string     `json:"Index Name"`
+	Plans        []planNode `json:"Plans"`
+}
+
+func (n planNode) walk(visit func(planNode)) {
+	visit(n)
+	for _, child := range n.Plans {
+		child.walk(visit)
+	}
+}
+
+func explainedPlan(explained string) (planNode, error) {
+	var plans []struct {
+		Plan planNode `json:"Plan"`
+	}
+	if err := json.Unmarshal([]byte(explained), &plans); err != nil {
+		return planNode{}, fmt.Errorf("read the plan: %w", err)
+	}
+	if len(plans) != 1 {
+		return planNode{}, fmt.Errorf("EXPLAIN returned %d plans, want one", len(plans))
+	}
+	return plans[0].Plan, nil
+}
+
 // TestTheClaimReadsTheQueueThroughTheIndex is the difference between a rule
 // that holds and a rule that holds until it matters.
 //
@@ -1159,6 +1188,11 @@ func TestBackoffGrowsWithTheStreak(t *testing.T) {
 // it - which is invisible on the empty queue every other test runs against, and
 // is exactly the queue an outage does not leave behind. The plan is asserted on
 // a backlog big enough for the planner to have a choice.
+//
+// The rule is about the queue table and nothing else: the plan joins small
+// tables whose whole content is a page, and reading one of those whole is the
+// planner being right. Asserting on the text of the plan made that a failure,
+// and the failure moved with whatever else the suite had left in those tables.
 func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
 	s := setupTestDB(t)
 	agID := outboundGroup(t, s)
@@ -1194,7 +1228,12 @@ func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
 		FROM generate_series(1, 5000) g`, batchID, testFamily, agID, seed); err != nil {
 		t.Fatalf("build the backlog: %v", err)
 	}
-	if _, err := s.db.Exec(`ANALYZE outbound_intents`); err != nil {
+	// Both tables the plan reads, so the plan is the one an operator would
+	// get. Without stats on the side table the planner assumes it is big and
+	// reaches for its index; with them it reads its single page whole, which
+	// is correct and was the shape that used to fail here. Leaving it to
+	// autovacuum made the plan depend on when autoanalyze last ran.
+	if _, err := s.db.Exec(`ANALYZE outbound_intents, outbound_group_snapshots`); err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
 
@@ -1207,21 +1246,38 @@ func TestTheClaimReadsTheQueueThroughTheIndex(t *testing.T) {
 				t.Fatalf("build the claim: %v", err)
 			}
 
-			var plan string
+			var explained string
 			if err := s.db.QueryRow("EXPLAIN (FORMAT JSON) "+statement,
 				testFamily, "slack", 4, outbound.NotificationLease.Seconds(),
-				"worker-1").Scan(&plan); err != nil {
+				"worker-1").Scan(&explained); err != nil {
 				t.Fatalf("explain the claim: %v", err)
 			}
+			plan, err := explainedPlan(explained)
+			if err != nil {
+				t.Fatalf("%v", err)
+			}
 
-			if strings.Contains(plan, `"Node Type": "Seq Scan"`) {
-				t.Errorf("the claim reads the whole table:\n%s", plan)
+			const claimIndex = "idx_outbound_intents_claim"
+			var sorted, walkedTheIndex bool
+			plan.walk(func(node planNode) {
+				if node.NodeType == "Sort" {
+					sorted = true
+				}
+				if node.RelationName != "outbound_intents" {
+					return
+				}
+				if node.NodeType == "Seq Scan" {
+					t.Errorf("the claim reads the whole queue as %q:\n%s", node.Alias, explained)
+				}
+				if node.IndexName == claimIndex {
+					walkedTheIndex = true
+				}
+			})
+			if sorted {
+				t.Errorf("the claim sorts the backlog to take four rows:\n%s", explained)
 			}
-			if strings.Contains(plan, `"Node Type": "Sort"`) {
-				t.Errorf("the claim sorts the backlog to take four rows:\n%s", plan)
-			}
-			if !strings.Contains(plan, `"Node Type": "Index Scan"`) {
-				t.Errorf("the claim does not walk an index at all:\n%s", plan)
+			if !walkedTheIndex {
+				t.Errorf("the claim does not walk %s at all:\n%s", claimIndex, explained)
 			}
 		})
 	}
