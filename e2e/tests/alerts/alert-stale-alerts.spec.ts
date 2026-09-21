@@ -11,23 +11,23 @@ import { test, expect } from '../../fixtures/auth.fixture';
  * person reaches it, by clicking it, which is the path that renders the
  * summary before the detail arrives.
  */
-const MOCK_ALERT_GROUP_ID = 'test-unreported';
+const MOCK_ALERT_GROUP_ID = 'test-stale';
 
 // Relative, so the badge has one right answer to give: three hours.
 const SILENT_SINCE = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
 
 const MOCK_SUMMARY = {
   id: MOCK_ALERT_GROUP_ID,
-  title: 'TestUnreported',
+  title: 'TestStale',
   status: 'triggered',
   severity: 'critical',
-  dedup_key: 'test-dedup-unreported',
+  dedup_key: 'test-dedup-stale',
   team_id: 'test-team',
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
   alerts_count: 4,
   firing_count: 1,
-  unreported_count: 1,
+  stale_count: 1,
   oncall_snapshot: null,
 };
 
@@ -43,9 +43,9 @@ const MOCK_ALERT_GROUP = {
     },
     {
       status: 'firing',
-      fingerprint: 'fp-unreported',
-      unreportedSince: SILENT_SINCE,
-      labels: { alertname: 'WentQuiet', instance: 'host-2' },
+      fingerprint: 'fp-stale',
+      staleSince: SILENT_SINCE,
+      labels: { alertname: 'WentStale', instance: 'host-2' },
       annotations: { description: 'Silenced in Alertmanager' },
     },
     {
@@ -110,7 +110,7 @@ test.describe('Alerts Alertmanager stopped reporting', () => {
 
     // The card counts by what the list answered: one of each state, and the
     // one that resolved is what is left over.
-    const card = page.locator('.alert-group-card', { hasText: 'TestUnreported' });
+    const card = page.locator('.alert-group-card', { hasText: 'TestStale' });
     await expect(card).toBeVisible();
     const counts = card.locator('.alerts-count-main');
     await expect(counts).toContainText('1 firing');
@@ -128,9 +128,9 @@ test.describe('Alerts Alertmanager stopped reporting', () => {
     // The alert nothing is heard about says how long, and is not called
     // Firing; since when is in the badge's own tooltip.
     const stale = page.locator('.alert-item', { hasText: 'host-2' });
-    await expect(stale).toHaveClass(/status-unreported/);
+    await expect(stale).toHaveClass(/status-stale/);
     const badge = stale.locator('.alert-status-tag');
-    await expect(badge).toHaveClass(/status-unreported/);
+    await expect(badge).toHaveClass(/status-stale/);
     await expect(badge).toHaveText('Stale 3h');
     await expect(badge).toHaveAttribute('title', /Absent from every Alertmanager notification/);
 

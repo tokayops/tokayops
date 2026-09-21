@@ -696,7 +696,7 @@ func TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp(t *testing.T)
 	if got := fingerprints(stored); len(got) != 1 || got["A"] != model.AlertStatusFiring {
 		t.Errorf("group holds %v, want only A firing", got)
 	}
-	if stored.Alerts[0].UnreportedSince == nil {
+	if stored.Alerts[0].StaleSince == nil {
 		t.Error("the snapshot without A left it as one Alertmanager still reports")
 	}
 }

@@ -29,15 +29,15 @@ func init() {
 			}
 			// Zero is how the field is cleared, and how it arrives from a
 			// build that never had it: nothing is claimed about silence.
-			if c.QuietAfterSeconds != 0 {
-				if c.QuietAfterSeconds < model.QuietAfterMin || c.QuietAfterSeconds > model.QuietAfterMax {
-					return fmt.Errorf("quiet_after_seconds must be between %d and %d, or 0 to leave it unset",
-						model.QuietAfterMin, model.QuietAfterMax)
+			if c.StaleAfterSeconds != 0 {
+				if c.StaleAfterSeconds < model.StaleAfterMin || c.StaleAfterSeconds > model.StaleAfterMax {
+					return fmt.Errorf("stale_after_seconds must be between %d and %d, or 0 to leave it unset",
+						model.StaleAfterMin, model.StaleAfterMax)
 				}
 				// Whole minutes: the form takes minutes, so a value that is
 				// not one would change every time somebody opened it.
-				if c.QuietAfterSeconds%60 != 0 {
-					return errors.New("quiet_after_seconds must be a whole number of minutes")
+				if c.StaleAfterSeconds%60 != 0 {
+					return errors.New("stale_after_seconds must be a whole number of minutes")
 				}
 			}
 			return nil

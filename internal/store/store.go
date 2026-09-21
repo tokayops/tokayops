@@ -458,15 +458,15 @@ func (s *Store) buildSchema() error {
 	// After how long silence about this group is unusual, as the integration
 	// that sent it declared. Nothing to fill in: it is declared, not inferred.
 	if _, err := s.db.Exec(
-		`ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS quiet_after_seconds INTEGER`); err != nil {
-		return fmt.Errorf("add quiet_after_seconds to alert_groups: %w", err)
+		`ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS stale_after_seconds INTEGER`); err != nil {
+		return fmt.Errorf("add stale_after_seconds to alert_groups: %w", err)
 	}
 
 	// Which integration last sent about this group. Named by id and without a
 	// key, like every other reference to an integration here: the integration
 	// can be deleted, and the group outlives it. It is what lets an operator's
 	// change to what silence is normal reach the groups that are already open,
-	// including the ones that have gone quiet and will never send again.
+	// including the ones that will never be sent about again.
 	if _, err := s.db.Exec(
 		`ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS intake_integration_id TEXT`); err != nil {
 		return fmt.Errorf("add intake_integration_id to alert_groups: %w", err)
@@ -927,7 +927,7 @@ func (s *Store) buildSchema() error {
 const alertGroupColumns = `id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step,
 	external_url, alerts_data, policy_snapshot, oncall_snapshot,
 	created_at, updated_at, resolved_at, acknowledged_by, resolved_by, render_source_version,
-	last_notified_at, quiet_after_seconds, intake_integration_id`
+	last_notified_at, stale_after_seconds, intake_integration_id`
 
 // alertGroupScanner is an interface for scanning rows (works with *sql.Row and *sql.Rows).
 type alertGroupScanner interface {
@@ -939,7 +939,7 @@ type alertGroupScanner interface {
 func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	var ag model.AlertGroup
 	var resolvedAt, lastNotifiedAt sql.NullTime
-	var quietAfterSeconds sql.NullInt64
+	var staleAfterSeconds sql.NullInt64
 	var intakeIntegrationID sql.NullString
 	var teamID, teamNameSnapshot, severity, policyID, externalURL sql.NullString
 	var alertsData, policySnapshot, oncallSnapshot, acknowledgedBy, resolvedBy sql.NullString
@@ -950,7 +950,7 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 		&externalURL, &alertsData,
 		&policySnapshot, &oncallSnapshot,
 		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt, &acknowledgedBy, &resolvedBy,
-		&ag.RenderSourceVersion, &lastNotifiedAt, &quietAfterSeconds, &intakeIntegrationID,
+		&ag.RenderSourceVersion, &lastNotifiedAt, &staleAfterSeconds, &intakeIntegrationID,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -974,9 +974,9 @@ func scanAlertGroupRow(scanner alertGroupScanner) (*model.AlertGroup, error) {
 	if lastNotifiedAt.Valid {
 		ag.LastNotifiedAt = &lastNotifiedAt.Time
 	}
-	if quietAfterSeconds.Valid {
-		seconds := int(quietAfterSeconds.Int64)
-		ag.QuietAfterSeconds = &seconds
+	if staleAfterSeconds.Valid {
+		seconds := int(staleAfterSeconds.Int64)
+		ag.StaleAfterSeconds = &seconds
 	}
 	ag.IntakeIntegrationID = intakeIntegrationID.String
 
@@ -1070,11 +1070,11 @@ func (s *Store) CreateAlertGroupAtomic(ag *model.AlertGroup, timelineEvents []*m
 	// the first thing Alertmanager said about it. A group opened by hand goes
 	// through CreateAlertGroup and has heard from nobody.
 	_, err = tx.Exec(
-		`INSERT INTO alert_groups (id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at, last_notified_at, quiet_after_seconds, intake_integration_id)
+		`INSERT INTO alert_groups (id, alert_key, status, title, team_id, team_name_snapshot, severity, policy_id, current_step, external_url, alerts_data, policy_snapshot, acknowledged_by, resolved_by, created_at, updated_at, last_notified_at, stale_after_seconds, intake_integration_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now(), $17, $18)`,
 		ag.ID, ag.AlertKey, ag.Status, ag.Title, ag.TeamID, ag.TeamNameSnapshot, ag.Severity, ag.PolicyID, ag.CurrentStep,
 		ag.ExternalURL, string(alertsJson), snapshotVal,
-		ag.AcknowledgedBy, ag.ResolvedBy, ag.CreatedAt, ag.UpdatedAt, ag.QuietAfterSeconds,
+		ag.AcknowledgedBy, ag.ResolvedBy, ag.CreatedAt, ag.UpdatedAt, ag.StaleAfterSeconds,
 		sql.NullString{String: ag.IntakeIntegrationID, Valid: ag.IntakeIntegrationID != ""},
 	)
 	if err != nil {
@@ -1508,7 +1508,7 @@ func (s *Store) GetAllAlertGroups(status *model.AlertGroupStatus, limit, offset 
 // and computing alert counts from alerts_data inline.
 //
 // The two counts are model.Alert.State in SQL: an alert is firing while
-// Alertmanager still reports it, unreported once it has stopped, and what is
+// Alertmanager still reports it, stale once it has stopped, and what is
 // left of the total is resolved. The definition lives in the model and is
 // written twice on purpose - once here, because counting in SQL is what keeps
 // the list off the alerts themselves - and a test holds the two to the same
@@ -1518,15 +1518,15 @@ const alertGroupSummaryColumns = `id, alert_key, status, title, team_id, severit
 	created_at, updated_at, resolved_at,
 	jsonb_array_length(COALESCE(alerts_data::jsonb, '[]'::jsonb)),
 	(SELECT count(*)::int FROM jsonb_array_elements(COALESCE(alerts_data::jsonb, '[]'::jsonb)) elem
-	  WHERE elem->>'status' = 'firing' AND elem->>'unreportedSince' IS NULL),
+	  WHERE elem->>'status' = 'firing' AND elem->>'staleSince' IS NULL),
 	(SELECT count(*)::int FROM jsonb_array_elements(COALESCE(alerts_data::jsonb, '[]'::jsonb)) elem
-	  WHERE elem->>'status' = 'firing' AND elem->>'unreportedSince' IS NOT NULL),
-	last_notified_at, quiet_after_seconds`
+	  WHERE elem->>'status' = 'firing' AND elem->>'staleSince' IS NOT NULL),
+	last_notified_at, stale_after_seconds`
 
 func scanAlertGroupSummaryRow(scanner alertGroupScanner) (*model.AlertGroupSummary, error) {
 	var ag model.AlertGroupSummary
 	var resolvedAt, lastNotifiedAt sql.NullTime
-	var quietAfterSeconds sql.NullInt64
+	var staleAfterSeconds sql.NullInt64
 	var teamID, severity, externalURL, oncallSnapshot, acknowledgedBy, resolvedBy sql.NullString
 
 	err := scanner.Scan(
@@ -1534,8 +1534,8 @@ func scanAlertGroupSummaryRow(scanner alertGroupScanner) (*model.AlertGroupSumma
 		&teamID, &severity, &ag.CurrentStep,
 		&oncallSnapshot, &externalURL, &acknowledgedBy, &resolvedBy,
 		&ag.CreatedAt, &ag.UpdatedAt, &resolvedAt,
-		&ag.AlertsCount, &ag.FiringCount, &ag.UnreportedCount,
-		&lastNotifiedAt, &quietAfterSeconds,
+		&ag.AlertsCount, &ag.FiringCount, &ag.StaleCount,
+		&lastNotifiedAt, &staleAfterSeconds,
 	)
 	if err != nil {
 		return nil, err
@@ -1553,9 +1553,9 @@ func scanAlertGroupSummaryRow(scanner alertGroupScanner) (*model.AlertGroupSumma
 	if lastNotifiedAt.Valid {
 		ag.LastNotifiedAt = &lastNotifiedAt.Time
 	}
-	if quietAfterSeconds.Valid {
-		seconds := int(quietAfterSeconds.Int64)
-		ag.QuietAfterSeconds = &seconds
+	if staleAfterSeconds.Valid {
+		seconds := int(staleAfterSeconds.Int64)
+		ag.StaleAfterSeconds = &seconds
 	}
 	if oncallSnapshot.Valid && oncallSnapshot.String != "" {
 		_ = json.Unmarshal([]byte(oncallSnapshot.String), &ag.OnCallSnapshot)

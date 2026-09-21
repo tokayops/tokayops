@@ -22,7 +22,7 @@ import (
 
 func intake(t *testing.T, s *Store, id, secret string, quietAfter int, enabled bool) {
 	t.Helper()
-	cfg, err := json.Marshal(model.WebhookConfig{Secret: secret, QuietAfterSeconds: quietAfter})
+	cfg, err := json.Marshal(model.WebhookConfig{Secret: secret, StaleAfterSeconds: quietAfter})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,8 +48,8 @@ func quietAfterOf(t *testing.T, s *Store, groupID string) *int {
 	t.Helper()
 	var seconds *int
 	if err := s.db.QueryRow(
-		`SELECT quiet_after_seconds FROM alert_groups WHERE id = $1`, groupID).Scan(&seconds); err != nil {
-		t.Fatalf("read quiet_after_seconds: %v", err)
+		`SELECT stale_after_seconds FROM alert_groups WHERE id = $1`, groupID).Scan(&seconds); err != nil {
+		t.Fatalf("read stale_after_seconds: %v", err)
 	}
 	return seconds
 }
@@ -71,7 +71,7 @@ func TestWhatAnIntegrationDeclaresRidesWithThePayload(t *testing.T) {
 		t.Helper()
 		if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key, alertgroup.Notification{
 			Alerts:            []model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)},
-			QuietAfterSeconds: quietAfter,
+			StaleAfterSeconds: quietAfter,
 		}, "system"); err != nil {
 			t.Fatalf("apply the payload: %v", err)
 		}
@@ -105,7 +105,7 @@ func TestAnIncidentOpenedByAPayloadKeepsWhatItDeclared(t *testing.T) {
 		Alerts:            []model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)},
 		CreatedAt:         time.Now(),
 		UpdatedAt:         time.Now(),
-		QuietAfterSeconds: &seconds,
+		StaleAfterSeconds: &seconds,
 	}
 	if err := s.CreateAlertGroupAtomic(group, nil, nil); err != nil {
 		t.Fatalf("open the incident: %v", err)
@@ -118,8 +118,8 @@ func TestAnIncidentOpenedByAPayloadKeepsWhatItDeclared(t *testing.T) {
 	if err != nil || read == nil {
 		t.Fatalf("read the incident: %v", err)
 	}
-	if read.QuietAfterSeconds == nil || *read.QuietAfterSeconds != seconds {
-		t.Errorf("the incident reads back %v, want %d", read.QuietAfterSeconds, seconds)
+	if read.StaleAfterSeconds == nil || *read.StaleAfterSeconds != seconds {
+		t.Errorf("the incident reads back %v, want %d", read.StaleAfterSeconds, seconds)
 	}
 }
 
@@ -174,7 +174,7 @@ func TestChangingTheIntegrationReachesTheGroupsItFeeds(t *testing.T) {
 	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key, alertgroup.Notification{
 		Alerts:            []model.Alert{notifiedAlert("fp-0", model.AlertStatusFiring)},
 		IntegrationID:     "am-feeding",
-		QuietAfterSeconds: 900,
+		StaleAfterSeconds: 900,
 	}, "system"); err != nil {
 		t.Fatalf("apply the payload: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestChangingTheIntegrationReachesTheGroupsItFeeds(t *testing.T) {
 	// From here on the group is silent: Alertmanager sends nothing about it.
 	edited := func(seconds int, enabled bool) {
 		t.Helper()
-		cfg, err := json.Marshal(model.WebhookConfig{Secret: "feeding-secret", QuietAfterSeconds: seconds})
+		cfg, err := json.Marshal(model.WebhookConfig{Secret: "feeding-secret", StaleAfterSeconds: seconds})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -236,7 +236,7 @@ func TestAClosedIncidentKeepsWhatWasDeclaredWhenItEnded(t *testing.T) {
 	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key, alertgroup.Notification{
 		Alerts:            []model.Alert{notifiedAlert("fp-0", model.AlertStatusResolved)},
 		IntegrationID:     "am-past",
-		QuietAfterSeconds: 900,
+		StaleAfterSeconds: 900,
 	}, "system"); err != nil {
 		t.Fatalf("resolve the incident: %v", err)
 	}

@@ -429,5 +429,5 @@ func (s *Store) VerifyIntake(ctx context.Context, integrationID, secret string) 
 	if cfg.Secret == "" || subtle.ConstantTimeCompare([]byte(cfg.Secret), []byte(secret)) != 1 {
 		return 0, false, nil
 	}
-	return cfg.QuietAfterSeconds, true, nil
+	return cfg.StaleAfterSeconds, true, nil
 }

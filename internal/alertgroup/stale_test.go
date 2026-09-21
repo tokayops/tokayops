@@ -28,10 +28,10 @@ func alertNamed(fingerprint string, status model.AlertStatus) model.Alert {
 	}
 }
 
-func unreportedAlert(fingerprint string, since time.Time) model.Alert {
+func staleAlert(fingerprint string, since time.Time) model.Alert {
 	a := alertNamed(fingerprint, model.AlertStatusFiring)
 	at := since
-	a.UnreportedSince = &at
+	a.StaleSince = &at
 	return a
 }
 
@@ -66,29 +66,29 @@ func TestWhatANotificationSaysAboutWhatIsStillReported(t *testing.T) {
 				Alerts: []model.Alert{alertNamed("B", firing)}, Snapshot: true,
 			},
 			wantStates: map[string]model.AlertState{
-				"A": model.AlertStateUnreported, "B": model.AlertStateFiring,
+				"A": model.AlertStateStale, "B": model.AlertStateFiring,
 			},
 			wantMarked: 1,
 		},
 		{
 			name: "the same snapshot again leaves the mark where it was",
-			held: []model.Alert{unreportedAlert("A", silentFrom), alertNamed("B", firing)},
+			held: []model.Alert{staleAlert("A", silentFrom), alertNamed("B", firing)},
 			notification: Notification{
 				Alerts: []model.Alert{alertNamed("B", firing)}, Snapshot: true,
 			},
 			wantStates: map[string]model.AlertState{
-				"A": model.AlertStateUnreported, "B": model.AlertStateFiring,
+				"A": model.AlertStateStale, "B": model.AlertStateFiring,
 			},
 			wantMarked: 0,
 		},
 		{
 			name: "the rest of the group clears and the marked alert holds the incident",
-			held: []model.Alert{unreportedAlert("A", silentFrom), alertNamed("B", firing)},
+			held: []model.Alert{staleAlert("A", silentFrom), alertNamed("B", firing)},
 			notification: Notification{
 				Alerts: []model.Alert{alertNamed("B", resolved)}, Snapshot: true,
 			},
 			wantStates: map[string]model.AlertState{
-				"A": model.AlertStateUnreported, "B": model.AlertStateResolved,
+				"A": model.AlertStateStale, "B": model.AlertStateResolved,
 			},
 			wantResolving: false,
 			wantHeldOnly:  true,
@@ -106,7 +106,7 @@ func TestWhatANotificationSaysAboutWhatIsStillReported(t *testing.T) {
 		},
 		{
 			name: "a marked alert reported again is reported again",
-			held: []model.Alert{unreportedAlert("A", silentFrom), alertNamed("B", firing)},
+			held: []model.Alert{staleAlert("A", silentFrom), alertNamed("B", firing)},
 			notification: Notification{
 				Alerts: []model.Alert{alertNamed("A", firing), alertNamed("B", firing)}, Snapshot: true,
 			},
@@ -117,7 +117,7 @@ func TestWhatANotificationSaysAboutWhatIsStillReported(t *testing.T) {
 		},
 		{
 			name: "a marked alert that comes back resolved ends the incident",
-			held: []model.Alert{unreportedAlert("A", silentFrom)},
+			held: []model.Alert{staleAlert("A", silentFrom)},
 			notification: Notification{
 				Alerts: []model.Alert{alertNamed("A", resolved)}, Snapshot: true,
 			},
@@ -131,17 +131,17 @@ func TestWhatANotificationSaysAboutWhatIsStillReported(t *testing.T) {
 			notification: Notification{
 				Alerts: []model.Alert{alertNamed("X", resolved)}, Snapshot: true,
 			},
-			wantStates:   map[string]model.AlertState{"A": model.AlertStateUnreported},
+			wantStates:   map[string]model.AlertState{"A": model.AlertStateStale},
 			wantMarked:   1,
 			wantHeldOnly: true,
 		},
 		{
-			name: "an incident already held only by unreported alerts is not a new one",
-			held: []model.Alert{unreportedAlert("A", silentFrom)},
+			name: "an incident already held only by stale alerts is not a new one",
+			held: []model.Alert{staleAlert("A", silentFrom)},
 			notification: Notification{
 				Alerts: []model.Alert{alertNamed("X", resolved)}, Snapshot: true,
 			},
-			wantStates:   map[string]model.AlertState{"A": model.AlertStateUnreported},
+			wantStates:   map[string]model.AlertState{"A": model.AlertStateStale},
 			wantHeldOnly: false,
 		},
 		{
@@ -159,8 +159,8 @@ func TestWhatANotificationSaysAboutWhatIsStillReported(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			marksBefore := map[string]time.Time{}
 			for _, a := range c.held {
-				if a.UnreportedSince != nil {
-					marksBefore[a.Fingerprint] = *a.UnreportedSince
+				if a.StaleSince != nil {
+					marksBefore[a.Fingerprint] = *a.StaleSince
 				}
 			}
 
@@ -177,9 +177,9 @@ func TestWhatANotificationSaysAboutWhatIsStillReported(t *testing.T) {
 			if applied.Marked != c.wantMarked {
 				t.Errorf("marked %d alerts, want %d", applied.Marked, c.wantMarked)
 			}
-			if applied.HeldOnlyByUnreported != c.wantHeldOnly {
-				t.Errorf("held only by unreported = %v, want %v",
-					applied.HeldOnlyByUnreported, c.wantHeldOnly)
+			if applied.HeldOnlyByStale != c.wantHeldOnly {
+				t.Errorf("held only by stale = %v, want %v",
+					applied.HeldOnlyByStale, c.wantHeldOnly)
 			}
 			if len(applied.Back) != len(c.wantBack) {
 				t.Fatalf("%d alerts came back, want %d: %v", len(applied.Back), len(c.wantBack), applied.Back)
@@ -195,11 +195,11 @@ func TestWhatANotificationSaysAboutWhatIsStillReported(t *testing.T) {
 			// already there stays where it was.
 			for _, a := range applied.Alerts {
 				before, had := marksBefore[a.Fingerprint]
-				if !had || a.UnreportedSince == nil {
+				if !had || a.StaleSince == nil {
 					continue
 				}
-				if !a.UnreportedSince.Equal(before) {
-					t.Errorf("the mark on %s moved from %v to %v", a.Fingerprint, before, a.UnreportedSince)
+				if !a.StaleSince.Equal(before) {
+					t.Errorf("the mark on %s moved from %v to %v", a.Fingerprint, before, a.StaleSince)
 				}
 			}
 
@@ -207,28 +207,28 @@ func TestWhatANotificationSaysAboutWhatIsStillReported(t *testing.T) {
 			// "Alertmanager stopped saying this is on fire", and there is no
 			// such thing for one that cleared.
 			for _, a := range applied.Alerts {
-				if a.UnreportedSince != nil && a.Status != firing {
-					t.Errorf("%s is %s and marked since %v", a.Fingerprint, a.Status, a.UnreportedSince)
+				if a.StaleSince != nil && a.Status != firing {
+					t.Errorf("%s is %s and marked since %v", a.Fingerprint, a.Status, a.StaleSince)
 				}
 			}
 		})
 	}
 }
 
-// TestMarkUnreportedLeavesWhatItWasGivenAlone. Apply hands it a slice the
+// TestMarkStaleLeavesWhatItWasGivenAlone. Apply hands it a slice the
 // merge has just built, so marking in place is invisible from there; this
 // holds the function itself to the contract, because the next caller may not
 // be handing it a copy.
-func TestMarkUnreportedLeavesWhatItWasGivenAlone(t *testing.T) {
+func TestMarkStaleLeavesWhatItWasGivenAlone(t *testing.T) {
 	held := []model.Alert{alertNamed("A", model.AlertStatusFiring)}
 
-	marked, n := MarkUnreported(held, map[string]bool{}, markedAt)
+	marked, n := MarkStale(held, map[string]bool{}, markedAt)
 
-	if n != 1 || marked[0].UnreportedSince == nil {
+	if n != 1 || marked[0].StaleSince == nil {
 		t.Fatalf("the alert nobody reported was not marked (%d)", n)
 	}
-	if held[0].UnreportedSince != nil {
-		t.Error("MarkUnreported marked the alerts it was given")
+	if held[0].StaleSince != nil {
+		t.Error("MarkStale marked the alerts it was given")
 	}
 }
 
@@ -241,10 +241,10 @@ func TestApplyLeavesWhatItWasGivenAlone(t *testing.T) {
 
 	applied := Apply(held, payload, markedAt)
 
-	if held[0].UnreportedSince != nil {
+	if held[0].StaleSince != nil {
 		t.Error("Apply marked the alerts it was given")
 	}
-	if stateOf(t, applied.Alerts, "A") != model.AlertStateUnreported {
+	if stateOf(t, applied.Alerts, "A") != model.AlertStateStale {
 		t.Error("the alert the snapshot left out was not marked in the result")
 	}
 }
@@ -253,7 +253,7 @@ func TestApplyLeavesWhatItWasGivenAlone(t *testing.T) {
 // database, and a step back there would otherwise be recorded as an alert that
 // was silent for minus ten minutes.
 func TestAClockThatStepsBackIsNotANegativeSilence(t *testing.T) {
-	held := []model.Alert{unreportedAlert("A", markedAt.Add(10*time.Minute))}
+	held := []model.Alert{staleAlert("A", markedAt.Add(10*time.Minute))}
 	payload := Notification{
 		Alerts: []model.Alert{alertNamed("A", model.AlertStatusFiring)}, Snapshot: true,
 	}

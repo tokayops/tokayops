@@ -341,15 +341,15 @@ func declareSilenceTx(ctx context.Context, tx *sql.Tx, integration *model.Integr
 	if err := json.Unmarshal(integration.Config, &cfg); err != nil {
 		return fmt.Errorf("read the configuration of %s: %w", integration.ID, err)
 	}
-	var quiet *int
-	if integration.Enabled && cfg.QuietAfterSeconds > 0 {
-		seconds := cfg.QuietAfterSeconds
-		quiet = &seconds
+	var staleAfter *int
+	if integration.Enabled && cfg.StaleAfterSeconds > 0 {
+		seconds := cfg.StaleAfterSeconds
+		staleAfter = &seconds
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE alert_groups SET quiet_after_seconds = $2
+		UPDATE alert_groups SET stale_after_seconds = $2
 		WHERE intake_integration_id = $1 AND status NOT IN ($3, $4)`,
-		integration.ID, quiet, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed,
+		integration.ID, staleAfter, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed,
 	); err != nil {
 		return fmt.Errorf("bring the alert groups of %s to what it declares: %w", integration.ID, err)
 	}
@@ -359,7 +359,7 @@ func declareSilenceTx(ctx context.Context, tx *sql.Tx, integration *model.Integr
 // clearSilenceTx is declareSilenceTx for an integration that no longer exists.
 func clearSilenceTx(ctx context.Context, tx *sql.Tx, integrationID string) (int64, error) {
 	result, err := tx.ExecContext(ctx, `
-		UPDATE alert_groups SET quiet_after_seconds = NULL
+		UPDATE alert_groups SET stale_after_seconds = NULL
 		WHERE intake_integration_id = $1 AND status NOT IN ($2, $3)`,
 		integrationID, model.AlertGroupStatusResolved, model.AlertGroupStatusClosed)
 	if err != nil {

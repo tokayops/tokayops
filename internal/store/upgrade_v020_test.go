@@ -20,7 +20,7 @@ import (
 func TestAStartUpgradesTheDatabaseOfV020(t *testing.T) {
 	s := throwawayDatabase(t, "schema-v0.2.0.sql")
 	if !relationExists(t, s, "outbound_intents") || hasColumn(t, s, "alert_groups", "last_notified_at") ||
-		hasColumn(t, s, "alert_groups", "quiet_after_seconds") {
+		hasColumn(t, s, "alert_groups", "stale_after_seconds") {
 		t.Fatal("the schema file is not v0.2.0's")
 	}
 
@@ -51,13 +51,13 @@ func TestAStartUpgradesTheDatabaseOfV020(t *testing.T) {
 	if !hasColumn(t, s, "alert_groups", "last_notified_at") {
 		t.Fatal("the start did not add last_notified_at")
 	}
-	if !hasColumn(t, s, "alert_groups", "quiet_after_seconds") {
-		t.Fatal("the start did not add quiet_after_seconds")
+	if !hasColumn(t, s, "alert_groups", "stale_after_seconds") {
+		t.Fatal("the start did not add stale_after_seconds")
 	}
 	// Declared, not inferred: the start fills in no allowance for silence.
 	for _, id := range []string{open, finished} {
 		if at := quietAfterOf(t, s, id); at != nil {
-			t.Errorf("the start filled in quiet_after_seconds of %s with %v", id, *at)
+			t.Errorf("the start filled in stale_after_seconds of %s with %v", id, *at)
 		}
 	}
 	for _, id := range []string{open, finished} {

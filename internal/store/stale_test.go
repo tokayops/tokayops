@@ -24,7 +24,7 @@ import (
 func twoAlertIncident(t *testing.T, s *Store) (id, key string) {
 	t.Helper()
 	id = uuid.New().String()
-	key = "unreported-" + id
+	key = "stale-" + id
 	if err := s.CreateAlertGroup(&model.AlertGroup{
 		ID: id, AlertKey: key, Status: model.AlertGroupStatusProcessing,
 		Title: "Disk filling up", Severity: "critical", TeamID: "team-1",
@@ -117,7 +117,7 @@ func TestASnapshotMarksTheAlertAlertmanagerLeftOut(t *testing.T) {
 	}
 
 	held := heldAlerts(t, s, id)
-	if state := held["fp-0"].State(); state != model.AlertStateUnreported {
+	if state := held["fp-0"].State(); state != model.AlertStateStale {
 		t.Errorf("the alert the snapshot left out is %s", state)
 	}
 	if state := held["fp-1"].State(); state != model.AlertStateFiring {
@@ -136,7 +136,7 @@ func TestTheMarkDoesNotMoveOnTheNextSnapshot(t *testing.T) {
 	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key, snapshot, "system"); err != nil {
 		t.Fatalf("apply the snapshot: %v", err)
 	}
-	first := heldAlerts(t, s, id)["fp-0"].UnreportedSince
+	first := heldAlerts(t, s, id)["fp-0"].StaleSince
 	if first == nil {
 		t.Fatal("the alert the snapshot left out was not marked")
 	}
@@ -148,16 +148,16 @@ func TestTheMarkDoesNotMoveOnTheNextSnapshot(t *testing.T) {
 	if result.Outcome != alertgroup.MergeUnchanged {
 		t.Errorf("the repeated snapshot came back %s, want unchanged", result.Outcome)
 	}
-	again := heldAlerts(t, s, id)["fp-0"].UnreportedSince
+	again := heldAlerts(t, s, id)["fp-0"].StaleSince
 	if again == nil || !again.Equal(*first) {
 		t.Errorf("the mark moved from %v to %v", first, again)
 	}
 }
 
-// TestAnUnreportedAlertHoldsTheIncidentOpen. This is the whole line between an
+// TestAStaleAlertHoldsTheIncidentOpen. This is the whole line between an
 // observation and a resolution: the rest of the group clearing does not end an
 // incident whose remaining alert was silenced rather than fixed.
-func TestAnUnreportedAlertHoldsTheIncidentOpen(t *testing.T) {
+func TestAStaleAlertHoldsTheIncidentOpen(t *testing.T) {
 	s := setupTestDB(t)
 	s.SetRenderEnvironment("https://tokay.example", "UTC")
 	id, key := twoAlertIncident(t, s)
@@ -182,7 +182,7 @@ func TestAnUnreportedAlertHoldsTheIncidentOpen(t *testing.T) {
 	if group.Status == model.AlertGroupStatusResolved {
 		t.Errorf("the incident is %s", group.Status)
 	}
-	if state := group.Alerts[0].State(); state != model.AlertStateUnreported {
+	if state := group.Alerts[0].State(); state != model.AlertStateStale {
 		t.Errorf("the alert nobody reports is %s", state)
 	}
 }
@@ -210,9 +210,9 @@ func TestAnAlertReportedAgainLosesItsMark(t *testing.T) {
 	if result.Outcome != alertgroup.MergeUnchanged && result.Outcome != alertgroup.MergeMerged {
 		t.Fatalf("the snapshot came back %s", result.Outcome)
 	}
-	if held := heldAlerts(t, s, id); held["fp-0"].UnreportedSince != nil {
+	if held := heldAlerts(t, s, id); held["fp-0"].StaleSince != nil {
 		t.Errorf("the alert Alertmanager reports again is still marked since %v",
-			held["fp-0"].UnreportedSince)
+			held["fp-0"].StaleSince)
 	}
 }
 
@@ -243,7 +243,7 @@ func TestTheListCountsTheThreeStates(t *testing.T) {
 		notifiedAlert("fp-0", model.AlertStatusFiring),
 		notifiedAlert("fp-1", model.AlertStatusResolved),
 	)
-	snapshot.QuietAfterSeconds = 900
+	snapshot.StaleAfterSeconds = 900
 	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key, snapshot, "system"); err != nil {
 		t.Fatalf("apply the snapshot: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestTheListCountsTheThreeStates(t *testing.T) {
 	for _, a := range group.Alerts {
 		inGo[a.State()]++
 	}
-	if inGo[model.AlertStateFiring] != 1 || inGo[model.AlertStateUnreported] != 1 ||
+	if inGo[model.AlertStateFiring] != 1 || inGo[model.AlertStateStale] != 1 ||
 		inGo[model.AlertStateResolved] != 1 {
 		t.Fatalf("the incident holds %v, want one of each", inGo)
 	}
@@ -276,11 +276,11 @@ func TestTheListCountsTheThreeStates(t *testing.T) {
 	}
 	if summary.AlertsCount != 3 ||
 		summary.FiringCount != inGo[model.AlertStateFiring] ||
-		summary.UnreportedCount != inGo[model.AlertStateUnreported] {
-		t.Errorf("the list counts %d alerts, %d firing and %d unreported; the alerts say %v",
-			summary.AlertsCount, summary.FiringCount, summary.UnreportedCount, inGo)
+		summary.StaleCount != inGo[model.AlertStateStale] {
+		t.Errorf("the list counts %d alerts, %d firing and %d stale; the alerts say %v",
+			summary.AlertsCount, summary.FiringCount, summary.StaleCount, inGo)
 	}
-	if resolved := summary.AlertsCount - summary.FiringCount - summary.UnreportedCount; resolved != 1 {
+	if resolved := summary.AlertsCount - summary.FiringCount - summary.StaleCount; resolved != 1 {
 		t.Errorf("what is left over is %d alerts, want the one that resolved", resolved)
 	}
 	// The card is drawn from this row alone, so it also carries what says
@@ -288,13 +288,13 @@ func TestTheListCountsTheThreeStates(t *testing.T) {
 	if summary.LastNotifiedAt == nil {
 		t.Error("the list does not say when Alertmanager last sent")
 	}
-	if summary.QuietAfterSeconds == nil || *summary.QuietAfterSeconds != 900 {
-		t.Errorf("the list says quiet after %v, want the declared 900", summary.QuietAfterSeconds)
+	if summary.StaleAfterSeconds == nil || *summary.StaleAfterSeconds != 900 {
+		t.Errorf("the list says quiet after %v, want the declared 900", summary.StaleAfterSeconds)
 	}
 }
 
 // TestWhatIsMeasuredAboutSilence. The three counters are what a decision about
-// resolving an incident without its unreported alerts would be made from, so
+// resolving an incident without its stale alerts would be made from, so
 // each of them has to mean what it says: a mark, a return with the status it
 // came back as, and the moment an incident came to be held by nothing else.
 func TestWhatIsMeasuredAboutSilence(t *testing.T) {
@@ -305,19 +305,19 @@ func TestWhatIsMeasuredAboutSilence(t *testing.T) {
 		return key
 	}()
 
-	marked := counterValue(t, "alerts_unreported_total", nil)
-	held := counterValue(t, "alert_groups_held_by_unreported_total", nil)
-	back := histogramCount(t, "alert_unreported_duration_seconds", "firing")
+	marked := counterValue(t, "alerts_stale_total", nil)
+	held := counterValue(t, "alert_groups_held_by_stale_total", nil)
+	back := histogramCount(t, "alert_stale_duration_seconds", "firing")
 
 	// fp-0 stops being reported.
 	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), key,
 		amSnapshot(notifiedAlert("fp-1", model.AlertStatusFiring)), "system"); err != nil {
 		t.Fatal(err)
 	}
-	if got := counterValue(t, "alerts_unreported_total", nil) - marked; got != 1 {
+	if got := counterValue(t, "alerts_stale_total", nil) - marked; got != 1 {
 		t.Errorf("one alert stopped being reported, counted %v", got)
 	}
-	if got := counterValue(t, "alert_groups_held_by_unreported_total", nil) - held; got != 0 {
+	if got := counterValue(t, "alert_groups_held_by_stale_total", nil) - held; got != 0 {
 		t.Errorf("the incident still has a firing alert, counted %v as held by silence", got)
 	}
 
@@ -326,7 +326,7 @@ func TestWhatIsMeasuredAboutSilence(t *testing.T) {
 		amSnapshot(notifiedAlert("fp-1", model.AlertStatusResolved)), "system"); err != nil {
 		t.Fatal(err)
 	}
-	if got := counterValue(t, "alert_groups_held_by_unreported_total", nil) - held; got != 1 {
+	if got := counterValue(t, "alert_groups_held_by_stale_total", nil) - held; got != 1 {
 		t.Errorf("the incident came to be held by silence, counted %v", got)
 	}
 
@@ -337,10 +337,10 @@ func TestWhatIsMeasuredAboutSilence(t *testing.T) {
 	), "system"); err != nil {
 		t.Fatal(err)
 	}
-	if got := histogramCount(t, "alert_unreported_duration_seconds", "firing") - back; got != 1 {
+	if got := histogramCount(t, "alert_stale_duration_seconds", "firing") - back; got != 1 {
 		t.Errorf("one alert came back firing, measured %v", got)
 	}
-	if got := counterValue(t, "alert_groups_held_by_unreported_total", nil) - held; got != 1 {
+	if got := counterValue(t, "alert_groups_held_by_stale_total", nil) - held; got != 1 {
 		t.Errorf("the incident left the state and was counted %v times into it", got)
 	}
 }

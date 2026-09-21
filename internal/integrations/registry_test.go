@@ -141,7 +141,7 @@ func TestWhatAnAlertmanagerIntegrationMayDeclareAboutSilence(t *testing.T) {
 		{"negative", -1, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			cfg, err := json.Marshal(model.WebhookConfig{Secret: "s", QuietAfterSeconds: c.seconds})
+			cfg, err := json.Marshal(model.WebhookConfig{Secret: "s", StaleAfterSeconds: c.seconds})
 			if err != nil {
 				t.Fatal(err)
 			}
