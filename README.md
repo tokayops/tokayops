@@ -365,9 +365,9 @@ receivers:
   it.
 - No custom `payload`. It replaces the message TokayOps reads.
 
-The integration has one optional setting of its own, **Consider quiet after**:
+The integration has one optional setting of its own, **Consider stale after**:
 how long this Alertmanager may say nothing about an alert group before the
-group is shown as quiet. A route repeats between its `repeat_interval` and
+group is marked stale. A route repeats between its `repeat_interval` and
 `repeat_interval + group_interval`, so take the upper bound and add your own
 margin; one receiver often serves several routes, and then the longest one is
 the number to use. Left empty, nothing is claimed and no alert group is

@@ -13,7 +13,8 @@ import { test, expect } from '../../fixtures/auth.fixture';
  */
 const MOCK_ALERT_GROUP_ID = 'test-unreported';
 
-const SILENT_SINCE = '2026-09-18T09:00:00Z';
+// Relative, so the badge has one right answer to give: three hours.
+const SILENT_SINCE = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
 
 const MOCK_SUMMARY = {
   id: MOCK_ALERT_GROUP_ID,
@@ -113,7 +114,7 @@ test.describe('Alerts Alertmanager stopped reporting', () => {
     await expect(card).toBeVisible();
     const counts = card.locator('.alerts-count-main');
     await expect(counts).toContainText('1 firing');
-    await expect(counts).toContainText('1 not reported');
+    await expect(counts).toContainText('1 stale');
     await expect(counts).toContainText('2 resolved');
 
     await card.click();
@@ -121,15 +122,17 @@ test.describe('Alerts Alertmanager stopped reporting', () => {
 
     const summary = page.locator('.detail-section-title', { hasText: 'Alerts:' }).first();
     await expect(summary).toContainText('1 firing');
-    await expect(summary).toContainText('1 not reported');
+    await expect(summary).toContainText('1 stale');
     await expect(summary).toContainText('2 resolved');
 
-    // The alert that went quiet says since when, and is not called Firing.
-    const quiet = page.locator('.alert-item', { hasText: 'host-2' });
-    await expect(quiet).toHaveClass(/status-unreported/);
-    const badge = quiet.locator('.alert-status-tag');
+    // The alert nothing is heard about says how long, and is not called
+    // Firing; since when is in the badge's own tooltip.
+    const stale = page.locator('.alert-item', { hasText: 'host-2' });
+    await expect(stale).toHaveClass(/status-unreported/);
+    const badge = stale.locator('.alert-status-tag');
     await expect(badge).toHaveClass(/status-unreported/);
-    await expect(badge).toContainText('Not reported since');
+    await expect(badge).toHaveText('Stale 3h');
+    await expect(badge).toHaveAttribute('title', /Absent from every Alertmanager notification/);
 
     // The other two keep the two states they had.
     await expect(page.locator('.alert-item', { hasText: 'host-1' }).locator('.alert-status-tag'))
