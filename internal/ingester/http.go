@@ -74,12 +74,12 @@ func (p AMPayload) alerts() []model.Alert {
 // max_alerts. Without a group key the alert key is one alert's fingerprint and
 // the payload was never about a group; with alerts cut off, what is missing is
 // missing for a reason nobody can read.
-func (p AMPayload) notification(integrationID string, quietAfterSeconds int) alertgroup.Notification {
+func (p AMPayload) notification(integrationID string, staleAfterSeconds int) alertgroup.Notification {
 	return alertgroup.Notification{
 		Alerts:            p.alerts(),
 		Snapshot:          p.GroupKey != "" && p.TruncatedAlerts == 0 && len(p.Alerts) > 0,
 		IntegrationID:     integrationID,
-		QuietAfterSeconds: quietAfterSeconds,
+		StaleAfterSeconds: staleAfterSeconds,
 	}
 }
 
@@ -145,7 +145,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		log.Printf("Ingester: Unauthorized webhook request")
 		return c.String(http.StatusUnauthorized, "Unauthorized")
 	}
-	quietAfterSeconds, allowed, err := i.store.VerifyIntake(c.Request().Context(), integrationID, token)
+	staleAfterSeconds, allowed, err := i.store.VerifyIntake(c.Request().Context(), integrationID, token)
 	if err != nil {
 		// The database is the same database the payload would be stored in, so
 		// there is nothing to be gained by turning Alertmanager away: it is
@@ -212,7 +212,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 	// means - a merge, the end of the incident, or nothing at all - is decided
 	// under the lock on the row, not here.
 	result, err := i.store.ApplyAlertmanagerUpdateAtomic(
-		c.Request().Context(), alertKey, payload.notification(integrationID, quietAfterSeconds), "system")
+		c.Request().Context(), alertKey, payload.notification(integrationID, staleAfterSeconds), "system")
 	if err != nil {
 		log.Printf("Ingester: Failed to apply the payload for %s: %v", alertKey, err)
 		return c.String(http.StatusInternalServerError, "Failed to persist")
@@ -262,9 +262,9 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 		UpdatedAt:   time.Now(),
 	}
 	ag.IntakeIntegrationID = integrationID
-	if quietAfterSeconds > 0 {
-		seconds := quietAfterSeconds
-		ag.QuietAfterSeconds = &seconds
+	if staleAfterSeconds > 0 {
+		seconds := staleAfterSeconds
+		ag.StaleAfterSeconds = &seconds
 	}
 
 	// Build timeline events for atomic insert - µs offsets ensure deterministic ordering
@@ -337,7 +337,7 @@ func (i *Ingester) handleWebhook(c echo.Context) error {
 			// and the payload now belongs to their incident.
 			log.Printf("Ingester: Duplicate key for %s, applying to the incident that won", alertKey)
 			retry, retryErr := i.store.ApplyAlertmanagerUpdateAtomic(
-				c.Request().Context(), alertKey, payload.notification(integrationID, quietAfterSeconds), "system")
+				c.Request().Context(), alertKey, payload.notification(integrationID, staleAfterSeconds), "system")
 			if retryErr != nil {
 				log.Printf("Ingester: Retry failed for %s: %v", alertKey, retryErr)
 				return c.String(http.StatusInternalServerError, "Failed to persist")

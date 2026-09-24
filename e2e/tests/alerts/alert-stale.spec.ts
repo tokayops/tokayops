@@ -19,7 +19,7 @@ const base = {
   updated_at: new Date(Date.now() - 6 * HOUR).toISOString(),
   alerts_count: 1,
   firing_count: 1,
-  unreported_count: 0,
+  stale_count: 0,
   oncall_snapshot: null,
 };
 
@@ -31,7 +31,7 @@ const GROUPS = [
     dedup_key: 'stale-overdue',
     // Silent for five hours where four is what the integration allows.
     last_notified_at: new Date(Date.now() - 5 * HOUR).toISOString(),
-    quiet_after_seconds: 4 * 3600,
+    stale_after_seconds: 4 * 3600,
   },
   {
     ...base,
@@ -39,7 +39,7 @@ const GROUPS = [
     title: 'StaleWithin',
     dedup_key: 'stale-within',
     last_notified_at: new Date(Date.now() - 1 * HOUR).toISOString(),
-    quiet_after_seconds: 4 * 3600,
+    stale_after_seconds: 4 * 3600,
   },
   {
     ...base,
@@ -57,7 +57,7 @@ const GROUPS = [
     status: 'resolved',
     resolved_at: new Date(Date.now() - 3 * HOUR).toISOString(),
     last_notified_at: new Date(Date.now() - 24 * HOUR).toISOString(),
-    quiet_after_seconds: 4 * 3600,
+    stale_after_seconds: 4 * 3600,
   },
 ];
 

@@ -1145,7 +1145,7 @@ func TestTheSummaryListCountsTheThreeStates(t *testing.T) {
 	silentSince := time.Now().Add(-time.Hour)
 	alert := func(fingerprint string, status model.AlertStatus, since *time.Time) model.Alert {
 		return model.Alert{
-			Fingerprint: fingerprint, Status: status, UnreportedSince: since,
+			Fingerprint: fingerprint, Status: status, StaleSince: since,
 			Labels: map[string]string{"alertname": fingerprint},
 		}
 	}
@@ -1154,7 +1154,7 @@ func TestTheSummaryListCountsTheThreeStates(t *testing.T) {
 	if err := s.CreateAlertGroup(&model.AlertGroup{
 		ID: "ag-counted", AlertKey: "dedup-counted", Status: model.AlertGroupStatusProcessing,
 		Title: "Test Alert Group", TeamID: "devops", TeamNameSnapshot: "DevOps",
-		Severity: "critical", LastNotifiedAt: &notifiedAt, QuietAfterSeconds: &quietAfter,
+		Severity: "critical", LastNotifiedAt: &notifiedAt, StaleAfterSeconds: &quietAfter,
 		Alerts: []model.Alert{
 			alert("fp-0", model.AlertStatusFiring, nil),
 			alert("fp-1", model.AlertStatusFiring, &silentSince),
@@ -1177,9 +1177,9 @@ func TestTheSummaryListCountsTheThreeStates(t *testing.T) {
 			ID                string     `json:"id"`
 			AlertsCount       int        `json:"alerts_count"`
 			FiringCount       int        `json:"firing_count"`
-			UnreportedCount   int        `json:"unreported_count"`
+			StaleCount        int        `json:"stale_count"`
 			LastNotifiedAt    *time.Time `json:"last_notified_at"`
-			QuietAfterSeconds *int       `json:"quiet_after_seconds"`
+			StaleAfterSeconds *int       `json:"stale_after_seconds"`
 		} `json:"alert_groups"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
@@ -1191,19 +1191,19 @@ func TestTheSummaryListCountsTheThreeStates(t *testing.T) {
 			continue
 		}
 		found = true
-		if summary.AlertsCount != 3 || summary.FiringCount != 1 || summary.UnreportedCount != 1 {
-			t.Errorf("the list says %d alerts, %d firing, %d unreported; want 3, 1 and 1",
-				summary.AlertsCount, summary.FiringCount, summary.UnreportedCount)
+		if summary.AlertsCount != 3 || summary.FiringCount != 1 || summary.StaleCount != 1 {
+			t.Errorf("the list says %d alerts, %d firing, %d stale; want 3, 1 and 1",
+				summary.AlertsCount, summary.FiringCount, summary.StaleCount)
 		}
-		if resolved := summary.AlertsCount - summary.FiringCount - summary.UnreportedCount; resolved != 1 {
+		if resolved := summary.AlertsCount - summary.FiringCount - summary.StaleCount; resolved != 1 {
 			t.Errorf("what is left over is %d, want the one alert that resolved", resolved)
 		}
 		// The card is drawn from the list alone, so what it needs to say an
 		// alert group has gone quiet has to be in the list too.
-		if summary.LastNotifiedAt == nil || summary.QuietAfterSeconds == nil ||
-			*summary.QuietAfterSeconds != 14700 {
+		if summary.LastNotifiedAt == nil || summary.StaleAfterSeconds == nil ||
+			*summary.StaleAfterSeconds != 14700 {
 			t.Errorf("the list says notified %v and quiet after %v; the card cannot tell",
-				summary.LastNotifiedAt, summary.QuietAfterSeconds)
+				summary.LastNotifiedAt, summary.StaleAfterSeconds)
 		}
 	}
 	if !found {

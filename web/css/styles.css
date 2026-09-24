@@ -1128,7 +1128,7 @@ body::before {
     padding: 0;
 }
 
-.alert-status-tag.status-unreported {
+.alert-status-tag.status-stale {
     border-color: var(--text-muted);
     color: var(--text-muted);
 }
@@ -1827,7 +1827,7 @@ body::before {
     border-left-color: var(--status-resolved);
 }
 
-.alert-item.status-unreported {
+.alert-item.status-stale {
     border-left-color: var(--text-muted);
 }
 

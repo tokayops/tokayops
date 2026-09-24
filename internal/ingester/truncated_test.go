@@ -75,13 +75,13 @@ func TestANotificationCutShortIsCounted(t *testing.T) {
 	}
 }
 
-// TestAPayloadCannotSayAnAlertWasUnreported. The mark is this system's own
+// TestAPayloadCannotSayAnAlertIsStale. The mark is this system's own
 // observation - when Alertmanager stopped reporting an alert - and whoever
 // holds the webhook secret must not be able to set it. The ingester reads a
 // payload into its own type, so the field has nowhere to land; this holds that
 // boundary, on the path that opens an incident and on the one that merges into
 // it.
-func TestAPayloadCannotSayAnAlertWasUnreported(t *testing.T) {
+func TestAPayloadCannotSayAnAlertIsStale(t *testing.T) {
 	s := store.NewMockStore()
 	seedDefaultTeams(s)
 	ing := NewIngester(s, &config.Config{}, &mockSecretValidator{secrets: map[string]bool{"secret123": true}})
@@ -90,7 +90,7 @@ func TestAPayloadCannotSayAnAlertWasUnreported(t *testing.T) {
 
 	send := func(alerts string) {
 		t.Helper()
-		payload := `{"status":"firing","groupKey":"claimed-unreported",` +
+		payload := `{"status":"firing","groupKey":"claimed-stale",` +
 			`"commonLabels":{"team":"devops","severity":"critical","alertname":"A"},` +
 			`"alerts":[` + alerts + `]}`
 		req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret123", strings.NewReader(payload))
@@ -103,13 +103,13 @@ func TestAPayloadCannotSayAnAlertWasUnreported(t *testing.T) {
 	}
 	claimed := func(fingerprint string) string {
 		return `{"status":"firing","labels":{"alertname":"A","team":"devops"},` +
-			`"fingerprint":"` + fingerprint + `","unreportedSince":"2020-01-01T00:00:00Z"}`
+			`"fingerprint":"` + fingerprint + `","staleSince":"2020-01-01T00:00:00Z"}`
 	}
 
 	send(claimed("fp-1"))
 	send(claimed("fp-1") + `,` + claimed("fp-2"))
 
-	ag, err := s.GetActiveAlertGroupByAlertKey("claimed-unreported")
+	ag, err := s.GetActiveAlertGroupByAlertKey("claimed-stale")
 	if err != nil || ag == nil {
 		t.Fatalf("the incident was not opened: %v", err)
 	}
@@ -117,9 +117,9 @@ func TestAPayloadCannotSayAnAlertWasUnreported(t *testing.T) {
 		t.Fatalf("the incident holds %d alerts, want the two the payloads carried", len(ag.Alerts))
 	}
 	for _, a := range ag.Alerts {
-		if a.UnreportedSince != nil {
-			t.Errorf("%s was recorded as unreported since %v, on a payload's say-so",
-				a.Fingerprint, a.UnreportedSince)
+		if a.StaleSince != nil {
+			t.Errorf("%s was recorded as stale since %v, on a payload's say-so",
+				a.Fingerprint, a.StaleSince)
 		}
 	}
 }

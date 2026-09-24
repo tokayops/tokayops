@@ -36,16 +36,16 @@ type Notification struct {
 
 	// IntegrationID names the integration this payload came through, so that a
 	// change to what that integration declares can reach the groups it feeds -
-	// including a group that has gone quiet and will never send again.
+	// including a group that will never be sent about again.
 	IntegrationID string
 
-	// QuietAfterSeconds is what the integration this payload came through says
+	// StaleAfterSeconds is what the integration this payload came through says
 	// about silence: how long a group may say nothing before the view calls it
-	// quiet. It is about the sender rather than about the alerts, and it rides
+	// stale. It is about the sender rather than about the alerts, and it rides
 	// with the payload because that is when it is read - fresh, per payload,
 	// so an operator's change reaches every instance at once. Zero is nothing
 	// declared.
-	QuietAfterSeconds int
+	StaleAfterSeconds int
 }
 
 // MergeOutcome is what an Alertmanager payload did to the incident it named.
@@ -166,7 +166,7 @@ func SameAlerts(a, b []model.Alert) bool {
 func sameAlert(x, y model.Alert) bool {
 	return x.Fingerprint == y.Fingerprint &&
 		x.Status == y.Status &&
-		sameInstant(x.UnreportedSince, y.UnreportedSince) &&
+		sameInstant(x.StaleSince, y.StaleSince) &&
 		x.GeneratorURL == y.GeneratorURL &&
 		x.StartsAt.Equal(y.StartsAt) &&
 		x.EndsAt.Equal(y.EndsAt) &&
@@ -211,11 +211,11 @@ type Applied struct {
 	Resolving bool
 
 	// Marked is how many alerts this payload marked as no longer reported,
-	// Back the ones it brought back, and HeldOnlyByUnreported says the
+	// Back the ones it brought back, and HeldOnlyByStale says the
 	// incident has just come to be open only because of alerts nobody reports.
-	Marked               int
-	Back                 []Reported
-	HeldOnlyByUnreported bool
+	Marked          int
+	Back            []Reported
+	HeldOnlyByStale bool
 }
 
 // Apply works out what a notification means for an incident: what it holds
@@ -231,20 +231,20 @@ func Apply(held []model.Alert, notification Notification, at time.Time) Applied 
 	// alerts the incident held a moment ago are the only place a silence that
 	// has just ended is still written down.
 	back := ReportedAgain(held, notification.Alerts, at)
-	heldBefore := HeldOnlyByUnreported(held)
+	heldBefore := HeldOnlyByStale(held)
 
 	marked := 0
 	if notification.Snapshot {
-		alerts, marked = MarkUnreported(alerts, ReportedIn(notification.Alerts), at)
+		alerts, marked = MarkStale(alerts, ReportedIn(notification.Alerts), at)
 	}
 
 	return Applied{
-		Alerts:               alerts,
-		Relevant:             relevant,
-		Resolving:            AllResolved(alerts),
-		Marked:               marked,
-		Back:                 back,
-		HeldOnlyByUnreported: !heldBefore && HeldOnlyByUnreported(alerts),
+		Alerts:          alerts,
+		Relevant:        relevant,
+		Resolving:       AllResolved(alerts),
+		Marked:          marked,
+		Back:            back,
+		HeldOnlyByStale: !heldBefore && HeldOnlyByStale(alerts),
 	}
 }
 
@@ -261,7 +261,7 @@ func ReportedIn(payload []model.Alert) map[string]bool {
 	return reported
 }
 
-// MarkUnreported is the incident's alerts with the ones Alertmanager has
+// MarkStale is the incident's alerts with the ones Alertmanager has
 // stopped reporting marked, and how many marks it added.
 //
 // Only a FIRING alert can be marked. A resolved one is missing from every
@@ -271,7 +271,7 @@ func ReportedIn(payload []model.Alert) map[string]bool {
 // second silence.
 //
 // The result is a new slice; the argument is not touched.
-func MarkUnreported(alerts []model.Alert, reported map[string]bool, at time.Time) ([]model.Alert, int) {
+func MarkStale(alerts []model.Alert, reported map[string]bool, at time.Time) ([]model.Alert, int) {
 	out := make([]model.Alert, len(alerts))
 	copy(out, alerts)
 
@@ -280,11 +280,11 @@ func MarkUnreported(alerts []model.Alert, reported map[string]bool, at time.Time
 		if out[i].Status != model.AlertStatusFiring || reported[out[i].Fingerprint] {
 			continue
 		}
-		if out[i].UnreportedSince != nil {
+		if out[i].StaleSince != nil {
 			continue
 		}
 		since := at
-		out[i].UnreportedSince = &since
+		out[i].StaleSince = &since
 		marked++
 	}
 	return out, marked
@@ -307,8 +307,8 @@ type Reported struct {
 func ReportedAgain(held, payload []model.Alert, at time.Time) []Reported {
 	silent := make(map[string]time.Time, len(held))
 	for _, a := range held {
-		if a.UnreportedSince != nil {
-			silent[a.Fingerprint] = *a.UnreportedSince
+		if a.StaleSince != nil {
+			silent[a.Fingerprint] = *a.StaleSince
 		}
 	}
 
@@ -327,24 +327,24 @@ func ReportedAgain(held, payload []model.Alert, at time.Time) []Reported {
 	return back
 }
 
-// HeldOnlyByUnreported says the incident has nothing firing that Alertmanager
+// HeldOnlyByStale says the incident has nothing firing that Alertmanager
 // still reports, and is open only because of alerts it has stopped reporting.
 //
 // This is the state a resolution that went by the alert set alone would have
 // ended, which is what counting it is for. It is an upper bound on that and
 // not a count of resolutions a policy would actually make: a policy would ask
 // more of the payload than its alerts.
-func HeldOnlyByUnreported(alerts []model.Alert) bool {
-	unreported := false
+func HeldOnlyByStale(alerts []model.Alert) bool {
+	stale := false
 	for _, a := range alerts {
 		switch a.State() {
 		case model.AlertStateFiring:
 			return false
-		case model.AlertStateUnreported:
-			unreported = true
+		case model.AlertStateStale:
+			stale = true
 		}
 	}
-	return unreported
+	return stale
 }
 
 // AllResolved says the incident is over: nothing it holds is firing.

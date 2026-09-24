@@ -72,7 +72,7 @@ func TestAnIntakeThatCannotBeCheckedAsksAlertmanagerToComeBack(t *testing.T) {
 // it and on the ones after.
 func TestWhatTheIntegrationDeclaresReachesTheIncident(t *testing.T) {
 	s, e := intakeIngester(t)
-	s.SetIntakeQuietAfter(14700)
+	s.SetIntakeStaleAfter(14700)
 
 	if rec := postOneFiring(t, e, "declared"); rec.Code != http.StatusOK {
 		t.Fatalf("the webhook answered %d: %s", rec.Code, rec.Body.String())
@@ -81,12 +81,12 @@ func TestWhatTheIntegrationDeclaresReachesTheIncident(t *testing.T) {
 	if err != nil || ag == nil {
 		t.Fatalf("the incident was not opened: %v", err)
 	}
-	if ag.QuietAfterSeconds == nil || *ag.QuietAfterSeconds != 14700 {
-		t.Fatalf("the incident says %v, want 14700", ag.QuietAfterSeconds)
+	if ag.StaleAfterSeconds == nil || *ag.StaleAfterSeconds != 14700 {
+		t.Fatalf("the incident says %v, want 14700", ag.StaleAfterSeconds)
 	}
 
 	// The operator clears the field, and the next payload says so.
-	s.SetIntakeQuietAfter(0)
+	s.SetIntakeStaleAfter(0)
 	if rec := postOneFiring(t, e, "declared"); rec.Code != http.StatusOK {
 		t.Fatalf("the webhook answered %d: %s", rec.Code, rec.Body.String())
 	}
@@ -94,8 +94,8 @@ func TestWhatTheIntegrationDeclaresReachesTheIncident(t *testing.T) {
 	if err != nil || ag == nil {
 		t.Fatalf("read the incident: %v", err)
 	}
-	if ag.QuietAfterSeconds != nil {
-		t.Errorf("the incident still says %v after the field was cleared", *ag.QuietAfterSeconds)
+	if ag.StaleAfterSeconds != nil {
+		t.Errorf("the incident still says %v after the field was cleared", *ag.StaleAfterSeconds)
 	}
 }
 

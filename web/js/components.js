@@ -243,7 +243,7 @@ const Components = {
      * silence and the declared allowance, or null when nothing is claimed.
      */
     staleSilence: (alertGroup) => {
-        const staleAfter = alertGroup?.quiet_after_seconds;
+        const staleAfter = alertGroup?.stale_after_seconds;
         if (!staleAfter || !alertGroup?.last_notified_at) return null;
         if (getDisplayStatus(alertGroup.status) === 'resolved') return null;
 
@@ -278,8 +278,8 @@ const Components = {
         const total = alertGroup.alerts_count ?? alerts?.length ?? 0;
         const counted = (state) => alerts?.filter(a => Components.alertState(a) === state).length ?? 0;
         const firing = alertGroup.firing_count ?? counted('firing');
-        const unreported = alertGroup.unreported_count ?? counted('unreported');
-        return { total, firing, unreported, resolved: Math.max(0, total - firing - unreported) };
+        const stale = alertGroup.stale_count ?? counted('stale');
+        return { total, firing, stale, resolved: Math.max(0, total - firing - stale) };
     },
 
     /**
@@ -287,28 +287,28 @@ const Components = {
      * says it. The same three states the API counts by, worked out in one
      * place so the badge, the border and the counts cannot disagree.
      * @param {Object} alert - Alert data
-     * @returns {'firing'|'unreported'|'resolved'}
+     * @returns {'firing'|'stale'|'resolved'}
      */
     alertState: (alert) => {
         // Anything that is not firing is resolved, including a status this
         // build does not know - the same answer model.Alert.State gives in Go
         // and the same one the list counts by in SQL.
         if (alert?.status?.toLowerCase() !== 'firing') return 'resolved';
-        return alert?.unreportedSince ? 'unreported' : 'firing';
+        return alert?.staleSince ? 'stale' : 'firing';
     },
 
     /**
-     * Render alert status badge (for alert-level states: firing/unreported/resolved)
+     * Render alert status badge (for alert-level states: firing/stale/resolved)
      * @param {Object} alert - Alert data
      */
     alertStatusBadge: (alert) => {
         const state = Components.alertState(alert);
-        if (state === 'unreported') {
-            const since = new Date(alert.unreportedSince).getTime();
+        if (state === 'stale') {
+            const since = new Date(alert.staleSince).getTime();
             const title = `Absent from every Alertmanager notification for this group since `
-                + `${Components.formatTime(alert.unreportedSince)}: silenced, inhibited, or `
+                + `${Components.formatTime(alert.staleSince)}: silenced, inhibited, or `
                 + 'cleared while silenced';
-            return `<span class="alert-status-tag status-unreported" title="${escapeHtml(title)}">`
+            return `<span class="alert-status-tag status-stale" title="${escapeHtml(title)}">`
                 + `Stale ${Components.formatDuration(Date.now() - since)}</span>`;
         }
         const label = state === 'resolved' ? 'Resolved' : 'Firing';
@@ -440,7 +440,7 @@ const Components = {
      * @param {Object} alertGroup - AlertGroup data
      */
     alertGroupCard: (alertGroup, options = {}) => {
-        const { total: alertCount, firing: firingCount, unreported: unreportedCount,
+        const { total: alertCount, firing: firingCount, stale: staleCount,
             resolved: resolvedCount } = Components.alertCounts(alertGroup);
 
         const displayStatus = getDisplayStatus(alertGroup.status);
@@ -468,7 +468,7 @@ const Components = {
         // rather than wrapping the row onto a second line.
         const alertsParts = [];
         if (firingCount > 0) alertsParts.push(['count-firing', `${firingCount} firing`]);
-        if (unreportedCount > 0) alertsParts.push(['count-unreported', `${unreportedCount} stale`]);
+        if (staleCount > 0) alertsParts.push(['count-stale', `${staleCount} stale`]);
         if (resolvedCount > 0) alertsParts.push(['count-resolved', `${resolvedCount} resolved`]);
         const alertsTitle = alertsParts.map(([, text]) => text).join(' · ');
         const alertsSummary = alertsParts.length > 0
@@ -547,10 +547,10 @@ const Components = {
         const onCallName = (alertGroup.onCall?.l1_users || []).map(u => u.name).join(', ');
         const onCallDisplay = onCallName ? truncateText(onCallName, 28) : (alertGroup.onCall ? 'Not configured' : '-');
         const onCallTitle = onCallName ? ` title="${escapeHtml(onCallName)}"` : '';
-        const { total: totalCount, firing: firingCount, unreported: unreportedCount,
+        const { total: totalCount, firing: firingCount, stale: staleCount,
             resolved: resolvedCount } = Components.alertCounts(alertGroup);
         const alertsSummary = `Alerts: ${firingCount} firing`
-            + (unreportedCount > 0 ? ` · ${unreportedCount} stale` : '')
+            + (staleCount > 0 ? ` · ${staleCount} stale` : '')
             + (resolvedCount > 0 ? ` · ${resolvedCount} resolved` : '');
         const teamLabel = alertGroup.team_id ? `Team ${alertGroup.team_id}` : 'Team N/A';
 
@@ -1944,8 +1944,8 @@ const Components = {
             // repeat_interval in minutes and hours, not in seconds. Whole
             // minutes only, which the API enforces, so nothing is lost on the
             // way back into the form.
-            const staleAfterMinutes = config?.quiet_after_seconds
-                ? config.quiet_after_seconds / 60
+            const staleAfterMinutes = config?.stale_after_seconds
+                ? config.stale_after_seconds / 60
                 : '';
 
             return `

@@ -88,7 +88,7 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 		if err := tx.Commit(); err != nil {
 			return alertgroup.MergeResult{}, err
 		}
-		countUnreported(applied)
+		countStale(applied)
 		return alertgroup.MergeResult{Outcome: outcome, AlertGroupID: group.ID}, nil
 	}
 
@@ -104,30 +104,30 @@ func (s *Store) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey stri
 	if resolving {
 		result, err := s.resolveByAlertmanagerTx(ctx, tx, group, events, now, actor)
 		if err == nil {
-			countUnreported(applied)
+			countStale(applied)
 		}
 		return result, err
 	}
 	result, err := s.mergeAlertsTx(ctx, tx, group, events, actor)
 	if err == nil {
-		countUnreported(applied)
+		countStale(applied)
 	}
 	return result, err
 }
 
-// countUnreported records what a payload did to the alerts Alertmanager still
+// countStale records what a payload did to the alerts Alertmanager still
 // reports, after the commit like every other count here: an observation about
 // a transaction that was rolled back is an observation about nothing.
-func countUnreported(applied alertgroup.Applied) {
+func countStale(applied alertgroup.Applied) {
 	for i := 0; i < applied.Marked; i++ {
-		metrics.AlertsUnreportedTotal.Inc()
+		metrics.AlertsStaleTotal.Inc()
 	}
 	for _, r := range applied.Back {
-		metrics.AlertUnreportedDurationSeconds.
+		metrics.AlertStaleDurationSeconds.
 			WithLabelValues(string(r.Status)).Observe(r.Silent.Seconds())
 	}
-	if applied.HeldOnlyByUnreported {
-		metrics.AlertGroupsHeldByUnreportedTotal.Inc()
+	if applied.HeldOnlyByStale {
+		metrics.AlertGroupsHeldByStaleTotal.Inc()
 	}
 }
 
@@ -156,10 +156,10 @@ func recordNotifiedTx(ctx context.Context, tx *sql.Tx, groupID string,
 	if err := tx.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&observedAt); err != nil {
 		return time.Time{}, fmt.Errorf("read the clock for %s: %w", groupID, err)
 	}
-	var quiet *int
-	if notification.QuietAfterSeconds > 0 {
-		seconds := notification.QuietAfterSeconds
-		quiet = &seconds
+	var staleAfter *int
+	if notification.StaleAfterSeconds > 0 {
+		seconds := notification.StaleAfterSeconds
+		staleAfter = &seconds
 	}
 	var sender *string
 	if notification.IntegrationID != "" {
@@ -169,9 +169,9 @@ func recordNotifiedTx(ctx context.Context, tx *sql.Tx, groupID string,
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE alert_groups
 		SET last_notified_at = GREATEST(last_notified_at, $2::timestamptz),
-		    quiet_after_seconds = $3,
+		    stale_after_seconds = $3,
 		    intake_integration_id = $4
-		WHERE id = $1`, groupID, observedAt, quiet, sender); err != nil {
+		WHERE id = $1`, groupID, observedAt, staleAfter, sender); err != nil {
 		return time.Time{}, fmt.Errorf("record that %s was notified: %w", groupID, err)
 	}
 	return observedAt, nil

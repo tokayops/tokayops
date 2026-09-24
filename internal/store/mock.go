@@ -33,7 +33,7 @@ type MockStore struct {
 
 	// What VerifyIntake answers: by default a payload is taken and nothing is
 	// declared about silence.
-	intakeQuietAfter int
+	intakeStaleAfter int
 	intakeRefused    bool
 	intakeErr        error
 
@@ -308,10 +308,10 @@ func (m *MockStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey 
 	}
 	// What the sender declares about silence, as it came: cleared when the
 	// operator clears it.
-	group.QuietAfterSeconds = nil
-	if notification.QuietAfterSeconds > 0 {
-		seconds := notification.QuietAfterSeconds
-		group.QuietAfterSeconds = &seconds
+	group.StaleAfterSeconds = nil
+	if notification.StaleAfterSeconds > 0 {
+		seconds := notification.StaleAfterSeconds
+		group.StaleAfterSeconds = &seconds
 	}
 
 	held := alertgroup.FingerprintsOf(group.Alerts)
@@ -653,13 +653,13 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 		if days > 0 && ag.UpdatedAt.Before(cutoff) && ag.CreatedAt.Before(cutoff) {
 			continue
 		}
-		firingCount, unreportedCount := 0, 0
+		firingCount, staleCount := 0, 0
 		for _, a := range ag.Alerts {
 			switch a.State() {
 			case model.AlertStateFiring:
 				firingCount++
-			case model.AlertStateUnreported:
-				unreportedCount++
+			case model.AlertStateStale:
+				staleCount++
 			}
 		}
 		filtered = append(filtered, &model.AlertGroupSummary{
@@ -669,8 +669,8 @@ func (m *MockStore) filterAlertGroupSummaries(teamID string, statuses []model.Al
 			AcknowledgedBy: ag.AcknowledgedBy, ResolvedBy: ag.ResolvedBy,
 			CreatedAt: ag.CreatedAt, UpdatedAt: ag.UpdatedAt, ResolvedAt: ag.ResolvedAt,
 			AlertsCount: len(ag.Alerts), FiringCount: firingCount,
-			UnreportedCount: unreportedCount,
-			LastNotifiedAt:  ag.LastNotifiedAt, QuietAfterSeconds: ag.QuietAfterSeconds,
+			StaleCount:     staleCount,
+			LastNotifiedAt: ag.LastNotifiedAt, StaleAfterSeconds: ag.StaleAfterSeconds,
 		})
 	}
 	return filtered
@@ -865,7 +865,7 @@ func (m *MockStore) CreateTeam(t *model.Team) error {
 
 // VerifyIntake mirrors the store: an integration the mock knows about, is
 // enabled, and whose secret matches may send, and it declares what
-// SetIntakeQuietAfter was told. The default is the one every ingester test
+// SetIntakeStaleAfter was told. The default is the one every ingester test
 // wants - the payload is taken, nothing is declared about silence.
 func (m *MockStore) VerifyIntake(ctx context.Context, integrationID, secret string) (int, bool, error) {
 	m.mu.RLock()
@@ -876,14 +876,14 @@ func (m *MockStore) VerifyIntake(ctx context.Context, integrationID, secret stri
 	if m.intakeRefused {
 		return 0, false, nil
 	}
-	return m.intakeQuietAfter, true, nil
+	return m.intakeStaleAfter, true, nil
 }
 
-// SetIntakeQuietAfter is what integrations say about silence in a test.
-func (m *MockStore) SetIntakeQuietAfter(seconds int) {
+// SetIntakeStaleAfter is what integrations say about silence in a test.
+func (m *MockStore) SetIntakeStaleAfter(seconds int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.intakeQuietAfter = seconds
+	m.intakeStaleAfter = seconds
 }
 
 // RefuseIntake makes every payload look like one from an integration that was

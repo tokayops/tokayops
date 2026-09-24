@@ -497,7 +497,7 @@ async function handleIntegrationSubmit(e) {
                 showToast('Consider stale after: a whole number of minutes, between 1 and 10080', 'error');
                 return;
             }
-            config.quiet_after_seconds = minutes * 60;
+            config.stale_after_seconds = minutes * 60;
         }
     } else if (type === 'generic_webhook') {
         const url = document.getElementById('config-webhook-url')?.value?.trim() || '';

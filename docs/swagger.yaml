@@ -1093,13 +1093,9 @@ definitions:
         additionalProperties:
           type: string
         type: object
-      startsAt:
-        type: string
-      status:
-        $ref: '#/definitions/model.AlertStatus'
-      unreportedSince:
+      staleSince:
         description: |-
-          UnreportedSince is when this alert stopped appearing in what
+          StaleSince is when this alert stopped appearing in what
           Alertmanager sends about its group, while the group was still being
           sent. It is an observation and not a cause: an alert goes missing
           because it was silenced, because an inhibition covers it, or because it
@@ -1108,6 +1104,10 @@ definitions:
           Set only for an alert that was firing, and cleared the moment
           Alertmanager reports it again.
         type: string
+      startsAt:
+        type: string
+      status:
+        $ref: '#/definitions/model.AlertStatus'
     type: object
   model.AlertGroup:
     properties:
@@ -1151,8 +1151,8 @@ definitions:
           LastNotifiedAt is when Alertmanager last sent anything about this group
           while it was open, repeats that changed nothing included. UpdatedAt is
           when the group last changed. A group that fires steadily does not
-          change, so this is what tells it apart from a group Alertmanager has
-          gone quiet about.
+          change, so this is what tells it apart from a group that has gone
+          stale - one Alertmanager has stopped sending about.
 
           Empty for a group Alertmanager never sent, such as one opened by hand,
           and for a group that has heard nothing since the version that records it.
@@ -1169,21 +1169,21 @@ definitions:
         allOf:
         - $ref: '#/definitions/model.EscalationPolicySnapshot'
         description: Policy Snapshot (stores the policy state at the time of creation/assignment)
-      quiet_after_seconds:
-        description: |-
-          QuietAfterSeconds is what the integration that last sent about this
-          group declared: how long silence is normal for it. A snapshot, like the
-          team name - the integration can be changed or deleted, and what was true
-          when the payload arrived stays.
-
-          Empty when nothing is declared, and then nothing is said about silence.
-        type: integer
       resolved_at:
         type: string
       resolved_by:
         type: string
       severity:
         type: string
+      stale_after_seconds:
+        description: |-
+          StaleAfterSeconds is what the integration that last sent about this
+          group declared: how long silence is normal for it. A snapshot, like the
+          team name - the integration can be changed or deleted, and what was true
+          when the payload arrived stays.
+
+          Empty when nothing is declared, and then nothing is said about silence.
+        type: integer
       status:
         $ref: '#/definitions/model.AlertGroupStatus'
       team_id:
