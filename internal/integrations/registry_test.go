@@ -120,3 +120,35 @@ func restore(s map[model.IntegrationType]Descriptor) {
 	defer mu.Unlock()
 	registry = s
 }
+
+// TestWhatAnAlertmanagerIntegrationMayDeclareAboutSilence. Zero is how the
+// field is cleared and how it arrives from a build that never had it, so it is
+// accepted; a number outside the bounds is a typo worth refusing at the form
+// rather than showing as a badge that never appears or never goes.
+func TestWhatAnAlertmanagerIntegrationMayDeclareAboutSilence(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		seconds int
+		wantErr bool
+	}{
+		{"nothing declared", 0, false},
+		{"the shortest allowed", 60, false},
+		{"a quarter of an hour", 900, false},
+		{"a week", 604800, false},
+		{"under a minute", 59, true},
+		{"a minute and a half", 90, true},
+		{"over a week", 604801, true},
+		{"negative", -1, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := json.Marshal(model.WebhookConfig{Secret: "s", StaleAfterSeconds: c.seconds})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = ValidateConfig(model.IntegrationTypeAlertmanagerWebhook, cfg, false)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("%d seconds answered %v, want error: %v", c.seconds, err, c.wantErr)
+			}
+		})
+	}
+}

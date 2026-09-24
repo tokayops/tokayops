@@ -941,10 +941,20 @@ body::before {
 }
 
 .alert-group-title {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    min-width: 0;
     font-size: 1rem;
     font-weight: 600;
     word-break: break-word;
-    line-height: 1.4;
+    /* Tighter than the body text: the line box then hugs the letters, and the
+       mark beside the title reads as level with them rather than a touch low. */
+    line-height: 1.25;
+    /* In the list the title shares a cell with the mark, and that cell can be
+       narrow. Clipped here, the mark is cut off at the column's edge instead of
+       being painted over the severity beside it. */
+    overflow: hidden;
 }
 
 .alert-group-badges {
@@ -1047,6 +1057,80 @@ body::before {
 .alert-status-tag.status-resolved {
     border-color: var(--action-success);
     color: var(--action-success);
+}
+
+/* An alert Alertmanager has stopped reporting: neither firing nor resolved,
+   and deliberately quieter than both. */
+/* An alert group Alertmanager has gone stale about.
+   Dashed, because it is not a state of the alert: it says what we have stopped
+   hearing, and the row's other two marks say what the alert is. It travels
+   with the title rather than with them - in the list, the title's cell is the
+   one place a mark can sit without taking a column of its own. */
+.stale-mark {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    border: 1px dashed var(--text-muted);
+    border-radius: var(--radius-sm);
+    padding: 1px 7px;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+/* The two marks that say what the alert IS read as one family: the fill
+   carries severity, the outline carries where it is in its life. Neither
+   shouts in capitals - the title does the shouting. */
+.alert-group-badges .badge-severity,
+.alert-group-status-badge .badge-status {
+    text-transform: capitalize;
+    letter-spacing: 0;
+    font-size: 0.75rem;
+    font-weight: 500;
+    padding: 2px 8px;
+}
+
+.alert-group-badges .badge-severity {
+    border-color: transparent;
+}
+
+.alert-group-badges .badge-severity.severity-critical {
+    background: color-mix(in srgb, var(--severity-critical-badge) 16%, transparent);
+}
+
+.alert-group-badges .badge-severity.severity-warning {
+    background: color-mix(in srgb, var(--severity-warning-badge) 16%, transparent);
+}
+
+.alert-group-badges .badge-severity.severity-info {
+    background: color-mix(in srgb, var(--severity-info-badge) 16%, transparent);
+}
+
+.alert-group-status-badge .badge-status {
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    padding: 2px 8px;
+}
+
+.alert-group-status-badge .badge-status.status-triggered,
+.alert-group-status-badge .badge-status.status-acknowledged,
+.alert-group-status-badge .badge-status.status-resolved {
+    opacity: 1;
+}
+
+/* In the list the row IS the structure, so the outline around the state is
+   chrome the table does not need - and at 80px it would touch the next
+   column. The colour of the severity chip is enough there. */
+.alert-groups-grid.view-list .alert-group-status-badge .badge-status {
+    border: 0;
+    padding: 0;
+}
+
+.alert-status-tag.status-stale {
+    border-color: var(--text-muted);
+    color: var(--text-muted);
 }
 
 .badge-severity {
@@ -1209,14 +1293,20 @@ body::before {
    List View Header
    =================================== */
 
+/* The header and the rows are two separate grids, so this track list is the
+   only thing keeping their columns in line: it is repeated on the row below
+   and the two change together. Every width is what that column's content
+   measures, plus a few pixels; the alerts column is the widest because all
+   three counts say their word there, on one line. */
 .list-header {
     display: none;
     /* Hidden by default (grid view) */
-    grid-template-columns: 1fr 100px 80px 100px 120px 120px 90px 90px 140px;
-    gap: var(--space-md);
+    grid-template-columns: 1fr 72px 88px 90px 110px 90px 82px 80px 200px;
+    gap: 0.75rem;
+    /* The same box as a row, border included: a header padded by hand instead
+       drifts a few pixels out of the columns it labels. */
     padding: var(--space-sm) var(--space-lg);
-    padding-left: calc(var(--space-lg) + 4px);
-    /* Account for left border */
+    border: 1px solid transparent;
     background: var(--bg-tertiary);
     border-radius: var(--radius-md);
     margin-bottom: var(--space-sm);
@@ -1249,10 +1339,25 @@ body::before {
 
 .alert-groups-grid.view-list .alert-group-card {
     display: grid;
-    grid-template-columns: 1fr 100px 80px 100px 120px 120px 90px 90px 140px;
+    /* Same nine tracks and the same gutter as .list-header above. */
+    grid-template-columns: 1fr 72px 88px 90px 110px 90px 82px 80px 200px;
     align-items: center;
-    gap: var(--space-md);
+    gap: 0.75rem;
     padding: var(--space-sm) var(--space-lg);
+}
+
+/* Narrower than this the row stops being a table: every other column is
+   already as narrow as its content, so what gives way is the title, and a
+   title clipped to three letters is not a list. Below the floor the table
+   scrolls sideways instead - header and rows in the same scroll box, because
+   they are two grids and nothing else keeps their columns in line. */
+.alert-groups-container:has(.alert-groups-grid.view-list) {
+    overflow-x: auto;
+}
+
+.alert-groups-container:has(.alert-groups-grid.view-list) .list-header,
+.alert-groups-grid.view-list .alert-group-card {
+    min-width: 1120px;
 }
 
 .list-header-col[data-sort] {
@@ -1304,9 +1409,15 @@ body::before {
 
 .alert-groups-grid.view-list .alert-group-title {
     margin-right: 0;
-    white-space: nowrap;
+}
+
+/* The title gives way, the mark does not: a row whose title is too long still
+   says whether anything is being heard about it. */
+.alert-group-title-text {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .alert-groups-grid.view-list .alert-group-badges {
@@ -1347,18 +1458,6 @@ body::before {
     flex-direction: column;
     align-items: flex-end;
     gap: 2px;
-}
-
-/* List view mobile: horizontal scroll wrapper */
-@media (max-width: 768px) {
-    .alert-groups-grid.view-list {
-        overflow-x: auto;
-        -webkit-overflow-scrolling: touch;
-    }
-
-    .alert-groups-grid.view-list .alert-group-card {
-        min-width: 800px;
-    }
 }
 
 /* ===================================
@@ -1726,6 +1825,10 @@ body::before {
 
 .alert-item.status-resolved {
     border-left-color: var(--status-resolved);
+}
+
+.alert-item.status-stale {
+    border-left-color: var(--text-muted);
 }
 
 .alert-header {

@@ -111,16 +111,43 @@ func pipelineConfig(l1Groups []rotation.RotationGroup, l2User string) rotation.S
 	return cfg
 }
 
-// testSecretValidator implements ingester.WebhookSecretValidator for integration tests
+// testSecretValidator implements ingester.WebhookSource for integration tests:
+// one secret, belonging to the integration these tests create.
 type testSecretValidator struct{}
 
-func (v *testSecretValidator) ValidateWebhookSecret(secret string) bool {
-	return secret == "test-secret"
+func (v *testSecretValidator) WebhookIntegrationID(secret string) (string, bool) {
+	if secret != "test-secret" {
+		return "", false
+	}
+	return "test-integration", true
+}
+
+// seedIntakeIntegration creates the Alertmanager integration these tests send
+// through. The ingester checks every payload against the database - the cache
+// only names the integration - so a payload from an integration that is not
+// there is refused, as it is in production.
+func seedIntakeIntegration(t *testing.T, s *store.Store) {
+	t.Helper()
+	cfg, err := json.Marshal(model.WebhookConfig{Secret: "test-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateIntegration(&model.Integration{
+		ID:        "test-integration",
+		Type:      model.IntegrationTypeAlertmanagerWebhook,
+		Direction: model.IntegrationDirectionInbound,
+		Name:      "Test Alertmanager",
+		Enabled:   true,
+		Config:    cfg,
+	}); err != nil {
+		t.Fatalf("CreateIntegration: %v", err)
+	}
 }
 
 func setupIntegrationTest(t *testing.T) *IntegrationTestEnv {
 	// 1. Setup DB
 	s := testutil.SetupDB(t)
+	seedIntakeIntegration(t, s)
 
 	// 1a. Seed users referenced by escalation policies, with Slack identities.
 	// Emails must be distinct and non-empty (users.email is UNIQUE; two empty

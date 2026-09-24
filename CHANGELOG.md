@@ -9,6 +9,60 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-25
+
+Converts to Apache-2.0 on 2028-09-25.
+
+### Upgrade notes
+
+- **The Alertmanager receiver has a stated contract:** `send_resolved: true`,
+  `max_alerts: 0` and no custom `payload` (see the README). Nothing checks
+  the first and the last; a notification cut by `max_alerts` is now counted and
+  warned about.
+- The start adds `alert_groups.last_notified_at` and
+  `alert_groups.stale_after_seconds`. Both stay empty for an existing alert
+  group until Alertmanager next sends about it.
+- **A disabled Alertmanager integration, or one whose token was rotated, is now
+  refused by every instance.** Every payload is checked against the database;
+  before, the instances that had not reloaded their integration cache went on
+  accepting the old token until they restarted.
+- **A token that has just been created or rotated starts working on every
+  instance within half a minute.** Each instance now reloads its integration
+  cache on a timer, because only the one that handled the change reloaded it
+  before - so a new token worked on that instance and was refused by the rest.
+
+### Added
+
+- **An alert group Alertmanager has stopped sending about is marked stale.**
+  The Alertmanager integration takes an optional "Consider stale after"
+  (`stale_after_seconds` in its config): how long silence about an alert group
+  is normal for that Alertmanager, set in whole minutes. Editing it, clearing it, disabling the integration or deleting it
+  reaches the alert groups it feeds that are still open - including the ones
+  that will never be sent about again. An open alert group that has said
+  nothing for longer is badged "Stale" with how long, in the list and in the
+  alert group view. Nothing is claimed unless the number is set, and nothing is
+  inferred from Alertmanager's own configuration - it cannot be read from what
+  it sends.
+- **Alerts Alertmanager has stopped reporting are shown as such.** When a
+  notification carries the whole group and an alert that was firing is not in
+  it - silenced, inhibited, or cleared while silenced - the alert is marked
+  stale from that moment, and the mark goes the moment Alertmanager reports it
+  again. The alert group view shows the state and counts it apart
+  (`staleSince` on the alert, `stale_count` on the list).
+  Such an alert still holds the alert group open: absence is not a resolution,
+  and nothing about paging or escalation changes.
+- Three metrics for how often this happens: `alerts_stale_total`,
+  `alert_stale_duration_seconds` (labelled with what the alert came back as)
+  and `alert_groups_held_by_stale_total`.
+- An alert group records when Alertmanager last sent anything about it,
+  repeats that change nothing included (`last_notified_at` in the API, "Last
+  notification" in the alert group's technical details). A group that fires
+  steadily does not change, so the time it last changed says nothing about
+  whether anyone is still reporting it; this one does, and it is what the
+  stale mark is measured from.
+- `alertmanager_truncated_notifications_total` and the warning rule
+  `AlertmanagerNotificationsTruncated`.
+
 ## [0.2.0] - 2026-09-11
 
 Converts to Apache-2.0 on 2028-09-11.
@@ -613,6 +667,7 @@ what the first supported version contains rather than what changed in it.
   move under you on the next release, or pin the image digest listed with this
   release for a reference that cannot move at all.
 
-[Unreleased]: https://github.com/tokayops/tokayops/compare/v0.2.0...develop
+[Unreleased]: https://github.com/tokayops/tokayops/compare/v0.3.0...develop
+[0.3.0]: https://github.com/tokayops/tokayops/releases/tag/v0.3.0
 [0.2.0]: https://github.com/tokayops/tokayops/releases/tag/v0.2.0
 [0.1.0]: https://github.com/tokayops/tokayops/releases/tag/v0.1.0

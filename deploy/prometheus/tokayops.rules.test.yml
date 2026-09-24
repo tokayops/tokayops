@@ -467,6 +467,29 @@ tests:
       - eval_time: 10m
         alertname: OnCallProjectionFailures
         exp_alerts: []
+  # ---- truncated Alertmanager notifications ----
+  - interval: 1m
+    input_series:
+      # One instance receives a notification cut short ten minutes in; the other
+      # never does. The alert fires on the sum, and stops once the hour has
+      # passed without another.
+      - series: 'alertmanager_truncated_notifications_total{instance="a"}'
+        values: '0x10 1x90'
+      - series: 'alertmanager_truncated_notifications_total{instance="b"}'
+        values: '0x100'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AlertmanagerNotificationsTruncated
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertmanagerNotificationsTruncated
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Alertmanager cut alerts off a notification in the last hour - set max_alerts to 0 on the TokayOps receiver"
+      - eval_time: 90m
+        alertname: AlertmanagerNotificationsTruncated
+        exp_alerts: []
   - interval: 1m
     input_series:
       # Critical alerts take an hour and ten minutes each to resolve: the

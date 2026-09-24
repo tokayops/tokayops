@@ -13,6 +13,10 @@ const (
 )
 
 // Alert represents a single alert received from Alertmanager.
+//
+// Everything but the last field is what Alertmanager said about the alert.
+// StaleSince is what this system observed about it, and no sender can
+// set it: the ingester reads a payload into its own type.
 type Alert struct {
 	Fingerprint  string            `json:"fingerprint"`
 	Status       AlertStatus       `json:"status"`
@@ -21,6 +25,43 @@ type Alert struct {
 	StartsAt     time.Time         `json:"startsAt"`
 	EndsAt       time.Time         `json:"endsAt"`
 	GeneratorURL string            `json:"generatorURL"`
+
+	// StaleSince is when this alert stopped appearing in what
+	// Alertmanager sends about its group, while the group was still being
+	// sent. It is an observation and not a cause: an alert goes missing
+	// because it was silenced, because an inhibition covers it, or because it
+	// cleared while silenced, and the notification does not say which.
+	//
+	// Set only for an alert that was firing, and cleared the moment
+	// Alertmanager reports it again.
+	StaleSince *time.Time `json:"staleSince,omitempty"`
+}
+
+// AlertState is what an alert is doing as far as this system knows: what
+// Alertmanager last said, and whether it still says it.
+//
+// One definition, because three readers count by it - the list summary in
+// SQL, the mock, and the view - and three definitions would eventually
+// disagree about the same alert.
+type AlertState string
+
+const (
+	AlertStateFiring   AlertState = "firing"
+	AlertStateStale    AlertState = "stale"
+	AlertStateResolved AlertState = "resolved"
+)
+
+// State answers with one of the three. Anything that is not firing is
+// resolved, which is what the counts have always done with a status this
+// build does not know.
+func (a Alert) State() AlertState {
+	if a.Status != AlertStatusFiring {
+		return AlertStateResolved
+	}
+	if a.StaleSince != nil {
+		return AlertStateStale
+	}
+	return AlertStateFiring
 }
 
 // AlertGroupStatus represents the state of an alert group in our system.
@@ -123,6 +164,30 @@ type AlertGroup struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
 	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
+
+	// LastNotifiedAt is when Alertmanager last sent anything about this group
+	// while it was open, repeats that changed nothing included. UpdatedAt is
+	// when the group last changed. A group that fires steadily does not
+	// change, so this is what tells it apart from a group that has gone
+	// stale - one Alertmanager has stopped sending about.
+	//
+	// Empty for a group Alertmanager never sent, such as one opened by hand,
+	// and for a group that has heard nothing since the version that records it.
+	LastNotifiedAt *time.Time `json:"last_notified_at,omitempty"`
+
+	// StaleAfterSeconds is what the integration that last sent about this
+	// group declared: how long silence is normal for it. A snapshot, like the
+	// team name - the integration can be changed or deleted, and what was true
+	// when the payload arrived stays.
+	//
+	// Empty when nothing is declared, and then nothing is said about silence.
+	StaleAfterSeconds *int `json:"stale_after_seconds,omitempty"`
+
+	// IntakeIntegrationID names the integration that last sent about this
+	// group. Internal: it is how a change to that integration reaches the
+	// groups it feeds, and a reader outside this repository can do nothing
+	// with it.
+	IntakeIntegrationID string `json:"-"`
 }
 
 // AlertGroupSummary is a lightweight projection of AlertGroup for list views.
@@ -144,7 +209,17 @@ type AlertGroupSummary struct {
 	UpdatedAt      time.Time        `json:"updated_at"`
 	ResolvedAt     *time.Time       `json:"resolved_at,omitempty"`
 	AlertsCount    int              `json:"alerts_count"`
-	FiringCount    int              `json:"firing_count"`
+	// FiringCount counts the alerts Alertmanager still reports as firing;
+	// StaleCount the firing ones it has stopped reporting. What is left
+	// of AlertsCount is resolved.
+	FiringCount int `json:"firing_count"`
+	StaleCount  int `json:"stale_count"`
+
+	// The list draws the card without the alerts, so what it needs to say
+	// "this group has gone stale" has to be here: when Alertmanager last sent,
+	// and after how long silence is unusual for whoever sent it.
+	LastNotifiedAt    *time.Time `json:"last_notified_at,omitempty"`
+	StaleAfterSeconds *int       `json:"stale_after_seconds,omitempty"`
 }
 
 // IncidentStatus represents the lifecycle state of a business incident.

@@ -670,6 +670,12 @@ func main() {
 		}
 	}()
 
+	// The integration cache follows the database from here on. Only the
+	// instance that handles a change reloads it by itself, so without this an
+	// Alertmanager whose token was just created or rotated is refused by every
+	// other instance until it restarts.
+	go integrationCache.Refresh(ctx, st, store.IntegrationCacheRefresh)
+
 	// Swagger UI
 	e.GET("/swagger/*", echoSwagger.WrapHandler)
 

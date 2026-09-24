@@ -4722,6 +4722,10 @@ const docTemplate = `{
                         "type": "string"
                     }
                 },
+                "staleSince": {
+                    "description": "StaleSince is when this alert stopped appearing in what\nAlertmanager sends about its group, while the group was still being\nsent. It is an observation and not a cause: an alert goes missing\nbecause it was silenced, because an inhibition covers it, or because it\ncleared while silenced, and the notification does not say which.\n\nSet only for an alert that was firing, and cleared the moment\nAlertmanager reports it again.",
+                    "type": "string"
+                },
                 "startsAt": {
                     "type": "string"
                 },
@@ -4766,6 +4770,10 @@ const docTemplate = `{
                     "description": "Link to future Incident (NULL in most cases for Phase 2)",
                     "type": "integer"
                 },
+                "last_notified_at": {
+                    "description": "LastNotifiedAt is when Alertmanager last sent anything about this group\nwhile it was open, repeats that changed nothing included. UpdatedAt is\nwhen the group last changed. A group that fires steadily does not\nchange, so this is what tells it apart from a group that has gone\nstale - one Alertmanager has stopped sending about.\n\nEmpty for a group Alertmanager never sent, such as one opened by hand,\nand for a group that has heard nothing since the version that records it.",
+                    "type": "string"
+                },
                 "oncall_snapshot": {
                     "description": "OnCall Snapshot (stores the on-call state at the time of alert group creation)",
                     "allOf": [
@@ -4794,6 +4802,10 @@ const docTemplate = `{
                 },
                 "severity": {
                     "type": "string"
+                },
+                "stale_after_seconds": {
+                    "description": "StaleAfterSeconds is what the integration that last sent about this\ngroup declared: how long silence is normal for it. A snapshot, like the\nteam name - the integration can be changed or deleted, and what was true\nwhen the payload arrived stays.\n\nEmpty when nothing is declared, and then nothing is said about silence.",
+                    "type": "integer"
                 },
                 "status": {
                     "$ref": "#/definitions/model.AlertGroupStatus"

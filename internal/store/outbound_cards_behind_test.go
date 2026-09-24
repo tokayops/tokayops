@@ -280,7 +280,7 @@ func TestARepeatedPayloadCostsNothing(t *testing.T) {
 	// admitted from, and a repeat would look like news for that reason instead
 	// of being caught by the rule under test.
 	if _, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
-		"desired-"+agID, same, "ingester"); err != nil {
+		"desired-"+agID, alertgroup.Notification{Alerts: same}, "ingester"); err != nil {
 		t.Fatalf("the first payload: %v", err)
 	}
 
@@ -300,7 +300,7 @@ func TestARepeatedPayloadCostsNothing(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(),
-			"desired-"+agID, same, "ingester")
+			"desired-"+agID, alertgroup.Notification{Alerts: same}, "ingester")
 		if err != nil {
 			t.Fatalf("repeat %d: %v", i, err)
 		}

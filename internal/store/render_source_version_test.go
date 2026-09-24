@@ -42,10 +42,10 @@ func TestWhatMovesTheRenderSourceVersion(t *testing.T) {
 					t.Fatalf("read the alert key: %v", err)
 				}
 				result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
-					[]model.Alert{{
+					alertgroup.Notification{Alerts: []model.Alert{{
 						Fingerprint: "fp-late", Status: model.AlertStatusFiring,
 						StartsAt: time.Now(), Labels: map[string]string{"alertname": "Late"},
-					}}, "system")
+					}}}, "system")
 				if err != nil || result.Outcome != alertgroup.MergeMerged {
 					t.Fatalf("the payload came back %s (%v)", result.Outcome, err)
 				}
@@ -79,11 +79,11 @@ func TestWhatMovesTheRenderSourceVersion(t *testing.T) {
 					t.Fatalf("read the alert key: %v", err)
 				}
 				result, err := s.ApplyAlertmanagerUpdateAtomic(context.Background(), alertKey,
-					[]model.Alert{{
+					alertgroup.Notification{Alerts: []model.Alert{{
 						Fingerprint: "fp-1", Status: model.AlertStatusResolved,
 						StartsAt: time.Unix(1700000000, 0),
 						Labels:   map[string]string{"alertname": "DiskWillFill"},
-					}}, "system")
+					}}}, "system")
 				if err != nil || result.Outcome != alertgroup.MergeResolved {
 					t.Fatalf("the payload came back %s (%v)", result.Outcome, err)
 				}

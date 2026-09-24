@@ -32,12 +32,12 @@ type errLookupStore struct {
 }
 
 func (s *errLookupStore) ApplyAlertmanagerUpdateAtomic(ctx context.Context, alertKey string,
-	incoming []model.Alert, actor string) (alertgroup.MergeResult, error) {
+	notification alertgroup.Notification, actor string) (alertgroup.MergeResult, error) {
 
 	if s.lookupErr != nil {
 		return alertgroup.MergeResult{}, s.lookupErr
 	}
-	return s.MockStore.ApplyAlertmanagerUpdateAtomic(ctx, alertKey, incoming, actor)
+	return s.MockStore.ApplyAlertmanagerUpdateAtomic(ctx, alertKey, notification, actor)
 }
 
 // duplicateKeyStore simulates a race condition:
@@ -499,6 +499,17 @@ func TestIngester_UnknownTeamCounter(t *testing.T) {
 	})
 }
 
+// postPayload sends a payload as it is, for the cases where what matters is a
+// field postAlerts does not set - whether Alertmanager cut the list short.
+func postPayload(t *testing.T, e *echo.Echo, payload string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager?token=secret", strings.NewReader(payload))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	return rec
+}
+
 // postAlerts drives one Alertmanager webhook carrying a raw alerts array through
 // the ingester and returns the recorder.
 func postAlerts(t *testing.T, e *echo.Echo, groupKey, alerts string) *httptest.ResponseRecorder {
@@ -615,8 +626,13 @@ func TestRegression_ResolvedAlertFromPreviousGroup_NotMergedIntoNewGroup(t *test
 }
 
 // TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp verifies that a
-// payload holding nothing the group owns is a no-op: no alerts_data rewrite and
-// no Slack re-render flag.
+// payload holding nothing the group owns never takes a foreign alert into the
+// group, and that it writes nothing at all when it is not a snapshot.
+//
+// A snapshot is the other half of the same rule: it holds nothing this group
+// owns and still says the alert the group DOES own is no longer reported, so
+// it marks it. The alert set is the same either way - a stranger does not
+// join.
 func TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp(t *testing.T) {
 	mock := store.NewMockStore()
 
@@ -638,9 +654,12 @@ func TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp(t *testing.T)
 	e := echo.New()
 	NewIngester(mock, &config.Config{}, validator).RegisterRoutes(e)
 
-	// Only a resolved alert the group has never seen (closed with an earlier incident).
-	rec := postAlerts(t, e, "foreign-noop-group",
-		`{"status":"resolved","labels":{"alertname":"InstanceJustRebooted"},"fingerprint":"X"}`)
+	// Only a resolved alert the group has never seen (closed with an earlier
+	// incident), in a payload that was cut short - so it says nothing about
+	// what is still reported.
+	strangerCutShort := `{"status":"resolved","groupKey":"foreign-noop-group","truncatedAlerts":1,` +
+		`"alerts":[{"status":"resolved","labels":{"alertname":"InstanceJustRebooted"},"fingerprint":"X"}]}`
+	rec := postPayload(t, e, strangerCutShort)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -661,5 +680,23 @@ func TestRegression_MergePayloadWithOnlyForeignResolvedAlerts_NoOp(t *testing.T)
 	// Both MockStore writes bump UpdatedAt, so an untouched timestamp proves neither ran.
 	if !stored.UpdatedAt.Equal(created) {
 		t.Errorf("UpdatedAt moved to %v, want %v - the group was written for nothing", stored.UpdatedAt, created)
+	}
+
+	// The same stranger in a whole payload: a snapshot. A does not leave and X
+	// does not join; A is marked as one Alertmanager no longer reports.
+	rec = postAlerts(t, e, "foreign-noop-group",
+		`{"status":"resolved","labels":{"alertname":"InstanceJustRebooted"},"fingerprint":"X"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	stored, err = mock.GetAlertGroupByID("ag-foreign-noop")
+	if err != nil || stored == nil {
+		t.Fatalf("alert group not readable: %v", err)
+	}
+	if got := fingerprints(stored); len(got) != 1 || got["A"] != model.AlertStatusFiring {
+		t.Errorf("group holds %v, want only A firing", got)
+	}
+	if stored.Alerts[0].StaleSince == nil {
+		t.Error("the snapshot without A left it as one Alertmanager still reports")
 	}
 }

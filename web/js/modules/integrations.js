@@ -480,11 +480,24 @@ async function handleIntegrationSubmit(e) {
         }
     } else if (type === 'alertmanager_webhook') {
         const secret = document.getElementById('config-secret')?.value?.trim() || '';
+        const staleAfterStr = document.getElementById('config-stale-after')?.value?.trim() || '';
         config = { secret };
 
         if (!State.editingIntegration && !secret) {
             showToast('Webhook secret is required', 'error');
             return;
+        }
+        // Empty is how the field is cleared: the config carries no number, and
+        // nothing is said about silence any more.
+        if (staleAfterStr) {
+            // Number, not parseInt: a number input accepts 1e3, and parseInt
+            // would read that as 1.
+            const minutes = Number(staleAfterStr);
+            if (!Number.isInteger(minutes) || minutes < 1 || minutes > 10080) {
+                showToast('Consider stale after: a whole number of minutes, between 1 and 10080', 'error');
+                return;
+            }
+            config.stale_after_seconds = minutes * 60;
         }
     } else if (type === 'generic_webhook') {
         const url = document.getElementById('config-webhook-url')?.value?.trim() || '';

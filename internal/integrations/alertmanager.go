@@ -3,6 +3,7 @@ package integrations
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/tokayops/tokayops/internal/model"
 )
@@ -24,6 +25,19 @@ func init() {
 				}
 				if c.Secret == model.MaskedSecret {
 					return errors.New("cannot use masked value as secret")
+				}
+			}
+			// Zero is how the field is cleared, and how it arrives from a
+			// build that never had it: nothing is claimed about silence.
+			if c.StaleAfterSeconds != 0 {
+				if c.StaleAfterSeconds < model.StaleAfterMin || c.StaleAfterSeconds > model.StaleAfterMax {
+					return fmt.Errorf("stale_after_seconds must be between %d and %d, or 0 to leave it unset",
+						model.StaleAfterMin, model.StaleAfterMax)
+				}
+				// Whole minutes: the form takes minutes, so a value that is
+				// not one would change every time somebody opened it.
+				if c.StaleAfterSeconds%60 != 0 {
+					return errors.New("stale_after_seconds must be a whole number of minutes")
 				}
 			}
 			return nil
