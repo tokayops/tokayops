@@ -9,9 +9,9 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-09-21
+## [0.3.0] - 2026-09-25
 
-Converts to Apache-2.0 on 2028-09-21.
+Converts to Apache-2.0 on 2028-09-25.
 
 ### Upgrade notes
 
