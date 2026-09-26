@@ -358,16 +358,8 @@ func TestADNDCheckIsForTheNumberItWasMadeFor(t *testing.T) {
 		t.Fatalf("mark on an unverified number = %v, want ErrPhoneNotVerified", err)
 	}
 	mustVerifyPhone(t, s, "alice", phoneA)
-	if err := s.ConfirmDNDCheck(ctx, "alice", sender); !errors.Is(err, ErrPhoneNoTestCall) {
-		t.Fatalf("mark with no test call = %v, want ErrPhoneNoTestCall", err)
-	}
-	req := callTo("alice", "dnd_check", phoneA, sender)
-	req.RequireVerified = true
-	if _, err := s.ReservePhoneCall(ctx, req); err != nil {
-		t.Fatalf("test call: %v", err)
-	}
 	if err := s.ConfirmDNDCheck(ctx, "alice", sender); err != nil {
-		t.Fatalf("mark after the test call: %v", err)
+		t.Fatalf("mark on a verified number: %v", err)
 	}
 	checks, err := s.PhoneDNDChecks(ctx, "alice")
 	if err != nil || len(checks) != 1 {

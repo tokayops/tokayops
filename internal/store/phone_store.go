@@ -21,9 +21,6 @@ var (
 	ErrPhoneContactChanged = errors.New("the phone number changed")
 	// ErrPhoneNotVerified means the request needs a verified number.
 	ErrPhoneNotVerified = errors.New("the phone number is not verified")
-	// ErrPhoneNoTestCall means a Do Not Disturb check was marked for a sender
-	// that has not called the number recently.
-	ErrPhoneNoTestCall = errors.New("no recent test call from that number")
 )
 
 // Why a call was not reserved.
@@ -50,10 +47,6 @@ const (
 	phoneVerifyCallsPerHour = 3
 	phoneCallsPerDay        = 10
 )
-
-// phoneTestCallFreshness is how recent a test call from a sender must be for
-// the person to mark that it came through.
-const phoneTestCallFreshness = time.Hour
 
 // PhoneCallRequest is one call a person asks for, and what it is spent against.
 type PhoneCallRequest struct {
@@ -456,10 +449,11 @@ func (s *Store) ConfirmPhoneCode(ctx context.Context, userID, code string) error
 	return drop(nil)
 }
 
-// ConfirmDNDCheck records the person's word that a test call from sender came
+// ConfirmDNDCheck records the person's word that a call from sender came
 // through Do Not Disturb to their current number. It needs a verified number
-// and a test call from that sender to it within the last hour: the mark is an
-// answer to a call, not a setting.
+// and nothing else: the mark is the person's own testimony, and the log of
+// calls could not prove more - a call asked for is logged even when the
+// provider refused it.
 func (s *Store) ConfirmDNDCheck(ctx context.Context, userID, sender string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -478,17 +472,6 @@ func (s *Store) ConfirmDNDCheck(ctx context.Context, userID, sender string) erro
 	}
 	if !contact.Verified() {
 		return ErrPhoneNotVerified
-	}
-	var called bool
-	if err := tx.QueryRowContext(ctx, `
-		SELECT EXISTS (SELECT 1 FROM phone_calls_log
-			WHERE user_id = $1 AND purpose = 'dnd_check' AND to_number = $2 AND from_number = $3
-			  AND created_at > now() - make_interval(secs => $4))`,
-		userID, contact.Value, sender, phoneTestCallFreshness.Seconds()).Scan(&called); err != nil {
-		return err
-	}
-	if !called {
-		return ErrPhoneNoTestCall
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO phone_dnd_checks (user_id, phone_value, sender_number, confirmed_at)

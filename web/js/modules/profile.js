@@ -10,7 +10,6 @@ const ProfileModule = {
     _staticListenersAttached: false,
     otpSent: false, // Track if OTP flow is active
     phone: null, // GET /me/phone, or null when phone calls are not configured
-    phoneCodeRequested: false, // a call with a code went out; show the code input
     phoneEditing: false, // the number is being changed
 
     /**
@@ -132,7 +131,6 @@ const ProfileModule = {
             this.tokens = tokensResp.tokens || [];
 
             // The phone section shows only where phone calls are configured.
-            this.phoneCodeRequested = false;
             this.phoneEditing = false;
             try {
                 this.phone = await API.auth.phone.get();
@@ -612,22 +610,8 @@ const ProfileModule = {
             return header + '<small class="form-hint">No phone provider can call this number. Ask an administrator which countries are covered.</small>';
         }
 
-        if (!verified) {
-            return header + `
-                <div class="slack-otp-state">
-                    <div class="slack-actions">
-                        <button type="button" class="btn btn-primary btn-sm" id="phone-call-code-btn">Call me with a code</button>
-                    </div>
-                    ${this.phoneCodeRequested ? `
-                    <div class="otp-input-group">
-                        <input type="text" id="phone-code" placeholder="Enter 6-digit code" maxlength="6" autocomplete="one-time-code">
-                        <button type="button" class="btn btn-success btn-sm" id="phone-confirm-code-btn">Confirm</button>
-                    </div>` : ''}
-                    <small class="form-hint">We call the number and say a six-digit code. Calls are only placed to a verified number.</small>
-                </div>
-            `;
-        }
-
+        // The provider choice comes before verification too: if the code call
+        // does not get through one provider, the person tries another.
         const providers = this.phone.providers || [];
         const pin = providers.length > 1 ? `
             <div class="form-group">
@@ -639,6 +623,25 @@ const ProfileModule = {
                 </select>
                 ${contact.pinned_integration_id && !this.phone.pin_active ? '<small class="form-hint">Your choice cannot call this number now; the default order is used.</small>' : ''}
             </div>` : '';
+
+        if (!verified) {
+            // The code field shows whenever the number is unverified, not only
+            // after this page asked for a call: a call whose outcome was
+            // unknown may still arrive, and a call asked for before the
+            // profile was reopened is still ringing.
+            return header + pin + `
+                <div class="slack-otp-state">
+                    <div class="slack-actions">
+                        <button type="button" class="btn btn-primary btn-sm" id="phone-call-code-btn">Call me with a code</button>
+                    </div>
+                    <div class="otp-input-group">
+                        <input type="text" id="phone-code" placeholder="Enter 6-digit code" maxlength="6" autocomplete="one-time-code">
+                        <button type="button" class="btn btn-success btn-sm" id="phone-confirm-code-btn">Confirm</button>
+                    </div>
+                    <small class="form-hint">We call the number and say a six-digit code. Calls are only placed to a verified number.</small>
+                </div>
+            `;
+        }
 
         const senders = (this.phone.senders || []).map(sender => `
             <div class="slack-connected-state">
@@ -682,7 +685,6 @@ const ProfileModule = {
 
     handleSavePhone() {
         const value = document.getElementById('phone-value').value.trim();
-        this.phoneCodeRequested = false;
         this.phoneEditing = false;
         return this.phoneAction(document.getElementById('phone-save-btn'), () => API.auth.phone.set(value), 'Phone number saved');
     },
@@ -691,7 +693,6 @@ const ProfileModule = {
         if (!confirm('Remove your phone number? You will not be called until you add and verify one again.')) {
             return;
         }
-        this.phoneCodeRequested = false;
         return this.phoneAction(document.getElementById('phone-remove-btn'), async () => {
             await API.auth.phone.remove();
             return API.auth.phone.get();
@@ -701,16 +702,13 @@ const ProfileModule = {
     handleCallWithCode() {
         return this.phoneAction(document.getElementById('phone-call-code-btn'), async () => {
             await API.auth.phone.callWithCode();
-            this.phoneCodeRequested = true;
         }, 'Calling you now');
     },
 
     handleConfirmPhoneCode() {
         const code = document.getElementById('phone-code').value.trim();
         return this.phoneAction(document.getElementById('phone-confirm-code-btn'), async () => {
-            const result = await API.auth.phone.confirm(code);
-            this.phoneCodeRequested = false;
-            return result;
+            return API.auth.phone.confirm(code);
         }, 'Phone number verified');
     },
 

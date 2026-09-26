@@ -522,7 +522,7 @@ func (a *API) RequestPhoneTestCall(c echo.Context) error {
 
 // ConfirmPhoneTestCall godoc
 // @Summary Mark that a test call came through
-// @Description Record that the test call from a sender rang through Do Not Disturb. Needs a test call from that sender within the last hour.
+// @Description Record that a call from a sender rang through Do Not Disturb. The person's own word; needs a verified number.
 // @Tags auth
 // @Accept json
 // @Produce json
@@ -608,8 +608,6 @@ func (a *API) phoneError(c echo.Context, err error) error {
 		return c.JSON(http.StatusConflict, ErrorResponse{Error: "the phone number changed; reload and try again"})
 	case errors.Is(err, store.ErrPhoneNotVerified):
 		return c.JSON(http.StatusConflict, ErrorResponse{Error: "verify the number first"})
-	case errors.Is(err, store.ErrPhoneNoTestCall):
-		return c.JSON(http.StatusConflict, ErrorResponse{Error: "make a test call from that number first"})
 	case errors.Is(err, store.ErrLinkTokenInvalid):
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid code"})
 	case errors.Is(err, store.ErrLinkTokenExpired):

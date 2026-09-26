@@ -354,7 +354,7 @@ const docTemplate = `{
         },
         "/api/auth/me/phone/dnd-confirm": {
             "post": {
-                "description": "Record that the test call from a sender rang through Do Not Disturb. Needs a test call from that sender within the last hour.",
+                "description": "Record that a call from a sender rang through Do Not Disturb. The person's own word; needs a verified number.",
                 "consumes": [
                     "application/json"
                 ],
