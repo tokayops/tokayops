@@ -9,6 +9,9 @@ const ProfileModule = {
     newlyCreatedToken: null,
     _staticListenersAttached: false,
     otpSent: false, // Track if OTP flow is active
+    phone: null, // GET /me/phone, or null when phone calls are not configured
+    phoneCodeRequested: false, // a call with a code went out; show the code input
+    phoneEditing: false, // the number is being changed
 
     /**
      * Initialize the profile module
@@ -89,6 +92,28 @@ const ProfileModule = {
         if (tgUnbindBtn) {
             tgUnbindBtn.addEventListener('click', () => this.handleUnbindTelegram());
         }
+
+        // Phone Actions
+        const on = (id, handler) => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('click', handler);
+        };
+        on('phone-save-btn', () => this.handleSavePhone());
+        on('phone-edit-btn', () => { this.phoneEditing = true; this.renderModal(); });
+        on('phone-cancel-edit-btn', () => { this.phoneEditing = false; this.renderModal(); });
+        on('phone-remove-btn', () => this.handleRemovePhone());
+        on('phone-call-code-btn', () => this.handleCallWithCode());
+        on('phone-confirm-code-btn', () => this.handleConfirmPhoneCode());
+        const pinSelect = document.getElementById('phone-pin-select');
+        if (pinSelect) {
+            pinSelect.addEventListener('change', () => this.handlePinPhone(pinSelect.value));
+        }
+        document.querySelectorAll('[data-phone-test]').forEach(btn => {
+            btn.addEventListener('click', () => this.handlePhoneTestCall(btn.dataset.phoneTest, btn));
+        });
+        document.querySelectorAll('[data-phone-rang]').forEach(btn => {
+            btn.addEventListener('click', () => this.handlePhoneRang(btn.dataset.phoneRang, btn));
+        });
     },
 
     /**
@@ -105,6 +130,15 @@ const ProfileModule = {
             // Fetch user's tokens
             const tokensResp = await API.tokens.list();
             this.tokens = tokensResp.tokens || [];
+
+            // The phone section shows only where phone calls are configured.
+            this.phoneCodeRequested = false;
+            this.phoneEditing = false;
+            try {
+                this.phone = await API.auth.phone.get();
+            } catch (error) {
+                this.phone = null;
+            }
 
             // Render modal content
             this.renderModal();
@@ -180,6 +214,13 @@ const ProfileModule = {
                             <label>Telegram Integration</label>
                             ${this.renderTelegramSection()}
                         </div>
+
+                        ${this.phone ? `
+                        <!-- Phone Section -->
+                        <div class="form-group phone-integration">
+                            <label>Phone</label>
+                            ${this.renderPhoneSection()}
+                        </div>` : ''}
 
                         <div class="form-actions">
                             <button type="submit" class="btn btn-primary" id="save-profile-btn">
@@ -529,6 +570,160 @@ const ProfileModule = {
             window.showToast && window.showToast(error.message, 'error');
             if (btn) btn.disabled = false;
         }
+    },
+
+    /**
+     * Render the phone section: the number, the call with a code that
+     * verifies it, the provider it is called through, and the test calls that
+     * show a call from each sender number gets through Do Not Disturb.
+     */
+    renderPhoneSection() {
+        const contact = this.phone.contact;
+
+        if (!contact || this.phoneEditing) {
+            return `
+                <div class="slack-connect-state">
+                    <div class="slack-input-group">
+                        <input type="tel" id="phone-value" placeholder="+14155550100"
+                            value="${this.escapeAttr(contact ? contact.value : '')}" autocomplete="tel">
+                        <button type="button" class="btn btn-primary btn-sm" id="phone-save-btn">Save</button>
+                        ${contact ? '<button type="button" class="btn btn-secondary btn-sm" id="phone-cancel-edit-btn">Cancel</button>' : ''}
+                    </div>
+                    <small class="form-hint">International form: a plus, the country code and the number. A new number has to be verified again.</small>
+                </div>
+            `;
+        }
+
+        const verified = !!contact.verified_at;
+        const header = `
+            <div class="slack-connected-state">
+                <div class="slack-info">
+                    <i data-lucide="${verified ? 'check-circle' : 'phone'}" class="${verified ? 'success-icon' : ''}"></i>
+                    <span><strong>${this.escapeHtml(contact.value)}</strong> ${verified ? 'verified' : 'not verified'}</span>
+                </div>
+                <div class="slack-actions">
+                    <button type="button" class="btn btn-secondary btn-sm" id="phone-edit-btn">Change</button>
+                    <button type="button" class="btn btn-danger btn-sm" id="phone-remove-btn">Remove</button>
+                </div>
+            </div>
+        `;
+
+        if (!this.phone.covered) {
+            return header + '<small class="form-hint">No phone provider can call this number. Ask an administrator which countries are covered.</small>';
+        }
+
+        if (!verified) {
+            return header + `
+                <div class="slack-otp-state">
+                    <div class="slack-actions">
+                        <button type="button" class="btn btn-primary btn-sm" id="phone-call-code-btn">Call me with a code</button>
+                    </div>
+                    ${this.phoneCodeRequested ? `
+                    <div class="otp-input-group">
+                        <input type="text" id="phone-code" placeholder="Enter 6-digit code" maxlength="6" autocomplete="one-time-code">
+                        <button type="button" class="btn btn-success btn-sm" id="phone-confirm-code-btn">Confirm</button>
+                    </div>` : ''}
+                    <small class="form-hint">We call the number and say a six-digit code. Calls are only placed to a verified number.</small>
+                </div>
+            `;
+        }
+
+        const providers = this.phone.providers || [];
+        const pin = providers.length > 1 ? `
+            <div class="form-group">
+                <small class="form-hint">Call me through</small>
+                <select id="phone-pin-select">
+                    <option value="">Default order</option>
+                    ${providers.map(p => `<option value="${this.escapeAttr(p.integration_id)}"
+                        ${p.integration_id === contact.pinned_integration_id ? 'selected' : ''}>${this.escapeHtml(p.integration)} (${this.escapeHtml(p.number)})</option>`).join('')}
+                </select>
+                ${contact.pinned_integration_id && !this.phone.pin_active ? '<small class="form-hint">Your choice cannot call this number now; the default order is used.</small>' : ''}
+            </div>` : '';
+
+        const senders = (this.phone.senders || []).map(sender => `
+            <div class="slack-connected-state">
+                <div class="slack-info">
+                    <i data-lucide="${sender.checked_at ? 'bell-ring' : 'bell-off'}" class="${sender.checked_at ? 'success-icon' : ''}"></i>
+                    <span>${this.escapeHtml(sender.number)} ${sender.checked_at ? 'rings through Do Not Disturb' : 'not checked'}</span>
+                </div>
+                <div class="slack-actions">
+                    <button type="button" class="btn btn-secondary btn-sm" data-phone-test="${this.escapeAttr(sender.number)}">Test call</button>
+                    <button type="button" class="btn btn-success btn-sm" data-phone-rang="${this.escapeAttr(sender.number)}">It rang</button>
+                </div>
+            </div>
+        `).join('');
+
+        return header + pin + `
+            <small class="form-hint">
+                Calls come from the numbers below. Save them as one contact
+                (<a href="${API.auth.phone.vcardURL}" download="tokayops.vcf">download the card</a>), then let it through:
+                on iPhone turn on Emergency Bypass for the contact's ringtone and allow it in every Focus, Sleep included;
+                on Android star the contact and allow starred contacts in Do Not Disturb and Bedtime.
+                Then make a test call from each number with Do Not Disturb on and the phone silenced.
+            </small>
+            ${senders}
+        `;
+    },
+
+    async phoneAction(btn, action, success) {
+        if (btn) btn.disabled = true;
+        try {
+            const result = await action();
+            if (result && result.contact !== undefined) {
+                this.phone = result;
+            }
+            if (success) window.showToast && window.showToast(success, 'success');
+            this.renderModal();
+        } catch (error) {
+            window.showToast && window.showToast(error.message, 'error');
+            if (btn) btn.disabled = false;
+        }
+    },
+
+    handleSavePhone() {
+        const value = document.getElementById('phone-value').value.trim();
+        this.phoneCodeRequested = false;
+        this.phoneEditing = false;
+        return this.phoneAction(document.getElementById('phone-save-btn'), () => API.auth.phone.set(value), 'Phone number saved');
+    },
+
+    async handleRemovePhone() {
+        if (!confirm('Remove your phone number? You will not be called until you add and verify one again.')) {
+            return;
+        }
+        this.phoneCodeRequested = false;
+        return this.phoneAction(document.getElementById('phone-remove-btn'), async () => {
+            await API.auth.phone.remove();
+            return API.auth.phone.get();
+        }, 'Phone number removed');
+    },
+
+    handleCallWithCode() {
+        return this.phoneAction(document.getElementById('phone-call-code-btn'), async () => {
+            await API.auth.phone.callWithCode();
+            this.phoneCodeRequested = true;
+        }, 'Calling you now');
+    },
+
+    handleConfirmPhoneCode() {
+        const code = document.getElementById('phone-code').value.trim();
+        return this.phoneAction(document.getElementById('phone-confirm-code-btn'), async () => {
+            const result = await API.auth.phone.confirm(code);
+            this.phoneCodeRequested = false;
+            return result;
+        }, 'Phone number verified');
+    },
+
+    handlePinPhone(integrationId) {
+        return this.phoneAction(null, () => API.auth.phone.pin(integrationId), 'Saved');
+    },
+
+    handlePhoneTestCall(sender, btn) {
+        return this.phoneAction(btn, () => API.auth.phone.testCall(sender), 'Test call on its way from ' + sender);
+    },
+
+    handlePhoneRang(sender, btn) {
+        return this.phoneAction(btn, () => API.auth.phone.confirmTestCall(sender), 'Marked');
     },
 
     /**

@@ -113,6 +113,9 @@ func (s *Service) Erase(ctx context.Context, userID string) error {
 		if err := tx.DeleteUserLinkTokens(ctx, userID); err != nil {
 			return err
 		}
+		if err := tx.DeleteUserPhoneData(ctx, userID); err != nil {
+			return err
+		}
 		if err := tx.NullifyOverrideRevisionReasons(ctx, userID); err != nil {
 			return err
 		}

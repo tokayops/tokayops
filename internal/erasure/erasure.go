@@ -138,6 +138,12 @@ type Tx interface {
 	DeleteUserExternalIdentities(ctx context.Context, userID string) error
 	DeleteUserLinkTokens(ctx context.Context, userID string) error
 
+	// DeleteUserPhoneData removes the person's phone number and what they
+	// confirmed about it, and blanks the number in the log of calls they asked
+	// for. The log rows stay: they are what the person was allowed, and a call
+	// the account paid for, with no address left in them.
+	DeleteUserPhoneData(ctx context.Context, userID string) error
+
 	// CancelLiveOutboundIntentsForUser withdraws what the system still owes the
 	// erased person.
 	//

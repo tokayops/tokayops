@@ -258,6 +258,11 @@ func (t *testErasureTx) DeleteUserLinkTokens(ctx context.Context, userID string)
 	return nil
 }
 
+func (t *testErasureTx) DeleteUserPhoneData(ctx context.Context, userID string) error {
+	t.record("DeleteUserPhoneData")
+	return nil
+}
+
 func (t *testErasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID string) error {
 	t.record("CancelLiveOutboundIntentsForUser")
 	return nil

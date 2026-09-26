@@ -36,6 +36,7 @@ import (
 	"github.com/tokayops/tokayops/internal/outbound/providers"
 	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	telegramprovider "github.com/tokayops/tokayops/internal/outbound/providers/telegram"
+	twilioprovider "github.com/tokayops/tokayops/internal/outbound/providers/twilio"
 	webhookprovider "github.com/tokayops/tokayops/internal/outbound/providers/webhook"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -434,6 +435,7 @@ func main() {
 	apiService.SetScheduleRenderer(scheduleRenderer)
 	apiService.SetUserEraser(erasure.NewService(st.ErasureRepository()))
 	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle
+	apiService.SetPhone(st, twilioprovider.NewClient())
 	// Register the Telegram webhook at boot so TOKAY_SELF_URL + restart suffices (no
 	// need to re-save the integration). Best-effort; goroutine so a slow/unreachable
 	// setWebhook never blocks startup.

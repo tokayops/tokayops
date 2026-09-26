@@ -1760,12 +1760,14 @@ const Components = {
         const typeIconMap = {
             'slack': 'message-square',
             'telegram': 'send',
+            'twilio': 'phone',
             'alertmanager_webhook': 'webhook',
             'generic_webhook': 'webhook'
         };
         const typeNameMap = {
             'slack': 'Slack',
             'telegram': 'Telegram',
+            'twilio': 'Twilio voice',
             'alertmanager_webhook': 'Webhook',
             'generic_webhook': 'Generic Webhook'
         };
@@ -1935,6 +1937,55 @@ const Components = {
                     <small class="form-hint">Requires a reachable webhook: TOKAY_SELF_URL must be set and the secret token configured.</small>
                 </div>
             `;
+        } else if (type === 'twilio') {
+            const accountSid = config?.account_sid || '';
+            const tokenMasked = config?.auth_token === '****';
+            const fromNumber = config?.from_number || '';
+            const coverage = (config?.coverage || []).join(', ');
+            const priority = config?.priority ?? 0;
+            const cps = config?.cps || 1;
+            const maxConcurrent = config?.max_concurrent || 3;
+            const language = config?.language || '';
+
+            return `
+                <div class="form-group">
+                    <label for="config-account-sid">Account SID *</label>
+                    <input type="text" id="config-account-sid" class="form-input" placeholder="AC..." value="${escapeHtml(accountSid)}">
+                </div>
+                <div class="form-group">
+                    <label for="config-auth-token">Auth Token *</label>
+                    <input type="password" id="config-auth-token" class="form-input" autocomplete="new-password"
+                           placeholder="${tokenMasked ? 'Leave empty to keep existing' : 'auth token'}" value="">
+                    ${tokenMasked ? '<small class="form-hint">Current token: ****. Leave empty to keep.</small>' : ''}
+                </div>
+                <div class="form-group">
+                    <label for="config-from-number">Sender number * <span class="tooltip-icon" data-tooltip="The number calls come from, in international form. People add it to their contacts and let it through Do Not Disturb, so keep it fixed."><i data-lucide="help-circle" style="width:14px;height:14px;color:var(--text-muted);"></i></span></label>
+                    <input type="tel" id="config-from-number" class="form-input" placeholder="+14155550100" value="${escapeHtml(fromNumber)}">
+                </div>
+                <div class="form-group">
+                    <label for="config-coverage">Numbers it may call * <span class="tooltip-icon" data-tooltip="Comma-separated prefixes: +7 for Russian numbers only, + for every number. A number no enabled integration covers is never called."><i data-lucide="help-circle" style="width:14px;height:14px;color:var(--text-muted);"></i></span></label>
+                    <input type="text" id="config-coverage" class="form-input" placeholder="+1, +44" value="${escapeHtml(coverage)}">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="config-priority">Priority <span class="tooltip-icon" data-tooltip="Where several integrations cover a number, the lower number goes first."><i data-lucide="help-circle" style="width:14px;height:14px;color:var(--text-muted);"></i></span></label>
+                        <input type="number" id="config-priority" class="form-input" min="0" value="${escapeHtml(String(priority))}">
+                    </div>
+                    <div class="form-group">
+                        <label for="config-cps">Calls per second <span class="tooltip-icon" data-tooltip="The account's CPS, 1 to 5. Integrations on one account share the lowest value."><i data-lucide="help-circle" style="width:14px;height:14px;color:var(--text-muted);"></i></span></label>
+                        <input type="number" id="config-cps" class="form-input" min="1" max="5" value="${escapeHtml(String(cps))}">
+                    </div>
+                    <div class="form-group">
+                        <label for="config-max-concurrent">Calls at once <span class="tooltip-icon" data-tooltip="How many calls the account may have at the same time. Integrations on one account share the lowest value."><i data-lucide="help-circle" style="width:14px;height:14px;color:var(--text-muted);"></i></span></label>
+                        <input type="number" id="config-max-concurrent" class="form-input" min="1" value="${escapeHtml(String(maxConcurrent))}">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="config-language">Voice language <span class="optional">(optional)</span></label>
+                    <input type="text" id="config-language" class="form-input" placeholder="en-US" value="${escapeHtml(language)}">
+                </div>
+                <small class="form-hint">The limits here must not exceed the account's own: whatever goes over is queued by Twilio, outside TokayOps. The account should be used by this installation only.</small>
+            `;
         } else if (type === 'alertmanager_webhook') {
             const secret = config?.secret || '';
             const isMasked = secret === '****';
@@ -2024,7 +2075,7 @@ const Components = {
         // Types grouped by direction
         const typesByDirection = {
             outbound: isAdmin
-                ? [{ value: 'slack', label: 'Slack' }, { value: 'telegram', label: 'Telegram' }, { value: 'generic_webhook', label: 'Generic Webhook' }]
+                ? [{ value: 'slack', label: 'Slack' }, { value: 'telegram', label: 'Telegram' }, { value: 'twilio', label: 'Twilio voice' }, { value: 'generic_webhook', label: 'Generic Webhook' }]
                 : [{ value: 'generic_webhook', label: 'Generic Webhook' }],
             inbound: [{ value: 'alertmanager_webhook', label: 'Alertmanager Webhook' }]
         };

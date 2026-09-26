@@ -82,6 +82,11 @@ definitions:
       outcome:
         type: string
     type: object
+  api.ConfirmPhoneCodeRequest:
+    properties:
+      code:
+        type: string
+    type: object
   api.ConfirmSlackCodeRequest:
     properties:
       code:
@@ -571,6 +576,53 @@ definitions:
       l2:
         $ref: '#/definitions/api.LayerOnCallDTO'
     type: object
+  api.PhoneResponse:
+    properties:
+      contact:
+        $ref: '#/definitions/model.PhoneContact'
+      covered:
+        description: Covered is whether any enabled provider can call the number.
+        type: boolean
+      pin_active:
+        description: PinActive is whether the pinned provider is the one a call would
+          use now.
+        type: boolean
+      providers:
+        description: |-
+          Providers are the enabled providers that cover the number, in the order
+          they are tried.
+        items:
+          $ref: '#/definitions/api.PhoneSender'
+        type: array
+      senders:
+        description: |-
+          Senders are the distinct numbers a call may come from, with the time the
+          person confirmed each gets through Do Not Disturb.
+        items:
+          $ref: '#/definitions/api.PhoneSender'
+        type: array
+    type: object
+  api.PhoneSender:
+    properties:
+      checked_at:
+        type: string
+      integration:
+        type: string
+      integration_id:
+        type: string
+      number:
+        type: string
+    type: object
+  api.PhoneSenderRequest:
+    properties:
+      sender:
+        type: string
+    type: object
+  api.PinPhoneRequest:
+    properties:
+      integration_id:
+        type: string
+    type: object
   api.PolicyRequest:
     properties:
       description:
@@ -931,6 +983,11 @@ definitions:
           type: string
         type: array
       until:
+        type: string
+    type: object
+  api.SetPhoneRequest:
+    properties:
+      value:
         type: string
     type: object
   api.ShiftDTO:
@@ -1383,12 +1440,14 @@ definitions:
     - telegram
     - alertmanager_webhook
     - generic_webhook
+    - twilio
     type: string
     x-enum-varnames:
     - IntegrationTypeSlack
     - IntegrationTypeTelegram
     - IntegrationTypeAlertmanagerWebhook
     - IntegrationTypeGenericWebhook
+    - IntegrationTypeTwilio
   model.OnCallResult:
     properties:
       l1_since:
@@ -1451,6 +1510,21 @@ definitions:
     - OutboxDeliveryRetry
     - OutboxDeliverySent
     - OutboxDeliveryFailed
+  model.PhoneContact:
+    properties:
+      pinned_integration_id:
+        description: |-
+          PinnedIntegrationID is the provider the person prefers to be called
+          through. A preference and not a ban: when it no longer covers the number
+          or is switched off, the others are used in their order.
+        type: string
+      updated_at:
+        type: string
+      value:
+        type: string
+      verified_at:
+        type: string
+    type: object
   model.Team:
     properties:
       created_at:
@@ -1758,6 +1832,267 @@ paths:
           schema:
             $ref: '#/definitions/api.ErrorResponse'
       summary: Update current user profile
+      tags:
+      - auth
+  /api/auth/me/phone:
+    delete:
+      description: Remove the phone number and the Do Not Disturb checks made for
+        it.
+      responses:
+        "204":
+          description: No Content
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Remove my phone
+      tags:
+      - auth
+    get:
+      description: The phone number, whether it is verified, which providers can call
+        it, and the sender numbers with their Do Not Disturb checks.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.PhoneResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get my phone
+      tags:
+      - auth
+    put:
+      consumes:
+      - application/json
+      description: Store the phone number, in E.164 form. A different number starts
+        unverified and unpinned.
+      parameters:
+      - description: Number
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/api.SetPhoneRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.PhoneResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Set my phone
+      tags:
+      - auth
+  /api/auth/me/phone/confirm:
+    post:
+      consumes:
+      - application/json
+      description: Enter the code the call spoke. A code spoken to an earlier number
+        verifies nothing.
+      parameters:
+      - description: Code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/api.ConfirmPhoneCodeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.PhoneResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Confirm my phone
+      tags:
+      - auth
+  /api/auth/me/phone/dnd-check:
+    post:
+      consumes:
+      - application/json
+      description: Call the verified number from one sender number, to check the call
+        gets through Do Not Disturb.
+      parameters:
+      - description: Sender number
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/api.PhoneSenderRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "502":
+          description: Bad Gateway
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Test call from one sender number
+      tags:
+      - auth
+  /api/auth/me/phone/dnd-confirm:
+    post:
+      consumes:
+      - application/json
+      description: Record that the test call from a sender rang through Do Not Disturb.
+        Needs a test call from that sender within the last hour.
+      parameters:
+      - description: Sender number
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/api.PhoneSenderRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.PhoneResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Mark that a test call came through
+      tags:
+      - auth
+  /api/auth/me/phone/pin:
+    put:
+      consumes:
+      - application/json
+      description: Prefer one of the providers that cover the number; an empty id
+        clears the preference.
+      parameters:
+      - description: Provider
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/api.PinPhoneRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.PhoneResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Prefer a phone provider
+      tags:
+      - auth
+  /api/auth/me/phone/vcard:
+    get:
+      description: A vCard named TokayOps with every number a call to this phone may
+        come from, to add to contacts and allow through Do Not Disturb.
+      produces:
+      - text/vcard
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: string
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Contact card of the sender numbers
+      tags:
+      - auth
+  /api/auth/me/phone/verify-call:
+    post:
+      description: Call the number and speak a six-digit code that verifies it. One
+        call at a time; a few per hour.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "502":
+          description: Bad Gateway
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Call my phone with a code
       tags:
       - auth
   /api/auth/me/slack:

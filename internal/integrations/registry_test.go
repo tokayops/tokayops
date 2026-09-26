@@ -16,6 +16,7 @@ func TestValidTypes_SortedAndComplete(t *testing.T) {
 		model.IntegrationTypeGenericWebhook,
 		model.IntegrationTypeSlack,
 		model.IntegrationTypeTelegram,
+		model.IntegrationTypeTwilio,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ValidTypes() = %v, want %v (sorted asc)", got, want)
