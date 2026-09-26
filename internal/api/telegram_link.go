@@ -40,8 +40,8 @@ func generateTelegramToken() (string, error) {
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/telegram/link [post]
 func (a *API) RequestTelegramLink(c echo.Context) error {
-	if err := a.requireSessionAuth(c); err != nil {
-		return err
+	if !a.sessionOnly(c) {
+		return nil
 	}
 	userID, ok := c.Get("user_id").(string)
 	if !ok {
@@ -104,8 +104,8 @@ func (a *API) RequestTelegramLink(c echo.Context) error {
 // @Failure 500 {object} ErrorResponse
 // @Router /api/auth/me/telegram [delete]
 func (a *API) UnbindTelegram(c echo.Context) error {
-	if err := a.requireSessionAuth(c); err != nil {
-		return err
+	if !a.sessionOnly(c) {
+		return nil
 	}
 	userID, ok := c.Get("user_id").(string)
 	if !ok {

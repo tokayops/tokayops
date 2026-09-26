@@ -60,8 +60,8 @@ type APITokenListResponse struct {
 // @Router /api/v1/tokens [post]
 func (a *API) CreateAPIToken(c echo.Context) error {
 	// Require session auth - don't allow Bearer tokens to create more tokens
-	if err := a.requireSessionAuth(c); err != nil {
-		return err
+	if !a.sessionOnly(c) {
+		return nil
 	}
 
 	userID, ok := c.Get("user_id").(string)
@@ -130,8 +130,8 @@ func (a *API) CreateAPIToken(c echo.Context) error {
 // @Router /api/v1/tokens [get]
 func (a *API) ListAPITokens(c echo.Context) error {
 	// Require session auth - token list is sensitive
-	if err := a.requireSessionAuth(c); err != nil {
-		return err
+	if !a.sessionOnly(c) {
+		return nil
 	}
 
 	userID, ok := c.Get("user_id").(string)
@@ -177,8 +177,8 @@ func (a *API) ListAPITokens(c echo.Context) error {
 // @Router /api/v1/tokens/{id} [delete]
 func (a *API) DeleteAPIToken(c echo.Context) error {
 	// Require session auth - don't allow Bearer tokens to revoke tokens
-	if err := a.requireSessionAuth(c); err != nil {
-		return err
+	if !a.sessionOnly(c) {
+		return nil
 	}
 
 	tokenID := c.Param("id")

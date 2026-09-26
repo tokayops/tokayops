@@ -267,7 +267,7 @@ func TestAPITokensRequireSession(t *testing.T) {
 		// Mock token to delete (need to existence check?)
 		// RBAC middleware runs first. ScopeFromResource checks existence.
 		// If we pass nonexistent, we get 404.
-		// If we pass existent, we get 403 (because requireSessionAuth).
+		// If we pass existent, we get 403 (because sessionOnly).
 		// We can reuse "session-token" itself.
 		req := httptest.NewRequest(http.MethodDelete, "/api/v1/tokens/session-token", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
