@@ -254,17 +254,18 @@ func claimStatement(phase outbound.ClaimPhase) (string, error) {
 // nothing to do with.
 func (s *Store) RecoverStaleAttempts(ctx context.Context, family string, limit int) ([]outbound.Recovered, error) {
 	type candidate struct {
-		intentID  string
-		attemptID string
-		groupID   string
-		policy    outbound.AmbiguityPolicy
+		intentID   string
+		attemptID  string
+		groupID    string
+		policy     outbound.AmbiguityPolicy
+		completion outbound.CompletionMode
 	}
 
 	// An unlocked read: the guards are re-checked under the lock below, so a
 	// candidate that stops qualifying between the two is skipped rather than
 	// mishandled.
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, current_attempt_id, COALESCE(alert_group_id, ''), ambiguity_policy
+		SELECT id, current_attempt_id, COALESCE(alert_group_id, ''), ambiguity_policy, completion_mode
 		FROM outbound_intents
 		WHERE delivery_family = $1 AND status = 'sending' AND locked_until <= now()
 		ORDER BY locked_until, id
@@ -275,7 +276,7 @@ func (s *Store) RecoverStaleAttempts(ctx context.Context, family string, limit i
 	var candidates []candidate
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.intentID, &c.attemptID, &c.groupID, &c.policy); err != nil {
+		if err := rows.Scan(&c.intentID, &c.attemptID, &c.groupID, &c.policy, &c.completion); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -290,7 +291,11 @@ func (s *Store) RecoverStaleAttempts(ctx context.Context, family string, limit i
 	for _, c := range candidates {
 		// The group is locked first for anything that could end up writing to
 		// it - here, a policy that turns doubt into a success.
-		lockGroup := c.groupID != "" && c.policy == outbound.PolicyAssumeAccepted
+		// So is a call whose acceptance only means "queued": an event about
+		// one of its calls may already have said how it ended, and the
+		// verdict asked below writes to the group.
+		lockGroup := c.groupID != "" && (c.policy == outbound.PolicyAssumeAccepted ||
+			c.completion == outbound.CompletionOnProviderReceipt)
 
 		result, err := s.recoverOne(ctx, c.intentID, c.attemptID, c.groupID, lockGroup)
 		if err != nil {
@@ -386,6 +391,15 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 	if err != nil {
 		return nil, err
 	}
+	// The worker died, and an event about this commitment's call may have
+	// come in while it held the request: it was applied to the object and is
+	// not coming again. A call known to have taken place settles the
+	// commitment here, as Finalize would have.
+	if settled, discharged, err := dischargedByEarlierCallTx(ctx, tx, *intent); err != nil {
+		return nil, err
+	} else if discharged {
+		transition = settled
+	}
 
 	backoff, err := outbound.BackoffFor(intent.Family, intent.FailureStreak+1)
 	if err != nil {
@@ -400,6 +414,21 @@ func (s *Store) recoverOne(ctx context.Context, intentID, attemptID, groupID str
 		Reason:          "the lease expired with an attempt in flight",
 	}); err != nil {
 		return nil, err
+	}
+	// And a call known to be ringing, or known not to have happened, decides
+	// the repeat the recovery just scheduled - the same question Finalize asks.
+	if intent.CompletionMode == outbound.CompletionOnProviderReceipt && transition.To == outbound.StatusPending {
+		after, err := readIntentTx(ctx, tx, intent.ID)
+		if err != nil {
+			return nil, err
+		}
+		moved, err := reviewReceiptTx(ctx, tx, *after, false)
+		if err != nil {
+			return nil, err
+		}
+		if moved.To != "" {
+			transition = moved
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1320,6 +1349,15 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	if err != nil {
 		return outbound.FinalizeResult{}, err
 	}
+	// An earlier call of this commitment is already known to have taken
+	// place. Whatever this request came to, the commitment is settled by that
+	// call - not failed by a refusal of the repeat, and not the reason the
+	// escalation stops.
+	if settled, discharged, err := dischargedByEarlierCallTx(ctx, tx, *intent); err != nil {
+		return outbound.FinalizeResult{}, err
+	} else if discharged {
+		transition = settled
+	}
 
 	// The attempt's own record. The receipt and the summary are refused if the
 	// recipient has been erased - both can carry an address - while the
@@ -1387,7 +1425,7 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	// this answer may already have said how the call ended, or that the
 	// doubtful call this attempt leaves behind is ringing.
 	if intent.CompletionMode == outbound.CompletionOnProviderReceipt {
-		if transition.To == outbound.StatusAwaitingReceipt {
+		if completion.Outcome == keys.OutcomeAccepted {
 			if err := recordAcceptedEffectTx(ctx, tx, *intent, req.AttemptID, settledRef); err != nil {
 				return outbound.FinalizeResult{}, err
 			}

@@ -351,15 +351,21 @@ func TestADoubtfulCallHeardFromLater(t *testing.T) {
 		}
 	})
 
-	t.Run("it was not placed: the repeat stands", func(t *testing.T) {
+	t.Run("it was not placed: repeated as a new generation", func(t *testing.T) {
 		s := setupTestDB(t)
 		asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 		_, intentID := admitCall(t, s)
 		doubtful := placeCall(t, s, intentID, concluded(outbound.OutcomeAmbiguous, "timeout"))
 
-		hear(t, s, callEvent(doubtful.AttemptID, "CA1", "failed", seqOf(4)))
-		if got := statusOf(t, s, intentID); got != outbound.StatusPending {
-			t.Fatalf("a doubtful call that did not happen left the commitment %s", got)
+		result := hear(t, s, callEvent(doubtful.AttemptID, "CA1", "failed", seqOf(4)))
+		if result.To != outbound.StatusPending || result.Row != "T36p" {
+			t.Fatalf("a doubtful call that did not happen: %+v", result)
+		}
+		// No doubt is left, so the repeat resolves afresh rather than going
+		// back through the integration that just failed under the same key.
+		if n := countOf(t, s, `SELECT count(*) FROM outbound_intents
+			WHERE id = $1 AND generation_no = 1 AND create_key IS NULL`, intentID); n != 1 {
+			t.Fatal("the repeat stayed in the generation that failed")
 		}
 	})
 }
@@ -544,5 +550,63 @@ func TestAnEventThatSettlesNothingDoesNotPushTheNextLook(t *testing.T) {
 	due, err := s.ClaimDueReceipts(context.Background(), outbound.FamilyCall, 10)
 	if err != nil || len(due) != 1 {
 		t.Fatalf("the wait that was due is no longer: %+v, %v", due, err)
+	}
+}
+
+// The worker died with a request open, and an event about the call came in
+// while it held it. The event was applied and is not coming again; recovery
+// asks the same question Finalize would have.
+func TestRecoveryHearsWhatCameInWhileTheWorkerWasGone(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		to     outbound.Status
+		row    string
+	}{
+		{"completed", outbound.StatusSucceeded, "T35s"},
+		{"ringing", outbound.StatusAwaitingReceipt, "T39"},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			s := setupTestDB(t)
+			asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
+			_, intentID := admitCall(t, s)
+			token := claimCall(t, s, intentID)
+			begun := beginOne(t, s, intentID, token)
+			_ = token
+
+			hear(t, s, callEvent(begun.AttemptID, "CA1", tc.status, seqOf(3)))
+			expireLease(t, s, intentID)
+
+			recovered, err := s.RecoverStaleAttempts(context.Background(), outbound.FamilyCall, 10)
+			if err != nil || len(recovered) != 1 {
+				t.Fatalf("recover: %+v, %v", recovered, err)
+			}
+			if recovered[0].To != tc.to || recovered[0].Row != tc.row {
+				t.Fatalf("recovered to %s (%s), want %s (%s)", recovered[0].To, recovered[0].Row, tc.to, tc.row)
+			}
+		})
+	}
+}
+
+// The first call ended in doubt; while the repeat was being placed, the first
+// one was heard to have taken place. The repeat is then refused for good: the
+// commitment is settled by the first call, not failed by the second.
+func TestARefusedRepeatDoesNotUndoACallThatTookPlace(t *testing.T) {
+	s := setupTestDB(t)
+	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
+	_, intentID := admitCall(t, s)
+	doubtful := placeCall(t, s, intentID, concluded(outbound.OutcomeAmbiguous, "timeout"))
+	exec(t, s, `UPDATE outbound_intents SET next_attempt_at = now() WHERE id = $1`, intentID)
+
+	token := claimCall(t, s, intentID)
+	repeat := beginOne(t, s, intentID, token)
+	hear(t, s, callEvent(doubtful.AttemptID, "CA1", "completed", seqOf(3)))
+
+	result := finalize(t, s, repeat.AttemptID, token, concluded(outbound.OutcomePermanentRejection, "invalid_number"))
+	if result.To != outbound.StatusSucceeded || result.Row != "T35s" {
+		t.Fatalf("a refused repeat after a call that took place: %s (%s)", result.To, result.Row)
+	}
+	if n := countOf(t, s, `SELECT count(*) FROM outbound_attempts
+		WHERE id = $1 AND outcome = 'permanent_rejection'`, repeat.AttemptID); n != 1 {
+		t.Fatal("the repeat's own answer was not kept as it was")
 	}
 }

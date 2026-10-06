@@ -300,13 +300,17 @@ func reviewReceiptTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
 	}
 
 	if intent.Status == outbound.StatusPending {
-		// A call due to be repeated after a doubtful attempt. Only a call that
-		// did happen, or one known to be ringing, changes that; anything else
-		// leaves the repeat to happen.
-		if verdict == outbound.VerdictStillGoing && !hasKnownLiveEffect(facts) {
-			return outbound.Transition{}, nil
-		}
-		if verdict != outbound.VerdictHappened && verdict != outbound.VerdictStillGoing {
+		// A call due to be repeated after a doubtful attempt. A call that did
+		// happen ends it; one known to be ringing is waited for; one known not
+		// to have happened, with no doubt left, is repeated as a new
+		// generation. Doubt alone leaves the repeat as it was.
+		switch verdict {
+		case outbound.VerdictHappened, outbound.VerdictNotPlaced:
+		case outbound.VerdictStillGoing:
+			if !hasKnownLiveEffect(facts) {
+				return outbound.Transition{}, nil
+			}
+		default:
 			return outbound.Transition{}, nil
 		}
 	}
@@ -345,6 +349,35 @@ func reviewReceiptTx(ctx context.Context, tx *sql.Tx, intent outbound.Intent,
 		return outbound.Transition{}, err
 	}
 	return transition, nil
+}
+
+// dischargedByEarlierCallTx says whether a call of this commitment is already
+// known to have taken place - an event about it came in while a request was
+// open - and if so, the transition that ends the commitment as settled. Asked
+// before a request's own outcome is allowed to end the commitment: a refusal
+// of a repeat must not fail a commitment whose first call reached somebody,
+// nor stop the escalation behind it.
+func dischargedByEarlierCallTx(ctx context.Context, tx *sql.Tx,
+	intent outbound.Intent) (outbound.Transition, bool, error) {
+
+	if intent.CompletionMode != outbound.CompletionOnProviderReceipt || intent.Form != outbound.FormOneShot {
+		return outbound.Transition{}, false, nil
+	}
+	facts, err := generationFactsTx(ctx, tx, intent)
+	if err != nil {
+		return outbound.Transition{}, false, err
+	}
+	verdict, err := outbound.GenerationVerdict(facts)
+	if err != nil || verdict != outbound.VerdictHappened {
+		return outbound.Transition{}, false, err
+	}
+	transition, err := outbound.Decide(outbound.Input{
+		Intent: intent, Trigger: outbound.TriggerVerdict, Verdict: outbound.VerdictHappened,
+	})
+	if err != nil {
+		return outbound.Transition{}, false, err
+	}
+	return transition, true, nil
 }
 
 // generationFactsTx reads what the verdict depends on.

@@ -373,6 +373,20 @@ func TestDecideNamedRows(t *testing.T) {
 			},
 			to: StatusAwaitingReceipt, row: "T39",
 		},
+		{
+			name: "a doubtful call due to be repeated was definitely not placed",
+			in: Input{
+				Intent: receiptIntent(StatusPending), Trigger: TriggerVerdict, Verdict: VerdictNotPlaced,
+			},
+			to: StatusPending, row: "T36p",
+		},
+		{
+			name: "an earlier call took place while this request was open",
+			in: Input{
+				Intent: receiptIntent(StatusSending), Trigger: TriggerVerdict, Verdict: VerdictHappened,
+			},
+			to: StatusSucceeded, row: "T35s",
+		},
 	}
 
 	for _, tc := range cases {
@@ -491,11 +505,18 @@ func TestDecideRefusesWhatItDoesNotHave(t *testing.T) {
 			}(),
 		},
 		{
-			// The repeat after a doubtful call is exactly what a call that
-			// definitely did not happen needs.
-			name: "a verdict of not placed for a call due to be repeated",
+			// The wait belongs to an accepted call; a call due to be repeated
+			// has none to be over.
+			name: "the end of a wait for a call due to be repeated",
 			in: func() Input {
 				i := receiptIntent(StatusPending)
+				return Input{Intent: i, Trigger: TriggerVerdict, Verdict: VerdictUnknown}
+			}(),
+		},
+		{
+			name: "a request still open, and nothing known to have happened",
+			in: func() Input {
+				i := receiptIntent(StatusSending)
 				return Input{Intent: i, Trigger: TriggerVerdict, Verdict: VerdictNotPlaced}
 			}(),
 		},

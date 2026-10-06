@@ -577,6 +577,8 @@ func decideVerdict(in Input) (Transition, error) {
 		return verdictWhileAwaiting(in)
 	case StatusPending:
 		return verdictWhilePending(in)
+	case StatusSending:
+		return verdictWhileSending(in)
 	default:
 		return Transition{}, invalidf("a verdict for a commitment in %s", in.Intent.Status)
 	}
@@ -629,6 +631,25 @@ func verdictWhileAwaiting(in Input) (Transition, error) {
 	}
 }
 
+// verdictWhileSending is a request ending - answered, or abandoned with its
+// lease - for a commitment one of whose earlier calls is already known to have
+// taken place: the event about it came in while this request was open. The
+// obligation was discharged by that call, whatever this request comes to; a
+// refusal of it must not end the commitment as failed, nor stop the
+// escalation behind it.
+func verdictWhileSending(in Input) (Transition, error) {
+	if in.Verdict != VerdictHappened {
+		return Transition{}, invalidf("verdict %s for a commitment whose request is still open", in.Verdict)
+	}
+	settled, err := settleApplied(in, ProofProviderConfirmed, "T35")
+	if err != nil {
+		return Transition{}, err
+	}
+	settled.Row = "T35s"
+	settled.Effects.ConsumeCancellation = in.Intent.CancellationRequested
+	return settled, nil
+}
+
 func verdictWhilePending(in Input) (Transition, error) {
 	switch in.Verdict {
 	case VerdictHappened:
@@ -648,6 +669,30 @@ func verdictWhilePending(in Input) (Transition, error) {
 				AwaitReceipt: true,
 			},
 			Row: "T39",
+		}, nil
+
+	case VerdictNotPlaced:
+		if in.Intent.ObligationWithdrawn {
+			return Transition{
+				To:      StatusCanceled,
+				Effects: Effects{ClearLease: true, Timeline: TimelineCanceled},
+				Row:     "T36w",
+			}, nil
+		}
+		// The doubtful call turned out definitely not to have happened, and no
+		// doubt is left in the generation. The repeat goes ahead - as a new
+		// generation, resolved afresh, not through the integration that just
+		// failed under the same key.
+		return Transition{
+			To: StatusPending,
+			Effects: Effects{
+				ClearLease:        true,
+				NewGeneration:     true,
+				ScheduleNow:       true,
+				BumpFailureStreak: true,
+				Timeline:          TimelineNotPlaced,
+			},
+			Row: "T36p",
 		}, nil
 
 	default:
