@@ -48,8 +48,8 @@ type RequestSlackCodeRequest struct {
 // @Failure 500 {object} ErrorResponse
 // @Router /api/auth/me/slack/request-code [post]
 func (a *API) RequestSlackCode(c echo.Context) error {
-	if err := a.requireSessionAuth(c); err != nil {
-		return err
+	if !a.sessionOnly(c) {
+		return nil
 	}
 
 	userID, ok := c.Get("user_id").(string)
@@ -121,8 +121,8 @@ type ConfirmSlackCodeRequest struct {
 // @Failure 500 {object} ErrorResponse
 // @Router /api/auth/me/slack/confirm-code [post]
 func (a *API) ConfirmSlackCode(c echo.Context) error {
-	if err := a.requireSessionAuth(c); err != nil {
-		return err
+	if !a.sessionOnly(c) {
+		return nil
 	}
 
 	userID, ok := c.Get("user_id").(string)
@@ -171,8 +171,8 @@ func (a *API) ConfirmSlackCode(c echo.Context) error {
 // @Failure 500 {object} ErrorResponse
 // @Router /api/auth/me/slack [delete]
 func (a *API) UnbindSlack(c echo.Context) error {
-	if err := a.requireSessionAuth(c); err != nil {
-		return err
+	if !a.sessionOnly(c) {
+		return nil
 	}
 
 	userID, ok := c.Get("user_id").(string)

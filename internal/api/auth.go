@@ -159,8 +159,8 @@ type UpdateMeRequest struct {
 // @Router /api/auth/me [patch]
 func (a *API) UpdateMe(c echo.Context) error {
 	// Profile updates require session authentication (no Bearer tokens)
-	if err := a.requireSessionAuth(c); err != nil {
-		return err
+	if !a.sessionOnly(c) {
+		return nil
 	}
 
 	userID, ok := c.Get("user_id").(string)
@@ -246,14 +246,21 @@ func (a *API) AuthMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
-// requireSessionAuth checks that the request uses cookie auth, not Bearer token.
-// This is used for sensitive operations like token management where we don't want
-// a stolen API token to be able to create more tokens.
-func (a *API) requireSessionAuth(c echo.Context) error {
+// sessionOnly refuses a request made with an API token, for the operations a
+// stolen token must not reach: making more tokens, and changing the profile
+// and the accounts linked to it. It reports whether the request may go on;
+// when it may not, the refusal is already written and the handler returns
+// without doing anything.
+//
+// A bool and not an error, on purpose. The helper this replaces wrote the 403
+// and returned what c.JSON returned - nil once the write succeeded - and every
+// caller read nil as "go on": the refusal went out and the action ran anyway.
+func (a *API) sessionOnly(c echo.Context) bool {
 	if isAPIToken, _ := c.Get("api_token").(bool); isAPIToken {
-		return c.JSON(http.StatusForbidden, ErrorResponse{Error: "session authentication required"})
+		_ = c.JSON(http.StatusForbidden, ErrorResponse{Error: "session authentication required"})
+		return false
 	}
-	return nil
+	return true
 }
 
 // validateAPIToken validates an API token and returns the token record

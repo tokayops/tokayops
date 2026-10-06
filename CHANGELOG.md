@@ -9,6 +9,13 @@ Each release converts to the Apache License 2.0 two years after it ships, per
 
 ## [Unreleased]
 
+### Security
+
+- **An API token can no longer act on the routes reserved for a signed-in
+  session.** Changing the profile, linking or unlinking Slack and Telegram, and
+  listing, creating or revoking API tokens answered an API token with 403 and
+  then did what was asked anyway. The refusal now stops the request.
+
 ## [0.3.0] - 2026-09-25
 
 Converts to Apache-2.0 on 2028-09-25.
