@@ -254,6 +254,22 @@ var (
 		Help: "Refusals that indicate a broken contract rather than a failed delivery.",
 	}, []string{"op", "kind"})
 
+	// OutboundProviderEventsTotal counts what became of each event a provider
+	// sent about a call it accepted: applied, ignored (its commitment had ended,
+	// or its status is one this build does not know), or unmatched - waiting
+	// for an attempt that may never turn up.
+	OutboundProviderEventsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_provider_events_total",
+		Help: "Provider events about accepted calls, by what applying them came to.",
+	}, []string{"provider", "outcome"})
+
+	// OutboundReceiptPollsTotal counts the questions put to a provider about a
+	// call it accepted and has not said the end of: answered, or failed to ask.
+	OutboundReceiptPollsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "outbound_receipt_polls_total",
+		Help: "Polls of a provider about accepted calls, by result.",
+	}, []string{"family", "result"})
+
 	// OutboundAdmissionsTotal counts what happened to each admission offered to
 	// the domain.
 	//
@@ -486,6 +502,8 @@ func init() {
 	register(OutboundAttemptsTotal)
 	register(OutboundIntentsTerminalTotal)
 	register(OutboundContractViolationsTotal)
+	register(OutboundProviderEventsTotal)
+	register(OutboundReceiptPollsTotal)
 	register(OutboundAdmissionsTotal)
 	register(OutboundDesiredRevisionsTotal)
 	register(OutboundAdmissionLatencySeconds)

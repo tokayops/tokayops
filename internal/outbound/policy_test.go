@@ -14,11 +14,29 @@ import (
 // set of the same numbers, and the way it goes wrong is by being written as a
 // copy with one value changed.
 func TestTheDeadlinesFitInsideEachOther(t *testing.T) {
-	for _, family := range []string{FamilyNotification, FamilyHandoff, FamilyWebhook} {
+	for _, family := range []string{FamilyNotification, FamilyHandoff, FamilyWebhook, FamilyCall} {
 		t.Run(family, func(t *testing.T) {
 			p, err := PolicyOf(family)
 			if err != nil {
 				t.Fatalf("no policy for %s: %v", family, err)
+			}
+
+			// The wait for the provider's word: asked first after the call can
+			// have ended, again at an interval, and given up on well after
+			// both. A deadline inside the first wait would assume a call
+			// happened before it could have rung out; a poll that may outlast
+			// its interval would overlap the next.
+			if r := p.Receipt; r != nil {
+				if r.FirstWait <= 0 || r.PollInterval <= 0 || r.PollDeadline <= 0 {
+					t.Errorf("a wait with a zero step: %+v", r)
+				}
+				if r.Deadline <= r.FirstWait+r.PollInterval {
+					t.Errorf("the wait ends at %s, before a first wait of %s and one poll after it",
+						r.Deadline, r.FirstWait)
+				}
+				if r.PollDeadline >= r.PollInterval {
+					t.Errorf("one poll may take %s and the next is due after %s", r.PollDeadline, r.PollInterval)
+				}
 			}
 
 			// The third inequality, and the reason the attempt deadline is a

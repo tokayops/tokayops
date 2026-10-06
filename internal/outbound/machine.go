@@ -70,6 +70,11 @@ const (
 
 	// TriggerOperator is a person deciding what a stuck commitment should do.
 	TriggerOperator Trigger = "operator"
+
+	// TriggerVerdict is what the provider has said, added up: the effects of a
+	// commitment whose acceptance only meant "queued" have settled, or have
+	// not, or the wait for them is over.
+	TriggerVerdict Trigger = "verdict"
 )
 
 // Decision is what an operator chose.
@@ -96,15 +101,17 @@ func Decisions() []Decision {
 type TimelineKind string
 
 const (
-	TimelineNone             TimelineKind = ""
-	TimelineSent             TimelineKind = "sent"
-	TimelineDelivered        TimelineKind = "delivered"
-	TimelineAssumedAccepted  TimelineKind = "assumed_accepted"
-	TimelineFailed           TimelineKind = "failed"
-	TimelineExpired          TimelineKind = "expired"
-	TimelineCanceled         TimelineKind = "canceled"
-	TimelineSentAlongsideAck TimelineKind = "sent_alongside_cancel"
-	TimelineLeaseLost        TimelineKind = "lease_lost"
+	TimelineNone              TimelineKind = ""
+	TimelineSent              TimelineKind = "sent"
+	TimelineProviderConfirmed TimelineKind = "provider_confirmed"
+	TimelineHandedOver        TimelineKind = "handed_over"
+	TimelineNotPlaced         TimelineKind = "not_placed"
+	TimelineAssumedAccepted   TimelineKind = "assumed_accepted"
+	TimelineFailed            TimelineKind = "failed"
+	TimelineExpired           TimelineKind = "expired"
+	TimelineCanceled          TimelineKind = "canceled"
+	TimelineSentAlongsideAck  TimelineKind = "sent_alongside_cancel"
+	TimelineLeaseLost         TimelineKind = "lease_lost"
 )
 
 // Input is everything a transition can depend on.
@@ -138,6 +145,9 @@ type Input struct {
 
 	// Expired says the commitment's own deadline has passed, as of now.
 	Expired bool
+
+	// Verdict is the effects of the commitment added up, for TriggerVerdict.
+	Verdict Verdict
 
 	// Decision, and the facts its guards need, for TriggerOperator.
 	Decision              Decision
@@ -176,6 +186,14 @@ type Effects struct {
 
 	RecordDuplicateRisk bool
 	RaiseFailureSignal  bool
+
+	// AwaitReceipt starts, or goes on with, the wait for the provider's word:
+	// when to ask next, and - once per generation - when to stop asking.
+	AwaitReceipt bool
+
+	// WithdrawObligation records that what the commitment was for no longer
+	// needs doing, while the effect it made may still be under way.
+	WithdrawObligation bool
 
 	Timeline TimelineKind
 }
@@ -216,6 +234,8 @@ func decide(in Input) (Transition, error) {
 		return decideRecover(in)
 	case TriggerOperator:
 		return decideOperator(in)
+	case TriggerVerdict:
+		return decideVerdict(in)
 	default:
 		return Transition{}, invalidf("unknown trigger %q", in.Trigger)
 	}
@@ -286,6 +306,20 @@ func decideFinish(in Input) (Transition, error) {
 	}
 
 	if in.Intent.CancellationRequested {
+		if in.Outcome == OutcomeAccepted && in.Intent.CompletionMode == CompletionOnProviderReceipt {
+			// The request to stop arrived while the call was being placed, and
+			// the provider took it. The call exists; whether it happens is
+			// still worth knowing, and the history has to say what it was.
+			// What the withdrawal changes is recorded with it: a call that
+			// turns out not to have happened is not made again.
+			waiting, err := awaitReceipt(in, "T16r")
+			if err != nil {
+				return Transition{}, err
+			}
+			waiting.Effects.ConsumeCancellation = true
+			waiting.Effects.WithdrawObligation = true
+			return waiting, nil
+		}
 		if in.Outcome == OutcomeAccepted {
 			settled, err := settleApplied(in, ProofAccepted, "T16")
 			if err != nil {
@@ -496,13 +530,128 @@ func reduceProviderAcceptance(in Input, row string) (Transition, error) {
 	case CompletionOnAcceptance:
 		return settleApplied(in, ProofAccepted, row)
 	case CompletionOnProviderReceipt:
-		// The channel would go on to wait for the provider's own confirmation.
-		// Nothing may be admitted in that mode yet, so reaching here means the
-		// validation that guarantees it has been bypassed.
-		return Transition{}, invalidf("completion mode %s is not reachable in this build",
-			in.Intent.CompletionMode)
+		return awaitReceipt(in, row+"r")
 	default:
 		return Transition{}, invalidf("unknown completion mode %q", in.Intent.CompletionMode)
+	}
+}
+
+// awaitReceipt is an acceptance that only means "queued": the call exists at
+// the provider, and the commitment waits to hear what became of it.
+//
+// One-shot only. An editable card is changed after it is made, and a change
+// to a message whose very existence is still unconfirmed has nothing to be
+// aimed at.
+func awaitReceipt(in Input, row string) (Transition, error) {
+	if in.Intent.Form != FormOneShot {
+		return Transition{}, invalidf("only a one-shot commitment waits for the provider's word")
+	}
+	return Transition{
+		To: StatusAwaitingReceipt,
+		Effects: Effects{
+			ClearLease:          true,
+			ClearCurrentAttempt: true,
+			ResetFailureStreak:  true,
+			StoreReceipt:        true,
+			AwaitReceipt:        true,
+			Timeline:            TimelineHandedOver,
+		},
+		Row: row,
+	}, nil
+}
+
+// decideVerdict is what the provider's word, added up, does to a commitment.
+//
+// From awaiting_receipt it ends the wait one of four ways. From pending - a
+// call whose request ended in doubt and is due to be made again - only two
+// verdicts mean anything: the doubtful call did happen, so the repeat is not
+// needed, or it is known and still going, so the repeat would be a second call
+// while the first is ringing. Anything else leaves the repeat to happen, and
+// asking is a caller's mistake.
+func decideVerdict(in Input) (Transition, error) {
+	if in.Intent.CompletionMode != CompletionOnProviderReceipt || in.Intent.Form != FormOneShot {
+		return Transition{}, invalidf("a verdict for a commitment that does not wait for one")
+	}
+	switch in.Intent.Status {
+	case StatusAwaitingReceipt:
+		return verdictWhileAwaiting(in)
+	case StatusPending:
+		return verdictWhilePending(in)
+	default:
+		return Transition{}, invalidf("a verdict for a commitment in %s", in.Intent.Status)
+	}
+}
+
+func verdictWhileAwaiting(in Input) (Transition, error) {
+	switch in.Verdict {
+	case VerdictHappened:
+		return settleApplied(in, ProofProviderConfirmed, "T35")
+
+	case VerdictNotPlaced:
+		if in.Intent.ObligationWithdrawn {
+			// Nobody needs it any more, and it did not happen: nothing to do
+			// again.
+			return Transition{
+				To:      StatusCanceled,
+				Effects: Effects{Timeline: TimelineCanceled},
+				Row:     "T36w",
+			}, nil
+		}
+		// The provider says, definitely, that the call did not take place.
+		// Repeating the same request at the same address under the same key
+		// would repeat the failure; a new generation resolves afresh.
+		return Transition{
+			To: StatusPending,
+			Effects: Effects{
+				NewGeneration:     true,
+				ScheduleNow:       true,
+				BumpFailureStreak: true,
+				Timeline:          TimelineNotPlaced,
+			},
+			Row: "T36",
+		}, nil
+
+	case VerdictUnknown:
+		// The wait is over and nothing settled it. The call was accepted into
+		// the provider's queue; counting on the next step of the policy is
+		// better than a second call in a storm.
+		return settleApplied(in, ProofAssumed, "T37")
+
+	case VerdictStillGoing:
+		return Transition{
+			To:      StatusAwaitingReceipt,
+			Effects: Effects{AwaitReceipt: true},
+			Row:     "T38",
+		}, nil
+
+	default:
+		return Transition{}, invalidf("unknown verdict %q", in.Verdict)
+	}
+}
+
+func verdictWhilePending(in Input) (Transition, error) {
+	switch in.Verdict {
+	case VerdictHappened:
+		settled, err := settleApplied(in, ProofProviderConfirmed, "T35")
+		if err != nil {
+			return Transition{}, err
+		}
+		settled.Row = "T35p"
+		return settled, nil
+
+	case VerdictStillGoing:
+		return Transition{
+			To: StatusAwaitingReceipt,
+			Effects: Effects{
+				ClearLease:   true,
+				StoreReceipt: true,
+				AwaitReceipt: true,
+			},
+			Row: "T39",
+		}, nil
+
+	default:
+		return Transition{}, invalidf("verdict %s leaves a pending commitment to its repeat", in.Verdict)
 	}
 }
 
@@ -527,8 +676,8 @@ func settleApplied(in Input, proof Proof, row string) (Transition, error) {
 	switch proof {
 	case ProofAccepted:
 		effects.Timeline = TimelineSent
-	case ProofDelivered:
-		effects.Timeline = TimelineDelivered
+	case ProofProviderConfirmed:
+		effects.Timeline = TimelineProviderConfirmed
 	case ProofAssumed:
 		effects.Timeline = TimelineAssumedAccepted
 		effects.RecordDuplicateRisk = true

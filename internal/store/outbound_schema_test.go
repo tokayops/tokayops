@@ -948,6 +948,11 @@ func TestOutboundIndexesAreDeclaredOnce(t *testing.T) {
 		"idx_outbound_intents_journal":         false,
 		"idx_outbound_intents_retention":       false,
 		"idx_outbound_intents_parent":          false,
+		// The wait for the provider's word, in outbound_receipt_schema.go.
+		"idx_outbound_intents_awaiting":          false,
+		"idx_outbound_effects_intent":            false,
+		"idx_outbound_provider_events_unmatched": false,
+		"idx_outbound_provider_events_attempt":   false,
 	}
 
 	rows, err := s.db.Query(`

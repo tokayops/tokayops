@@ -1089,10 +1089,14 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 
 	failedStep, stopping := stopsEscalation(*unlocked)
 	stopping = stopping && concluded.Outcome == keys.OutcomePermanentRejection
+	// A call whose acceptance only means "queued" can be settled by this very
+	// transaction whatever the outcome: an event about it may already be in,
+	// and the verdict it leads to writes to the group.
 	lockGroup := groupID != "" &&
 		(concluded.Outcome == keys.OutcomeAccepted ||
 			(concluded.Outcome == keys.OutcomeAmbiguous && policy == outbound.PolicyAssumeAccepted) ||
-			stopping)
+			stopping ||
+			unlocked.CompletionMode == outbound.CompletionOnProviderReceipt)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1375,6 +1379,31 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 	if stopping && transition.To == outbound.StatusPermanentFailed {
 		if withdrawn, err = stopEscalationTx(ctx, tx, *intent, failedStep); err != nil {
 			return outbound.FinalizeResult{}, err
+		}
+	}
+
+	// A call the provider only queued. The object it made is written now, and
+	// the question every door asks is asked here too: an event that overtook
+	// this answer may already have said how the call ended, or that the
+	// doubtful call this attempt leaves behind is ringing.
+	if intent.CompletionMode == outbound.CompletionOnProviderReceipt {
+		if transition.To == outbound.StatusAwaitingReceipt {
+			if err := recordAcceptedEffectTx(ctx, tx, *intent, req.AttemptID, settledRef); err != nil {
+				return outbound.FinalizeResult{}, err
+			}
+		}
+		if transition.To == outbound.StatusAwaitingReceipt || transition.To == outbound.StatusPending {
+			after, err := readIntentTx(ctx, tx, intent.ID)
+			if err != nil {
+				return outbound.FinalizeResult{}, err
+			}
+			moved, err := reviewReceiptTx(ctx, tx, *after, false)
+			if err != nil {
+				return outbound.FinalizeResult{}, err
+			}
+			if moved.To != "" {
+				transition = moved
+			}
 		}
 	}
 

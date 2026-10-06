@@ -38,6 +38,19 @@ type outboundStore interface {
 	FinalizeDeliveryAttempt(ctx context.Context, req FinalizeRequest) (FinalizeResult, error)
 }
 
+// receiptStore is what a family whose acceptance only means "queued" needs on
+// top: the waits that came round, the provider's answers kept and applied, and
+// the question asked once the answers are in. Separate from outboundStore so
+// that the families that never wait carry none of it.
+type receiptStore interface {
+	ClaimDueReceipts(ctx context.Context, family string, limit int) ([]AwaitingReceipt, error)
+	RecordProviderEvent(ctx context.Context, event ProviderEvent) (string, error)
+	ApplyProviderEvent(ctx context.Context, eventRowID string,
+		translators map[string]EffectTranslator) (ApplyResult, error)
+	ReviewReceiptWait(ctx context.Context, intentID string) (ApplyResult, error)
+	UnmatchedProviderEvents(ctx context.Context, limit int) ([]string, error)
+}
+
 // Channel is one provider as the worker sees it: whether a call may be made,
 // how to make it, and what the answer means.
 type Channel interface {
@@ -54,6 +67,13 @@ type Worker struct {
 
 	store    outboundStore
 	channels map[string]Channel
+
+	// receipts and translators are set for a family whose acceptance only
+	// means "queued", and nil for the others.
+	receipts    receiptStore
+	translators map[string]EffectTranslator
+	receiving   map[string]ReceiptChannel
+	polling     atomic.Bool
 
 	inflight atomic.Int64
 	ticks    atomic.Uint64
@@ -91,14 +111,39 @@ func NewWorkerFor(family string, st outboundStore, workerID string,
 	if err != nil {
 		return nil, err
 	}
-	return &Worker{
+	w := &Worker{
 		family:   policy.Family,
 		policy:   policy,
 		workerID: workerID,
 		pool:     policy.PoolSize,
 		store:    st,
 		channels: channels,
-	}, nil
+	}
+	if policy.Receipt == nil {
+		return w, nil
+	}
+
+	// A family that waits for the provider's word is refused at the start
+	// rather than at its first delivery when something it needs is missing: a
+	// channel that cannot read the provider's events would leave every call
+	// it made waiting until the deadline assumed it happened.
+	receipts, ok := st.(receiptStore)
+	if !ok {
+		return nil, fmt.Errorf("outbound: family %s waits for the provider's word, and its store cannot keep it", family)
+	}
+	w.receipts = receipts
+	w.translators = make(map[string]EffectTranslator, len(channels))
+	w.receiving = make(map[string]ReceiptChannel, len(channels))
+	for provider, channel := range channels {
+		receiving, ok := channel.(ReceiptChannel)
+		if !ok {
+			return nil, fmt.Errorf("outbound: family %s waits for the provider's word, and channel %s cannot read it",
+				family, provider)
+		}
+		w.translators[provider] = receiving
+		w.receiving[provider] = receiving
+	}
+	return w, nil
 }
 
 // Run works until the context is cancelled, then waits for what it holds.
@@ -204,6 +249,10 @@ func (w *Worker) tick(ctx context.Context) {
 	}
 	if err != nil {
 		log.Printf("outbound worker %s: recover: %v", w.workerID, err)
+	}
+
+	if w.receipts != nil {
+		w.pollReceipts(ctx)
 	}
 
 	free := w.pool - int(w.inflight.Load())

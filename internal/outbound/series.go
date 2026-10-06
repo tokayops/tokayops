@@ -15,6 +15,7 @@ func Families() []string {
 // status from a caller and have to refuse one this build does not know.
 func Statuses() []Status {
 	return []Status{StatusPending, StatusSending, StatusIdle, StatusManualReview,
+		StatusAwaitingReceipt,
 		StatusSucceeded, StatusPermanentFailed, StatusExpired, StatusCanceled}
 }
 

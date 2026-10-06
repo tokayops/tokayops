@@ -83,6 +83,10 @@ type SweepCounts struct {
 	Observations int64
 	Events       int64
 	Outbox       int64
+	// Effects and ProviderEvents are the objects a call's attempts made and
+	// what the provider said about them, which go with the attempts.
+	Effects        int64
+	ProviderEvents int64
 }
 
 // Add is the running total of a pass.
@@ -92,6 +96,8 @@ func (c *SweepCounts) Add(other SweepCounts) {
 	c.Observations += other.Observations
 	c.Events += other.Events
 	c.Outbox += other.Outbox
+	c.Effects += other.Effects
+	c.ProviderEvents += other.ProviderEvents
 }
 
 // SweepResult is one chunk's answer: busy when another instance holds the
@@ -218,6 +224,8 @@ func countRetention(deleted SweepCounts) {
 		"outbound_attempt_observations": deleted.Observations,
 		"outbound_intent_events":        deleted.Events,
 		"event_outbox":                  deleted.Outbox,
+		"outbound_effects":              deleted.Effects,
+		"outbound_provider_events":      deleted.ProviderEvents,
 	} {
 		if n > 0 {
 			metrics.OutboundRetentionDeletedTotal.WithLabelValues(table).Add(float64(n))
@@ -230,6 +238,6 @@ func countRetention(deleted SweepCounts) {
 func RetentionTables() []string {
 	return []string{
 		"outbound_intents", "outbound_attempts", "outbound_attempt_observations",
-		"outbound_intent_events", "event_outbox",
+		"outbound_intent_events", "event_outbox", "outbound_effects", "outbound_provider_events",
 	}
 }

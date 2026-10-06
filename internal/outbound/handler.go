@@ -19,9 +19,12 @@ import (
 // turn a page nobody received into a success, and no reviewer of a new channel
 // would notice.
 //
-// Reconcile and ReduceProviderEvent are deliberately absent. Nothing in this
-// build can perform either, and an interface method with no implementation is a
-// promise that does not exist.
+// What a channel whose acceptance only means "queued" answers on top - how a
+// provider's event reads, and where a call stands when asked - is
+// ReceiptChannel, a separate interface (receipt.go): the channels whose
+// acceptance is the delivery have nothing to say to either question, and a
+// method they could not implement would be a promise that does not exist.
+// Reconciling an ambiguous request is still absent, for the same reason.
 
 // Evidence is what the transport can prove about a request, and it is the whole
 // reason a handler returns a struct rather than an error.

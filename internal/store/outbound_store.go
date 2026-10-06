@@ -1286,7 +1286,8 @@ const outboundIntentColumns = `
 	       create_key IS NOT NULL, payload_schema_version,
 	       provider_key_codec_version, payload, payload_digest, receipt, receipt_ref,
 	       COALESCE(expires_at <= now(), FALSE), created_at, updated_at,
-	       COALESCE(parent_intent_id, ''), awaits_intent_ids`
+	       COALESCE(parent_intent_id, ''), awaits_intent_ids,
+	       obligation_withdrawn_at IS NOT NULL`
 
 // scanIntent turns one row of outboundIntentColumns into a commitment, and is
 // the only place that mapping exists: two readers that disagreed about it would
@@ -1315,7 +1316,7 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		&intent.ProviderKeyCodecVersion, &payload, &intent.PayloadDigest,
 		&coordinates, &name,
 		&deadlinePassed, &intent.CreatedAt, &intent.UpdatedAt, &intent.ParentID,
-		pq.Array(&intent.AwaitsIntentIDs)); err != nil {
+		pq.Array(&intent.AwaitsIntentIDs), &intent.ObligationWithdrawn); err != nil {
 		return nil, false, err
 	}
 
@@ -1439,6 +1440,27 @@ type transitionWrite struct {
 func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error {
 	e := w.Transition.Effects
 
+	// The wait for the provider's word is the family's, never the caller's: a
+	// commitment that starts waiting is first asked about after the longest a
+	// call can take, one that goes on waiting after the poll interval, and
+	// either gives up at the deadline fixed by its generation's first wait.
+	var firstOrNext, deadline float64
+	if e.AwaitReceipt {
+		policy, err := outbound.PolicyOf(w.Intent.Family)
+		if err != nil {
+			return outboundContractf("%v", err)
+		}
+		if policy.Receipt == nil {
+			return outboundContractf("commitment %s of family %s was put to waiting, and the family does not wait",
+				w.Intent.ID, w.Intent.Family)
+		}
+		firstOrNext = policy.Receipt.FirstWait.Seconds()
+		if w.Intent.Status == outbound.StatusAwaitingReceipt {
+			firstOrNext = policy.Receipt.PollInterval.Seconds()
+		}
+		deadline = policy.Receipt.Deadline.Seconds()
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE outbound_intents SET
 			status = $2,
@@ -1496,6 +1518,27 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 				WHEN $14 AND $16 THEN TRUE ELSE final_revision_applied END,
 			accepted_duplicate_risk = CASE WHEN $17 THEN TRUE ELSE accepted_duplicate_risk END,
 			expires_at = COALESCE($18, expires_at),
+			-- The wait: asked about next at the family's interval, given up on
+			-- at the deadline its generation's first wait fixed. A new
+			-- generation waits afresh; anything that is not waiting has no
+			-- time to be asked at.
+			receipt_timeout_at = CASE
+				WHEN $20 THEN now() + make_interval(secs => $21)
+				WHEN $2 <> 'awaiting_receipt' THEN NULL
+				ELSE receipt_timeout_at END,
+			receipt_deadline = CASE
+				WHEN $6 THEN NULL
+				WHEN $20 THEN COALESCE(receipt_deadline, now() + make_interval(secs => $22))
+				ELSE receipt_deadline END,
+			obligation_withdrawn_at = CASE
+				WHEN $23 THEN COALESCE(obligation_withdrawn_at, now())
+				ELSE obligation_withdrawn_at END,
+			obligation_withdrawn_reason = CASE
+				WHEN $23 AND obligation_withdrawn_at IS NULL THEN $24
+				ELSE obligation_withdrawn_reason END,
+			obligation_withdrawn_actor = CASE
+				WHEN $23 AND obligation_withdrawn_at IS NULL THEN $25
+				ELSE obligation_withdrawn_actor END,
 			updated_at = now()
 		WHERE id = $1`,
 		w.Intent.ID, string(w.Transition.To),
@@ -1506,6 +1549,8 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 		e.ScheduleRetry, w.Backoff.Seconds(), e.ScheduleNow,
 		e.ApplyRevision, w.AppliedRevision, w.AttemptIsFinal, e.RecordDuplicateRisk,
 		w.NewExpires, nilIfEmpty(w.ReceiptRef),
+		e.AwaitReceipt, firstOrNext, deadline,
+		e.WithdrawObligation, nilIfEmpty(w.Reason), w.Actor.Ref(),
 	); err != nil {
 		return fmt.Errorf("apply %s to commitment %s: %w", w.Transition.Row, w.Intent.ID, err)
 	}
@@ -1543,6 +1588,12 @@ func appendTransitionEventTx(ctx context.Context, tx *sql.Tx, w transitionWrite)
 		// attempt is ever made afterwards.
 		if err := appendIntentEventTx(ctx, tx, w.Intent.ID, nextEventSeq,
 			"generation_started", w.Reason, w.Actor); err != nil {
+			return err
+		}
+	}
+	if e.WithdrawObligation && !w.Intent.ObligationWithdrawn {
+		if err := appendIntentEventTx(ctx, tx, w.Intent.ID, nextEventSeq,
+			"obligation_withdrawn", w.Reason, w.Actor); err != nil {
 			return err
 		}
 	}
@@ -1610,8 +1661,16 @@ func timelineLine(kind outbound.TimelineKind) (string, model.TimelineEventType, 
 	switch kind {
 	case outbound.TimelineSent:
 		return "Notification sent", model.TimelineEventNotificationSent, true
-	case outbound.TimelineDelivered:
-		return "Notification delivered", model.TimelineEventNotificationSent, true
+	case outbound.TimelineProviderConfirmed:
+		// For a call: put through and ended, answered or not. Not "heard" -
+		// no provider can say that.
+		return "Notification confirmed by the provider", model.TimelineEventNotificationSent, true
+	case outbound.TimelineHandedOver:
+		return "Notification handed to the provider; waiting to hear what became of it",
+			model.TimelineEventNotificationSent, true
+	case outbound.TimelineNotPlaced:
+		return "The provider could not place the notification; trying again",
+			model.TimelineEventNotificationFailed, true
 	case outbound.TimelineAssumedAccepted:
 		return "Notification assumed delivered: the provider never confirmed, and the risk was accepted",
 			model.TimelineEventNotificationSent, true
