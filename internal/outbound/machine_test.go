@@ -20,9 +20,10 @@ import (
 
 var (
 	allStatuses = []Status{
-		StatusPending, StatusSending, StatusIdle, StatusManualReview,
+		StatusPending, StatusSending, StatusIdle, StatusManualReview, StatusAwaitingReceipt,
 		StatusSucceeded, StatusPermanentFailed, StatusExpired, StatusCanceled,
 	}
+	allVerdicts = Verdicts()
 	allOutcomes = []Outcome{
 		OutcomeAccepted, OutcomeRetryableRejection, OutcomePermanentRejection,
 		OutcomeAmbiguous, OutcomeCanceled,
@@ -42,6 +43,15 @@ var (
 	allCompletion   = []CompletionMode{CompletionOnAcceptance, CompletionOnProviderReceipt}
 	bothWays        = []bool{false, true}
 )
+
+// receiptIntent is a call: one-shot, and its acceptance only means "queued".
+func receiptIntent(status Status) Intent {
+	i := sendingIntent()
+	i.Provider = "phone"
+	i.CompletionMode = CompletionOnProviderReceipt
+	i.Status = status
+	return i
+}
 
 func sendingIntent() Intent {
 	return Intent{
@@ -296,6 +306,87 @@ func TestDecideNamedRows(t *testing.T) {
 			}(),
 			to: StatusPending, row: "T33",
 		},
+		{
+			name: "a call accepted into the provider's queue waits for its fate",
+			in: Input{
+				Intent: receiptIntent(StatusSending), Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted,
+			},
+			to: StatusAwaitingReceipt, row: "T8r",
+		},
+		{
+			name: "a call accepted while the alert was being acknowledged still waits",
+			in: func() Input {
+				i := receiptIntent(StatusSending)
+				i.CancellationRequested = true
+				return Input{Intent: i, Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted}
+			}(),
+			to: StatusAwaitingReceipt, row: "T16r",
+		},
+		{
+			name: "the provider says the call took place",
+			in: Input{
+				Intent: receiptIntent(StatusAwaitingReceipt), Trigger: TriggerVerdict, Verdict: VerdictHappened,
+			},
+			to: StatusSucceeded, row: "T35/S1",
+		},
+		{
+			name: "a doubtful call due to be repeated turns out to have taken place",
+			in: Input{
+				Intent: receiptIntent(StatusPending), Trigger: TriggerVerdict, Verdict: VerdictHappened,
+			},
+			to: StatusSucceeded, row: "T35p",
+		},
+		{
+			name: "the provider could not place the call",
+			in: Input{
+				Intent: receiptIntent(StatusAwaitingReceipt), Trigger: TriggerVerdict, Verdict: VerdictNotPlaced,
+			},
+			to: StatusPending, row: "T36",
+		},
+		{
+			name: "a call nobody needs any more was not placed",
+			in: func() Input {
+				i := receiptIntent(StatusAwaitingReceipt)
+				i.ObligationWithdrawn = true
+				return Input{Intent: i, Trigger: TriggerVerdict, Verdict: VerdictNotPlaced}
+			}(),
+			to: StatusCanceled, row: "T36w",
+		},
+		{
+			name: "the wait ended with nothing heard",
+			in: Input{
+				Intent: receiptIntent(StatusAwaitingReceipt), Trigger: TriggerVerdict, Verdict: VerdictUnknown,
+			},
+			to: StatusSucceeded, row: "T37/S1",
+		},
+		{
+			name: "the call is still going",
+			in: Input{
+				Intent: receiptIntent(StatusAwaitingReceipt), Trigger: TriggerVerdict, Verdict: VerdictStillGoing,
+			},
+			to: StatusAwaitingReceipt, row: "T38",
+		},
+		{
+			name: "a doubtful call due to be repeated is known to be ringing",
+			in: Input{
+				Intent: receiptIntent(StatusPending), Trigger: TriggerVerdict, Verdict: VerdictStillGoing,
+			},
+			to: StatusAwaitingReceipt, row: "T39",
+		},
+		{
+			name: "a doubtful call due to be repeated was definitely not placed",
+			in: Input{
+				Intent: receiptIntent(StatusPending), Trigger: TriggerVerdict, Verdict: VerdictNotPlaced,
+			},
+			to: StatusPending, row: "T36p",
+		},
+		{
+			name: "an earlier call took place while this request was open",
+			in: Input{
+				Intent: receiptIntent(StatusSending), Trigger: TriggerVerdict, Verdict: VerdictHappened,
+			},
+			to: StatusSucceeded, row: "T35s",
+		},
 	}
 
 	for _, tc := range cases {
@@ -393,11 +484,40 @@ func TestDecideRefusesWhatItDoesNotHave(t *testing.T) {
 			}(),
 		},
 		{
-			name: "a channel that waits for the provider's own confirmation",
+			// A change to a message whose existence is still unconfirmed has
+			// nothing to be aimed at.
+			name: "an editable card that waits for the provider's own confirmation",
 			in: func() Input {
 				i := sendingIntent()
 				i.CompletionMode = CompletionOnProviderReceipt
-				return Input{Intent: i, Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted}
+				i.Form = FormEditable
+				i.DesiredRevision = 3
+				return Input{Intent: i, Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted,
+					AttemptRevision: revisionOf(3)}
+			}(),
+		},
+		{
+			name: "a verdict for a commitment that does not wait for one",
+			in: func() Input {
+				i := sendingIntent()
+				i.Status = StatusPending
+				return Input{Intent: i, Trigger: TriggerVerdict, Verdict: VerdictHappened}
+			}(),
+		},
+		{
+			// The wait belongs to an accepted call; a call due to be repeated
+			// has none to be over.
+			name: "the end of a wait for a call due to be repeated",
+			in: func() Input {
+				i := receiptIntent(StatusPending)
+				return Input{Intent: i, Trigger: TriggerVerdict, Verdict: VerdictUnknown}
+			}(),
+		},
+		{
+			name: "a request still open, and nothing known to have happened",
+			in: func() Input {
+				i := receiptIntent(StatusSending)
+				return Input{Intent: i, Trigger: TriggerVerdict, Verdict: VerdictNotPlaced}
 			}(),
 		},
 		{
@@ -533,8 +653,38 @@ func TestDecideOverTheWholeInputSpace(t *testing.T) {
 			if e.Proof == ProofAssumed && !e.RecordDuplicateRisk {
 				t.Fatal("an assumed success recorded no risk")
 			}
-		} else if e.ApplyRevision || e.StoreReceipt || e.TriggerGroup {
+		} else if e.ApplyRevision || e.TriggerGroup {
 			t.Fatalf("a non-success applied a revision or moved the group: %+v", e)
+		} else if e.StoreReceipt && got.To != StatusAwaitingReceipt {
+			// The one non-success that keeps coordinates: the call exists at
+			// the provider, and its fate is what the wait is for.
+			t.Fatalf("a non-success stored a receipt and did not wait: %+v", got)
+		}
+
+		// Waiting is one shape: a one-shot call whose acceptance only means
+		// "queued", holding nothing, with its wait scheduled.
+		if got.To == StatusAwaitingReceipt {
+			if in.Intent.CompletionMode != CompletionOnProviderReceipt || in.Intent.Form != FormOneShot {
+				t.Fatalf("a commitment that does not wait was put to waiting: %+v", in)
+			}
+			if !e.AwaitReceipt {
+				t.Fatalf("waiting with no wait scheduled: %+v", got)
+			}
+			if in.Intent.Status != StatusAwaitingReceipt && !e.ClearLease {
+				t.Fatalf("started waiting holding a lease: %+v", got)
+			}
+		}
+		if e.AwaitReceipt && got.To != StatusAwaitingReceipt {
+			t.Fatalf("scheduled a wait for a commitment in %s", got.To)
+		}
+
+		// A call nobody needs any more is not made again.
+		if (in.Intent.ObligationWithdrawn || e.WithdrawObligation) &&
+			(e.NewGeneration || e.ScheduleNow || e.ScheduleRetry) {
+			t.Fatalf("a withdrawn obligation scheduled another call: %+v", got)
+		}
+		if e.WithdrawObligation && !in.Intent.CancellationRequested {
+			t.Fatal("recorded a withdrawal nobody asked for")
 		}
 
 		// Leaving "sending" always releases what was held there. A lease or an
@@ -672,6 +822,27 @@ func TestDecideOverTheWholeInputSpace(t *testing.T) {
 									}
 								}
 							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for _, status := range allStatuses {
+		for _, verdict := range allVerdicts {
+			for _, form := range allForms {
+				for _, completion := range allCompletion {
+					for _, withdrawn := range bothWays {
+						for _, receipt := range bothWays {
+							intent := sendingIntent()
+							intent.Status = status
+							intent.Form = form
+							intent.CompletionMode = completion
+							intent.ObligationWithdrawn = withdrawn
+							intent.HasReceipt = receipt
+							intent.DesiredRevision = 3
+							check(Input{Intent: intent, Trigger: TriggerVerdict, Verdict: verdict})
 						}
 					}
 				}

@@ -94,6 +94,22 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 		return 0, err
 	}
 
+	// A call the provider accepted and has not said the end of. The call
+	// exists and is not undone by this, so the commitment keeps waiting for its
+	// fate; what is recorded is that a call which turns out not to have
+	// happened is not to be made again. Not a withdrawal of a notification, and
+	// not counted as one in the alert's history: the call may be ringing now.
+	awaiting, err := withdrawObligationsTx(ctx, tx, alertGroupID, reason, actor)
+	if err != nil {
+		return 0, err
+	}
+	for _, w := range awaiting {
+		if err := appendIntentEventTx(ctx, tx, w.id, nextEventSeq, "obligation_withdrawn",
+			w.reason(reason)+"; the call already placed is followed to its end", actor); err != nil {
+			return 0, err
+		}
+	}
+
 	for _, w := range notSent {
 		if err := appendIntentEventTx(ctx, tx, w.id, nextEventSeq, "canceled",
 			w.reason(reason), actor); err != nil {
@@ -156,6 +172,35 @@ func cancelIntentsAtTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason str
 		return 0, err
 	}
 	return withdrawn, nil
+}
+
+// withdrawObligationsTx records, on every call of the group the provider
+// accepted and has not said the end of, that what it was for is no longer
+// needed.
+func withdrawObligationsTx(ctx context.Context, tx *sql.Tx, alertGroupID, reason string,
+	actor outbound.Actor) ([]withdrawnRow, error) {
+
+	rows, err := tx.QueryContext(ctx, `
+		UPDATE outbound_intents
+		SET obligation_withdrawn_at = now(), obligation_withdrawn_reason = $2,
+		    obligation_withdrawn_actor = $3, updated_at = now()
+		WHERE alert_group_id = $1 AND status = 'awaiting_receipt'
+		  AND obligation_withdrawn_at IS NULL
+		RETURNING id, parent_intent_id IS NOT NULL`,
+		alertGroupID, nilIfEmpty(reason), actor.Ref())
+	if err != nil {
+		return nil, fmt.Errorf("withdraw the obligations of %s: %w", alertGroupID, err)
+	}
+	defer rows.Close()
+	var taken []withdrawnRow
+	for rows.Next() {
+		var w withdrawnRow
+		if err := rows.Scan(&w.id, &w.satellite); err != nil {
+			return nil, err
+		}
+		taken = append(taken, w)
+	}
+	return taken, rows.Err()
 }
 
 // withdrawnRow is one commitment the withdrawal touched, and whether it is a

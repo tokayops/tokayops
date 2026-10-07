@@ -79,6 +79,14 @@ const (
 	// StatusManualReview is waiting for a person. Nothing automatic leaves it.
 	StatusManualReview Status = "manual_review"
 
+	// StatusAwaitingReceipt is a commitment whose call the provider accepted
+	// into its own queue, waiting to hear what became of it. Only a channel
+	// whose acceptance means "queued" gets here - a phone call rings, is
+	// answered or not, after the request that made it has returned. It holds
+	// no lease and no open attempt: what moves it is the provider's word, by
+	// callback or by poll, or the end of the wait.
+	StatusAwaitingReceipt Status = "awaiting_receipt"
+
 	StatusSucceeded       Status = "succeeded"
 	StatusPermanentFailed Status = "permanent_failed"
 	StatusExpired         Status = "expired"
@@ -130,8 +138,10 @@ type Proof string
 const (
 	// ProofAccepted: the provider took the message.
 	ProofAccepted Proof = "accepted"
-	// ProofDelivered: the provider later confirmed delivery. Not reachable yet.
-	ProofDelivered Proof = "delivered"
+	// ProofProviderConfirmed: the provider later said the effect happened - for a
+	// call, that it was put through and ended. Not that a person heard it: no
+	// provider can say that, and the history does not claim it.
+	ProofProviderConfirmed Proof = "provider_confirmed"
 	// ProofAssumed: nobody confirmed anything and somebody decided to call it
 	// delivered. The risk is recorded with it.
 	ProofAssumed Proof = "assumed"
@@ -261,6 +271,13 @@ type Intent struct {
 
 	CancellationRequested bool
 	AcceptedDuplicateRisk bool
+
+	// ObligationWithdrawn says what this commitment was for no longer needs
+	// doing - the alert was acknowledged - while its external effect may still
+	// be under way. A call already placed is not undone by that, so the status
+	// stays where it is; what changes is that a call which turns out not to
+	// have happened is not made again.
+	ObligationWithdrawn bool
 
 	NotBefore     time.Time
 	NextAttemptAt time.Time

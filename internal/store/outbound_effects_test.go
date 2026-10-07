@@ -32,6 +32,8 @@ func TestEveryEffectIsAccountedFor(t *testing.T) {
 		"TriggerGroup":        "groupEffectsTx: the alert leaves processing",
 		"Timeline":            "groupEffectsTx: the line the alert's history gets",
 		"OpenGeneration":      "BeginAttempt: binds the address and key, guarded by beginEffectsUnderstood",
+		"AwaitReceipt":        "applyTransitionTx: receipt_timeout_at, receipt_deadline, from the family's wait",
+		"WithdrawObligation":  "applyTransitionTx: obligation_withdrawn_at and who said so, and an event saying so",
 	}
 
 	notDurable := map[string]string{

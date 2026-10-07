@@ -122,6 +122,15 @@ func (s *Store) SweepDeliveryHistory(ctx context.Context, cutoff time.Time, chun
 			{&deleted.Observations, `DELETE FROM outbound_attempt_observations
 				WHERE attempt_id IN (SELECT id FROM outbound_attempts WHERE intent_id = ANY($1))`},
 			{&deleted.Events, `DELETE FROM outbound_intent_events WHERE intent_id = ANY($1)`},
+			// What a call's attempts made, and what the provider said about
+			// it, go with the attempts - and before them: the objects hold a
+			// key to the attempt, and a cascade nobody wrote would roll the
+			// whole chunk back. An event still unmatched is not touched; it
+			// names no attempt that exists, and it is an operator's to read.
+			{&deleted.ProviderEvents, `DELETE FROM outbound_provider_events
+				WHERE state <> 'unmatched'
+				  AND attempt_id IN (SELECT id FROM outbound_attempts WHERE intent_id = ANY($1))`},
+			{&deleted.Effects, `DELETE FROM outbound_effects WHERE intent_id = ANY($1)`},
 			{&deleted.Attempts, `DELETE FROM outbound_attempts WHERE intent_id = ANY($1)`},
 			{&deleted.Intents, `DELETE FROM outbound_intents WHERE id = ANY($1)`},
 		} {

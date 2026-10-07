@@ -74,6 +74,8 @@ func setupTestDB(t *testing.T) *Store {
 	// Order matters due to foreign keys if CASCADE is not used (but we use CASCADE here for safety)
 	tables := []string{
 		"outbound_intent_events",
+		"outbound_provider_events",
+		"outbound_effects",
 		"outbound_attempt_observations",
 		"outbound_attempts",
 		"outbound_intents",
