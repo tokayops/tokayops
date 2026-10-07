@@ -1478,14 +1478,27 @@ const Components = {
                 chips.push(`<span class="step-delay">(${delayStr})</span>`);
             }
 
-            // Chips read step.target_kind ("dm" / "channel").
+            // Chips read step.target_kind ("dm" / "channel" / "call").
             const isChannel = step.target_kind === 'channel';
-            const icon = isChannel ? 'hash' : 'user';
-            const label = isChannel ? 'Channel' : 'DM';
+            const isCall = step.target_kind === 'call';
+            const icon = isChannel ? 'hash' : (isCall ? 'phone' : 'user');
+            const label = isChannel ? 'Channel' : (isCall ? 'Call' : 'DM');
             chips.push(`<span class="step-chip"><i data-lucide="${icon}" style="width:12px;height:12px;"></i> ${label}</span>`);
         });
 
         return `<div class="step-chips-container" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${chips.join('<span class="step-arrow">→</span>')}</div>`;
+    },
+
+    /**
+     * The provider a new step starts with: the first one that can send a DM,
+     * since a new step targets a user by DM. Not every provider can - a call
+     * has no DM form.
+     * @param {Array} providers - Registered providers
+     */
+    defaultStepProvider: (providers = []) => {
+        const list = providers || [];
+        const dm = list.find((p) => (p.supported_target_kinds || []).includes('dm'));
+        return (dm || list[0])?.name || '';
     },
 
     /**
@@ -1594,7 +1607,7 @@ const Components = {
                         <label>Delay (s)</label>
                         <input type="number" class="form-input delay-input" value="${step.delay_seconds || 0}" min="0">
                     </div>
-                    <div class="step-field step-field-message">
+                    <div class="step-field step-field-message" ${step.target_kind === 'call' ? 'style="display:none"' : ''}>
                         <label>Message <span class="variables-hint" title="Text of the direct message. {{.Title}}, {{.Severity}}, {{.Team}} and {{.AlertsCount}} are filled in from the alert. A channel step posts the card, which is not changed.">ⓘ</span></label>
                         <input type="text" class="form-input message-input" placeholder="Text of the direct message (optional)" value="${escapeHtml(step.message || '')}">
                     </div>
@@ -1614,7 +1627,7 @@ const Components = {
         const isGlobalPolicy = isEdit && !policy.team_id;
         const currentScope = isGlobalPolicy ? 'global' : 'team';
         const isAdmin = Permissions.isAdmin();
-        const defaultProvider = (State.providers || [])[0]?.name || '';
+        const defaultProvider = Components.defaultStepProvider(State.providers);
         const steps = policy?.steps || [{ provider: defaultProvider, target_kind: 'dm', target_type: 'user', target_id: '', delay_seconds: 0, message: '', continue_on_failure: true }];
 
         // Build scope selector HTML

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tokayops/tokayops/internal/outbound"
+	"github.com/tokayops/tokayops/internal/outbound/keys"
 )
 
 // Calls whose acceptance only means "queued", through the store: the object an
@@ -37,23 +38,25 @@ func (callTranslator) EffectStateOf(e outbound.ProviderEvent) (outbound.EffectSt
 	}
 }
 
-var callTranslators = map[string]outbound.EffectTranslator{"slack": callTranslator{}}
+var callTranslators = map[string]outbound.EffectTranslator{"phone": callTranslator{}}
 
-// admitCall is one call to one person, in a group of its own.
+// admitCall is one call to one person, in a group of its own, admitted the way
+// an escalation step to the phone provider is.
 func admitCall(t *testing.T, s *Store) (agID, intentID string) {
 	t.Helper()
 	agID = outboundGroup(t, s)
-	intentID = admitOne(t, s, agID, dmCommitment("U0001"))[0]
-	relabel(t, s, intentID, "escalation", outbound.FamilyCall)
-	exec(t, s, `UPDATE outbound_intents SET completion_mode = 'on_provider_receipt' WHERE id = $1`, intentID)
+	call := dmCommitment("U0001")
+	call.Provider = keys.ProviderPhone
+	call.CompletionMode = keys.CompletionOnProviderReceipt
+	intentID = admitOne(t, s, agID, call)[0]
 	return agID, intentID
 }
 
 func claimCall(t *testing.T, s *Store, intentID string) string {
 	t.Helper()
 	leased, err := s.ClaimDueIntents(context.Background(), outbound.ClaimRequest{
-		Family: outbound.FamilyCall, Provider: "slack", Phase: outbound.ClaimRetriesFirst,
-		Limit: 10, Lease: outbound.CallLease, WorkerID: "worker-1",
+		Family: outbound.FamilyNotification, Provider: keys.ProviderPhone, Phase: outbound.ClaimRetriesFirst,
+		Limit: 10, Lease: outbound.NotificationLease, WorkerID: "worker-1",
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
@@ -150,7 +153,6 @@ func countOf(t *testing.T, s *Store, query string, args ...any) int {
 // whether anybody was reached.
 func TestAnAcceptedCallWaitsForItsFate(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	agID, intentID := admitCall(t, s)
 
 	begun := placeCall(t, s, intentID, callAccepted("CA1"))
@@ -184,7 +186,6 @@ func TestAnAcceptedCallWaitsForItsFate(t *testing.T) {
 // that comes after it finds the call already over.
 func TestACallbackBeforeTheAnswerIsNotLost(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 	token := claimCall(t, s, intentID)
 	begun := beginOne(t, s, intentID, token)
@@ -206,7 +207,6 @@ func TestACallbackBeforeTheAnswerIsNotLost(t *testing.T) {
 // Events are separate requests: they repeat and they arrive out of order.
 func TestEventsRepeatAndArriveOutOfOrder(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 	begun := placeCall(t, s, intentID, callAccepted("CA1"))
 
@@ -230,7 +230,6 @@ func TestEventsRepeatAndArriveOutOfOrder(t *testing.T) {
 // first one failing says nothing about the second, which is ringing.
 func TestOneCallFailingDoesNotDecideTheOther(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 
 	doubtful := placeCall(t, s, intentID, concluded(outbound.OutcomeAmbiguous, "timeout"))
@@ -254,7 +253,6 @@ func TestOneCallFailingDoesNotDecideTheOther(t *testing.T) {
 func TestACallThatWasNotPlaced(t *testing.T) {
 	t.Run("the obligation stands", func(t *testing.T) {
 		s := setupTestDB(t)
-		asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 		_, intentID := admitCall(t, s)
 		begun := placeCall(t, s, intentID, callAccepted("CA1"))
 
@@ -270,7 +268,6 @@ func TestACallThatWasNotPlaced(t *testing.T) {
 
 	t.Run("the alert was acknowledged while the call waited", func(t *testing.T) {
 		s := setupTestDB(t)
-		asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 		agID, intentID := admitCall(t, s)
 		begun := placeCall(t, s, intentID, callAccepted("CA1"))
 
@@ -301,7 +298,6 @@ func TestACallThatWasNotPlaced(t *testing.T) {
 
 	t.Run("the alert was acknowledged while the call was being placed", func(t *testing.T) {
 		s := setupTestDB(t)
-		asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 		agID, intentID := admitCall(t, s)
 		token := claimCall(t, s, intentID)
 		begun := beginOne(t, s, intentID, token)
@@ -329,7 +325,6 @@ func TestACallThatWasNotPlaced(t *testing.T) {
 func TestADoubtfulCallHeardFromLater(t *testing.T) {
 	t.Run("it took place: no repeat", func(t *testing.T) {
 		s := setupTestDB(t)
-		asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 		_, intentID := admitCall(t, s)
 		doubtful := placeCall(t, s, intentID, concluded(outbound.OutcomeAmbiguous, "timeout"))
 
@@ -341,7 +336,6 @@ func TestADoubtfulCallHeardFromLater(t *testing.T) {
 
 	t.Run("it is ringing: wait, not a second call", func(t *testing.T) {
 		s := setupTestDB(t)
-		asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 		_, intentID := admitCall(t, s)
 		doubtful := placeCall(t, s, intentID, concluded(outbound.OutcomeAmbiguous, "timeout"))
 
@@ -353,7 +347,6 @@ func TestADoubtfulCallHeardFromLater(t *testing.T) {
 
 	t.Run("it was not placed: repeated as a new generation", func(t *testing.T) {
 		s := setupTestDB(t)
-		asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 		_, intentID := admitCall(t, s)
 		doubtful := placeCall(t, s, intentID, concluded(outbound.OutcomeAmbiguous, "timeout"))
 
@@ -374,21 +367,20 @@ func TestADoubtfulCallHeardFromLater(t *testing.T) {
 // answer goes in through the same door as any callback.
 func TestALostCallbackIsAskedFor(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 	begun := placeCall(t, s, intentID, callAccepted("CA1"))
 
 	ctx := context.Background()
-	if due, _ := s.ClaimDueReceipts(ctx, outbound.FamilyCall, 10); len(due) != 0 {
+	if due, _ := s.ClaimDueReceipts(ctx, outbound.FamilyNotification, []string{keys.ProviderPhone}, 10); len(due) != 0 {
 		t.Fatal("a wait was taken before it came round")
 	}
 	exec(t, s, `UPDATE outbound_intents SET receipt_timeout_at = now() - interval '1 second' WHERE id = $1`, intentID)
 
-	due, err := s.ClaimDueReceipts(ctx, outbound.FamilyCall, 10)
+	due, err := s.ClaimDueReceipts(ctx, outbound.FamilyNotification, []string{keys.ProviderPhone}, 10)
 	if err != nil || len(due) != 1 || len(due[0].Effects) != 1 || due[0].Effects[0].ExternalRef != "CA1" {
 		t.Fatalf("the wait that came round: %+v, %v", due, err)
 	}
-	if again, _ := s.ClaimDueReceipts(ctx, outbound.FamilyCall, 10); len(again) != 0 {
+	if again, _ := s.ClaimDueReceipts(ctx, outbound.FamilyNotification, []string{keys.ProviderPhone}, 10); len(again) != 0 {
 		t.Fatal("the same wait was taken twice")
 	}
 
@@ -403,7 +395,6 @@ func TestALostCallbackIsAskedFor(t *testing.T) {
 // Several instances poll at once; each wait is taken by one of them.
 func TestEachWaitIsTakenOnce(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	const calls = 6
 	for i := 0; i < calls; i++ {
 		_, intentID := admitCall(t, s)
@@ -419,7 +410,7 @@ func TestEachWaitIsTakenOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			due, err := s.ClaimDueReceipts(context.Background(), outbound.FamilyCall, calls)
+			due, err := s.ClaimDueReceipts(context.Background(), outbound.FamilyNotification, []string{keys.ProviderPhone}, calls)
 			if err != nil {
 				t.Errorf("claim: %v", err)
 				return
@@ -446,7 +437,6 @@ func TestEachWaitIsTakenOnce(t *testing.T) {
 // lost and every poll failed. The deadline still ends the wait.
 func TestTheDeadlineEndsAWaitWhoseLastWordWasInProgress(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 	begun := placeCall(t, s, intentID, callAccepted("CA1"))
 	hear(t, s, callEvent(begun.AttemptID, "CA1", "ringing", seqOf(2)))
@@ -470,12 +460,11 @@ func TestTheDeadlineEndsAWaitWhoseLastWordWasInProgress(t *testing.T) {
 // the poll's.
 func TestExpiryLeavesAWaitingCallAlone(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 	placeCall(t, s, intentID, callAccepted("CA1"))
 	exec(t, s, `UPDATE outbound_intents SET expires_at = now() - interval '1 second' WHERE id = $1`, intentID)
 
-	if _, err := s.ExpireDueIntents(context.Background(), outbound.FamilyCall, 10); err != nil {
+	if _, err := s.ExpireDueIntents(context.Background(), outbound.FamilyNotification, 10); err != nil {
 		t.Fatalf("expire: %v", err)
 	}
 	if got := statusOf(t, s, intentID); got != outbound.StatusAwaitingReceipt {
@@ -486,7 +475,6 @@ func TestExpiryLeavesAWaitingCallAlone(t *testing.T) {
 // A status this build has never seen does not decide anything.
 func TestAnUnknownProviderStatusChangesNothing(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 	begun := placeCall(t, s, intentID, callAccepted("CA1"))
 
@@ -517,7 +505,6 @@ func TestAnEventAboutNothingHereIsKeptUnmatched(t *testing.T) {
 // included, and before the attempts they point at.
 func TestAFinishedCallIsSweptWithEverythingItMade(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 	begun := placeCall(t, s, intentID, callAccepted("CA1"))
 	hear(t, s, callEvent(begun.AttemptID, "CA1", "completed", seqOf(3)))
@@ -538,7 +525,6 @@ func TestAFinishedCallIsSweptWithEverythingItMade(t *testing.T) {
 // deadline would be the only thing left to end it.
 func TestAnEventThatSettlesNothingDoesNotPushTheNextLook(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 	begun := placeCall(t, s, intentID, callAccepted("CA1"))
 	exec(t, s, `UPDATE outbound_intents SET receipt_timeout_at = now() - interval '1 second' WHERE id = $1`, intentID)
@@ -547,7 +533,7 @@ func TestAnEventThatSettlesNothingDoesNotPushTheNextLook(t *testing.T) {
 	if result.To != "" {
 		t.Fatalf("a ringing moved the commitment: %+v", result)
 	}
-	due, err := s.ClaimDueReceipts(context.Background(), outbound.FamilyCall, 10)
+	due, err := s.ClaimDueReceipts(context.Background(), outbound.FamilyNotification, []string{keys.ProviderPhone}, 10)
 	if err != nil || len(due) != 1 {
 		t.Fatalf("the wait that was due is no longer: %+v, %v", due, err)
 	}
@@ -567,7 +553,6 @@ func TestRecoveryHearsWhatCameInWhileTheWorkerWasGone(t *testing.T) {
 	} {
 		t.Run(tc.status, func(t *testing.T) {
 			s := setupTestDB(t)
-			asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 			_, intentID := admitCall(t, s)
 			token := claimCall(t, s, intentID)
 			begun := beginOne(t, s, intentID, token)
@@ -576,7 +561,7 @@ func TestRecoveryHearsWhatCameInWhileTheWorkerWasGone(t *testing.T) {
 			hear(t, s, callEvent(begun.AttemptID, "CA1", tc.status, seqOf(3)))
 			expireLease(t, s, intentID)
 
-			recovered, err := s.RecoverStaleAttempts(context.Background(), outbound.FamilyCall, 10)
+			recovered, err := s.RecoverStaleAttempts(context.Background(), outbound.FamilyNotification, 10)
 			if err != nil || len(recovered) != 1 {
 				t.Fatalf("recover: %+v, %v", recovered, err)
 			}
@@ -592,7 +577,6 @@ func TestRecoveryHearsWhatCameInWhileTheWorkerWasGone(t *testing.T) {
 // commitment is settled by the first call, not failed by the second.
 func TestARefusedRepeatDoesNotUndoACallThatTookPlace(t *testing.T) {
 	s := setupTestDB(t)
-	asABuildThatKnows(t, s, "escalation", outbound.FamilyCall)
 	_, intentID := admitCall(t, s)
 	doubtful := placeCall(t, s, intentID, concluded(outbound.OutcomeAmbiguous, "timeout"))
 	exec(t, s, `UPDATE outbound_intents SET next_attempt_at = now() WHERE id = $1`, intentID)

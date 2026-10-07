@@ -95,6 +95,11 @@ type EffectRef struct {
 	IntentID    string
 	AttemptID   string
 	ExternalRef string
+	// Provider is the commitment's, and decides how the object is asked about.
+	Provider string
+	// Context is what the attempt that made the object was bound to: the
+	// integration and account to ask with.
+	Context BoundContext
 }
 
 // EffectTranslator is the half of a ReceiptChannel that reads an event: what

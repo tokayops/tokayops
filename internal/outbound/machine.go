@@ -106,6 +106,7 @@ const (
 	TimelineProviderConfirmed TimelineKind = "provider_confirmed"
 	TimelineHandedOver        TimelineKind = "handed_over"
 	TimelineNotPlaced         TimelineKind = "not_placed"
+	TimelineNoContact         TimelineKind = "no_contact"
 	TimelineAssumedAccepted   TimelineKind = "assumed_accepted"
 	TimelineFailed            TimelineKind = "failed"
 	TimelineExpired           TimelineKind = "expired"
@@ -148,6 +149,13 @@ type Input struct {
 
 	// Verdict is the effects of the commitment added up, for TriggerVerdict.
 	Verdict Verdict
+
+	// DoubtInGeneration says an earlier call of the current generation may
+	// still be ringing: it is known and has not ended, or its request ended in
+	// doubt and nothing has named what it made. Read by the store from the
+	// same facts as the verdict. It decides what a refusal of a call means: a
+	// refused repeat proves only that IT placed nothing.
+	DoubtInGeneration bool
 
 	// Decision, and the facts its guards need, for TriggerOperator.
 	Decision              Decision
@@ -290,6 +298,16 @@ func decidePreparation(in Input) (Transition, error) {
 			Row: "T4b",
 		}, nil
 
+	case PreparationNoContact:
+		return Transition{
+			To: StatusNoContact,
+			Effects: Effects{
+				ClearLease: true,
+				Timeline:   TimelineNoContact,
+			},
+			Row: "T4c",
+		}, nil
+
 	default:
 		return Transition{}, invalidf("unknown preparation outcome %q", in.Preparation)
 	}
@@ -361,6 +379,9 @@ func decideFinish(in Input) (Transition, error) {
 		}, nil
 
 	case OutcomePermanentRejection:
+		if in.Intent.CompletionMode == CompletionOnProviderReceipt && in.Intent.Form == FormOneShot {
+			return refusedCall(in)
+		}
 		return Transition{
 			To: StatusPermanentFailed,
 			Effects: Effects{
@@ -534,6 +555,40 @@ func reduceProviderAcceptance(in Input, row string) (Transition, error) {
 	default:
 		return Transition{}, invalidf("unknown completion mode %q", in.Intent.CompletionMode)
 	}
+}
+
+// refusedCall is one provider's definite refusal of a call. It is not the end
+// of the commitment: another integration may reach the person, and running
+// out of them is preparation's to say. Nor is it a reason to move on while
+// an earlier call of the generation may be ringing - another provider then
+// would be a second call to somebody whose first one nobody has heard the end
+// of. So the generation decides: settled, the next integration; in doubt,
+// wait for the doubt to resolve like any call.
+func refusedCall(in Input) (Transition, error) {
+	if in.DoubtInGeneration {
+		return Transition{
+			To: StatusAwaitingReceipt,
+			Effects: Effects{
+				ClearLease:          true,
+				ClearCurrentAttempt: true,
+				BumpFailureStreak:   true,
+				AwaitReceipt:        true,
+			},
+			Row: "T10w",
+		}, nil
+	}
+	return Transition{
+		To: StatusPending,
+		Effects: Effects{
+			ClearLease:          true,
+			ClearCurrentAttempt: true,
+			NewGeneration:       true,
+			ScheduleNow:         true,
+			BumpFailureStreak:   true,
+			Timeline:            TimelineNotPlaced,
+		},
+		Row: "T10r",
+	}, nil
 }
 
 // awaitReceipt is an acceptance that only means "queued": the call exists at

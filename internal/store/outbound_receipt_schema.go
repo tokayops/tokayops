@@ -26,6 +26,7 @@ import (
 // account, and a repeat of it is the same event.
 
 const (
+	outboundAwaitingHasWait    = "outbound_intents_awaiting_has_wait"
 	outboundAwaitingHasReceipt = "outbound_intents_awaiting_has_receipt"
 	outboundEffectStateKnown   = "outbound_effects_state_known"
 	outboundEventStateKnown    = "outbound_provider_events_state_known"
@@ -42,14 +43,30 @@ func applyReceiptSchema(ctx context.Context, tx *sql.Tx) error {
 				ADD COLUMN IF NOT EXISTS obligation_withdrawn_actor TEXT`,
 		},
 		{
-			// A commitment waits for the provider's word about something it
-			// made, and knows when to ask next. Without either it is a wait for
-			// nothing, at no time - a row nothing would ever pick up.
-			what: "add " + outboundAwaitingHasReceipt,
-			sql: guardedConstraint("outbound_intents", outboundAwaitingHasReceipt,
+			// The first form of the rule asked for a receipt too. A refused
+			// repeat whose first call ended in doubt waits with no object
+			// known at all - the generation's fate is read from its objects,
+			// not from a receipt - so the rule is replaced by its successor.
+			what: "drop " + outboundAwaitingHasReceipt,
+			sql:  `ALTER TABLE outbound_intents DROP CONSTRAINT IF EXISTS ` + outboundAwaitingHasReceipt,
+		},
+		{
+			// A commitment that waits knows when to ask next and when to stop
+			// asking. Without either it is a wait at no time - a row nothing
+			// would ever pick up.
+			what: "add " + outboundAwaitingHasWait,
+			sql: guardedConstraint("outbound_intents", outboundAwaitingHasWait,
 				`CHECK (status <> 'awaiting_receipt'
-				        OR (receipt_recorded AND receipt_timeout_at IS NOT NULL
-				            AND receipt_deadline IS NOT NULL))`),
+				        OR (receipt_timeout_at IS NOT NULL AND receipt_deadline IS NOT NULL))`),
+		},
+		{
+			// What each attempt was bound to, kept on the attempt: the
+			// commitment's own copy is overwritten by the next generation, and
+			// a call's account and integration are needed afterwards - to ask
+			// about the call, to check the provider's signature on what it
+			// says, and to know which integrations already refused.
+			what: "add the binding to the attempts",
+			sql:  `ALTER TABLE outbound_attempts ADD COLUMN IF NOT EXISTS bound_context JSONB`,
 		},
 		{
 			what: "add the poll's index",

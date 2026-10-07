@@ -280,6 +280,8 @@ func (a *API) DeletePolicy(c echo.Context) error {
 var targetKindForTargetType = map[string]map[string]bool{
 	"dm":      {"user": true, "schedule": true},
 	"channel": {"channel": true},
+	// A call goes to a person, and a schedule resolves to the people on call.
+	"call": {"user": true, "schedule": true},
 }
 
 // validatePolicyStep checks the (provider, target_kind, target_type) triple
@@ -318,7 +320,7 @@ func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup)
 	// Taxonomy invariant: target_kind ↔ target_type compatibility.
 	allowedTargetTypes, ok := targetKindForTargetType[step.TargetKind]
 	if !ok {
-		return fmt.Errorf("invalid target_kind: %s (must be dm or channel)", step.TargetKind)
+		return fmt.Errorf("invalid target_kind: %s (must be dm, channel or call)", step.TargetKind)
 	}
 	if !allowedTargetTypes[step.TargetType] {
 		return fmt.Errorf("%s step requires one of %v target types, got %s", step.TargetKind, keysOf(allowedTargetTypes), step.TargetType)
@@ -336,6 +338,12 @@ func validatePolicyStep(step PolicyStepRequest, caps ProviderCapabilitiesLookup)
 	// timeout_seconds and max_attempts are accepted and ignored: neither
 	// decides anything since 0.2.0, and a saved policy naming them is not
 	// wrong, only old.
+
+	// A call says the same few words whatever the alert, and a message on its
+	// step would be accepted and never spoken.
+	if step.TargetKind == "call" && step.Message != "" {
+		return fmt.Errorf("a call step has no message: the call says the same few words for every alert")
+	}
 
 	// The message is checked here, once, so an attempt never meets a
 	// template it cannot render.

@@ -3519,6 +3519,35 @@ const docTemplate = `{
                     }
                 }
             }
+        },
+        "/twilio/voice/status": {
+            "post": {
+                "description": "Twilio reports how a call goes. Signed with the auth token of the account the call was placed on; the attempt is named in the query.",
+                "consumes": [
+                    "application/x-www-form-urlencoded"
+                ],
+                "tags": [
+                    "webhooks"
+                ],
+                "summary": "Twilio call status callback",
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {

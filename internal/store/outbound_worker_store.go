@@ -483,6 +483,19 @@ func (s *Store) BeginAttempt(ctx context.Context,
 	// the lock order depends on it, and the payload does not change.
 	var stopping bool
 	var failedStep keys.Slot
+	if req.Preparation == outbound.PreparationNoContact {
+		// Nobody to reach writes a line in the alert's history, so the group
+		// comes first here too. It never stops the escalation.
+		unlocked, err := readIntentTx(ctx, tx, req.IntentID)
+		if err != nil {
+			return outbound.BeginAttemptResult{}, err
+		}
+		if unlocked != nil && unlocked.AlertGroupID != "" {
+			if err := lockAlertGroupTx(ctx, tx, unlocked.AlertGroupID); err != nil {
+				return outbound.BeginAttemptResult{}, err
+			}
+		}
+	}
 	if req.Preparation == outbound.PreparationPermanent {
 		unlocked, err := readIntentTx(ctx, tx, req.IntentID)
 		if err != nil {
@@ -635,7 +648,14 @@ func (s *Store) BeginAttempt(ctx context.Context,
 
 	var boundContext json.RawMessage
 	if transition.Effects.OpenGeneration {
-		if boundContext, err = s.dmContextTx(ctx, tx, *intent); err != nil {
+		// A context the channel chose - the integration a call goes through -
+		// or the one the store derives for a direct message. Never both: a
+		// channel that proposes one is not a Slack direct message.
+		if !req.BoundContext.Empty() {
+			if boundContext, err = req.BoundContext.Encode(); err != nil {
+				return outbound.BeginAttemptResult{}, err
+			}
+		} else if boundContext, err = s.dmContextTx(ctx, tx, *intent); err != nil {
 			return outbound.BeginAttemptResult{}, err
 		}
 	}
@@ -717,12 +737,12 @@ func (s *Store) BeginAttempt(ctx context.Context,
 			id, intent_id, attempt_no, record_kind, generation_no, attempt_kind,
 			operation, applied_revision, provider, bound_endpoint, provider_key,
 			request_fingerprint, lease_token, worker_id, started_at,
-			completion_fingerprint_version)
-		VALUES ($1, $2, $3, 'attempt', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), $14)`,
+			completion_fingerprint_version, bound_context)
+		VALUES ($1, $2, $3, 'attempt', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), $14, $15)`,
 		attemptID, req.IntentID, attemptNo, intent.GenerationNo, string(plan.Kind),
 		string(plan.Operation), appliedRevision(content), intent.Provider, effect.Endpoint,
 		providerKey, content.Digest(), req.LeaseToken,
-		nilIfEmpty(req.WorkerID), fingerprintVersion,
+		nilIfEmpty(req.WorkerID), fingerprintVersion, nullableJSON(effect.Context),
 	); err != nil {
 		return outbound.BeginAttemptResult{}, fmt.Errorf("open the attempt: %w", err)
 	}
@@ -1339,12 +1359,24 @@ func (s *Store) FinalizeDeliveryAttempt(ctx context.Context,
 		final = stored.Final && applied != nil && stored.Revision == *applied
 	}
 
+	// Whether an earlier call of this generation may still be ringing is what
+	// a refusal of this one means for a call: read from the same facts as the
+	// verdict, before the machine is asked.
+	doubt := false
+	if intent.CompletionMode == outbound.CompletionOnProviderReceipt {
+		facts, err := generationFactsTx(ctx, tx, *intent)
+		if err != nil {
+			return outbound.FinalizeResult{}, err
+		}
+		doubt = facts.Unaccounted > 0 || hasKnownLiveEffect(facts)
+	}
 	transition, err := outbound.Decide(outbound.Input{
-		Intent:          *intent,
-		Trigger:         outbound.TriggerFinishAttempt,
-		Outcome:         completion.Outcome,
-		AttemptRevision: applied,
-		AttemptIsFinal:  final,
+		Intent:            *intent,
+		Trigger:           outbound.TriggerFinishAttempt,
+		Outcome:           completion.Outcome,
+		AttemptRevision:   applied,
+		AttemptIsFinal:    final,
+		DoubtInGeneration: doubt,
 	})
 	if err != nil {
 		return outbound.FinalizeResult{}, err

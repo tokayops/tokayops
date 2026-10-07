@@ -21,6 +21,15 @@ import (
 type BoundContext struct {
 	CardReceiptRef string `json:"card_receipt_ref,omitempty"`
 	TeamURL        string `json:"team_url,omitempty"`
+
+	// For a call: the integration it goes through, the provider account, and
+	// the number it comes from - chosen by the channel when the generation
+	// opens, and settled with it. A repeat of a request that may have placed
+	// the call goes the same way; going another would be a second call
+	// through a second provider.
+	IntegrationID string `json:"integration_id,omitempty"`
+	AccountScope  string `json:"account_scope,omitempty"`
+	FromNumber    string `json:"from_number,omitempty"`
 }
 
 // Empty is a context with nothing in it, which is stored as NULL.

@@ -27,16 +27,6 @@ import (
 const (
 	FamilyNotification = "notification"
 	FamilyHandoff      = "handoff"
-	// FamilyCall is the partition phone calls run in: a call's acceptance only
-	// means "queued", and the commitment then waits for the provider's word.
-	// Its own because that wait, and the polling behind it, must not hold up a
-	// direct message.
-	//
-	// Known to PolicyOf and not yet listed by Families(): the liveness counters
-	// are zero-filled from that list, and a family with no worker running
-	// would fire the rule written for a worker that stopped. It joins the list
-	// with its worker.
-	FamilyCall = "call"
 	// FamilyWebhook is the partition outgoing webhooks run in. Its own because
 	// the slot scheduler is fair by count and paging pays in time: a call to a
 	// subscriber that neither answers nor refuses holds a slot for the whole of
@@ -151,11 +141,6 @@ type Policy struct {
 	// acknowledgement, a handover carries a deadline of its own shape.
 	Expiry time.Duration
 
-	// Receipt is how long this family waits for the provider's word about a
-	// call its acceptance only queued. Nil for the families whose acceptance is
-	// the delivery.
-	Receipt *ReceiptPolicy
-
 	// BackoffCap is where this family's retry curve stops growing. The curve
 	// is one; the ceiling is the family's, because what it costs to knock on a
 	// dead subscriber's door every five minutes for a day is not what it costs
@@ -178,33 +163,56 @@ type ReceiptPolicy struct {
 	PollDeadline time.Duration
 }
 
-// CompletesOnReceipt reports whether a family's acceptance only means "queued".
-func CompletesOnReceipt(family string) bool {
-	p, err := PolicyOf(family)
-	return err == nil && p.Receipt != nil
-}
-
-// The call family's numbers. Provisional: the channel that sets the ring time
-// they are measured against arrives with the family's admission.
+// The phone provider's numbers. A call runs in the paging family, on a worker
+// and a pool of its own, so these are the provider's and not a family's: the
+// wait for the provider's word, and how soon a call may be tried again.
 const (
-	CallLease            = NotificationLease
-	CallAttemptDeadline  = NotificationAttemptDeadline
-	CallPoolSize         = 4
-	CallClaimInterval    = NotificationClaimInterval
-	CallPrepareDeadline  = NotificationPrepareDeadline
-	CallRecordDeadline   = NotificationRecordDeadline
-	CallShutdownDeadline = CallPrepareDeadline + CallRecordDeadline + CallAttemptDeadline +
-		CallRecordDeadline + 10*time.Second
+	// PhonePoolSize is how many calls one instance places at once. The
+	// account's own limit is the real ceiling, and calls wait for it before
+	// they are placed; this keeps a stalled request from holding more than a
+	// handful of slots.
+	PhonePoolSize = 4
 
-	// CallFirstWait is a minute of ringing and half a minute to put it through.
-	CallFirstWait    = 90 * time.Second
-	CallPollInterval = 30 * time.Second
-	// CallReceiptDeadline is how long a call is waited for before it is
+	// PhoneFirstWait is a minute of ringing and half a minute to put it
+	// through.
+	PhoneFirstWait    = 90 * time.Second
+	PhonePollInterval = 30 * time.Second
+	// PhoneReceiptDeadline is how long a call is waited for before it is
 	// assumed to have happened. Ten minutes: a page later than that is the
 	// next step's job.
-	CallReceiptDeadline = 10 * time.Minute
-	CallPollDeadline    = 10 * time.Second
+	PhoneReceiptDeadline = 10 * time.Minute
+	PhonePollDeadline    = 10 * time.Second
+
+	// PhoneRetryFloor is the soonest a call is tried again after a request
+	// that may have placed it. The family's curve starts at about two
+	// seconds; for a call whose answer was lost that is several real calls a
+	// minute.
+	PhoneRetryFloor = time.Minute
 )
+
+// ReceiptPolicyOf is the wait for the provider's word for a provider whose
+// acceptance only means "queued", and false for the others.
+func ReceiptPolicyOf(provider string) (ReceiptPolicy, bool) {
+	if provider != keys.ProviderPhone {
+		return ReceiptPolicy{}, false
+	}
+	return ReceiptPolicy{
+		FirstWait:    PhoneFirstWait,
+		PollInterval: PhonePollInterval,
+		Deadline:     PhoneReceiptDeadline,
+		PollDeadline: PhonePollDeadline,
+	}, true
+}
+
+// RetryFloorOf is the soonest a provider's commitment is tried again after a
+// failure, whatever the family's curve says. Zero for every provider but the
+// phone.
+func RetryFloorOf(provider string) time.Duration {
+	if provider == keys.ProviderPhone {
+		return PhoneRetryFloor
+	}
+	return 0
+}
 
 // PolicyOf is the closed set of families this build executes.
 //
@@ -238,24 +246,6 @@ func PolicyOf(family string) (Policy, error) {
 			RecordDeadline:   HandoffRecordDeadline,
 			ShutdownDeadline: HandoffShutdownDeadline,
 			BackoffCap:       backoffCap,
-		}, nil
-	case FamilyCall:
-		return Policy{
-			Family:           FamilyCall,
-			Lease:            CallLease,
-			AttemptDeadline:  CallAttemptDeadline,
-			PoolSize:         CallPoolSize,
-			ClaimInterval:    CallClaimInterval,
-			PrepareDeadline:  CallPrepareDeadline,
-			RecordDeadline:   CallRecordDeadline,
-			ShutdownDeadline: CallShutdownDeadline,
-			BackoffCap:       backoffCap,
-			Receipt: &ReceiptPolicy{
-				FirstWait:    CallFirstWait,
-				PollInterval: CallPollInterval,
-				Deadline:     CallReceiptDeadline,
-				PollDeadline: CallPollDeadline,
-			},
 		}, nil
 	case FamilyWebhook:
 		return Policy{

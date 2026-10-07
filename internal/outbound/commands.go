@@ -413,6 +413,11 @@ type BeginAttemptRequest struct {
 	// is not the one who gets to decide that.
 	BoundEndpoint string
 
+	// BoundContext is the context the channel proposes for the generation, by
+	// the same rule as the address: kept when the generation opens, ignored
+	// inside one.
+	BoundContext BoundContext
+
 	// ErrorClass and Summary describe a preparation that failed, and are what
 	// the journal keeps instead of an attempt.
 	ErrorClass string

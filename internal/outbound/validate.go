@@ -31,6 +31,7 @@ func notAdmissiblef(format string, args ...any) error {
 var notificationProviders = map[string]bool{
 	"slack":    true,
 	"telegram": true,
+	"phone":    true,
 }
 
 // DeliversThrough reports whether this build has a channel for a provider.
@@ -116,14 +117,21 @@ func ValidateEscalationAdmission(adm keys.Admission, now time.Time) error {
 			return notAdmissiblef("provider %q is not one this build delivers through", c.Provider)
 		}
 
-		if c.CompletionMode != keys.CompletionOnAcceptance {
-			// A channel whose acceptance only means "queued" needs somewhere to
-			// wait for the provider's own confirmation, and there is nowhere to
-			// wait yet. Admitting one would leave a commitment that can never
-			// be completed.
-			return notAdmissiblef(
-				"completion mode %q needs provider receipts, which this build cannot receive",
-				c.CompletionMode)
+		// The completion mode is the provider's, not the producer's: a call's
+		// acceptance only means "queued" and nothing else's does. Either way
+		// round a mismatch is a commitment that can never be completed - one
+		// waiting for a word its provider never sends, or one settled by an
+		// acceptance that proved nothing.
+		_, waits := ReceiptPolicyOf(c.Provider)
+		switch {
+		case waits && c.CompletionMode != keys.CompletionOnProviderReceipt:
+			return notAdmissiblef("provider %q completes on the provider's word, not on %q",
+				c.Provider, c.CompletionMode)
+		case !waits && c.CompletionMode != keys.CompletionOnAcceptance:
+			return notAdmissiblef("provider %q completes on acceptance, not on %q",
+				c.Provider, c.CompletionMode)
+		case waits && c.Editable:
+			return notAdmissiblef("provider %q makes one-shot calls; nothing of it can be edited", c.Provider)
 		}
 
 		switch c.AmbiguityPolicy {

@@ -435,6 +435,13 @@ function bindPolicyEditorEvents() {
                 const targetTypeSelect = row.querySelector('.target-type-select');
                 const targetContainer = row.querySelector('.target-selector-container');
 
+                // A call says the same few words for every alert: its step has
+                // no message to write.
+                const messageField = row.querySelector('.step-field-message');
+                if (messageField) {
+                    messageField.style.display = targetKind === 'call' ? 'none' : '';
+                }
+
                 if (targetKind === 'channel') {
                     targetTypeSelect.innerHTML = '<option value="channel">Channel</option>';
                     updateTargetSelector(targetContainer, 'channel');
@@ -542,10 +549,9 @@ function addNewStep() {
     const newIndex = stepsList.children.length;
     const currentTeamId = document.getElementById('policy-team-select')?.value || '';
 
-    // Pass currentScheduleId for schedule target display. Default provider
-    // is the first registered one (alphabetical) - the editor is
-    // discover providers via /providers instead of hardcoding "slack_dm".
-    const defaultProvider = (State.providers || [])[0]?.name || '';
+    // Pass currentScheduleId for schedule target display. The editor
+    // discovers providers via /providers instead of hardcoding "slack_dm".
+    const defaultProvider = Components.defaultStepProvider(State.providers);
     const stepHtml = Components.policyStepRow({
         provider: defaultProvider,
         target_kind: 'dm',
@@ -653,7 +659,7 @@ function collectStepsData() {
         const targetType = row.querySelector('.target-type-select')?.value || 'user';
         const targetId = row.querySelector('.target-id-input')?.value || '';
         const delaySeconds = parseInt(row.querySelector('.delay-input')?.value || '0', 10);
-        const message = row.querySelector('.message-input')?.value || '';
+        const message = targetKind === 'call' ? '' : (row.querySelector('.message-input')?.value || '');
         const continueOnFailure = row.querySelector('.continue-on-failure-input')?.checked ?? true;
 
         steps.push({

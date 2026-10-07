@@ -27,7 +27,11 @@ func (w *Worker) pollReceipts(ctx context.Context) {
 }
 
 func (w *Worker) pollPass(ctx context.Context) {
-	due, err := w.receipts.ClaimDueReceipts(ctx, w.family, w.pool)
+	providers := make([]string, 0, len(w.receiving))
+	for provider := range w.receiving {
+		providers = append(providers, provider)
+	}
+	due, err := w.receipts.ClaimDueReceipts(ctx, w.family, providers, w.pool)
 	if err != nil {
 		log.Printf("outbound worker %s: claim the waits: %v", w.workerID, err)
 		return
@@ -71,7 +75,8 @@ func (w *Worker) pollPass(ctx context.Context) {
 // answer becomes an event of its own, named by the object and the status it
 // reports: asking twice and hearing the same is the same event.
 func (w *Worker) pollOne(ctx context.Context, channel ReceiptChannel, ref EffectRef) {
-	pollCtx, cancel := context.WithTimeout(ctx, w.policy.Receipt.PollDeadline)
+	policy, _ := ReceiptPolicyOf(ref.Provider)
+	pollCtx, cancel := context.WithTimeout(ctx, policy.PollDeadline)
 	event, err := channel.Poll(pollCtx, ref)
 	cancel()
 	if err != nil {

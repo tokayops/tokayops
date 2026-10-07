@@ -535,3 +535,51 @@ func TestTwoStepsOnOneScheduleAreToldApart(t *testing.T) {
 		}
 	}
 }
+
+// TestACallStepIsPromisedAsACall. A step to the phone is one call to one
+// person: nothing of it can be edited, its acceptance only means "queued", the
+// step's message is not spoken, and it is owed for a while after its step
+// rather than for ever.
+func TestACallStepIsPromisedAsACall(t *testing.T) {
+	store := &failingStore{
+		team: routedTeam,
+		policy: &model.EscalationPolicy{
+			ID: "policy-1", Name: "Calls",
+			Steps: []*model.EscalationStep{
+				{StepIndex: 1, Provider: "phone", TargetKind: "call",
+					TargetType: "user", TargetID: "U_CALLED", DelaySeconds: 120, Message: "never spoken"},
+				{StepIndex: 2, Provider: "slack", TargetKind: "dm",
+					TargetType: "user", TargetID: "U_MESSAGED"},
+			},
+		},
+	}
+
+	admission, err := planFor(store).buildPlan(context.Background(), criticalGroup(),
+		schedulerender.TeamOnCallResult{})
+	if err != nil {
+		t.Fatalf("build the plan: %v", err)
+	}
+
+	var call, message *keys.AdmittedCommitment
+	for i, c := range admission.Admission.Commitments {
+		switch c.Target.Ref {
+		case "U_CALLED":
+			call = &admission.Admission.Commitments[i]
+		case "U_MESSAGED":
+			message = &admission.Admission.Commitments[i]
+		}
+	}
+	if call == nil || message == nil {
+		t.Fatalf("commitments: %+v", admission.Admission.Commitments)
+	}
+	if call.Provider != keys.ProviderPhone || call.Editable ||
+		call.CompletionMode != keys.CompletionOnProviderReceipt {
+		t.Fatalf("the call was promised as %+v", call)
+	}
+	if call.Expiry == nil || call.Expiry.Offset != 2*time.Minute+callExpiry {
+		t.Fatalf("the call is owed until %+v, want its step and %s after", call.Expiry, callExpiry)
+	}
+	if message.CompletionMode != keys.CompletionOnAcceptance || message.Expiry != nil {
+		t.Fatalf("the direct message beside it changed: %+v", message)
+	}
+}

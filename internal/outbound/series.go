@@ -1,6 +1,10 @@
 package outbound
 
-import "github.com/tokayops/tokayops/internal/metrics"
+import (
+	"fmt"
+
+	"github.com/tokayops/tokayops/internal/metrics"
+)
 
 // Families is every execution partition this build runs, in a fixed order.
 //
@@ -11,12 +15,53 @@ func Families() []string {
 	return []string{FamilyNotification, FamilyHandoff, FamilyWebhook}
 }
 
+// LaneDefault is the lane every family's worker runs on unless it is given
+// another, and LanePhone the paging family's second one, for calls.
+const (
+	LaneDefault = "default"
+	LanePhone   = "phone"
+)
+
+// Lane is one worker of one family.
+type Lane struct {
+	Family string
+	Lane   string
+}
+
+// Lanes is every worker this build runs, for the liveness counter's zero
+// series. A family's second worker is a lane of its own: counted together, a
+// healthy worker would hide one that stopped.
+func Lanes() []Lane {
+	return []Lane{
+		{FamilyNotification, LaneDefault},
+		{FamilyNotification, LanePhone},
+		{FamilyHandoff, LaneDefault},
+		{FamilyWebhook, LaneDefault},
+	}
+}
+
+// lanePool is the pool of one lane: the family's own for its default lane, the
+// lane's for the others. A lane that is not in Lanes is refused - its ticks
+// would have no zero series for the liveness rule to read.
+func lanePool(family, lane string, policy Policy) (int, error) {
+	for _, known := range Lanes() {
+		if known.Family != family || known.Lane != lane {
+			continue
+		}
+		if lane == LanePhone {
+			return PhonePoolSize, nil
+		}
+		return policy.PoolSize, nil
+	}
+	return 0, fmt.Errorf("outbound: %s is not a lane of family %s", lane, family)
+}
+
 // Statuses is every status a commitment can be in, for the doors that take a
 // status from a caller and have to refuse one this build does not know.
 func Statuses() []Status {
 	return []Status{StatusPending, StatusSending, StatusIdle, StatusManualReview,
 		StatusAwaitingReceipt,
-		StatusSucceeded, StatusPermanentFailed, StatusExpired, StatusCanceled}
+		StatusSucceeded, StatusPermanentFailed, StatusExpired, StatusCanceled, StatusNoContact}
 }
 
 // RecoveryTargets is every status recovery can move a commitment to when its
@@ -39,8 +84,10 @@ func RecoveryTargets() []Status {
 // closed list of families, is what makes the rule's input exist independently
 // of whether cmd/tokayops built the worker.
 func init() {
+	for _, lane := range Lanes() {
+		metrics.OutboundWorkerTicksTotal.WithLabelValues(lane.Family, lane.Lane)
+	}
 	for _, family := range Families() {
-		metrics.OutboundWorkerTicksTotal.WithLabelValues(family)
 		for _, to := range RecoveryTargets() {
 			metrics.OutboundLeasesExpiredTotal.WithLabelValues(family, string(to))
 		}

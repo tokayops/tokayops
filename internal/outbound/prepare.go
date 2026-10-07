@@ -17,6 +17,7 @@ import "context"
 type Preparation struct {
 	outcome    PreparationOutcome
 	endpoint   string
+	context    BoundContext
 	errorClass string
 	summary    string
 }
@@ -56,11 +57,27 @@ func Ready(endpoint string) Preparation {
 	return Preparation{outcome: PreparationReady, endpoint: endpoint}
 }
 
+// ReadyWith is a call that may go ahead, with the context the channel chose
+// for it - for a call, the integration, account and sender number. Like the
+// address, it is a proposal: the store keeps it only when the generation
+// opens, and inside a generation the bound one wins.
+func ReadyWith(endpoint string, context BoundContext) Preparation {
+	return Preparation{outcome: PreparationReady, endpoint: endpoint, context: context}
+}
+
 // Impossible is a refusal nothing will fix on its own: no integration, an
 // identity nobody linked, a configuration the provider rejects. It ends the
 // commitment where a person will see it.
 func Impossible(class, summary string) Preparation {
 	return refusal(PreparationPermanent, class, summary)
+}
+
+// NoContact is a recipient this provider has no way to reach - no phone, an
+// unverified one, a number no integration covers. It ends the commitment
+// without calling it a failure, and without stopping the escalation behind
+// it: the person was never reachable this way, and that is known in advance.
+func NoContact(class, summary string) Preparation {
+	return refusal(PreparationNoContact, class, summary)
 }
 
 // NotNow is a refusal that may resolve itself: a rate limit local to this
@@ -94,6 +111,7 @@ func (p Preparation) Request(intentID, leaseToken, workerID string) BeginAttempt
 		WorkerID:      workerID,
 		Preparation:   p.outcome,
 		BoundEndpoint: p.endpoint,
+		BoundContext:  p.context,
 		ErrorClass:    p.errorClass,
 		Summary:       p.summary,
 	}

@@ -63,15 +63,19 @@ func TestTheLivenessSeriesExistBeforeAnythingTicked(t *testing.T) {
 	if ticks.GetType() != dto.MetricType_COUNTER {
 		t.Errorf("outbound_worker_ticks_total is a %s, not a counter", ticks.GetType())
 	}
-	for _, family := range Families() {
-		m, ok := seriesOf(ticks, map[string]string{"family": family})
+	// Every lane of every family, the call lane included: a second worker of
+	// a family is a series of its own, or a healthy worker hides one that
+	// stopped.
+	for _, lane := range Lanes() {
+		m, ok := seriesOf(ticks, map[string]string{"family": lane.Family, "lane": lane.Lane})
 		if !ok {
-			t.Errorf("no outbound_worker_ticks_total series for %s before its worker ticked", family)
+			t.Errorf("no outbound_worker_ticks_total series for %s/%s before its worker ticked",
+				lane.Family, lane.Lane)
 			continue
 		}
-		if family != FamilyNotification && m.GetCounter().GetValue() != 0 {
-			t.Errorf("outbound_worker_ticks_total{family=%q} = %v before any tick, want 0",
-				family, m.GetCounter().GetValue())
+		if lane.Family != FamilyNotification && m.GetCounter().GetValue() != 0 {
+			t.Errorf("outbound_worker_ticks_total{family=%q,lane=%q} = %v before any tick, want 0",
+				lane.Family, lane.Lane, m.GetCounter().GetValue())
 		}
 	}
 
@@ -114,7 +118,7 @@ func TestTheLivenessSeriesCarryExactlyTheLabelsTheRulesName(t *testing.T) {
 		return names
 	}
 	want := map[string][]string{
-		"outbound_worker_ticks_total":   {"family"},
+		"outbound_worker_ticks_total":   {"family", "lane"},
 		"outbound_leases_expired_total": {"family", "to"},
 		"outbound_fanout_ticks_total":   nil,
 	}

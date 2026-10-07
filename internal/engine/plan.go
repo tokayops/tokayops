@@ -496,11 +496,31 @@ func (p *planner) commitments(ctx context.Context, people *roster,
 				},
 				targetKind: step.TargetKind,
 			}
+			if step.Provider == keys.ProviderPhone {
+				card.commitment = callOf(card.commitment, offset)
+			}
 			out = append(out, card)
 			out = append(out, satellitesOf(card)...)
 		}
 	}
 	return out, unpromised, nil
+}
+
+// callExpiry is how long after its step a call is still worth placing. Later
+// than that the page is the next step's job, and a call that rings half an
+// hour late wakes somebody about something already handled.
+const callExpiry = 10 * time.Minute
+
+// callOf is a step's commitment as a call: one-shot - nothing of a call can be
+// edited - waiting for the provider's word, and owed only for a while after
+// its step. The message of the step is not spoken: a call says the same few
+// words whatever the alert, and the person reads the rest where it is.
+func callOf(c keys.EscalationCommitment, offset time.Duration) keys.EscalationCommitment {
+	c.Editable = false
+	c.MessageOverride = nil
+	c.CompletionMode = keys.CompletionOnProviderReceipt
+	c.Expiry = &keys.TimingSpec{Kind: keys.TimingRelativeToAdmission, Offset: offset + callExpiry}
+	return c
 }
 
 // recipients is who one policy step names, as this system names them.

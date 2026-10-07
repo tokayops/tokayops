@@ -21,7 +21,7 @@ import (
 var (
 	allStatuses = []Status{
 		StatusPending, StatusSending, StatusIdle, StatusManualReview, StatusAwaitingReceipt,
-		StatusSucceeded, StatusPermanentFailed, StatusExpired, StatusCanceled,
+		StatusSucceeded, StatusPermanentFailed, StatusExpired, StatusCanceled, StatusNoContact,
 	}
 	allVerdicts = Verdicts()
 	allOutcomes = []Outcome{
@@ -33,7 +33,7 @@ var (
 	}
 	allForms       = []Form{FormOneShot, FormEditable}
 	allPreparation = []PreparationOutcome{
-		PreparationReady, PreparationPermanent, PreparationTransient,
+		PreparationReady, PreparationPermanent, PreparationTransient, PreparationNoContact,
 	}
 	allDecisions = []Decision{
 		DecisionAssumeAccepted, DecisionCancel,
@@ -312,6 +312,31 @@ func TestDecideNamedRows(t *testing.T) {
 				Intent: receiptIntent(StatusSending), Trigger: TriggerFinishAttempt, Outcome: OutcomeAccepted,
 			},
 			to: StatusAwaitingReceipt, row: "T8r",
+		},
+		{
+			name: "a provider refused a call, and the generation is settled",
+			in: Input{
+				Intent: receiptIntent(StatusSending), Trigger: TriggerFinishAttempt,
+				Outcome: OutcomePermanentRejection,
+			},
+			to: StatusPending, row: "T10r",
+		},
+		{
+			name: "a provider refused a repeat while the first call may be ringing",
+			in: Input{
+				Intent: receiptIntent(StatusSending), Trigger: TriggerFinishAttempt,
+				Outcome: OutcomePermanentRejection, DoubtInGeneration: true,
+			},
+			to: StatusAwaitingReceipt, row: "T10w",
+		},
+		{
+			name: "nobody to reach through the provider",
+			in: Input{
+				Intent:      Intent{Status: StatusPending},
+				Trigger:     TriggerPreparation,
+				Preparation: PreparationNoContact,
+			},
+			to: StatusNoContact, row: "T4c",
 		},
 		{
 			name: "a call accepted while the alert was being acknowledged still waits",
@@ -752,20 +777,23 @@ func TestDecideOverTheWholeInputSpace(t *testing.T) {
 								// - which is every commitment drawn from its
 								// own payload.
 								for _, revision := range []*int64{nil, revisionOf(2), revisionOf(3)} {
-									intent := sendingIntent()
-									intent.Status = status
-									intent.AmbiguityPolicy = policy
-									intent.Form = form
-									intent.CompletionMode = completion
-									intent.CancellationRequested = canceled
-									intent.DesiredRevision = 3
-									check(Input{
-										Intent:          intent,
-										Trigger:         TriggerFinishAttempt,
-										Outcome:         outcome,
-										AttemptRevision: revision,
-										AttemptIsFinal:  final,
-									})
+									for _, doubt := range bothWays {
+										intent := sendingIntent()
+										intent.Status = status
+										intent.AmbiguityPolicy = policy
+										intent.Form = form
+										intent.CompletionMode = completion
+										intent.CancellationRequested = canceled
+										intent.DesiredRevision = 3
+										check(Input{
+											Intent:            intent,
+											Trigger:           TriggerFinishAttempt,
+											Outcome:           outcome,
+											AttemptRevision:   revision,
+											AttemptIsFinal:    final,
+											DoubtInGeneration: doubt,
+										})
+									}
 								}
 							}
 						}

@@ -461,30 +461,40 @@ func receiptEffect(f outbound.GenerationFacts, verdict outbound.Verdict) (outbou
 // The moment is read with clock_timestamp(), after the row lock: now() is when
 // the transaction began, and one that waited behind a neighbour would schedule
 // from before the wait.
-func (s *Store) ClaimDueReceipts(ctx context.Context, family string, limit int) ([]outbound.AwaitingReceipt, error) {
-	if limit <= 0 {
+func (s *Store) ClaimDueReceipts(ctx context.Context, family string, providers []string,
+	limit int) ([]outbound.AwaitingReceipt, error) {
+
+	if limit <= 0 || len(providers) == 0 {
 		return nil, nil
 	}
-	policy, err := outbound.PolicyOf(family)
-	if err != nil {
+	if _, err := outbound.PolicyOf(family); err != nil {
 		return nil, err
 	}
-	if policy.Receipt == nil {
-		return nil, outboundContractf("family %s does not wait for the provider's word", family)
+	intervals := make([]float64, len(providers))
+	for i, provider := range providers {
+		policy, waits := outbound.ReceiptPolicyOf(provider)
+		if !waits {
+			return nil, outboundContractf("provider %s does not wait for the provider's word", provider)
+		}
+		intervals[i] = policy.PollInterval.Seconds()
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
+		WITH interval_of AS (
+			SELECT * FROM unnest($3::text[], $4::float8[]) AS p(provider, secs)
+		)
 		UPDATE outbound_intents i
-		SET receipt_timeout_at = clock_timestamp() + make_interval(secs => $3)
+		SET receipt_timeout_at = clock_timestamp() + make_interval(secs => p.secs)
 		FROM (
 			SELECT id FROM outbound_intents
-			WHERE delivery_family = $1 AND status = 'awaiting_receipt' AND receipt_timeout_at <= now()
+			WHERE delivery_family = $1 AND provider = ANY($3) AND status = 'awaiting_receipt'
+			  AND receipt_timeout_at <= now()
 			ORDER BY receipt_timeout_at, id
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
-		) due
-		WHERE i.id = due.id
-		RETURNING i.id, i.provider`, family, limit, policy.Receipt.PollInterval.Seconds())
+		) due, interval_of p
+		WHERE i.id = due.id AND p.provider = i.provider
+		RETURNING i.id, i.provider`, family, limit, pq.Array(providers), pq.Array(intervals))
 	if err != nil {
 		return nil, fmt.Errorf("claim the waits of %s: %w", family, err)
 	}
@@ -511,17 +521,26 @@ func (s *Store) ClaimDueReceipts(ctx context.Context, family string, limit int) 
 		ids[i], index[a.IntentID] = a.IntentID, i
 	}
 	effects, err := s.db.QueryContext(ctx, `
-		SELECT intent_id, attempt_id, external_ref FROM outbound_effects
-		WHERE intent_id = ANY($1) AND state = 'in_progress'
-		ORDER BY intent_id, attempt_id`, pq.Array(ids))
+		SELECT e.intent_id, e.attempt_id, e.external_ref, i.provider, a.bound_context
+		FROM outbound_effects e
+		JOIN outbound_intents i ON i.id = e.intent_id
+		JOIN outbound_attempts a ON a.id = e.attempt_id
+		WHERE e.intent_id = ANY($1) AND e.state = 'in_progress'
+		ORDER BY e.intent_id, e.attempt_id`, pq.Array(ids))
 	if err != nil {
 		return nil, err
 	}
 	defer effects.Close()
 	for effects.Next() {
 		var ref outbound.EffectRef
-		if err := effects.Scan(&ref.IntentID, &ref.AttemptID, &ref.ExternalRef); err != nil {
+		var bound []byte
+		if err := effects.Scan(&ref.IntentID, &ref.AttemptID, &ref.ExternalRef, &ref.Provider, &bound); err != nil {
 			return nil, err
+		}
+		// What the attempt was bound to is the account to ask with, and it is
+		// read strictly: asking with a guess is asking somebody else's account.
+		if ref.Context, err = outbound.DecodeBoundContext(bound); err != nil {
+			return nil, fmt.Errorf("read what attempt %s was bound to: %w", ref.AttemptID, err)
 		}
 		i := index[ref.IntentID]
 		due[i].Effects = append(due[i].Effects, ref)
@@ -597,4 +616,55 @@ func (s *Store) UnmatchedProviderEvents(ctx context.Context, limit int) ([]strin
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// RefusedIntegrations are the integrations that definitely refused one of this
+// commitment's calls: the provider said no to the request, or said the call it
+// accepted was never placed. A call is not tried through them again; when no
+// other integration is left, the commitment has run out of ways to reach the
+// person.
+func (s *Store) RefusedIntegrations(ctx context.Context, intentID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT a.bound_context->>'integration_id'
+		FROM outbound_attempts a
+		WHERE a.intent_id = $1 AND a.bound_context ? 'integration_id'
+		  AND (a.outcome = 'permanent_rejection'
+		       OR EXISTS (SELECT 1 FROM outbound_effects e
+		                  WHERE e.attempt_id = a.id AND e.state = 'not_placed'))
+		ORDER BY 1`, intentID)
+	if err != nil {
+		return nil, fmt.Errorf("read the integrations that refused %s: %w", intentID, err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// AttemptBinding is what one attempt was bound to - for a call, the
+// integration and account it went through - and false when there is no such
+// attempt. Read by whatever has to speak to that account about it afterwards:
+// the check of the provider's signature on a callback, and the poll.
+func (s *Store) AttemptBinding(ctx context.Context, attemptID string) (outbound.BoundContext, bool, error) {
+	var raw []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT bound_context FROM outbound_attempts WHERE id = $1 AND record_kind = 'attempt'`,
+		attemptID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return outbound.BoundContext{}, false, nil
+	}
+	if err != nil {
+		return outbound.BoundContext{}, false, err
+	}
+	bound, err := outbound.DecodeBoundContext(raw)
+	if err != nil {
+		return outbound.BoundContext{}, false, fmt.Errorf("read what attempt %s was bound to: %w", attemptID, err)
+	}
+	return bound, true, nil
 }

@@ -6,6 +6,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/tokayops/tokayops/internal/metrics"
 )
 
 // receivingChannel is a channel that can read a provider's events and be
@@ -45,7 +48,7 @@ type receiptFakeStore struct {
 	reviewed []string
 }
 
-func (f *receiptFakeStore) ClaimDueReceipts(context.Context, string, int) ([]AwaitingReceipt, error) {
+func (f *receiptFakeStore) ClaimDueReceipts(context.Context, string, []string, int) ([]AwaitingReceipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	due := f.due
@@ -87,16 +90,16 @@ func (f *receiptFakeStore) UnmatchedProviderEvents(context.Context, int) ([]stri
 func TestAWaitingFamilyRefusesToStartWithoutWhatItNeeds(t *testing.T) {
 	receiving := &receivingChannel{fakeChannel: newFakeChannel()}
 
-	if _, err := NewWorkerFor(FamilyCall, newFakeStore(), "w", map[string]Channel{"phone": receiving}); err == nil ||
+	if _, err := NewLaneWorker(FamilyNotification, LanePhone, newFakeStore(), "w", map[string]Channel{"phone": receiving}); err == nil ||
 		!strings.Contains(err.Error(), "store") {
 		t.Fatalf("a store that cannot keep the provider's word: %v", err)
 	}
 	store := &receiptFakeStore{fakeStore: newFakeStore()}
-	if _, err := NewWorkerFor(FamilyCall, store, "w", map[string]Channel{"phone": newFakeChannel()}); err == nil ||
+	if _, err := NewLaneWorker(FamilyNotification, LanePhone, store, "w", map[string]Channel{"phone": newFakeChannel()}); err == nil ||
 		!strings.Contains(err.Error(), "phone") {
 		t.Fatalf("a channel that cannot read the provider's word: %v", err)
 	}
-	if _, err := NewWorkerFor(FamilyCall, store, "w", map[string]Channel{"phone": receiving}); err != nil {
+	if _, err := NewLaneWorker(FamilyNotification, LanePhone, store, "w", map[string]Channel{"phone": receiving}); err != nil {
 		t.Fatalf("a family with what it needs: %v", err)
 	}
 	// And the families that never wait are not asked for any of it.
@@ -113,11 +116,11 @@ func TestAPollAsksAboutEveryObjectAndThenReviews(t *testing.T) {
 	store := &receiptFakeStore{fakeStore: newFakeStore(), due: []AwaitingReceipt{{
 		IntentID: "intent-1", Provider: "phone",
 		Effects: []EffectRef{
-			{IntentID: "intent-1", AttemptID: "a1", ExternalRef: "CA1"},
-			{IntentID: "intent-1", AttemptID: "a2", ExternalRef: "CA2"},
+			{IntentID: "intent-1", AttemptID: "a1", ExternalRef: "CA1", Provider: "phone"},
+			{IntentID: "intent-1", AttemptID: "a2", ExternalRef: "CA2", Provider: "phone"},
 		},
 	}}}
-	w, err := NewWorkerFor(FamilyCall, store, "w", map[string]Channel{"phone": receiving})
+	w, err := NewLaneWorker(FamilyNotification, LanePhone, store, "w", map[string]Channel{"phone": receiving})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +149,7 @@ func TestAFailedPollStillLetsTheWaitEnd(t *testing.T) {
 		IntentID: "intent-1", Provider: "phone",
 		Effects: []EffectRef{{IntentID: "intent-1", AttemptID: "a1", ExternalRef: "CA1"}},
 	}}}
-	w, err := NewWorkerFor(FamilyCall, store, "w", map[string]Channel{"phone": receiving})
+	w, err := NewLaneWorker(FamilyNotification, LanePhone, store, "w", map[string]Channel{"phone": receiving})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,5 +160,115 @@ func TestAFailedPollStillLetsTheWaitEnd(t *testing.T) {
 	}
 	if len(store.reviewed) != 1 {
 		t.Fatal("a failed poll kept the wait from being reviewed")
+	}
+}
+
+// calledWithin waits for a channel to have been asked to send, or gives up.
+func calledWithin(c *fakeChannel, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		n := len(c.calls)
+		c.mu.Unlock()
+		if n > 0 {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+// A storm of calls whose requests hang until their deadline holds every call
+// slot, and a direct message that comes after it still goes out at once: calls
+// run on a lane of their own, with a pool of their own.
+func TestHungCallsDoNotHoldADirectMessage(t *testing.T) {
+	store := &receiptFakeStore{fakeStore: newFakeStore()}
+	store.fakeStore.due = []ProviderDue{
+		{Provider: "phone", ClaimableDue: 20, ClaimableFresh: 20},
+		{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1},
+	}
+	store.available = map[string]*queues{"phone": {fresh: 20}, "slack": {fresh: 1}}
+
+	hung := &receivingChannel{fakeChannel: newFakeChannel()}
+	hung.block = make(chan struct{})
+	defer close(hung.block)
+	slack := newFakeChannel()
+
+	calls, err := NewLaneWorker(FamilyNotification, LanePhone, store, "calls", map[string]Channel{"phone": hung})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := NewWorkerFor(FamilyNotification, store, "messages", map[string]Channel{"slack": slack})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	calls.Tick(context.Background())
+	if !calledWithin(hung.fakeChannel, time.Second) {
+		t.Fatal("no call was placed")
+	}
+	if calls.inflight.Load() != int64(PhonePoolSize) {
+		t.Fatalf("%d calls in flight, the call lane holds %d", calls.inflight.Load(), PhonePoolSize)
+	}
+
+	messages.Tick(context.Background())
+	if !calledWithin(slack, time.Second) {
+		t.Fatal("a direct message waited behind calls that hang")
+	}
+}
+
+// The same storm through ONE pool shows what the lane prevents: the calls take
+// every slot, and the message waits for a deadline.
+func TestOnePoolForBothWouldHoldTheMessage(t *testing.T) {
+	store := &receiptFakeStore{fakeStore: newFakeStore()}
+	store.fakeStore.due = []ProviderDue{{Provider: "phone", ClaimableDue: 20, ClaimableFresh: 20}}
+	store.available = map[string]*queues{"phone": {fresh: 20}, "slack": {}}
+
+	hung := &receivingChannel{fakeChannel: newFakeChannel()}
+	hung.block = make(chan struct{})
+	defer close(hung.block)
+	slack := newFakeChannel()
+
+	shared, err := NewWorkerFor(FamilyNotification, store, "shared",
+		map[string]Channel{"phone": hung, "slack": slack})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared.Tick(context.Background())
+	if !calledWithin(hung.fakeChannel, time.Second) {
+		t.Fatal("no call was placed")
+	}
+
+	// The message arrives after the calls took the slots.
+	store.fakeStore.mu.Lock()
+	store.fakeStore.due = append(store.fakeStore.due, ProviderDue{Provider: "slack", ClaimableDue: 1, ClaimableFresh: 1})
+	store.available["slack"].fresh = 1
+	store.fakeStore.mu.Unlock()
+	shared.Tick(context.Background())
+	if calledWithin(slack, 200*time.Millisecond) {
+		t.Fatal("a shared pool let the message through; the lane test proves nothing")
+	}
+}
+
+// The call lane counts its ticks under its own lane: a stopped call worker is
+// a series of its own going flat, not hidden by the paging worker's ticks.
+func TestTheCallLaneTicksUnderItsOwnName(t *testing.T) {
+	store := &receiptFakeStore{fakeStore: newFakeStore()}
+	calls, err := NewLaneWorker(FamilyNotification, LanePhone, store, "calls",
+		map[string]Channel{"phone": &receivingChannel{fakeChannel: newFakeChannel()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := counterValue(t, metrics.OutboundWorkerTicksTotal, FamilyNotification, LanePhone)
+	paging := counterValue(t, metrics.OutboundWorkerTicksTotal, FamilyNotification, LaneDefault)
+	calls.Tick(context.Background())
+	if got := counterValue(t, metrics.OutboundWorkerTicksTotal, FamilyNotification, LanePhone) - before; got != 1 {
+		t.Fatalf("the call lane ticked %v times", got)
+	}
+	if got := counterValue(t, metrics.OutboundWorkerTicksTotal, FamilyNotification, LaneDefault) - paging; got != 0 {
+		t.Fatalf("the call lane's tick was counted as paging's: %v", got)
+	}
+	if _, err := NewLaneWorker(FamilyHandoff, LanePhone, store, "x", nil); err == nil {
+		t.Fatal("a lane no family has was built")
 	}
 }
