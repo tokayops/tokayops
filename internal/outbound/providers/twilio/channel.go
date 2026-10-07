@@ -173,7 +173,13 @@ func withoutRefused(covering []Integration, refused []string) []Integration {
 // ExecuteAttempt places the call through the integration the generation is
 // bound to, from the number it was bound to.
 func (c *Channel) ExecuteAttempt(ctx context.Context, call outbound.Call) (outbound.Result, error) {
-	cfg, err := c.config(call.BoundContext.IntegrationID)
+	// A new call only through an integration that is still switched on and
+	// still on the account the generation was bound to. Either way round the
+	// binding is unusable: nothing leaves this process, the commitment tries
+	// again later and, if nothing changes, ends with its deadline. It is not
+	// moved to another integration - a request that may have placed a call is
+	// repeated the way it was made, or not at all.
+	cfg, err := c.config(call.BoundContext, true)
 	if err != nil {
 		return outbound.Result{Evidence: outbound.DefinitelyNotSent, Summary: err.Error()}, nil
 	}
@@ -260,7 +266,10 @@ func (c *Channel) EffectStateOf(event outbound.ProviderEvent) (outbound.EffectSt
 // Poll asks Twilio where one call stands, with the account the attempt that
 // made it was bound to.
 func (c *Channel) Poll(ctx context.Context, ref outbound.EffectRef) (outbound.ProviderEvent, error) {
-	cfg, err := c.config(ref.Context.IntegrationID)
+	// Asking about a call already made is allowed through an integration that
+	// was switched off since; asking another account is not - the call is not
+	// there, and its silence would read as nothing at all.
+	cfg, err := c.config(ref.Context, false)
 	if err != nil {
 		return outbound.ProviderEvent{}, err
 	}
@@ -274,22 +283,32 @@ func (c *Channel) Poll(ctx context.Context, ref outbound.EffectRef) (outbound.Pr
 	}, nil
 }
 
-// config is an integration's configuration, read from the database each time:
-// a rotated token is used from the next call on.
-func (c *Channel) config(integrationID string) (model.TwilioConfig, error) {
-	if integrationID == "" {
+// config is the configuration of the integration a call is bound to, read
+// from the database each time: a token rotated within the account is used from
+// the next request on. The binding is unusable when the integration is gone,
+// when it now names another account - the call and its record are in the
+// account it was made on, whose token is not kept - or, for a new call, when
+// it has been switched off.
+func (c *Channel) config(bound outbound.BoundContext, placing bool) (model.TwilioConfig, error) {
+	if bound.IntegrationID == "" {
 		return model.TwilioConfig{}, errors.New("the call is bound to no integration")
 	}
-	row, err := c.directory.GetIntegrationByID(integrationID)
+	row, err := c.directory.GetIntegrationByID(bound.IntegrationID)
 	if err != nil {
-		return model.TwilioConfig{}, fmt.Errorf("read twilio integration %s: %w", integrationID, err)
+		return model.TwilioConfig{}, fmt.Errorf("read twilio integration %s: %w", bound.IntegrationID, err)
 	}
 	if row == nil || row.Type != model.IntegrationTypeTwilio {
-		return model.TwilioConfig{}, fmt.Errorf("twilio integration %s is gone", integrationID)
+		return model.TwilioConfig{}, fmt.Errorf("twilio integration %s is gone", bound.IntegrationID)
+	}
+	if placing && !row.Enabled {
+		return model.TwilioConfig{}, fmt.Errorf("twilio integration %s is switched off", bound.IntegrationID)
 	}
 	var cfg model.TwilioConfig
 	if err := json.Unmarshal(row.Config, &cfg); err != nil {
-		return model.TwilioConfig{}, fmt.Errorf("read the config of twilio integration %s: %w", integrationID, err)
+		return model.TwilioConfig{}, fmt.Errorf("read the config of twilio integration %s: %w", bound.IntegrationID, err)
+	}
+	if bound.AccountScope != "" && cfg.AccountSID != bound.AccountScope {
+		return model.TwilioConfig{}, fmt.Errorf("twilio integration %s is on another account than the call", bound.IntegrationID)
 	}
 	return cfg, nil
 }

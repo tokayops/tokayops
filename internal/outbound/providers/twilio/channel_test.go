@@ -291,3 +291,60 @@ func TestAPollAsksTheAccountTheCallWasPlacedOn(t *testing.T) {
 		t.Fatal("a poll with no binding asked somebody")
 	}
 }
+
+// A binding is usable while its integration is switched on and still on the
+// account the call was bound to. A token rotated within the account is used
+// from the next request on.
+func TestABindingIsUsableOnlyAsItWasMade(t *testing.T) {
+	bound := outbound.BoundContext{IntegrationID: "ru-1", AccountScope: "AC" + strings.Repeat("0", 31) + "1",
+		FromNumber: "+79990000001"}
+	place := func(row *model.Integration) (*fakeCaller, outbound.Result) {
+		caller := &fakeCaller{status: "completed"}
+		channel := NewChannel(&fakeDirectory{integrations: []*model.Integration{row}}, caller, "https://tokay.example")
+		result, _ := channel.ExecuteAttempt(context.Background(),
+			outbound.Call{AttemptID: "a", Endpoint: "+79161234567", BoundContext: bound})
+		return caller, result
+	}
+	ask := func(row *model.Integration) (*fakeCaller, error) {
+		caller := &fakeCaller{status: "completed"}
+		channel := NewChannel(&fakeDirectory{integrations: []*model.Integration{row}}, caller, "https://tokay.example")
+		_, err := channel.Poll(context.Background(), outbound.EffectRef{ExternalRef: "CA1", Context: bound})
+		return caller, err
+	}
+
+	t.Run("switched off: no new call, the old one is still asked about", func(t *testing.T) {
+		row := twilioRow("ru-1", "+79990000001", 1, "+7")
+		row.Enabled = false
+		caller, result := place(row)
+		if result.Evidence != outbound.DefinitelyNotSent || len(caller.made) != 0 {
+			t.Fatalf("a call through a switched-off integration: %+v, %d made", result, len(caller.made))
+		}
+		if caller, err := ask(row); err != nil || len(caller.asked) != 1 {
+			t.Fatalf("a call made before it was switched off was not asked about: %v", err)
+		}
+	})
+
+	t.Run("moved to another account: neither placed nor asked", func(t *testing.T) {
+		row := twilioRow("ru-2", "+79990000001", 1, "+7")
+		row.ID = "ru-1"
+		caller, result := place(row)
+		if result.Evidence != outbound.DefinitelyNotSent || len(caller.made) != 0 {
+			t.Fatalf("a call through another account: %+v, %d made", result, len(caller.made))
+		}
+		if caller, err := ask(row); err == nil || len(caller.asked) != 0 {
+			t.Fatalf("a call was asked about in an account it was not made on: %v", err)
+		}
+	})
+
+	t.Run("token rotated within the account", func(t *testing.T) {
+		row := twilioRow("ru-1", "+79990000001", 1, "+7")
+		var cfg model.TwilioConfig
+		_ = json.Unmarshal(row.Config, &cfg)
+		cfg.AuthToken = "rotated"
+		row.Config, _ = json.Marshal(cfg)
+		caller, result := place(row)
+		if result.Status != "accepted" || caller.madeVia[0].AuthToken != "rotated" {
+			t.Fatalf("a rotated token was not used: %+v", result)
+		}
+	})
+}
