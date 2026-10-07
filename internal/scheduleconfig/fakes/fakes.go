@@ -997,6 +997,10 @@ func (t *erasureTx) DeleteUserLinkTokens(ctx context.Context, userID string) err
 	return t.wipe("DeleteUserLinkTokens", userID)
 }
 
+func (t *erasureTx) DeleteUserPhoneData(ctx context.Context, userID string) error {
+	return t.wipe("DeleteUserPhoneData", userID)
+}
+
 func (t *erasureTx) CancelLiveOutboundIntentsForUser(ctx context.Context, userID string) error {
 	return t.wipe("CancelLiveOutboundIntentsForUser", userID)
 }

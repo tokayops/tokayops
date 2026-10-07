@@ -389,7 +389,7 @@ function updateTypeOptions(direction) {
     const isAdmin = Permissions.isAdmin();
     const typesByDirection = {
         outbound: isAdmin
-            ? [{ value: 'slack', label: 'Slack' }, { value: 'telegram', label: 'Telegram' }, { value: 'generic_webhook', label: 'Generic Webhook' }]
+            ? [{ value: 'slack', label: 'Slack' }, { value: 'telegram', label: 'Telegram' }, { value: 'twilio', label: 'Twilio voice' }, { value: 'generic_webhook', label: 'Generic Webhook' }]
             : [{ value: 'generic_webhook', label: 'Generic Webhook' }],
         inbound: [{ value: 'alertmanager_webhook', label: 'Alertmanager Webhook' }]
     };
@@ -416,7 +416,7 @@ function updateConfigFields(type) {
     // Update name placeholder based on type
     const nameInput = document.getElementById('integration-name');
     if (nameInput) {
-        const placeholders = { slack: 'e.g., Production Slack', telegram: 'e.g., Production Telegram', generic_webhook: 'e.g., Prod Webhook', alertmanager_webhook: 'e.g., Prod Alertmanager' };
+        const placeholders = { slack: 'e.g., Production Slack', telegram: 'e.g., Production Telegram', twilio: 'e.g., Twilio US', generic_webhook: 'e.g., Prod Webhook', alertmanager_webhook: 'e.g., Prod Alertmanager' };
         nameInput.placeholder = placeholders[type] || 'e.g., My Integration';
     }
 
@@ -476,6 +476,24 @@ async function handleIntegrationSubmit(e) {
         }
         if (!State.editingIntegration && !secretToken) {
             showToast('Secret token is required (the webhook needs it for account linking and Ack/Resolve buttons)', 'error');
+            return;
+        }
+    } else if (type === 'twilio') {
+        const value = (id) => document.getElementById(id)?.value?.trim() || '';
+        const authToken = value('config-auth-token');
+        config = {
+            account_sid: value('config-account-sid'),
+            auth_token: authToken,
+            from_number: value('config-from-number'),
+            coverage: value('config-coverage').split(',').map(p => p.trim()).filter(Boolean),
+            priority: Number(value('config-priority') || 0),
+            cps: Number(value('config-cps') || 1),
+            max_concurrent: Number(value('config-max-concurrent') || 1),
+            language: value('config-language'),
+        };
+
+        if (!State.editingIntegration && !authToken) {
+            showToast('Auth token is required', 'error');
             return;
         }
     } else if (type === 'alertmanager_webhook') {

@@ -196,6 +196,48 @@ const API = {
                 method: 'DELETE',
             }),
         },
+
+        /**
+         * Phone: the number, the call with a code that verifies it, and the
+         * test calls that show a call gets through Do Not Disturb.
+         */
+        phone: {
+            get: () => request('/me/phone', { baseURL: '/api/auth' }),
+            set: (value) => request('/me/phone', {
+                baseURL: '/api/auth',
+                method: 'PUT',
+                body: JSON.stringify({ value }),
+            }),
+            remove: () => request('/me/phone', {
+                baseURL: '/api/auth',
+                method: 'DELETE',
+            }),
+            callWithCode: () => request('/me/phone/verify-call', {
+                baseURL: '/api/auth',
+                method: 'POST',
+            }),
+            confirm: (code) => request('/me/phone/confirm', {
+                baseURL: '/api/auth',
+                method: 'POST',
+                body: JSON.stringify({ code }),
+            }),
+            pin: (integrationId) => request('/me/phone/pin', {
+                baseURL: '/api/auth',
+                method: 'PUT',
+                body: JSON.stringify({ integration_id: integrationId || '' }),
+            }),
+            testCall: (sender) => request('/me/phone/dnd-check', {
+                baseURL: '/api/auth',
+                method: 'POST',
+                body: JSON.stringify({ sender }),
+            }),
+            confirmTestCall: (sender) => request('/me/phone/dnd-confirm', {
+                baseURL: '/api/auth',
+                method: 'POST',
+                body: JSON.stringify({ sender }),
+            }),
+            vcardURL: '/api/auth/me/phone/vcard',
+        },
     },
 
     /**

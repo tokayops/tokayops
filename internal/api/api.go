@@ -56,6 +56,8 @@ type API struct {
 	selfURL          string                     // TokayOps base URL for manifest generation
 	providerCaps     ProviderCapabilitiesLookup // capability registry view (read-only)
 	telegram         TelegramAPI                // optional, nil = telegram interactivity disabled
+	phone            PhoneStore                 // optional, nil = phone routes answer 503
+	phoneCaller      PhoneCaller
 
 	// Schedule configuration is deliberately NOT reached through
 	// store.StoreInterface. The revision model is not mirrored into MockStore,
@@ -174,6 +176,16 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 	// Telegram Binding Routes (deep-link, not OTP)
 	authGroup.POST("/me/telegram/link", a.AuthMiddleware(a.RequestTelegramLink))
 	authGroup.DELETE("/me/telegram", a.AuthMiddleware(a.UnbindTelegram))
+	// Phone: the number, the call that verifies it, and the Do Not Disturb checks
+	authGroup.GET("/me/phone", a.AuthMiddleware(a.GetMyPhone))
+	authGroup.PUT("/me/phone", a.AuthMiddleware(a.SetMyPhone))
+	authGroup.DELETE("/me/phone", a.AuthMiddleware(a.DeleteMyPhone))
+	authGroup.POST("/me/phone/verify-call", a.AuthMiddleware(a.RequestPhoneCode))
+	authGroup.POST("/me/phone/confirm", a.AuthMiddleware(a.ConfirmMyPhone))
+	authGroup.PUT("/me/phone/pin", a.AuthMiddleware(a.PinMyPhoneProvider))
+	authGroup.POST("/me/phone/dnd-check", a.AuthMiddleware(a.RequestPhoneTestCall))
+	authGroup.POST("/me/phone/dnd-confirm", a.AuthMiddleware(a.ConfirmPhoneTestCall))
+	authGroup.GET("/me/phone/vcard", a.AuthMiddleware(a.GetMyPhoneVCard))
 
 	// OIDC Routes (Public)
 	authGroup.GET("/oidc/config", a.OIDCConfig)

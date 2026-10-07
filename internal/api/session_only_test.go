@@ -92,6 +92,9 @@ func TestAnAPITokenIsRefusedAndNothingHappens(t *testing.T) {
 	}
 	a := NewAPI(spy, nil, spy, nil, "https://tokay.test", nil)
 	a.SetTelegram(&fakeTelegramAPI{username: "tokay_bot"})
+	phone := &fakePhoneStore{}
+	caller := &fakeCaller{}
+	a.SetPhone(phone, caller)
 	e := echo.New()
 	a.RegisterRoutes(e)
 
@@ -106,6 +109,15 @@ func TestAnAPITokenIsRefusedAndNothingHappens(t *testing.T) {
 		{http.MethodGet, "/api/v1/tokens", ``},
 		{http.MethodPost, "/api/v1/tokens", `{"name":"another"}`},
 		{http.MethodDelete, "/api/v1/tokens/tok-1", ``},
+		{http.MethodGet, "/api/auth/me/phone", ``},
+		{http.MethodPut, "/api/auth/me/phone", `{"value":"+14155550101"}`},
+		{http.MethodDelete, "/api/auth/me/phone", ``},
+		{http.MethodPost, "/api/auth/me/phone/verify-call", ``},
+		{http.MethodPost, "/api/auth/me/phone/confirm", `{"code":"123456"}`},
+		{http.MethodPut, "/api/auth/me/phone/pin", `{"integration_id":""}`},
+		{http.MethodPost, "/api/auth/me/phone/dnd-check", `{"sender":"+15005550006"}`},
+		{http.MethodPost, "/api/auth/me/phone/dnd-confirm", `{"sender":"+15005550006"}`},
+		{http.MethodGet, "/api/auth/me/phone/vcard", ``},
 	} {
 		t.Run(route.method+" "+route.path, func(t *testing.T) {
 			spy.mu.Lock()
@@ -132,6 +144,10 @@ func TestAnAPITokenIsRefusedAndNothingHappens(t *testing.T) {
 				t.Fatalf("the refused request still did %v", spy.calls)
 			}
 		})
+	}
+
+	if len(phone.calls) != 0 || len(caller.calls) != 0 {
+		t.Errorf("a refused request reached the phone: %v, %d calls", phone.calls, len(caller.calls))
 	}
 
 	// And the state says the same.

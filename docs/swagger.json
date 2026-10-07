@@ -144,6 +144,390 @@
                 }
             }
         },
+        "/api/auth/me/phone": {
+            "get": {
+                "description": "The phone number, whether it is verified, which providers can call it, and the sender numbers with their Do Not Disturb checks.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Get my phone",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.PhoneResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "description": "Store the phone number, in E.164 form. A different number starts unverified and unpinned.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Set my phone",
+                "parameters": [
+                    {
+                        "description": "Number",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.SetPhoneRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.PhoneResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Remove the phone number and the Do Not Disturb checks made for it.",
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Remove my phone",
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/auth/me/phone/confirm": {
+            "post": {
+                "description": "Enter the code the call spoke. A code spoken to an earlier number verifies nothing.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Confirm my phone",
+                "parameters": [
+                    {
+                        "description": "Code",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.ConfirmPhoneCodeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.PhoneResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/auth/me/phone/dnd-check": {
+            "post": {
+                "description": "Call the verified number from one sender number, to check the call gets through Do Not Disturb.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Test call from one sender number",
+                "parameters": [
+                    {
+                        "description": "Sender number",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.PhoneSenderRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "429": {
+                        "description": "Too Many Requests",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "502": {
+                        "description": "Bad Gateway",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/auth/me/phone/dnd-confirm": {
+            "post": {
+                "description": "Record that a call from a sender rang through Do Not Disturb. The person's own word; needs a verified number.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Mark that a test call came through",
+                "parameters": [
+                    {
+                        "description": "Sender number",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.PhoneSenderRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.PhoneResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/auth/me/phone/pin": {
+            "put": {
+                "description": "Prefer one of the providers that cover the number; an empty id clears the preference.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Prefer a phone provider",
+                "parameters": [
+                    {
+                        "description": "Provider",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.PinPhoneRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.PhoneResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/auth/me/phone/vcard": {
+            "get": {
+                "description": "A vCard named TokayOps with every number a call to this phone may come from, to add to contacts and allow through Do Not Disturb.",
+                "produces": [
+                    "text/vcard"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Contact card of the sender numbers",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/auth/me/phone/verify-call": {
+            "post": {
+                "description": "Call the number and speak a six-digit code that verifies it. One call at a time; a few per hour.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Call my phone with a code",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "429": {
+                        "description": "Too Many Requests",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "502": {
+                        "description": "Bad Gateway",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/auth/me/slack": {
             "delete": {
                 "description": "Remove the Slack identity binding from the current user",
@@ -3255,6 +3639,14 @@
                 }
             }
         },
+        "api.ConfirmPhoneCodeRequest": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                }
+            }
+        },
         "api.ConfirmSlackCodeRequest": {
             "type": "object",
             "properties": {
@@ -3969,6 +4361,69 @@
                 }
             }
         },
+        "api.PhoneResponse": {
+            "type": "object",
+            "properties": {
+                "contact": {
+                    "$ref": "#/definitions/model.PhoneContact"
+                },
+                "covered": {
+                    "description": "Covered is whether any enabled provider can call the number.",
+                    "type": "boolean"
+                },
+                "pin_active": {
+                    "description": "PinActive is whether the pinned provider is the one a call would use now.",
+                    "type": "boolean"
+                },
+                "providers": {
+                    "description": "Providers are the enabled providers that cover the number, in the order\nthey are tried.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.PhoneSender"
+                    }
+                },
+                "senders": {
+                    "description": "Senders are the distinct numbers a call may come from, with the time the\nperson confirmed each gets through Do Not Disturb.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.PhoneSender"
+                    }
+                }
+            }
+        },
+        "api.PhoneSender": {
+            "type": "object",
+            "properties": {
+                "checked_at": {
+                    "type": "string"
+                },
+                "integration": {
+                    "type": "string"
+                },
+                "integration_id": {
+                    "type": "string"
+                },
+                "number": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.PhoneSenderRequest": {
+            "type": "object",
+            "properties": {
+                "sender": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.PinPhoneRequest": {
+            "type": "object",
+            "properties": {
+                "integration_id": {
+                    "type": "string"
+                }
+            }
+        },
         "api.PolicyRequest": {
             "type": "object",
             "properties": {
@@ -4476,6 +4931,14 @@
                     }
                 },
                 "until": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.SetPhoneRequest": {
+            "type": "object",
+            "properties": {
+                "value": {
                     "type": "string"
                 }
             }
@@ -5086,13 +5549,15 @@
                 "slack",
                 "telegram",
                 "alertmanager_webhook",
-                "generic_webhook"
+                "generic_webhook",
+                "twilio"
             ],
             "x-enum-varnames": [
                 "IntegrationTypeSlack",
                 "IntegrationTypeTelegram",
                 "IntegrationTypeAlertmanagerWebhook",
-                "IntegrationTypeGenericWebhook"
+                "IntegrationTypeGenericWebhook",
+                "IntegrationTypeTwilio"
             ]
         },
         "model.OnCallResult": {
@@ -5176,6 +5641,24 @@
                 "OutboxDeliverySent",
                 "OutboxDeliveryFailed"
             ]
+        },
+        "model.PhoneContact": {
+            "type": "object",
+            "properties": {
+                "pinned_integration_id": {
+                    "description": "PinnedIntegrationID is the provider the person prefers to be called\nthrough. A preference and not a ban: when it no longer covers the number\nor is switched off, the others are used in their order.",
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                },
+                "value": {
+                    "type": "string"
+                },
+                "verified_at": {
+                    "type": "string"
+                }
+            }
         },
         "model.Team": {
             "type": "object",

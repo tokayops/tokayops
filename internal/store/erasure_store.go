@@ -249,6 +249,24 @@ func (t *erasureTx) DeleteUserLinkTokens(ctx context.Context, userID string) err
 	return err
 }
 
+// DeleteUserPhoneData: the reservations keep their account and their hold -
+// the capacity they took is the account's, not the person's - and lose who
+// asked. users is never deleted by erasure, so ON DELETE SET NULL does not do
+// this by itself.
+func (t *erasureTx) DeleteUserPhoneData(ctx context.Context, userID string) error {
+	for _, statement := range []string{
+		`DELETE FROM user_contacts WHERE user_id = $1`,
+		`DELETE FROM phone_dnd_checks WHERE user_id = $1`,
+		`UPDATE phone_calls_log SET to_number = NULL WHERE user_id = $1 AND to_number IS NOT NULL`,
+		`UPDATE call_reservations SET user_id = NULL WHERE user_id = $1`,
+	} {
+		if _, err := t.tx.ExecContext(ctx, statement, userID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // CancelLiveOutboundIntentsForUser marks this person's commitments as erased
 // and withdraws what is still owed to them.
 //

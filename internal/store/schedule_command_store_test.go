@@ -727,15 +727,21 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 
 	// Columns that erasure clears, empties or removes the row of.
 	erased := map[string]bool{
-		"users.email":                        true,
-		"users.name":                         true,
-		"users.password_hash":                true,
-		"users.auth_provider":                true,
-		"users.deleted_at":                   true,
-		"api_tokens.user_id":                 true,
-		"external_identities.user_id":        true,
-		"link_tokens.user_id":                true,
-		"team_members.user_id":               true,
+		"users.email":                 true,
+		"users.name":                  true,
+		"users.password_hash":         true,
+		"users.auth_provider":         true,
+		"users.deleted_at":            true,
+		"api_tokens.user_id":          true,
+		"external_identities.user_id": true,
+		"link_tokens.user_id":         true,
+		"team_members.user_id":        true,
+		// The phone: the number and what the person confirmed about it are
+		// deleted; a reservation keeps the account's capacity it took and
+		// loses who asked.
+		"user_contacts.user_id":              true,
+		"phone_dnd_checks.user_id":           true,
+		"call_reservations.user_id":          true,
 		"schedule_override_revisions.reason": true,
 		"schedule_revisions.change_reason":   true,
 
@@ -767,6 +773,10 @@ func TestErasureCoversEveryUserDataSource(t *testing.T) {
 	// Columns that survive by design: immutable identity references that
 	// history is joined on.
 	byDesign := map[string]bool{
+		// The calls a person asked for stay, with the number blanked: the log
+		// is what the account paid for and what the allowance counted. The id
+		// is this system's own, like users.id.
+		"phone_calls_log.user_id":                 true,
 		"users.id":                                true,
 		"users.role":                              true,
 		"schedule_revisions.created_by":           true,

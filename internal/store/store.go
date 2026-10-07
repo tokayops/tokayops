@@ -803,10 +803,17 @@ func (s *Store) buildSchema() error {
 	ALTER TABLE integrations ADD COLUMN IF NOT EXISTS scope TEXT;
 	ALTER TABLE integrations ADD COLUMN IF NOT EXISTS team_id TEXT REFERENCES teams(id);
 
-	-- Rebuild unique index: exclude generic_webhook from single-outbound constraint
+	-- Rebuild unique index: one outbound integration per type, except the
+	-- types that come in several. generic_webhook is one per subscriber; twilio
+	-- is one per sender number and coverage, and an operator with a cheap
+	-- local carrier and a worldwide one has two.
+	--
+	-- The exception list lives HERE, in the rebuild every start runs. A later
+	-- phase that widened it would never be reached: with two twilio rows in
+	-- the table, this CREATE fails first.
 	DROP INDEX IF EXISTS idx_integrations_type_outbound;
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_integrations_type_outbound
-		ON integrations (type) WHERE direction = 'outbound' AND type <> 'generic_webhook';
+		ON integrations (type) WHERE direction = 'outbound' AND type NOT IN ('generic_webhook', 'twilio');
 
 	-- CHECK: generic_webhook requires scope; others must have scope=NULL
 	ALTER TABLE integrations DROP CONSTRAINT IF EXISTS chk_webhook_scope;
@@ -905,6 +912,12 @@ func (s *Store) buildSchema() error {
 		team_id    TEXT,
 		deleted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`); err != nil {
+		return err
+	}
+
+	// A person's phone and the limiter in front of the provider account. After
+	// integrations, which a contact's pinned provider references.
+	if err := s.applyPhoneSchema(); err != nil {
 		return err
 	}
 

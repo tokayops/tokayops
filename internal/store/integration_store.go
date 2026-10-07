@@ -285,6 +285,21 @@ func mergeSecrets(integrationType model.IntegrationType, existingConfig, newConf
 		merged, _ := json.Marshal(new)
 		return merged
 
+	case model.IntegrationTypeTwilio:
+		var existing, new model.TwilioConfig
+		if err := json.Unmarshal(existingConfig, &existing); err != nil {
+			return newConfig
+		}
+		if err := json.Unmarshal(newConfig, &new); err != nil {
+			return newConfig
+		}
+		// Keep existing auth_token if new is empty or masked
+		if new.AuthToken == "" || new.AuthToken == model.MaskedSecret {
+			new.AuthToken = existing.AuthToken
+		}
+		merged, _ := json.Marshal(new)
+		return merged
+
 	case model.IntegrationTypeGenericWebhook:
 		var existing, new model.GenericWebhookConfig
 		if err := json.Unmarshal(existingConfig, &existing); err != nil {

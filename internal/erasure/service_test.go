@@ -214,6 +214,7 @@ func TestEraseCallsEveryPrimitiveInOrder(t *testing.T) {
 		"DeleteUserAPITokens",
 		"DeleteUserExternalIdentities",
 		"DeleteUserLinkTokens",
+		"DeleteUserPhoneData",
 		"NullifyOverrideRevisionReasons",
 		"NullifyScheduleRevisionChangeReasons",
 		"DeleteUserTeamMemberships",

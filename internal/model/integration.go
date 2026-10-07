@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -13,6 +14,7 @@ const (
 	IntegrationTypeTelegram            IntegrationType = "telegram"
 	IntegrationTypeAlertmanagerWebhook IntegrationType = "alertmanager_webhook"
 	IntegrationTypeGenericWebhook      IntegrationType = "generic_webhook"
+	IntegrationTypeTwilio              IntegrationType = "twilio"
 )
 
 // WebhookScope defines the scope of a generic_webhook subscription
@@ -88,6 +90,52 @@ func (c TelegramConfig) IsInteractive() bool {
 		return true
 	}
 	return *c.Interactive
+}
+
+// TwilioConfig is the config schema for a Twilio voice integration: one
+// account, one sender number, and the numbers it may call.
+//
+// auth_token is a secret; the json tag MUST match the twilio
+// Descriptor.SecretFields so MaskSecrets/mergeSecrets find it.
+type TwilioConfig struct {
+	AccountSID string `json:"account_sid"`
+	AuthToken  string `json:"auth_token"`
+	// FromNumber is the number the call comes from, in E.164. A person adds it
+	// to their contacts and to the exceptions of Do Not Disturb, so it is one
+	// fixed number and not a pool.
+	FromNumber string `json:"from_number"`
+	// Coverage is the E.164 prefixes this integration may call: "+7" for a
+	// carrier that reaches Russian numbers only, "+" for the whole world. A
+	// number no enabled integration covers is not called at all - this is also
+	// the list of countries a person can make the account call.
+	Coverage []string `json:"coverage"`
+	// Priority orders the integrations that cover a number; lower goes first.
+	Priority int `json:"priority"`
+	// CPS and MaxConcurrent are the account's limits as this integration
+	// states them. The provider applies them per account, and so does the
+	// limiter: integrations on one account share the lowest of their values.
+	CPS           int `json:"cps"`
+	MaxConcurrent int `json:"max_concurrent"`
+	// Language is the voice of <Say>, as Twilio names it. Empty means en-US.
+	Language string `json:"language,omitempty"`
+}
+
+// SayLanguage is the language the calls of this integration speak in.
+func (c TwilioConfig) SayLanguage() string {
+	if c.Language == "" {
+		return "en-US"
+	}
+	return c.Language
+}
+
+// Covers reports whether number starts with one of the coverage prefixes.
+func (c TwilioConfig) Covers(number string) bool {
+	for _, prefix := range c.Coverage {
+		if strings.HasPrefix(number, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // WebhookConfig is the config schema for Alertmanager webhook integrations
