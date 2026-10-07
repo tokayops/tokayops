@@ -549,10 +549,9 @@ function addNewStep() {
     const newIndex = stepsList.children.length;
     const currentTeamId = document.getElementById('policy-team-select')?.value || '';
 
-    // Pass currentScheduleId for schedule target display. Default provider
-    // is the first registered one (alphabetical) - the editor is
-    // discover providers via /providers instead of hardcoding "slack_dm".
-    const defaultProvider = (State.providers || [])[0]?.name || '';
+    // Pass currentScheduleId for schedule target display. The editor
+    // discovers providers via /providers instead of hardcoding "slack_dm".
+    const defaultProvider = Components.defaultStepProvider(State.providers);
     const stepHtml = Components.policyStepRow({
         provider: defaultProvider,
         target_kind: 'dm',

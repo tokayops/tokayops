@@ -1490,6 +1490,18 @@ const Components = {
     },
 
     /**
+     * The provider a new step starts with: the first one that can send a DM,
+     * since a new step targets a user by DM. Not every provider can - a call
+     * has no DM form.
+     * @param {Array} providers - Registered providers
+     */
+    defaultStepProvider: (providers = []) => {
+        const list = providers || [];
+        const dm = list.find((p) => (p.supported_target_kinds || []).includes('dm'));
+        return (dm || list[0])?.name || '';
+    },
+
+    /**
      * Render single step row in editor
      * @param {Object} step - Step data
      * @param {number} index - Step index
@@ -1615,7 +1627,7 @@ const Components = {
         const isGlobalPolicy = isEdit && !policy.team_id;
         const currentScope = isGlobalPolicy ? 'global' : 'team';
         const isAdmin = Permissions.isAdmin();
-        const defaultProvider = (State.providers || [])[0]?.name || '';
+        const defaultProvider = Components.defaultStepProvider(State.providers);
         const steps = policy?.steps || [{ provider: defaultProvider, target_kind: 'dm', target_type: 'user', target_id: '', delay_seconds: 0, message: '', continue_on_failure: true }];
 
         // Build scope selector HTML
