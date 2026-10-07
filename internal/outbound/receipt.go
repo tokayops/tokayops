@@ -234,8 +234,8 @@ type GenerationFacts struct {
 	DeadlinePassed bool
 }
 
-// GenerationVerdict is the table of the plan, in order: the first row that
-// holds decides.
+// GenerationVerdict is a table read in order: the first row that holds
+// decides.
 //
 //  1. an object of ANY generation happened - the obligation is discharged; a
 //     call that did take place, late, is not made again
