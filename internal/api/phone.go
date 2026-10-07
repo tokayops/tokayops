@@ -105,17 +105,18 @@ type PhoneSenderRequest struct {
 	Sender string `json:"sender"`
 }
 
-// sessionUser is the user of a session request. API tokens are refused: a
-// person's phone is theirs to change, not a script's.
-func (a *API) sessionUser(c echo.Context) (string, error) {
-	if isAPIToken, _ := c.Get("api_token").(bool); isAPIToken {
-		return "", c.JSON(http.StatusForbidden, ErrorResponse{Error: "session authentication required"})
+// phoneUser is the user of a session request. API tokens are refused through
+// sessionOnly: a person's phone is theirs to change, not a script's.
+func (a *API) phoneUser(c echo.Context) (string, bool) {
+	if !a.sessionOnly(c) {
+		return "", false
 	}
 	userID, ok := c.Get("user_id").(string)
 	if !ok || userID == "" {
-		return "", c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
+		_ = c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "unauthorized"})
+		return "", false
 	}
-	return userID, nil
+	return userID, true
 }
 
 // phoneReady answers 503 when the phone routes are not wired.
@@ -144,9 +145,9 @@ func (a *API) twilioIntegrations() ([]twilio.Integration, error) {
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/phone [get]
 func (a *API) GetMyPhone(c echo.Context) error {
-	userID, err := a.sessionUser(c)
-	if userID == "" {
-		return err
+	userID, ok := a.phoneUser(c)
+	if !ok {
+		return nil
 	}
 	if !a.phoneReady(c) {
 		return nil
@@ -209,9 +210,9 @@ func (a *API) phoneResponse(ctx context.Context, userID string) (*PhoneResponse,
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/phone [put]
 func (a *API) SetMyPhone(c echo.Context) error {
-	userID, err := a.sessionUser(c)
-	if userID == "" {
-		return err
+	userID, ok := a.phoneUser(c)
+	if !ok {
+		return nil
 	}
 	if !a.phoneReady(c) {
 		return nil
@@ -244,9 +245,9 @@ func (a *API) SetMyPhone(c echo.Context) error {
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/phone [delete]
 func (a *API) DeleteMyPhone(c echo.Context) error {
-	userID, err := a.sessionUser(c)
-	if userID == "" {
-		return err
+	userID, ok := a.phoneUser(c)
+	if !ok {
+		return nil
 	}
 	if !a.phoneReady(c) {
 		return nil
@@ -270,9 +271,9 @@ func (a *API) DeleteMyPhone(c echo.Context) error {
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/phone/verify-call [post]
 func (a *API) RequestPhoneCode(c echo.Context) error {
-	userID, err := a.sessionUser(c)
-	if userID == "" {
-		return err
+	userID, ok := a.phoneUser(c)
+	if !ok {
+		return nil
 	}
 	if !a.phoneReady(c) {
 		return nil
@@ -386,9 +387,9 @@ func (a *API) placePhoneCall(c echo.Context, reservation *store.PhoneReservation
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/phone/confirm [post]
 func (a *API) ConfirmMyPhone(c echo.Context) error {
-	userID, err := a.sessionUser(c)
-	if userID == "" {
-		return err
+	userID, ok := a.phoneUser(c)
+	if !ok {
+		return nil
 	}
 	if !a.phoneReady(c) {
 		return nil
@@ -421,9 +422,9 @@ func (a *API) ConfirmMyPhone(c echo.Context) error {
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/phone/pin [put]
 func (a *API) PinMyPhoneProvider(c echo.Context) error {
-	userID, err := a.sessionUser(c)
-	if userID == "" {
-		return err
+	userID, ok := a.phoneUser(c)
+	if !ok {
+		return nil
 	}
 	if !a.phoneReady(c) {
 		return nil
@@ -478,9 +479,9 @@ func (a *API) PinMyPhoneProvider(c echo.Context) error {
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/phone/dnd-check [post]
 func (a *API) RequestPhoneTestCall(c echo.Context) error {
-	userID, err := a.sessionUser(c)
-	if userID == "" {
-		return err
+	userID, ok := a.phoneUser(c)
+	if !ok {
+		return nil
 	}
 	if !a.phoneReady(c) {
 		return nil
@@ -532,9 +533,9 @@ func (a *API) RequestPhoneTestCall(c echo.Context) error {
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/phone/dnd-confirm [post]
 func (a *API) ConfirmPhoneTestCall(c echo.Context) error {
-	userID, err := a.sessionUser(c)
-	if userID == "" {
-		return err
+	userID, ok := a.phoneUser(c)
+	if !ok {
+		return nil
 	}
 	if !a.phoneReady(c) {
 		return nil
@@ -564,9 +565,9 @@ func (a *API) ConfirmPhoneTestCall(c echo.Context) error {
 // @Failure 503 {object} ErrorResponse
 // @Router /api/auth/me/phone/vcard [get]
 func (a *API) GetMyPhoneVCard(c echo.Context) error {
-	userID, err := a.sessionUser(c)
-	if userID == "" {
-		return err
+	userID, ok := a.phoneUser(c)
+	if !ok {
+		return nil
 	}
 	if !a.phoneReady(c) {
 		return nil
