@@ -347,7 +347,7 @@ var (
 	OutboundWorkerTicksTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "outbound_worker_ticks_total",
 		Help: "Passes of the delivery worker of each family, including passes that found nothing to do. A stopped rate is a stopped worker.",
-	}, []string{"family"})
+	}, []string{"family", "lane"})
 
 	// OutboundFanOutTicksTotal is the same signal for the webhook family's
 	// producer, which runs in a loop of its own.

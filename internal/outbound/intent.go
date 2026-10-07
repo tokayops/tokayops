@@ -91,6 +91,12 @@ const (
 	StatusPermanentFailed Status = "permanent_failed"
 	StatusExpired         Status = "expired"
 
+	// StatusNoContact is a commitment that had nobody to send to through its
+	// provider: the person has no number, has not verified it, or no provider
+	// can reach it. Not a failure of the channel - nothing was refused - and
+	// so not the reason the escalation behind it stops.
+	StatusNoContact Status = "no_contact"
+
 	// StatusCanceled is a commitment the domain withdrew. It is not proof that
 	// nothing went out: a send that was already in flight may well have landed.
 	StatusCanceled Status = "canceled"
@@ -99,7 +105,7 @@ const (
 // Terminal reports whether a status is one only an operator can leave.
 func (s Status) Terminal() bool {
 	switch s {
-	case StatusSucceeded, StatusPermanentFailed, StatusExpired, StatusCanceled:
+	case StatusSucceeded, StatusPermanentFailed, StatusExpired, StatusCanceled, StatusNoContact:
 		return true
 	default:
 		return false
@@ -172,6 +178,10 @@ const (
 	// something: no integration, no linked identity, an unsupported payload.
 	PreparationPermanent PreparationOutcome = "permanent"
 
+	// PreparationNoContact is a recipient with nobody to send to through this
+	// provider. The commitment ends without a failure.
+	PreparationNoContact PreparationOutcome = "no_contact"
+
 	// PreparationTransient is a refusal that may not repeat - a cache that was
 	// not warm, a lookup that failed. The database is still reachable, so the
 	// commitment goes back into the queue with its lease released.
@@ -214,6 +224,13 @@ type Intent struct {
 	GenerationNo         int
 	AttemptsInGeneration int
 	FailureStreak        int
+
+	// BoundEndpoint is the address the current generation is bound to, empty
+	// when none is. A channel compares it with what it would resolve now: a
+	// call bound to a number the person has since replaced, or stopped
+	// vouching for, must not be placed - the store would send it to the bound
+	// address whatever the channel proposes.
+	BoundEndpoint string
 
 	// GenerationBound says the current external effect has an address and a
 	// provider key of its own. It is a fact rather than a count: a refusal that

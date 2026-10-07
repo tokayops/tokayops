@@ -188,11 +188,13 @@ tests:
   # ---- liveness ----
   - interval: 1m
     input_series:
-      - series: 'outbound_worker_ticks_total{family="notification"}'
+      - series: 'outbound_worker_ticks_total{family="notification",lane="default"}'
         values: '0+60x20'
-      - series: 'outbound_worker_ticks_total{family="handoff"}'
+      - series: 'outbound_worker_ticks_total{family="notification",lane="phone"}'
+        values: '0+60x20'
+      - series: 'outbound_worker_ticks_total{family="handoff",lane="default"}'
         values: '7x20'
-      - series: 'outbound_worker_ticks_total{family="webhook"}'
+      - series: 'outbound_worker_ticks_total{family="webhook",lane="default"}'
         values: '0+30x20'
       - series: 'outbound_fanout_ticks_total'
         values: '3x20'
@@ -206,10 +208,10 @@ tests:
       - eval_time: 12m
         alertname: OutboundWorkerStopped
         exp_alerts:
-          - exp_labels: {severity: critical, family: handoff}
+          - exp_labels: {severity: critical, family: handoff, lane: default}
             exp_annotations:
-              summary: "The handoff delivery worker has not ticked for 5 minutes"
-              description: "Nothing of the handoff family is being delivered. Check the process log and restart if the loop is gone."
+              summary: "The handoff/default delivery worker has not ticked for 5 minutes"
+              description: "Nothing of the handoff family on the default lane is being delivered. Check the process log and restart if the loop is gone."
       - eval_time: 12m
         alertname: OutboundFanOutStopped
         exp_alerts:
@@ -217,6 +219,31 @@ tests:
             exp_annotations:
               summary: "The webhook fan-out has not ticked for 5 minutes"
               description: "Alert events are not being turned into webhook deliveries; they wait in event_outbox as pending. Check the process log."
+
+  # ---- liveness: two instances, and one of them lost its call worker ----
+  # Its paging worker and the other instance's call worker go on ticking; the
+  # rule is not summed, so neither of them hides the one that stopped.
+  - interval: 1m
+    input_series:
+      - series: 'outbound_worker_ticks_total{instance="a",family="notification",lane="default"}'
+        values: '0+60x20'
+      - series: 'outbound_worker_ticks_total{instance="a",family="notification",lane="phone"}'
+        values: '0+60x5 300x15'
+      - series: 'outbound_worker_ticks_total{instance="b",family="notification",lane="default"}'
+        values: '0+60x20'
+      - series: 'outbound_worker_ticks_total{instance="b",family="notification",lane="phone"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: OutboundWorkerStopped
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: OutboundWorkerStopped
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: a, family: notification, lane: phone}
+            exp_annotations:
+              summary: "The notification/phone delivery worker has not ticked for 5 minutes"
+              description: "Nothing of the notification family on the phone lane is being delivered. Check the process log and restart if the loop is gone."
 
   # ---- retention: a fleet of two, and the success of any one of them ----
   - interval: 1m

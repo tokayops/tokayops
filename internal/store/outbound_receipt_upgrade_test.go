@@ -27,13 +27,16 @@ func TestAStartFromV030AddsTheWaitForTheProvidersWord(t *testing.T) {
 			t.Errorf("the start did not add outbound_intents.%s", column)
 		}
 	}
+	if !hasColumn(t, s, "outbound_attempts", "bound_context") {
+		t.Error("the start did not add outbound_attempts.bound_context")
+	}
 	var rules int
 	if err := s.db.QueryRow(`SELECT count(*) FROM pg_constraint WHERE conname = $1`,
-		outboundAwaitingHasReceipt).Scan(&rules); err != nil {
+		outboundAwaitingHasWait).Scan(&rules); err != nil {
 		t.Fatal(err)
 	}
 	if rules != 1 {
-		t.Fatalf("the start did not add %s", outboundAwaitingHasReceipt)
+		t.Fatalf("the start did not add %s", outboundAwaitingHasWait)
 	}
 
 	// And again: a second start changes nothing and fails on nothing.

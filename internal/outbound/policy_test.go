@@ -14,29 +14,11 @@ import (
 // set of the same numbers, and the way it goes wrong is by being written as a
 // copy with one value changed.
 func TestTheDeadlinesFitInsideEachOther(t *testing.T) {
-	for _, family := range []string{FamilyNotification, FamilyHandoff, FamilyWebhook, FamilyCall} {
+	for _, family := range []string{FamilyNotification, FamilyHandoff, FamilyWebhook} {
 		t.Run(family, func(t *testing.T) {
 			p, err := PolicyOf(family)
 			if err != nil {
 				t.Fatalf("no policy for %s: %v", family, err)
-			}
-
-			// The wait for the provider's word: asked first after the call can
-			// have ended, again at an interval, and given up on well after
-			// both. A deadline inside the first wait would assume a call
-			// happened before it could have rung out; a poll that may outlast
-			// its interval would overlap the next.
-			if r := p.Receipt; r != nil {
-				if r.FirstWait <= 0 || r.PollInterval <= 0 || r.PollDeadline <= 0 {
-					t.Errorf("a wait with a zero step: %+v", r)
-				}
-				if r.Deadline <= r.FirstWait+r.PollInterval {
-					t.Errorf("the wait ends at %s, before a first wait of %s and one poll after it",
-						r.Deadline, r.FirstWait)
-				}
-				if r.PollDeadline >= r.PollInterval {
-					t.Errorf("one poll may take %s and the next is due after %s", r.PollDeadline, r.PollInterval)
-				}
 			}
 
 			// The third inequality, and the reason the attempt deadline is a
@@ -215,6 +197,43 @@ func TestADeadSubscriberCostsThisManyAttemptsADay(t *testing.T) {
 	} {
 		if got := attemptsInADay(tc.cap, hold, tc.fraction); got != tc.want {
 			t.Errorf("%s: %d attempts in a day, the profile says %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The wait for the provider's word: asked first after the call can have
+// ended, again at an interval, and given up on well after both. A deadline
+// inside the first wait would assume a call happened before it could have rung
+// out; a poll that may outlast its interval would overlap the next.
+func TestTheWaitForAProvidersWordFitsTogether(t *testing.T) {
+	r, waits := ReceiptPolicyOf("phone")
+	if !waits {
+		t.Fatal("the phone provider does not wait")
+	}
+	if r.FirstWait <= 0 || r.PollInterval <= 0 || r.PollDeadline <= 0 {
+		t.Errorf("a wait with a zero step: %+v", r)
+	}
+	if r.Deadline <= r.FirstWait+r.PollInterval {
+		t.Errorf("the wait ends at %s, before a first wait of %s and one poll after it", r.Deadline, r.FirstWait)
+	}
+	if r.PollDeadline >= r.PollInterval {
+		t.Errorf("one poll may take %s and the next is due after %s", r.PollDeadline, r.PollInterval)
+	}
+	for _, provider := range []string{"slack", "telegram", "webhook"} {
+		if _, waits := ReceiptPolicyOf(provider); waits {
+			t.Errorf("%s waits for a provider's word", provider)
+		}
+	}
+}
+
+// A call is not tried again sooner than a minute; nothing else's curve moves.
+func TestOnlyACallHasARetryFloor(t *testing.T) {
+	if RetryFloorOf("phone") < time.Minute {
+		t.Fatalf("a call may be repeated after %s", RetryFloorOf("phone"))
+	}
+	for _, provider := range []string{"slack", "telegram", "webhook"} {
+		if floor := RetryFloorOf(provider); floor != 0 {
+			t.Errorf("%s has a retry floor of %s", provider, floor)
 		}
 	}
 }

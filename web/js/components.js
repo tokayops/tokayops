@@ -1478,10 +1478,11 @@ const Components = {
                 chips.push(`<span class="step-delay">(${delayStr})</span>`);
             }
 
-            // Chips read step.target_kind ("dm" / "channel").
+            // Chips read step.target_kind ("dm" / "channel" / "call").
             const isChannel = step.target_kind === 'channel';
-            const icon = isChannel ? 'hash' : 'user';
-            const label = isChannel ? 'Channel' : 'DM';
+            const isCall = step.target_kind === 'call';
+            const icon = isChannel ? 'hash' : (isCall ? 'phone' : 'user');
+            const label = isChannel ? 'Channel' : (isCall ? 'Call' : 'DM');
             chips.push(`<span class="step-chip"><i data-lucide="${icon}" style="width:12px;height:12px;"></i> ${label}</span>`);
         });
 
@@ -1594,7 +1595,7 @@ const Components = {
                         <label>Delay (s)</label>
                         <input type="number" class="form-input delay-input" value="${step.delay_seconds || 0}" min="0">
                     </div>
-                    <div class="step-field step-field-message">
+                    <div class="step-field step-field-message" ${step.target_kind === 'call' ? 'style="display:none"' : ''}>
                         <label>Message <span class="variables-hint" title="Text of the direct message. {{.Title}}, {{.Severity}}, {{.Team}} and {{.AlertsCount}} are filled in from the alert. A channel step posts the card, which is not changed.">ⓘ</span></label>
                         <input type="text" class="form-input message-input" placeholder="Text of the direct message (optional)" value="${escapeHtml(step.message || '')}">
                     </div>

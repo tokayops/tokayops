@@ -50,6 +50,9 @@ const ProviderWebhook = "webhook"
 const (
 	ProviderSlack    = "slack"
 	ProviderTelegram = "telegram"
+	// ProviderPhone is a voice call. Its acceptance only means "queued": the
+	// provider places the call afterwards and says how it went later.
+	ProviderPhone = "phone"
 )
 
 // Kind is the identity grammar a key is written in.

@@ -43,7 +43,7 @@ type outboundStore interface {
 // the question asked once the answers are in. Separate from outboundStore so
 // that the families that never wait carry none of it.
 type receiptStore interface {
-	ClaimDueReceipts(ctx context.Context, family string, limit int) ([]AwaitingReceipt, error)
+	ClaimDueReceipts(ctx context.Context, family string, providers []string, limit int) ([]AwaitingReceipt, error)
 	RecordProviderEvent(ctx context.Context, event ProviderEvent) (string, error)
 	ApplyProviderEvent(ctx context.Context, eventRowID string,
 		translators map[string]EffectTranslator) (ApplyResult, error)
@@ -61,6 +61,7 @@ type Channel interface {
 // Worker runs one family's deliveries on one instance.
 type Worker struct {
 	family   string
+	lane     string
 	policy   Policy
 	workerID string
 	pool     int
@@ -97,7 +98,7 @@ func NewWorker(st outboundStore, workerID string, channels map[string]Channel) *
 	return worker
 }
 
-// NewWorkerFor builds the worker for one family.
+// NewWorkerFor builds the worker for one family, on its default lane.
 //
 // The family is a name and the numbers come from PolicyOf, never from the
 // caller. Given both, a caller could start a worker whose attempt deadline
@@ -107,38 +108,61 @@ func NewWorker(st outboundStore, workerID string, channels map[string]Channel) *
 func NewWorkerFor(family string, st outboundStore, workerID string,
 	channels map[string]Channel) (*Worker, error) {
 
+	return NewLaneWorker(family, LaneDefault, st, workerID, channels)
+}
+
+// NewLaneWorker builds the worker of one lane of a family: the family's
+// numbers, the lane's pool, and only the lane's channels.
+//
+// A lane is a second worker of the same family that serves other providers
+// with a pool of its own. Calls run in the paging family, so an escalation is
+// still one claim; they run on a lane of their own, so a request to the call
+// provider that hangs until its deadline holds a call slot and never a slot a
+// direct message is waiting for. The claim already takes only the providers a
+// worker serves; the lane is what gives them separate slots.
+func NewLaneWorker(family, lane string, st outboundStore, workerID string,
+	channels map[string]Channel) (*Worker, error) {
+
 	policy, err := PolicyOf(family)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := lanePool(family, lane, policy)
 	if err != nil {
 		return nil, err
 	}
 	w := &Worker{
 		family:   policy.Family,
+		lane:     lane,
 		policy:   policy,
 		workerID: workerID,
-		pool:     policy.PoolSize,
+		pool:     pool,
 		store:    st,
 		channels: channels,
 	}
-	if policy.Receipt == nil {
-		return w, nil
-	}
 
-	// A family that waits for the provider's word is refused at the start
+	// A provider whose acceptance only means "queued" is refused at the start
 	// rather than at its first delivery when something it needs is missing: a
-	// channel that cannot read the provider's events would leave every call
-	// it made waiting until the deadline assumed it happened.
-	receipts, ok := st.(receiptStore)
-	if !ok {
-		return nil, fmt.Errorf("outbound: family %s waits for the provider's word, and its store cannot keep it", family)
-	}
-	w.receipts = receipts
-	w.translators = make(map[string]EffectTranslator, len(channels))
-	w.receiving = make(map[string]ReceiptChannel, len(channels))
+	// channel that cannot read the provider's events would leave every call it
+	// made waiting until the deadline assumed it happened.
 	for provider, channel := range channels {
+		if _, waits := ReceiptPolicyOf(provider); !waits {
+			continue
+		}
 		receiving, ok := channel.(ReceiptChannel)
 		if !ok {
-			return nil, fmt.Errorf("outbound: family %s waits for the provider's word, and channel %s cannot read it",
-				family, provider)
+			return nil, fmt.Errorf("outbound: provider %s completes on the provider's word, and its channel cannot read it",
+				provider)
+		}
+		if w.receipts == nil {
+			receipts, ok := st.(receiptStore)
+			if !ok {
+				return nil, fmt.Errorf("outbound: provider %s completes on the provider's word, and the store cannot keep it",
+					provider)
+			}
+			w.receipts = receipts
+			w.translators = map[string]EffectTranslator{}
+			w.receiving = map[string]ReceiptChannel{}
 		}
 		w.translators[provider] = receiving
 		w.receiving[provider] = receiving
@@ -148,8 +172,8 @@ func NewWorkerFor(family string, st outboundStore, workerID string,
 
 // Run works until the context is cancelled, then waits for what it holds.
 func (w *Worker) Run(ctx context.Context) {
-	log.Printf("outbound worker %s started: family=%s pool=%d providers=%d",
-		w.workerID, w.family, w.pool, len(w.channels))
+	log.Printf("outbound worker %s started: family=%s lane=%s pool=%d providers=%d",
+		w.workerID, w.family, w.lane, w.pool, len(w.channels))
 
 	ticker := time.NewTicker(w.policy.ClaimInterval)
 	defer ticker.Stop()
@@ -216,7 +240,7 @@ func (w *Worker) tick(ctx context.Context) {
 	tick := w.ticks.Add(1)
 	// Counted first, before anything that could hang: the tick that is stuck
 	// in housekeeping is one this counter has to stop showing.
-	metrics.OutboundWorkerTicksTotal.WithLabelValues(w.family).Inc()
+	metrics.OutboundWorkerTicksTotal.WithLabelValues(w.family, w.lane).Inc()
 
 	// Housekeeping runs whether or not this instance has room. It is mostly
 	// about work OTHER instances abandoned, and skipping it while busy is how a

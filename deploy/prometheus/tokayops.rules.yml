@@ -128,8 +128,8 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "The {{ $labels.family }} delivery worker has not ticked for 5 minutes"
-          description: "Nothing of the {{ $labels.family }} family is being delivered. Check the process log and restart if the loop is gone."
+          summary: "The {{ $labels.family }}/{{ $labels.lane }} delivery worker has not ticked for 5 minutes"
+          description: "Nothing of the {{ $labels.family }} family on the {{ $labels.lane }} lane is being delivered. Check the process log and restart if the loop is gone."
 
       - alert: OutboundFanOutStopped
         expr: rate(outbound_fanout_ticks_total[5m]) == 0

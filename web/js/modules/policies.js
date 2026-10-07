@@ -435,6 +435,13 @@ function bindPolicyEditorEvents() {
                 const targetTypeSelect = row.querySelector('.target-type-select');
                 const targetContainer = row.querySelector('.target-selector-container');
 
+                // A call says the same few words for every alert: its step has
+                // no message to write.
+                const messageField = row.querySelector('.step-field-message');
+                if (messageField) {
+                    messageField.style.display = targetKind === 'call' ? 'none' : '';
+                }
+
                 if (targetKind === 'channel') {
                     targetTypeSelect.innerHTML = '<option value="channel">Channel</option>';
                     updateTargetSelector(targetContainer, 'channel');
@@ -653,7 +660,7 @@ function collectStepsData() {
         const targetType = row.querySelector('.target-type-select')?.value || 'user';
         const targetId = row.querySelector('.target-id-input')?.value || '';
         const delaySeconds = parseInt(row.querySelector('.delay-input')?.value || '0', 10);
-        const message = row.querySelector('.message-input')?.value || '';
+        const message = targetKind === 'call' ? '' : (row.querySelector('.message-input')?.value || '');
         const continueOnFailure = row.querySelector('.continue-on-failure-input')?.checked ?? true;
 
         steps.push({

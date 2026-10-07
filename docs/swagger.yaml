@@ -4121,4 +4121,24 @@ paths:
       summary: Resolve user IDs to display names
       tags:
       - users
+  /twilio/voice/status:
+    post:
+      consumes:
+      - application/x-www-form-urlencoded
+      description: Twilio reports how a call goes. Signed with the auth token of the
+        account the call was placed on; the attempt is named in the query.
+      responses:
+        "204":
+          description: No Content
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Twilio call status callback
+      tags:
+      - webhooks
 swagger: "2.0"

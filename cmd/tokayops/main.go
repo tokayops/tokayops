@@ -114,6 +114,14 @@ func channelCatalog() *providers.Catalog {
 		IntegrationType:      model.IntegrationTypeTelegram,
 		SupportedTargetKinds: []string{"dm", "channel"},
 	})
+	// A call is a step of its own kind, and never "dm": the handoff fan-out
+	// goes through every provider that carries a direct message, and a shift
+	// change announced by phone would wake whoever is coming on duty.
+	channels.Register(providers.Capability{
+		Name:                 "phone",
+		IntegrationType:      model.IntegrationTypeTwilio,
+		SupportedTargetKinds: []string{"call"},
+	})
 	return channels
 }
 
@@ -176,7 +184,7 @@ func main() {
 	if cfg.Global.SelfURL == "" {
 		log.Println("WARN: TOKAY_SELF_URL not set - clickable links and provider interactivity are disabled: " +
 			"Slack/Telegram Ack/Resolve buttons are hidden, the Telegram webhook is not registered, " +
-			"and Telegram account linking (/start) cannot complete. Set TOKAY_SELF_URL to a public HTTPS URL to enable them.")
+			"Telegram account linking (/start) cannot complete, and phone calls are not placed. Set TOKAY_SELF_URL to a public HTTPS URL to enable them.")
 	}
 
 	// What a message needs that an alert group does not carry, frozen into
@@ -435,7 +443,13 @@ func main() {
 	apiService.SetScheduleRenderer(scheduleRenderer)
 	apiService.SetUserEraser(erasure.NewService(st.ErasureRepository()))
 	apiService.SetTelegram(telegramProvider) // webhook interactivity + lifecycle
-	apiService.SetPhone(st, twilioprovider.NewClient())
+	twilioClient := twilioprovider.NewClient()
+	apiService.SetPhone(st, twilioClient)
+	// Calls run in the paging family, on a lane of their own: an escalation is
+	// still one claim, and a request to the call provider that hangs until its
+	// deadline holds a call slot, never one a direct message waits for.
+	phoneChannel := twilioprovider.NewChannel(st, twilioClient, cfg.Global.SelfURL)
+	apiService.SetCallEvents(st, map[string]outbound.EffectTranslator{keys.ProviderPhone: phoneChannel})
 	// Register the Telegram webhook at boot so TOKAY_SELF_URL + restart suffices (no
 	// need to re-save the integration). Best-effort; goroutine so a slow/unreachable
 	// setWebhook never blocks startup.
@@ -486,6 +500,11 @@ func main() {
 		uuid.New().String(), outboundChannels())
 	if err != nil {
 		log.Fatalf("Failed to build the handover worker: %v", err)
+	}
+	phoneWorker, err := outbound.NewLaneWorker(outbound.FamilyNotification, outbound.LanePhone, st,
+		uuid.New().String(), map[string]outbound.Channel{keys.ProviderPhone: phoneChannel})
+	if err != nil {
+		log.Fatalf("Failed to build the call worker: %v", err)
 	}
 
 	// The third family, and the only channel it has. Outgoing webhooks run in a
@@ -557,8 +576,9 @@ func main() {
 	go func() {
 		defer close(outboundStopped)
 		var running sync.WaitGroup
-		running.Add(3)
+		running.Add(4)
 		go func() { defer running.Done(); outboundWorker.Run(ctx) }()
+		go func() { defer running.Done(); phoneWorker.Run(ctx) }()
 		go func() { defer running.Done(); handoffWorker.Run(ctx) }()
 		go func() { defer running.Done(); webhookWorker.Run(ctx) }()
 		running.Wait()
@@ -631,6 +651,10 @@ func main() {
 				}
 				// Skip CSRF for Telegram webhook (uses X-Telegram-Bot-Api-Secret-Token verification)
 				if path == "/telegram/webhook" {
+					return true
+				}
+				// Skip CSRF for Twilio call progress (uses the account's request signature)
+				if path == "/twilio/voice/status" {
 					return true
 				}
 				return false

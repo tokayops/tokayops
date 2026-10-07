@@ -51,7 +51,7 @@ func TestEveryTickIsCountedEvenAnEmptyOne(t *testing.T) {
 		t.Run(family, func(t *testing.T) {
 			before := map[string]float64{}
 			for _, f := range Families() {
-				before[f] = counterValue(t, metrics.OutboundWorkerTicksTotal, f)
+				before[f] = counterValue(t, metrics.OutboundWorkerTicksTotal, f, LaneDefault)
 			}
 
 			w := workerOf(t, family, newFakeStore())
@@ -59,7 +59,7 @@ func TestEveryTickIsCountedEvenAnEmptyOne(t *testing.T) {
 			w.tick(context.Background())
 
 			for _, f := range Families() {
-				moved := counterValue(t, metrics.OutboundWorkerTicksTotal, f) - before[f]
+				moved := counterValue(t, metrics.OutboundWorkerTicksTotal, f, LaneDefault) - before[f]
 				want := 0.0
 				if f == family {
 					want = 2

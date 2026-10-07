@@ -17,6 +17,7 @@ import (
 	"github.com/tokayops/tokayops/internal/auth"
 	"github.com/tokayops/tokayops/internal/erasure"
 	"github.com/tokayops/tokayops/internal/model"
+	"github.com/tokayops/tokayops/internal/outbound"
 	"github.com/tokayops/tokayops/internal/rbac"
 	"github.com/tokayops/tokayops/internal/scheduleconfig"
 	"github.com/tokayops/tokayops/internal/schedulerender"
@@ -58,6 +59,8 @@ type API struct {
 	telegram         TelegramAPI                // optional, nil = telegram interactivity disabled
 	phone            PhoneStore                 // optional, nil = phone routes answer 503
 	phoneCaller      PhoneCaller
+	callEvents       CallEvents // optional, nil = the call callback answers 503
+	callTranslators  map[string]outbound.EffectTranslator
 
 	// Schedule configuration is deliberately NOT reached through
 	// store.StoreInterface. The revision model is not mirrored into MockStore,
@@ -311,6 +314,10 @@ func (a *API) RegisterRoutes(e *echo.Echo) {
 
 	// Telegram webhook (Public - no AuthMiddleware, uses X-Telegram-Bot-Api-Secret-Token verification)
 	e.POST("/telegram/webhook", a.HandleTelegramWebhook, a.TelegramSecretMiddleware)
+
+	// Twilio call progress (Public - no AuthMiddleware, checked by the
+	// signature of the account the call was placed on)
+	e.POST("/twilio/voice/status", a.HandleTwilioCallStatus)
 }
 
 // AlertGroupListResponse represents a list of alert groups.

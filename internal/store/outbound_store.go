@@ -1287,7 +1287,7 @@ const outboundIntentColumns = `
 	       provider_key_codec_version, payload, payload_digest, receipt, receipt_ref,
 	       COALESCE(expires_at <= now(), FALSE), created_at, updated_at,
 	       COALESCE(parent_intent_id, ''), awaits_intent_ids,
-	       obligation_withdrawn_at IS NOT NULL`
+	       obligation_withdrawn_at IS NOT NULL, COALESCE(bound_endpoint, '')`
 
 // scanIntent turns one row of outboundIntentColumns into a commitment, and is
 // the only place that mapping exists: two readers that disagreed about it would
@@ -1316,7 +1316,7 @@ func scanIntent(row interface{ Scan(...any) error }) (*outbound.Intent, bool, er
 		&intent.ProviderKeyCodecVersion, &payload, &intent.PayloadDigest,
 		&coordinates, &name,
 		&deadlinePassed, &intent.CreatedAt, &intent.UpdatedAt, &intent.ParentID,
-		pq.Array(&intent.AwaitsIntentIDs), &intent.ObligationWithdrawn); err != nil {
+		pq.Array(&intent.AwaitsIntentIDs), &intent.ObligationWithdrawn, &intent.BoundEndpoint); err != nil {
 		return nil, false, err
 	}
 
@@ -1440,25 +1440,30 @@ type transitionWrite struct {
 func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error {
 	e := w.Transition.Effects
 
-	// The wait for the provider's word is the family's, never the caller's: a
+	// The wait for the provider's word is the provider's, never the caller's: a
 	// commitment that starts waiting is first asked about after the longest a
 	// call can take, one that goes on waiting after the poll interval, and
 	// either gives up at the deadline fixed by its generation's first wait.
 	var firstOrNext, deadline float64
 	if e.AwaitReceipt {
-		policy, err := outbound.PolicyOf(w.Intent.Family)
-		if err != nil {
-			return outboundContractf("%v", err)
+		policy, waits := outbound.ReceiptPolicyOf(w.Intent.Provider)
+		if !waits {
+			return outboundContractf("commitment %s of %s was put to waiting, and the provider does not wait",
+				w.Intent.ID, w.Intent.Provider)
 		}
-		if policy.Receipt == nil {
-			return outboundContractf("commitment %s of family %s was put to waiting, and the family does not wait",
-				w.Intent.ID, w.Intent.Family)
-		}
-		firstOrNext = policy.Receipt.FirstWait.Seconds()
+		firstOrNext = policy.FirstWait.Seconds()
 		if w.Intent.Status == outbound.StatusAwaitingReceipt {
-			firstOrNext = policy.Receipt.PollInterval.Seconds()
+			firstOrNext = policy.PollInterval.Seconds()
 		}
-		deadline = policy.Receipt.Deadline.Seconds()
+		deadline = policy.Deadline.Seconds()
+	}
+
+	// The soonest a retry may come is the provider's, applied after the
+	// family's curve and its jitter: a call whose answer was lost, tried again
+	// two seconds later, is a second real call.
+	retry := w.Backoff
+	if floor := outbound.RetryFloorOf(w.Intent.Provider); retry < floor {
+		retry = floor
 	}
 
 	if _, err := tx.ExecContext(ctx, `
@@ -1546,7 +1551,7 @@ func applyTransitionTx(ctx context.Context, tx *sql.Tx, w transitionWrite) error
 		e.NewGeneration,
 		e.StoreReceipt, nullableJSON(w.Receipt),
 		e.ResetFailureStreak, e.BumpFailureStreak,
-		e.ScheduleRetry, w.Backoff.Seconds(), e.ScheduleNow,
+		e.ScheduleRetry, retry.Seconds(), e.ScheduleNow,
 		e.ApplyRevision, w.AppliedRevision, w.AttemptIsFinal, e.RecordDuplicateRisk,
 		w.NewExpires, nilIfEmpty(w.ReceiptRef),
 		e.AwaitReceipt, firstOrNext, deadline,
@@ -1668,6 +1673,9 @@ func timelineLine(kind outbound.TimelineKind) (string, model.TimelineEventType, 
 	case outbound.TimelineHandedOver:
 		return "Notification handed to the provider; waiting to hear what became of it",
 			model.TimelineEventNotificationSent, true
+	case outbound.TimelineNoContact:
+		return "A notification had nobody to reach: no verified contact the provider can use",
+			model.TimelineEventNotificationFailed, true
 	case outbound.TimelineNotPlaced:
 		return "The provider could not place the notification; trying again",
 			model.TimelineEventNotificationFailed, true
