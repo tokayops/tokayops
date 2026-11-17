@@ -59,6 +59,9 @@ func TestTheFallbacksAreResolvedOnce(t *testing.T) {
 	if alert.SlackUser == nil || *alert.SlackUser != "U0001" {
 		t.Fatalf("the mention was lost: %v", alert.SlackUser)
 	}
+	if alert.RunbookURL == nil || *alert.RunbookURL != "https://runbooks.example" {
+		t.Fatalf("the runbook was lost: %v", alert.RunbookURL)
+	}
 
 	// The links are frozen whole rather than as a base to append to later.
 	if state.GroupURL == nil || *state.GroupURL != "https://tokay.example/#/ops/alert-groups/ag-1" {
@@ -66,6 +69,46 @@ func TestTheFallbacksAreResolvedOnce(t *testing.T) {
 	}
 	if state.TeamSetupURL == nil || *state.TeamSetupURL != "https://tokay.example/#/cfg/teams" {
 		t.Fatalf("the team setup link is %v", state.TeamSetupURL)
+	}
+}
+
+// TestTheFirstNonEmptyAddressIsTheOneThatIsFrozen. dashboard_url and
+// runbook_url are what Grafana and kube-prometheus send. An annotation is
+// preferred to a label only when it is non-empty, and a non-empty annotation
+// that no channel will link still wins over a safe label.
+func TestTheFirstNonEmptyAddressIsTheOneThatIsFrozen(t *testing.T) {
+	group := liveGroup()
+	group.Alerts[0].Annotations["dashboard"] = ""
+	group.Alerts[0].Labels["dashboard"] = ""
+	group.Alerts[0].Annotations["dashboard_url"] = "https://grafana.example/d/disk"
+	group.Alerts[0].Annotations["runbook"] = ""
+	group.Alerts[0].Annotations["runbook_url"] = "https://runbooks.example/disk"
+
+	alert := ViewOf(GroupView{Group: group, Zone: "UTC"}).Alerts[0]
+	if alert.DashboardURL == nil || *alert.DashboardURL != "https://grafana.example/d/disk" {
+		t.Fatalf("dashboard_url was not frozen: %v", alert.DashboardURL)
+	}
+	if alert.RunbookURL == nil || *alert.RunbookURL != "https://runbooks.example/disk" {
+		t.Fatalf("runbook_url was not frozen: %v", alert.RunbookURL)
+	}
+
+	group.Alerts[0].Annotations["dashboard"] = "https://grafana.example/from-annotation"
+	group.Alerts[0].Labels["dashboard"] = "https://grafana.example/from-label"
+	alert = ViewOf(GroupView{Group: group, Zone: "UTC"}).Alerts[0]
+	if alert.DashboardURL == nil || *alert.DashboardURL != "https://grafana.example/from-annotation" {
+		t.Fatalf("the annotation did not beat the label: %v", alert.DashboardURL)
+	}
+
+	group.Alerts[0].Annotations["dashboard"] = "javascript:alert(1)"
+	alert = ViewOf(GroupView{Group: group, Zone: "UTC"}).Alerts[0]
+	if alert.DashboardURL == nil || *alert.DashboardURL != "javascript:alert(1)" {
+		t.Fatalf("an unusable annotation fell through to the label: %v", alert.DashboardURL)
+	}
+
+	group.Alerts[0].Annotations["dashboard"] = "   "
+	alert = ViewOf(GroupView{Group: group, Zone: "UTC"}).Alerts[0]
+	if alert.DashboardURL == nil || *alert.DashboardURL != "   " {
+		t.Fatalf("a blank annotation fell through to the label: %v", alert.DashboardURL)
 	}
 }
 

@@ -202,19 +202,10 @@ func buildAlertList(alerts []keys.AlertSnapshot, zone string) string {
 		}
 		rendered++
 
-		dashLink := ""
-		if a.DashboardURL != nil && linkable(*a.DashboardURL) {
-			dashLink = fmt.Sprintf(" <%s|[dash]>", *a.DashboardURL)
-		}
-		bookLink := ""
-		if a.RunbookURL != nil && linkable(*a.RunbookURL) {
-			bookLink = fmt.Sprintf(" <%s|[runbook]>", *a.RunbookURL)
-		}
-
 		if a.Status == keys.AlertFiring {
-			alertList += fmt.Sprintf("• 🔴 %s (Sev: %s)%s%s\n", mrkdwn(a.AlertName), mrkdwn(a.Severity), dashLink, bookLink)
+			alertList += fmt.Sprintf("• 🔴 %s (Sev: %s)%s\n", mrkdwn(a.AlertName), mrkdwn(a.Severity), alertLinks(a))
 		} else {
-			alertList += fmt.Sprintf("• 🟢 %s (Resolved)%s%s\n", mrkdwn(a.AlertName), dashLink, bookLink)
+			alertList += fmt.Sprintf("• 🟢 %s (Resolved)%s\n", mrkdwn(a.AlertName), alertLinks(a))
 		}
 	}
 	if remaining := len(alerts) - maxAlerts; remaining > 0 {

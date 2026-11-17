@@ -181,6 +181,11 @@ func TestAnAddressFromOutsideIsLinkedOnlyWhenItIsOne(t *testing.T) {
 		"https://":                                            false,
 		"https://a b.example":                                 false,
 		"grafana.example/d/abc":                               false,
+		"https:example.com":                                   false,
+		"https:///example.com":                                false,
+		`https:\\example.com`:                                 false,
+		`https://example.com\path`:                            false,
+		`https://evil.example\@good.example`:                  false,
 		"":                                                    false,
 	} {
 		state := handlerState(t).Content()
@@ -196,6 +201,10 @@ func TestAnAddressFromOutsideIsLinkedOnlyWhenItIsOne(t *testing.T) {
 		// two that are prefixes of the card's own links are not checked.
 		if !want && raw != "" && raw != "https://" && strings.Contains(card, raw) {
 			t.Errorf("%q was put into the card without being linked:\n%s", raw, card)
+		}
+		thread := RenderThread(state)
+		if strings.Contains(thread, "<"+raw+"|") != want {
+			t.Errorf("%q linked in the thread: %v, want %v\n%s", raw, !want, want, thread)
 		}
 	}
 }

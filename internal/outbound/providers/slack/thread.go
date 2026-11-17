@@ -2,10 +2,8 @@ package slack
 
 import (
 	"fmt"
-	"net/url"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/tokayops/tokayops/internal/outbound/keys"
 	"github.com/tokayops/tokayops/internal/outbound/providers"
@@ -36,27 +34,9 @@ func mrkdwn(s string) string { return mrkdwnEscaper.Replace(s) }
 // codeLine makes a field from outside safe to put on a line of a code block.
 func codeLine(s string) string { return codeLineEscaper.Replace(s) }
 
-// linkable says whether an address that arrived from outside - an alert's
-// dashboard or runbook annotation, Alertmanager's own URL - may be the target
-// of a mrkdwn link. A link is <url|label>, and a > or a | inside the address
-// ends it early: whatever follows is read as markup, and an annotation
-// reading https://a|x> <!channel> pages the channel from the title of every
-// card. Only an http or https address with nothing mrkdwn can read is
-// linked; anything else is not linked at all, which also keeps a javascript:
-// address out of a card. Escaping instead would print a broken address, and
-// a link that is not one is worth less than no link.
-func linkable(raw string) bool {
-	if strings.ContainsAny(raw, "<>|") || strings.ContainsFunc(raw, func(r rune) bool {
-		return unicode.IsSpace(r) || unicode.IsControl(r)
-	}) {
-		return false
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
-}
+// linkable is the check every Slack message uses. The rule lives in one place
+// so the card, the thread and the web UI cannot disagree about an address.
+func linkable(raw string) bool { return providers.Linkable(raw) }
 
 // maxThreadAlerts bounds the details section, as the card bounds its list.
 const maxThreadAlerts = 10
@@ -85,6 +65,7 @@ func RenderThread(state keys.SnapshotInput) string {
 		if description := providers.AlertDescription(a); description != "" {
 			line += ": " + mrkdwn(description)
 		}
+		line += alertLinks(a)
 		b.WriteString(line + "\n")
 	}
 
@@ -103,6 +84,19 @@ func RenderThread(state keys.SnapshotInput) string {
 	}
 	b.WriteString("```")
 	return b.String()
+}
+
+// alertLinks is the dashboard and the runbook on an alert's line, in the card
+// and in the thread. An address that is not linkable is left out.
+func alertLinks(a keys.AlertSnapshot) string {
+	links := ""
+	if a.DashboardURL != nil && linkable(*a.DashboardURL) {
+		links += fmt.Sprintf(" <%s|[dash]>", *a.DashboardURL)
+	}
+	if a.RunbookURL != nil && linkable(*a.RunbookURL) {
+		links += fmt.Sprintf(" <%s|[runbook]>", *a.RunbookURL)
+	}
+	return links
 }
 
 // RenderReply is the message that closes the thread. It says who resolved the

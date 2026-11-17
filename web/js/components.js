@@ -553,6 +553,9 @@ const Components = {
             + (staleCount > 0 ? ` · ${staleCount} stale` : '')
             + (resolvedCount > 0 ? ` · ${resolvedCount} resolved` : '');
         const teamLabel = alertGroup.team_id ? `Team ${alertGroup.team_id}` : 'Team N/A';
+        const orderedAlerts = alertGroup.alerts?.length && window.AlertReview
+            ? window.AlertReview.readingOrder(alertGroup.alerts)
+            : (alertGroup.alerts || []);
 
         return `
             <div class="detail-hero">
@@ -633,7 +636,7 @@ const Components = {
                 <div class="detail-section">
                     <h3 class="detail-section-title">${alertsSummary}</h3>
                     <div class="alerts-list">
-                        ${alertGroup.alerts.map(alert => Components.alertItem(alert)).join('')}
+                        ${orderedAlerts.map(alert => Components.alertItem(alert)).join('')}
                     </div>
                 </div>
             ` : (!alertGroup.alerts && totalCount > 0 ? `
@@ -686,7 +689,10 @@ const Components = {
             <div class="alert-item status-${Components.alertState(alert)}">
                 <div class="alert-header">
                     <span class="alert-name">${escapeHtml(headerTitle)}</span>
-                    ${Components.alertStatusBadge(alert)}
+                    <span class="alert-header-marks">
+                        ${reviewHeaderLinks(alert)}
+                        ${Components.alertStatusBadge(alert)}
+                    </span>
                 </div>
                 ${summary ? `
                     <div class="alert-annotation">${escapeHtml(summary)}</div>
@@ -2476,6 +2482,18 @@ function escapeHtml(str) {
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+}
+
+function reviewAnchor(url, label) {
+    const href = escapeAttr(url);
+    return `<a class="alert-review-link" href="${href}" title="${href}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
+}
+
+function reviewHeaderLinks(alert) {
+    const found = window.AlertReview
+        ? window.AlertReview.links(alert)
+        : { dashboard: '', runbook: '' };
+    return `${found.dashboard ? reviewAnchor(found.dashboard, 'Dashboard') : ''}${found.runbook ? reviewAnchor(found.runbook, 'Runbook') : ''}`;
 }
 
 /**

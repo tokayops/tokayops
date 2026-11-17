@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"encoding/json"
+	"html"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,34 @@ func cardState() keys.SnapshotInput {
 		}},
 	}
 }
+
+func TestACardLinksTheDashboardAndTheRunbook(t *testing.T) {
+	state := cardState()
+	dash := `https://grafana.example/d/a?var-host="db"&from=now`
+	book := "https://runbooks.example/disk"
+	state.Alerts[0].DashboardURL = &dash
+	state.Alerts[0].RunbookURL = &book
+
+	got := RenderCard(state)
+	if !strings.Contains(got, `<a href="`+html.EscapeString(dash)+`">dash</a>`) {
+		t.Fatalf("the dashboard was not escaped into the card:\n%s", got)
+	}
+	if !strings.Contains(got, `<a href="`+html.EscapeString(book)+`">runbook</a>`) {
+		t.Fatalf("the runbook was not linked:\n%s", got)
+	}
+	if strings.Contains(got, `var-host="db"`) {
+		t.Fatalf("the quote reached the href raw:\n%s", got)
+	}
+
+	state.Alerts[0].DashboardURL = ptrTelegram("https:example.com")
+	state.Alerts[0].RunbookURL = ptrTelegram(`https://example.com\path`)
+	got = RenderCard(state)
+	if strings.Contains(got, ">dash</a>") || strings.Contains(got, ">runbook</a>") {
+		t.Fatalf("an address that is not a link was linked:\n%s", got)
+	}
+}
+
+func ptrTelegram(v string) *string { return &v }
 
 func TestACardIsAFunctionOfItsSnapshot(t *testing.T) {
 	state := cardState()

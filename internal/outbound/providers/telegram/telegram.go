@@ -506,10 +506,11 @@ func alertLines(state keys.SnapshotInput) []string {
 		}
 		rendered++
 		name := html.EscapeString(a.AlertName)
+		links := telegramLink(a.DashboardURL, "dash") + telegramLink(a.RunbookURL, "runbook")
 		if a.Status == keys.AlertFiring {
-			out = append(out, fmt.Sprintf("• 🔴 %s (Sev: %s)", name, html.EscapeString(a.Severity)))
+			out = append(out, fmt.Sprintf("• 🔴 %s (Sev: %s)%s", name, html.EscapeString(a.Severity), links))
 		} else {
-			out = append(out, fmt.Sprintf("• 🟢 %s (Resolved)", name))
+			out = append(out, fmt.Sprintf("• 🟢 %s (Resolved)%s", name, links))
 		}
 		// What is wrong and since when, on a line of its own: Telegram has no
 		// thread to say it in, so the card says it, in the words the Slack
@@ -520,6 +521,16 @@ func alertLines(state keys.SnapshotInput) []string {
 		out = append(out, fmt.Sprintf("… and %d more alerts", remaining))
 	}
 	return out
+}
+
+// telegramLink is one dashboard or runbook anchor, or nothing when the address
+// cannot be followed. The address is escaped so a quote or an ampersand in a
+// query cannot leave the href.
+func telegramLink(raw *string, label string) string {
+	if raw == nil || !providers.Linkable(*raw) {
+		return ""
+	}
+	return fmt.Sprintf(` <a href="%s">%s</a>`, html.EscapeString(*raw), label)
 }
 
 // cardFooter returns the "Open in Tokay" deep-link footer as one complete HTML line.
