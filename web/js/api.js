@@ -60,9 +60,11 @@ async function request(endpoint, options = {}) {
         if (!response.ok) {
             // Handle 401 Unauthorized globally
             if (response.status === 401) {
-                // If we are not on the login page, redirect
+                // If we are not on the login page, redirect. The route that
+                // was open goes with the redirect, or a deep link dies here.
                 if (!window.location.pathname.includes('login.html')) {
-                    window.location.href = '/login.html';
+                    const target = window.ReturnPath ? window.ReturnPath.loginLocation() : '/login.html';
+                    window.location.href = target;
                     throw new Error('Unauthorized'); // Stop processing
                 }
             }

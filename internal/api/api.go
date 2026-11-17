@@ -47,7 +47,7 @@ type TelegramAPI interface {
 type API struct {
 	store            store.StoreInterface
 	agService        *alertgroup.Service
-	oidcProvider     *auth.OIDCProvider
+	oidcProvider     oidcLogin
 	rbac             *rbac.Checker
 	slack            SlackMessenger
 	integrationCache *store.IntegrationCache
@@ -81,10 +81,16 @@ type API struct {
 // handlers (policy validation falls back to taxonomy-only checks) but the
 // production wiring in main.go always supplies it.
 func NewAPI(s store.StoreInterface, oidc *auth.OIDCProvider, slack SlackMessenger, cache *store.IntegrationCache, selfURL string, providerCaps ProviderCapabilitiesLookup) *API {
+	// Keep a nil provider as a nil interface. A typed nil passes the interface
+	// check, and every "OIDC is off" branch then calls through it.
+	var provider oidcLogin
+	if oidc != nil {
+		provider = oidc
+	}
 	api := &API{
 		store:            s,
 		agService:        alertgroup.NewService(s),
-		oidcProvider:     oidc,
+		oidcProvider:     provider,
 		rbac:             rbac.NewChecker(s),
 		slack:            slack,
 		integrationCache: cache,

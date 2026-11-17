@@ -10,7 +10,9 @@ import (
 	slackprovider "github.com/tokayops/tokayops/internal/outbound/providers/slack"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -23,6 +25,33 @@ import (
 )
 
 const AuthCookieName = "access_token"
+
+// oidcNextCookieName keeps the hash route to restore when the provider
+// sends the browser back. It sits beside oidc_state rather than inside the
+// state value, so the route is not sent to the identity provider.
+const oidcNextCookieName = "oidc_next"
+
+// oidcLogin is the part of an OIDC provider the sign-in handlers call.
+// Tests substitute a fake; production passes *auth.OIDCProvider.
+type oidcLogin interface {
+	IsEnabled() bool
+	GetAuthURL(state string) string
+	ExchangeCode(ctx context.Context, code string) (*auth.OIDCUserInfo, error)
+	ValidateDomain(email string) bool
+}
+
+const maxReturnHashLength = 512
+
+var returnHashPattern = regexp.MustCompile(`^#/(ops|cfg)(/[A-Za-z0-9._~%-]*)*$`)
+
+// safeReturnHash is the route to open after login, or empty.
+// The redirect is "/" plus this value, and the pattern is the whole check.
+func safeReturnHash(raw string) string {
+	if len(raw) == 0 || len(raw) > maxReturnHashLength || !returnHashPattern.MatchString(raw) {
+		return ""
+	}
+	return raw
+}
 
 // LoginRequest represents the login credentials.
 type LoginRequest struct {
@@ -340,6 +369,9 @@ func (a *API) OIDCRedirect(c echo.Context) error {
 		Secure:   os.Getenv("APP_ENV") == "production",
 		SameSite: http.SameSiteLaxMode,
 	})
+	// An absent or rejected next clears a route remembered for an earlier
+	// attempt, so this login cannot restore someone else's target.
+	a.setOIDCNextCookie(c, safeReturnHash(c.QueryParam("next")))
 
 	authURL := a.oidcProvider.GetAuthURL(state)
 	return c.Redirect(http.StatusFound, authURL)
@@ -360,6 +392,11 @@ func (a *API) OIDCCallback(c echo.Context) error {
 	if a.oidcProvider == nil || !a.oidcProvider.IsEnabled() {
 		return c.JSON(http.StatusBadRequest, ErrorResponse{Error: "OIDC not configured"})
 	}
+
+	// Read the route before the state check. A failed login still forgets it,
+	// so a rejected attempt cannot be replayed into a later success.
+	hash := returnHashFromCookie(c)
+	a.setOIDCNextCookie(c, "")
 
 	// Verify state (CSRF protection)
 	stateCookie, err := c.Cookie("oidc_state")
@@ -454,8 +491,39 @@ func (a *API) OIDCCallback(c echo.Context) error {
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	// Redirect to home page
-	return c.Redirect(http.StatusFound, "/")
+	// "/" plus a fragment. An empty route is the home page.
+	return c.Redirect(http.StatusFound, "/"+hash)
+}
+
+func returnHashFromCookie(c echo.Context) string {
+	cookie, err := c.Cookie(oidcNextCookieName)
+	if err != nil || cookie.Value == "" {
+		return ""
+	}
+	raw, err := url.QueryUnescape(cookie.Value)
+	if err != nil {
+		return ""
+	}
+	return safeReturnHash(raw)
+}
+
+func (a *API) setOIDCNextCookie(c echo.Context, hash string) {
+	value := ""
+	maxAge := -1
+	if hash != "" {
+		value = url.QueryEscape(hash)
+		maxAge = 300
+	}
+	// nosemgrep: go.lang.security.audit.net.cookie-missing-secure.cookie-missing-secure
+	c.SetCookie(&http.Cookie{
+		Name:     oidcNextCookieName,
+		Value:    value,
+		MaxAge:   maxAge,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   os.Getenv("APP_ENV") == "production",
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 // tryLinkSlackUser attempts to auto-link a user's Slack account by looking up

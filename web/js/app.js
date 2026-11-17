@@ -6,6 +6,7 @@
  */
 
 import { State } from '/js/core/state.js';
+import { loginLocation, clearReturnPath, restoreReturnPath } from '/js/core/return-path.js';
 import { Elements, initElements, showToast, initTheme, toggleTheme, escapeHtml, initModalEscapeHandler } from '/js/core/utils.js';
 import { ViewManager } from '/js/core/viewManager.js';
 import { Permissions } from '/js/modules/permissions.js';
@@ -592,7 +593,7 @@ async function checkAuth() {
         return user;
     } catch (error) {
         console.warn('Not authenticated, redirecting...', error);
-        window.location.href = '/login.html';
+        window.location.href = loginLocation();
         throw error;
     }
 }
@@ -636,9 +637,11 @@ function bindUserMenuEvents() {
             e.preventDefault();
             try {
                 await API.auth.logout();
+                clearReturnPath();
                 window.location.href = '/login.html';
             } catch (error) {
                 console.error('Logout error:', error);
+                clearReturnPath();
                 window.location.href = '/login.html';
             }
         });
@@ -666,6 +669,10 @@ async function init() {
         // checkAuth handles redirect, just stop here
         return;
     }
+
+    // A sign-in that landed on / with the route kept beside it, because the
+    // fragment did not survive the callback.
+    restoreReturnPath();
 
     const authLoading = document.getElementById('auth-loading');
     const mainApp = document.getElementById('main-app');
