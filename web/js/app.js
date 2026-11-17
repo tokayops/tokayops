@@ -6,6 +6,7 @@
  */
 
 import { State } from '/js/core/state.js';
+import '/js/core/alert-review.js';
 import { loginLocation, clearReturnPath, restoreReturnPath } from '/js/core/return-path.js';
 import { Elements, initElements, showToast, initTheme, toggleTheme, escapeHtml, initModalEscapeHandler } from '/js/core/utils.js';
 import { ViewManager } from '/js/core/viewManager.js';

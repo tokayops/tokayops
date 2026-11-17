@@ -162,12 +162,19 @@ func alertSnapshot(alert model.Alert, firstSeen time.Time) keys.AlertSnapshot {
 	}
 
 	out.SlackUser = optional(alert.Labels["slack_user"])
-	dashboard := alert.Annotations["dashboard"]
-	if dashboard == "" {
-		dashboard = alert.Labels["dashboard"]
-	}
-	out.DashboardURL = optional(dashboard)
-	out.RunbookURL = optional(alert.Annotations["runbook"])
+	// The first non-empty string is the address, and an unusable one is not
+	// skipped. A javascript: annotation with a safe label beside it stays the
+	// annotation: the renderer drops it, and the label does not take its place.
+	out.DashboardURL = optional(firstSet(
+		alert.Annotations["dashboard"],
+		alert.Annotations["dashboard_url"],
+		alert.Labels["dashboard"],
+		alert.Labels["dashboard_url"],
+	))
+	out.RunbookURL = optional(firstSet(
+		alert.Annotations["runbook"],
+		alert.Annotations["runbook_url"],
+	))
 
 	description := alert.Annotations["description"]
 	if description == "" {
@@ -239,6 +246,17 @@ func zoneName(zone string) string {
 // It exists only for that path. Everything admitted through the outbound domain
 // carries the zone in its snapshot, decided once by whoever composed it.
 func ProcessZone() string { return zoneName(time.Local.String()) }
+
+// firstSet is the first value that carries any characters. An empty string is
+// the only one that is skipped; a string of spaces is a choice, not an absence.
+func firstSet(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
 
 func optional(value string) *string {
 	if value == "" {
