@@ -992,6 +992,70 @@ export function monthlyScheduleCalendar(render, startDate, timezone = 'UTC', nam
 }
 
 /**
+ * Who takes the shift when the save lands: whoever the rotation has there, or
+ * a group named now.
+ *
+ * Without this a reorder could not put anyone on duty: the rotation keeps the
+ * group in progress until the next handoff, which is right for an edit of the
+ * order and wrong when the point of the edit is to change who is on call.
+ *
+ * @param {Object} params
+ * @param {Array<{id: string, user_ids: string[]}>} params.groups - L1 groups, in order
+ * @param {Object|null} params.current - on_call_after.l1 of the preview without a handoff
+ * @param {Map} params.names - id -> display name
+ * @param {string} params.timezone
+ * @param {string} params.handoffTo - the group chosen, '' for none
+ */
+export function scheduleHandoffChoice({ groups, current, names, timezone, handoffTo }) {
+    const groupNames = (group) => (group.user_ids || [])
+        .map(id => names.get(id) || `Unknown user (${id})`)
+        .join(', ') || 'Nobody';
+
+    // An override hides the rotation underneath it, so no group is "the one
+    // on duty" to leave out of the list.
+    const onDutyGroup = current?.source === 'rotation' ? current.group_id : '';
+    const candidates = groups
+        .map((group, index) => ({ group, index }))
+        .filter(({ group }) => group.id !== onDutyGroup);
+    const selected = handoffTo || candidates[0]?.group.id || '';
+
+    // assignment_end is when this composition actually stops. The grid slot is
+    // the rotation underneath it, and an override or a mid-shift edit ends
+    // sooner than that. The on-call row uses the same boundary. Falling back
+    // to the grid would promise the weekly handoff when the duty ends today.
+    const until = current?.assignment_end
+        ? new Date(current.assignment_end).toLocaleString(undefined, {
+            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: timezone,
+        })
+        : '';
+    const keepLabel = current
+        ? `<span class="banner-who">${escapeHtml(onCallNames(current, names))}</span>
+           ${until ? `stays on duty until ${escapeHtml(until)}` : 'stays on duty'}`
+        : 'Leave it to the rotation';
+
+    return `
+        <fieldset class="handoff-choice">
+            <legend class="preview-shifts-title">On duty from now</legend>
+            <label class="handoff-option">
+                <input type="radio" name="handoff-mode" value="keep" ${handoffTo ? '' : 'checked'}>
+                <span>${keepLabel}</span>
+            </label>
+            <label class="handoff-option">
+                <input type="radio" name="handoff-mode" value="now" ${handoffTo ? 'checked' : ''}>
+                <span>Hand off now to</span>
+                <select id="handoff-group" class="handoff-group-select">
+                    ${candidates.map(({ group, index }) => `
+                        <option value="${escapeAttr(group.id)}" ${group.id === selected ? 'selected' : ''}>
+                            ${index + 1}. ${escapeHtml(groupNames(group))}
+                        </option>
+                    `).join('')}
+                </select>
+            </label>
+        </fieldset>
+    `;
+}
+
+/**
  * What a save would do, before it does it.
  *
  * The answer is true as of `evaluated_at` and is not a promise: the save

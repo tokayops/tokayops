@@ -69,6 +69,12 @@ type PutScheduleConfigRequest struct {
 	// Reason is free text recorded with the revision.
 	Reason *string `json:"reason,omitempty"`
 
+	// L1HandoffNowGroupID puts this L1 group on duty from the moment of the
+	// save instead of keeping whoever is on duty until the next handoff. It is
+	// an instruction, not configuration: it is not stored and not returned.
+	// Naming the group already on duty changes nothing.
+	L1HandoffNowGroupID string `json:"l1_handoff_now_group_id,omitempty"`
+
 	ScheduleConfigDTO
 }
 

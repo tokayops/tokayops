@@ -698,6 +698,13 @@ definitions:
         type: integer
       l1:
         $ref: '#/definitions/api.ScheduleL1DTO'
+      l1_handoff_now_group_id:
+        description: |-
+          L1HandoffNowGroupID puts this L1 group on duty from the moment of the
+          save instead of keeping whoever is on duty until the next handoff. It is
+          an instruction, not configuration: it is not stored and not returned.
+          Naming the group already on duty changes nothing.
+        type: string
       l2:
         $ref: '#/definitions/api.ScheduleL2DTO'
       reason:

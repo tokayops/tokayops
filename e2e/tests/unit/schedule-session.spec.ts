@@ -248,6 +248,89 @@ async function waitForToast(page: Page) {
     document.querySelectorAll('#toast-container .toast').length > 0);
 }
 
+/**
+ * A schedule with someone else to hand to, and a note of every save.
+ *
+ * The review step only offers the choice when L1 has more than one group.
+ * The harness schedule has one, which is why these tests replace it.
+ */
+async function useTwoGroupSchedule(page: Page) {
+  await page.evaluate(() => {
+    const harness = (window as any).__h;
+    harness.saves = [] as unknown[];
+    harness.holdPreview = false;
+    harness.releasePreview = null;
+    harness.previewSettled = 0;
+
+    (window as any).API.schedules.getConfig = async () => ({
+      schedule_id: 'sch-1',
+      version: 1,
+      config: {
+        timezone: 'UTC',
+        slack_usergroup_id: '',
+        l1: {
+          enabled: true,
+          rotation_type: 'daily',
+          handoff_time: '09:00',
+          handoff_day: null,
+          groups: [
+            { id: 'g1', user_ids: ['u1'] },
+            { id: 'g2', user_ids: ['u2'] },
+          ],
+        },
+        l2: {
+          enabled: false,
+          escalation_timeout_minutes: 5,
+          rotation_type: 'daily',
+          handoff_time: '09:00',
+          handoff_day: null,
+          user_ids: [],
+        },
+      },
+    });
+
+    const onCall = {
+      user_ids: ['u1'],
+      group_id: 'g1',
+      source: 'rotation',
+      assignment_end: '2026-11-23T08:00:00Z',
+      grid_slot_end: '2026-11-23T08:00:00Z',
+    };
+    (window as any).API.schedules.preview = async (
+      _teamId: string, _config: unknown, _until: unknown, options: any = {},
+    ) => {
+      // Only the handoff re-preview waits. Holding the first one would mean
+      // the review step never opened.
+      if (options.handoffNowGroupId && harness.holdPreview) {
+        await new Promise<void>(resolve => { harness.releasePreview = resolve; });
+        harness.previewSettled += 1;
+      }
+      return {
+        base_version: 1,
+        on_call_changed: false,
+        on_call_before: { l1: onCall },
+        on_call_after: { l1: onCall },
+        entries: [],
+        warnings: [],
+        evaluated_at: new Date().toISOString(),
+      };
+    };
+
+    const save = (window as any).API.schedules.saveConfig;
+    (window as any).API.schedules.saveConfig = async (...args: unknown[]) => {
+      harness.saves.push(args);
+      return save(...args);
+    };
+  });
+}
+
+/** A click Playwright will not send, because the button is disabled. */
+async function syntheticClick(page: Page, selector: string) {
+  await page.evaluate((sel) => {
+    document.querySelector(sel)!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  }, selector);
+}
+
 test.describe('modal session', () => {
   test.beforeEach(async ({ page }) => {
     await boot(page);
@@ -556,5 +639,114 @@ test.describe('modal session', () => {
     const calls = await page.evaluate(() => (window as any).__h.calls);
     expect(calls.created, 'it created').toBe(1);
     expect(calls.updated, 'an edit that leaked would have appended a revision').toBe(0);
+  });
+
+  test('a second save cannot leave while the first is still in flight', async ({ page }) => {
+    await useTwoGroupSchedule(page);
+    const release = await holdWrites(page);
+
+    await openEditor(page);
+    await page.locator('#schedule-form-submit').click();
+    await page.locator('input[name="handoff-mode"][value="now"]').check();
+    // The re-preview enables Save again once it has an answer. The click
+    // waits for that, and then the write is what we hold.
+    await page.locator('#preview-confirm').click();
+    await page.waitForFunction(() => (window as any).__h.releaseWrite !== null);
+
+    // The fieldset carries disabled, which is what turns the radios and the
+    // list off. Playwright does not report the fieldset itself as disabled.
+    await expect(page.locator('.handoff-choice')).toHaveAttribute('disabled', '');
+    await expect(page.locator('input[name="handoff-mode"]')).toHaveCount(2);
+    for (const control of [
+      page.locator('input[name="handoff-mode"]').nth(0),
+      page.locator('input[name="handoff-mode"]').nth(1),
+      page.locator('#handoff-group'),
+      page.locator('#preview-confirm'),
+    ]) {
+      await expect(control).toBeDisabled();
+    }
+    const inflight = await page.evaluate(() => (window as any).__h.saves.map((args: any[]) => args[4]));
+    expect(inflight, 'the write captured the handoff that was chosen').toEqual(['g2']);
+
+    // The controls are disabled, so a person cannot do this. Dispatching it
+    // anyway is what reaches the guard: a Playwright click on a disabled
+    // button never fires, and neither does HTMLElement.click().
+    await page.evaluate(() => {
+      const keep = document.querySelector('input[name="handoff-mode"][value="keep"]') as HTMLInputElement;
+      keep.checked = true;
+      keep.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await syntheticClick(page, '#preview-confirm');
+
+    const during = await page.evaluate(() => (window as any).__h.saves.map((args: any[]) => args[4]));
+    expect(during, 'neither the switch nor the second click started a save').toEqual(['g2']);
+    await expect(page.locator('#preview-confirm')).toBeDisabled();
+
+    await release();
+    expect(await page.evaluate(() => (window as any).__h.saves.length)).toBe(1);
+  });
+
+  test('a preview that answers after Save was pressed does not unlock it', async ({ page }) => {
+    await useTwoGroupSchedule(page);
+    await page.evaluate(() => { (window as any).__h.holdPreview = true; });
+    const release = await holdWrites(page);
+
+    await openEditor(page);
+    await page.locator('#schedule-form-submit').click();
+    await page.locator('input[name="handoff-mode"][value="now"]').check();
+    await page.waitForFunction(() => (window as any).__h.releasePreview !== null);
+    await expect(page.locator('#preview-confirm')).toBeDisabled();
+
+    // Save is disabled because the preview has not answered. The click is
+    // synthetic so the write starts anyway, and the preview is still held.
+    await syntheticClick(page, '#preview-confirm');
+    await page.waitForFunction(() => (window as any).__h.releaseWrite !== null);
+    expect(await page.evaluate(() => (window as any).__h.saves.length)).toBe(1);
+
+    // setTimeout yields past the preview's microtask, so the assertion sees
+    // the button after that answer has been applied, not before it.
+    await page.evaluate(() => new Promise((resolve) => {
+      (window as any).__h.releasePreview();
+      setTimeout(resolve, 0);
+    }));
+    expect(await page.evaluate(() => (window as any).__h.previewSettled)).toBe(1);
+
+    await expect(page.locator('#preview-confirm'),
+      'the late preview re-enabled Save over the write').toBeDisabled();
+    expect(await page.evaluate(() => (window as any).__h.saves.length)).toBe(1);
+
+    await release();
+    expect(await page.evaluate(() => (window as any).__h.saves.length)).toBe(1);
+  });
+
+  test('a refused save unlocks the handoff choice', async ({ page }) => {
+    await useTwoGroupSchedule(page);
+    await page.evaluate(() => {
+      const harness = (window as any).__h;
+      (window as any).API.schedules.saveConfig = async (...args: unknown[]) => {
+        harness.saves.push(args);
+        throw Object.assign(new Error('no such group'), {
+          status: 422,
+          code: 'validation_failed',
+          body: { field: 'l1_handoff_now_group_id' },
+        });
+      };
+    });
+
+    await openEditor(page);
+    await page.locator('#schedule-form-submit').click();
+    await page.locator('#preview-confirm').waitFor({ state: 'attached' });
+    await page.locator('#preview-confirm').click();
+
+    // The refusal leaves the review step up. The choice has to work again,
+    // or the only way out is to reopen the editor.
+    await expect(page.locator('#preview-confirm')).toBeEnabled();
+    await expect(page.locator('.handoff-choice')).not.toHaveAttribute('disabled', '');
+    await expect(page.locator('#handoff-group')).toBeEnabled();
+    expect(await page.evaluate(() => (window as any).__h.saves.length)).toBe(1);
+
+    await page.locator('#preview-confirm').click();
+    await page.waitForFunction(() => (window as any).__h.saves.length === 2);
+    await expect(page.locator('#handoff-group')).toBeEnabled();
   });
 });

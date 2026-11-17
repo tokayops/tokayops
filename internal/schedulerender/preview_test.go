@@ -77,7 +77,7 @@ func (f *previewFixture) save(t *testing.T, version int64, cfg rotation.Schedule
 
 func (f *previewFixture) preview(t *testing.T, cfg rotation.ScheduleConfiguration, until *time.Time) *schedulerender.PreviewResult {
 	t.Helper()
-	res, err := f.svc.Preview(context.Background(), "devops", cfg, until)
+	res, err := f.svc.Preview(context.Background(), "devops", cfg, "", until)
 	if err != nil {
 		t.Fatalf("Preview: %v", err)
 	}
@@ -155,11 +155,20 @@ func TestPreviewValidationMatchesSave(t *testing.T) {
 	t.Run("membership", func(t *testing.T) {
 		f := newPreviewFixture(t)
 		_, err := f.svc.Preview(context.Background(), "devops",
-			previewConfig(pvGroup(pvGroupA, "mallory")), nil)
+			previewConfig(pvGroup(pvGroupA, "mallory")), "", nil)
 
 		var notMember *scheduleconfig.UserNotTeamMemberError
 		if !errors.As(err, &notMember) {
 			t.Fatalf("error = %v, want a membership rejection", err)
+		}
+	})
+
+	t.Run("handoff target", func(t *testing.T) {
+		f := newPreviewFixture(t)
+		_, err := f.svc.Preview(context.Background(), "devops",
+			previewConfig(pvGroup(pvGroupA, "alice")), pvGroupB, nil)
+		if !errors.Is(err, scheduleconfig.ErrValidation) {
+			t.Fatalf("error = %v, want a validation rejection", err)
 		}
 	})
 
@@ -168,7 +177,7 @@ func TestPreviewValidationMatchesSave(t *testing.T) {
 		cfg := previewConfig(pvGroup(pvGroupA, "alice"))
 		cfg.Timezone = "Mars/Olympus"
 
-		_, err := f.svc.Preview(context.Background(), "devops", cfg, nil)
+		_, err := f.svc.Preview(context.Background(), "devops", cfg, "", nil)
 		if !errors.Is(err, scheduleconfig.ErrValidation) {
 			t.Fatalf("error = %v, want a validation rejection", err)
 		}
@@ -308,7 +317,7 @@ func TestPreviewReadsTheEffectiveRevisionOnce(t *testing.T) {
 
 	f.repo.Calls = nil
 	if _, err := f.svc.Preview(context.Background(), "devops",
-		previewConfig(pvGroup(pvGroupA, "alice", "carol"), pvGroup(pvGroupB, "bob")), nil); err != nil {
+		previewConfig(pvGroup(pvGroupA, "alice", "carol"), pvGroup(pvGroupB, "bob")), "", nil); err != nil {
 		t.Fatalf("Preview: %v", err)
 	}
 
@@ -320,5 +329,51 @@ func TestPreviewReadsTheEffectiveRevisionOnce(t *testing.T) {
 	}
 	if reads != 1 {
 		t.Fatalf("GetEffectiveRevision called %d times, want 1: %v", reads, f.repo.Calls)
+	}
+}
+
+// An immediate handoff shows up in the preview as a change of duty, and the
+// save that follows puts the same group on duty.
+func TestPreviewHandoffNow(t *testing.T) {
+	f := newPreviewFixture(t)
+	cfg := previewConfig(pvGroup(pvGroupA, "alice"), pvGroup(pvGroupB, "bob"))
+	created := f.save(t, 0, cfg)
+
+	plain := f.preview(t, cfg, nil)
+	if plain.OnCallChanged {
+		t.Fatalf("an unchanged configuration must not change the duty")
+	}
+	if got := plain.OnCallAfter.L1.GroupID; got != pvGroupA {
+		t.Fatalf("on duty = %s, want group A", got)
+	}
+
+	res, err := f.svc.Preview(context.Background(), "devops", cfg, pvGroupB, nil)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if !res.OnCallChanged || res.OnCallAfter.L1.GroupID != pvGroupB {
+		t.Fatalf("preview of a handoff: changed=%v after=%+v", res.OnCallChanged, res.OnCallAfter.L1)
+	}
+
+	saved, err := f.config.Save(context.Background(), "devops", scheduleconfig.SaveCommand{
+		ExpectedVersion:     created.Version,
+		Desired:             cfg,
+		ActorID:             "alice",
+		L1HandoffNowGroupID: pvGroupB,
+	})
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if saved.Noop {
+		t.Fatalf("a handoff with an unchanged configuration is still a save")
+	}
+	if got := saved.Revision.ChangeSummary.L1GroupSelection; got != rotation.SelectionExplicit {
+		t.Fatalf("change summary selection = %s, want explicit", got)
+	}
+	// The fixture clock is frozen and the save took effect a resolution unit
+	// after the create, so the read has to step past it.
+	f.now = saved.EffectiveAt.Add(time.Minute)
+	if after := f.preview(t, cfg, nil); after.OnCallAfter.L1.GroupID != pvGroupB {
+		t.Fatalf("on duty after the save = %s, want group B", after.OnCallAfter.L1.GroupID)
 	}
 }

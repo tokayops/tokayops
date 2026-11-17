@@ -51,17 +51,23 @@ type PreviewResult struct {
 // expected_version is deliberately not checked. The preview is advisory - the
 // version it reports is what the subsequent save will collide on, and that
 // save takes the lock that makes the check meaningful.
+//
+// handoffTo is the same immediate-handoff instruction the save takes, empty
+// for none.
 func (s *Service) Preview(ctx context.Context, teamID string,
-	desired rotation.ScheduleConfiguration, until *time.Time) (*PreviewResult, error) {
+	desired rotation.ScheduleConfiguration, handoffTo string, until *time.Time) (*PreviewResult, error) {
 
 	normalized, err := scheduleconfig.NormalizeConfiguration(desired)
 	if err != nil {
 		return nil, err
 	}
+	if err := scheduleconfig.ValidateHandoff(normalized, handoffTo); err != nil {
+		return nil, err
+	}
 
 	var out *PreviewResult
 	err = s.repo.WithinSnapshot(ctx, func(view scheduleconfig.ScheduleReadView) error {
-		res, err := s.preview(ctx, view, teamID, normalized, until)
+		res, err := s.preview(ctx, view, teamID, normalized, handoffTo, until)
 		if err != nil {
 			return err
 		}
@@ -93,7 +99,7 @@ type previewBase struct {
 }
 
 func (s *Service) preview(ctx context.Context, view scheduleconfig.ScheduleReadView, teamID string,
-	desired rotation.ScheduleConfiguration, until *time.Time) (*PreviewResult, error) {
+	desired rotation.ScheduleConfiguration, handoffTo string, until *time.Time) (*PreviewResult, error) {
 
 	evaluatedAt := scheduleconfig.NormalizeTimestamp(s.now().UTC())
 	windowUntil := previewWindow(evaluatedAt, until)
@@ -115,6 +121,7 @@ func (s *Service) preview(ctx context.Context, view scheduleconfig.ScheduleReadV
 		Current:     base.current,
 		Desired:     desired,
 		EffectiveAt: evaluatedAt,
+		L1HandoffTo: handoffTo,
 	})
 	if err != nil {
 		return nil, err

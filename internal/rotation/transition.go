@@ -19,16 +19,24 @@ const (
 	SelectionSuccessor = "successor"
 	SelectionFirst     = "first"
 	SelectionNone      = "none"
+	SelectionExplicit  = "explicit"
 )
 
 // TransitionInput feeds the pure planner. Current is the effective revision
 // SNAPSHOT (not the revision envelope: revision ID, version, effective
 // interval and audit metadata play no role in rotation math); nil means the
 // initial revision is being created.
+//
+// L1HandoffTo is a one-off instruction rather than configuration: when set, the
+// L1 group with this ID takes the slot containing EffectiveAt, whoever the
+// rotation would have kept there. It is not stored, so a later save without it
+// goes back to preserving whoever is on duty then. Asking for the group that
+// is already on duty changes nothing.
 type TransitionInput struct {
 	Current     *ScheduleRevisionSnapshot
 	Desired     ScheduleConfiguration
 	EffectiveAt time.Time
+	L1HandoffTo string
 }
 
 // LayerTransition describes one layer's classified transition.
@@ -85,6 +93,10 @@ type TransitionPlan struct {
 //     group ID list unchanged                         -> carry + preserve
 //  4. both active, anything of grid/IDs changed       -> reanchor +
 //     preserve | successor | first
+//
+// An L1 handoff instruction comes between 1 and 2: a group other than the one
+// on duty is reanchored onto the current slot (reanchor + explicit), even
+// when the configuration itself is unchanged.
 func PlanTransition(in TransitionInput) (TransitionPlan, error) {
 	var zero TransitionPlan
 	if in.EffectiveAt.IsZero() {
@@ -102,7 +114,18 @@ func PlanTransition(in TransitionInput) (TransitionPlan, error) {
 		c := ConfigurationFromSnapshot(*in.Current)
 		currentCfg = &c
 		if ConfigEqual(c, desired) {
-			return TransitionPlan{Noop: true}, nil
+			onDuty, err := handoffAlreadyServed(in.Current.L1, in.Current.Timezone, in.L1HandoffTo, in.EffectiveAt)
+			if err != nil {
+				return zero, fmt.Errorf("l1: %w", err)
+			}
+			if onDuty {
+				return TransitionPlan{Noop: true}, nil
+			}
+		}
+	}
+	if in.L1HandoffTo != "" {
+		if err := ValidateHandoffTarget(desired.L1, in.L1HandoffTo); err != nil {
+			return zero, err
 		}
 	}
 
@@ -111,11 +134,11 @@ func PlanTransition(in TransitionInput) (TransitionPlan, error) {
 	if in.Current != nil {
 		curL1, curL2, curTZ = &in.Current.L1, &in.Current.L2, in.Current.Timezone
 	}
-	l1Snap, l1T, err := planLayer(curL1, curTZ, desired.L1, desired.Timezone, in.EffectiveAt)
+	l1Snap, l1T, err := planLayer(curL1, curTZ, desired.L1, desired.Timezone, in.EffectiveAt, in.L1HandoffTo)
 	if err != nil {
 		return zero, fmt.Errorf("l1: %w", err)
 	}
-	l2Snap, l2T, err := planLayer(curL2, curTZ, desired.L2, desired.Timezone, in.EffectiveAt)
+	l2Snap, l2T, err := planLayer(curL2, curTZ, desired.L2, desired.Timezone, in.EffectiveAt, "")
 	if err != nil {
 		return zero, fmt.Errorf("l2: %w", err)
 	}
@@ -139,9 +162,40 @@ func PlanTransition(in TransitionInput) (TransitionPlan, error) {
 	}, nil
 }
 
+// ValidateHandoffTarget checks that an immediate handoff names a group the
+// desired layer will actually have.
+func ValidateHandoffTarget(desired LayerConfiguration, groupID string) error {
+	if !desired.Enabled || len(desired.Groups) == 0 {
+		return fmt.Errorf("rotation: cannot hand off to group %q: the layer has no groups", groupID)
+	}
+	if groupIndexByID(desired.Groups, groupID) < 0 {
+		return fmt.Errorf("rotation: cannot hand off to group %q: no such group", groupID)
+	}
+	return nil
+}
+
+// handoffAlreadyServed reports whether an immediate handoff to groupID would
+// change nothing because that group is on duty at effectiveAt anyway. No
+// instruction at all is trivially served.
+func handoffAlreadyServed(current RotationLayerSnapshot, tz, groupID string, effectiveAt time.Time) (bool, error) {
+	if groupID == "" {
+		return true, nil
+	}
+	g, err := NewGrid(tz, current.Policy)
+	if err != nil {
+		return false, err
+	}
+	active, _, ok, err := ActiveGroupAt(g, current, effectiveAt)
+	if err != nil {
+		return false, err
+	}
+	return ok && active.ID == groupID, nil
+}
+
 // planLayer implements the normative classification order for one layer.
 // current is nil when there is no current revision; currentTZ accompanies it.
-func planLayer(current *RotationLayerSnapshot, currentTZ string, desired LayerConfiguration, desiredTZ string, effectiveAt time.Time) (RotationLayerSnapshot, LayerTransition, error) {
+// handoffTo is the immediate-handoff instruction, empty for none.
+func planLayer(current *RotationLayerSnapshot, currentTZ string, desired LayerConfiguration, desiredTZ string, effectiveAt time.Time, handoffTo string) (RotationLayerSnapshot, LayerTransition, error) {
 	newLayer := RotationLayerSnapshot{
 		Enabled: desired.Enabled,
 		Policy:  desired.Policy.clone(),
@@ -168,6 +222,25 @@ func planLayer(current *RotationLayerSnapshot, currentTZ string, desired LayerCo
 			PhaseAction:    PhaseActionReanchor,
 			GroupSelection: selection,
 		}, nil
+	}
+
+	// An immediate handoff to a group that is not already on duty. Asking for
+	// the group on duty falls through: steps 2-4 keep it there anyway.
+	if handoffTo != "" {
+		idx := groupIndexByID(desired.Groups, handoffTo)
+		if idx < 0 {
+			return RotationLayerSnapshot{}, LayerTransition{}, ValidateHandoffTarget(desired, handoffTo)
+		}
+		served := false
+		if current != nil && current.Enabled && len(current.Groups) > 0 {
+			var err error
+			if served, err = handoffAlreadyServed(*current, currentTZ, handoffTo, effectiveAt); err != nil {
+				return RotationLayerSnapshot{}, LayerTransition{}, err
+			}
+		}
+		if !served {
+			return reanchor(SelectionExplicit, idx)
+		}
 	}
 
 	// Step 2: no current phase to continue from (initial revision, re-enable

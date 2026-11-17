@@ -204,4 +204,54 @@ test.describe('widget context', () => {
     expect(derived.keys).not.toContain('exists');
     expect(derived.keys).not.toContain('active');
   });
+
+  test('the keep line says when this assignment ends', async ({ page }) => {
+    const rendered = await page.evaluate(async (componentsUrl: string) => {
+      const components = await import(componentsUrl);
+      const names = new Map([['u1', 'Ann'], ['u2', 'Ben']]);
+      const groups = [
+        { id: 'g1', user_ids: ['u1'] },
+        { id: 'g2', user_ids: ['u2'] },
+      ];
+      // 18:00 in Moscow, and the weekly handoff the Monday after. The two
+      // have to format differently, or the assertion cannot tell which
+      // boundary the label used.
+      const assignmentEnd = '2026-11-17T15:00:00Z';
+      const gridEnd = '2026-11-23T08:00:00Z';
+      const fmt = (value: string) => new Date(value).toLocaleString(undefined, {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow',
+      });
+      const choice = (current: Record<string, unknown>) => components.scheduleHandoffChoice({
+        groups, names, timezone: 'Europe/Moscow', handoffTo: '', current,
+      });
+
+      return {
+        override: choice({
+          source: 'override', user_ids: ['u1'], group_id: 'g1',
+          assignment_end: assignmentEnd, grid_slot_end: gridEnd,
+        }),
+        rotation: choice({
+          source: 'rotation', user_ids: ['u1'], group_id: 'g1',
+          assignment_end: gridEnd, grid_slot_end: gridEnd,
+        }),
+        // The grid is known and the assignment is not. Guessing the grid
+        // would put the weekly handoff on a duty that has no end we can name.
+        noAssignment: choice({
+          source: 'override', user_ids: ['u1'], group_id: 'g1',
+          grid_slot_end: gridEnd,
+        }),
+        assignmentText: fmt(assignmentEnd),
+        gridText: fmt(gridEnd),
+      };
+    }, COMPONENTS);
+
+    expect(rendered.override).toContain(`stays on duty until ${rendered.assignmentText}`);
+    expect(rendered.override).not.toContain(rendered.gridText);
+
+    expect(rendered.rotation).toContain(`stays on duty until ${rendered.gridText}`);
+
+    expect(rendered.noAssignment).toContain('stays on duty');
+    expect(rendered.noAssignment).not.toContain('until');
+    expect(rendered.noAssignment).not.toContain(rendered.gridText);
+  });
 });

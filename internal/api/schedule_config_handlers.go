@@ -136,6 +136,8 @@ func (a *API) PutScheduleConfig(c echo.Context) error {
 		Desired:         req.ScheduleConfigDTO.toConfiguration(),
 		ActorID:         actorID(c),
 		Reason:          req.Reason,
+
+		L1HandoffNowGroupID: req.L1HandoffNowGroupID,
 	})
 	if err != nil {
 		return a.mapScheduleError(c, err)
@@ -186,7 +188,7 @@ func (a *API) PostSchedulePreview(c echo.Context) error {
 	}
 
 	res, err := a.scheduleRenderer.Preview(c.Request().Context(), teamID,
-		req.ScheduleConfigDTO.toConfiguration(), until)
+		req.ScheduleConfigDTO.toConfiguration(), req.L1HandoffNowGroupID, until)
 	if err != nil {
 		return a.mapScheduleError(c, err)
 	}

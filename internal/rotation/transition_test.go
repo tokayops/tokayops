@@ -501,3 +501,98 @@ func TestPlanTransition_ClassificationPartition(t *testing.T) {
 		}
 	}
 }
+
+func mustPlanHandoff(t *testing.T, current *ScheduleRevisionSnapshot, desired ScheduleConfiguration, at time.Time, to string) TransitionPlan {
+	t.Helper()
+	plan, err := PlanTransition(TransitionInput{Current: current, Desired: desired, EffectiveAt: at, L1HandoffTo: to})
+	if err != nil {
+		t.Fatalf("PlanTransition: %v", err)
+	}
+	return plan
+}
+
+// The reported case: the groups are reordered so that someone else is first,
+// and that someone is asked to take the shift now rather than at the next
+// handoff.
+func TestPlanTransition_HandoffNow_WithReorder(t *testing.T) {
+	snap := baseSnapshot()
+	desired := ConfigurationFromSnapshot(snap)
+	desired.L1.Groups = []RotationGroup{
+		{ID: gid[2], Members: []string{"carol"}},
+		{ID: gid[0], Members: []string{"alice"}},
+		{ID: gid[1], Members: []string{"bob"}},
+	}
+
+	plan := mustPlanHandoff(t, &snap, desired, effAt, gid[2])
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionExplicit)
+	if id := activeAt(t, plan.Snapshot, effAt); id != gid[2] {
+		t.Fatalf("active after handoff = %s, want carol", id)
+	}
+	// The grid is untouched: carol hands off at the usual time, to the group
+	// after her in the new order.
+	if id := activeAt(t, plan.Snapshot, utc(2026, time.August, 5, 10, 59)); id != gid[2] {
+		t.Fatalf("carol's shift ended early: %s", id)
+	}
+	if id := activeAt(t, plan.Snapshot, utc(2026, time.August, 5, 11, 0)); id != gid[0] {
+		t.Fatalf("next handoff goes to %s, want alice", id)
+	}
+	if plan.Change.L1GroupSelection != SelectionExplicit {
+		t.Fatalf("summary must record the explicit handoff: %+v", plan.Change)
+	}
+}
+
+// Handing off without changing the configuration is still a change: the
+// phase moves even though nothing a person typed did.
+func TestPlanTransition_HandoffNow_UnchangedConfig(t *testing.T) {
+	snap := baseSnapshot()
+	desired := ConfigurationFromSnapshot(snap)
+
+	plan := mustPlanHandoff(t, &snap, desired, effAt, gid[2])
+	if plan.Noop {
+		t.Fatalf("a handoff to another group is not a no-op")
+	}
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionExplicit)
+	if id := activeAt(t, plan.Snapshot, effAt); id != gid[2] {
+		t.Fatalf("active after handoff = %s, want carol", id)
+	}
+	if plan.Change.L1GroupsChanged || plan.Change.L1PolicyChanged {
+		t.Fatalf("nothing but the phase changed: %+v", plan.Change)
+	}
+}
+
+// Asking for the group that is already on duty is not an instruction to
+// restart its shift.
+func TestPlanTransition_HandoffNow_ToActiveGroup(t *testing.T) {
+	snap := baseSnapshot()
+	desired := ConfigurationFromSnapshot(snap)
+	if plan := mustPlanHandoff(t, &snap, desired, effAt, gid[1]); !plan.Noop {
+		t.Fatalf("handing off to the group on duty must be a no-op")
+	}
+
+	desired.L1.Groups[1].Members = []string{"bob", "dave"}
+	plan := mustPlanHandoff(t, &snap, desired, effAt, gid[1])
+	assertLayer(t, plan.L1, PhaseActionCarry, SelectionPreserve)
+}
+
+func TestPlanTransition_HandoffNow_InitialRevision(t *testing.T) {
+	desired := ConfigurationFromSnapshot(baseSnapshot())
+	plan := mustPlanHandoff(t, nil, desired, effAt, gid[1])
+	assertLayer(t, plan.L1, PhaseActionReanchor, SelectionExplicit)
+	if id := activeAt(t, plan.Snapshot, effAt); id != gid[1] {
+		t.Fatalf("active = %s, want bob", id)
+	}
+}
+
+func TestPlanTransition_HandoffNow_UnknownGroup(t *testing.T) {
+	snap := baseSnapshot()
+	desired := ConfigurationFromSnapshot(snap)
+	desired.L1.Groups = desired.L1.Groups[:2]
+	_, err := PlanTransition(TransitionInput{Current: &snap, Desired: desired, EffectiveAt: effAt, L1HandoffTo: gid[2]})
+	if err == nil {
+		t.Fatalf("a handoff to a removed group must be refused")
+	}
+	desired.L1.Enabled = false
+	if err := ValidateHandoffTarget(desired.L1, gid[0]); err == nil {
+		t.Fatalf("a handoff on a disabled layer must be refused")
+	}
+}

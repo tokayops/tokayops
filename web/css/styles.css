@@ -4493,6 +4493,55 @@ body::before {
     color: var(--text-muted);
 }
 
+/* The choice of who takes the shift sits above the preview it changes, set
+   as a heading and two plain rows so it reads as a question, not a form. */
+.handoff-choice {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    margin: 0 0 var(--space-lg);
+    padding: 0;
+    border: 0;
+    min-width: 0;
+}
+
+.handoff-choice legend {
+    padding: 0;
+    margin-bottom: var(--space-sm);
+}
+
+.handoff-option {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-sm);
+    font-size: 0.875rem;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.handoff-option:has(input:checked) {
+    background: var(--bg-tertiary);
+}
+
+.handoff-option input[type="radio"] {
+    margin: 0;
+    accent-color: var(--accent-primary);
+}
+
+.handoff-group-select {
+    min-width: 0;
+    max-width: 100%;
+    padding: 4px 8px;
+    font: inherit;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+}
+
 /* The caveat is a footnote about the answer above it, and it is set as one:
    quieter than what it qualifies, and separated by a rule so it does not read
    as another shift. */

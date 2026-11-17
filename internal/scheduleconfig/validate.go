@@ -38,6 +38,20 @@ func NormalizeConfiguration(c rotation.ScheduleConfiguration) (rotation.Schedule
 	return normalized, nil
 }
 
+// ValidateHandoff rejects an immediate handoff to a group the desired
+// configuration does not have. Like the two helpers around it, it is shared
+// by Save and Preview so the preview cannot offer a handoff the save refuses.
+// An empty groupID is no instruction and always passes.
+func ValidateHandoff(desired rotation.ScheduleConfiguration, groupID string) error {
+	if groupID == "" {
+		return nil
+	}
+	if err := rotation.ValidateHandoffTarget(desired.L1, groupID); err != nil {
+		return invalidField("l1_handoff_now_group_id", "%s", err.Error())
+	}
+	return nil
+}
+
 // ValidateMembership rejects a configuration that puts someone outside the
 // owning team on call.
 //
