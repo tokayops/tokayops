@@ -6,9 +6,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const submitBtn = form.querySelector('button[type="submit"]');
     const ssoSection = document.getElementById('sso-section');
 
+    // The route that sent the user here, when it is one this app can open.
+    const returnPath = window.ReturnPath;
+    const next = returnPath ? returnPath.currentReturnPath() : '';
+    const ssoButton = document.getElementById('sso-button');
+    if (ssoButton && returnPath) {
+        ssoButton.href = returnPath.oidcRedirectLocation(next);
+    }
+
+    const home = () => returnPath ? returnPath.homeWithHash(returnPath.consumeReturnPath()) : '/';
+
     // Check if already logged in, redirect if so
     API.auth.me().then(() => {
-        window.location.href = '/';
+        window.location.href = home();
     }).catch(() => {
         // Not logged in, stay here
     });
@@ -42,7 +52,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
             await API.auth.login(email, password);
-            window.location.href = '/';
+            window.location.href = home();
         } catch (error) {
             console.error('Login failed:', error);
             errorDisplay.textContent = error.message || 'Invalid email or password';

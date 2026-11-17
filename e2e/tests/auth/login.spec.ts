@@ -47,6 +47,35 @@ test.describe('Authentication', () => {
     await expect(page).toHaveURL(/\/login\.html/, { timeout: 10000 });
   });
 
+  test('a deep link is restored after signing in', async ({ page, loginPage }) => {
+    const route = '#/ops/alert-groups/ag-deep-link';
+    await page.goto('/' + route);
+    await expect(page).toHaveURL(/\/login\.html\?next=/, { timeout: 10000 });
+    expect(new URL(page.url()).searchParams.get('next')).toBe(route);
+    await expect(loginPage.ssoButton).toHaveAttribute(
+      'href',
+      '/api/auth/oidc/redirect?next=' + encodeURIComponent(route),
+    );
+
+    const email = process.env.TEST_USER_EMAIL || 'admin@example.com';
+    const password = process.env.TEST_USER_PASSWORD || 'Admin123!';
+    await loginPage.login(email, password);
+
+    await page.waitForURL(url => url.hash === route, { timeout: 10000 });
+    await expect(page.locator('#main-app')).toBeVisible({ timeout: 10000 });
+  });
+
+  test('a login next value cannot leave the site', async ({ page, loginPage }) => {
+    await page.goto('/login.html?next=' + encodeURIComponent('https://evil.example/phish'));
+
+    const email = process.env.TEST_USER_EMAIL || 'admin@example.com';
+    const password = process.env.TEST_USER_PASSWORD || 'Admin123!';
+    await loginPage.login(email, password);
+
+    await expect(page).toHaveURL(/\/#\//, { timeout: 10000 });
+    expect(page.url()).not.toContain('evil.example');
+  });
+
   test('should have email field focused by default', async ({ loginPage }) => {
     await loginPage.goto();
 
