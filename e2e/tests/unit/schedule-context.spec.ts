@@ -18,6 +18,7 @@ import { test, expect, Page } from '@playwright/test';
 const SHARED = '/js/modules/schedule-shared.js';
 const COMPONENTS = '/js/modules/schedule-components.js';
 const PERMISSIONS = '/js/modules/permissions.js';
+const CALENDAR = '/js/modules/schedule-calendar.js';
 
 type Rendered = {
   kind: string;
@@ -253,5 +254,152 @@ test.describe('widget context', () => {
     expect(rendered.noAssignment).toContain('stays on duty');
     expect(rendered.noAssignment).not.toContain('until');
     expect(rendered.noAssignment).not.toContain(rendered.gridText);
+  });
+
+  test('a handoff day shows when the shift changes, not when the calendar was opened', async ({ page }) => {
+    const rendered = await page.evaluate(async (componentsUrl: string) => {
+      const components = await import(componentsUrl);
+      const zone = 'Asia/Bangkok';
+      const clock = (value: string) => new Date(value).toLocaleTimeString('en-US', {
+        hour: '2-digit', minute: '2-digit', hour12: false, timeZone: zone,
+      });
+      // Opened Friday 14:18 in Bangkok. Denis has been on since before that;
+      // the render clips his shift to that instant. He hands off Monday at
+      // 15:00 Bangkok, which is 11:00 in Moscow.
+      const openedAt = '2026-11-13T07:18:00Z';
+      const handoff = '2026-11-16T08:00:00Z';
+      const html = components.monthlyScheduleCalendar({
+        entries: [
+          { layer: 'l1', source: 'rotation', user_ids: ['u1'], start: openedAt, end: handoff },
+          { layer: 'l1', source: 'rotation', user_ids: ['u2'], start: handoff, end: '2026-11-23T08:00:00Z' },
+          // A shift that begins and ends on Tuesday, so the same-day form stays.
+          { layer: 'l1', source: 'override', user_ids: ['u3'], start: '2026-11-17T03:00:00Z', end: '2026-11-17T05:00:00Z' },
+          { layer: 'l1', source: 'rotation', user_ids: ['u2'], start: '2026-11-17T05:00:00Z', end: '2026-11-23T08:00:00Z' },
+        ],
+      }, new Date(openedAt), zone, new Map([['u1', 'Denis'], ['u2', 'Yuriy'], ['u3', 'Nikita']]));
+
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const day = (num: string, month: string) => {
+        const block = [...doc.querySelectorAll('.calendar-day')].find(el => {
+          const date = el.querySelector('.calendar-day-date')?.textContent || '';
+          return date.includes(num) && date.includes(month);
+        });
+        return [...(block?.querySelectorAll('.calendar-entry') || [])].map(el => ({
+          user: el.querySelector('.entry-user')?.textContent || '',
+          time: el.querySelector('.entry-time')?.textContent || '',
+        }));
+      };
+      return {
+        monday: day('16', 'Nov'),
+        tuesday: day('17', 'Nov'),
+        opened: clock(openedAt),
+        handoff: clock(handoff),
+        overrideStart: clock('2026-11-17T03:00:00Z'),
+        overrideEnd: clock('2026-11-17T05:00:00Z'),
+      };
+    }, COMPONENTS);
+
+    const denis = rendered.monday.find(entry => entry.user === 'Denis');
+    const yuriy = rendered.monday.find(entry => entry.user === 'Yuriy');
+    expect(denis?.time).toBe(`→${rendered.handoff}`);
+    expect(yuriy?.time).toBe(`${rendered.handoff}→`);
+    expect(rendered.monday.map(entry => entry.time).join(' ')).not.toContain(rendered.opened);
+
+    const nikita = rendered.tuesday.find(entry => entry.user === 'Nikita');
+    expect(nikita?.time).toBe(`${rendered.overrideStart}-${rendered.overrideEnd}`);
+  });
+
+  test('opening on the handoff day does not show the open time as coming on duty', async ({ page }) => {
+    const rendered = await page.evaluate(async (componentsUrl: string) => {
+      const components = await import(componentsUrl);
+      const zone = 'Europe/Moscow';
+      const clock = (value: string) => new Date(value).toLocaleTimeString('en-US', {
+        hour: '2-digit', minute: '2-digit', hour12: false, timeZone: zone,
+      });
+      // Monday 10:18 in Moscow, fifty minutes before the 11:00 handoff.
+      // The render clips Denis to that instant. It is the window edge, not
+      // when his duty began.
+      const openedAt = '2026-11-16T07:18:00Z';
+      const handoff = '2026-11-16T08:00:00Z';
+      const html = components.monthlyScheduleCalendar({
+        entries: [
+          { layer: 'l1', source: 'rotation', user_ids: ['u1'], start: openedAt, end: handoff },
+          { layer: 'l1', source: 'rotation', user_ids: ['u2'], start: handoff, end: '2026-11-23T08:00:00Z' },
+        ],
+      }, new Date(openedAt), zone, new Map([['u1', 'Denis'], ['u2', 'Yuriy']]));
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const monday = [...doc.querySelectorAll('.calendar-day')].find(el =>
+        (el.querySelector('.calendar-day-date')?.textContent || '').trim() === '16 Nov');
+      const entries = [...(monday?.querySelectorAll('.calendar-entry') || [])].map(el => ({
+        user: el.querySelector('.entry-user')?.textContent || '',
+        time: el.querySelector('.entry-time')?.textContent || '',
+      }));
+      return { entries, opened: clock(openedAt), handoff: clock(handoff) };
+    }, COMPONENTS);
+
+    const denis = rendered.entries.find(entry => entry.user === 'Denis');
+    const yuriy = rendered.entries.find(entry => entry.user === 'Yuriy');
+    expect(denis?.time).toBe(`→${rendered.handoff}`);
+    expect(denis?.time).not.toContain(rendered.opened);
+    expect(yuriy?.time).toBe(`${rendered.handoff}→`);
+  });
+
+  test('a day whose midnight was skipped still labels the handoff, not the whole shift', async ({ page }) => {
+    const rendered = await page.evaluate(async (componentsUrl: string) => {
+      const components = await import(componentsUrl);
+      const zone = 'America/Santiago';
+      const clock = (value: string) => new Date(value).toLocaleTimeString('en-US', {
+        hour: '2-digit', minute: '2-digit', hour12: false, timeZone: zone,
+      });
+      // 6 September 2026 has no midnight there: the clocks jump from
+      // 23:59 on the 5th to 01:00 on the 6th. Denis was clipped to an
+      // earlier open; he hands off at 11:00 that morning.
+      const openedAt = '2026-09-04T14:18:00Z';
+      const handoff = '2026-09-06T14:00:00Z';
+      const html = components.monthlyScheduleCalendar({
+        entries: [
+          { layer: 'l1', source: 'rotation', user_ids: ['u1'], start: openedAt, end: handoff },
+          { layer: 'l1', source: 'rotation', user_ids: ['u2'], start: handoff, end: '2026-09-13T14:00:00Z' },
+        ],
+      }, new Date(openedAt), zone, new Map([['u1', 'Denis'], ['u2', 'Yuriy']]));
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const day = [...doc.querySelectorAll('.calendar-day')].find(el =>
+        (el.querySelector('.calendar-day-date')?.textContent || '').trim() === '6 Sep');
+      const entries = [...(day?.querySelectorAll('.calendar-entry') || [])].map(el => ({
+        user: el.querySelector('.entry-user')?.textContent || '',
+        time: el.querySelector('.entry-time')?.textContent || '',
+      }));
+      return { entries, opened: clock(openedAt), handoff: clock(handoff) };
+    }, COMPONENTS);
+
+    const denis = rendered.entries.find(entry => entry.user === 'Denis');
+    const yuriy = rendered.entries.find(entry => entry.user === 'Yuriy');
+    expect(denis?.time).toBe(`→${rendered.handoff}`);
+    expect(denis?.time).not.toContain(rendered.opened);
+    expect(yuriy?.time).toBe(`${rendered.handoff}→`);
+    expect(yuriy?.time).not.toBe(`${rendered.handoff}-${rendered.handoff}`);
+  });
+
+  test('the calendar opens in the schedule zone, not the computer zone', async ({ page }) => {
+    const chosen = await page.evaluate(async (calendarUrl: string) => {
+      const calendar = await import(calendarUrl);
+      return {
+        schedule: calendar.calendarTimezone({
+          schedule: 'Europe/Moscow', browser: 'Asia/Bangkok',
+        }),
+        remembered: calendar.calendarTimezone({
+          stored: 'Asia/Bangkok', schedule: 'Europe/Moscow', browser: 'Asia/Bangkok',
+        }),
+        computer: calendar.calendarTimezone({ browser: 'Asia/Bangkok' }),
+        unknown: calendar.calendarTimezone({
+          stored: 'Mars/Olympus', schedule: 'Europe/Moscow', browser: 'Asia/Bangkok',
+        }),
+      };
+    }, CALENDAR);
+
+    expect(chosen.schedule).toBe('Europe/Moscow');
+    expect(chosen.remembered).toBe('Asia/Bangkok');
+    expect(chosen.computer).toBe('Asia/Bangkok');
+    expect(chosen.unknown).toBe('Europe/Moscow');
   });
 });

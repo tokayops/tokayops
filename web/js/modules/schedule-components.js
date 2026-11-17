@@ -12,6 +12,7 @@
  */
 
 import { escapeHtml, escapeAttr } from '/js/core/utils.js';
+import { instantToLocalInput, resolveLocalTime } from '/js/core/zoned-time.js';
 import { Permissions } from '/js/modules/permissions.js';
 import { assertScheduleKind, scheduleActive, scheduleExists, overrideHasEnded } from '/js/modules/schedule-shared.js';
 
@@ -920,17 +921,80 @@ export function monthlyScheduleCalendar(render, startDate, timezone = 'UTC', nam
             ? `${entry.layer === 'l2' ? 'L2' : 'L1'} override`
             : (entry.layer === 'l2' ? 'L2' : 'L1');
 
-    const formatShiftTime = (entry) => {
-        const start = new Date(entry.start);
-        const end = new Date(entry.end);
+    // The clock on a day is the part of the shift that falls on that day.
+    // Two instants are not a coming-on-duty and must not be printed as one.
+    // The render window clips an ongoing shift to the moment the calendar
+    // was opened, including when that moment is the handoff day itself.
+    // And a local midnight can fail to exist: America/Santiago skips
+    // 00:00 on 6 September 2026, and the day begins at 01:00.
+    const pad = (n) => String(n).padStart(2, '0');
+    const windowEdges = new Set(
+        [startDate, render?.from]
+            .filter(value => value !== undefined && value !== null && value !== '')
+            .map(value => new Date(value).getTime())
+            .filter(ms => !Number.isNaN(ms)),
+    );
+    const atMinute = (date, minute) => {
+        const hour = Math.floor(minute / 60);
+        return resolveLocalTime(
+            `${date}T${pad(hour)}:${pad(minute % 60)}`, timezone, { prefer: 'earlier' },
+        );
+    };
+    // The first instant that falls on this calendar date. Midnight when it
+    // exists; otherwise the first minute after the gap that skipped it.
+    // A date the zone never had (the whole day was skipped) has none.
+    const firstInstantOfLocalDate = (date) => {
+        const midnight = atMinute(date, 0);
+        if (midnight.instant) return midnight.instant;
+        const step = 30;
+        let hit = -1;
+        for (let minute = step; minute < 24 * 60; minute += step) {
+            if (atMinute(date, minute).instant) {
+                hit = minute;
+                break;
+            }
+        }
+        if (hit < 0) return null;
+        while (hit > 0 && atMinute(date, hit - 1).instant) hit -= 1;
+        return atMinute(date, hit).instant;
+    };
+    const dayWindows = new Map();
+    const localDayWindow = (instant) => {
+        const date = instantToLocalInput(instant, timezone).slice(0, 10);
+        if (dayWindows.has(date)) return dayWindows.get(date);
+        const [year, month, dayOfMonth] = date.split('-').map(Number);
+        const next = new Date(Date.UTC(year, month - 1, dayOfMonth + 1));
+        const nextDate = `${next.getUTCFullYear()}-${pad(next.getUTCMonth() + 1)}-${pad(next.getUTCDate())}`;
+        const start = firstInstantOfLocalDate(date);
+        const end = firstInstantOfLocalDate(nextDate);
+        const bounds = start && end ? { start, end } : null;
+        dayWindows.set(date, bounds);
+        return bounds;
+    };
+    const formatShiftTime = (entry, day) => {
+        const bounds = localDayWindow(day);
+        // No day bounds means no honest clock. Falling back to the whole
+        // shift prints a start and end from other days on this one.
+        if (!bounds) return '';
+        const entryStart = new Date(entry.start);
+        const entryEnd = new Date(entry.end);
+        const start = new Date(Math.max(entryStart.getTime(), bounds.start.getTime()));
+        const end = new Date(Math.min(entryEnd.getTime(), bounds.end.getTime()));
+        if (!(end > start)) return '';
         const formatTime = (d) => d.toLocaleTimeString('en-US', {
             hour: '2-digit', minute: '2-digit', hour12: false, timeZone: timezone,
         });
-        const sameDay = getDateKey(start) === getDateKey(end);
-        if (sameDay) return `${formatTime(start)}-${formatTime(end)}`;
-        const durationHours = (end - start) / (1000 * 60 * 60);
-        if (durationHours >= 23.5) return `${formatTime(start)}→`;
-        return `${formatTime(start)}-${formatTime(end)}`;
+        // The slice begins at the window edge only because the shift was
+        // cut there. That is not when this person came on duty.
+        const clippedToWindow = start.getTime() === entryStart.getTime()
+            && windowEdges.has(entryStart.getTime());
+        const startsToday = !clippedToWindow && start.getTime() !== bounds.start.getTime();
+        const endsToday = end.getTime() !== bounds.end.getTime();
+        // Covers the whole local day: the name is the whole story.
+        if (!startsToday && !endsToday) return '';
+        if (startsToday && endsToday) return `${formatTime(start)}-${formatTime(end)}`;
+        if (startsToday) return `${formatTime(start)}→`;
+        return `→${formatTime(end)}`;
     };
 
     return `
@@ -961,7 +1025,7 @@ export function monthlyScheduleCalendar(render, startDate, timezone = 'UTC', nam
                             <div class="calendar-day-entries">
                                 ${dayEntries.length > 0 ? dayEntries.map(entry => {
             const showTime = dayEntries.length > 1;
-            const timeStr = showTime ? formatShiftTime(entry) : '';
+            const timeStr = showTime ? formatShiftTime(entry, day) : '';
             const userNames = (entry.user_ids || [])
                 .map(id => names.get(id) || `Unknown user (${id})`)
                 .join(', ') || 'Nobody';

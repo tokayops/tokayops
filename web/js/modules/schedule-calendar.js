@@ -20,26 +20,52 @@ import { resolveNames } from '/js/core/users-directory.js';
 import { monthlyScheduleCalendar } from '/js/modules/schedule-components.js';
 import { overrideHasEnded } from '/js/modules/schedule-shared.js';
 
-// Which zone the calendar is read in. A preference rather than state: it
-// outlives the modal on purpose, and keeping it in storage is what lets it do
-// that without a variable beside the module that every open has to remember to
-// reset.
+// An explicit choice of zone, remembered across opens. Without one, the
+// calendar uses the schedule's zone: the computer's zone is a different
+// fact, and a Moscow handoff at 11:00 must not open as 15:00 because the
+// laptop is in Bangkok. The list of every team stays in the reader's zone,
+// because one screen holds schedules that do not share a zone.
 const TIMEZONE_KEY = 'tokay.schedule.calendar-timezone';
 
-function preferredTimezone() {
-    const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    const stored = localStorage.getItem(TIMEZONE_KEY);
-    if (!stored) return browserTz;
+function knownZone(zone) {
+    if (!zone || typeof zone !== 'string') return '';
     try {
-        // A zone that the engine no longer knows would throw from inside the
-        // render, where it reads as "the calendar is broken" rather than as
-        // "that preference is stale".
-        Intl.DateTimeFormat(undefined, { timeZone: stored });
-        return stored;
+        // A zone the engine no longer knows throws from inside the render,
+        // where it reads as "the calendar is broken" rather than as "that
+        // name is stale".
+        Intl.DateTimeFormat(undefined, { timeZone: zone });
+        return zone;
     } catch {
-        localStorage.removeItem(TIMEZONE_KEY);
-        return browserTz;
+        return '';
     }
+}
+
+/**
+ * The zone the calendar draws in.
+ *
+ * A remembered choice wins. Then the schedule's own zone. The computer's
+ * zone is only the last resort, when the schedule has none we can name.
+ */
+export function calendarTimezone({ stored = '', schedule = '', browser = '' } = {}) {
+    return knownZone(stored) || knownZone(schedule) || knownZone(browser) || 'UTC';
+}
+
+function readStoredTimezone() {
+    let stored = '';
+    try {
+        stored = localStorage.getItem(TIMEZONE_KEY) || '';
+    } catch {
+        return '';
+    }
+    if (stored && !knownZone(stored)) {
+        try {
+            localStorage.removeItem(TIMEZONE_KEY);
+        } catch {
+            // Private mode can refuse the write. The stale name is still ignored.
+        }
+        return '';
+    }
+    return stored;
 }
 
 /**
@@ -52,7 +78,7 @@ function preferredTimezone() {
  * @param {(teamId: string) => void} [options.onChanged] - an override was removed here
  */
 export async function openScheduleCalendar(teamId, options = {}) {
-    const view = { teamId, timezone: preferredTimezone(), menu: null };
+    const view = { teamId, timezone: readStoredTimezone(), menu: null };
 
     const session = beginModalSession({
         // Escape belongs to whatever is nearest, and with the menu open that is
@@ -107,9 +133,24 @@ async function renderCalendar(session, view) {
         // Well inside the 90-day cap the server enforces.
         until.setDate(until.getDate() + 30);
 
-        const render = await API.schedules.render(view.teamId, now, until,
+        const renderPromise = API.schedules.render(view.teamId, now, until,
             { signal: session.signal });
+        // Only asked when nobody has chosen a zone. A remembered choice is
+        // already on the view, and fetching the schedule just to ignore it
+        // would put a second request on every redraw.
+        const scheduleZone = view.timezone
+            ? ''
+            : API.schedules.getConfig(view.teamId, { signal: session.signal })
+                .then(cfg => cfg?.config?.timezone || '')
+                .catch(() => '');
+        const [render, scheduleTz] = await Promise.all([renderPromise, scheduleZone]);
         if (session.closed) return;
+        if (!view.timezone) {
+            view.timezone = calendarTimezone({
+                schedule: scheduleTz,
+                browser: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            });
+        }
         const names = await resolveNames((render.entries || []).flatMap(e => e.user_ids || []));
         if (session.closed) return;
 
