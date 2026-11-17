@@ -21,7 +21,7 @@ import { beginModalSession, modalShell } from '/js/core/modal-session.js';
 import { initTimezonePicker } from '/js/core/timezone-picker.js';
 import { resolveNames, assignableMembers, invalidateNames } from '/js/core/users-directory.js';
 import { onScheduleError } from '/js/modules/schedule-errors.js';
-import { scheduleConfigModal, schedulePreview } from '/js/modules/schedule-components.js';
+import { scheduleConfigModal, schedulePreview, scheduleHandoffChoice } from '/js/modules/schedule-components.js';
 
 /**
  * Open the editor for a team.
@@ -502,10 +502,13 @@ async function handleScheduleSubmit(e, session, options) {
 async function showPreviewStep(session, { teamId, config, preview, expectedVersion, reason, options }) {
     const { title: modalTitle, body: modalContent, footer: modalFooter } = modalShell();
 
+    // Every group's members, not only the ones this preview shows: the
+    // handoff choice names groups the current preview has not put anywhere.
     const ids = [
         ...(preview.on_call_before?.l1?.user_ids || []),
         ...(preview.on_call_after?.l1?.user_ids || []),
         ...(preview.entries || []).flatMap(e => e.user_ids || []),
+        ...config.l1.groups.flatMap(g => g.user_ids || []),
     ];
     const names = await resolveNames(ids);
     if (session.closed) return;
@@ -523,8 +526,33 @@ async function showPreviewStep(session, { teamId, config, preview, expectedVersi
 
     const previewHost = document.createElement('div');
     previewHost.id = 'schedule-preview-host';
-    previewHost.innerHTML = schedulePreview(preview, names, config.timezone);
     modalContent.appendChild(previewHost);
+
+    // The group to put on duty when the save lands, '' to leave it to the
+    // rotation. It is offered only when there is someone else to hand to.
+    // The first preview is the rotation's own answer, and the "keep" option
+    // keeps describing it while a handoff is being previewed.
+    let handoffTo = '';
+    const rotationOnCall = preview.on_call_after?.l1 || null;
+    const offerHandoff = config.l1.enabled && config.l1.groups.length > 1;
+
+    const choiceHost = document.createElement('div');
+    const previewBody = document.createElement('div');
+    previewHost.append(choiceHost, previewBody);
+    const renderChoice = () => {
+        choiceHost.innerHTML = offerHandoff
+            ? scheduleHandoffChoice({
+                groups: config.l1.groups, current: rotationOnCall, names,
+                timezone: config.timezone, handoffTo,
+            })
+            : '';
+    };
+    const renderBody = (shown) => {
+        previewBody.innerHTML = schedulePreview(shown, names, config.timezone);
+        if (window.lucide) lucide.createIcons();
+    };
+    renderChoice();
+    renderBody(preview);
 
     // The footer is hidden rather than replaced, for the same reason as the
     // form: rewriting its markup gives back buttons that look right and do
@@ -556,15 +584,79 @@ async function showPreviewStep(session, { teamId, config, preview, expectedVersi
     document.getElementById('preview-back')?.addEventListener('click', restoreForm,
         { signal: session.signal });
 
-    document.getElementById('preview-confirm')?.addEventListener('click', async () => {
+    // Each change of the choice asks the server again rather than guessing:
+    // the handoff moves the rotation's phase, and the server is the only one
+    // that does that math. Only the latest answer is shown.
+    //
+    // A save in flight has to quiet the choice. Switching back to "keep"
+    // previews from memory and would re-enable Save before the PUT returns,
+    // and the next click sends the same version with a different handoff
+    // than the one already on its way.
+    let saving = false;
+    let previewSeq = 0;
+    const lockChoice = (locked) => {
+        const fieldset = choiceHost.querySelector('.handoff-choice');
+        if (fieldset) fieldset.disabled = locked;
+    };
+    const repreview = async () => {
+        if (saving) return;
+        const seq = ++previewSeq;
         const confirmBtn = document.getElementById('preview-confirm');
         if (confirmBtn) confirmBtn.disabled = true;
+        try {
+            const until = new Date();
+            until.setDate(until.getDate() + 14);
+            const next = handoffTo
+                ? await API.schedules.preview(teamId, config, until,
+                    { signal: session.signal, handoffNowGroupId: handoffTo })
+                : preview;
+            // A preview that was already in flight when Save was pressed does
+            // not get to unlock the button. The write owns the screen until
+            // it comes back.
+            if (session.closed || seq !== previewSeq || saving) return;
+            if (next.base_version !== expectedVersion) {
+                showToast(
+                    'Someone else saved this schedule while you were editing. Reopen it to see their changes.',
+                    'error');
+                return;
+            }
+            renderBody(next);
+            if (confirmBtn && !saving) confirmBtn.disabled = false;
+        } catch (error) {
+            if (session.closed || seq !== previewSeq || saving) return;
+            console.error('Failed to preview schedule:', error);
+            await handleSaveError(error, session, teamId, options);
+        }
+    };
+
+    choiceHost.addEventListener('change', (e) => {
+        if (saving) return;
+        const mode = choiceHost.querySelector('input[name="handoff-mode"]:checked')?.value;
+        const select = choiceHost.querySelector('#handoff-group');
+        // Picking a group is choosing to hand off: making someone also click
+        // the radio beside the list they just used is a step that only fails.
+        if (e.target === select) {
+            const now = choiceHost.querySelector('input[name="handoff-mode"][value="now"]');
+            if (now) now.checked = true;
+        }
+        const wanted = (mode === 'now' || e.target === select) ? (select?.value || '') : '';
+        if (wanted === handoffTo) return;
+        handoffTo = wanted;
+        repreview();
+    }, { signal: session.signal });
+
+    document.getElementById('preview-confirm')?.addEventListener('click', async () => {
+        if (saving) return;
+        saving = true;
+        const confirmBtn = document.getElementById('preview-confirm');
+        if (confirmBtn) confirmBtn.disabled = true;
+        lockChoice(true);
         try {
             // No session signal on the way out. Reads are abandoned when the
             // modal closes, because their answer has nowhere to land; a write
             // that is already in flight has already changed something, and
             // aborting it would only cost us the answer about what.
-            const saved = await API.schedules.saveConfig(teamId, config, expectedVersion, reason);
+            const saved = await API.schedules.saveConfig(teamId, config, expectedVersion, reason, handoffTo);
 
             if (saved.noop) {
                 showToast('No changes to save', 'info');
@@ -594,7 +686,16 @@ async function showPreviewStep(session, { teamId, config, preview, expectedVersi
             console.error('Failed to save schedule:', error);
             await handleSaveError(error, session, teamId, options);
         } finally {
-            if (confirmBtn) confirmBtn.disabled = false;
+            const open = !session.closed;
+            saving = false;
+            // A validation refusal leaves this review step up, and the choice
+            // has to work again. A save that closed the session, or one whose
+            // modal was already replaced, must not enable whatever button is
+            // on screen now.
+            if (open) {
+                lockChoice(false);
+                if (confirmBtn) confirmBtn.disabled = false;
+            }
         }
     }, { signal: session.signal });
 }

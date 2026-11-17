@@ -145,6 +145,49 @@ test.describe('Schedule editor', () => {
     expect(nextDifferent?.user_ids, 'C is next, the cycle did not restart at A').toEqual(['e2e-cal']);
   });
 
+  /**
+   * Reordering the groups changes the queue, not the shift in progress: the
+   * group on duty keeps it until the next handoff. When the point of the edit
+   * is to put someone else on call now, the review step says so explicitly.
+   */
+  test('the review step can hand the shift to another group now', async ({ page }) => {
+    const env = await seedTeam(page, 'handoff');
+
+    // One group first, so its member is the one on duty, then a second.
+    await save(page, env.teamId, config([['e2e-ann']], 0));
+    const first = await readConfig(page, env.teamId);
+    const groupA = first.config.l1.groups[0].id;
+    const two = config([['e2e-ann'], ['e2e-ben']], first.version);
+    two.l1.groups[0].id = groupA;
+    await save(page, env.teamId, two);
+    const groupB = (await readConfig(page, env.teamId)).config.l1.groups[1].id;
+    expect((await onCall(page, env.teamId)).on_call.l1.group_id).toBe(groupA);
+
+    await openEditor(page, env.teamId);
+    await page.locator('#schedule-form-submit').click();
+    await page.locator('.schedule-preview').waitFor({ state: 'visible' });
+    await expect(page.locator('.schedule-preview')).toContainText('stays on duty');
+
+    // The group on duty is not offered: handing the shift to it is not a handoff.
+    const select = page.locator('#handoff-group');
+    await expect(select.locator('option')).toHaveCount(1);
+    await expect(select.locator('option')).toHaveAttribute('value', groupB);
+
+    await page.locator('input[name="handoff-mode"][value="now"]').check();
+    await expect(page.locator('.schedule-preview')).toContainText('On duty right now changes');
+
+    await page.locator('#preview-confirm').click();
+    await expect(page.locator('#modal-overlay')).not.toHaveClass(/active/);
+
+    const after = await onCall(page, env.teamId);
+    expect(after.on_call.l1.group_id, 'B took the shift at the save').toBe(groupB);
+    // The handoff is an instruction, not configuration: nothing about the
+    // groups was rewritten to carry it.
+    const saved = await readConfig(page, env.teamId);
+    expect(saved.config.l1.groups.map((g: any) => g.id), 'the order itself is unchanged')
+      .toEqual([groupA, groupB]);
+  });
+
   test('the preview writes nothing', async ({ page }) => {
     const env = await seedTeam(page, 'preview');
     await save(page, env.teamId, config([['e2e-ann']], 0));

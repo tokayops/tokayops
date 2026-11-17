@@ -621,15 +621,18 @@ const API = {
          * @param {Object} config - {timezone, slack_usergroup_id, l1, l2}
          * @param {number} expectedVersion
          * @param {string} [reason] - free text recorded with the revision
+         * @param {string} [handoffNowGroupId] - L1 group to put on duty now
+         *   rather than at the next handoff; not stored with the configuration
          * @returns {Promise<{version, revision_id, noop, created, recreated}>}
          */
-        saveConfig: (teamId, config, expectedVersion, reason) => {
+        saveConfig: (teamId, config, expectedVersion, reason, handoffNowGroupId) => {
             return request(`/teams/${encodeURIComponent(teamId)}/schedule/config`, {
                 method: 'PUT',
                 body: JSON.stringify({
                     ...config,
                     expected_version: expectedVersion,
                     ...(reason ? { reason } : {}),
+                    ...(handoffNowGroupId ? { l1_handoff_now_group_id: handoffNowGroupId } : {}),
                 }),
             });
         },
@@ -641,13 +644,18 @@ const API = {
          * @param {string} teamId
          * @param {Object} config - the same payload the save would carry
          * @param {Date} [until] - end of the previewed window
+         * @param {Object} [options] - fetch options, plus `handoffNowGroupId`
+         *   to preview the same immediate handoff the save would carry
          */
         preview: (teamId, config, until, options = {}) => {
+            const { handoffNowGroupId, ...fetchOptions } = options;
             const query = buildQuery({ until: until ? until.toISOString() : null });
             return request(`/teams/${encodeURIComponent(teamId)}/schedule/preview${query}`, {
                 method: 'POST',
-                body: JSON.stringify(config),
-                ...options,
+                body: JSON.stringify(handoffNowGroupId
+                    ? { ...config, l1_handoff_now_group_id: handoffNowGroupId }
+                    : config),
+                ...fetchOptions,
             });
         },
 

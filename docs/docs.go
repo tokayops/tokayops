@@ -4558,6 +4558,10 @@ const docTemplate = `{
                 "l1": {
                     "$ref": "#/definitions/api.ScheduleL1DTO"
                 },
+                "l1_handoff_now_group_id": {
+                    "description": "L1HandoffNowGroupID puts this L1 group on duty from the moment of the\nsave instead of keeping whoever is on duty until the next handoff. It is\nan instruction, not configuration: it is not stored and not returned.\nNaming the group already on duty changes nothing.",
+                    "type": "string"
+                },
                 "l2": {
                     "$ref": "#/definitions/api.ScheduleL2DTO"
                 },

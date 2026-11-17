@@ -67,6 +67,11 @@ type SaveCommand struct {
 	Desired         rotation.ScheduleConfiguration
 	ActorID         string
 	Reason          *string
+
+	// L1HandoffNowGroupID, when set, puts that L1 group on duty from the
+	// effective instant instead of keeping whoever the rotation has there.
+	// See rotation.TransitionInput.L1HandoffTo.
+	L1HandoffNowGroupID string
 }
 
 // SaveResult is everything the caller needs to answer, including when nothing
@@ -119,6 +124,9 @@ func (s *Service) Save(ctx context.Context, teamID string, cmd SaveCommand) (*Sa
 	if err != nil {
 		return nil, err
 	}
+	if err := ValidateHandoff(desired, cmd.L1HandoffNowGroupID); err != nil {
+		return nil, err
+	}
 
 	var result *SaveResult
 	err = s.runCommand(ctx, func(tx ScheduleConfigTx) error {
@@ -167,7 +175,7 @@ func (s *Service) save(ctx context.Context, tx ScheduleConfigTx, teamID string,
 		if cmd.ExpectedVersion != 0 {
 			return nil, &VersionConflictError{Expected: cmd.ExpectedVersion, Current: 0}
 		}
-		return s.initialize(ctx, tx, teamID, desired, cmd.ActorID, cmd.Reason)
+		return s.initialize(ctx, tx, teamID, desired, cmd)
 	}
 	if err != nil {
 		return nil, err
@@ -248,6 +256,7 @@ func (s *Service) rewrite(ctx context.Context, tx ScheduleConfigTx, target *writ
 		Current:     current,
 		Desired:     desired,
 		EffectiveAt: target.effectiveAt,
+		L1HandoffTo: cmd.L1HandoffNowGroupID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
@@ -321,7 +330,9 @@ func (s *Service) appendRevision(ctx context.Context, tx ScheduleConfigTx, targe
 
 // initialize writes the root, revision 1 and the creation event.
 func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID string,
-	desired rotation.ScheduleConfiguration, actorID string, reason *string) (*SaveResult, error) {
+	desired rotation.ScheduleConfiguration, cmd SaveCommand) (*SaveResult, error) {
+
+	actorID, reason := cmd.ActorID, cmd.Reason
 
 	// The team row is the serialization point, and it is taken BEFORE
 	// membership is read.
@@ -350,6 +361,7 @@ func (s *Service) initialize(ctx context.Context, tx ScheduleConfigTx, teamID st
 		Current:     nil,
 		Desired:     desired,
 		EffectiveAt: effectiveAt,
+		L1HandoffTo: cmd.L1HandoffNowGroupID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvariantViolation, err)
